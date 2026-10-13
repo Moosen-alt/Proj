@@ -268,6 +268,27 @@ function boundAfter(after: string, assigned: boolean, value: number | null = nul
   return BOUND_AFTER.test(after) || RATING_AFTER.test(after) || (!assigned && MAX_AFTER.test(after))
     || (assigned && rangeAfter(after, value));
 }
+/**
+ * A LABEL WITH NO VALUE READS NOTHING. The text after a label's candidate value decides whether the
+ * value is the label's own statement or the first CELL OF A TABLE: a number that opens a row of bare
+ * numbers is a cell. The live case (#312): a letter's page 2 ends with its design-criteria LABELS
+ * ("… Exposure: Risk Category:") and page 3 opens with a span table ("1 43 191.11 41 194.38 …"); the
+ * page break itself does not survive extraction (extractPdfText joins pages with a newline and
+ * readSources flattens every run of whitespace), so the "1" sat right after "Risk Category:" and
+ * read as Risk Category I — a BLOCKER against the plan set's II. The same shape would read
+ * "Ground Snow Load:" as Pg 1 and "Wind Speed (mph) 110 120 130" as 110 mph.
+ * ONE predicate for every label reader. Not a row: a list marker opening the next note ("II 2.
+ * WIND SPEED = 110 MPH"), a number carrying its own unit or label ("II 45.00 psf", "II 110 MPH",
+ * "II 2023 EDITION"), a lone number at the end of the window.
+ */
+// (`\s*`, not `\s+`: a label reader's match may already have swallowed the space after its value —
+// "Ground Snow Load: 1 " — and every value reader forbids a digit directly after the value.)
+const NUMBER_ROW_AFTER = /^\s*(?!\d{1,2}[.)]\s)\d+(?:\.\d+)?(?![\d.])\s*(?=\d)/;
+function opensNumberRow(after: string): boolean {
+  return NUMBER_ROW_AFTER.test(after);
+}
+/** A value wearing a measure mark is another quantity ("1' X X" — a span table's feet column). */
+const MEASURE_MARK_AFTER = /^\s*['"″′%°]/;
 /** "psf 25" / "mph V 120" split by a PDF: "2 5 PSF", "ASCE 7-1 6". Joined ONLY right after a
  *  field separator and right before the unit — anywhere else two numbers are two numbers. */
 function joinSplitDigits(text: string): string {
@@ -372,7 +393,7 @@ function extractWind(text: string, source: string, out: StatedDesignCriterion[])
     const endAt = lf.index + lf[0].length;
     const after = text.slice(endAt, endAt + 24);
     if (/^\s*(?:mph|m\/s|km|kph|psf|%|ft|'|-|–|\/|x\b|sec)/i.test(after)) continue;
-    if (/^\s+\d{1,3}(?:\.\d+)?\b/.test(after)) continue;
+    if (opensNumberRow(after)) continue;
     const value = toNumber(lf[4]);
     if (value == null || value < 60 || value > 250) continue;
     const before = text.slice(Math.max(0, lf.index - 30), lf.index);
@@ -443,6 +464,8 @@ function extractExposureAndRisk(text: string, source: string, out: StatedDesignC
       if (EXPOSURE_LIST_AFTER.test(after) || EXPOSURE_RATING_AFTER.test(after)) continue;
       // "Exposure C max" bounds an UNASSIGNED letter; after "EXPOSURE CATEGORY: C" a "MAX. ..." is the next field.
       if (!/[:=]/.test(m[0]) && /^\s*max(?:imum)?\b/i.test(after)) continue;
+      // A letter that opens a row of numbers is a table's cell, not the label's value (opensNumberRow).
+      if (opensNumberRow(after)) continue;
       if (candidates.some((c) => c.at === at)) continue;
       candidates.push({ at, end, letter: m[1].toUpperCase() });
     }
@@ -474,6 +497,9 @@ function extractExposureAndRisk(text: string, source: string, out: StatedDesignC
     if (/^\s+(?:IV|I{1,3})\s+(?:IV|I{1,3})(?![A-Za-z0-9])/.test(riskAfter)) continue;
     if (/^\s*(?:or\s+(?:less|lower|greater|more|higher)\b|and\s+(?:below|above|less|greater)\b)/i.test(riskAfter)) continue;
     if (!/[:=]/.test(r[0]) && limitGoverns(text, r.index)) continue;
+    // A LABEL WITH NO VALUE: the number after "Risk Category:" is the next page's table ("1 43
+    // 191.11 …") or wears a measure mark ("1' X X") — a cell, never the category (opensNumberRow).
+    if (opensNumberRow(riskAfter) || MEASURE_MARK_AFTER.test(riskAfter)) continue;
     out.push({ criterion: "riskCategory", value: normRisk(r[1]), qualifier: "unspecified", source, derived: false, excerpt: excerptAt(text, r.index, r.index + r[0].length) });
   }
   const asce = /\bASCE(?:\/SEI)?\s*7\s*[-–]\s*(\d{2})\b/gi;
@@ -518,6 +544,7 @@ function extractSeismicAndFrost(text: string, source: string, out: StatedDesignC
     if (SDC_LIST_AFTER.test(after)) continue;
     if (/^\s*(?:or\s+(?:less|lower|greater|more|higher)\b|and\s+(?:below|above|less|greater)\b)/i.test(after)) continue;
     if (!/[:=]/.test(m[0]) && limitGoverns(text, m.index)) continue;
+    if (opensNumberRow(after)) continue;
     out.push({ criterion: "seismicDesignCategory", value: m[1], qualifier: "unspecified", source, derived: false, excerpt: excerptAt(text, m.index, end) });
   }
   for (const re of [FROST_LABEL_FIRST, FROST_VALUE_FIRST]) {
@@ -849,6 +876,9 @@ function extractSnow(text: string, source: string, out: StatedDesignCriterion[],
     const assigned = new RegExp(SEP).test(m[0]);
     if (boundAfter(text.slice(end, end + 30), assigned, value)) return;
     if (!assigned && limitGoverns(text, m.index)) return;
+    // A unitless number a separator handed to the label is the label's only when it stands alone:
+    // "Ground Snow Load: 1 43 191.11" is the next page's table (opensNumberRow), never Pg 1.
+    if (!/\b(?:psf|lbs?)\b/i.test(m[0]) && opensNumberRow(text.slice(end, end + 30))) return;
     out.push({ criterion, value, qualifier, source, derived: false, excerpt: excerptAt(text, m.index, end) });
   };
   const asd = (s: string | undefined): boolean => !!s && /asd/i.test(s);
@@ -1104,7 +1134,9 @@ function acronym(name: string): string {
     .join("");
 }
 
-type BasisItem = { at: number; end: number; entry: Omit<StatedCodeBasisEntry, "source" | "excerpt"> };
+/** One entry read from a text: WEAK when its run's shape was ambiguous (pairCodeTokens), and
+ *  whether it was a bare abbreviation (read only inside a GOVERNING CODES block). */
+type BasisItem = { at: number; end: number; entry: Omit<StatedCodeBasisEntry, "source" | "excerpt">; weak: boolean; abbreviation: boolean };
 
 const YEAR = "(?:19|20)\\d{2}";
 /** A parenthetical naming the base model code, either order: "(NEC 2020)", "(2023 NEC)",
@@ -1136,27 +1168,153 @@ function namedCode(name: string, paren: string, tail: string): string {
   return code;
 }
 
-// "2023 OREGON ELECTRICAL SPECIALTY CODE (NEC 2020)", "2022 OREGON STRUCTURAL SPECIALTY CODE
-// (OSSC)", "2021 International Residential Code". Case-sensitive on the capitals: every word
-// of a code's printed name is capitalised, and "in 2021 the electrical code was…" is prose.
-// A year that ends a DATE is not an edition: a portal page's "06/03/2026 Result Code Approved".
-// A state named AFTER "CODE" is part of the name: "2020 RESIDENTIAL CODE OF NEW YORK STATE
-// (2020 RCNYS)" is the RCNYS, not a code named "RC"; so is "… CODE OF THE STATE OF X".
-const NAMED_CODE = /(?<![/.\-\d])\b((?:19|20)\d{2})\s+((?:[A-Z][A-Za-z.'-]*\s+){0,6}?(?:CODE|Code))\b(\s+(?:of|OF)\s+(?:(?:the|THE)\s+)?(?:(?:State|STATE|Commonwealth|COMMONWEALTH)\s+(?:of|OF)\s+(?:[A-Z][A-Za-z]+\s?){1,2}|(?:[A-Z][A-Za-z]+\s+){1,2}(?:State|STATE)\b))?(?:\s*\(\s*([^)]{1,40}?)\s*\))?/g;
-// Name first, then the edition: "Oregon Structural Specialty Code, 2025 Edition (2024 IBC)",
-// "International Residential Code, 2021 Edition".
-// An ordinal edition with the year in parentheses: "FLORIDA BUILDING CODE, RESIDENTIAL 8TH
-// EDITION (2023)".
+// --- the code-basis block: names, years, and the SHAPE that pairs them --------------------
+//
+// A CODE NAME is a run of capitalised words ending in CODE ("OREGON FIRE CODE", "International
+// Residential Code", "RESIDENTIAL CODE OF NEW YORK STATE" with its state tail). Its EDITION is a
+// year printed beside it — and which SIDE the year sits on is a property of the BLOCK, not of the
+// name: a cover sheet prints year-first ("· 2023 OREGON RESIDENTIAL SPECIALTY CODE · 2025 OREGON
+// FIRE CODE"), an engineer's letter name-first ("Oregon Electrical Specialty Code 2023 Oregon Fire
+// Code 2025"). Read with a fixed side, the letter bound the Fire Code to the Electrical Code's 2023
+// — a BLOCKER against a verified OFC 2025 on a correct package (#312).
+//
+// So ONE predicate pairs them (pairCodeTokens), for spelled-out names and bare abbreviations
+// alike: the tokens of a RUN — code names, abbreviations (inside a GOVERNING CODES block only) and
+// years, joined by nothing but glue — are paired in order from the run's first token. A run that
+// opens with a code and closes with a year is name-first; any other run reads year-first, as every
+// block read before #312. A run whose shape is ambiguous (it opens and closes with the same kind:
+// "2023 OREGON FIRE CODE 2025", "ORSC 2023 OESC 2023 OFC") is read year-first and every pair in it
+// is WEAK — a mismatch found through a weak pair is a callout, never a blocker. The ordinal shape
+// ("FLORIDA BUILDING CODE, RESIDENTIAL 8TH EDITION (2023)") carries its year inside its own
+// parenthesis: it is read first, and its span is never paired again.
+//
+// Case-sensitive on the capitals: every word of a code's printed name is capitalised, and "in 2021
+// the electrical code was…" is prose. A year that ends a DATE is not an edition: a portal page's
+// "06/03/2026 Result Code Approved". "CODE:" is a heading ("Building Code: Oregon Structural
+// Specialty Code, 2025 Edition", "PER CODE: NEC 690.54"), never the end of a name. A state named
+// AFTER "CODE" is part of the name: "2020 RESIDENTIAL CODE OF NEW YORK STATE (2020 RCNYS)" is the
+// RCNYS, not a code named "RC"; so is "… CODE OF THE STATE OF X".
 const NAMED_CODE_ORDINAL = /\b((?:[A-Z][A-Za-z.'-]*\s+){1,6}?(?:CODE|Code))((?:\s*[,\-–]?\s*(?:RESIDENTIAL|BUILDING|Residential|Building))?),?\s*[-–]?\s*\d{1,2}(?:ST|ND|RD|TH|st|nd|rd|th)\s+(?:EDITION|Edition)\s*\(\s*((?:19|20)\d{2})\s*\)/g;
-const NAMED_CODE_EDITION = /\b((?:[A-Z][A-Za-z.'-]*\s+){1,6}?(?:CODE|Code)),?\s+((?:19|20)\d{2})\s+(?:EDITION|Edition)\b(?:\s*\(\s*([^)]{1,40}?)\s*\))?/g;
+const STATE_TAIL_AT = /^\s+(?:of|OF)\s+(?:(?:the|THE)\s+)?(?:(?:State|STATE|Commonwealth|COMMONWEALTH)\s+(?:of|OF)\s+(?:[A-Z][A-Za-z]+\s?){1,2}|(?:[A-Z][A-Za-z]+\s+){1,2}(?:State|STATE)\b)/;
+/** A word of a code's printed name: capitalised, no trailing punctuation. "B." (a list marker),
+ *  "Ordinances," and "2023" are not. */
+const NAME_WORD = /^[A-Z](?:[A-Za-z.'-]*[A-Za-z])?$/;
+/** The parenthetical printed directly after a token — after its "Edition" when there is one:
+ *  "(NEC 2020)", "(ORSC)", "2025 Edition (2024 IBC)". */
+const PAREN_AFTER = /^\s*,?\s*(?:Edition|EDITION|edition)?\s*\(\s*([^)]{1,40}?)\s*\)/;
+/** What may sit between two tokens of one run: space, a bullet, a comma, a dash ("IRC-2021"), a
+ *  list marker, "Edition", a volume word, a blanked parenthetical. A word of prose or of another
+ *  field ends the run. (A range's second year is no token — codeTokens drops it — so a dash is glue.) */
+const RUN_GLUE = /^(?:\s|[,;:•·▪●■◦*/&\-–—]|\(\s*[a-z0-9]{1,2}\s*\)|\b\d{1,2}[.)](?=\s)|\b(?:Edition|EDITION|edition|and|AND|the|THE|of|OF|RESIDENTIAL|BUILDING|Residential|Building)\b)*$/;
 
-function namedItems(part: string): BasisItem[] {
+type CodeToken = {
+  kind: "year" | "name" | "abbr";
+  at: number;
+  end: number;
+  /** The year, the abbreviation, or the printed name with its state tail. */
+  value: string;
+  /** A spelled-out name without its state tail, and the text after the name (its volume words). */
+  bare?: string;
+  tail?: string;
+  /** The parenthetical printed directly after the token. */
+  paren?: string;
+};
+
+/**
+ * The tokens of a text, found on a copy with its parentheticals blanked (a "(2021 IRC)" base is its
+ * item's, never a year of its own). Abbreviations only inside `windows` (GOVERNING CODES blocks),
+ * nothing inside `taken` (an ordinal item's span), and never an abbreviation inside a name ("2020
+ * NEC CODE" is the name). A permit-number shape ("BLDC 2024-00012") is not a code and not a year.
+ */
+function codeTokens(text: string, windows: Array<[number, number]>, taken: Array<[number, number]>): CodeToken[] {
+  const blanked = blankParentheticals(text);
+  const free = (a: number, b: number): boolean => !taken.some(([x, y]) => a < y && b > x);
+  const parenAt = (end: number): string | undefined => PAREN_AFTER.exec(text.slice(end, end + 56))?.[1]?.trim();
+  const out: CodeToken[] = [];
+  const words = [...blanked.matchAll(/\S+/g)];
+  for (let i = 0; i < words.length; i++) {
+    if (!/^(?:CODE|Code)(?![A-Za-z:])/.test(words[i][0])) continue;
+    // The name runs back from CODE over capitalised words — never through a year, a CODES heading, a
+    // stopword, a list marker or a punctuation-terminated word, and never into the previous name.
+    let j = i;
+    while (j > 0 && i - j < 6) {
+      const p = words[j - 1][0];
+      if (!NAME_WORD.test(p) || /^(?:19|20)\d{2}$/.test(p) || /^(?:CODES?|Codes?)$/.test(p) || NAME_STOPWORDS.has(p.toUpperCase())) break;
+      j--;
+    }
+    const at = words[j].index!;
+    const nameEnd = words[i].index! + 4;
+    const tail = STATE_TAIL_AT.exec(blanked.slice(nameEnd, nameEnd + 60))?.[0] ?? "";
+    const end = nameEnd + tail.length;
+    if (!free(at, end)) continue;
+    out.push({ kind: "name", at, end, value: blanked.slice(at, end), bare: blanked.slice(at, nameEnd), tail: blanked.slice(end, end + 20), paren: parenAt(end) });
+  }
+  let m: RegExpExecArray | null;
+  const years = new RegExp(`\\b(${YEAR})\\b`, "g");
+  while ((m = years.exec(blanked))) {
+    const at = m.index;
+    const end = at + m[0].length;
+    // A date ("06/03/2026"), a range or a permit number ("2024-00012", "00012-2024", "7-2020") —
+    // a dash after a LETTER keeps the year ("IRC-2021").
+    if (/[/.\d]$|\d\s*-\s*$/.test(blanked.slice(Math.max(0, at - 4), at))) continue;
+    if (/^\s*-\s*\d/.test(blanked.slice(end, end + 4))) continue;
+    if (!free(at, end)) continue;
+    out.push({ kind: "year", at, end, value: m[1], paren: parenAt(end) });
+  }
+  // Case-sensitive: codes are printed as capitals, and a lower-case word is never one.
+  const abbreviations = /\b([A-Z]{2,6}(?:-R\b)?)\b/g;
+  while ((m = abbreviations.exec(blanked))) {
+    const at = m.index;
+    const end = at + m[0].length;
+    if (!windows.some(([a, b]) => at >= a && end <= b) || !free(at, end) || !isCodeToken(m[1])) continue;
+    if (out.some((t) => t.kind === "name" && at < t.end && end > t.at)) continue;
+    // A permit-number prefix: "BLDC 2024-00012", "ELEC# 2024-0031", "BLD 20240012".
+    if (/^\s*[-#:]?\s*(?:(?:19|20)\d{2}\s*-\s*\d+|\d{5,})/.test(blanked.slice(end, end + 20))) continue;
+    out.push({ kind: "abbr", at, end, value: m[1], paren: parenAt(end) });
+  }
+  return out.sort((a, b) => a.at - b.at);
+}
+
+/**
+ * THE ONE PAIRING. Tokens joined by nothing but glue (RUN_GLUE), kinds alternating, form a run; a
+ * run is paired in order FROM ITS FIRST TOKEN, so the run's first token decides its shape: a run
+ * that opens with a code is name-first ("Oregon Fire Code 2025 Oregon Structural Specialty Code
+ * 2025", "IRC 2021 NEC 2023 IFC 2021"), one that opens with a year is year-first ("· 2023 ORSC ·
+ * 2025 OSSC", "2019 CHICAGO BUILDING CODE 2018 CHICAGO ELECTRICAL CODE") — exactly how the bare
+ * abbreviations were always paired, and the plan's year-first blocks read as before. A run that
+ * opens and closes with the same kind is ambiguous — one token is stray either way ("2023 OREGON
+ * FIRE CODE 2025", "ORSC 2023 OESC 2023 OFC") — so its pairs are WEAK; the stray token reads nothing.
+ */
+function pairCodeTokens(tokens: CodeToken[], blanked: string): Array<{ code: CodeToken; year: CodeToken; weak: boolean }> {
+  const runs: CodeToken[][] = [];
+  for (const t of tokens) {
+    const run = runs[runs.length - 1];
+    const prev = run?.[run.length - 1];
+    if (prev && (prev.kind === "year") !== (t.kind === "year") && RUN_GLUE.test(blanked.slice(prev.end, t.at))) run.push(t);
+    else runs.push([t]);
+  }
+  const pairs: Array<{ code: CodeToken; year: CodeToken; weak: boolean }> = [];
+  for (const run of runs) {
+    if (run.length < 2) continue;
+    const weak = run.length % 2 === 1;
+    for (let i = 0; i + 1 < run.length; i += 2) {
+      const [a, b] = [run[i], run[i + 1]];
+      pairs.push({ code: a.kind === "year" ? b : a, year: a.kind === "year" ? a : b, weak });
+    }
+  }
+  return pairs;
+}
+
+const codeBasisKey = (source: string, b: { code: string; edition: string }): string => `${source}|codeBasis|${normCodeToken(b.code)}|${b.edition}`;
+
+function codeBasisItems(text: string): BasisItem[] {
   const items: BasisItem[] = [];
-  const push = (at: number, end: number, rawName: string, edition: string, rawParen: string | undefined, volume?: string): void => {
+  const push = (at: number, end: number, rawName: string, edition: string, parens: string[], tail: string, weak: boolean): void => {
     const name = rawName.replace(/\s+/g, " ").trim().toUpperCase();
-    const paren = (rawParen || "").trim();
-    const parsedBase = parenBase(paren);
-    const code = namedCode(name, parsedBase ? "" : paren, volume ?? part.slice(end, end + 20));
+    const parsedBase = parens.map(parenBase).find((b) => b) ?? null;
+    // A parenthetical that is not a base is the code's own abbreviation: "(ORSC)", "(NEC)".
+    const abbrParen = parens.find((p) => !parenBase(p)) ?? "";
+    const code = namedCode(name, abbrParen, tail);
     // A parenthetical naming the SAME code is its abbreviation, not its base:
     // "RESIDENTIAL CODE OF NEW YORK STATE (2020 RCNYS)".
     const base = parsedBase && parsedBase.baseCode !== code ? parsedBase : null;
@@ -1164,99 +1322,64 @@ function namedItems(part: string): BasisItem[] {
     // printed code name never opens with a preposition, and needs two initials besides CODE.
     if (NAME_STOPWORDS.has(name.split(" ")[0]) || code.length < 2) return;
     if (items.some((i) => at < i.end && end > i.at)) return;
-    items.push({ at, end, entry: { code, edition, name, ...(base ?? {}) } });
+    items.push({ at, end, entry: { code, edition, name, ...(base ?? {}) }, weak, abbreviation: false });
   };
   let m: RegExpExecArray | null;
-  const yearFirst = new RegExp(NAMED_CODE.source, "g");
-  while ((m = yearFirst.exec(part))) {
+  const ordinal = new RegExp(NAMED_CODE_ORDINAL.source, "g");
+  while ((m = ordinal.exec(text))) push(m.index, m.index + m[0].length, m[1], m[3], [], m[2], false);
+  const header = new RegExp(CODE_BASIS_HEADER.source, "gi");
+  const windows: Array<[number, number]> = [];
+  while ((m = header.exec(text))) windows.push([m.index + m[0].length, Math.min(text.length, m.index + m[0].length + 520)]);
+  const tokens = codeTokens(text, windows, items.map((i) => [i.at, i.end]));
+  for (const { code, year, weak } of pairCodeTokens(tokens, blankParentheticals(text))) {
+    const last = code.at > year.at ? code : year;
+    const parens = [...new Set([code.paren, last.paren].filter((p): p is string => !!p))];
+    const parenEnd = last.paren ? last.end + (PAREN_AFTER.exec(text.slice(last.end, last.end + 56))?.[0].length ?? 0) : last.end;
+    const at = Math.min(code.at, year.at);
+    const end = Math.max(code.end, year.end, parenEnd);
+    if (code.kind === "abbr") {
+      const base = parens.map(parenBase).find((b) => b) ?? null;
+      if (!items.some((i) => at < i.end && end > i.at)) items.push({ at, end, entry: { code: normCodeToken(code.value), edition: year.value, ...(base ?? {}) }, weak, abbreviation: true });
+      continue;
+    }
     // "2021 INTERNATIONAL RESIDENTIAL CODE OF THE STATE OF COLORADO" is the IRC; only a name that is
     // not a known code WITHOUT its state tail takes the tail ("RESIDENTIAL CODE OF NEW YORK STATE"
     // is the RCNYS, not a code named "RC").
-    const bare = m[2].replace(/\s+/g, " ").trim().toUpperCase();
-    const bareCode = namedCode(bare, "", part.slice(m.index + m[0].length, m.index + m[0].length + 20));
+    const bareCode = namedCode(code.bare!.replace(/\s+/g, " ").trim().toUpperCase(), "", code.tail!);
     const known = MODEL_CODES.has(bareCode) || bareCode in STATE_CODE_BASE;
-    push(m.index, m.index + m[0].length, known || !m[3] ? m[2] : `${m[2]}${m[3]}`, m[1], m[4]);
+    push(at, end, known ? code.bare! : code.value, year.value, parens, code.tail!, weak);
   }
-  const ordinal = new RegExp(NAMED_CODE_ORDINAL.source, "g");
-  while ((m = ordinal.exec(part))) push(m.index, m.index + m[0].length, m[1], m[3], undefined, m[2]);
-  const nameFirst = new RegExp(NAMED_CODE_EDITION.source, "g");
-  while ((m = nameFirst.exec(part))) push(m.index, m.index + m[0].length, m[1], m[2], m[3]);
-  return items;
+  return items.sort((a, b) => a.at - b.at);
 }
-
-type BasisToken = { kind: "year" | "code"; at: number; end: number; value: string };
 
 /**
- * Bare abbreviations in a code-basis block, READ IN ORDER and PAIRED ONCE: a code and a year
- * side by side (either order) form one entry and are consumed, so one year can never serve two
- * codes. "IRC 2021 NEC 2023 IFC 2021" is exactly those three pairs; "2021 IBC 3) 2018 IRC" is
- * two. A permit-number shape ("BLDC 2024-00012") is not a code and not a year.
+ * Every code-basis entry a text states. A spelled-out name with its year is self-anchoring, so it
+ * is read ANYWHERE: PDF text order often puts the list BEFORE its "GOVERNING CODES:" heading
+ * (measured on the live book). Bare abbreviations ("2021 IBC", "NEC 2020") are read only inside a
+ * code-basis block, and a block is contiguous — once the entries stop, whatever follows is another
+ * note: the labels sheet repeats "NEC: 2020, PER CODE: NEC 690.31" dozens of times, and those are
+ * placard citations, not the design's code basis. `weak` / `sure` collect the reading keys
+ * (codeBasisKey) of the entries read through an ambiguous block and the others.
  */
-function abbreviationItems(block: string, taken: Array<[number, number]>): BasisItem[] {
-  const free = (a: number, b: number): boolean => !taken.some(([x, y]) => a < y && b > x);
-  const tokens: BasisToken[] = [];
-  // Case-sensitive: codes are printed as capitals, and a lower-case word is never one.
-  const re = new RegExp(`\\b(${YEAR})\\b(?!\\s*-\\s*\\d)|\\b([A-Z]{2,6}(?:-R\\b)?)\\b`, "g");
-  let m: RegExpExecArray | null;
-  while ((m = re.exec(block))) {
-    const at = m.index;
-    const end = at + m[0].length;
-    if (!free(at, end)) continue;
-    if (m[1]) {
-      // "2024-00012" is excluded by the lookahead; so is the tail of "00012-2024".
-      if (/\d\s*-\s*$/.test(block.slice(Math.max(0, at - 3), at))) continue;
-      tokens.push({ kind: "year", at, end, value: m[1] });
-    } else if (isCodeToken(m[2])) {
-      // A permit-number prefix: "BLDC 2024-00012", "ELEC# 2024-0031", "BLD 20240012".
-      if (/^\s*[-#:]?\s*(?:(?:19|20)\d{2}\s*-\s*\d+|\d{5,})/.test(block.slice(end))) continue;
-      tokens.push({ kind: "code", at, end, value: m[2] });
-    }
-  }
-  const items: BasisItem[] = [];
-  for (let i = 0; i + 1 < tokens.length;) {
-    const a = tokens[i];
-    const b = tokens[i + 1];
-    if (a.kind === b.kind || !/^\s*[-:]?\s*$/.test(block.slice(a.end, b.at))) { i++; continue; }
-    const code = a.kind === "code" ? a : b;
-    const year = a.kind === "year" ? a : b;
-    let end = b.end;
-    const paren = block.slice(end).match(/^\s*\(\s*([^)]{1,40}?)\s*\)/);
-    const base = paren ? parenBase(paren[1]) : null;
-    if (base && paren) end += paren[0].length;
-    items.push({ at: a.at, end, entry: { code: normCodeToken(code.value), edition: year.value, ...(base ?? {}) } });
-    i += 2;
-    // The tokens inside a consumed "(NEC 2020)" belong to this entry.
-    while (i < tokens.length && tokens[i].at < end) i++;
-  }
-  return items;
-}
-
-function extractCodeBasis(text: string, source: string, out: StatedCodeBasisEntry[]): void {
-  const emit = (part: string, item: BasisItem): void => {
-    out.push({ ...item.entry, source, excerpt: flat(part.slice(item.at, item.end)).slice(0, 90) });
-  };
-  // A spelled-out code name with its year is self-anchoring, so it is read ANYWHERE: PDF text
-  // order often puts the list BEFORE its "GOVERNING CODES:" heading (measured on the live book).
-  for (const item of namedItems(text)) emit(text, item);
-
-  // Bare abbreviations ("2021 IBC", "NEC 2020") are only read inside a code-basis block —
-  // the labels sheet repeats "NEC: 2020, PER CODE: NEC 690.31" dozens of times, and those are
-  // placard citations, not the design's code basis.
-  let h: RegExpExecArray | null;
+function extractCodeBasis(text: string, source: string, out: StatedCodeBasisEntry[], weak: Set<string>, sure: Set<string>): void {
+  const items = codeBasisItems(text);
+  const admitted = new Set<BasisItem>();
   const header = new RegExp(CODE_BASIS_HEADER.source, "gi");
+  let h: RegExpExecArray | null;
   while ((h = header.exec(text))) {
-    const blockStart = h.index + h[0].length;
-    const block = text.slice(blockStart, blockStart + 520);
-    const items: BasisItem[] = namedItems(block);
-    items.push(...abbreviationItems(block, items.map((i) => [i.at, i.end])));
-    items.sort((a, b) => a.at - b.at);
-    // A block is contiguous: once the entries stop, whatever follows is another note.
-    let lastEnd = 0;
+    const start = h.index + h[0].length;
+    let lastEnd = start;
     for (const item of items) {
-      if (item.at - lastEnd > 120) break;
+      if (item.at < start) continue;
+      if (item.end > start + 520 || item.at - lastEnd > 120) break;
       lastEnd = item.end;
-      emit(block, item);
+      admitted.add(item);
     }
+  }
+  for (const item of items) {
+    if (item.abbreviation && !admitted.has(item)) continue;
+    out.push({ ...item.entry, source, excerpt: flat(text.slice(item.at, item.end)).slice(0, 90) });
+    (item.weak ? weak : sure).add(codeBasisKey(source, item.entry));
   }
 }
 
@@ -1323,6 +1446,10 @@ function extractFromSources(project: ProjectRecord, sources: ReadSource[]): Stat
   const codeBasis: StatedCodeBasisEntry[] = [];
   const sure = new Set<string>();
   const unsure = new Set<string>();
+  // Code-basis entries read through an ambiguous block (codeBasisKey) — weak unless some reading
+  // of the same entry in the same source was sure.
+  const weakBasis = new Set<string>();
+  const sureBasis = new Set<string>();
   extractParsedFields(project, criteria);
   for (const source of sources) {
     const found: StatedDesignCriterion[] = [];
@@ -1340,12 +1467,13 @@ function extractFromSources(project: ProjectRecord, sources: ReadSource[]): Stat
     // The code basis is read from the package's own sheets only; a narrative summary
     // paraphrasing "2021 IRC" is not the plan's GOVERNING CODES block.
     if (source.sheet) {
-      extractCodeBasis(source.text, source.label, codeBasis);
+      extractCodeBasis(source.text, source.label, codeBasis, weakBasis, sureBasis);
     }
   }
   const seenBasis = new Set<string>();
   // Two sources under one label: a value one of them read surely is sure.
   for (const k of sure) unsure.delete(k);
+  for (const k of weakBasis) if (!sureBasis.has(k)) unsure.add(k);
   return {
     unsure,
     documentTextRead: sources.some((s) => s.sheet),
@@ -2429,8 +2557,12 @@ export function residentialCodeRef(ctx: EffectiveCodeContext, section: string, t
   return ref(ctx, section, title, note);
 }
 
-function describeValues(entries: Array<{ value: string | number; sources: Set<string> }>, unit: string): string {
-  return entries.map((e) => `${e.value}${unit} in ${[...e.sources].join(", ")}`).join("; ");
+/** The note a WEAK reading carries wherever it is named — one vocabulary (describeGroundReadings). */
+const WEAK_READING_NOTE = "[only one way of reading an unseparated load list]";
+function describeValues(entries: Array<{ value: string | number; sources: Set<string>; weakSources?: Set<string> }>, unit: string): string {
+  return entries
+    .map((e) => `${e.value}${unit} in ${[...e.sources].map((s) => (e.weakSources?.has(s) ? `${s} ${WEAK_READING_NOTE}` : s)).join(", ")}`)
+    .join("; ");
 }
 
 // A MODEL CODE'S SPELLED-OUT NAME anywhere in a title ("… adoption of the 2021 International
@@ -2484,7 +2616,8 @@ function profileCodeEntry(a: { code: string; edition: string; title?: string; no
   let label = `${a.code} ${a.edition}`;
   if (MODEL_CODES.has(code) && a.title) {
     const model = code;
-    const named = namedItems(a.title)
+    const named = codeBasisItems(a.title)
+      .filter((i) => !i.abbreviation)
       .map((i) => i.entry)
       .find((e) => !MODEL_CODES.has(e.code) && e.edition === edition && (baseModelCode(e.code) ?? model) === model);
     // No year in the title, but a state code's abbreviation: "Oregon Mechanical Specialty Code (OMSC)".
@@ -2736,46 +2869,71 @@ export function evaluateDesignCriteriaFindings(
   const conflictLines: string[] = [];
   const conflictItems: StatedDesignCriterion[] = [];
   let conflictBlocker = false;
+  // Every group that disagrees rests on a WEAK reading alone: with the weak readings set aside, the
+  // documents state one value. Such a conflict is a callout naming the weak reading (#312).
+  let weakOnlyGroups = 0;
+  const weakConflictSources = new Set<string>();
   for (const [group, items] of groups) {
-    const byValue = new Map<string, { value: string | number; sources: Set<string>; docSources: Set<string> }>();
+    const byValue = new Map<string, { value: string | number; sources: Set<string>; docSources: Set<string>; weakSources: Set<string> }>();
+    // Each document's SURE readings of the quantity.
+    const docValues = new Map<string, Set<string>>();
     for (const c of items) {
       const key = String(c.value);
-      const e = byValue.get(key) ?? { value: c.value, sources: new Set<string>(), docSources: new Set<string>() };
+      const e = byValue.get(key) ?? { value: c.value, sources: new Set<string>(), docSources: new Set<string>(), weakSources: new Set<string>() };
       e.sources.add(c.source);
       // A document counts toward a two-document BLOCKER only with a value it states SURELY: a value
       // only one pass of an ambiguous load list gave is not that document's statement.
-      if (!c.derived && !stated.unsure.has(readingKey(c))) e.docSources.add(c.source);
+      if (!c.derived && !stated.unsure.has(readingKey(c))) {
+        e.docSources.add(c.source);
+        const v = docValues.get(c.source) ?? new Set<string>();
+        v.add(key);
+        docValues.set(c.source, v);
+      } else if (!c.derived) {
+        e.weakSources.add(c.source);
+      }
       byValue.set(key, e);
     }
     if (byValue.size < 2) continue;
     const entries = [...byValue.values()];
-    // Blocker only when two DIFFERENT documents each explicitly state a different value.
-    // The parser's fields and narrative summaries are readings, not documents: a disagreement
-    // that needs one of them to exist is a warning (and may be the parser's mistake, or the
-    // parser describing ONE document's own inconsistency, rather than two documents'.)
-    for (let i = 0; i < entries.length && !conflictBlocker; i++) {
-      for (let j = 0; j < entries.length && !conflictBlocker; j++) {
-        if (i === j) continue;
-        for (const s1 of entries[i].docSources) {
-          if ([...entries[j].docSources].some((s2) => !sameDocument(s1, s2))) { conflictBlocker = true; break; }
-        }
-      }
+    // BLOCKER ONLY WHEN EVERY READING DISAGREES. A document STATES the quantity only when every sure
+    // reading of it in that document is one value; the blocker needs two such documents (not the
+    // same pages) stating different values. A document that states both values, or states one only
+    // through a weak reading, does not disagree with the other — it is unsure, and an uncertain
+    // reading must not block. The parser's fields and narrative summaries are readings, not
+    // documents: a disagreement that needs one of them to exist is a warning (and may be the
+    // parser's mistake, or the parser describing ONE document's own inconsistency, rather than two
+    // documents'.)
+    const single = [...docValues].filter(([, v]) => v.size === 1).map(([source, v]) => ({ source, value: [...v][0] }));
+    if (single.some((a) => single.some((b) => a.value !== b.value && !sameDocument(a.source, b.source)))) conflictBlocker = true;
+    const sureValues = entries.filter((e) => e.docSources.size);
+    const weakOnly = entries.filter((e) => !e.docSources.size && e.weakSources.size);
+    const derivedOnly = entries.filter((e) => !e.docSources.size && !e.weakSources.size);
+    if (sureValues.length <= 1 && weakOnly.length && !derivedOnly.length) {
+      weakOnlyGroups++;
+      for (const e of weakOnly) for (const s of e.weakSources) weakConflictSources.add(s);
     }
+    // A weak reading is named only where no sure reading of the same document states the value.
+    for (const e of entries) for (const s of e.docSources) e.weakSources.delete(s);
     const criterion = items[0].criterion;
     conflictLines.push(`${CRITERION_LABEL[group] ?? group}: ${describeValues(entries, unitFor(criterion))}`);
     conflictItems.push(...items);
   }
   if (conflictLines.length) {
     const sources = [...new Set(conflictItems.map((c) => c.source))];
+    const weakOnly = !conflictBlocker && weakOnlyGroups === conflictLines.length;
     out.push({
       id: "city.struct.design-criteria-conflict",
-      severity: conflictBlocker ? "blocker" : "warning",
+      severity: conflictBlocker ? "blocker" : weakOnly ? "callout" : "warning",
       category: "structural",
       title: "Design criteria conflict between documents",
       message: `The package states different values for the same design criterion. ${conflictLines.join(". ")}.`
-        + (conflictBlocker ? "" : " (No two documents disagree here: the values come from one document, or one side is the parser's reading of the package — verify before treating it as a document conflict.)"),
+        + (conflictBlocker ? ""
+          : weakOnly ? ` (The disagreeing value rests on a weak reading of ${[...weakConflictSources].join(", ")} alone — the extractor could read that document's load list more than one way; the documents' sure readings agree. Verify that document before treating this as a conflict.)`
+            : " (No two documents disagree here: the values come from one document, one document states more than one value, or one side is the parser's reading of the package — verify before treating it as a document conflict.)"),
       cityFeedback: "The structural design criteria conflict between the calculations and the submitted plan set. Ensure the same design criteria (wind speed and its basis, exposure category, ground snow load, risk category) appear on all documents. A later document stating that it supersedes another does not reconcile the package — revise the superseded sheets.",
-      designTeamAction: `Reconcile the design criteria across ${sources.join(", ")}: pick the governing values (at least the jurisdiction's minimums), then reissue every sheet and calculation that states them.`,
+      designTeamAction: weakOnly
+        ? `Open ${[...weakConflictSources].join(", ")} and confirm which value its load list states; if it really differs from the rest of the package, reconcile the design criteria across ${sources.join(", ")} and reissue the sheets that state them.`
+        : `Reconcile the design criteria across ${sources.join(", ")}: pick the governing values (at least the jurisdiction's minimums), then reissue every sheet and calculation that states them.`,
       evidenceNeeded: ["Revised plan-set structural notes with the governing design criteria", "Calculation / engineer's letter restating the same criteria", ...conflictLines].slice(0, 8),
       codeReferences: [ref(ctx, "R106.1", "Construction documents — information on construction documents", "Construction documents must be consistent; the examiner reviews the package as submitted."), ref(ctx, "Table R301.2", "Climatic and geographic design criteria", "Wind speed, exposure and ground snow load are design criteria the whole package must state consistently.")],
       installerCallout: true,
@@ -3098,23 +3256,39 @@ export function evaluateDesignCriteriaFindings(
     // `graceVia`: the state-code pair a BASE line belongs to. The profile records only the new
     // edition's base, so a plan's base on the previous state edition is in grace exactly when its
     // state-code pair is.
-    const report = (key: string, line: string, compared: { code: string; edition: string }, graceVia?: { code: string; edition: string }): void => {
+    // Lines that rest on a WEAK reading (#312): the entry was read through an ambiguous block, or
+    // another reading of the same code in the package matches the profile — not every reading
+    // disagrees. These never block; they land as a callout naming the weak reading.
+    const weakLines = new Set<string>();
+    const report = (key: string, line: string, compared: { code: string; edition: string }, graceVia?: { code: string; edition: string }, weakWhy?: string): void => {
       if (seen.has(key)) return;
       seen.add(key);
       const due = upcomingFor(compared);
       const grace = due ? null : graceFor(compared) ?? (graceVia ? graceFor(graceVia) : null);
+      const base = weakWhy ? `${line} — ${weakWhy}` : line;
       const text = due
-        ? `${line} — the plan's edition is the upcoming ${due.code} ${due.edition}, anticipated effective ${due.anticipatedDate}`
-        : grace ? `${line} — still allowed during the phase-in: ${grace.note.replace(/\.$/, "")}` : line;
+        ? `${base} — the plan's edition is the upcoming ${due.code} ${due.edition}, anticipated effective ${due.anticipatedDate}`
+        : grace ? `${base} — still allowed during the phase-in: ${grace.note.replace(/\.$/, "")}` : base;
       if (due) softened.add(text);
       if (grace) inGrace.add(text);
+      if (weakWhy) weakLines.add(text);
       lines.push(text);
+    };
+    /** Why a line cannot block: the reading is weak, or another sheet's reading of the code agrees with the profile. */
+    const weakWhyFor = (b: StatedCodeBasisEntry, code: string, agreeing: StatedCodeBasisEntry[]): string | undefined => {
+      const others = [...new Set(agreeing.filter((o) => o !== b).map((o) => `${o.source} (${o.code} ${o.edition})`))];
+      if (stated.unsure.has(codeBasisKey(b.source, b))) {
+        return `a weak reading: the ${b.source}'s block reads year-first or name-then-edition either way${others.length ? `, and ${others.join(", ")} matches the profile` : ""} — verify the ${b.source}`;
+      }
+      if (others.length) return `not every reading disagrees: ${others.join(", ")} matches the profile — verify which edition the package means`;
+      return undefined;
     };
     for (const b of stated.codeBasis) {
       const code = normCodeToken(b.code);
       const same = profileEntries.filter((a) => a.code === code);
       if (same.length && !same.some((a) => a.edition === b.edition)) {
-        report(`${code}|${b.edition}`, `plan states ${b.code} ${b.edition} (${b.source}) — profile records ${same.map((a) => a.label).join(" / ")}`, b);
+        const agreeing = stated.codeBasis.filter((o) => normCodeToken(o.code) === code && same.some((a) => a.edition === o.edition));
+        report(`${code}|${b.edition}`, `plan states ${b.code} ${b.edition} (${b.source}) — profile records ${same.map((a) => a.label).join(" / ")}`, b, undefined, weakWhyFor(b, code, agreeing));
       }
       // The plan's printed base, compared with a base the profile states for that model code.
       if (b.baseCode && b.baseEdition) {
@@ -3126,7 +3300,9 @@ export function evaluateDesignCriteriaFindings(
             ...profileEntries.filter((a) => a.base?.code === model).map((a) => ({ edition: a.base!.edition, label: `${a.label} (based on ${model} ${a.base!.edition})` })),
           ];
           if (recorded.length && !recorded.some((r) => r.edition === b.baseEdition)) {
-            report(`${code}|${b.edition}|${model}|${b.baseEdition}`, `plan states ${b.code} ${b.edition} based on ${model} ${b.baseEdition} (${b.source}) — profile records ${recorded.map((r) => r.label).join(" / ")}`, { code: model, edition: b.baseEdition }, b);
+            const agreeing = stated.codeBasis.filter((o) => (normCodeToken(o.code) === model && recorded.some((r) => r.edition === o.edition))
+              || (o.baseCode && normCodeToken(o.baseCode) === model && recorded.some((r) => r.edition === o.baseEdition)));
+            report(`${code}|${b.edition}|${model}|${b.baseEdition}`, `plan states ${b.code} ${b.edition} based on ${model} ${b.baseEdition} (${b.source}) — profile records ${recorded.map((r) => r.label).join(" / ")}`, { code: model, edition: b.baseEdition }, b, weakWhyFor(b, model, agreeing));
           }
         }
       }
@@ -3135,7 +3311,8 @@ export function evaluateDesignCriteriaFindings(
       if (!same.length && MODEL_CODES.has(code)) {
         const via = profileEntries.filter((a) => a.base?.code === code);
         if (via.length && !via.some((a) => a.base!.edition === b.edition)) {
-          report(`${code}|${b.edition}`, `plan states ${b.code} ${b.edition} (${b.source}) — profile records ${via.map((a) => `${a.label} (based on ${code} ${a.base!.edition})`).join(" / ")}`, b);
+          const agreeing = stated.codeBasis.filter((o) => normCodeToken(o.code) === code && via.some((a) => a.base!.edition === o.edition));
+          report(`${code}|${b.edition}`, `plan states ${b.code} ${b.edition} (${b.source}) — profile records ${via.map((a) => `${a.label} (based on ${code} ${a.base!.edition})`).join(" / ")}`, b, undefined, weakWhyFor(b, code, agreeing));
         }
       }
     }
@@ -3143,12 +3320,15 @@ export function evaluateDesignCriteriaFindings(
       // A VERIFIED edition is the jurisdiction's code: a plan on another edition is not approvable
       // as drawn. Only a seeded row stays a warning, and only an upcoming edition softens it. A
       // plan wholly inside a recorded phase-in is no mismatch at all: a callout naming the date.
-      // Softening only ever lowers severity (rule 3): one line outside both still blocks.
-      const blocks = ctx.verified && lines.some((l) => !softened.has(l) && !inGrace.has(l));
+      // A line resting on a weak reading never blocks either (#312): when every line is weak (or
+      // softened, or in grace) the finding is a callout naming the weak reading.
+      // Softening only ever lowers severity (rule 3): one line outside all three still blocks.
+      const blocks = ctx.verified && lines.some((l) => !softened.has(l) && !inGrace.has(l) && !weakLines.has(l));
       const graceOnly = inGrace.size === lines.length;
+      const weakOnly = !graceOnly && weakLines.size > 0 && lines.every((l) => weakLines.has(l) || inGrace.has(l) || softened.has(l));
       out.push({
         id: "city.code.basis-mismatch",
-        severity: blocks ? "blocker" : graceOnly ? "callout" : "warning",
+        severity: blocks ? "blocker" : graceOnly || weakOnly ? "callout" : "warning",
         category: "plan_set",
         title: graceOnly
           ? "Plan's code basis is the previous edition — still allowed during the phase-in"
@@ -3157,6 +3337,8 @@ export function evaluateDesignCriteriaFindings(
           ? "The adopted editions are verified — the plan's governing-codes block must state them."
           : graceOnly
             ? "The jurisdiction still accepts the previous edition until the mandatory date — a submittal on or after that date must state the new edition."
+            : weakOnly
+              ? "A reading the extractor could not anchor surely, or one that another sheet of the package contradicts, never blocks — verify the named document before asking for a change."
             : softened.size === lines.length
               ? "The plan anticipates the upcoming edition — confirm which edition the jurisdiction will review under on the submittal date."
               : softened.size + inGrace.size === lines.length
@@ -3177,7 +3359,7 @@ export function evaluateDesignCriteriaFindings(
           .filter((code) => profileEntries.some((a) => a.code === normCodeToken(code)))
           .slice(0, 4)
           .map((code) => ctx.citationFor(code, "Adopted edition", `${code} as adopted by ${who}`)),
-        installerCallout: ctx.verified && !graceOnly,
+        installerCallout: ctx.verified && !graceOnly && !weakOnly,
         evidenceStatus: "verified",
         evidenceFound: stated.codeBasis.slice(0, 12).map((b) => ({
           kind: "source_excerpt" as const,
