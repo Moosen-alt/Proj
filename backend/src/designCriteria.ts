@@ -1202,9 +1202,10 @@ const NAME_WORD = /^[A-Z](?:[A-Za-z.'-]*[A-Za-z])?$/;
 /** The parenthetical printed directly after a token — after its "Edition" when there is one:
  *  "(NEC 2020)", "(ORSC)", "2025 Edition (2024 IBC)". */
 const PAREN_AFTER = /^\s*,?\s*(?:Edition|EDITION|edition)?\s*\(\s*([^)]{1,40}?)\s*\)/;
-/** What may sit between two tokens of one run: space, a bullet, a comma, a list marker, "Edition",
- *  a volume word, a blanked parenthetical. A word of prose or of another field ends the run. */
-const RUN_GLUE = /^(?:\s|[,;:•·▪●■◦*/&]|[-–—](?!\s*\d)|\(\s*[a-z0-9]{1,2}\s*\)|\b\d{1,2}[.)](?=\s)|\b(?:Edition|EDITION|edition|and|AND|the|THE|of|OF|RESIDENTIAL|BUILDING|Residential|Building)\b)*$/;
+/** What may sit between two tokens of one run: space, a bullet, a comma, a dash ("IRC-2021"), a
+ *  list marker, "Edition", a volume word, a blanked parenthetical. A word of prose or of another
+ *  field ends the run. (A range's second year is no token — codeTokens drops it — so a dash is glue.) */
+const RUN_GLUE = /^(?:\s|[,;:•·▪●■◦*/&\-–—]|\(\s*[a-z0-9]{1,2}\s*\)|\b\d{1,2}[.)](?=\s)|\b(?:Edition|EDITION|edition|and|AND|the|THE|of|OF|RESIDENTIAL|BUILDING|Residential|Building)\b)*$/;
 
 type CodeToken = {
   kind: "year" | "name" | "abbr";
@@ -1253,8 +1254,9 @@ function codeTokens(text: string, windows: Array<[number, number]>, taken: Array
   while ((m = years.exec(blanked))) {
     const at = m.index;
     const end = at + m[0].length;
-    // A date ("06/03/2026"), a range or a permit number ("2024-00012", "00012-2024", "7-2020").
-    if (/[/.\-\d]$|\d\s*-\s*$/.test(blanked.slice(Math.max(0, at - 4), at))) continue;
+    // A date ("06/03/2026"), a range or a permit number ("2024-00012", "00012-2024", "7-2020") —
+    // a dash after a LETTER keeps the year ("IRC-2021").
+    if (/[/.\d]$|\d\s*-\s*$/.test(blanked.slice(Math.max(0, at - 4), at))) continue;
     if (/^\s*-\s*\d/.test(blanked.slice(end, end + 4))) continue;
     if (!free(at, end)) continue;
     out.push({ kind: "year", at, end, value: m[1], paren: parenAt(end) });
@@ -1275,11 +1277,13 @@ function codeTokens(text: string, windows: Array<[number, number]>, taken: Array
 
 /**
  * THE ONE PAIRING. Tokens joined by nothing but glue (RUN_GLUE), kinds alternating, form a run; a
- * run is paired in order from its first token. Name-first needs positive evidence — the run opens
- * with a code AND closes with a year ("Oregon Fire Code 2025 Oregon Structural Specialty Code
- * 2025", "IRC 2021 NEC 2023 IFC 2021"); every other run reads year-first ("· 2023 ORSC · 2025 OSSC",
- * "2019 CHICAGO BUILDING CODE 2018 CHICAGO ELECTRICAL CODE"). A run that opens and closes with the
- * same kind is ambiguous — one token is stray either way — so its pairs are WEAK.
+ * run is paired in order FROM ITS FIRST TOKEN, so the run's first token decides its shape: a run
+ * that opens with a code is name-first ("Oregon Fire Code 2025 Oregon Structural Specialty Code
+ * 2025", "IRC 2021 NEC 2023 IFC 2021"), one that opens with a year is year-first ("· 2023 ORSC ·
+ * 2025 OSSC", "2019 CHICAGO BUILDING CODE 2018 CHICAGO ELECTRICAL CODE") — exactly how the bare
+ * abbreviations were always paired, and the plan's year-first blocks read as before. A run that
+ * opens and closes with the same kind is ambiguous — one token is stray either way ("2023 OREGON
+ * FIRE CODE 2025", "ORSC 2023 OESC 2023 OFC") — so its pairs are WEAK; the stray token reads nothing.
  */
 function pairCodeTokens(tokens: CodeToken[], blanked: string): Array<{ code: CodeToken; year: CodeToken; weak: boolean }> {
   const runs: CodeToken[][] = [];
@@ -1292,12 +1296,8 @@ function pairCodeTokens(tokens: CodeToken[], blanked: string): Array<{ code: Cod
   const pairs: Array<{ code: CodeToken; year: CodeToken; weak: boolean }> = [];
   for (const run of runs) {
     if (run.length < 2) continue;
-    const opensWithCode = run[0].kind !== "year";
-    const nameFirst = opensWithCode && run[run.length - 1].kind === "year";
     const weak = run.length % 2 === 1;
-    // An ambiguous run that opens with a code reads year-first from its second token: its first
-    // name has no year before it.
-    for (let i = opensWithCode && !nameFirst ? 1 : 0; i + 1 < run.length; i += 2) {
+    for (let i = 0; i + 1 < run.length; i += 2) {
       const [a, b] = [run[i], run[i + 1]];
       pairs.push({ code: a.kind === "year" ? b : a, year: a.kind === "year" ? a : b, weak });
     }

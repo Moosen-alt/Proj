@@ -138,6 +138,14 @@ check("MUST-EXCLUDE: a 'CODE:' heading never opens a run — a year-first block 
   assert.deepEqual(codes("GOVERNING CODES: 2019 CHICAGO BUILDING CODE 2018 CHICAGO ELECTRICAL CODE"), ["CBC 2019", "CEC 2018"]);
 });
 
+check("MUST-PASS: the shapes the abbreviation reader always paired still read — a dash or a colon between a code and its year, and a cut-off run keeps its first pairs", () => {
+  assert.deepEqual(codes("GOVERNING CODES: IRC-2021, NEC-2020"), ["IRC 2021", "NEC 2020"]);
+  assert.deepEqual(codes("GOVERNING CODES: NEC: 2020, IRC: 2021"), ["IRC 2021", "NEC 2020"]);
+  // Opens with a code, closes with a code: the first pairs stand (weak), the yearless OFC reads nothing.
+  assert.deepEqual(codes("CODES: ORSC 2023 OESC 2023 OFC"), ["OESC 2023", "ORSC 2023"]);
+  assert.deepEqual(codes("APPLICABLE CODES: NFPA 70-2020"), []);
+});
+
 check("MUST-PASS: verified OR profile + year-first plan + name-first letter -> no basis-mismatch (the letter agrees with the profile)", () => {
   const p = project({ planSetExtractedText: `${PLAN_CODES}\n${LETTER_CODES}` });
   const f = get(findings(p, VERIFIED_OR, [{ label: "Plan set", text: PLAN_CODES }, { label: "Structural letter", text: LETTER_CODES }]), BASIS);
