@@ -208,6 +208,100 @@ check("MUST-PASS: a document that states BOTH values does not disagree with the 
   assert.match(f!.message, /one document states more than one value/);
 });
 
+// ---------------------------------------------------------------------------------------
+// 4. Follow-up to #313 (#314): three governing-codes shapes the one pairing read worse than the
+// readers before it. Each row is the issue's text with "GOVERNING CODES:" in front, and reads
+// what it read before #313: the same names, the same editions, and SURE (a mismatch through it
+// blocks against a verified profile).
+// ---------------------------------------------------------------------------------------
+console.log("4. a code name keeps its stopwords and its title colon, and a yearless name takes no year");
+
+const GOV = (s: string): string => `GOVERNING CODES: ${s}`;
+/** "<code> <edition> sure|weak" per entry read: each code is checked alone against a VERIFIED
+ *  profile recording it at another edition, where a sure reading blocks and a weak one is a callout. */
+const readings = (text: string): string[] => read(text).codeBasis.map((b) => {
+  const f = get(findings(project({}), { ...VERIFIED_OR, adoptedCodes: [{ code: b.code, edition: "1999" }] }, [{ label: "Structural letter", text }]), BASIS);
+  return `${b.code} ${b.edition} ${f?.severity === "blocker" ? "sure" : "weak"}`;
+}).sort();
+
+// Table 1: a stopword inside the name ("CITY OF", "TOWN OF", "STATE OF", "POOL AND SPA").
+const STOPWORD_ROWS: Array<[string, string[]]> = [
+  ["2023 CITY OF LOS ANGELES BUILDING CODE 2020 CITY OF LOS ANGELES ELECTRICAL CODE", ["CLABC 2023 sure", "CLAEC 2020 sure"]],
+  ["· 2021 TOWN OF TESTPORT BUILDING CODE · 2020 NATIONAL ELECTRICAL CODE", ["NEC 2020 sure", "TTBC 2021 sure"]],
+  ["2021 INTERNATIONAL RESIDENTIAL CODE 2021 INTERNATIONAL BUILDING CODE 2021 INTERNATIONAL SWIMMING POOL AND SPA CODE 2020 NATIONAL ELECTRICAL CODE 2021 INTERNATIONAL FIRE CODE",
+    ["IBC 2021 sure", "IFC 2021 sure", "IRC 2021 sure", "ISPSC 2021 sure", "NEC 2020 sure"]],
+  ["2021 STATE OF WASHINGTON RESIDENTIAL CODE 2020 NATIONAL ELECTRICAL CODE", ["NEC 2020 sure", "SWRC 2021 sure"]],
+  // The same names printed in title case.
+  ["2023 City of Los Angeles Building Code 2020 City of Los Angeles Electrical Code", ["CLABC 2023 sure", "CLAEC 2020 sure"]],
+];
+// Table 2: a title whose CODE is followed by a colon.
+const COLON_ROWS: Array<[string, string[]]> = [
+  ["2018 NORTH CAROLINA STATE BUILDING CODE: RESIDENTIAL CODE", ["NCSBC 2018 sure"]],
+  ["2021 INTERNATIONAL RESIDENTIAL CODE: SECTION R324 2017 NATIONAL ELECTRICAL CODE: ARTICLE 690", ["IRC 2021 sure", "NEC 2017 sure"]],
+  ["2021 INTERNATIONAL RESIDENTIAL CODE: SECTION R324", ["IRC 2021 sure"]],
+];
+// Table 3: a name with no year of its own (the first row has no header).
+const YEARLESS_ROWS: Array<[string, string[]]> = [
+  ["ALL WORK PER THE BUILDING CODE 2020 NATIONAL ELECTRICAL CODE", ["NEC 2020 sure"]],
+  [GOV("LOCAL FIRE CODE 2021 IRC 2020 NEC"), ["IRC 2021 sure", "NEC 2020 sure"]],
+];
+
+for (const [text, want] of STOPWORD_ROWS) {
+  check(`MUST-PASS: a stopword inside a year-first name keeps the name whole — "${text.slice(0, 60)}…" reads ${want.join(", ")}`, () => {
+    assert.deepEqual(readings(GOV(text)), want);
+  });
+}
+
+check("MUST-PASS: a correct LA package against a verified LABC 2023 raises no basis-mismatch (it was a BLOCKER: \"plan states LABC 2020\")", () => {
+  const f = get(findings(project({}), { ...VERIFIED_OR, adoptedCodes: [{ code: "LABC", edition: "2023" }] }, [{ label: "Plan set", text: GOV(STOPWORD_ROWS[0][0]) }]), BASIS);
+  assert.equal(f, undefined, f?.message);
+});
+
+check("MUST-PASS: the five-code list against a verified IFC 2018 still blocks on the plan's IFC 2021 (the IFC was dropped)", () => {
+  const f = get(findings(project({}), { ...VERIFIED_OR, adoptedCodes: [{ code: "IFC", edition: "2018" }] }, [{ label: "Plan set", text: GOV(STOPWORD_ROWS[2][0]) }]), BASIS);
+  assert.equal(f?.severity, "blocker", f?.message ?? "no finding");
+  assert.match(f!.message, /IFC 2021/);
+});
+
+for (const [text, want] of COLON_ROWS) {
+  check(`MUST-PASS: a title whose CODE is followed by a colon reads — "${text.slice(0, 60)}…" reads ${want.join(", ")}`, () => {
+    assert.deepEqual(readings(GOV(text)), want);
+  });
+}
+
+check("MUST-PASS: 'CODE: SECTION' / 'CODE: ARTICLE' against a verified NEC 2020 blocks on the plan's NEC 2017 (a false negative before)", () => {
+  const f = get(findings(project({}), { ...VERIFIED_OR, adoptedCodes: [{ code: "NEC", edition: "2020" }] }, [{ label: "Plan set", text: GOV(COLON_ROWS[1][0]) }]), BASIS);
+  assert.equal(f?.severity, "blocker", f?.message ?? "no finding");
+});
+
+for (const [text, want] of YEARLESS_ROWS) {
+  check(`MUST-PASS: a name with no year of its own takes no other item's year — "${text}" reads ${want.join(", ")}`, () => {
+    assert.deepEqual(readings(text), want);
+  });
+}
+
+check("MUST-PASS: all-caps prose before a name-first name is not part of it — 'SHALL CONFORM TO CHICAGO ELECTRICAL CODE 2018' is CEC 2018", () => {
+  assert.deepEqual(codes("SHALL CONFORM TO CHICAGO ELECTRICAL CODE 2018"), ["CEC 2018"]);
+  assert.deepEqual(codes(GOV("ALL WORK SHALL CONFORM TO CHICAGO ELECTRICAL CODE 2018")), ["CEC 2018"]);
+});
+
+check("MUST-EXCLUDE: the heading, placard and conjunction shapes keep reading as #313 made them", () => {
+  assert.deepEqual(codes("BUILDING CODE: 2023 ORSC 2025 OFC"), ["OFC 2025", "ORSC 2023"]);
+  assert.deepEqual(codes("Design Criteria Code: 2021 WSBC, 2021 WSRC"), ["WSBC 2021", "WSRC 2021"]);
+  assert.deepEqual(codes("ELECTRICAL CODE: NEC 2020 BUILDING CODE: IRC 2021"), ["IRC 2021", "NEC 2020"]);
+  assert.ok(!codes("NEC: 2020 PER CODE: NEC 690.54").some((c) => c.startsWith("PC ")), "no code named PC");
+  // "AND" between two names joins no name: never a code named "ORSCAOSSC".
+  assert.deepEqual(codes(GOV("2023 OREGON RESIDENTIAL SPECIALTY CODE AND OREGON STRUCTURAL SPECIALTY CODE 2023")), ["ORSC 2023", "OSSC 2023"]);
+  assert.deepEqual(codes("OREGON RESIDENTIAL SPECIALTY CODE AND OREGON STRUCTURAL SPECIALTY CODE 2023"), ["OSSC 2023"]);
+  assert.deepEqual(codes(GOV("2023 ORSC AND 2025 OSSC")), ["ORSC 2023", "OSSC 2025"]);
+  assert.deepEqual(codes(GOV("2023 EDITION OF THE OREGON RESIDENTIAL SPECIALTY CODE")), ["ORSC 2023"]);
+  assert.deepEqual(codes(GOV("IRC 2021 AND NATIONAL ELECTRICAL CODE 2020")), ["IRC 2021", "NEC 2020"]);
+  // Name-first, the year before the second "CITY OF" is the FIRST code's: both names read as #313 read them.
+  assert.deepEqual(codes(GOV("CITY OF LOS ANGELES BUILDING CODE 2023 CITY OF LOS ANGELES ELECTRICAL CODE 2020")), ["LABC 2023", "LAEC 2020"]);
+  // A cut-off name-first letter still reads its first pairs.
+  assert.deepEqual(codes(GOV("Oregon Fire Code 2025 Oregon Structural Specialty Code 2025 Oregon Electrical Specialty Code")), ["OFC 2025", "OSSC 2025"]);
+});
+
 if (failures) {
   console.error(`\n${failures} letter-reader check(s) FAILED`);
   process.exit(1);
