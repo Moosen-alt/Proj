@@ -18,8 +18,9 @@ import type { Page, Frame, Locator } from "playwright";
 export interface ApplicationEntryMatch {
   /** The visible label of the control we would click. */
   label: string;
-  /** How it was matched, for diagnostics/telemetry. */
-  via: "text" | "href";
+  /** How it was matched, for diagnostics/telemetry. "tile" is a choice card clicked whole,
+   *  labelled by its title (see markChoiceTilesInPage). */
+  via: "text" | "href" | "tile";
   /** The href when the control is a link (absolute or portal-relative). */
   href?: string;
 }
@@ -159,6 +160,205 @@ function entryRank(label: string): number {
   return i < 0 ? ENTRY_PATTERNS.length : i;
 }
 
+// ---------------------------------------------------------------------------
+// CHOICE TILES — a page whose controls are CARDS, not links or buttons.
+//
+// Portland DevHub (live, 2026-10-13) answers "Apply For A Permit" with a column of tiles:
+//
+//   <div class="card-h card-l card">
+//     <div class="card-body">
+//       <div class="card-title">Solar Permit Request</div>
+//       <div class="card-text">… <a onclick="event.stopPropagation()">See more information…</a></div>
+//     </div>
+//     <div class="card-next"><i class="fa fa-chevron-right"></i></div>
+//   </div>
+//
+// The whole card is the control — a click handler bound in script; no onclick attribute, no
+// role, no <button>, no <a> around it. The only anchors inside are information links, which
+// stop propagation. Field discovery collects buttons and links, so it saw 35 controls and no
+// tile; the entry pass found nothing; the planner's one candidate was the information link,
+// which the rule-5 guard rightly refused; and the run died "nothing fillable" standing on a
+// page of plainly labelled choices, telling the operator to record the portal by hand.
+//
+// A tile is recognised by its SHAPE, never by a class name or a host:
+//   - a block container with a short, heading-like TITLE of its own;
+//   - an AFFORDANCE that says "this goes somewhere": a right/forward arrow icon or glyph, a
+//     click handler, a role, or a pointer cursor that STARTS on the tile (cursor inherits, so
+//     the card's body would otherwise qualify as a tile inside the tile);
+//   - no fillable control and no button of its own (those would be the control);
+//   - REPEATED as alike siblings — one card is content, a row of them is a menu;
+//   - its title and affordance are its OWN: a section that holds tiles "has" the first tile's
+//     title and icon, and must not be taken for a tile itself.
+// Its LABEL is its title. The inner information links keep their own labels and stay exactly
+// as off-limits as they were.
+//
+// Never inside page chrome: a chevron-separated step bar is a row of "heading + arrow"
+// siblings — a tile's shape to the letter — and its "Review and Submit" item would reach the
+// review classifier as a button-typed field. The chrome vocabulary is portalSafety's step-bar
+// cut, plus nav/header/footer/menus/tables.
+//
+// Runs INSIDE the page (page.evaluate): self-contained, no module references, and no named
+// inner functions (esbuild's keepNames wraps those in __name, which a raw page lacks — see
+// markActiveScopeInPage). Stamps every tile with a transient data-al-tile key (precedent:
+// data-al-prog, data-al-resultrow) so a caller clicks the element that was scanned, and
+// returns the RAW title: Node turns it into a label in choiceTileLabel, the one place that
+// derivation lives.
+// ---------------------------------------------------------------------------
+
+/** One tile as the in-page scan reports it: its transient key and the title's raw text. */
+export interface ChoiceTileRaw {
+  key: string;
+  title: string;
+}
+
+export function markChoiceTilesInPage(): ChoiceTileRaw[] {
+  for (const prev of Array.from(document.querySelectorAll("[data-al-tile], [data-al-tile-label]"))) {
+    prev.removeAttribute("data-al-tile");
+    prev.removeAttribute("data-al-tile-label");
+  }
+  const TITLE = "h1, h2, h3, h4, h5, h6, [class*='title'], [class*='heading'], [class*='header'], strong, b, dt, legend";
+  const CHROME = "nav, header, footer, table, [role='navigation'], [role='tablist'], [role='menu'], [role='menubar'], "
+    + "[aria-hidden='true'], [aria-label*='step' i], [class*='stepper'], [class*='steps'], [class*='stepNav'], "
+    + "[class*='step-nav'], [class*='step-header'], [class*='progress'], [class*='breadcrumb'], [class*='navbar'], [class*='menu']";
+  const FILLABLE = "input:not([type='hidden']), select, textarea, [contenteditable='true']";
+  const OWN_CONTROL = "button, input[type='button'], input[type='submit'], [role='button']";
+  // Material / icon-font ligatures and bare glyphs that draw a forward arrow.
+  const ICON_LIGATURE = /^(chevron_right|arrow_forward|arrow_forward_ios|arrow_right|arrow_right_alt|navigate_next|keyboard_arrow_right|east|arrow_circle_right|double_arrow|last_page)$/;
+  const ARROW_GLYPH = /^[\s›»→➔➜➝➞❯⟩⇒⟶▶▸►>]+$/;
+  // A class token that names a forward arrow ("fa-chevron-right", "bi-arrow-right-circle",
+  // "card-next", "navigate_next") — and never a down/up/left one (accordion carets, back arrows).
+  const ARROW_TOKEN = /(?:^|[-_])(?:chevron|arrow|caret|angle|triangle)(?:[-_]|$)/i;
+  const NEXT_TOKEN = /(?:^|[-_])(?:next|forward)(?:[-_]|$)/i;
+  const NOT_FORWARD = /(?:^|[-_])(?:down|up|left|back|prev|previous|collapse|expand)(?:[-_]|$)/i;
+
+  const found: Array<{ el: Element; title: string; titleEl: Element; affEl: Element | null }> = [];
+  for (const el of Array.from(document.querySelectorAll("div, li, section, article"))) {
+    if (el.closest(CHROME)) continue;
+    if (el.closest("button")) continue;
+    const r = el.getBoundingClientRect();
+    if (r.width < 80 || r.height < 32) continue;
+    if (el.querySelector(FILLABLE) || el.querySelector(OWN_CONTROL)) continue;
+    const titleEl = el.querySelector(TITLE);
+    if (!titleEl) continue;
+    // A title that IS a link already has its control — the link — and a label of its own.
+    const titleLink = titleEl.closest("a, button");
+    if (titleLink && el.contains(titleLink)) continue;
+    const title = (titleEl.textContent || "").replace(/\s+/g, " ").trim();
+    if (title.length < 3 || title.length > 120) continue;
+
+    let affordance = el.hasAttribute("onclick") || el.hasAttribute("data-href") || el.hasAttribute("data-url")
+      || /^(button|link|option|menuitem)$/.test(el.getAttribute("role") || "")
+      || (el.hasAttribute("tabindex") && Number(el.getAttribute("tabindex")) >= 0);
+    if (!affordance) {
+      const parent = el.parentElement;
+      affordance = window.getComputedStyle(el).cursor === "pointer"
+        && !(parent && window.getComputedStyle(parent).cursor === "pointer");
+    }
+    let affEl: Element | null = null;
+    if (!affordance) {
+      for (const d of Array.from(el.querySelectorAll("*"))) {
+        // An inner link's own icon is not the tile's affordance.
+        const inner = d.closest("a, button");
+        if (inner && el.contains(inner)) continue;
+        let hit = false;
+        for (const tok of String(d.getAttribute("class") || "").split(/\s+/)) {
+          if (!tok || NOT_FORWARD.test(tok)) continue;
+          if (ARROW_TOKEN.test(tok) || NEXT_TOKEN.test(tok)) { hit = true; break; }
+        }
+        if (!hit && d.children.length === 0) {
+          const txt = (d.textContent || "").trim();
+          if (txt && (ICON_LIGATURE.test(txt) || ARROW_GLYPH.test(txt))) hit = true;
+        }
+        if (hit) { affEl = d; break; }
+      }
+      affordance = affEl !== null;
+    }
+    if (!affordance) continue;
+    found.push({ el, title, titleEl, affEl });
+  }
+
+  // OWNERSHIP: a candidate whose title or icon lives inside ANOTHER candidate is a wrapper
+  // (the section around the tiles), not a tile.
+  const own = found.filter((c) => !found.some((o) =>
+    o !== c && c.el.contains(o.el) && (o.el.contains(c.titleEl) || (c.affEl !== null && o.el.contains(c.affEl)))));
+
+  // REPETITION: alike siblings under one parent. A lone card is content.
+  const kept: Array<{ el: Element; title: string }> = [];
+  for (const c of own) {
+    const parent = c.el.parentElement;
+    if (!parent) continue;
+    const alike = own.filter((o) => o.el.parentElement === parent && o.el.tagName === c.el.tagName);
+    if (alike.length >= 2) kept.push({ el: c.el, title: c.title });
+  }
+  // Whatever nesting ownership left, the inner element is the one a click lands on.
+  const tiles = kept.filter((c) => !kept.some((o) => o !== c && c.el.contains(o.el)));
+
+  const out: ChoiceTileRaw[] = [];
+  let n = 0;
+  for (const c of tiles) {
+    const key = "t" + String(n++);
+    c.el.setAttribute("data-al-tile", key);
+    out.push({ key, title: c.title });
+  }
+  return out;
+}
+
+/**
+ * THE LABEL OF A CHOICE TILE, from its title's raw text — the one place this is decided.
+ * Null means "a card, not a choice": a title that reads as a record (a number, an address,
+ * a date), or as a page's way forward / a step bar's last item, is never offered as a
+ * navigation candidate.
+ */
+export function choiceTileLabel(raw: string): string | null {
+  let t = String(raw ?? "").replace(/\s+/g, " ").trim();
+  // A trailing arrow drawn as text ("Solar Permit Request ›") is the affordance, not the name.
+  t = t.replace(/[\s›»→➔➜➝➞❯⟩⇒⟶▶▸►>]+$/, "").trim();
+  if (t.length < 3 || t.length > 120) return null;
+  // Three digits in a row is a record number, a street number or a year: a thing that exists,
+  // not a kind of thing to apply for. A record card on a dashboard must never read as a type.
+  if (/\d{3,}/.test(t)) return null;
+  // Advance / submit wording whole: a step bar's items and a button face, never a choice.
+  if (/^(next|continue|proceed|back|previous|cancel|close|submit|save|finish|done|ok)(\s+(step|now|application|form|page))?$/i.test(t)) return null;
+  if (/^review(\s*(and|&)\s*submit)?$/i.test(t)) return null;
+  return t;
+}
+
+/** A choice tile with its derived label, stamped in the page as data-al-tile / data-al-tile-label. */
+export interface ChoiceTile {
+  key: string;
+  label: string;
+}
+
+/**
+ * Scan ONE scope (page or frame) for choice tiles, derive each label, and stamp the label
+ * back onto the element so the field harvest (extractFieldsInPage) reads it rather than
+ * re-deriving it. Never throws; an unreadable page simply has no tiles. The shape of what the
+ * page returns is checked rather than trusted — a test's fake page answers every evaluate
+ * with one canned object.
+ */
+export async function scanChoiceTiles(scope: Page | Frame): Promise<ChoiceTile[]> {
+  if (!scope || typeof (scope as Frame).evaluate !== "function") return [];
+  let raws: unknown;
+  try { raws = await (scope as Frame).evaluate(markChoiceTilesInPage); } catch { return []; }
+  if (!Array.isArray(raws)) return [];
+  const tiles: ChoiceTile[] = [];
+  for (const r of raws as Array<Partial<ChoiceTileRaw> | null>) {
+    if (!r || typeof r.key !== "string" || !/^t\d+$/.test(r.key) || typeof r.title !== "string") continue;
+    const label = choiceTileLabel(r.title);
+    if (label) tiles.push({ key: r.key, label });
+  }
+  if (!tiles.length) return [];
+  try {
+    await (scope as Frame).evaluate((pairs: Array<[string, string]>) => {
+      for (const pair of pairs) {
+        const el = document.querySelector(`[data-al-tile="${pair[0]}"]`);
+        if (el) el.setAttribute("data-al-tile-label", pair[1]);
+      }
+    }, tiles.map((t): [string, string] => [t.key, t.label]));
+  } catch { return []; }
+  return tiles;
+}
+
 /**
  * Find the control that starts a NEW application, searching the main document and every
  * same-origin frame. Returns the best candidate WITHOUT clicking it (callers decide), or
@@ -239,6 +439,19 @@ export async function findApplicationEntry(page: Page): Promise<{ locator: Locat
         ? byText
         : (scope as Frame).locator(`[aria-label="${c.label.replace(/"/g, '\\"')}"], [title="${c.label.replace(/"/g, '\\"')}"]`).first();
       best = { locator: loc as Locator, match: { label: c.label, via: c.href ? "href" : "text", href: c.href || undefined }, rank };
+    }
+    // THE SAME QUESTION, ASKED OF THE PAGE'S CHOICE TILES. A home that offers "Apply for a
+    // Permit" as a card (DevHub's home does, beside its sidebar link) is entered through the
+    // card, by its title, under the same exclusions and the same rank — and a tie keeps the
+    // control found first, so a link with the same label still wins. "My Permits", "View or
+    // Pay Fees" tiles are refused exactly as the links would be.
+    for (const t of await scanChoiceTiles(scope)) {
+      if (!matchesEntryLabel(t.label)) continue;
+      if (formShaped && /\bsubmit\b/i.test(t.label)) continue;
+      const rank = entryRank(t.label);
+      if (best && rank >= best.rank) continue;
+      const loc = (scope as Frame).locator(`[data-al-tile="${t.key}"]`).first();
+      best = { locator: loc as Locator, match: { label: t.label, via: "tile" }, rank };
     }
   }
   return best ? { locator: best.locator, match: best.match } : null;
@@ -435,6 +648,9 @@ export interface PermitTypeChoice {
   /** The chosen control, ready to click. */
   locator: Locator;
   label: string;
+  /** A link/button carrying the label, or a choice tile labelled by its title and clicked
+   *  whole (see markChoiceTilesInPage). Decides how the step is recorded for replay. */
+  kind: "control" | "tile";
 }
 
 /** What the page offered, for the message when we refuse. */
@@ -442,15 +658,27 @@ export interface PermitTypeRefusal {
   reason: "none" | "ambiguous";
   offered: string[];
   matched: string[];
+  /** The choice tiles the page offered (their titles; a subset of `offered`), so a refusal
+   *  can NAME the choices a person has to make — never "nothing fillable" on a page of ten. */
+  tiles: string[];
 }
 
-// Keyed to the TRACK. A NEM/interconnection filing wants the solar/PV type; an electrical
-// permit wants electrical; structural wants building/structural. Deliberately not one
-// "solar-ish" regex: on an AHJ menu "Commercial Solar Permit" and "Residential Solar
-// Permit" both contain solar, and choosing between them by position is how the wrong
-// permit gets filed.
-const TYPE_PATTERNS: Record<string, RegExp[]> = {
-  solar: [/\bsolar\b/i, /photovoltaic/i, /\bpv\b/i, /net\s*-?\s*meter/i, /interconnect/i],
+// WHICH VOCABULARY LEADS. A type that names the JOB — solar / photovoltaic / PV / renewable
+// energy / interconnection — outranks a type that names the track's DISCIPLINE, on every
+// track. The record-type guard in autoLearnAdapter (RECORD_TYPE_LABEL) already answers this
+// question that way: "a solar/PV-specific type is always allowed: that IS the right answer
+// wherever an AHJ offers one". Portland DevHub is the live proof — its tile says "The new
+// Solar Permit Request includes the Renewable Energy Electrical Permit", so an electrical-
+// track run that took "Trade Permits", or a structural-track run that took "Building Permit
+// Request", would file the wrong permit. The discipline vocabulary is the SECOND tier: it
+// decides at an AHJ with no solar-specific type, where a solar job files as an electrical
+// permit plus a building permit.
+//
+// Deliberately not one "solar-ish" regex over the exclusions: on an AHJ menu "Commercial
+// Solar Permit" and "Residential Solar Permit" both contain solar, and choosing between them
+// by position is how the wrong permit gets filed — the commercial twin is excluded below.
+const JOB_PATTERNS: RegExp[] = [/\bsolar\b/i, /photovoltaic/i, /\bpv\b/i, /renewable\s+energy/i, /net\s*-?\s*meter/i, /interconnect/i];
+const DISCIPLINE_PATTERNS: Record<string, RegExp[]> = {
   electrical: [/\belectric(al)?\b/i],
   structural: [/\bstructural\b/i, /\bbuilding\b/i],
 };
@@ -467,17 +695,25 @@ const TYPE_EXCLUDE: RegExp[] = [
   /\blook ?up\b|\bsearch\b/i,
   /\bdemolition\b/i,
   /\btemporary\b/i,
+  // "Renewable Energy Rebate" matches the job vocabulary and files nothing — the trap
+  // PROGRAM_EXCLUDE (applicationProgram.ts) already guards for programme choices.
+  /\brebate\b|\bincentive\b/i,
 ];
 
 export function permitTypeCandidates(labels: string[], track: string): string[] {
-  const pats = TYPE_PATTERNS[track] ?? TYPE_PATTERNS.solar;
-  return labels.filter((raw) => {
+  const eligible = labels.filter((raw) => {
     const label = (raw || "").replace(/\s+/g, " ").trim();
     if (!label || label.length > 80) return false;
     if (TYPE_EXCLUDE.some((re) => re.test(label))) return false;
     if (isExcludedEntryLabel(label)) return false;
-    return pats.some((re) => re.test(label));
+    return true;
   });
+  // First tier with a hit wins; several hits in that tier is the caller's ambiguity.
+  for (const tier of [JOB_PATTERNS, DISCIPLINE_PATTERNS[track] ?? []]) {
+    const hits = eligible.filter((raw) => tier.some((re) => re.test(raw)));
+    if (hits.length) return hits;
+  }
+  return [];
 }
 
 /** Pick the permit type for this track, or refuse and say why. Never guesses. */
@@ -486,6 +722,8 @@ export async function chooseApplicationType(
   track: string,
 ): Promise<{ ok: true; choice: PermitTypeChoice } | { ok: false; refusal: PermitTypeRefusal }> {
   const scopes: Array<Page | Frame> = typeof page.frames === "function" ? page.frames() : [page];
+  const offeredAll: string[] = [];
+  const tilesAll: string[] = [];
   for (const scope of scopes) {
     let labels: string[] = [];
     try {
@@ -500,19 +738,37 @@ export async function chooseApplicationType(
           .filter((t) => t.length >= 3);
       });
     } catch { labels = []; }
-    if (!labels.length) continue;
+    // A permit type offered as a CARD is a candidate by its title — same vocabulary, same
+    // exclusions, same refusals as a link. The information links inside the cards are in
+    // `labels` already, under their own text, and the exclusion list refuses them there.
+    const tiles = await scanChoiceTiles(scope);
+    const tileLabels = tiles.map((t) => t.label);
+    if (!labels.length && !tiles.length) continue;
+    for (const l of [...labels, ...tileLabels]) if (!offeredAll.includes(l)) offeredAll.push(l);
+    for (const l of tileLabels) if (!tilesAll.includes(l)) tilesAll.push(l);
 
-    const matched = [...new Set(permitTypeCandidates(labels, track))];
+    const matched = [...new Set(permitTypeCandidates([...labels, ...tileLabels], track))];
     if (matched.length === 1) {
-      const loc = (scope as Frame).getByRole("link", { name: matched[0], exact: true })
-        .or((scope as Frame).getByRole("button", { name: matched[0], exact: true })).first();
-      if (await loc.count().catch(() => 0)) return { ok: true, choice: { locator: loc, label: matched[0] } };
+      const label = matched[0];
+      // A link/button that carries the label is the control; a tile is the control only when
+      // no link or button says the same thing (a card whose title is also a link is entered by
+      // the link, as it always was).
+      if (labels.includes(label)) {
+        const loc = (scope as Frame).getByRole("link", { name: label, exact: true })
+          .or((scope as Frame).getByRole("button", { name: label, exact: true })).first();
+        if (await loc.count().catch(() => 0)) return { ok: true, choice: { locator: loc, label, kind: "control" } };
+      }
+      const tile = tiles.find((t) => t.label === label);
+      if (tile) {
+        const loc = (scope as Frame).locator(`[data-al-tile="${tile.key}"]`).first();
+        if (await loc.count().catch(() => 0)) return { ok: true, choice: { locator: loc, label, kind: "tile" } };
+      }
     }
     if (matched.length > 1) {
-      return { ok: false, refusal: { reason: "ambiguous", offered: labels.slice(0, 40), matched } };
+      return { ok: false, refusal: { reason: "ambiguous", offered: offeredAll.slice(0, 40), matched, tiles: tilesAll } };
     }
   }
-  return { ok: false, refusal: { reason: "none", offered: [], matched: [] } };
+  return { ok: false, refusal: { reason: "none", offered: offeredAll.slice(0, 40), matched: [], tiles: tilesAll } };
 }
 export function normalizeEntryLabel(label: string): string {
   return String(label ?? "").replace(/\s+/g, " ").trim().toLowerCase();

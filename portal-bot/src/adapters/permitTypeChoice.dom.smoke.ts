@@ -47,13 +47,31 @@ check("...and never the COMMERCIAL twin, which matches 'solar' just as well",
   !solar.includes("Commercial Solar Permit"),
   "choosing between residential and commercial by position is how the wrong permit gets filed");
 
+// THE JOB OUTRANKS THE DISCIPLINE (#315). This menu offers a solar-specific type, and that is
+// the right answer on every track: the record-type guard (autoLearnAdapter, RECORD_TYPE_LABEL)
+// has always ruled "a solar/PV-specific type is always allowed: that IS the right answer
+// wherever an AHJ offers one", and Portland DevHub says so in its own words — "The new Solar
+// Permit Request includes the Renewable Energy Electrical Permit". Before this, the electrical
+// track took "Electrical Permit" and the structural track "Residential Building Permit" from
+// this very menu, and on Portland's tiles the one found nothing and the other took "Building
+// Permit Request": a different permit. The discipline vocabulary is the SECOND tier, pinned
+// right after.
 const electrical = permitTypeCandidates(MENU, "electrical");
-check("an electrical track picks the electrical permit",
-  electrical.length === 1 && electrical[0] === "Electrical Permit", JSON.stringify(electrical));
+check("an electrical track picks the residential SOLAR permit where the AHJ offers one",
+  electrical.length === 1 && electrical[0] === "Residential Solar Permit", JSON.stringify(electrical));
 
 const structural = permitTypeCandidates(MENU, "structural");
-check("a structural track picks the residential BUILDING permit, not the commercial one",
-  structural.length === 1 && structural[0] === "Residential Building Permit", JSON.stringify(structural));
+check("a structural track picks the residential SOLAR permit too — not the building one, not the commercial one",
+  structural.length === 1 && structural[0] === "Residential Solar Permit", JSON.stringify(structural));
+
+const NO_SOLAR_MENU = MENU.filter((t) => !/solar/i.test(t));
+const electricalNoSolar = permitTypeCandidates(NO_SOLAR_MENU, "electrical");
+check("with no solar type on offer, an electrical track picks the electrical permit",
+  electricalNoSolar.length === 1 && electricalNoSolar[0] === "Electrical Permit", JSON.stringify(electricalNoSolar));
+
+const structuralNoSolar = permitTypeCandidates(NO_SOLAR_MENU, "structural");
+check("with no solar type on offer, a structural track picks the residential BUILDING permit, not the commercial one",
+  structuralNoSolar.length === 1 && structuralNoSolar[0] === "Residential Building Permit", JSON.stringify(structuralNoSolar));
 
 // ---- the refusals, which matter more than the matches -------------------------
 check("'Smoke Detector Permit' is never a solar type — the string the DISMISSER used to click",

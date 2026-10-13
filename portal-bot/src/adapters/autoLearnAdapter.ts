@@ -11,7 +11,7 @@ import { detectChallengeFrame, frameSelectorFor, maskId, readbackMatches, redact
 import { applyFormatHint } from "../formatHint";
 import { scrapeReviewScreen as scrapeReviewScreenShared } from "../reviewScreenScraper";
 import { performLogin, lastRevealTrail, loginFormPresent, holdForPerson } from "./loginFlow";
-import { enterApplicationFlow, isExcludedEntryLabel, normalizeEntryLabel, chooseApplicationType } from "./applicationEntry";
+import { enterApplicationFlow, isExcludedEntryLabel, normalizeEntryLabel, chooseApplicationType, scanChoiceTiles } from "./applicationEntry";
 import { chooseProgram, offeredLabels, programSelector, scanProgramGroups, type ProgramGroup } from "./applicationProgram";
 import { planHiddenReveal, planLabelProxy } from "./revealHidden";
 import { looksLikeConsentWall, planConsentDismissal } from "./consentBanner";
@@ -688,7 +688,11 @@ export function hasVisibleWidgetFaceInPage(el: Element): boolean {
   return !!face && (face as HTMLElement).offsetParent !== null;
 }
 
-export const EXTRACT_SEL = "input, select, textarea, button, [role=button], a[href]:not([href='#']):not([href=''])";
+// `[data-al-tile]`: a choice CARD stamped by scanChoiceTiles (applicationEntry.ts) just before
+// the harvest — a container clickable as a whole, labelled by its title. Portland DevHub's
+// "Apply for a Permit" page is ten of them and nothing else; without this the planner saw only
+// the cards' information links and the run died "nothing fillable".
+export const EXTRACT_SEL = "input, select, textarea, button, [role=button], a[href]:not([href='#']):not([href='']), [data-al-tile]";
 
 // ---------------------------------------------------------------------------
 // ONE ACTIVE SCOPE PER PAGE — scope the HARVEST, never the page's exits.
@@ -1239,6 +1243,9 @@ export interface RawField {
   offstage?: boolean;
   /** True when the control is not operable right now. See ExtractedField.disabled. */
   disabled?: boolean;
+  /** A choice tile (markChoiceTilesInPage): a card clicked as a whole, labelled by its title.
+   *  Its selector is the title TEXT — getByRole finds nothing on a plain container. */
+  tile?: boolean;
 }
 
 // Serializable extractor — derives a label and selector hints for each interactive
@@ -1451,6 +1458,12 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
   for (const el of els) {
     const tag = el.tagName.toLowerCase();
     const typeAttr = (el.getAttribute("type") || "").toLowerCase();
+    // A CHOICE TILE: a card clickable as a whole, labelled by its title. scanChoiceTiles stamped
+    // the key and the label before this harvest; the label is READ here, never re-derived
+    // (choiceTileLabel is the one place that happens). A stamped card with no usable label was
+    // a card, not a choice — a record on a dashboard, a step bar's item — and is skipped.
+    const tileLabel = el.hasAttribute("data-al-tile") ? (el.getAttribute("data-al-tile-label") || "").trim() : "";
+    if (el.hasAttribute("data-al-tile") && !tileLabel) continue;
     let fieldType: ExtractedField["fieldType"] = "other";
     let options: string[] | undefined;
 
@@ -1469,6 +1482,10 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       else if (typeAttr === "file") fieldType = "file";
       else if (typeAttr === "hidden" || typeAttr === "password") fieldType = typeAttr === "password" ? "text" : "other";
       else fieldType = "text";
+    } else if (tileLabel) {
+      // A tile is a NAVIGATION candidate, like a link: the planner's navigate path clicks it
+      // whole and the recorded step re-finds it by its title text.
+      fieldType = "button";
     }
 
     // ROLE=COMBOBOX / aria-haspopup=listbox is a DROPDOWN even when it's an <input>.
@@ -1586,7 +1603,7 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       const tv = el.getAttribute(attr);
       if (tv) { testCss = `[${attr}="${tv}"]`; testHint = tv.replace(/[-_]+/g, " ").trim(); break; }
     }
-    let rawLabel = labelFor(el);
+    let rawLabel = tileLabel || labelFor(el);
     // A FRAMEWORK-GENERATED ID IS NOT A LABEL. Angular Material (and CDK/Ionic) name their
     // generated wrappers "mat-button-toggle-group-2", "cdk-overlay-4" — ids that look like
     // labels to any label-shaped lookup but tell a planner nothing. ComEd's new-application
@@ -1626,7 +1643,9 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
     const ariaName = el.getAttribute("aria-label")?.trim() || "";
     const ligatureShaped = /^[a-z][a-z0-9_]{1,24}$/.test(rawText); // one lowercase token, no spaces
     const buttonText = ariaName && (ligatureShaped || !rawText || iconish(el)) ? ariaName : rawText;
-    const text = fieldType === "button" ? buttonText || undefined : undefined;
+    // A tile's text is its TITLE, never the whole card (the body's prose would become the
+    // name a replay has to match).
+    const text = tileLabel ? tileLabel : fieldType === "button" ? buttonText || undefined : undefined;
     // Capture href for anchors so a hidden/menu-nested nav link can be reached by direct
     // navigation when it can't be clicked.
     const href = tag === "a" ? (el.getAttribute("href") || undefined) : undefined;
@@ -1656,6 +1675,7 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
 
     out.push({
       label, fieldType, options, role, name, placeholder, id, text, href,
+      tile: tileLabel ? true : undefined,
       required: required || undefined,
       section: sectionFor(el) || undefined,
       testCss,
@@ -1683,7 +1703,20 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
 // stable RecipeSelector preferring label / role+name / name, falling back to css #id.
 export function toExtractedField(raw: RawField): ExtractedField {
   const selector: RecipeSelector = {};
-  if (raw.fieldType === "button") {
+  if (raw.fieldType === "button" && raw.tile) {
+    // A CHOICE TILE is a plain container: getByRole resolves nothing on it, so the selector is
+    // the title TEXT — exact, because "Solar Permit Request" must not also match "Solar Permit
+    // Requests for Residential or Commercial…" in the card's body. The text resolves the title
+    // element, and a click there bubbles to the card's handler, at learn time and on replay.
+    // The role-named fallbacks cover a portal that later turns the card into a real link.
+    selector.text = raw.label;
+    selector.exact = true;
+    selector.fallbacks = [
+      { role: "link", name: raw.label, exact: true },
+      { role: "button", name: raw.label, exact: true },
+      ...(raw.id ? [{ css: `#${raw.id}` }] : []),
+    ];
+  } else if (raw.fieldType === "button") {
     // Use the element's actual ARIA role ("link" for <a> tags, "button" otherwise).
     // getByRole("button", {name}) never matches a plain <a> — it must be "link".
     const ariaRole = raw.role || "button";
@@ -2809,6 +2842,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         if (!frameKey) continue; // untargetable frame — skip so we never plan an unreplayable fill
       }
       try {
+        // Choice tiles are stamped FIRST so the harvest's `[data-al-tile]` clause finds them
+        // labelled; a page with none costs one evaluate. Never throws — fails open to no tiles.
+        await scanChoiceTiles(frame);
         const raws = await frame.$$eval(extractSel, extractFieldsInPage);
         for (const r of raws) {
           if (frameKey) r.frame = frameKey;
@@ -2820,7 +2856,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // Safety net: if frame enumeration yielded nothing (e.g. a fake/stub page in tests, or an
     // older runtime), fall back to a direct main-document scrape so the loop still sees fields.
     if (!out.length) {
-      try { out.push(...(await this.page.$$eval(extractSel, extractFieldsInPage))); } catch { /* ignore */ }
+      try {
+        await scanChoiceTiles(this.page);
+        out.push(...(await this.page.$$eval(extractSel, extractFieldsInPage)));
+      } catch { /* ignore */ }
     }
     const scoped = applyActiveScopeFilter(out, scopeActive);
     if (scopeActive && (scoped.dropped || scoped.exempted.length)) {
@@ -5153,7 +5192,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       let url = "";
       let bodyText = "";
       try {
-        const extractSel = "input, select, textarea, button, [role=button], a[href]:not([href='#']):not([href=''])";
+        const extractSel = EXTRACT_SEL;
         let raws: RawField[] = [];
         for (let tryN = 0; tryN < 4; tryN++) {
           raws = await this.extractAllFrames(extractSel);
@@ -5596,18 +5635,61 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             const clicked = await picked.choice.locator.click({ timeout: 8000 }).then(() => true).catch(() => false);
             if (clicked) {
               await this.waitAfterClick(beforeTypeUrl, beforeTypeFp, this.tabCount());
+              const label = picked.choice.label;
               steps.push({
                 action: "click",
                 phase: "open",
-                selector: { role: "link", name: picked.choice.label, text: picked.choice.label },
-                note: `permit type: ${picked.choice.label}`,
+                // A CHOICE TILE is a plain container (Portland DevHub's "Solar Permit Request"
+                // card): a role-named selector resolves nothing on it, so the step is recorded by
+                // the title TEXT, exact, which resolves the title element — and a click there
+                // bubbles to the card's own handler. See toExtractedField's tile branch.
+                selector: picked.choice.kind === "tile"
+                  ? { text: label, exact: true, fallbacks: [{ role: "link", name: label, exact: true }, { role: "button", name: label, exact: true }] }
+                  : { role: "link", name: label, text: label },
+                note: `permit type: ${label}`,
               });
-              this.debug?.event({ type: "permit_type_chosen", track, label: picked.choice.label });
+              this.debug?.event({ type: "permit_type_chosen", track, label, via: picked.choice.kind });
             }
-          } else if (picked && !picked.ok && picked.refusal.reason === "ambiguous") {
-            // Two plausible types (roof-mount vs ground-mount is a real shape). A human picks;
-            // guessing files one of them.
-            this.debug?.event({ type: "permit_type_ambiguous", track, matched: picked.refusal.matched.slice(0, 6) });
+          } else if (picked && !picked.ok) {
+            if (picked.refusal.reason === "ambiguous") {
+              // Two plausible types (roof-mount vs ground-mount is a real shape). A human picks;
+              // guessing files one of them.
+              this.debug?.event({ type: "permit_type_ambiguous", track, matched: picked.refusal.matched.slice(0, 6) });
+            }
+            // A PAGE OF CHOICE TILES THAT NAMES NOTHING WE CAME FOR IS A STOP THAT NAMES THEM —
+            // never "nothing fillable". Live Portland (2026-10-13): the walk stood on ten
+            // labelled tiles, saw none of them, and told the operator to record the portal by
+            // hand. Now the tiles ARE seen, so the honest report is which choices the page
+            // offered and that none (or several) of them reads as this job. The planner is
+            // not consulted: a permit type is never guessed (the mechanical-permit mistake),
+            // and every tile is now a navigate candidate it could pick.
+            //
+            // Gated on the page the chooser was asked about being the page this iteration
+            // SCRAPED (no entry click landed just before — the chooser runs on whatever the
+            // entry pass left on screen) and that page offering nothing to fill: a tile page
+            // beside a form is left to the form. A refusal straight after an entry click is
+            // retried next iteration on the scraped page, where it stops if still unmatched.
+            const tiles = Array.isArray(picked.refusal.tiles) ? picked.refusal.tiles : [];
+            if (tiles.length > 0) {
+              this.debug?.event({
+                type: "choice_tiles_unmatched", page: pageCount, track, reason: picked.refusal.reason,
+                tiles: tiles.slice(0, 12).map((t) => t.slice(0, 60)), matched: picked.refusal.matched.slice(0, 6),
+              });
+              if (!entered?.ok && !hasFillable) {
+                const named = tiles.slice(0, 12).map((t) => `"${t.slice(0, 60)}"`).join(" | ");
+                const why = picked.refusal.reason === "ambiguous"
+                  ? `more than one of them could be it (${picked.refusal.matched.slice(0, 6).map((m) => `"${m}"`).join(" | ")}) and a permit type is never guessed`
+                  : `none of them names this job (${track} track)`;
+                return fail(
+                  steps,
+                  this.portalName,
+                  `Auto-learn stopped at a page of ${tiles.length} choice tile(s): ${why}. The page offered: ${named}. A person picks the permit type here; record that step manually.`,
+                  null,
+                  pageCount,
+                  portalNotices,
+                );
+              }
+            }
           }
         }
         if (entered?.ok) {
