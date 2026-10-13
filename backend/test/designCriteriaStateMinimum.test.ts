@@ -235,12 +235,15 @@ await check("MUST-PASS (snow-inv): the below-AHJ snow line asks the same predica
   const w = run(project("City of Salem", PRESCRIPTIVE), orCtx("City of Salem", { designCriteria: { groundSnowLoadPsf: 36, windSpeedMph: 120 } }), `${AMBIGUOUS} WIND SPEED = 100 MPH`).find((x) => x.id === "city.struct.design-criteria-below-ahj");
   assert.equal(w?.severity, "blocker", w?.message);
 });
-await check("MUST-PASS (snow-inv): two documents that disagree only through an unsure reading are a conflict WARNING, and the minimum a WARNING", () => {
+// (#312: a conflict that rests on a weak reading alone is a CALLOUT naming the weak reading — still never a blocker.)
+await check("MUST-PASS (snow-inv): two documents that disagree only through an unsure reading are a conflict CALLOUT naming it, and the minimum a WARNING", () => {
   const fs = evaluateDesignCodeFindings(project("City of Salem", PRESCRIPTIVE), null, orCtx("City of Salem"), [], [
     { label: "Plan set", text: AMBIGUOUS },
     { label: "Engineer letter", text: "GROUND SNOW LOAD = 36 PSF" },
   ]);
-  assert.equal(fs.find((f) => f.id === "city.struct.design-criteria-conflict")?.severity, "warning");
+  const conflict = fs.find((f) => f.id === "city.struct.design-criteria-conflict");
+  assert.equal(conflict?.severity, "callout", conflict?.message);
+  assert.match(conflict!.message, /Plan set \[only one way of reading an unseparated load list\]/);
   assert.equal(minimum(fs)?.severity, "warning", minimum(fs)?.message);
   // Control: two documents that SURELY disagree (16 vs 36) keep the conflict BLOCKER; the minimum is
   // a warning then (the package states two Pg values), naming both.
