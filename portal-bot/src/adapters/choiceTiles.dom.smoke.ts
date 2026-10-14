@@ -279,6 +279,40 @@ const PAGES: Record<string, string> = {
     <div id="sgControls">${NO_SOLAR_TILES}</div>
     ${DELEGATION(TO_CHOSEN)}
   </body></html>`,
+  // #328 review 1 (Helm): PERMIT TYPES THAT LIVE IN "FRAME" MARKUP. The frame stamp is wide (any
+  // header/footer, an <article>'s own header, any class containing "menu"/"progress"), so the
+  // chooser reads it as a SECOND pool — only when nothing outside the frame names the job, and
+  // there only a label that reads as an application.
+  "/types-article-header": `<!doctype html><html><body><main>
+    <h1>Choose a permit type</h1>
+    <article class="type-card"><header><a href="/chosen?tile=Building%20Permit%20Request">Building Permit Request</a></header><p>Additions and alterations.</p></article>
+    <article class="type-card"><header><a href="/chosen?tile=Solar%20Permit%20Request">Solar Permit Request</a></header><p>Rooftop PV.</p></article>
+    <article class="type-card"><header><a href="/chosen?tile=Fence%20Permit%20Request">Fence Permit Request</a></header><p>Fences over six feet.</p></article>
+  </main></body></html>`,
+  "/types-permit-menu": `<!doctype html><html><body><main>
+    <h1>Apply for a permit</h1>
+    <ul class="permit-menu"><li><a href="/chosen?tile=Fence%20Permit">Fence Permit</a></li><li><a href="/chosen?tile=Solar%20Permit">Solar Permit</a></li><li><a href="/chosen?tile=Sign%20Permit">Sign Permit</a></li></ul>
+  </main></body></html>`,
+  "/types-in-progress": `<!doctype html><html><body><div class="in-progress-applications">
+    <h1>New application</h1>
+    <a href="/chosen?tile=Fence%20Permit">Fence Permit</a> <a href="/chosen?tile=Building%20Permit">Building Permit</a> <a href="/chosen?tile=Sign%20Permit">Sign Permit</a>
+  </div></body></html>`,
+  "/types-nav-sidebar": `<!doctype html><html><body>
+    <nav class="sidebar"><a href="/chosen?tile=Fence%20Permit">Fence Permit</a><a href="/chosen?tile=Solar%20Permit">Solar Permit</a><a href="/chosen?tile=Sign%20Permit">Sign Permit</a></nav>
+    <main><h1>Pick a permit type from the list.</h1></main>
+  </body></html>`,
+  // MUST EXCLUDE: a site header's "Going Solar" and a footer's "Solar Energy Program" are never
+  // the type — beside the page's own type, and with no type in the page at all.
+  "/types-header-trap": `<!doctype html><html><body>
+    <header><a href="/going-solar">Going Solar</a></header>
+    <main><a href="/chosen?tile=Electrical%20Permit">Electrical Permit</a> <a href="/chosen?tile=Fence%20Permit">Fence Permit</a></main>
+    <footer><a href="/program">Solar Energy Program</a></footer>
+  </body></html>`,
+  "/types-header-only": `<!doctype html><html><body>
+    <header><a href="/going-solar">Going Solar</a></header>
+    <main><a href="/chosen?tile=Fence%20Permit">Fence Permit</a> <a href="/chosen?tile=Sign%20Permit">Sign Permit</a></main>
+    <footer><a href="/program">Solar Energy Program</a></footer>
+  </body></html>`,
   // MUST EXCLUDE: a dashboard of the operator's RECORDS as pointer-cursor cards. A record's
   // title carries a number; a type's never does.
   "/records": `<!doctype html><html><head><style>.card{border:1px solid #999;padding:12px;min-height:50px;cursor:pointer}</style></head><body>
@@ -646,6 +680,40 @@ for (const track of ["electrical", "structural", "solar"]) {
   check("the learner reads the names from contactIdentity.ownNames and picks the solar tile",
     w.notes.some((n) => n === `permit type: ${SOLAR}`), `notes=${JSON.stringify(w.notes)} message=${w.r.message}`);
 }
+
+// ===========================================================================================
+// 11) #328 review 1 — permit types in FRAME markup are a second pool, not a cut. The chooser
+//     reads them only when nothing outside the frame names the job, and there only a label that
+//     reads as an application; a site header's "Going Solar" is never the type.
+// ===========================================================================================
+console.log("\n[11] permit types inside frame markup (article header, *-menu, *-progress wrapper, nav sidebar)");
+for (const [route, track, want, what] of [
+  ["/types-article-header", "solar", "Solar Permit Request", "type links as card titles inside <article><header>"],
+  ["/types-permit-menu", "solar", "Solar Permit", "type links in <ul class=\"permit-menu\"> inside <main>"],
+  ["/types-in-progress", "structural", "Building Permit", "the whole page inside <div class=\"in-progress-applications\">"],
+  ["/types-nav-sidebar", "solar", "Solar Permit", "a type list in <nav class=\"sidebar\">"],
+] as const) {
+  await page.goto(`${base}${route}`);
+  const picked = await chooseApplicationType(page, track);
+  check(`${what} (${track}): "${want}" is chosen`,
+    picked.ok && picked.choice.label === want,
+    picked.ok ? picked.choice.label : `refused: ${picked.refusal.reason} matched=${JSON.stringify(picked.refusal.matched)}`);
+  if (picked.ok && picked.choice.label === want) {
+    await picked.choice.locator.click({ timeout: 5000 }).catch(() => null);
+    await page.waitForLoadState("domcontentloaded").catch(() => null);
+    check(`${what}: ...and its click lands on that type`, decodeURIComponent(page.url()).includes(`tile=${want}`), `url=${page.url()}`);
+  }
+}
+await page.goto(`${base}/types-header-trap`);
+const trap = await chooseApplicationType(page, "electrical");
+check("MUST EXCLUDE: beside the page's own 'Electrical Permit', a header 'Going Solar' / footer 'Solar Energy Program' is never the type",
+  trap.ok && trap.choice.label === "Electrical Permit",
+  trap.ok ? trap.choice.label : `refused: ${trap.refusal.reason} matched=${JSON.stringify(trap.refusal.matched)}`);
+await page.goto(`${base}/types-header-only`);
+const headerOnly = await chooseApplicationType(page, "solar");
+check("MUST EXCLUDE: with no type in the page, 'Going Solar' / 'Solar Energy Program' are still never chosen",
+  !headerOnly.ok && !headerOnly.refusal.matched.some((m) => /going solar|solar energy program/i.test(m)),
+  headerOnly.ok ? `picked ${headerOnly.choice.label}` : JSON.stringify(headerOnly.refusal.matched));
 
 await browser.close();
 await new Promise<void>((r) => server.close(() => r()));

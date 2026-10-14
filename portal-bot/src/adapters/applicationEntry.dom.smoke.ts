@@ -154,6 +154,40 @@ const PAGES: Record<string, string> = {
     <div id="nav" style="display:none"><a href="/apply">Apply Here</a><a href="/pay">Pay Fees Due</a></div>
     <script>document.getElementById('burger').onclick=function(){document.getElementById('nav').style.display='block';};</script>
   </body>`,
+
+  // #328 review 1 (Helm): AN ENTRY THAT SITS NEXT TO SIGN OUT IS STILL THE WAY IN. The account
+  // resolver stamps an account menu or a small user panel as a whole; only the account's OWN
+  // controls (the toggle, Sign Out, My Profile) are refused — an entry beside them stays a
+  // candidate, ranked after every entry outside the account.
+  // Momentum's shape: a hamburger drawer (aria-haspopup, role=menu) holding "Apply Here" AND
+  // "Sign Out" — openCollapsedNav exists to reach exactly this.
+  "/drawer-with-signout": `<!doctype html><body>
+    <button id="burger2" aria-label="Open Navigation Menu" aria-haspopup="true" aria-expanded="true" aria-controls="drawer">☰</button>
+    <div id="drawer" role="menu"><a role="menuitem" href="/apply">Apply Here</a><a role="menuitem" href="/logout">Sign Out</a></div>
+  </body>`,
+  "/user-panel-id": `<!doctype html><body>
+    <h1>Welcome back</h1>
+    <div id="userPanel"><a href="/apply">Apply for a Permit</a><a href="/logout">Log out</a></div>
+  </body>`,
+  // An OPEN account menu (the toggle's menu holds Sign Out) that also holds the entry.
+  "/open-account-menu": `<!doctype html><body>
+    <div class="dropdown">
+      <button class="dropdown-toggle" data-bs-toggle="dropdown" aria-expanded="true">Placeholder Solar Co</button>
+      <ul class="dropdown-menu show"><li><a href="/profile">My Profile</a></li><li><a href="/apply">Apply for a Permit</a></li><li><a href="/logout">Sign Out</a></li></ul>
+    </div>
+  </body>`,
+  "/user-panel-class": `<!doctype html><body>
+    <div class="user-panel"><a href="/company">Placeholder Solar Co</a><a href="/apply">Apply for a Permit</a><a href="/logout">Log out</a></div>
+  </body>`,
+  // RANKING: the page's own entry beats the same wording inside the account menu, whatever the
+  // DOM order — the account menu comes FIRST here on purpose.
+  "/account-menu-ranked": `<!doctype html><body>
+    <div class="dropdown">
+      <button class="dropdown-toggle" data-bs-toggle="dropdown" aria-expanded="true">Placeholder Solar Co</button>
+      <ul class="dropdown-menu show"><li><a href="/license">Apply for a License</a></li><li><a href="/logout">Sign Out</a></li></ul>
+    </div>
+    <main><a href="/apply">Apply for a Permit</a></main>
+  </body>`,
 };
 
 const server = http.createServer((q, r) => { r.writeHead(200, { "Content-Type": "text/html" }); r.end(PAGES[q.url || ""] ?? "<body>?</body>"); });
@@ -357,6 +391,19 @@ await check("...and the real entry controls beside them still match", async () =
     assert.equal(matchesEntryLabel(good), true, `should match: ${good}`);
   }
 });
+
+// #328 review 1: an entry beside the account's Sign Out is still found; the account's own
+// controls never are.
+await check("Momentum drawer (aria-haspopup, role=menu) with 'Apply Here' beside 'Sign Out': the entry is found",
+  () => expectEntry("/drawer-with-signout", "Apply Here"));
+await check("a div#userPanel with 'Apply for a Permit' beside 'Log out': the entry is found",
+  () => expectEntry("/user-panel-id", "Apply for a Permit"));
+await check("an OPEN account menu holding 'Apply for a Permit' (beside My Profile / Sign Out): the entry is found",
+  () => expectEntry("/open-account-menu", "Apply for a Permit"));
+await check("a .user-panel with the company link, 'Apply for a Permit' and 'Log out': the entry is found",
+  () => expectEntry("/user-panel-class", "Apply for a Permit"));
+await check("RANKING: the page's own 'Apply for a Permit' beats an 'Apply for a License' in the account menu above it",
+  () => expectEntry("/account-menu-ranked", "Apply for a Permit"));
 
 await browser.close();
 await new Promise<void>((r) => server.close(() => r()));

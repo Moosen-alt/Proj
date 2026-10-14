@@ -193,13 +193,19 @@ function entryRank(label: string): number {
 //   frame   — the page's frame: nav/header/footer and their landmark roles, menus, navbars,
 //             breadcrumbs, and the step-bar vocabulary portalSafety cuts.
 //
-// Which door reads which kind, and why they differ:
-//   - the tile scan and the permit-type chooser refuse ALL kinds: a type is never in the frame,
-//     never a menu opener, never the installer's own account;
-//   - the entry finder refuses ACCOUNT only. Entries legitimately live in navigation —
-//     openCollapsedNav exists precisely to reach one inside a shut menu, and DevHub's own
-//     "Apply For A Permit" sits in <nav role="navigation"> — and an entry can be a dropdown
-//     ("New Application ▾"); cutting either would stop the walk at its first page.
+// Which door reads which kind, and why they differ (#328, Helm's review 1):
+//   - the tile scan refuses ALL kinds: a card is never in the frame, a toggle or the account;
+//   - the permit-type chooser always refuses ACCOUNT and TOGGLE. The FRAME is a second pool,
+//     read only when the page's own (non-chrome) links and tiles match nothing, and there only a
+//     label that reads as an application (permit / application / request / interconnection):
+//     a type list can live in a sidebar or a `*-menu` wrapper, and an <article> has its own
+//     <header>, but a site header's "Going Solar" must never outrank the page's own type;
+//   - the entry finder refuses only a control that IS stamped account (the toggle, Sign Out,
+//     My Profile). A control merely inside an account menu or panel stays a candidate, ranked
+//     after every other entry: Momentum's hamburger drawer holds "Apply Here" beside "Sign Out".
+//     Frame and toggles are not cut there: openCollapsedNav exists to reach an entry inside a
+//     shut menu, DevHub's own "Apply For A Permit" sits in <nav role="navigation">, and an entry
+//     can be a dropdown ("New Application ▾").
 //
 // <body>/<html> are never stamped: a page-state class ("menu-open") is not chrome.
 //
@@ -580,10 +586,14 @@ export async function findApplicationEntry(page: Page): Promise<{ locator: Locat
   let best: { locator: Locator; match: ApplicationEntryMatch; rank: number } | null = null;
 
   for (const scope of scopes) {
-    let scan: { candidates: Array<{ label: string; href: string; index: number; fromText: boolean }>; fillable: number } =
+    let scan: { candidates: Array<{ label: string; href: string; index: number; fromText: boolean; inAccount?: boolean }>; fillable: number } =
       { candidates: [], fillable: 0 };
-    // The installer's own ACCOUNT controls are never the way in (#328). Only that kind: an entry
-    // legitimately lives in navigation and may be a dropdown — see markSiteChromeInPage.
+    // The installer's own ACCOUNT controls are never the way in (#328) — the controls THEMSELVES
+    // (the toggle, Sign Out, My Profile). A control merely INSIDE an account menu or panel is
+    // still a candidate, ranked after every other entry: Momentum's hamburger drawer holds "Apply
+    // Here" beside "Sign Out", and a user panel can hold "Apply for a Permit" beside "Log out".
+    // Frame and toggles are not cut here at all: an entry lives in navigation and may be a
+    // dropdown — see markSiteChromeInPage.
     await markSiteChrome(scope);
     try {
       scan = await (scope as Frame).evaluate(() => {
@@ -609,7 +619,8 @@ export async function findApplicationEntry(page: Page): Promise<{ locator: Locat
         const meaningful = (t: string): boolean => t.length >= 3 && !/^[+\-–—·•*]+$/.test(t) && !/^[a-z][a-z0-9_]{1,24}$/.test(t);
         const candidates = (Array.from(document.querySelectorAll("a, button, input[type=button], input[type=submit], [role=button]")) as HTMLElement[])
           .filter(vis)
-          .filter((el) => !el.closest("[data-al-chrome='account']"))
+          // The account's OWN controls (its toggle, Sign Out, My Profile) are never the way in.
+          .filter((el) => el.getAttribute("data-al-chrome") !== "account")
           .map((el, index) => {
             const own = ((el as HTMLInputElement).value || el.textContent || "").replace(/\s+/g, " ").trim();
             const aria = (el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
@@ -620,6 +631,8 @@ export async function findApplicationEntry(page: Page): Promise<{ locator: Locat
               fromText: useOwn,           // how the label was derived decides how we re-find it
               href: el.getAttribute("href") || "",
               index,
+              // Inside an account menu or panel: used only when nothing outside it is an entry.
+              inAccount: !!el.closest("[data-al-chrome='account']"),
             };
           })
           .filter((c) => c.label);
@@ -644,7 +657,9 @@ export async function findApplicationEntry(page: Page): Promise<{ locator: Locat
     for (const c of scan.candidates) {
       if (!matchesEntryLabel(c.label)) continue;
       if (formShaped && /\bsubmit\b/i.test(c.label)) continue;
-      const rank = entryRank(c.label);
+      // An entry inside an account menu/panel ranks after EVERY entry outside one, so the page's
+      // own "Apply for a Permit" still wins over an "Apply for a License" in the account menu.
+      const rank = entryRank(c.label) + (c.inAccount ? ENTRY_PATTERNS.length + 1 : 0);
       if (best && rank >= best.rank) continue;
       // Re-locate the way the label was DERIVED. A label taken from aria-label or a tooltip
       // is not on the page as text, so locating it by text finds nothing — which is how an
@@ -964,29 +979,43 @@ export async function chooseApplicationType(
     // Scanned FIRST: scanChoiceTiles stamps the page's chrome, which the label pool reads.
     const tiles = await scanChoiceTiles(scope);
     let labels: string[] = [];
+    let frameLabels: string[] = [];
     try {
-      labels = await (scope as Frame).evaluate(() => {
+      const pools = await (scope as Frame).evaluate(() => {
         const vis = (el: Element): boolean => {
           const r = (el as HTMLElement).getBoundingClientRect();
           return r.width > 0 && r.height > 0;
         };
-        // NEVER CHROME (#328): not the frame, not a menu toggle, not the installer's own
-        // account. Live DevHub's account button reads the company's name, which contains
-        // "Solar", and tied with "Solar Permit Request" as the job's type.
-        return (Array.from(document.querySelectorAll("a, button, [role=button], input[type=button]")) as HTMLElement[])
+        // NEVER THE ACCOUNT, NEVER A MENU TOGGLE (#328). Live DevHub's account button reads the
+        // company's name, which contains "Solar", and tied with "Solar Permit Request".
+        // The FRAME (nav, header, footer, menus, a wrapper whose class says "menu"/"progress") is
+        // read only when nothing outside it names the job: a type list can live in a sidebar, but
+        // a header's "Going Solar" link must never outrank the page's own "Electrical Permit".
+        const text = (el: HTMLElement) => ((el as HTMLInputElement).value || el.textContent || "").replace(/\s+/g, " ").trim();
+        const all = (Array.from(document.querySelectorAll("a, button, [role=button], input[type=button]")) as HTMLElement[])
           .filter(vis)
-          .filter((el) => !el.closest("[data-al-chrome]"))
-          .map((el) => ((el as HTMLInputElement).value || el.textContent || "").replace(/\s+/g, " ").trim())
-          .filter((t) => t.length >= 3);
+          .filter((el) => !el.closest("[data-al-chrome='account'], [data-al-chrome='toggle']"));
+        return {
+          main: all.filter((el) => !el.closest("[data-al-chrome]")).map(text).filter((t) => t.length >= 3),
+          frame: all.filter((el) => !!el.closest("[data-al-chrome]")).map(text).filter((t) => t.length >= 3),
+        };
       });
-    } catch { labels = []; }
+      labels = pools.main; frameLabels = pools.frame;
+    } catch { labels = []; frameLabels = []; }
     const tileLabels = tiles.map((t) => t.label);
-    if (!labels.length && !tiles.length) continue;
+    if (!labels.length && !frameLabels.length && !tiles.length) continue;
     for (const l of [...labels, ...tileLabels]) if (!offeredAll.includes(l)) offeredAll.push(l);
     for (const l of tileLabels) if (!tilesAll.includes(l)) tilesAll.push(l);
     for (const t of tiles) tileChoices.push({ label: t.label, locator: (scope as Frame).locator(`[data-al-tile="${t.key}"]`).first() as Locator });
 
-    const matched = [...new Set(permitTypeCandidates([...labels, ...tileLabels], track, { ownNames: opts.ownNames }))];
+    let matched = [...new Set(permitTypeCandidates([...labels, ...tileLabels], track, { ownNames: opts.ownNames }))];
+    if (!matched.length && frameLabels.length) {
+      // ...and only a label that reads as an application ("Solar Permit"), never a header's
+      // "Going Solar" or a footer's "Solar Energy Program".
+      matched = [...new Set(permitTypeCandidates(frameLabels, track, { ownNames: opts.ownNames }))]
+        .filter((l) => /\b(permits?|applications?|requests?|interconnection)\b/i.test(l));
+      if (matched.length) labels = [...labels, ...frameLabels];
+    }
     if (matched.length === 1) {
       const label = matched[0];
       // A link/button that carries the label is the control; a tile is the control only when
