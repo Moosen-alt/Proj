@@ -1063,6 +1063,8 @@ function extractSnow(text: string, source: string, out: StatedDesignCriterion[],
 // labels sheet of the most common plan-set template).
 const CODE_BASIS_HEADER = /\b(governing\s+codes?|applicable\s+codes?|code\s+basis|design\s+codes?|codes?\s+and\s+standards|references\s+and\s+codes|building\s+codes?\s+used|codes?\s+used)\b\s*[:\-–]?|\bcodes\s*:|(?<!\bper\s{1,3})\bcode\s*:(?=\s*(?:(?:19|20)\d{2}\s+[A-Z]{2,6}\b|[A-Z]{2,6}\s+(?:19|20)\d{2}\b))/gi;
 const NAME_STOPWORDS = new Set(["OF", "THE", "AND", "FOR", "&", "PER", "BY", "IN", "TO", "WITH", "AS", "ON", "AT", "SEE"]);
+/** Qualifiers that make a generic mention of a code, not its name: "LOCAL FIRE CODE", "CURRENT BUILDING CODE". */
+const GENERIC_QUALIFIER = /^(?:(?:LOCAL|APPLICABLE|GOVERNING|ADOPTED|CURRENT|LATEST|MUNICIPAL|PREVAILING|REQUIRED|ALL)\s+)+/i;
 /** An abbreviation reads as a CODE only when it ends in C (NEC, IRC, OESC, IECC …) or is a
  *  known code token (FBC-R); "OREGON", "ASCE", "NDS" and every other capitalised word do not. */
 const CODE_ABBR = /^[A-Z]{1,5}C$/;
@@ -1211,6 +1213,9 @@ const RUN_GLUE = /^(?:\s|[,;:•·▪●■◦*/&\-–—]|\(\s*[a-z0-9]{1,2}\s*
 
 type CodeToken = {
   kind: "year" | "name" | "abbr";
+  /** A generic mention of a code ("THE BUILDING CODE", "LOCAL FIRE CODE"): it keeps its slot in a
+   *  list, so the items around it pair as printed, but it names no code and reads nothing. */
+  generic?: boolean;
   at: number;
   end: number;
   /** The year, the abbreviation, or the printed name with its state tail. */
@@ -1281,10 +1286,12 @@ function codeTokens(text: string, windows: Array<[number, number]>, taken: Array
     const end = nameEnd + tail.length;
     if (!free(at, end)) continue;
     const token: CodeToken = { kind: "name", at, end, value: blanked.slice(at, end), bare: blanked.slice(at, nameEnd), tail: blanked.slice(end, end + 20), paren: parenAt(end), shortAt };
-    // A name of fewer than three initials is no code ("THE BUILDING CODE", "Fire Code:") unless it
-    // is a known one; as a token it would only take a year that belongs to the next item (#314).
-    const code = nameTokenCode(token);
-    if (code.replace(/-.*$/, "").length < 3 && !(MODEL_CODES.has(code) || code in STATE_CODE_BASE)) continue;
+    // A name of fewer than three initials, once a generic qualifier is set aside, is no code unless it
+    // is a known one ("THE BUILDING CODE", "LOCAL FIRE CODE", "Fire Code:"). It stays a token, so a
+    // list that prints its own year beside it ("BUILDING CODE 2021, NEC 2020") still pairs as printed,
+    // but it is GENERIC: it reads nothing, and pairCodeTokens may make it a run's stray (#314).
+    const code = nameTokenCode({ ...token, value: token.value.replace(GENERIC_QUALIFIER, ""), bare: token.bare!.replace(GENERIC_QUALIFIER, "") });
+    if (code.replace(/-.*$/, "").length < 3 && !(MODEL_CODES.has(code) || code in STATE_CODE_BASE)) token.generic = true;
     out.push(token);
   }
   let m: RegExpExecArray | null;
@@ -1347,15 +1354,13 @@ function pairCodeTokens(tokens: CodeToken[], blanked: string): Array<{ code: Cod
   }
   const pairs: Array<{ code: CodeToken; year: CodeToken; weak: boolean }> = [];
   for (let run of runs) {
-    // A run that opens AND closes with a code has one code without a year of its own. When one end
-    // is the only spelled-out name among abbreviations (or the only abbreviation among names), that
-    // end is it: "LOCAL FIRE CODE 2021 IRC 2020 NEC" is the IRC 2021 and NEC 2020, read surely,
-    // never a Local Fire Code that took the IRC's year and left the NEC without one (#314).
-    if (run.length >= 3 && run.length % 2 === 1 && run[0].kind !== "year" && run[run.length - 1].kind !== "year") {
-      const codes = run.filter((t) => t.kind !== "year");
-      const odd = (end: CodeToken): boolean => codes.every((t) => t === end || t.kind !== end.kind);
-      if (odd(run[0]) && !odd(run[run.length - 1])) run = run.slice(1);
-      else if (odd(run[run.length - 1]) && !odd(run[0])) run = run.slice(0, -1);
+    // In an odd run one token has no partner. When exactly one end is a generic mention, that end is
+    // it: "LOCAL FIRE CODE 2021 IRC 2020 NEC" is the IRC 2021 and NEC 2020, read surely, never a Local
+    // Fire Code that took the IRC's year and left the NEC without one (#314). Any other odd run stays
+    // weak: a real code at either end ("NEC 2023, OREGON RESIDENTIAL SPECIALTY CODE 2023, OREGON FIRE
+    // CODE") may be the dated one, and dropping it would slide every year onto the wrong code.
+    if (run.length >= 3 && run.length % 2 === 1 && !!run[0].generic !== !!run[run.length - 1].generic) {
+      run = run[0].generic ? run.slice(1) : run.slice(0, -1);
     }
     if (run.length < 2) continue;
     const weak = run.length % 2 === 1;
@@ -1396,6 +1401,7 @@ function codeBasisItems(text: string): BasisItem[] {
   for (const pair of pairCodeTokens(tokens, blankParentheticals(text))) {
     const { year, weak } = pair;
     let code = pair.code;
+    if (code.generic) continue;
     // A name paired with the year AFTER it (name-first) does not own the words before its stopword:
     // in "CITY OF LOS ANGELES BUILDING CODE 2023 CITY OF LOS ANGELES ELECTRICAL CODE 2020" the 2023
     // before the second "CITY OF" is the first code's edition, so the second is the LAEC like the first.

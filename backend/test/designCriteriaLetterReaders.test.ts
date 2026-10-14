@@ -280,6 +280,32 @@ for (const [text, want] of YEARLESS_ROWS) {
   });
 }
 
+// Review of #317: a name-first list whose LAST item has no year is weak, as #313 reads it. The real,
+// dated code at its front is never dropped as a stray: that slid every year onto the wrong code and
+// BLOCKED a correct package. Each is checked against a verified profile recording the plan's editions.
+const YEARLESS_LAST: Array<[string, Array<{ code: string; edition: string }>, string[]]> = [
+  ["NEC 2023, OREGON RESIDENTIAL SPECIALTY CODE 2023, OREGON FIRE CODE (LATEST EDITION)",
+    [{ code: "ORSC", edition: "2023" }, { code: "OFC", edition: "2025" }, { code: "NEC", edition: "2023" }], ["NEC 2023 weak", "ORSC 2023 weak"]],
+  ["DESIGNED PER NEC 2023, THE OREGON RESIDENTIAL SPECIALTY CODE 2023 AND THE OREGON FIRE CODE.",
+    [{ code: "ORSC", edition: "2023" }, { code: "OFC", edition: "2025" }, { code: "NEC", edition: "2023" }], ["NEC 2023 weak", "ORSC 2023 weak"]],
+  ["LOS ANGELES BUILDING CODE 2023 CBC 2022 CRC",
+    [{ code: "LABC", edition: "2023" }, { code: "CBC", edition: "2022" }, { code: "CRC", edition: "2022" }], ["CBC 2022 weak", "LABC 2023 weak"]],
+];
+for (const [text, adopted, want] of YEARLESS_LAST) {
+  check(`MUST-PASS: a name-first list whose last item has no year stays weak and right — "${text.slice(0, 60)}…" raises no basis-mismatch`, () => {
+    assert.deepEqual(readings(GOV(text)), want);
+    const f = get(findings(project({}), { ...VERIFIED_OR, adoptedCodes: adopted }, [{ label: "Plan set", text: GOV(text) }]), BASIS);
+    assert.equal(f, undefined, f?.message);
+  });
+}
+
+check("MUST-PASS: a generic mention keeps its slot — its own year is never left for the next code", () => {
+  assert.deepEqual(readings(GOV("BUILDING CODE 2021, NEC 2020")), ["NEC 2020 sure"]);
+  // A generic mention in the middle names nothing; the run's cut-off end keeps it weak.
+  assert.deepEqual(readings(GOV("IRC 2021, LOCAL FIRE CODE 2021, NEC 2020, IFC")), ["IRC 2021 weak", "NEC 2020 weak"]);
+  assert.deepEqual(readings(GOV("LOCAL FIRE CODE 2021, IRC 2020, NEC 2017")), ["IRC 2020 sure", "NEC 2017 sure"]);
+});
+
 check("MUST-PASS: all-caps prose before a name-first name is not part of it — 'SHALL CONFORM TO CHICAGO ELECTRICAL CODE 2018' is CEC 2018", () => {
   assert.deepEqual(codes("SHALL CONFORM TO CHICAGO ELECTRICAL CODE 2018"), ["CEC 2018"]);
   assert.deepEqual(codes(GOV("ALL WORK SHALL CONFORM TO CHICAGO ELECTRICAL CODE 2018")), ["CEC 2018"]);
