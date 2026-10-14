@@ -20,6 +20,22 @@ import { parseStreetName, parseStreetNumber, parseStreetLine, correctTruncatedAd
 import { portalUploadCapBytes } from "../uploadCap";
 import { LearnRunDebug } from "../learnDebug";
 import { armHumanCaptureOnPage } from "../humanCapture";
+import { chooseDraftForm, findSiteDraft, isDraftFormRefusal, modificationOnOriginalNotice } from "../draftCreated";
+import { scanProjectForms, type ProjectFormRow } from "./correctionForm";
+import { readApplicationLedgerInPage, type LedgerEntry } from "./submissionLedger";
+import { LIST_LINK } from "../statusFinder";
+
+/** See AutoLearnAdapter's continueDraft option (#302). */
+export interface ContinueDraft {
+  /** The draft's number as a run recorded it ("NEM-44131"), when one did. */
+  applicationNumber?: string;
+  /** The form the draft page said to continue to, when a run recorded it. */
+  nextForm?: string;
+  /** The project's street address, for finding an unsubmitted draft no run recorded. */
+  street?: string;
+  /** A draft is ON RECORD for this project: never start a new application. */
+  required?: boolean;
+}
 import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isSignatureNameLabel, isTypeSignatureToggleLabel, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
 import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
@@ -213,6 +229,9 @@ export interface LearnResult {
   /** What the person taking the review page must know before submitting (unsaved answers, held
    *  calls) — the same lines are appended to `message`. B3 / B14. */
   reviewHandoffNotes?: string[];
+  /** This walk opened the project's EXISTING draft and continued it (#302) instead of starting
+   *  an application. Its steps start inside that one record, so they are not a recipe. */
+  continuedDraft?: { applicationNumber: string; form: string; why: string };
 }
 
 // Live progress signal emitted while learning a portal, so the UI can show a real
@@ -2009,6 +2028,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   // Who and where this project is, for choosing between versions of an address on a
   // disambiguation grid. Not fill data — identity used to REJECT another property's row.
   private siteIdentity: SiteIdentity | undefined;
+  /** #302 — see the continueDraft option. */
+  private continueDraft: ContinueDraft | undefined;
+  /** The existing draft this walk opened instead of starting an application (#302). */
+  private continuedDraft: LearnResult["continuedDraft"];
+  /** Lines for the person at review that come from the PAGE, not the run (#302: PSE's red
+   *  "file as a modification on the original record" notice). */
+  private pageReviewNotes: string[] = [];
   // Operator delegation for the final submit, honoured only alongside PORTAL_ALLOW_FINAL_SUBMIT=1.
   private allowFinalSubmit = false;
   // Tri-state on purpose: false means the project SAYS there is no battery (guard it),
@@ -2188,6 +2214,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
        *  itself, named. Default 360 000 (live Accela reaches its first fill ~4 pages / ~250 s in). A page that never becomes fillable must not cost
        *  90 s x N advance passes. */
       noProgressBudgetMs?: number;
+      /** THIS PROJECT'S EXISTING DRAFT (#302): before starting a new application, look for the
+       *  project's unsubmitted draft — by the number a run recorded, else by an unsubmitted row on
+       *  the project's street — and open the form that continues it ("Interconnection Application
+       *  - Part 2" [Begin]). `required`: a draft is on record, so a new application is never
+       *  started: a draft that cannot be opened stops the run, named. */
+      continueDraft?: ContinueDraft;
     } = {},
   ) {
     super();
@@ -2196,6 +2228,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     this.policyProfile = options.policyProfile ?? "residential_nem";
     this.bindableFields = new Set(options.bindableFields ?? []);
     this.siteIdentity = options.siteIdentity;
+    this.continueDraft = options.continueDraft;
     this.allowFinalSubmit = options.allowFinalSubmit === true;
     this.hasBattery = options.hasBattery;
     this.equipment = options.equipment ?? {};
@@ -3301,6 +3334,86 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     if (this.hbTimer) { clearInterval(this.hbTimer); this.hbTimer = null; }
   }
 
+  private continueDraftTried = false;
+
+  /**
+   * OPEN THIS PROJECT'S EXISTING DRAFT AND THE FORM THAT CONTINUES IT (#302). Clicks only two
+   * things, both chosen by what they say: the draft's own record link (the number on the account's
+   * list, exact text) and its next form's own row control (chooseDraftForm — by name, never a
+   * cancellation, never a "View" receipt). Every uncertain outcome is "none" (nothing listed for
+   * this project: the walk starts an application as before, unless a draft is on record) or
+   * "refused" (something is there and cannot be chosen safely: the walk stops, named). Nothing is
+   * recorded as a recipe step — these clicks belong to one house's record.
+   */
+  private async openExistingDraft(cd: ContinueDraft): Promise<
+    | { kind: "opened"; applicationNumber: string; form: string; why: string }
+    | { kind: "none" | "refused"; why: string }
+  > {
+    const page = this.page;
+    if (!page || typeof page.evaluate !== "function") return { kind: "none", why: "no page to read" };
+    const readList = async (): Promise<LedgerEntry[]> => (await page.evaluate(readApplicationLedgerInPage).catch(() => [])) as LedgerEntry[];
+    let find = findSiteDraft(await readList(), cd);
+    // A recorded draft that is not on the landing page: the portal's own application list, once,
+    // by read-only navigation (the link that names the list — statusFinder's LIST_LINK).
+    if (!find.found && !find.ambiguous && cd.applicationNumber) {
+      const links = page.locator("a, [role='link']");
+      const n: number = await links.count().catch(() => 0);
+      for (let i = 0; i < Math.min(n, 80); i++) {
+        const t = String(await links.nth(i).innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+        if (!LIST_LINK.test(t)) continue;
+        const beforeUrl = String(page.url?.() ?? "");
+        const beforeFp = await this.pageFingerprint();
+        if (await links.nth(i).click({ timeout: 8000 }).then(() => true).catch(() => false)) {
+          await this.waitAfterClick(beforeUrl, beforeFp, this.tabCount());
+          find = findSiteDraft(await readList(), cd);
+        }
+        break;
+      }
+    }
+    if (!find.found) return { kind: find.ambiguous ? "refused" : "none", why: find.why };
+    const appNo = find.entry.id;
+    // The record's own link: exact text first, so NEM-4413 can never open NEM-44131.
+    const linkish = this.page!.locator("a, [role='link']").filter({ hasText: appNo });
+    const count: number = await linkish.count().catch(() => 0);
+    let target: { click: (o?: { timeout?: number }) => Promise<void> } | null = null;
+    for (let i = 0; i < Math.min(count, 25); i++) {
+      const t = String(await linkish.nth(i).innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+      if (t === appNo) { target = linkish.nth(i); break; }
+    }
+    if (!target) return { kind: "refused", why: `the draft ${appNo} is listed, but no link on the list is exactly "${appNo}"` };
+    {
+      const beforeUrl = String(this.page!.url?.() ?? "");
+      const beforeFp = await this.pageFingerprint();
+      const clicked = await target.click({ timeout: 10_000 }).then(() => true).catch(() => false);
+      if (!clicked) return { kind: "refused", why: `the draft ${appNo}'s link could not be clicked` };
+      await this.waitAfterClick(beforeUrl, beforeFp, this.tabCount());
+    }
+    const recordText = String(await this.page!.locator("body").innerText().catch(() => ""));
+    if (!recordText.includes(appNo)) return { kind: "refused", why: `the page the draft's link opened does not mention ${appNo}` };
+    let scanFailed = false;
+    const rows = (await this.page!.evaluate(scanProjectForms).catch(() => { scanFailed = true; return []; })) as ProjectFormRow[];
+    if (scanFailed) return { kind: "refused", why: `the form list on the draft ${appNo} could not be read` };
+    const choice = chooseDraftForm(rows, cd.nextForm ?? "");
+    if (isDraftFormRefusal(choice)) return { kind: "refused", why: `draft ${appNo}: ${choice.why} (offered: ${choice.offered.join(" | ").slice(0, 200) || "nothing"})` };
+    const beforeUrl = String(this.page!.url?.() ?? "");
+    const beforeFp = await this.pageFingerprint();
+    const control = this.page!.locator(`[data-al-cform="${choice.row.key}"]`).first();
+    const clicked = await control.click({ timeout: 10_000 }).then(() => true).catch(() => false);
+    if (!clicked) return { kind: "refused", why: `draft ${appNo}: the "${choice.row.name}" [${choice.row.action}] control could not be clicked` };
+    await this.waitAfterClick(beforeUrl, beforeFp, this.tabCount());
+    const moved = String(this.page!.url?.() ?? "") !== beforeUrl || (await this.pageFingerprint()) !== beforeFp;
+    if (!moved) return { kind: "refused", why: `draft ${appNo}: clicking "${choice.row.name}" [${choice.row.action}] did not open the form` };
+    return { kind: "opened", applicationNumber: appNo, form: choice.row.name, why: `${find.why}; ${choice.why}` };
+  }
+
+  /** The left-open page's visible text, scrubbed of every secret this run knows. Read-only: the
+   *  caller (index.ts draftAwareHumanSink) reads what a person's submit click produced (#302). */
+  async readCurrentPageText(): Promise<string> {
+    if (!this.page) return "";
+    const body = await this.page.locator("body").innerText({ timeout: 5000 }).catch(() => "");
+    return this.scrubSecrets(String(body ?? ""));
+  }
+
   // PATCH-BY-DEMONSTRATION: arm the (still-open, headed) page so anything the human
   // fixes by hand at the review handoff — a missed dropdown, an unmapped field — is
   // captured as RecipeSteps and streamed to the caller for merging into the learned
@@ -3348,10 +3461,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // answers the portal may not have saved, and the portal's own background calls the lockdown
       // held back (a section may render incomplete). The learner cannot tell how the page was
       // reached, so the advice is the portal's own navigation, never a reload.
+      if (this.continuedDraft) result = { ...result, continuedDraft: this.continuedDraft };
       if (result.reachedReview) {
         const reviewUrl = (() => { try { return typeof this.page?.url === "function" ? String(this.page.url() || "") : ""; } catch { return ""; } })();
         const blockedCalls = backstop ? portalOwnCallsBlockedAtReview(backstop.aborts, reviewUrl) : [];
-        const handoff = [this.reviewUnsavedWarning, reviewBlockedCallsLine(blockedCalls, null)].filter(Boolean);
+        const handoff = [this.reviewUnsavedWarning, reviewBlockedCallsLine(blockedCalls, null), ...this.pageReviewNotes].filter(Boolean);
         if (handoff.length) {
           result = { ...result, reviewPageBlockedCalls: blockedCalls, reviewHandoffNotes: handoff, message: `${result.message} ${handoff.join(" ")}` };
           this.debug?.event({ type: "review_handoff_notes", notes: handoff.map((h) => h.slice(0, 200)) });
@@ -5533,6 +5647,27 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         }
       }
 
+      // b8z) THIS PROJECT'S EXISTING DRAFT (#302) — before anything could start a NEW application.
+      //      A two-part portal (PSE PowerClerk) made a draft at Part 1's Submit; starting again would
+      //      mint a second application number for the same house (owner ruling 2026-10-10). Once
+      //      per run, and only while nothing has been filled.
+      if (this.continueDraft && !this.continueDraftTried && !reviewSignals && this.page
+        && !steps.some((st) => st.action === "fill" || st.action === "select" || st.action === "check")) {
+        this.continueDraftTried = true;
+        const opened = await this.openExistingDraft(this.continueDraft);
+        this.debug?.event({ type: "existing_draft", page: pageCount, kind: opened.kind, why: opened.why.slice(0, 200) });
+        if (opened.kind === "opened") {
+          this.continuedDraft = { applicationNumber: opened.applicationNumber, form: opened.form, why: opened.why };
+          continue;
+        }
+        if (opened.kind === "refused" || this.continueDraft.required) {
+          return {
+            ...fail(steps, this.portalName, `Stopped before starting an application: ${opened.why}. This project already has a draft on the portal${this.continueDraft.applicationNumber ? ` (${this.continueDraft.applicationNumber})` : ""}, and starting again would create a second one. Open the draft by hand, or correct the recorded draft, then stage again.`, null, pageCount, portalNotices),
+            stopReason: "existing_draft_not_opened",
+          };
+        }
+      }
+
       // b9) DETERMINISTIC APPLICATION ENTRY (portal-agnostic). On a logged-in DASHBOARD the
       //     only useful move is "start a new application", and every vendor words that
       //     control differently ("Create an Application", a bare "Apply" tile, "Apply for a
@@ -5904,6 +6039,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // Scrubbed before they are kept: a portal repeats a typed account back ("Account number …
           // could not be found"), and these leave the process (result.portalNotices, messages).
           const notices = (await collectPortalNoticesFrom(this.page)).map((n) => this.scrubSecrets(n));
+          // PSE's red Part 1 notice (#302): a change to an existing system goes on the ORIGINAL
+          // record as a modification, when one exists. A person decides that — a review note, never
+          // a stop.
+          {
+            const mod = modificationOnOriginalNotice(this.scrubSecrets(bodyText || ""));
+            const line = mod ? `The portal says: "${mod}" Check whether this project has an original interconnection record before submitting.` : "";
+            if (line && !this.pageReviewNotes.includes(line)) this.pageReviewNotes.push(line);
+          }
           const fresh = notices.filter((n) => !portalNotices.includes(n));
           if (fresh.length) {
             for (const n of fresh) portalNotices.push(n);

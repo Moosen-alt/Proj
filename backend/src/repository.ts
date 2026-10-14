@@ -96,6 +96,7 @@ import { readAndRecordPortalFees } from "./portalFeeReadings";
 import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential } from "./portalCredentials";
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
 import { logger } from "./logger";
+import { draftContinuationGaps, openPortalDraftFor, recordPortalDraft, type ObservedDraft } from "./portalDraft";
 import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, type HostFit, type PortalUrlSource } from "./portalChannel";
 import { isPortalPaused } from "./portalPause";
 // The ONE creator of permit_check_targets rows (extracted from markTrackSubmitted).
@@ -8908,8 +8909,18 @@ export async function prepareSubmission(
     // WRITTEN ONLY WHEN THE READ IS CONFIDENT. Every downstream check keys on this value,
     // so a low-confidence read is recorded as a NOTE for the operator to confirm rather
     // than written as fact — the manual capture form keeps working exactly as it does now.
-    onSubmitCaptured: (capture: { recordNumber: string; confidence: string; reason: string; recordLink: string }) => {
+    onSubmitCaptured: (capture: { recordNumber: string; confidence: string; reason: string; recordLink: string; draftCreated?: ObservedDraft }) => {
       try {
+        // THE CLICK ONLY MADE A DRAFT (#302: PSE's Part 1 Submit). Nothing was filed: no submission,
+        // no record number. The draft is written down for the next stage to continue, and the
+        // replayed recipe's final-submit flag comes off the step that made it (portalDraft.ts).
+        if (capture.draftCreated) {
+          const healed = recordPortalDraft(db, { projectId, track: track ?? "permit", draft: capture.draftCreated, runId, recipeId: recipe?.id ?? null, source: "replay" });
+          logger.info("submit-capture", "the submit created a draft, not a filing — recorded for the next stage", {
+            project: projectId, track, healed: healed.healed, why: healed.why,
+          });
+          return;
+        }
         if (capture.confidence === "high" && capture.recordNumber) {
           // runId is minted above, before staging, and the row exists by the time a human
           // gets round to clicking submit — this fires from the left-open window, minutes
@@ -8944,6 +8955,8 @@ export async function prepareSubmission(
     // AND PacifiCorp on different subdomains) log in to the RIGHT portal instead of a
     // hardcoded default. Already permit/utility scoped by the credentialUrl resolution.
     loginUrl: credentialUrl || undefined,
+    // The replay's existing-draft check (#302): NEM only — the two-part utility portals.
+    siteDraft: track === "nem" ? { street: portalProject.projectAddress } : undefined,
   };
 
   // UNIVERSAL-FIRST dispatch with SELF-SEED (see selectStagingActor):
@@ -9008,7 +9021,14 @@ export async function prepareSubmission(
     simulationEnabled: process.env.MOCK_PORTAL === "1",
     portalPaused,
   });
-  const runActorLabel = channelDecision.adapterLabel;
+  // THIS PROJECT HAS A DRAFT ON THE PORTAL ALREADY (#302): a two-part portal's Part 1 Submit made
+  // it, and replaying the recipe would start the application again — a second number for the same
+  // house. The learner opens that draft's next form instead (AutoLearnAdapter continueDraft).
+  // Only where the replay would otherwise run; every other decision stands as it was.
+  const nemDraft = track === "nem" ? openPortalDraftFor(db, projectId, "nem") : null;
+  const runActorLabel = nemDraft && autoSeedEnabled && channelDecision.adapterLabel === "RecipeAdapter"
+    ? "AutoLearnAdapter"
+    : channelDecision.adapterLabel;
   // Now that the actor is known, name a real-but-profile-less portal by its track identity so the
   // status/audit text below doesn't read "Mock portal" for a run that actually drives a browser.
   if (!isRealPortal && runActorLabel !== "MockPortalAdapter") {
@@ -9299,7 +9319,17 @@ export async function prepareSubmission(
       // → keep. Nothing attributable → keep AND flag for a human. A paused run (MFA/CAPTCHA
       // wall) is not a failure of anything and never reaches here.
       // Only a replay that FAILED (not a pause) is judged. A paused run stopped at a challenge.
-      const replayFailed = result && result.ok === false && !(typeof result.pauseReason === "string" && result.pauseReason);
+      // THE ADDRESS ALREADY HAD A DRAFT ON THE PORTAL (#302): the replay stopped before its first
+      // step, so nothing was started and nothing in the recipe failed. One found draft is written
+      // down — the next stage opens it (openPortalDraftFor) instead of replaying the start again.
+      const existingDraft = (result as { existingDraft?: { applicationNumber?: string; why?: string; ambiguous?: boolean } }).existingDraft ?? null;
+      if (existingDraft && track === "nem" && existingDraft.applicationNumber && !existingDraft.ambiguous) {
+        recordPortalDraft(db, {
+          projectId, track: "nem", runId, recipeId: null, source: "replay",
+          draft: { applicationNumber: existingDraft.applicationNumber, nextForm: "", evidence: String(existingDraft.why ?? ""), strength: "status" },
+        });
+      }
+      const replayFailed = result && result.ok === false && !(typeof result.pauseReason === "string" && result.pauseReason) && !existingDraft;
       // THE PORTAL SAID THIS ADDRESS IS NOT SERVED THERE (portal-truth D5). The replay stopped with
       // the portal's own words; nothing filed here is kept for this entity on that host: its own
       // recipe is refused (flagged, demoted — never replayed again until a person clears it); on a
@@ -9418,6 +9448,14 @@ export async function prepareSubmission(
           : `Staging stopped before opening a browser: ${credentialUrl} — ${learnFit.reason}.`;
         addAuditLog(db, projectId, "system", "submit gate", trackHostConflict ? "portal.track_host_conflict" : "portal.entity_host_conflict", { track: track ?? "permit", url: credentialUrl, code: learnFit.code });
         result = { ok: false, finalSubmitClicked: false, pauseReason: null, message: msg, steps: [{ ok: false, message: msg }] };
+      } else if (nemDraft && draftContinuationGaps(stagedProject).length) {
+        // PART 2 STEP 1 ASKS FOR THE ACCOUNT, THE METER, THE NAME ON THE BILL AND THE SERVICE
+        // ADDRESS (#302) — the "Validated Information" PSE checks against its records. Stopped here,
+        // named, before a browser opens: a draft continued without them cannot be submitted.
+        const gaps = draftContinuationGaps(stagedProject);
+        const msg = `Staging stopped before opening the portal: this project's draft${nemDraft.applicationNumber ? ` ${nemDraft.applicationNumber}` : ""} continues with the customer information the utility validates, and the project is missing ${gaps.join(", ")}. Add ${gaps.length > 1 ? "them" : "it"} to the project (from the customer's bill), then stage again. Nothing was opened.`;
+        addAuditLog(db, projectId, "system", "submit gate", "portal.draft_continuation_missing", { track: "nem", missing: gaps });
+        result = { ok: false, finalSubmitClicked: false, pauseReason: null, message: msg, steps: [{ ok: false, message: msg }] };
       } else {
         try {
           const { autoLearnPortal } = await import("./autoLearn");
@@ -9446,6 +9484,11 @@ export async function prepareSubmission(
             // Match the hand-coded/replay adapters' headed setting so the self-seed opens a visible
             // browser locally and leaves it open at review for the human (headless on a server).
             headless: stageOptions.headless,
+            // THIS PROJECT'S EXISTING DRAFT (#302): a recorded one is opened and never re-started; with
+            // none recorded, the walk still looks for an unsubmitted draft listed for this street.
+            continueDraft: track === "nem"
+              ? { applicationNumber: nemDraft?.applicationNumber || undefined, nextForm: nemDraft?.nextForm || undefined, street: portalProject.projectAddress, required: Boolean(nemDraft) }
+              : undefined,
           });
           result = seedOutcomeToStageResult(seed);
           // Say WHY this stage learned instead of replaying, so a re-learn on an AHJ that
