@@ -187,8 +187,9 @@ function entryRank(label: string): number {
 //     the card's body would otherwise qualify as a tile inside the tile);
 //   - no fillable control and no button of its own (those would be the control);
 //   - REPEATED as alike siblings — one card is content, a row of them is a menu;
-//   - its title and affordance are its OWN: a section that holds tiles "has" the first tile's
-//     title and icon, and must not be taken for a tile itself.
+//   - a LEAF: it holds no other such block. A section that holds tiles "has" the first tile's
+//     title and icon, and a panel may carry its own heading and chevron over them; neither is
+//     a tile, and the cuts (size, chrome, hidden) are applied only after that is settled.
 // Its LABEL is its title. The inner information links keep their own labels and stay exactly
 // as off-limits as they were.
 //
@@ -231,18 +232,19 @@ export function markChoiceTilesInPage(): ChoiceTileRaw[] {
   const NEXT_TOKEN = /(?:^|[-_])(?:next|forward)(?:[-_]|$)/i;
   const NOT_FORWARD = /(?:^|[-_])(?:down|up|left|back|prev|previous|collapse|expand)(?:[-_]|$)/i;
 
-  const found: Array<{ el: Element; title: string; titleEl: Element; affEl: Element | null }> = [];
+  // STAGE 1 — SHAPE. Every block with a title and a forward affordance of its own, BEFORE
+  // any cut. A block the cuts below would drop (hidden, too small, inside chrome, its title
+  // a link) still counts here, because the bug this guards against is a CONTAINER inheriting
+  // a cut descendant's title or arrow: the scan asked "does this element hold a title and an
+  // arrow?" and a section around nine cards does — it holds the first card's. Cut the cards
+  // first and the section is the page's one "tile", labelled by a card it is not, clicked at
+  // its centre into whichever card sits there (a Demolition request, recorded as Building).
+  const shaped: Array<{ el: Element; title: string; titleEl: Element; affEl: Element | null }> = [];
   for (const el of Array.from(document.querySelectorAll("div, li, section, article"))) {
-    if (el.closest(CHROME)) continue;
     if (el.closest("button")) continue;
-    const r = el.getBoundingClientRect();
-    if (r.width < 80 || r.height < 32) continue;
     if (el.querySelector(FILLABLE) || el.querySelector(OWN_CONTROL)) continue;
     const titleEl = el.querySelector(TITLE);
     if (!titleEl) continue;
-    // A title that IS a link already has its control — the link — and a label of its own.
-    const titleLink = titleEl.closest("a, button");
-    if (titleLink && el.contains(titleLink)) continue;
     const title = (titleEl.textContent || "").replace(/\s+/g, " ").trim();
     if (title.length < 3 || title.length > 120) continue;
 
@@ -260,6 +262,9 @@ export function markChoiceTilesInPage(): ChoiceTileRaw[] {
         // An inner link's own icon is not the tile's affordance.
         const inner = d.closest("a, button");
         if (inner && el.contains(inner)) continue;
+        // An arrow nobody can see (the cards of a collapsed section) is not one either.
+        const dr = d.getBoundingClientRect();
+        if (dr.width === 0 && dr.height === 0) continue;
         let hit = false;
         for (const tok of String(d.getAttribute("class") || "").split(/\s+/)) {
           if (!tok || NOT_FORWARD.test(tok)) continue;
@@ -274,27 +279,43 @@ export function markChoiceTilesInPage(): ChoiceTileRaw[] {
       affordance = affEl !== null;
     }
     if (!affordance) continue;
-    found.push({ el, title, titleEl, affEl });
+    shaped.push({ el, title, titleEl, affEl });
   }
 
-  // OWNERSHIP: a candidate whose title or icon lives inside ANOTHER candidate is a wrapper
-  // (the section around the tiles), not a tile.
-  const own = found.filter((c) => !found.some((o) =>
-    o !== c && c.el.contains(o.el) && (o.el.contains(c.titleEl) || (c.affEl !== null && o.el.contains(c.affEl)))));
+  // STAGE 2 — A TILE IS A LEAF. A shaped block that holds another shaped block is the section,
+  // panel or list AROUND tiles, never one of them — whether it borrowed its title and arrow
+  // from a card inside it or carries its own ("Permit Applications ›" as a panel heading over
+  // the menu). It is dropped even when every card inside it is cut below: the cards still say
+  // what it is. Leaves never nest, so the click lands on the element that was scanned.
+  const leaves = shaped.filter((c) => !shaped.some((o) => o !== c && c.el.contains(o.el)));
 
-  // REPETITION, OR SOLITUDE: alike siblings under one parent are a menu; a card that is the
-  // page's ONLY candidate is its one choice — the learner enters it when nothing else on the
-  // page advances (the adapter's single-tile rule; owner's ruling 2026-09-26: a false stop on
-  // a legitimate step is a bug). Two unalike cards in different places are content.
-  const kept: Array<{ el: Element; title: string }> = [];
-  for (const c of own) {
+  // STAGE 3 — THE CUTS, on leaves only: too small to be a card, a title nobody can see,
+  // inside chrome, or a title that IS a link (the link is its control and has a label of its
+  // own). A chrome match on <body> or <html> is a page-state class ("menu-open"), not chrome.
+  const candidates = leaves.filter((c) => {
+    const r = c.el.getBoundingClientRect();
+    if (r.width < 80 || r.height < 32) return false;
+    const tr = c.titleEl.getBoundingClientRect();
+    if (tr.width === 0 && tr.height === 0) return false;
+    const chrome = c.el.closest(CHROME);
+    if (chrome && chrome !== document.body && chrome !== document.documentElement) return false;
+    const titleLink = c.titleEl.closest("a, button");
+    if (titleLink && c.el.contains(titleLink)) return false;
+    return true;
+  });
+
+  // STAGE 4 — REPETITION, OR SOLITUDE: alike siblings under one parent are a menu; a card
+  // that is the page's ONLY candidate is its one choice — the learner enters it when nothing
+  // else on the page advances (the adapter's single-tile rule; owner's ruling 2026-09-26: a
+  // false stop on a legitimate step is a bug). Two unalike cards in different places are
+  // content.
+  const tiles: Array<{ el: Element; title: string }> = [];
+  for (const c of candidates) {
     const parent = c.el.parentElement;
     if (!parent) continue;
-    const alike = own.filter((o) => o.el.parentElement === parent && o.el.tagName === c.el.tagName);
-    if (alike.length >= 2 || own.length === 1) kept.push({ el: c.el, title: c.title });
+    const alike = candidates.filter((o) => o.el.parentElement === parent && o.el.tagName === c.el.tagName);
+    if (alike.length >= 2 || candidates.length === 1) tiles.push({ el: c.el, title: c.title });
   }
-  // Whatever nesting ownership left, the inner element is the one a click lands on.
-  const tiles = kept.filter((c) => !kept.some((o) => o !== c && c.el.contains(o.el)));
 
   const out: ChoiceTileRaw[] = [];
   let n = 0;
@@ -708,6 +729,9 @@ const TYPE_EXCLUDE: RegExp[] = [
   // "Renewable Energy Rebate" matches the job vocabulary and files nothing — the trap
   // PROGRAM_EXCLUDE (applicationProgram.ts) already guards for programme choices.
   /\brebate\b|\bincentive\b/i,
+  // "Solar Permit Fees" / "Invoices" / "Payments" are the operator's money, not a kind of
+  // permit — the same door the dashboard guard shuts on a link so labelled (isPayFee).
+  /\bfees?\b|\binvoices?\b|\bpayments?\b/i,
 ];
 
 export function permitTypeCandidates(labels: string[], track: string): string[] {

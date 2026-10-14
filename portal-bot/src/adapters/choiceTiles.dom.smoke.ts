@@ -30,6 +30,9 @@
 //                a false stop on a legitimate step is a bug); a single "Pay Fees Due" card is not.
 //   MUST EXCLUDE — a chevron step bar, a card holding inputs, an accordion, and a dashboard
 //                of record cards (titles with numbers) are never tiles.
+//   REVIEW 1   — a wrapper around cards is never the page's one tile ([8]); the planner never
+//                clicks a tile, at the navigate door or the advance door ([9]); the recipe
+//                records the entry click before the type click ([3], [7]).
 //
 // Against main's applicationEntry.ts + autoLearnAdapter.ts every MUST PASS line is a FAIL
 // banner, not a crash: the new exports are reached through a namespace import.
@@ -225,6 +228,34 @@ const PAGES: Record<string, string> = {
     </div>
     ${DELEGATION("function () { return '/fees'; }")}
   </body></html>`,
+  // REVIEW 1 (Helm, finding 1 — the blocker): a CONTAINER must never inherit a cut card's title
+  // and arrow and survive as the page's one tile. Nine cards inside a wrapper the chrome cut
+  // drops (`apply-steps`, `permit-menu`), nine 28px rows under a heading, a heading over nine
+  // hidden cards: each read as ONE tile stamped on the wrapper, clicked at its centre into
+  // whichever card sat there (a Demolition request, recorded as "Building Permit Request").
+  "/home-wrapped": shell({ title: "Welcome", content: HOME_TILES, applyHref: "/apply-wrapped", script: DELEGATION("function (t) { return t === 'Apply For A Permit' ? '/apply-wrapped' : '/unknown'; }") }),
+  "/apply-wrapped": shell({ title: "Apply for a Permit", content: `<div class="apply-steps">${APPLY_TILES}</div>`, applyHref: "/apply-wrapped", script: DELEGATION(TO_CHOSEN) }),
+  "/apply-wrapped-menu": shell({ title: "Apply for a Permit", content: `<div class="permit-menu">${APPLY_TILES}</div>`, applyHref: "/apply-wrapped-menu", script: DELEGATION(TO_CHOSEN) }),
+  "/apply-rows": `<!doctype html><html><body>
+    <div id="content"><h2>Choose a permit type</h2><ul id="rows" style="list-style:none;padding:0;margin:0">
+      ${["Building Permit Request", "New Single-Family Residence Permit Request", SOLAR, "FCC Wireless Applications - Permit Request", "Demolition Permit Request", "Trade Permits", "Trade Permits with Plan Review", "Sign Permit Request", "Tree Permits"]
+        .map((t) => `<li style="height:28px;display:flex;align-items:center"><span class="row-title">${t}</span><i class="fa fa-chevron-right"></i></li>`).join("")}
+    </ul></div>
+    <script>document.getElementById('rows').addEventListener('click', function (e) { var li = e.target.closest('li'); if (li) location.href = '/chosen?tile=' + encodeURIComponent(li.querySelector('.row-title').textContent); });</script>
+  </body></html>`,
+  "/apply-hidden": `<!doctype html><html><body>
+    <section id="sgControls"><h2>Apply for a Permit</h2><div style="display:none">${APPLY_TILES}</div></section>
+    ${DELEGATION(TO_CHOSEN)}
+  </body></html>`,
+  // REVIEW 1 (finding 3): tiles the chooser refused beside a SEARCH BOX — the page has
+  // something fillable, so it reaches the planner; a planner that names a tile as its
+  // navigate or its advance must be refused at both doors. No entry control on purpose.
+  "/apply-search": `<!doctype html><html><head><style>.card{display:flex;border:1px solid #ccc;margin:8px 0;padding:8px;min-height:60px} .card-body{flex:1}</style></head><body>
+    <h1>Apply for a Permit</h1>
+    <label for="q">Search permit types</label><input id="q" name="q" type="search">
+    <div id="sgControls">${NO_SOLAR_TILES}</div>
+    ${DELEGATION(TO_CHOSEN)}
+  </body></html>`,
   // MUST EXCLUDE: a dashboard of the operator's RECORDS as pointer-cursor cards. A record's
   // title carries a number; a type's never does.
   "/records": `<!doctype html><html><head><style>.card{border:1px solid #999;padding:12px;min-height:50px;cursor:pointer}</style></head><body>
@@ -340,10 +371,10 @@ if (tileRaw) {
 // 3) MUST PASS — THE LEARNER, end to end from the captured home, on every track.
 // ===========================================================================================
 console.log("\n[3] the learner from the home page: entry → tile → the application");
-const runLearn = async (start: string, project: Record<string, string>) => {
+const runLearn = async (start: string, project: Record<string, string>, planner: LearnPlanner = stubPlanner) => {
   const pw = await ctx.newPage();
   await pw.goto(`${base}${start}`);
-  const a = new AutoLearnAdapter("Choice Tiles Walk", stubPlanner, { maxPages: 3, budgetMs: 120_000 });
+  const a = new AutoLearnAdapter("Choice Tiles Walk", planner, { maxPages: 3, budgetMs: 120_000 });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (a as any).page = pw;
   const r = await a.learn(
@@ -368,6 +399,12 @@ for (const [track, project] of [["electrical", { permitType: "electrical" }], ["
   check(`${track}: no information page and no records page was ever requested`,
     !hits.slice(before).some((h) => h.startsWith("/info/") || h.startsWith("/my-permits") || h.startsWith("/fees")),
     JSON.stringify(hits.slice(before)));
+  // REVIEW 1 (finding 4): the recipe is in WALK ORDER — entry, then type. Recorded the other
+  // way round, a replay clicks the permit type on the home page, where it does not exist.
+  const entryIdx = w.notes.findIndex((n) => /^application entry: Apply For A Permit/.test(n));
+  const typeIdx = w.notes.findIndex((n) => n === `permit type: ${SOLAR}`);
+  check(`${track}: the ENTRY click is recorded before the TYPE click`,
+    entryIdx >= 0 && typeIdx > entryIdx, `order=${JSON.stringify(w.notes)}`);
   // (The run's final message is the stub planner's doing — it fills nothing on the page behind
   // the tile — and is not asserted here; the tile page's own wording is pinned in [4].)
 }
@@ -465,12 +502,70 @@ check("the chooser refuses the TYPE (no job word) but reports the one card as th
     `ended on ${w.url}; notes=${JSON.stringify(w.notes)}`);
   check("...never the help or privacy links beside it",
     !hits.slice(before).some((h) => h.startsWith("/help") || h.startsWith("/privacy")), JSON.stringify(hits.slice(before)));
+  // REVIEW 1 (finding 4), in walk order: the single card, then the entry it revealed, then the type.
+  const tileIdx = w.notes.findIndex((n) => n === "choice tile: Begin Submittal");
+  const entryIdx = w.notes.findIndex((n) => /^application entry: Apply For A Permit/.test(n));
+  const typeIdx = w.notes.findIndex((n) => n === `permit type: ${SOLAR}`);
+  check("...recorded in walk order: single card, entry, type",
+    tileIdx >= 0 && entryIdx > tileIdx && typeIdx > entryIdx, `order=${JSON.stringify(w.notes)}`);
 }
 await page.goto(`${base}/home-single-pay`);
 const payPick = await chooseApplicationType(page, "electrical");
 check("MUST EXCLUDE: a single card that is a real-filing control ('Pay Fees Due') is never the single choice",
   !payPick.ok && !(payPick.refusal as { singleTile?: unknown }).singleTile,
   payPick.ok ? `picked ${payPick.choice.label}` : JSON.stringify(payPick.refusal));
+
+// ===========================================================================================
+// 8) REVIEW 1, finding 1 (the blocker) — a wrapper must never inherit a cut card's title and
+//    arrow and survive as the page's ONE tile. Nine cards inside an `apply-steps` or
+//    `permit-menu` div, nine 28px rows under a heading, a heading over nine hidden cards: each
+//    reads as NO tiles, and the learner clicks nothing (before: the wrapper was the single tile,
+//    clicked at its centre into whichever card sat there and recorded under the wrong name).
+// ===========================================================================================
+console.log("\n[8] wrapper shapes: no container is ever the page's one tile");
+for (const [route, what] of [
+  ["/apply-wrapped", "nine cards inside an apply-steps div"],
+  ["/apply-wrapped-menu", "nine cards inside a permit-menu div"],
+  ["/apply-rows", "nine 28px rows under a heading"],
+  ["/apply-hidden", "a heading over nine hidden cards"],
+] as const) {
+  await page.goto(`${base}${route}`);
+  const got = scanChoiceTiles ? await scanChoiceTiles(page) : null;
+  check(`${what}: NO tiles`, !!got && got.length === 0, got ? JSON.stringify(got.map((t) => t.label)) : "scanChoiceTiles not exported");
+}
+{
+  const before = hits.length;
+  const w = await runLearn("/home-wrapped", { permitType: "electrical" });
+  check("the learner on the wrapped menu clicks NOTHING: no tile step, no card destination requested",
+    !w.notes.some((n) => /^choice tile:|^permit type:/.test(n)) && !hits.slice(before).some((h) => h.startsWith("/chosen")),
+    `notes=${JSON.stringify(w.notes)} requests=${JSON.stringify(hits.slice(before))}`);
+}
+
+// ===========================================================================================
+// 9) REVIEW 1, finding 3 — THE PLANNER NEVER CLICKS A TILE. Refused tiles beside a search box
+//    (so the page reaches the planner); a planner that names a tile as its advance, or as its
+//    navigate, is refused at that door and nothing is clicked. The run that ends there names
+//    the choices the page offered — never "nothing fillable".
+// ===========================================================================================
+console.log("\n[9] the planner's doors: a tile named as advance or navigate is never clicked");
+const tilePlanner = (door: "advance" | "navigate"): LearnPlanner => async (req) => {
+  const i = req.fields.findIndex((f) => f.label === "Building Permit Request");
+  if (i < 0) return { fills: [], atReview: false };
+  return door === "advance"
+    ? { fills: [], atReview: false, advanceSelectorIndex: i }
+    : { fills: [], atReview: false, navigateSelectorIndex: i };
+};
+for (const door of ["advance", "navigate"] as const) {
+  const before = hits.length;
+  const w = await runLearn("/apply-search", { permitType: "electrical" }, tilePlanner(door));
+  check(`${door} door: a refused tile named by the planner as ${door}SelectorIndex is NOT clicked`,
+    !hits.slice(before).some((h) => h.startsWith("/chosen")) && !w.notes.some((n) => /Building Permit Request/.test(n)),
+    `requests=${JSON.stringify(hits.slice(before))} notes=${JSON.stringify(w.notes)}`);
+  // The walk ends here through its stuck-page stop (the planner keeps naming the tile and is
+  // refused each time), whose own message says so — never "nothing fillable" on a page of choices.
+  check(`${door} door: ...and the run never reports "nothing fillable" about a page of choices`,
+    !/nothing fillable/i.test(w.r.message), w.r.message);
+}
 
 await browser.close();
 await new Promise<void>((r) => server.close(() => r()));
