@@ -77,7 +77,10 @@ export type HumanStepFn = (step: RecipeStep) => void;
 export function payloadToStep(p: HumanCapturePayload, ctx?: ControlContext): RecipeStep | null {
   const note = p.label ? `human-patch: ${p.label}` : "human-patch";
   // Submit observation is a SIGNAL, not a replayable step — see HUMAN_SUBMIT_OBSERVED_NOTE.
-  if (p.kind === "submitObserved") return { action: "click", selector: {}, optional: true, note: HUMAN_SUBMIT_OBSERVED_NOTE };
+  // The clicked control's visible label rides in `value` (never the selector, so the signal can
+  // never resolve to a control): it is the key that matches the click to the recipe's recorded
+  // final step when the page afterwards says the click only made a draft (#302, draftCreated.ts).
+  if (p.kind === "submitObserved") return { action: "click", selector: {}, optional: true, note: HUMAN_SUBMIT_OBSERVED_NOTE, ...(p.label ? { value: String(p.label).slice(0, 120) } : {}) };
   if (p.kind === "click") {
     if (p.safetyUnavailable) return null;
     // Called on its own, the page context is only what the payload carries (formDataEntered

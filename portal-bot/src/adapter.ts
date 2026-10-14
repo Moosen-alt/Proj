@@ -54,7 +54,7 @@ export interface PortalAdapter {
    *  record number can be read off the completion page instead of typed in by hand. The
    *  human still clicks; this only watches. Optional — an adapter with no live page
    *  returns false. */
-  armSubmitWatch?(onSubmitObserved: () => void): Promise<boolean>;
+  armSubmitWatch?(onSubmitObserved: (clickedLabel?: string) => void): Promise<boolean>;
   /** Read-only status scrape — navigates to the portal's project status page and returns
    *  the raw status text for the given application/permit numbers.
    *  SAFETY: must never click submit, modify, or pay anything.
@@ -110,7 +110,7 @@ export abstract class BasePortalAdapter implements PortalAdapter {
    * saying so plainly is better than a silent no-op. The capture itself is best-effort and
    * a failed read simply leaves the operator's manual form exactly as it is today.
    */
-  async armSubmitWatch(_onSubmitObserved: () => void): Promise<boolean> {
+  async armSubmitWatch(_onSubmitObserved: (clickedLabel?: string) => void): Promise<boolean> {
     return false;
   }
 

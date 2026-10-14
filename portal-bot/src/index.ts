@@ -12,6 +12,42 @@ import { resolveHeadless } from "./browser";
 import { HUMAN_REVIEW_MESSAGE } from "./adapter";
 import { clearReviewOpen, markReviewOpen } from "./reviewSession";
 import { draftReferenceFromUrl } from "./adapters/submissionLedger";
+import { readDraftCreated, type DraftCreatedRead } from "./draftCreated";
+import { HUMAN_SUBMIT_OBSERVED_NOTE } from "./humanCapture";
+
+/** A draft-created page observed after a person's submit click, with the control they clicked. */
+export type DraftCreatedObserved = DraftCreatedRead & { clickedLabel: string };
+
+/**
+ * THE LEARN'S LEFT-OPEN PAGE, WATCHED FOR A SUBMIT THAT ONLY MADE A DRAFT (#302). Every captured
+ * step passes straight through, except the operator's final-submit signal: that one waits for
+ * the page the click produced (read after it settles, like armSubmitCapture), and when the page
+ * says a draft was created the signal is NOT passed on (the recording is not promoted on a click
+ * that filed nothing) and onDraftCreated hears the draft instead. Read-only: it clicks nothing.
+ */
+export function draftAwareHumanSink(
+  adapter: { readCurrentPageText?: () => Promise<string> },
+  onHumanStep: (step: import("../../shared/src/types").RecipeStep) => void,
+  onDraftCreated?: (draft: DraftCreatedObserved) => void,
+  settleMs = 4000,
+): (step: import("../../shared/src/types").RecipeStep) => void {
+  if (typeof onDraftCreated !== "function" || typeof adapter.readCurrentPageText !== "function") return onHumanStep;
+  return (step) => {
+    if ((step.note || "") !== HUMAN_SUBMIT_OBSERVED_NOTE) { onHumanStep(step); return; }
+    void (async () => {
+      await new Promise((r) => setTimeout(r, settleMs));
+      const text = await adapter.readCurrentPageText!().catch(() => "");
+      const draft = readDraftCreated(text);
+      if (draft.draft) {
+        // The capture sink disarmed itself at this click (humanCapture.ts), so nothing a person does
+        // after it on the same page is observed. Fine for PSE's flow: the next stage continues the draft.
+        try { onDraftCreated({ ...draft, clickedLabel: String(step.value ?? "") }); } catch { /* reporting must never disturb the operator's window */ }
+        return;
+      }
+      onHumanStep(step);
+    })();
+  };
+}
 
 // One shared cap across EVERY browser-launching path — recipe replay, hand-coded staging, AND the
 // auto-learn self-seed. Each Playwright instance is ~200 MB; >2-3 concurrently OOMs/crashes Chromium.
@@ -246,6 +282,9 @@ interface StageOptions {
     source: string;
     reason: string;
     recordLink: string;
+    /** The click only CREATED A DRAFT (#302): nothing was filed, recordNumber is "", and the
+     *  caller records the draft for the next stage to continue — never a submission. */
+    draftCreated?: DraftCreatedObserved;
   }) => void;
   // Track-scoped portal login URL (resolved server-side from portal_credentials/recipe/KB).
   // Lets platform adapters that host many tenants (PowerClerk: PGE, PacifiCorp…) land on
@@ -256,6 +295,8 @@ interface StageOptions {
   // retrying… 1/3)", "Step 12/53: …". Non-PII. The live run 99baa5d0's operator watched a frozen
   // login screen for three minutes; the dashboard needs this to say why. Recipe replays only.
   onProgress?: (p: import("./adapters/recipeAdapter").RecipeProgress) => void;
+  /** The project's site, for the replay's existing-draft check (#302, RecipeAdapter siteDraft). */
+  siteDraft?: { street?: string; city?: string; zip?: string; siblingAtSameStreet?: boolean };
 }
 
 // Headed, guided-manual staging leaves the browser OPEN at the review screen so the human
@@ -287,7 +328,7 @@ async function armSubmitCapture(
   if (typeof options.onSubmitCaptured !== "function") return;
   try {
     if (typeof adapter.armSubmitWatch !== "function") return;
-    await adapter.armSubmitWatch(() => {
+    await adapter.armSubmitWatch((clickedLabel?: string) => {
       // The click has happened; the portal is now navigating. Read AFTER it settles —
       // reading immediately catches the review screen the operator just left, which is the
       // one page guaranteed not to carry a record number.
@@ -296,6 +337,17 @@ async function armSubmitCapture(
           await new Promise((r) => setTimeout(r, 4000));
           const capture = await adapter.captureSubmissionConfirmation();
           const data = (capture.data ?? {}) as Record<string, unknown>;
+          // THE CLICK MADE A DRAFT (#302): reported as such, with no record number, so the caller
+          // never records a filing that did not happen.
+          const draft = data.draftCreated as DraftCreatedRead | undefined;
+          if (draft && draft.draft) {
+            options.onSubmitCaptured?.({
+              recordNumber: "", confidence: "low", source: "draft_created", reason: capture.message,
+              recordLink: String(data.recordLink ?? ""),
+              draftCreated: { ...draft, clickedLabel: String(clickedLabel ?? "") },
+            });
+            return;
+          }
           const recordNumber = String(data.permitNumber ?? data.confirmationNumber ?? "");
           const read = recordNumber
             ? { confidence: "high" as const, source: "completion_page", reason: capture.message }
@@ -512,6 +564,8 @@ async function runAdapter(
     // point at the folder, and at the one shot that shows how the filing ended.
     const evidenceDir = steps.map((s) => String(s?.data?.pageShotDir ?? "")).filter(Boolean).pop() ?? "";
     const outcomeShotPath = steps.map((s) => String(s?.data?.outcomeShotPath ?? "")).filter(Boolean).pop() ?? "";
+    // This address already had an unsubmitted draft on the portal (#302): carried up for the caller.
+    const existingDraft = steps.map((s) => s?.data?.existingDraft).find((d) => d && typeof d === "object") ?? null;
 
     // Leave the browser OPEN for the human ONLY when: this is a guided-manual run (no
     // autosubmit), it's headed (the human is watching), it staged cleanly to review, and we
@@ -567,6 +621,7 @@ async function runAdapter(
       capturedConfirmationNumber: captured?.confirmationNumber || "",
       capturedRecordLink: captured?.recordLink || "",
       ...(draftReference && draftReference.link ? { draftReference } : {}),
+      ...(existingDraft ? { existingDraft } : {}),
       evidenceDir,
       outcomeShotPath,
       pauseReason: stepPause,
@@ -631,6 +686,7 @@ export async function stageWithRecipe(
     runApproval: options.runApproval ?? null, runId: options.runId,
     onProgress: options.onProgress,
     owedAttachments: options.owedAttachments,
+    siteDraft: options.siteDraft,
   }), project, files, options));
 }
 
@@ -762,6 +818,12 @@ export async function learnPortal(input: {
   // RecipeStep so the backend can merge it into the learned recipe. Sensitive values are
   // never included; final-submit/pay clicks are never captured.
   onHumanStep?: (step: import("../../shared/src/types").RecipeStep) => void;
+  // THE HUMAN'S SUBMIT ONLY MADE A DRAFT (#302). When the page the operator's final-submit click
+  // produced reads as a draft-created page (draftCreated.ts), this fires INSTEAD of passing the
+  // submit signal to onHumanStep: nothing was filed, so the recording is not promoted on it.
+  onDraftCreated?: (draft: DraftCreatedObserved) => void;
+  /** This project's existing draft to continue instead of starting an application (#302). */
+  continueDraft?: import("./adapters/autoLearnAdapter").ContinueDraft;
   // Equipment identity (inverterMake/inverterModel/moduleMake/moduleModel) for the
   // adapter's deterministic PV-spec combobox pass.
   equipment?: Record<string, string>;
@@ -802,7 +864,7 @@ export async function learnPortal(input: {
       input.onProgress?.({ phase: "page", pageCount: 0, maxPages: input.maxPages ?? 18, message: `Paused for a person: ${String(info.reason ?? "").slice(0, 200)}` });
     } catch { /* a notifier must never change the outcome */ }
   };
-  const adapter = new AutoLearnAdapter(input.portalName, input.planner, { parkMs: input.parkMs, credentialForUrl: input.credentialForUrl, noProgressBudgetMs: input.noProgressBudgetMs, maxPages: input.maxPages, budgetMs: input.budgetMs, docsByType: input.docsByType, beforeUpload: input.beforeUpload, uploadMode: input.uploadMode, policyProfile: input.policyProfile, bindableFields: input.bindableFields, onProgress: input.onProgress, onPark, equipment: input.equipment, certifiedAliases: input.certifiedAliases, contactIdentity: input.contactIdentity, siteContactIdentity: input.siteContactIdentity, siteIdentity: input.siteIdentity, allowFinalSubmit: input.allowFinalSubmit, hasBattery: input.hasBattery, allowConsentAccept: input.allowConsentAccept });
+  const adapter = new AutoLearnAdapter(input.portalName, input.planner, { parkMs: input.parkMs, credentialForUrl: input.credentialForUrl, noProgressBudgetMs: input.noProgressBudgetMs, maxPages: input.maxPages, budgetMs: input.budgetMs, docsByType: input.docsByType, beforeUpload: input.beforeUpload, uploadMode: input.uploadMode, policyProfile: input.policyProfile, bindableFields: input.bindableFields, onProgress: input.onProgress, onPark, equipment: input.equipment, certifiedAliases: input.certifiedAliases, contactIdentity: input.contactIdentity, siteContactIdentity: input.siteContactIdentity, siteIdentity: input.siteIdentity, allowFinalSubmit: input.allowFinalSubmit, hasBattery: input.hasBattery, allowConsentAccept: input.allowConsentAccept, continueDraft: input.continueDraft });
   let tmpStatePath: string | undefined;
   let leaveOpen = false;
   // A browser left open by a prior guided-manual stage holds this profile's lock — close it
@@ -878,7 +940,7 @@ export async function learnPortal(input: {
     // Arm patch-by-demonstration on the browser being left open: the human finishing the
     // missed fields at review teaches the recipe those fields for every future project.
     if (leaveOpen && input.onHumanStep) {
-      try { await adapter.armHumanCapture(input.onHumanStep); } catch { /* capture is best-effort */ }
+      try { await adapter.armHumanCapture(draftAwareHumanSink(adapter, input.onHumanStep, input.onDraftCreated)); } catch { /* capture is best-effort */ }
     }
     return learnResult;
   } catch (err) {
