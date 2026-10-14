@@ -69,6 +69,11 @@ check("THE LABEL: choiceTileLabel exists and a card's title text IS its label", 
 check("the label is a KIND of thing: a record's title (digits), a step bar's item, a button face are null", () => {
   assert.equal(choiceTileLabel!("BP-2024-00123 — 123 Main St"), null, "a record number is a thing that exists, not a type");
   assert.equal(choiceTileLabel!("Permit 2026-0042"), null);
+  assert.equal(choiceTileLabel!("Solar PV Permit — 123 Main St"), null, "a street number is a place, not a type");
+  // ...but a digit run that names a SIZE TIER is a kind of thing: a unit right after it keeps it.
+  assert.equal(choiceTileLabel!("Solar PV Systems up to 100 kW"), "Solar PV Systems up to 100 kW");
+  assert.equal(choiceTileLabel!("Interconnection 1000 kW and above"), "Interconnection 1000 kW and above", "no backtracking into '100' + '0'");
+  assert.equal(choiceTileLabel!("Service Upgrade 200A"), "Service Upgrade 200A");
   assert.equal(choiceTileLabel!("Review and Submit"), null, "the step bar's last item");
   assert.equal(choiceTileLabel!("Review & Submit"), null);
   assert.equal(choiceTileLabel!("Next"), null);

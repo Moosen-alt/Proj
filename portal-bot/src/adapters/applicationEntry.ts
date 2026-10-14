@@ -316,7 +316,10 @@ export function choiceTileLabel(raw: string): string | null {
   if (t.length < 3 || t.length > 120) return null;
   // Three digits in a row is a record number, a street number or a year: a thing that exists,
   // not a kind of thing to apply for. A record card on a dashboard must never read as a type.
-  if (/\d{3,}/.test(t)) return null;
+  // A digit run that names a SIZE TIER ("Solar PV Systems up to 100 kW") is the one exception:
+  // a unit right after it makes it a kind of thing again. Anchored on both sides so "1000 kW"
+  // cannot backtrack into "100" + "0".
+  if (/(?<!\d)\d{3,}(?!\d)(?!\s*(?:kw|kva|mw|mva|va|w|a|v|%|sq\.?\s?ft|sf)\b)/i.test(t)) return null;
   // Advance / submit wording whole: a step bar's items and a button face, never a choice.
   if (/^(next|continue|proceed|back|previous|cancel|close|submit|save|finish|done|ok)(\s+(step|now|application|form|page))?$/i.test(t)) return null;
   if (/^review(\s*(and|&)\s*submit)?$/i.test(t)) return null;
