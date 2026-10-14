@@ -11,7 +11,7 @@ import { detectChallengeFrame, frameSelectorFor, maskId, readbackMatches, redact
 import { applyFormatHint } from "../formatHint";
 import { scrapeReviewScreen as scrapeReviewScreenShared } from "../reviewScreenScraper";
 import { performLogin, lastRevealTrail, loginFormPresent, holdForPerson } from "./loginFlow";
-import { enterApplicationFlow, isExcludedEntryLabel, normalizeEntryLabel, chooseApplicationType } from "./applicationEntry";
+import { enterApplicationFlow, isExcludedEntryLabel, normalizeEntryLabel, chooseApplicationType, scanChoiceTiles } from "./applicationEntry";
 import { chooseProgram, offeredLabels, programSelector, scanProgramGroups, type ProgramGroup } from "./applicationProgram";
 import { planHiddenReveal, planLabelProxy } from "./revealHidden";
 import { looksLikeConsentWall, planConsentDismissal } from "./consentBanner";
@@ -129,6 +129,10 @@ export interface ExtractedField {
    *  unlocks on validation was read as a terminal page precisely because nothing recorded
    *  that the Next existed. See classifyTerminalSubmitPage. */
   disabled?: boolean;
+  /** A choice tile (markChoiceTilesInPage): a card clicked as a whole, labelled by its title.
+   *  Carried so the planner's navigate and advance doors can refuse it: a tile is entered by
+   *  the chooser (by vocabulary) or by the single-tile door, never by the planner. */
+  tile?: boolean;
 }
 
 export interface LearnPlanRequest {
@@ -711,7 +715,11 @@ export function hasVisibleWidgetFaceInPage(el: Element): boolean {
   return !!face && (face as HTMLElement).offsetParent !== null;
 }
 
-export const EXTRACT_SEL = "input, select, textarea, button, [role=button], a[href]:not([href='#']):not([href=''])";
+// `[data-al-tile]`: a choice CARD stamped by scanChoiceTiles (applicationEntry.ts) just before
+// the harvest — a container clickable as a whole, labelled by its title. Portland DevHub's
+// "Apply for a Permit" page is ten of them and nothing else; without this the planner saw only
+// the cards' information links and the run died "nothing fillable".
+export const EXTRACT_SEL = "input, select, textarea, button, [role=button], a[href]:not([href='#']):not([href='']), [data-al-tile]";
 
 // ---------------------------------------------------------------------------
 // ONE ACTIVE SCOPE PER PAGE — scope the HARVEST, never the page's exits.
@@ -1262,6 +1270,9 @@ export interface RawField {
   offstage?: boolean;
   /** True when the control is not operable right now. See ExtractedField.disabled. */
   disabled?: boolean;
+  /** A choice tile (markChoiceTilesInPage): a card clicked as a whole, labelled by its title.
+   *  Its selector is the title TEXT — getByRole finds nothing on a plain container. */
+  tile?: boolean;
 }
 
 // Serializable extractor — derives a label and selector hints for each interactive
@@ -1474,6 +1485,12 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
   for (const el of els) {
     const tag = el.tagName.toLowerCase();
     const typeAttr = (el.getAttribute("type") || "").toLowerCase();
+    // A CHOICE TILE: a card clickable as a whole, labelled by its title. scanChoiceTiles stamped
+    // the key and the label before this harvest; the label is READ here, never re-derived
+    // (choiceTileLabel is the one place that happens). A stamped card with no usable label was
+    // a card, not a choice — a record on a dashboard, a step bar's item — and is skipped.
+    const tileLabel = el.hasAttribute("data-al-tile") ? (el.getAttribute("data-al-tile-label") || "").trim() : "";
+    if (el.hasAttribute("data-al-tile") && !tileLabel) continue;
     let fieldType: ExtractedField["fieldType"] = "other";
     let options: string[] | undefined;
 
@@ -1492,6 +1509,10 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       else if (typeAttr === "file") fieldType = "file";
       else if (typeAttr === "hidden" || typeAttr === "password") fieldType = typeAttr === "password" ? "text" : "other";
       else fieldType = "text";
+    } else if (tileLabel) {
+      // A tile is a NAVIGATION candidate, like a link: the planner's navigate path clicks it
+      // whole and the recorded step re-finds it by its title text.
+      fieldType = "button";
     }
 
     // ROLE=COMBOBOX / aria-haspopup=listbox is a DROPDOWN even when it's an <input>.
@@ -1609,7 +1630,7 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       const tv = el.getAttribute(attr);
       if (tv) { testCss = `[${attr}="${tv}"]`; testHint = tv.replace(/[-_]+/g, " ").trim(); break; }
     }
-    let rawLabel = labelFor(el);
+    let rawLabel = tileLabel || labelFor(el);
     // A FRAMEWORK-GENERATED ID IS NOT A LABEL. Angular Material (and CDK/Ionic) name their
     // generated wrappers "mat-button-toggle-group-2", "cdk-overlay-4" — ids that look like
     // labels to any label-shaped lookup but tell a planner nothing. ComEd's new-application
@@ -1649,7 +1670,9 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
     const ariaName = el.getAttribute("aria-label")?.trim() || "";
     const ligatureShaped = /^[a-z][a-z0-9_]{1,24}$/.test(rawText); // one lowercase token, no spaces
     const buttonText = ariaName && (ligatureShaped || !rawText || iconish(el)) ? ariaName : rawText;
-    const text = fieldType === "button" ? buttonText || undefined : undefined;
+    // A tile's text is its TITLE, never the whole card (the body's prose would become the
+    // name a replay has to match).
+    const text = tileLabel ? tileLabel : fieldType === "button" ? buttonText || undefined : undefined;
     // Capture href for anchors so a hidden/menu-nested nav link can be reached by direct
     // navigation when it can't be clicked.
     const href = tag === "a" ? (el.getAttribute("href") || undefined) : undefined;
@@ -1679,6 +1702,7 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
 
     out.push({
       label, fieldType, options, role, name, placeholder, id, text, href,
+      tile: tileLabel ? true : undefined,
       required: required || undefined,
       section: sectionFor(el) || undefined,
       testCss,
@@ -1706,7 +1730,20 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
 // stable RecipeSelector preferring label / role+name / name, falling back to css #id.
 export function toExtractedField(raw: RawField): ExtractedField {
   const selector: RecipeSelector = {};
-  if (raw.fieldType === "button") {
+  if (raw.fieldType === "button" && raw.tile) {
+    // A CHOICE TILE is a plain container: getByRole resolves nothing on it, so the selector is
+    // the title TEXT — exact, because "Solar Permit Request" must not also match "Solar Permit
+    // Requests for Residential or Commercial…" in the card's body. The text resolves the title
+    // element, and a click there bubbles to the card's handler, at learn time and on replay.
+    // The role-named fallbacks cover a portal that later turns the card into a real link.
+    selector.text = raw.label;
+    selector.exact = true;
+    selector.fallbacks = [
+      { role: "link", name: raw.label, exact: true },
+      { role: "button", name: raw.label, exact: true },
+      ...(raw.id ? [{ css: `#${raw.id}` }] : []),
+    ];
+  } else if (raw.fieldType === "button") {
     // Use the element's actual ARIA role ("link" for <a> tags, "button" otherwise).
     // getByRole("button", {name}) never matches a plain <a> — it must be "link".
     const ariaRole = raw.role || "button";
@@ -1779,6 +1816,7 @@ export function toExtractedField(raw: RawField): ExtractedField {
   // Carried, not derived: the terminal-page classifier counts ENABLED forward controls, and a
   // `disabled` that stops at the RawField boundary would make every gated Next invisible to it.
   if (raw.disabled) field.disabled = true;
+  if (raw.tile) field.tile = true;
   // Fingerprint: raw element attributes for replay-heal tie-breaking. Attribute
   // NAMES/labels only — never values, so nothing sensitive can land in a recipe.
   if (raw.id || raw.name || raw.placeholder || raw.ariaLabel || raw.section) {
@@ -2112,6 +2150,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    *  forward progress. Keyed by path so a label that legitimately recurs on a LATER page
    *  ("Continue" on a multi-step wizard) is still allowed. */
   private readonly navClicksByPath = new Set<string>();
+  /** Pages (by pathname) whose choice tiles the chooser refused — none named this job, or
+   *  several did. A run that ends on one of them says which choices the page offered rather
+   *  than "nothing fillable". (The planner never clicks a tile anywhere — see the navigate
+   *  and advance doors — so this is for the report, not for refusing.) */
+  private readonly refusedTilePages = new Map<string, { tiles: string[]; why: string }>();
   // Equipment fields whose select verification failed for EVERY candidate this
   // run — retrying them each rescan pass just burns waitForOptionReady caps.
   private equipmentFillFailed = new Set<string>();
@@ -2846,6 +2889,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         if (!frameKey) continue; // untargetable frame — skip so we never plan an unreplayable fill
       }
       try {
+        // Choice tiles are stamped FIRST so the harvest's `[data-al-tile]` clause finds them
+        // labelled; a page with none costs one evaluate. Never throws — fails open to no tiles.
+        await scanChoiceTiles(frame);
         const raws = await frame.$$eval(extractSel, extractFieldsInPage);
         for (const r of raws) {
           if (frameKey) r.frame = frameKey;
@@ -2857,7 +2903,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // Safety net: if frame enumeration yielded nothing (e.g. a fake/stub page in tests, or an
     // older runtime), fall back to a direct main-document scrape so the loop still sees fields.
     if (!out.length) {
-      try { out.push(...(await this.page.$$eval(extractSel, extractFieldsInPage))); } catch { /* ignore */ }
+      try {
+        await scanChoiceTiles(this.page);
+        out.push(...(await this.page.$$eval(extractSel, extractFieldsInPage)));
+      } catch { /* ignore */ }
     }
     const scoped = applyActiveScopeFilter(out, scopeActive);
     if (scopeActive && (scoped.dropped || scoped.exempted.length)) {
@@ -4909,10 +4958,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     }
   }
 
-  private navClickKey(pageUrl: string, label: string): string {
+  private pathOf(pageUrl: string): string {
     let pathname = String(pageUrl ?? "").toLowerCase();
     try { pathname = new URL(pageUrl).pathname.toLowerCase(); } catch { /* not a URL — compare as given */ }
-    return `${pathname}::${normalizeEntryLabel(label)}`;
+    return pathname;
+  }
+
+  private navClickKey(pageUrl: string, label: string): string {
+    return `${this.pathOf(pageUrl)}::${normalizeEntryLabel(label)}`;
   }
 
   private async chooseApplicationProgram(steps: RecipeStep[]): Promise<boolean> {
@@ -5274,7 +5327,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       let url = "";
       let bodyText = "";
       try {
-        const extractSel = "input, select, textarea, button, [role=button], a[href]:not([href='#']):not([href=''])";
+        const extractSel = EXTRACT_SEL;
         let raws: RawField[] = [];
         for (let tryN = 0; tryN < 4; tryN++) {
           raws = await this.extractAllFrames(extractSel);
@@ -5711,6 +5764,24 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         }
         this.debug?.event({ type: "application_entry_pass", page: pageCount, ok: Boolean(entered?.ok), label: entered?.label ?? null });
 
+        // THE ENTRY STEP IS RECORDED BEFORE THE TYPE IS CHOSEN, in the order the walk took
+        // them. This block used to sit AFTER the chooser, so a walk whose entry click and
+        // permit-type click happened in one iteration (home -> menu -> type; the Portland
+        // shape) recorded the type step FIRST and a replay would have clicked the type on the
+        // home page. The settle after the entry click now also precedes the chooser, so it
+        // reads the page the entry landed on, not the one still loading.
+        if (entered?.ok) {
+          // Record it the way replay will need it: click the control by its visible text.
+          steps.push({
+            action: "click",
+            phase: "open",
+            selector: { text: entered.label, fallbacks: [{ role: "link", name: entered.label }, { role: "button", name: entered.label }] },
+            note: `application entry: ${entered.label}`,
+          });
+          await this.page.waitForLoadState?.("networkidle", { timeout: 15000 }).catch(() => null);
+          await this.page.waitForTimeout?.(1200).catch(() => null);
+        }
+
         // WHICH PERMIT TO FILE — A LOOKUP, NOT A PLANNER CALL.
         //
         // permiteyes.us answers "New Application" with a menu of ~50 permit types. Handing
@@ -5727,6 +5798,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // Recorded as an ordinary step, which is the whole point: the type choice has to be
         // IN the recipe or replay lands on this menu with no step for it, which is exactly
         // how permiteyes' nine-fill recipe failed at step 2 of 12.
+        // Set when the page's ONE choice tile was entered below; the loop then re-scrapes.
+        let singleTileEntered = false;
         if (!applicationStarted && this.page) {
           const track = /elec/i.test(this.permitDiscipline) ? "electrical"
             : /struct|build/i.test(this.permitDiscipline) ? "structural"
@@ -5738,32 +5811,101 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             const clicked = await picked.choice.locator.click({ timeout: 8000 }).then(() => true).catch(() => false);
             if (clicked) {
               await this.waitAfterClick(beforeTypeUrl, beforeTypeFp, this.tabCount());
+              const label = picked.choice.label;
               steps.push({
                 action: "click",
                 phase: "open",
-                selector: { role: "link", name: picked.choice.label, text: picked.choice.label },
-                note: `permit type: ${picked.choice.label}`,
+                // A CHOICE TILE is a plain container (Portland DevHub's "Solar Permit Request"
+                // card): a role-named selector resolves nothing on it, so the step is recorded by
+                // the title TEXT, exact, which resolves the title element — and a click there
+                // bubbles to the card's own handler. See toExtractedField's tile branch.
+                selector: picked.choice.kind === "tile"
+                  ? { text: label, exact: true, fallbacks: [{ role: "link", name: label, exact: true }, { role: "button", name: label, exact: true }] }
+                  : { role: "link", name: label, text: label },
+                note: `permit type: ${label}`,
               });
-              this.debug?.event({ type: "permit_type_chosen", track, label: picked.choice.label });
+              this.debug?.event({ type: "permit_type_chosen", track, label, via: picked.choice.kind });
             }
-          } else if (picked && !picked.ok && picked.refusal.reason === "ambiguous") {
-            // Two plausible types (roof-mount vs ground-mount is a real shape). A human picks;
-            // guessing files one of them.
-            this.debug?.event({ type: "permit_type_ambiguous", track, matched: picked.refusal.matched.slice(0, 6) });
+          } else if (picked && !picked.ok) {
+            if (picked.refusal.reason === "ambiguous") {
+              // Two plausible types (roof-mount vs ground-mount is a real shape). A human picks;
+              // guessing files one of them.
+              this.debug?.event({ type: "permit_type_ambiguous", track, matched: picked.refusal.matched.slice(0, 6) });
+            }
+            // A PAGE OF CHOICE TILES THAT NAMES NOTHING WE CAME FOR IS A STOP THAT NAMES THEM —
+            // never "nothing fillable". Live Portland (2026-10-13): the walk stood on ten
+            // labelled tiles, saw none of them, and told the operator to record the portal by
+            // hand. Now the tiles ARE seen, so the honest report is which choices the page
+            // offered and that none (or several) of them reads as this job. The planner is
+            // not consulted: a permit type is never guessed (the mechanical-permit mistake),
+            // and every tile is now a navigate candidate it could pick.
+            //
+            // Gated on the page the chooser was asked about being the page this iteration
+            // SCRAPED (no entry click landed just before — the chooser runs on whatever the
+            // entry pass left on screen) and that page offering nothing to fill: a tile page
+            // beside a form is left to the form. A refusal straight after an entry click is
+            // retried next iteration on the scraped page, where it stops if still unmatched.
+            const tiles = Array.isArray(picked.refusal.tiles) ? picked.refusal.tiles : [];
+            if (tiles.length > 0) {
+              this.debug?.event({
+                type: "choice_tiles_unmatched", page: pageCount, track, reason: picked.refusal.reason,
+                tiles: tiles.slice(0, 12).map((t) => t.slice(0, 60)), matched: picked.refusal.matched.slice(0, 6),
+              });
+              // THE MEMO, FOR THE REPORT — NOT A STOP. The page still goes to the planner: a
+              // dashboard whose way in is a link the entry vocabulary does not know ("Begin
+              // Submittal") beside two content cards is the planner's to enter, as it was
+              // before tiles existed (owner's ruling 2026-09-26) — never through a tile, which
+              // the planner's doors refuse everywhere (a permit type is never guessed). A run
+              // that ENDS on this page names the choices it offered, never "nothing fillable" —
+              // beside a search box too, so the memo is set on every refusal, keyed by the page
+              // ON SCREEN (after an entry click `url` is still the page that was scraped), and
+              // cleared below if the page's single tile is entered.
+              const why = picked.refusal.reason === "ambiguous"
+                ? `more than one of them could be it (${picked.refusal.matched.slice(0, 6).map((m) => `"${m}"`).join(" | ")}) and a permit type is never guessed`
+                : `none of them names this job (${track} track)`;
+              const herePath = this.pathOf(typeof this.page.url === "function" ? String(this.page.url() ?? "") : url);
+              this.refusedTilePages.set(herePath, { tiles: tiles.slice(0, 12).map((t) => t.slice(0, 60)), why });
+              if (!entered?.ok && !hasFillable) {
+                // ONE CARD AND NOTHING ELSE TO ADVANCE IS A DOOR, NOT A STOP (owner's ruling
+                // 2026-09-26: a false stop on a legitimate step is a bug). A home whose only way
+                // in is a single card worded outside the entry vocabulary ("Begin Submittal")
+                // was left to the planner before tiles existed; stopping here would have named
+                // it and gone home. With exactly one tile — no fillable, no entry control, no
+                // other tile — the learner enters it, once per page (a card that does not move
+                // the page is never clicked twice), and records it the way the entry is. The
+                // chooser has already refused a real-filing title (singleTile is unset then).
+                // Two or more tiles with no job-matching title still stop and name themselves:
+                // choosing between them is choosing a permit type, which is never guessed.
+                // The ONE card is entered only where the planner's own dashboard door would be
+                // allowed to: the entry exclusions plus the pay/fee and existing-record
+                // vocabularies (isOffLimitsDashboardTarget). "Permit Fees", "Invoices", "Amend
+                // Permit" are refused here exactly as a link so labelled is refused there.
+                const offered = tiles.length === 1 ? picked.refusal.singleTile : undefined;
+                const single = offered && !this.isOffLimitsDashboardTarget({ label: offered.label, fieldType: "button", selector: { text: offered.label } })
+                  ? offered : undefined;
+                const singleKey = single ? this.navClickKey(url, single.label) : "";
+                if (single && singleKey && !this.navClicksByPath.has(singleKey)) {
+                  const beforeTileUrl = typeof this.page.url === "function" ? String(this.page.url() ?? "") : "";
+                  const beforeTileFp = await this.pageFingerprint();
+                  const clicked = await single.locator.click({ timeout: 8000 }).then(() => true).catch(() => false);
+                  if (clicked) {
+                    this.navClicksByPath.add(singleKey);
+                    this.refusedTilePages.delete(herePath);
+                    await this.waitAfterClick(beforeTileUrl, beforeTileFp, this.tabCount());
+                    steps.push({
+                      action: "click",
+                      phase: "open",
+                      selector: { text: single.label, exact: true, fallbacks: [{ role: "link", name: single.label, exact: true }, { role: "button", name: single.label, exact: true }] },
+                      note: `choice tile: ${single.label}`,
+                    });
+                    this.debug?.event({ type: "choice_tile_entered_single", page: pageCount, label: single.label.slice(0, 60) });
+                    singleTileEntered = true;
+                  }
+                }
+              }
+            }
           }
         }
-        if (entered?.ok) {
-          // Record it the way replay will need it: click the control by its visible text.
-          steps.push({
-            action: "click",
-            phase: "open",
-            selector: { text: entered.label, fallbacks: [{ role: "link", name: entered.label }, { role: "button", name: entered.label }] },
-            note: `application entry: ${entered.label}`,
-          });
-          await this.page.waitForLoadState?.("networkidle", { timeout: 15000 }).catch(() => null);
-          await this.page.waitForTimeout?.(1200).catch(() => null);
-        }
-
         // The entry may have opened a DRAWER that asks which programme to apply under before
         // it will show a single field. Answer it, or the run reports "nothing fillable" while
         // standing on the choice (live: ComEd, six pages, no steps recorded).
@@ -5776,7 +5918,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         const programJustChosen = this.entryLabelsClicked.size > 0 && !this.programChosen
           ? await this.chooseApplicationProgram(steps)
           : false;
-        if (entered?.ok || programJustChosen) continue;
+        if (entered?.ok || programJustChosen || singleTileEntered) continue;
       }
 
       // b9) AN OPTION-LESS DROPDOWN IS UNANSWERABLE. Ask it what it offers, first.
@@ -6271,6 +6413,16 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // purpose). Re-opening a filled one is how the planner overwrote it with the homeowner's
           // details (live Coos Bay), so refuse the click and let the advance path move on.
           this.debug?.event({ type: "contact_reopen_refused", label: (navField.label || "").slice(0, 60), why: this.contactReopenRefused(navField) });
+        } else if (navField && navField.tile) {
+          // A CHOICE TILE IS NEVER THE PLANNER'S TO CLICK. The chooser enters a tile by its
+          // vocabulary, or the single-tile door enters a lone one; a tile the chooser did not
+          // choose is a permit type the planner would be guessing (the mechanical-permit
+          // mistake, RECORD_TYPE_LABEL guard) — and that holds whether the chooser refused
+          // this page or never ran on it (the entry-pass bound, a form beside the cards).
+          // Refused, like a record; the planner is told to use the page's own way forward.
+          this.debug?.event({ type: "navigate_tile_rejected", page: pageCount, label: (navField.label || "").slice(0, 60) });
+          pendingHint = `"${(navField.label || "").slice(0, 40)}" is a choice tile (a permit type) and is never clicked by the planner. ` +
+            `If this page has another way forward — a link or button that starts or continues the application — use that; otherwise return no navigation.`;
         } else if (navField && (isDashboard ? this.isOffLimitsDashboardTarget(navField) : this.isOffLimitsButton(navField))) {
           // The planner picked a control that reaches into the operator's existing records
           // (or, on a dashboard, anything that isn't starting a new application). Refuse and
@@ -7136,6 +7288,16 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             continue;
           }
         }
+        // A CHOICE TILE IS NEVER THE ADVANCE EITHER — the navigate door's rule, at the one
+        // other door the planner has (it returned a refused tile as advanceSelectorIndex and
+        // the walk clicked it as "advance: Building Permit Request").
+        if (advanceField.tile) {
+          this.debug?.event({ type: "advance_tile_rejected", page: pageCount, label: String(advanceField.label ?? "").slice(0, 60) });
+          pendingHint = `"${String(advanceField.label ?? "").slice(0, 40)}" is a choice tile (a permit type) and is never clicked by the planner, as an advance or otherwise. ` +
+            `Use the page's own Continue/Next if it has one; otherwise return no advance.`;
+          if (await this.clickFallbackAdvance(steps, fields)) continue;
+          continue;
+        }
         // SAFETY: never click/record a pay/fee/checkout button as the "advance".
         if (this.isOffLimitsButton(advanceField)) {
           return {
@@ -7457,6 +7619,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // validation channel is empty, because every advance "worked".
     // The portal says what is missing; this says what was on offer and why none of it fit.
     // Together they name the upstream choice that put the application on the wrong branch.
+    // A run that ENDS on a page of choice tiles that named nothing we came for stopped there,
+    // and says so by the choices the page offered. A run that went on past such a page (the
+    // planner found another door) is judged by where it ended, as before.
+    const endPath = this.pathOf(typeof this.page?.url === "function" ? String(this.page.url() ?? "") : "");
+    const tileStop = this.refusedTilePages.get(endPath) ?? null;
     const choiceWarning = unmatchedChoices.length > 0
       ? ` 🔀 ${unmatchedChoices.slice(0, 3).join(" | ")}. A choice made on an EARLIER page decides what these pages offer — check that one.`
       : "";
@@ -7478,7 +7645,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       ? `${HUMAN_REVIEW_MESSAGE} Auto-learn reached the review screen after ${pageCount} page(s). Verify every field/value below before a human submits.${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`
       : filledSomething
         ? `Auto-learn filled ${pageCount} page(s) and recorded the steps, but did not reach a review screen. Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`
-        : `Auto-learn found nothing fillable on ${pageCount} page(s); no steps recorded.${nothingFillableHint} Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`;
+        : tileStop
+          ? `Auto-learn stopped at a page of ${tileStop.tiles.length} choice tile(s): ${tileStop.why}. The page offered: ${tileStop.tiles.map((t) => `"${t}"`).join(" | ")}. If one of these is the way in, a person clicks it; record that step manually. (${pageCount} page(s), no steps recorded.) Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`
+          : `Auto-learn found nothing fillable on ${pageCount} page(s); no steps recorded.${nothingFillableHint} Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`;
 
     // Capture the review page screenshot when we've reached the review screen. fullPage:true so
     // the vision verifier sees the WHOLE review — a viewport-only shot would let an off-screen
