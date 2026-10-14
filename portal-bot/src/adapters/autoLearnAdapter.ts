@@ -20,7 +20,7 @@ import { parseStreetName, parseStreetNumber, parseStreetLine, correctTruncatedAd
 import { portalUploadCapBytes } from "../uploadCap";
 import { LearnRunDebug } from "../learnDebug";
 import { armHumanCaptureOnPage } from "../humanCapture";
-import { chooseDraftForm, findSiteDraft, isDraftFormRefusal, modificationOnOriginalNotice } from "../draftCreated";
+import { chooseDraftForm, findSiteDraft, isDraftFormRefusal, modificationOnOriginalNotice, readsAsUnsubmittedDraft } from "../draftCreated";
 import { scanProjectForms, type ProjectFormRow } from "./correctionForm";
 import { readApplicationLedgerInPage, type LedgerEntry } from "./submissionLedger";
 import { LIST_LINK } from "../statusFinder";
@@ -33,6 +33,10 @@ export interface ContinueDraft {
   nextForm?: string;
   /** The project's street address, for finding an unsubmitted draft no run recorded. */
   street?: string;
+  city?: string;
+  zip?: string;
+  /** Another project of this client shares the house number and street words (backend-known). */
+  siblingAtSameStreet?: boolean;
   /** A draft is ON RECORD for this project: never start a new application. */
   required?: boolean;
 }
@@ -3390,6 +3394,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     }
     const recordText = String(await this.page!.locator("body").innerText().catch(() => ""));
     if (!recordText.includes(appNo)) return { kind: "refused", why: `the page the draft's link opened does not mention ${appNo}` };
+    // A record that no longer reads as an unsubmitted draft was completed (by hand, or by another
+    // run): there is nothing to continue, and the forms it offers now belong to a filed application.
+    if (!readsAsUnsubmittedDraft(recordText)) return { kind: "refused", why: `the record ${appNo} does not read as an unsubmitted draft any more — nothing to continue` };
     let scanFailed = false;
     const rows = (await this.page!.evaluate(scanProjectForms).catch(() => { scanFailed = true; return []; })) as ProjectFormRow[];
     if (scanFailed) return { kind: "refused", why: `the form list on the draft ${appNo} could not be read` };

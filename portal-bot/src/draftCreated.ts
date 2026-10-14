@@ -71,6 +71,15 @@ const CONTINUE_TO_FORM =
 // changes") is not a status and does not count.
 const DRAFT_STATUS = /\bapplication\s+draft\b|\bunsubmitted\s+draft\b|\bstatus\s*[:\-–—]?\s*(?:unsubmitted|draft)\b/i;
 
+// A page that STILL ASKS for the submit (the review page a slow portal has not left four seconds
+// after the click, a form page whose header shows the record's status) is not the page the click
+// produced. A status word on it says nothing about what the click did; only the "created" wording
+// decides there. Only the review page's own asks count ("review your application", "before
+// submitting"): a record page's help text ("has not yet been submitted", "to submit your
+// application, complete the forms", "click Submit to file") describes a draft and must not veto it.
+// (classifySubmissionText's own still-asks test includes the word "draft", so it cannot be reused here.)
+const PAGE_STILL_ASKS = /\bbefore\s+(?:you\s+)?(?:submit|submitting|filing)\b|\breview\s+(?:all\s+)?(?:your|the)\s+(?:application|information|submission|details|entries)\b/i;
+
 const squash = (s: string): string => String(s || "").replace(/\s+/g, " ").trim();
 const cleanFormName = (s: string): string => squash(s).replace(/^["“'\s]+|["”'.,;:\s]+$/g, "").slice(0, 90);
 
@@ -87,8 +96,10 @@ export function readDraftCreated(bodyText: string | null | undefined): DraftCrea
   const recordCreated = text.match(RECORD_CREATED);
   const cont = text.match(CONTINUE_TO_FORM);
   const status = text.match(DRAFT_STATUS);
-  const tell = created ?? (recordCreated && cont ? recordCreated : null) ?? status;
+  const createdTell = created ?? (recordCreated && cont ? recordCreated : null);
+  const tell = createdTell ?? status;
   if (!tell) return NOT_A_DRAFT;
+  if (!createdTell && PAGE_STILL_ASKS.test(text)) return NOT_A_DRAFT;
   // A sentence that says the application WAS submitted wins over every draft tell (positive
   // filing evidence, the same phrases classifySubmissionText accepts on). Record-number-only
   // "evidence" does not count here: a draft page carries the draft's own number.
@@ -163,32 +174,141 @@ export type SiteDraftFind =
   | { found: true; entry: LedgerEntry; why: string }
   | { found: false; ambiguous: boolean; why: string };
 
-/** "1234 N Example St" → ["1234", "example"]: the house number and the street's first real word. */
-function streetTokens(street: string): string[] {
-  const words = formKey(street).split(" ").filter(Boolean);
-  const house = words.find((w) => /^\d+[a-z]?$/.test(w));
-  const DIRECTIONAL = /^(n|s|e|w|ne|nw|se|sw|north|south|east|west)$/;
-  const name = words.find((w) => w !== house && !/^\d/.test(w) && !DIRECTIONAL.test(w));
-  return house && name ? [house, name] : [];
+const DIRECTIONAL = /^(?:n|s|e|w|ne|nw|se|sw|north|south|east|west|northeast|northwest|southeast|southwest)$/;
+const SUFFIXES: Record<string, string> = {
+  st: "st", street: "st", ave: "ave", av: "ave", avenue: "ave", rd: "rd", road: "rd", dr: "dr", drive: "dr", ln: "ln", lane: "ln",
+  ct: "ct", court: "ct", cir: "cir", circle: "cir", blvd: "blvd", boulevard: "blvd", way: "way", pl: "pl", place: "pl", ter: "ter",
+  terrace: "ter", trl: "trl", trail: "trl", pkwy: "pkwy", parkway: "pkwy", hwy: "hwy", highway: "hwy", loop: "loop", sq: "sq",
+  square: "sq", aly: "aly", alley: "aly", cv: "cv", cove: "cv", pt: "pt", point: "pt", run: "run", row: "row", walk: "walk", path: "path",
+};
+const UNIT_WORD = /^(?:unit|apt|apartment|ste|suite|bldg|building|lot|space|spc|trlr|rm|room|fl|floor|no|num|number)$/;
+const STATE = /^(?:al|ak|az|ar|ca|co|ct|de|fl|ga|hi|id|il|in|ia|ks|ky|la|me|md|ma|mi|mn|ms|mo|mt|ne|nv|nh|nj|nm|ny|nc|nd|oh|ok|or|pa|ri|sc|sd|tn|tx|ut|vt|va|wa|wv|wi|wy|dc)$/;
+const ZIP = /^\d{5}$/;
+const zip5 = (s: string): string => { const m = String(s || "").match(/\b(\d{5})(?:-\d{4})?\b/); return m ? m[1] : ""; };
+
+/** The parts of a site a list row can be held against. "1234 N Example St Unit B, Lynden, WA 98264"
+ *  → house "1234", words ["example"], suffix "st", unit "b", city "lynden", zip "98264". Ordinals
+ *  are street words ("1st" ≠ "3rd"); directionals are not (the row may abbreviate them); the suffix
+ *  is kept apart, canonical, and compared only when both sides carry one. The street line is the
+ *  first comma segment of the address, so a suffix-less street ("1234 Broadway, Lynden, WA 98264")
+ *  never absorbs its city, state and ZIP into the words; without a comma, the words stop at a
+ *  state code, a ZIP, a unit word or the given city. A unit is read after a unit word or a "#";
+ *  a single letter right after the suffix ("1234 Main St B") counts only on the project's own
+ *  address (`strict` off): on a list row a bare letter or number after the street is an initial,
+ *  a date, a size or a fee column, not a unit. `after` is what the row says past the street line. */
+export interface SiteKey { house: string; words: string[]; suffix: string; unit: string; city: string; zip: string; after: string[] }
+export function siteKey(site: { street?: string; city?: string; zip?: string }, strict = false): SiteKey | null {
+  const raw = String(site.street ?? "");
+  const city = formKey(String(site.city ?? "")).split(" ")[0] || "";
+  const line = raw.includes(",") ? raw.slice(0, raw.indexOf(",")) : raw;
+  const toks = formKey(line.replace(/#/g, " unit ")).split(" ").filter(Boolean);
+  const houseAt = toks.findIndex((w) => /^\d+[a-z]?$/.test(w));
+  if (houseAt < 0) return null;
+  const words: string[] = []; let suffix = ""; let unit = ""; let i = houseAt + 1;
+  for (; i < toks.length; i++) {
+    const w = toks[i];
+    if (UNIT_WORD.test(w)) { unit = toks[i + 1] ?? ""; i += 2; break; }
+    if (ZIP.test(w) || STATE.test(w) || (city && w === city)) break;
+    if (SUFFIXES[w] && words.length) {
+      suffix = SUFFIXES[w]; i += 1;
+      const n = toks[i] ?? "";
+      if (UNIT_WORD.test(n)) { unit = toks[i + 1] ?? ""; i += 2; }
+      else if (!strict && /^[a-z]$/.test(n) && !DIRECTIONAL.test(n)) { unit = n; i += 1; }
+      break;
+    }
+    if (DIRECTIONAL.test(w)) continue;
+    words.push(w);
+  }
+  const after = toks.slice(i).concat(formKey(raw.slice(line.length)).split(" ").filter(Boolean));
+  // A unit named after the city or ZIP ("… Lynden 98264 Unit B", "…, Apt 4"): still this site's unit.
+  if (!unit) { const k = after.findIndex((w) => UNIT_WORD.test(w)); if (k >= 0) unit = after[k + 1] ?? ""; }
+  const zip = zip5(String(site.zip ?? "")) || zip5(after.join(" ")) || "";
+  const cityOut = city || (after.find((w) => /^[a-z]{3,}$/.test(w) && !STATE.test(w)) ?? "");
+  return words.length ? { house: toks[houseAt], words, suffix, unit, city: cityOut, zip, after } : null;
 }
 
-export function findSiteDraft(entries: LedgerEntry[], site: { applicationNumber?: string; street?: string }): SiteDraftFind {
+/** Words a list row carries after an address that are never a city: statuses, actions, programs. */
+const ROW_NOISE = /^(?:application|applications|draft|unsubmitted|submitted|complete|completed|started|select|edit|view|open|continue|begin|delete|resume|withdraw|interconnection|net|metering|nem|solar|pv|residential|commercial|program|status|modified|created|updated|last|date|customer|account|acct|meter|id|no|num|number|total|kw|kwh|the|and|for|of)$/;
+const NOT_A_ZIP_AFTER = /^(?:account|acct|customer|meter|id|no|num|number|unit|apt|suite|ste|lot|space|spc|bldg|rm|fl)$/;
+
+export type RowFit = "confirmed" | "unconfirmed" | "ambiguous" | "other";
+/** How a list row fits the project's site. "other": a different house (a street word missing, a
+ *  suffix or ZIP that disagrees, both sides naming different units). "confirmed": the same street
+ *  line and the row names the project's city or ZIP. "unconfirmed": the same street line and the
+ *  row names no city or ZIP. "ambiguous": the same street line but only one side names a unit, or
+ *  the row names a city word that is not the project's — it may or may not be this site, so it is
+ *  never claimed and always shown to a person.
+ *  Only the address part of the row (from the house number on) is read: the record number's own
+ *  digits ("NEM-90017") and the columns before it are not a ZIP or a unit. */
+export function rowFit(row: string, key: SiteKey): { fit: RowFit; why: string } {
+  const r = formKey(String(row || "").replace(/#/g, " unit "));
+  const has = (t: string, s = r) => new RegExp(`(^| )${t}( |$)`).test(s);
+  if (!has(key.house) || !key.words.every((w) => has(w))) return { fit: "other", why: "another street" };
+  const addressPart = r.slice(r.search(new RegExp(`(^| )${key.house}( |$)`))).trim();
+  const rowKey = siteKey({ street: addressPart, city: key.city }, true);
+  if (!rowKey || !key.words.every((w) => rowKey.words.includes(w))) return { fit: "other", why: "another street" };
+  if (key.suffix && rowKey.suffix && key.suffix !== rowKey.suffix) return { fit: "other", why: `the row's street is a ${rowKey.suffix}, not a ${key.suffix}` };
+  const toks = addressPart.split(" ");
+  const zips = toks.filter((w, k) => k > 0 && ZIP.test(w) && w !== rowKey.unit && !NOT_A_ZIP_AFTER.test(toks[k - 1]));
+  if (key.zip && zips.length && !zips.includes(key.zip)) return { fit: "other", why: `the row's ZIP ${zips[0]} is not ${key.zip}` };
+  if (key.unit && rowKey.unit && key.unit !== rowKey.unit) return { fit: "other", why: `the row is unit ${rowKey.unit}, not ${key.unit}` };
+  if (Boolean(key.unit) !== Boolean(rowKey.unit)) return { fit: "ambiguous", why: key.unit ? `the project is unit ${key.unit} and the row names no unit` : `the row names unit ${rowKey.unit} and the project names none` };
+  if (key.zip && zips.includes(key.zip)) return { fit: "confirmed", why: `the row carries ZIP ${key.zip}` };
+  if (key.city && has(key.city, addressPart)) return { fit: "confirmed", why: `the row names ${key.city}` };
+  const cityLike = rowKey.after.find((w) => /^[a-z]{3,}$/.test(w) && !STATE.test(w) && !DIRECTIONAL.test(w) && !ROW_NOISE.test(w) && !SUFFIXES[w] && !UNIT_WORD.test(w));
+  if (key.city && cityLike) return { fit: "ambiguous", why: `the row says "${cityLike}" after the street, not ${key.city}` };
+  return { fit: "unconfirmed", why: "the row names no city or ZIP" };
+}
+
+export interface SiteToMatch {
+  applicationNumber?: string;
+  street?: string;
+  city?: string;
+  zip?: string;
+  /** Another project of this client has the same house number and street words (the backend
+   *  knows): a row that names no city or ZIP can then be either house, and is never claimed. */
+  siblingAtSameStreet?: boolean;
+}
+
+/** A listed record's own status words, when it carries any that are not a draft's ("Not Submitted"
+ *  is a draft's). */
+const FILED_STATUS = /(?<!\bnot\s)(?<!\bnot\s\s)\b(?:submitted|under\s+review|in\s+review|approved|accepted|received|completed?|withdrawn|cancell?ed|closed|rejected|denied|issued|active)\b/i;
+
+export function findSiteDraft(entries: LedgerEntry[], site: SiteToMatch): SiteDraftFind {
   const list = Array.isArray(entries) ? entries : [];
   const number = String(site.applicationNumber ?? "").trim().toUpperCase();
   if (number) {
     const hits = list.filter((e) => String(e.id || "").trim().toUpperCase() === number);
-    if (hits.length === 1) return { found: true, entry: hits[0], why: `the recorded draft ${number} is listed` };
+    if (hits.length === 1) {
+      const row = String(hits[0].row || "");
+      // A recorded draft whose row now carries a filed status was completed by hand: nothing to continue.
+      if (!readsAsUnsubmittedDraft(row) && FILED_STATUS.test(row)) {
+        return { found: false, ambiguous: false, why: `the recorded draft ${number} no longer reads as an unsubmitted draft (its row says "${squash(row).slice(0, 120)}")` };
+      }
+      return { found: true, entry: hits[0], why: `the recorded draft ${number} is listed` };
+    }
     return { found: false, ambiguous: hits.length > 1, why: hits.length > 1 ? `${hits.length} rows carry ${number}` : `the recorded draft ${number} is not on this list` };
   }
-  const tokens = streetTokens(String(site.street ?? ""));
-  if (!tokens.length) return { found: false, ambiguous: false, why: "the project has no street address to match a draft by" };
-  const hits = list.filter((e) => {
-    const row = formKey(e.row || "");
-    return readsAsUnsubmittedDraft(e.row) && tokens.every((t) => new RegExp(`(^| )${t}( |$)`).test(row));
-  });
-  if (hits.length === 1) return { found: true, entry: hits[0], why: `${hits[0].id} is the one unsubmitted draft listed for this street address` };
-  if (hits.length > 1) return { found: false, ambiguous: true, why: `${hits.length} unsubmitted drafts are listed for this street address (${hits.map((h) => h.id).join(", ")})` };
-  return { found: false, ambiguous: false, why: "no unsubmitted draft is listed for this street address" };
+  const key = siteKey(site);
+  if (!key) return { found: false, ambiguous: false, why: "the project has no street address to match a draft by" };
+  const where = (e: LedgerEntry) => `${e.id} ("${squash(e.row || "").slice(0, 100)}")`;
+  // Every row on this street line (house number and street words), whatever its status or city: a
+  // second record there, filed or not, is the portal's own proof that the line holds more than one
+  // application, and a draft whose row names no city or ZIP could then be either one.
+  const fitted = list.map((e) => ({ e, ...rowFit(e.row || "", key) }));
+  const onLine = fitted.filter((x) => x.why !== "another street");
+  const drafts = onLine.filter((x) => x.fit !== "other" && readsAsUnsubmittedDraft(x.e.row));
+  if (!drafts.length) return { found: false, ambiguous: false, why: "no unsubmitted draft is listed for this street address" };
+  if (drafts.length > 1) return { found: false, ambiguous: true, why: `${drafts.length} unsubmitted drafts are listed for this street address (${drafts.map((x) => where(x.e)).join(", ")}) — a person opens the right one` };
+  const one = drafts[0];
+  if (one.fit === "ambiguous") return { found: false, ambiguous: true, why: `${where(one.e)} is an unsubmitted draft at this house number and street, but ${one.why} — a person opens the right one` };
+  if (one.fit === "confirmed") return { found: true, entry: one.e, why: `${one.e.id} is the one unsubmitted draft listed for this site (${squash(one.e.row || "").slice(0, 100)}; ${one.why})` };
+  const others = onLine.filter((x) => x !== one);
+  if (site.siblingAtSameStreet || others.length) {
+    const proof = others.length ? `the list also carries ${others.map((x) => x.e.id).join(", ")} on that line` : "this client has more than one project on that street line";
+    return { found: false, ambiguous: true, why: `${where(one.e)} is an unsubmitted draft whose row names no city or ZIP, and ${proof} — a person opens the right one` };
+  }
+  return { found: true, entry: one.e, why: `${one.e.id} is the one unsubmitted draft listed for this street address (${squash(one.e.row || "").slice(0, 100)}; the row names no city or ZIP)` };
 }
 
 // ---------------------------------------------------------------------------

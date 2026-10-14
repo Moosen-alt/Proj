@@ -133,6 +133,71 @@ check("a filed record on the same street is not a draft, and two drafts on one s
   assert.equal(findSiteDraft(entries, { applicationNumber: "NEM-99999" }).found, false);
 });
 
+// THE STREET MATCH NEVER CLAIMS ANOTHER HOUSE (Helm review of PR #325, blocker). A false claim is
+// recorded for this project and the next stage fills that stranger's Part 2 with this project's data.
+const draftRow = (id: string, address: string, extra = "") => ({ id, href: `https://utility.example.test/p/${id}`, row: `${id} Application Draft Jordan Testcase ${address}${extra ? ` ${extra}` : ""}` });
+const site = (street: string, city = "", zip = "", siblingAtSameStreet = false) => ({ street, city, zip, siblingAtSameStreet });
+
+check("another house's draft is never claimed: a different ordinal street, another city, another unit", () => {
+  const ordinal = findSiteDraft([draftRow("NEM-91001", "15 1st Ave, Lynden")], site("15 3rd Ave, Bellingham", "Bellingham"));
+  assert.equal(ordinal.found, false, ordinal.why);
+  const city = findSiteDraft([draftRow("NEM-91002", "1234 Main St, Seattle")], site("1234 Main St, Lynden", "Lynden"));
+  assert.equal(city.found, false, city.why);
+  const unit = findSiteDraft([draftRow("NEM-91003", "1234 Main St Unit A, Lynden")], site("1234 Main St Unit B, Lynden", "Lynden"));
+  assert.equal(unit.found, false, unit.why);
+  // The house number as a DAY in a date column, on an avenue with another name.
+  const date = findSiteDraft([draftRow("NEM-91004", "88 Elm Ave, Lynden", "10/15/2026")], site("15 Oak Ave, Lynden", "Lynden"));
+  assert.equal(date.found, false, date.why);
+});
+
+check("one side naming a unit, a foreign city word, or a city-less row with another record on the line stops as ambiguous", () => {
+  const oneUnit = findSiteDraft([draftRow("NEM-92001", "1234 Main St, Lynden")], site("1234 Main St Unit B, Lynden", "Lynden"));
+  assert.ok(!oneUnit.found && oneUnit.ambiguous, oneUnit.why);
+  const foreign = findSiteDraft([draftRow("NEM-92002", "1234 Main St Ferndale")], site("1234 Main St, Lynden", "Lynden"));
+  assert.ok(!foreign.found && foreign.ambiguous, foreign.why);
+  const twoOnLine = findSiteDraft([
+    draftRow("NEM-92003", "1234 Main St"),
+    { id: "NEM-92004", href: "", row: "NEM-92004 Approved Riley Sample 1234 Main St" },
+  ], site("1234 Main St, Lynden", "Lynden"));
+  assert.ok(!twoOnLine.found && twoOnLine.ambiguous, twoOnLine.why);
+  const sibling = findSiteDraft([draftRow("NEM-92005", "1234 Main St")], site("1234 Main St, Lynden", "Lynden", "", true));
+  assert.ok(!sibling.found && sibling.ambiguous, sibling.why);
+  const unconfirmed = findSiteDraft([draftRow("NEM-92006", "1234 Main St")], site("1234 Main St, Lynden", "Lynden"));
+  assert.ok(unconfirmed.found, `with no sibling and nothing else on the line, the one city-less draft is the project's: ${unconfirmed.why}`);
+});
+
+check("the one real draft is still found past dates, fees, sizes, ZIP+4, long house numbers, suffix-less streets and a unit after the ZIP", () => {
+  const cases: Array<[string, ReturnType<typeof site>]> = [
+    ["1234 N Example St, Lynden 10/15/2026 $125.00 7.2 kW", site("1234 North Example Street, Lynden, WA 98264", "Lynden", "98264")],
+    ["1234 N Example St Lynden WA 98264-1234", site("1234 N Example St, Lynden, WA 98264", "Lynden", "98264")],
+    ["12345 Example Rd, Lynden", site("12345 Example Rd, Lynden, WA", "Lynden")],
+    ["1234 Broadway, Lynden", site("1234 Broadway, Lynden, WA 98264", "Lynden", "98264")],
+    ["1234 Main St Lynden WA 98264 Unit B", site("1234 Main St Unit B, Lynden, WA 98264", "Lynden", "98264")],
+  ];
+  for (const [address, s] of cases) {
+    const r = findSiteDraft([draftRow("NEM-93001", address), { id: "NEM-93999", href: "", row: "NEM-93999 Approved 77 Other Rd Lynden" }], s);
+    assert.ok(r.found && r.entry.id === "NEM-93001", `"${address}": ${r.why}`);
+  }
+});
+
+check("a recorded draft whose row now reads filed is not continued; a 'Not Submitted' row still is", () => {
+  const filed = findSiteDraft([{ id: "NEM-94001", href: "", row: "NEM-94001 Submitted 1234 Main St Lynden" }], { applicationNumber: "NEM-94001" });
+  assert.equal(filed.found, false, filed.why);
+  const notSubmitted = findSiteDraft([{ id: "NEM-94002", href: "", row: "NEM-94002 Not Submitted 1234 Main St Lynden" }], { applicationNumber: "NEM-94002" });
+  assert.ok(notSubmitted.found, notSubmitted.why);
+});
+
+check("a status-only tell on a page that still asks for the submit is not a draft; the record page's help text still is", () => {
+  const stillAsks = "NEM-90017 Status: Application Draft  Step 5 of 5. Please review your application before submitting.  Submit";
+  assert.equal(readDraftCreated(stillAsks).draft, false);
+  const helpText = `${DRAFT_RECORD_PAGE} This application has not yet been submitted. To submit your application, complete the forms below and click Submit to file.`;
+  const r = readDraftCreated(helpText);
+  assert.equal(r.draft, true);
+  assert.equal(r.strength, "status");
+  // The "created" wording wins even on a page that also asks.
+  assert.equal(readDraftCreated(`${DRAFT_CREATED_PAGE} Please review your application before submitting.`).draft, true);
+});
+
 check("PSE's modification-on-the-original-record notice is read as a review note, digits masked", () => {
   const note = modificationOnOriginalNotice("Application Type: Change to an existing Net Metered System. If an original application exists, this change must be filed as a modification on the original record 4413100 instead. Next");
   assert.match(note, /modification on the original record/);

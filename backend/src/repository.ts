@@ -98,6 +98,7 @@ import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCreden
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
 import { logger } from "./logger";
 import { draftContinuationGaps, openPortalDraftFor, recordPortalDraft, type ObservedDraft } from "./portalDraft";
+import { siteKey } from "../../portal-bot/src/draftCreated";
 import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, type HostFit, type PortalUrlSource } from "./portalChannel";
 import { isPortalPaused } from "./portalPause";
 // The ONE creator of permit_check_targets rows (extracted from markTrackSubmitted).
@@ -8907,6 +8908,18 @@ export async function prepareSubmission(
     } catch { /* no planner available — stage with hand-coded/recipe fills only */ }
   }
 
+  // ANOTHER PROJECT OF THIS CLIENT ON THE SAME STREET LINE (#302): the portal's list row for a draft
+  // may name no city or ZIP, and then "1234 Main St" could be either house. Known here, decided there
+  // (draftCreated.ts findSiteDraft): with a sibling, such a row is never claimed.
+  const streetLineKey = (addr: string): string => { const k = siteKey({ street: addr }); return k ? `${k.house} ${k.words.join(" ")}` : ""; };
+  const ownStreetLine = track === "nem" ? streetLineKey(portalProject.projectAddress) : "";
+  const siblingAtSameStreet = Boolean(ownStreetLine) && db.query<Row>(
+    "SELECT project_address FROM projects WHERE client_id = ? AND id != ?", [portalProject.clientId ?? "", projectId],
+  ).some((r) => streetLineKey(text(r.project_address)) === ownStreetLine);
+  const siteDraftParts = track === "nem"
+    ? { street: portalProject.projectAddress, city: portalProject.city, zip: portalProject.zip, siblingAtSameStreet }
+    : undefined;
+
   const stageOptions = {
     beforeUpload: uploadDocumentGuard(db, projectId, track !== "nem"),
     encryptedStorageStatePath: portalProfile?.encrypted_storage_state ?? undefined,
@@ -8989,7 +9002,7 @@ export async function prepareSubmission(
     // hardcoded default. Already permit/utility scoped by the credentialUrl resolution.
     loginUrl: credentialUrl || undefined,
     // The replay's existing-draft check (#302): NEM only — the two-part utility portals.
-    siteDraft: track === "nem" ? { street: portalProject.projectAddress } : undefined,
+    siteDraft: siteDraftParts,
   };
 
   // UNIVERSAL-FIRST dispatch with SELF-SEED (see selectStagingActor):
@@ -9202,6 +9215,14 @@ export async function prepareSubmission(
       // Kill-switch tripped: surface a manual handoff and drive NO automation.
       const msg = `${portalLabel} is paused (legal kill-switch). ${channelDecision.reason} Submit this application by hand and resume the portal once it's cleared.`;
       result = { ok: false, finalSubmitClicked: false, pauseReason: "portal_paused", message: msg, steps: [{ ok: false, message: msg }] };
+    } else if (nemDraft && (runActorLabel === "RecipeAdapter" || runActorLabel === "PowerClerkAdapter" || runActorLabel === "OregonEPermittingAdapter")) {
+      // THE DRAFT CAN ONLY BE CONTINUED BY THE LEARNER (#302). With PORTAL_AUTOSEED off, or a hand-coded
+      // adapter picked for this portal, this run would start the application again — a second number
+      // for the same house — so it stops before a browser opens, and says what unblocks it.
+      const why = autoSeedEnabled ? `${runActorLabel} is the actor for this portal` : "PORTAL_AUTOSEED is off on this server";
+      const msg = `Staging stopped before opening the portal: this project already has a draft on the utility portal${nemDraft.applicationNumber ? ` (${nemDraft.applicationNumber})` : ""}, and continuing it needs the learner, which this run cannot use (${why}). Starting the application again would create a second one. Turn the learner on and stage again, or complete the draft in the portal by hand and record the filing.`;
+      addAuditLog(db, projectId, "system", "submit gate", "portal.draft_continuation_unavailable", { track: "nem", actor: runActorLabel, autoSeedEnabled, applicationNumber: nemDraft.applicationNumber });
+      result = { ok: false, finalSubmitClicked: false, pauseReason: null, message: msg, steps: [{ ok: false, message: msg }] };
     } else if (recipe && runActorLabel === "RecipeAdapter" && recipeTrackConflict) {
       // TRACK/HOST GATE for the REPLAY path, BOTH WAYS: a pre-fix learn mis-keyed by the KB
       // poisoning bug can leave an AHJ-scoped COMPLETE recipe whose steps drive the utility NEM
@@ -9519,8 +9540,8 @@ export async function prepareSubmission(
             headless: stageOptions.headless,
             // THIS PROJECT'S EXISTING DRAFT (#302): a recorded one is opened and never re-started; with
             // none recorded, the walk still looks for an unsubmitted draft listed for this street.
-            continueDraft: track === "nem"
-              ? { applicationNumber: nemDraft?.applicationNumber || undefined, nextForm: nemDraft?.nextForm || undefined, street: portalProject.projectAddress, required: Boolean(nemDraft) }
+            continueDraft: siteDraftParts
+              ? { ...siteDraftParts, applicationNumber: nemDraft?.applicationNumber || undefined, nextForm: nemDraft?.nextForm || undefined, required: Boolean(nemDraft) }
               : undefined,
           });
           result = seedOutcomeToStageResult(seed);

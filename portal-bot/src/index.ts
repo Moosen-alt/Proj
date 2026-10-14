@@ -39,6 +39,8 @@ export function draftAwareHumanSink(
       const text = await adapter.readCurrentPageText!().catch(() => "");
       const draft = readDraftCreated(text);
       if (draft.draft) {
+        // The capture sink disarmed itself at this click (humanCapture.ts), so nothing a person does
+        // after it on the same page is observed. Fine for PSE's flow: the next stage continues the draft.
         try { onDraftCreated({ ...draft, clickedLabel: String(step.value ?? "") }); } catch { /* reporting must never disturb the operator's window */ }
         return;
       }
@@ -294,7 +296,7 @@ interface StageOptions {
   // login screen for three minutes; the dashboard needs this to say why. Recipe replays only.
   onProgress?: (p: import("./adapters/recipeAdapter").RecipeProgress) => void;
   /** The project's site, for the replay's existing-draft check (#302, RecipeAdapter siteDraft). */
-  siteDraft?: { street?: string };
+  siteDraft?: { street?: string; city?: string; zip?: string; siblingAtSameStreet?: boolean };
 }
 
 // Headed, guided-manual staging leaves the browser OPEN at the review screen so the human

@@ -570,7 +570,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       /** THIS PROJECT'S SITE, for the existing-draft check (#302): before the recipe starts a new
        *  application, an unsubmitted draft already listed for this street stops the replay, named
        *  — a two-part portal made that draft at its Part 1 Submit, and a second one is a failure. */
-      siteDraft?: { street?: string };
+      siteDraft?: { street?: string; city?: string; zip?: string; siblingAtSameStreet?: boolean };
     } = {},
   ) {
     super();
@@ -663,7 +663,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     const street = String(this.options.siteDraft?.street ?? "").trim();
     if (street && this.page && typeof this.page.evaluate === "function") {
       const entries = (await this.page.evaluate(readApplicationLedgerInPage).catch(() => [])) as LedgerEntry[];
-      const find = findSiteDraft(entries, { street });
+      const find = findSiteDraft(entries, { ...this.options.siteDraft, street });
       if (find.found || find.ambiguous) {
         const appNo = find.found ? find.entry.id : "";
         return fail(

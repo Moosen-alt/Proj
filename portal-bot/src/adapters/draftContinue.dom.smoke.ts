@@ -17,6 +17,9 @@
 //   (4) PSE's red "file as a modification on the original record" notice is a review note in the
 //       hand-off, not a stop.
 //   (5) A REQUIRED draft that is not on the list stops the run by name before anything is started.
+//   (6) A RECORDED DRAFT THAT WAS FILED SINCE is not continued: the list row (stale, no status) is
+//       found by number, but the record page reads Submitted, so its "Modification Request [Begin]"
+//       is never opened and the run stops by name (Helm review of PR #325).
 //
 // Run: npx tsx portal-bot/src/adapters/draftContinue.dom.smoke.ts
 import "../smokeArtifactDirs";
@@ -50,8 +53,14 @@ const PAGES: Record<string, string> = {
     <a href="/new" class="btn">Start a New Application</a>
     <table><thead><tr><th>Project</th><th>Status</th><th>Customer</th><th>Site</th></tr></thead><tbody>
       <tr><td><a href="/rec/80001">NEM-80001</a></td><td>Approved</td><td>Riley Sample</td><td>77 Other Rd, Lynden</td></tr>
+      <tr><td><a href="/rec/70001">NEM-70001</a></td><td></td><td>Casey Example</td><td>9 Pine Ln, Lynden</td></tr>
       <tr><td><a href="/rec/90017">NEM-90017</a></td><td>Application Draft</td><td>Jordan Testcase</td><td>1234 N Example St, Lynden</td></tr>
     </tbody></table>`),
+  "/rec/70001": shell("NEM-70001", `
+    <h1>NEM-70001</h1><p>Status: Submitted - Under Utility Review</p><p>9 Pine Ln, Lynden</p>
+    <div class="card"><div class="card-header">Current Forms</div><table><tbody>
+      <tr><td>Modification Request <button type="button" onclick="location.href='/mod'">Begin</button></td><td>New Form</td></tr>
+    </tbody></table></div>`),
   "/rec/90017": shell("NEM-90017", `
     <h1>NEM-90017</h1><p>Status: Application Draft</p><p>1234 N Example St, Lynden</p>
     <div class="card"><div class="card-header">Current Forms</div><table><tbody>
@@ -179,6 +188,27 @@ try {
     catch { /* reported below */ }
     check("(5) a required draft that is not listed stops the run by name and starts no application",
       r?.ok === false && r?.stopReason === "existing_draft_not_opened" && !hits.includes("/new") && posts.length === 0,
+      `ok=${r?.ok} stop=${r?.stopReason} hits=[${hits.join(",")}] ${String(r?.message ?? "").slice(0, 300)}`);
+    await ctx.close().catch(() => null);
+  }
+
+  // (6) a recorded draft that was filed since: never continued, never a modification.
+  {
+    const { ctx, page } = await newPage();
+    await page.goto(`${base}/home`);
+    hits.length = 0; posts.length = 0;
+    const adapter = new AutoLearnAdapter("Smoke PowerClerk", planner, {
+      maxPages: 6,
+      continueDraft: { applicationNumber: "NEM-70001", street: "9 Pine Ln, Lynden, WA", city: "Lynden", required: true },
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (adapter as any).page = page;
+    let r: Awaited<ReturnType<AutoLearnAdapter["learn"]>> | null = null;
+    try { r = await adapter.learn({ portalUrl: `${base}/home` } as never, { ...PROJECT, projectAddress: "9 Pine Ln, Lynden, WA" } as never); }
+    catch { /* reported below */ }
+    check("(6) a recorded draft whose record now reads filed is refused by name: no Modification Request, no new application",
+      r?.ok === false && r?.stopReason === "existing_draft_not_opened" && /does not read as an unsubmitted draft/.test(String(r?.message ?? ""))
+        && !hits.includes("/mod") && !hits.includes("/new") && posts.length === 0,
       `ok=${r?.ok} stop=${r?.stopReason} hits=[${hits.join(",")}] ${String(r?.message ?? "").slice(0, 300)}`);
     await ctx.close().catch(() => null);
   }
