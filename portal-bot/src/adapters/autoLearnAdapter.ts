@@ -5624,6 +5624,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // Recorded as an ordinary step, which is the whole point: the type choice has to be
         // IN the recipe or replay lands on this menu with no step for it, which is exactly
         // how permiteyes' nine-fill recipe failed at step 2 of 12.
+        // Set when the page's ONE choice tile was entered below; the loop then re-scrapes.
+        let singleTileEntered = false;
         if (!applicationStarted && this.page) {
           const track = /elec/i.test(this.permitDiscipline) ? "electrical"
             : /struct|build/i.test(this.permitDiscipline) ? "structural"
@@ -5676,18 +5678,49 @@ export class AutoLearnAdapter extends BasePortalAdapter {
                 tiles: tiles.slice(0, 12).map((t) => t.slice(0, 60)), matched: picked.refusal.matched.slice(0, 6),
               });
               if (!entered?.ok && !hasFillable) {
-                const named = tiles.slice(0, 12).map((t) => `"${t.slice(0, 60)}"`).join(" | ");
-                const why = picked.refusal.reason === "ambiguous"
-                  ? `more than one of them could be it (${picked.refusal.matched.slice(0, 6).map((m) => `"${m}"`).join(" | ")}) and a permit type is never guessed`
-                  : `none of them names this job (${track} track)`;
-                return fail(
-                  steps,
-                  this.portalName,
-                  `Auto-learn stopped at a page of ${tiles.length} choice tile(s): ${why}. The page offered: ${named}. A person picks the permit type here; record that step manually.`,
-                  null,
-                  pageCount,
-                  portalNotices,
-                );
+                // ONE CARD AND NOTHING ELSE TO ADVANCE IS A DOOR, NOT A STOP (owner's ruling
+                // 2026-09-26: a false stop on a legitimate step is a bug). A home whose only way
+                // in is a single card worded outside the entry vocabulary ("Begin Submittal")
+                // was left to the planner before tiles existed; stopping here would have named
+                // it and gone home. With exactly one tile — no fillable, no entry control, no
+                // other tile — the learner enters it, once per page (a card that does not move
+                // the page is never clicked twice), and records it the way the entry is. The
+                // chooser has already refused a real-filing title (singleTile is unset then).
+                // Two or more tiles with no job-matching title still stop and name themselves:
+                // choosing between them is choosing a permit type, which is never guessed.
+                const single = tiles.length === 1 ? picked.refusal.singleTile : undefined;
+                const singleKey = single ? this.navClickKey(url, single.label) : "";
+                if (single && singleKey && !this.navClicksByPath.has(singleKey)) {
+                  const beforeTileUrl = typeof this.page.url === "function" ? String(this.page.url() ?? "") : "";
+                  const beforeTileFp = await this.pageFingerprint();
+                  const clicked = await single.locator.click({ timeout: 8000 }).then(() => true).catch(() => false);
+                  if (clicked) {
+                    this.navClicksByPath.add(singleKey);
+                    await this.waitAfterClick(beforeTileUrl, beforeTileFp, this.tabCount());
+                    steps.push({
+                      action: "click",
+                      phase: "open",
+                      selector: { text: single.label, exact: true, fallbacks: [{ role: "link", name: single.label, exact: true }, { role: "button", name: single.label, exact: true }] },
+                      note: `choice tile: ${single.label}`,
+                    });
+                    this.debug?.event({ type: "choice_tile_entered_single", page: pageCount, label: single.label.slice(0, 60) });
+                    singleTileEntered = true;
+                  }
+                }
+                if (!singleTileEntered) {
+                  const named = tiles.slice(0, 12).map((t) => `"${t.slice(0, 60)}"`).join(" | ");
+                  const why = picked.refusal.reason === "ambiguous"
+                    ? `more than one of them could be it (${picked.refusal.matched.slice(0, 6).map((m) => `"${m}"`).join(" | ")}) and a permit type is never guessed`
+                    : `none of them names this job (${track} track)`;
+                  return fail(
+                    steps,
+                    this.portalName,
+                    `Auto-learn stopped at a page of ${tiles.length} choice tile(s): ${why}. The page offered: ${named}. A person picks the permit type here; record that step manually.`,
+                    null,
+                    pageCount,
+                    portalNotices,
+                  );
+                }
               }
             }
           }
@@ -5716,7 +5749,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         const programJustChosen = this.entryLabelsClicked.size > 0 && !this.programChosen
           ? await this.chooseApplicationProgram(steps)
           : false;
-        if (entered?.ok || programJustChosen) continue;
+        if (entered?.ok || programJustChosen || singleTileEntered) continue;
       }
 
       // b9) AN OPTION-LESS DROPDOWN IS UNANSWERABLE. Ask it what it offers, first.

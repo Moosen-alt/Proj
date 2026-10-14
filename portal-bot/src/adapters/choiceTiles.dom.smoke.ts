@@ -25,8 +25,11 @@
 //                never "nothing fillable".
 //   MUST PASS  — the entry pass enters a home whose "Apply for a Permit" is a card, never its
 //                "My Permits" / "View or Pay Fees" cards; a pointer cursor alone is an affordance.
-//   MUST EXCLUDE — a chevron step bar, a lone card, a card holding inputs, an accordion, and a
-//                dashboard of record cards (titles with numbers) are never tiles.
+//   MUST PASS  — a home whose ONLY way in is one card worded outside the entry vocabulary
+//                ("Begin Submittal") is ENTERED, not stopped at (owner's ruling 2026-09-26:
+//                a false stop on a legitimate step is a bug); a single "Pay Fees Due" card is not.
+//   MUST EXCLUDE — a chevron step bar, a card holding inputs, an accordion, and a dashboard
+//                of record cards (titles with numbers) are never tiles.
 //
 // Against main's applicationEntry.ts + autoLearnAdapter.ts every MUST PASS line is a FAIL
 // banner, not a crash: the new exports are reached through a namespace import.
@@ -201,6 +204,26 @@ const PAGES: Record<string, string> = {
       <div class="card"><h3>Owner</h3><label for="o">Owner name</label><input id="o" name="o"><i class="fa fa-chevron-right"></i></div>
       <div class="card"><h3>Installer</h3><label for="i">Installer name</label><input id="i" name="i"><i class="fa fa-chevron-right"></i></div>
     </div>
+  </body></html>`,
+  // A home whose ONLY way in is one card, worded outside the entry vocabulary ("Begin
+  // Submittal"): no fillable, no entry-pattern control, no other tile. The owner's ruling
+  // (2026-09-26): a false stop on a legitimate step is a bug — the learner enters it.
+  "/home-single": `<!doctype html><html><head><style>.card{display:flex;border:1px solid #ccc;padding:12px;min-height:60px} .card-body{flex:1}</style></head><body>
+    <h1>Welcome to the Permit Portal</h1>
+    <p>Signed in as Example Solar Co.</p>
+    <div id="sgControls">
+      <div class="card"><div class="card-body"><div class="card-title">Begin Submittal</div><div class="card-text">Start a new permit submittal with the city.</div></div><div class="card-next"><i class="fa fa-chevron-right"></i></div></div>
+    </div>
+    <ul class="menu"><li><a href="/help">Help and FAQs</a></li><li><a href="/privacy">Privacy policy</a></li></ul>
+    ${DELEGATION("function () { return '/apply'; }")}
+  </body></html>`,
+  // MUST EXCLUDE: the same shape, but the one card is a real-filing control.
+  "/home-single-pay": `<!doctype html><html><head><style>.card{display:flex;border:1px solid #ccc;padding:12px;min-height:60px} .card-body{flex:1}</style></head><body>
+    <h1>Welcome to the Permit Portal</h1>
+    <div id="sgControls">
+      <div class="card"><div class="card-body"><div class="card-title">Pay Fees Due</div><div class="card-text">Fees are due on your permits.</div></div><div class="card-next"><i class="fa fa-chevron-right"></i></div></div>
+    </div>
+    ${DELEGATION("function () { return '/fees'; }")}
   </body></html>`,
   // MUST EXCLUDE: a dashboard of the operator's RECORDS as pointer-cursor cards. A record's
   // title carries a number; a type's never does.
@@ -405,8 +428,10 @@ check("a chevron step bar yields no tiles, and 'Review and Submit' never reaches
   JSON.stringify(stepperRaws.map((f) => f.label)));
 await page.goto(`${base}/lone`);
 const loneRaws = await harvest(page);
-check("a lone card is content and a card holding inputs is a form: no tiles",
-  !loneRaws.some((f) => (f as { tile?: boolean }).tile), JSON.stringify(loneRaws.filter((f) => (f as { tile?: boolean }).tile).map((f) => f.label)));
+check("a card holding inputs is a form, never a tile; the one card without is the page's single choice",
+  !loneRaws.some((f) => (f as { tile?: boolean }).tile && /^(owner|installer)$/i.test(f.label))
+    && loneRaws.filter((f) => (f as { tile?: boolean }).tile).map((f) => f.label).join("|") === SOLAR,
+  JSON.stringify(loneRaws.filter((f) => (f as { tile?: boolean }).tile).map((f) => f.label)));
 await page.goto(`${base}/home`);
 const homeRaws = await harvest(page);
 check("the home's accordion items (heading + button each) are not tiles; its five cards are",
@@ -417,6 +442,35 @@ await page.goto(`${base}/records`);
 const recordRaws = await harvest(page);
 check("a dashboard of the operator's record cards yields no tiles (a title with a number is a record)",
   !recordRaws.some((f) => (f as { tile?: boolean }).tile), JSON.stringify(recordRaws.map((f) => f.label)));
+
+// ===========================================================================================
+// 7) MUST PASS — ONE card, nothing else to advance: the learner enters it (owner's ruling,
+//    2026-09-26: a false stop on a legitimate step is a bug). Two or more unmatched tiles still
+//    stop and name themselves ([4]); a single card that is a real-filing control is never entered.
+// ===========================================================================================
+console.log("\n[7] a home whose only way in is ONE card worded outside the entry vocabulary");
+await page.goto(`${base}/home-single`);
+const singlePick = await chooseApplicationType(page, "electrical");
+const singleRef = singlePick.ok ? null : (singlePick.refusal as { tiles?: string[]; singleTile?: { label: string } });
+check("the chooser refuses the TYPE (no job word) but reports the one card as the page's single choice",
+  !!singleRef && (singleRef.tiles ?? []).length === 1 && singleRef.singleTile?.label === "Begin Submittal",
+  singlePick.ok ? `picked ${singlePick.choice.label}` : JSON.stringify(singleRef));
+{
+  const before = hits.length;
+  const w = await runLearn("/home-single", { permitType: "electrical" });
+  check("the learner ENTERS the single card instead of stopping",
+    w.notes.some((n) => n === "choice tile: Begin Submittal"), `notes=${JSON.stringify(w.notes)} message=${w.r.message}`);
+  check("...and goes on to pick the solar tile on the page behind it",
+    w.notes.some((n) => n === `permit type: ${SOLAR}`) && w.url.includes("/chosen?tile=Solar%20Permit%20Request"),
+    `ended on ${w.url}; notes=${JSON.stringify(w.notes)}`);
+  check("...never the help or privacy links beside it",
+    !hits.slice(before).some((h) => h.startsWith("/help") || h.startsWith("/privacy")), JSON.stringify(hits.slice(before)));
+}
+await page.goto(`${base}/home-single-pay`);
+const payPick = await chooseApplicationType(page, "electrical");
+check("MUST EXCLUDE: a single card that is a real-filing control ('Pay Fees Due') is never the single choice",
+  !payPick.ok && !(payPick.refusal as { singleTile?: unknown }).singleTile,
+  payPick.ok ? `picked ${payPick.choice.label}` : JSON.stringify(payPick.refusal));
 
 await browser.close();
 await new Promise<void>((r) => server.close(() => r()));

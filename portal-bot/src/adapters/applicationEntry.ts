@@ -282,13 +282,16 @@ export function markChoiceTilesInPage(): ChoiceTileRaw[] {
   const own = found.filter((c) => !found.some((o) =>
     o !== c && c.el.contains(o.el) && (o.el.contains(c.titleEl) || (c.affEl !== null && o.el.contains(c.affEl)))));
 
-  // REPETITION: alike siblings under one parent. A lone card is content.
+  // REPETITION, OR SOLITUDE: alike siblings under one parent are a menu; a card that is the
+  // page's ONLY candidate is its one choice — the learner enters it when nothing else on the
+  // page advances (the adapter's single-tile rule; owner's ruling 2026-09-26: a false stop on
+  // a legitimate step is a bug). Two unalike cards in different places are content.
   const kept: Array<{ el: Element; title: string }> = [];
   for (const c of own) {
     const parent = c.el.parentElement;
     if (!parent) continue;
     const alike = own.filter((o) => o.el.parentElement === parent && o.el.tagName === c.el.tagName);
-    if (alike.length >= 2) kept.push({ el: c.el, title: c.title });
+    if (alike.length >= 2 || own.length === 1) kept.push({ el: c.el, title: c.title });
   }
   // Whatever nesting ownership left, the inner element is the one a click lands on.
   const tiles = kept.filter((c) => !kept.some((o) => o !== c && c.el.contains(o.el)));
@@ -664,6 +667,10 @@ export interface PermitTypeRefusal {
   /** The choice tiles the page offered (their titles; a subset of `offered`), so a refusal
    *  can NAME the choices a person has to make — never "nothing fillable" on a page of ten. */
   tiles: string[];
+  /** Set when the page offered exactly ONE tile and its title is not a real-filing control
+   *  (the entry vocabulary's exclusions): not a type we can name, but the page's single
+   *  choice, which the learner enters when nothing else on the page advances. */
+  singleTile?: PermitTypeChoice;
 }
 
 // WHICH VOCABULARY LEADS. A type that names the JOB — solar / photovoltaic / PV / renewable
@@ -727,6 +734,7 @@ export async function chooseApplicationType(
   const scopes: Array<Page | Frame> = typeof page.frames === "function" ? page.frames() : [page];
   const offeredAll: string[] = [];
   const tilesAll: string[] = [];
+  const tileChoices: Array<{ label: string; locator: Locator }> = [];
   for (const scope of scopes) {
     let labels: string[] = [];
     try {
@@ -749,6 +757,7 @@ export async function chooseApplicationType(
     if (!labels.length && !tiles.length) continue;
     for (const l of [...labels, ...tileLabels]) if (!offeredAll.includes(l)) offeredAll.push(l);
     for (const l of tileLabels) if (!tilesAll.includes(l)) tilesAll.push(l);
+    for (const t of tiles) tileChoices.push({ label: t.label, locator: (scope as Frame).locator(`[data-al-tile="${t.key}"]`).first() as Locator });
 
     const matched = [...new Set(permitTypeCandidates([...labels, ...tileLabels], track))];
     if (matched.length === 1) {
@@ -771,7 +780,13 @@ export async function chooseApplicationType(
       return { ok: false, refusal: { reason: "ambiguous", offered: offeredAll.slice(0, 40), matched, tiles: tilesAll } };
     }
   }
-  return { ok: false, refusal: { reason: "none", offered: offeredAll.slice(0, 40), matched: [], tiles: tilesAll } };
+  // ONE card and nothing else: not a type we can name, but the page's single choice. Offered
+  // to the caller as such — never when its title is a real-filing control ("Pay Fees Due",
+  // "My Permits", "Resume …"), which the entry vocabulary refuses.
+  const singleTile: PermitTypeChoice | undefined = tileChoices.length === 1 && !isExcludedEntryLabel(tileChoices[0].label)
+    ? { locator: tileChoices[0].locator, label: tileChoices[0].label, kind: "tile" }
+    : undefined;
+  return { ok: false, refusal: { reason: "none", offered: offeredAll.slice(0, 40), matched: [], tiles: tilesAll, singleTile } };
 }
 export function normalizeEntryLabel(label: string): string {
   return String(label ?? "").replace(/\s+/g, " ").trim().toLowerCase();
