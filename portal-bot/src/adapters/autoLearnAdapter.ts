@@ -49,7 +49,7 @@ export interface ContinueDraft {
    *  Submit; not signed, or unreadable, it stops on the record page and names why. */
   awaitingSignature?: boolean;
 }
-import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
+import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
 import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
 import { hostOfUrl, sameCredentialScope } from "../siteOf";
@@ -273,7 +273,7 @@ export interface LearnProgress {
   phase: "login" | "page" | "review" | "verify" | "done";
   pageCount: number;
   maxPages: number;
-  classification?: "form" | "dashboard" | "review" | "empty";
+  classification?: "form" | "dashboard" | "review" | "interstitial" | "empty";
   fillsPlanned?: number;
   message: string;
   // Milliseconds spent on the CURRENT step (time since the last real progress event).
@@ -906,6 +906,22 @@ function isPanelAdvanceLabel(label: string | undefined): boolean {
   if (PAGINATION_CONTROL.test(t)) return false;
   if (SUBMIT_INTENT.test(t)) return false;
   return ADVANCE_ONLY.test(t);
+}
+
+/** THE PLAIN WAY FORWARD ON AN INFORMATION INTERSTITIAL (#341). The advance the engine is allowed
+ *  to click (isPanelAdvanceLabel, to the letter: Next / Continue / Proceed, never a submit, never a
+ *  pager) plus a WHOLE-label Begin / Start / Get Started, which is how a "before you apply" page
+ *  words the same thing. Never a backward or exit control (Previous / Back / Cancel / Exit / Save
+ *  and Exit / Continue Later), never anything the shared final-submit reading or the pay list
+ *  claims. Read only on a page the walk has already proved is an interstitial (see c2i). */
+const INTERSTITIAL_START = /^\s*(begin|start|get started)\s*[»›>→]*\s*$/i;
+const BACKWARD_OR_EXIT = /\b(previous|prev|back|cancel|exit|close|later|quit)\b/i;
+export function isInterstitialForwardLabel(label: string | undefined): boolean {
+  const t = String(label ?? "").replace(/\s+/g, " ").trim();
+  if (!t || t.length > 40) return false;
+  if (BACKWARD_OR_EXIT.test(t)) return false;
+  if (isPayFee(t) || isFinalSubmitControl(t)) return false;
+  return isPanelAdvanceLabel(t) || INTERSTITIAL_START.test(t);
 }
 
 /** RE-ADMISSION: is this label shaped like a page's WAY FORWARD at all? Union of the
@@ -6209,13 +6225,40 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           ACCEPT_TERMS.test(String(s.selector?.label ?? "")) ||
           /termaccept/i.test(String(s.selector?.css ?? "")) ||
           /accept entry terms/i.test(String(s.note ?? "")));
-      const anyFormMutationRecorded = steps.some(
+      // THE ONE "HAS THIS RUN ENTERED FORM DATA?" QUESTION (#341). Asked here by the entry-
+      // disclaimer guard and the interstitial guard, and at the end of the page by the terminal
+      // page's empty guard — one closure, read at call time, so the three cannot drift apart.
+      const formDataEnteredThisRun = (): boolean => steps.some(
         (s) => (s.action === "fill" || s.action === "check" || s.action === "select") && !isTermsAcknowledgment(s));
+      const anyFormMutationRecorded = formDataEnteredThisRun();
       const entryDisclaimer = disclaimerish && !anyFormMutationRecorded;
+      // c2i) AN INFORMATION INTERSTITIAL IS NOT THE REVIEW SCREEN (#341). Portland DevHub, live
+      //      2026-10-14: the page behind the "Solar Permit Request" tile is prose ("This is a
+      //      permit request only. A Permit Tech will review your submission … click Continue.
+      //      Please do not submit additional requests …") with Previous / Next and no field. The
+      //      first clause below ("no input and not a dashboard") made it the review screen, because
+      //      "review your submission" is review wording — the walk stopped there having typed
+      //      nothing, armed the review lockdown and told the owner "Nothing was staged".
+      //      A review screen is a summary of what was ENTERED, so it cannot come before the first
+      //      entry (the entry-disclaimer rule, generalised): with nothing entered on this run, no
+      //      input on the page and none of the review screen's OWN shape — a submit-worded or
+      //      final-submit control, a terms/certify box, a review URL — prose about review or
+      //      submission no longer makes it one. ONLY EVER FEWER REVIEW PAGES, AND NEVER WHERE DATA
+      //      COULD EXIST: a run that continues a draft or resumes after a signature carries
+      //      entries this run did not make, so it keeps the old reading in full; any submit-shaped
+      //      control keeps the old reading; nothing here touches what the backstop reads.
+      const onPageControl = (f: ExtractedField): boolean =>
+        !navOnly.has(String(f.label ?? "").replace(/\s+/g, " ").trim().toLowerCase());
+      const reviewShaped = hasSubmitIntentBtn || hasAcceptTermsCheckbox || looksLikeReviewUrl(url)
+        || fields.some((f) => f.fieldType === "button" && onPageControl(f) && isFinalSubmitControl(f.label));
+      const plannerSaidReview = plan.atReview === true;
+      const interstitial = !hasFillable && !reviewShaped && !anyFormMutationRecorded && !entryDisclaimer
+        && !this.continueDraft && !this.continuedDraft && !this.signatureCheck && !signatureDone
+        && (!isDashboard || plannerSaidReview);
       const isReviewPage =
         ((!hasFillable && !isDashboard) ||
           (reviewSignals && hasSubmitIntentBtn) ||
-          (hasSubmitIntentBtn && hasAcceptTermsCheckbox)) && !entryDisclaimer;
+          (hasSubmitIntentBtn && hasAcceptTermsCheckbox)) && !entryDisclaimer && !interstitial;
       if (isReviewPage && !plan.atReview) {
         // Promote a planner "advance" that is actually a submit-intent button to finalSubmit.
         let promotedFinal = typeof plan.finalSubmitSelectorIndex === "number" ? plan.finalSubmitSelectorIndex : undefined;
@@ -6284,6 +6327,50 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         if (process.env.AUTOLEARN_DEBUG === "1") console.error(`[learn] rejected atReview on the entry disclaimer (p${pageCount}) — passing through.`);
       }
 
+      // c2i') THE INTERSTITIAL'S WAY FORWARD (#341). The page is not review (c2i), so nothing on it
+      //       is a final submit — a planner that named its Next as one is overruled, never recorded
+      //       — and its plain forward control (isInterstitialForwardLabel: Next / Continue / Proceed
+      //       / Begin / Start, never Previous / Back / Cancel, never submit- or pay-worded) is the
+      //       advance, as on any pass-through page. ONCE PER PAGE: the click is remembered in
+      //       navClicksByPath under this page's path, the control's label and the page's
+      //       fingerprint (DevHub serves every SmartGuide step at one path, so the path alone would
+      //       refuse a second, different interstitial); back on the SAME page, the walk stops and
+      //       says so instead of clicking it again.
+      //       ONE WAY FORWARD, on the page that READ as review: the forward-worded controls must
+      //       be one control (a top and a bottom copy at most, one label) — a list whose rows each
+      //       say "Continue" is somebody's records, not an interstitial — and a page that was a
+      //       dashboard by structure (only the planner called it review) is not advanced here.
+      let interstitialAdvanceKey = "";
+      if (interstitial) {
+        const norm = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
+        const fwdCands = fields.map((f, i) => ({ f, i })).filter(({ f }) => f.fieldType === "button" && !f.disabled && !f.tile
+          && onPageControl(f) && isInterstitialForwardLabel(f.label) && !this.isOffLimitsButton(f));
+        const oneWay = !isDashboard && fwdCands.length > 0 && fwdCands.length <= 2
+          && new Set(fwdCands.map(({ f }) => norm(f.label).toLowerCase())).size === 1;
+        const fwd = oneWay ? fwdCands[0].i : -1;
+        const fwdLabel = fwd >= 0 ? norm(fields[fwd].label) : "";
+        const key = fwd >= 0 ? this.navClickKey(url, `${fwdLabel} @ ${loopFp}`) : "";
+        const repeat = !!key && this.navClicksByPath.has(key);
+        this.debug?.event({ type: "interstitial_not_review", page: pageCount, forward: fwdLabel.slice(0, 40) || null, candidates: fwdCands.length, plannerSaidReview, repeat });
+        if (repeat) {
+          return {
+            ...fail(steps, this.portalName, `Stopped on an information page ("${(redactStatusText(pageTitle) || "this page").slice(0, 60)}"): its "${fwdLabel.slice(0, 40)}" was clicked once already and the walk is back on the same page, so it is not clicked again. Nothing has been entered on this run. Continue past the page by hand, or record the portal.`, null, pageCount, portalNotices),
+            stopReason: "interstitial_loop",
+          };
+        }
+        // No forward control: still not review (no lockdown, no final submit) — the walk's ordinary
+        // no-advance path takes the page; the planner's advance is dropped so a Previous / Cancel
+        // it may have named is never the click here.
+        plan = {
+          ...plan,
+          atReview: false,
+          finalSubmitSelectorIndex: undefined,
+          advanceSelectorIndex: fwd >= 0 ? fwd : undefined,
+          ...(fwd >= 0 ? { navigateSelectorIndex: undefined } : {}),
+        };
+        interstitialAdvanceKey = key;
+      }
+
       // c2b) DIAGNOSTIC BREADCRUMB — record what we saw + what the planner decided on this
       //      page. host+pathname only (NO query string — avoids leaking any ids), title
       //      capped, no field values. This is the trace surfaced when a run finds nothing.
@@ -6293,7 +6380,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         const fillCount = fields.filter((f) => f.fieldType !== "button").length;
         const btnCount = fields.filter((f) => f.fieldType === "button").length;
         const linkCount = fields.filter((f) => f.fieldType === "button" && f.selector?.role === "link").length;
-        const cls = isReviewPage ? "review" : isDashboard ? "dashboard" : hasFillable ? "form" : "empty";
+        const cls = isReviewPage ? "review" : interstitial ? "interstitial" : isDashboard ? "dashboard" : hasFillable ? "form" : "empty";
         // Titles go through redactStatusText — portal record pages often title themselves
         // with the record number/applicant address, and the trace is logged + persisted.
         pageTrace.push(
@@ -7474,6 +7561,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         }
         // Whose dialog the next page opens (a section opener), or none (a main-page advance).
         this.noteContactClick(advanceField, url);
+        // An interstitial's forward control is clicked once per page (c2i'): remembered now, as
+        // the click is made, so a return to the same page stops instead of clicking it again.
+        if (interstitialAdvanceKey) this.navClicksByPath.add(interstitialAdvanceKey);
         // Record the advance click, then perform it.
         steps.push({
           action: "click",
@@ -7668,10 +7758,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // carried this precondition ("a page we filled nothing on is a page we have no
         // business advancing past") since it was written; recording a FILING on such a page
         // is the same mistake with a worse ending. Terms/acknowledgment ticks do not count —
-        // an agree box is not an application.
-        const mutationsRecorded = steps.some(
-          (s) => (s.action === "fill" || s.action === "check" || s.action === "select") && !isTermsAcknowledgment(s));
-        if (!mutationsRecorded) {
+        // an agree box is not an application. (The same question c2 asks: formDataEnteredThisRun.)
+        if (!formDataEnteredThisRun()) {
           this.debug?.event({ type: "terminal_page_refused", page: pageCount, guard: "empty", why: "nothing has been filled on this run yet" });
           break;
         }
