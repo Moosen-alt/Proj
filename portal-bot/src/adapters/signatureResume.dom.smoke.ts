@@ -22,9 +22,16 @@
 //       nothing clicked, step 5 never reached.
 //   (6) Two signers on the record, one "Signed" and one "Requested": not signed — stops on the record.
 //   (7) The application's own "Status: Application Draft" is never read as a signature status.
+//   (8) The reader (Helm review of PR #332): a line it is not sure is the homeowner's signature status
+//       (a preview, upload, Part 1, installer or document status, a name-labelled line, a bare Status
+//       column of a documents table, a hidden table or row) never votes "signed"; an empty value is read
+//       from the label's own element ("(no value)"), never from the next line; a second "Sent" status
+//       still vetoes; a real "Signed"/"Completed" still reads signed.
 //
-// KILL TEST: skip the record-page read in openExistingDraft (`if (false && cd.awaitingSignature)`) →
-// 12 checks across (1)–(6) fail: the run opens the form without reading the signature.
+// KILL TESTS: skip the record-page read in openExistingDraft (`if (false && cd.awaitingSignature)`) →
+// 12 checks across (1)–(6) fail: the run opens the form without reading the signature. Put back the
+// reader before the Helm's review (any "<sig> Status" line votes, hidden rows read, an empty value takes
+// the next line) → the (8) shapes read signed and fail.
 //
 // Run: npx tsx portal-bot/src/adapters/signatureResume.dom.smoke.ts
 import "../smokeArtifactDirs";
@@ -32,6 +39,7 @@ import http from "node:http";
 import { chromium } from "playwright";
 import { AutoLearnAdapter, type LearnPlanner } from "./autoLearnAdapter";
 import { readSignatureStatuses } from "./signatureStatusRead";
+import { signatureCompletion } from "../../../shared/src/signatureCompletion";
 
 delete process.env.PORTAL_ALLOW_FINAL_SUBMIT;
 
@@ -179,6 +187,72 @@ try {
     await page.goto(`${base}/p2/4`);
     const s4 = await readSignatureStatuses(page);
     check("(7) the signature step's own status line is read", s4.length === 1 && s4[0] === "Signed", JSON.stringify(s4));
+    await ctx.close().catch(() => null);
+  }
+
+  // (8) the reader never lets a line it is not sure of vote "signed" (Helm review of PR #332). Each
+  // shape shows a homeowner who has NOT signed next to some other "done" word; each must read not signed.
+  {
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    const card = (h: string, inner: string) => `<div class="card"><div class="card-header">${h}</div>${inner}</div>`;
+    const readShape = async (shape: string): Promise<string[]> => {
+      await page.setContent(`<!doctype html><html><body><main><h1>NEM-90017</h1><p>Status: Application Draft</p>${shape}</main></body></html>`);
+      return readSignatureStatuses(page);
+    };
+    const badgeSent = `<p>DocuSign: <span class="badge">Sent</span></p>`;
+    const hiddenTable = `<table><tr><th>Signer</th><th>Status</th></tr><tr><td>Jordan Testcase</td><td>Completed</td></tr></table>`;
+    const falseSigned: Array<[string, string]> = [
+      ["a preview status beside a badge", card("eSignature", `<p>Preview Status: Complete</p>${badgeSent}`)],
+      ["Part 1 / Step 4 statuses beside an envelope line", `<section><h2>Documents and Signatures</h2><p>Part 1 Status: Completed</p><p>Step 4 Status: Completed</p><p>Envelope sent 10/12/2026 to the homeowner</p></section>`],
+      ["an eSign preview status beside prose", `<p>eSign Preview Status: Completed</p><p>Awaiting homeowner signature</p>`],
+      ["an upload status in a signature fieldset", `<fieldset><legend>Customer Signature</legend><p>Upload Status: Complete</p>${badgeSent}</fieldset>`],
+      ["the installer's signature beside the customer's badge", card("Signatures", `<p>Installer Signature Status: Signed</p><p>Customer: <span class="badge">Sent</span></p>`)],
+      ["a signer line whose label is a name", card("Signers", `<p>Jordan Testcase (Homeowner) — Status: Completed</p><p>Alex Testcase (Co-owner) — Sent</p>`)],
+      ["a documents table's bare Status column", `<h3>Documents</h3><table><tr><th>Document</th><th>eSignature</th><th>Status</th></tr><tr><td>Interconnection Agreement</td><td>Sent</td><td>Complete</td></tr></table>`],
+      ["a hidden signer table (display:none)", card("Signatures", `${badgeSent}<div style="display:none">${hiddenTable}</div>`)],
+      ["a hidden signer table ([hidden])", card("Signatures", `${badgeSent}<div hidden>${hiddenTable}</div>`)],
+      ...["Signature Request", "eSign Consent", "Signer Information", "Signer Verification", "Envelope Creation", "Customer Information", "Applicant Details", "Signature Page"]
+        .map((l): [string, string] => [`"${l} Status: Completed" beside a badge`, card("eSignature", `<p>${l} Status: Completed</p>${badgeSent}`)]),
+    ];
+    for (const [name, shape] of falseSigned) {
+      const read = await readShape(shape);
+      const c = signatureCompletion(read);
+      check(`(8) ${name}: not signed`, !c.signed && !read.includes("Completed") && !read.includes("Complete"), `read=${JSON.stringify(read)} reading=${c.reading}`);
+    }
+    // An empty value is read from the label's own element, never from the next line.
+    for (const [name, shape] of [
+      ["a dt/dd whose value is only an icon", `<dl><dt>Signature Status</dt><dd><i title="Sent"></i></dd><dt>Signed</dt><dd>—</dd></dl>`],
+      ["a label[for] whose target is empty", `<div><label for="sx">Signature Status</label> <span id="sx"></span></div><p>Completed 10/12/2026</p>`],
+    ] as Array<[string, string]>) {
+      const read = await readShape(shape);
+      const c = signatureCompletion(read);
+      check(`(8) ${name}: reads "(no value)", unreadable`, read.join("|") === "(no value)" && c.reading === "unreadable" && !c.signed, `read=${JSON.stringify(read)} reading=${c.reading}`);
+    }
+    // The vetoes stay: a second status that is not signed still holds the track.
+    for (const [name, shape, want] of [
+      ["Signature Status: Signed + Part 2 Signature Status: Sent", `<p>Signature Status: Signed</p><p>Part 2 Signature Status: Sent</p>`, "Signed|Sent"],
+      ["Homeowner Status: Signed + Spouse Status: Sent", card("Signers", `<p>Homeowner Status: Signed</p><p>Spouse Status: Sent</p>`), "Signed|Sent"],
+      ["two signers in a table, one Requested", card("Signatures", `<table><tr><th>Signer</th><th>Status</th></tr><tr><td>Account Holder</td><td>Signed</td></tr><tr><td>Co-Applicant</td><td>Requested</td></tr></table>`), "Signed|Requested"],
+    ] as Array<[string, string, string]>) {
+      const read = await readShape(shape);
+      const c = signatureCompletion(read);
+      check(`(8) veto kept — ${name}: requested`, read.join("|") === want && c.reading === "requested" && !c.signed, `read=${JSON.stringify(read)} reading=${c.reading}`);
+    }
+    // Hidden rows say nothing; the visible row still does.
+    {
+      const read = await readShape(card("Signatures", `<table><tr><th>Signer</th><th>Status</th></tr><tr style="display:none"><td>Old envelope</td><td>Completed</td></tr><tr><td>Jordan Testcase</td><td>Sent</td></tr></table>`));
+      check("(8) a hidden row says nothing: only the visible row's \"Sent\" is read", read.join("|") === "Sent", JSON.stringify(read));
+    }
+    // Controls: a real signed status still reads signed.
+    for (const [name, shape] of [
+      ["dt/dd Signature Status: Completed", `<dl><dt>Signature Status</dt><dd>Completed</dd></dl>`],
+      ["card Signature Status: Signed", card("Application Signature", `<p>Signature Status: Signed</p>`)],
+      ["signer table, every row Completed", card("Signatures", `<table><tr><th>Signer</th><th>Status</th></tr><tr><td>Jordan Testcase</td><td>Completed on 10/12/2026</td></tr><tr><td>Alex Testcase</td><td>Signed by Alex Testcase</td></tr></table>`)],
+    ] as Array<[string, string]>) {
+      const read = await readShape(shape);
+      check(`(8) control — ${name}: signed`, signatureCompletion(read).signed, `read=${JSON.stringify(read)}`);
+    }
     await ctx.close().catch(() => null);
   }
 

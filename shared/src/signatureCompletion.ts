@@ -37,9 +37,10 @@ export interface SignatureCompletion {
 const squash = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
 
 // A who/when tail a portal may put after the status word: "Signed on 10/12/2026", "Completed by
-// Jordan Testcase", "Signed - 10/12/2026 3:14 PM". Only "on/by/at …" or a date/time: any other
-// trailing words ("Completed Preview") make the status something this module does not know.
-const TAIL = String.raw`(?:\s*(?:[,;:–—-]+\s*|\s+)(?:(?:on|by|at)\s+[\w/.:,' -]{1,48}|\d[\d/.:, -]{3,24}(?:\s*[ap]\.?m\.?)?))?`;
+// Jordan Testcase", "Signed - 10/12/2026 3:14 PM". "on/at" takes a real date only, "by" a name only
+// (a letter first, no commas or hyphens), else a date/time: any other trailing words ("Completed
+// Preview", "Signed by owner, co-owner to sign") make the status something this module does not know.
+const TAIL = String.raw`(?:\s*(?:[,;:–—-]+\s*|\s+)(?:(?:on|at)\s+\d[\d/.-]{5,9}(?:,?\s+\d{1,2}:\d{2}(?:\s*[ap]\.?m\.?)?)?|by\s+[A-Za-z][\w.' ]{0,47}|\d[\d/.:, -]{3,24}(?:\s*[ap]\.?m\.?)?))?`;
 
 // SIGNED, POSITIVELY: the whole status says the signing is done. "Preview Completed" (a
 // not-yet-requested state), "Signature Requested", "Partially Signed" and "Signed by 1 of 2" do not
@@ -55,7 +56,7 @@ const SIGNED = new RegExp(
 
 // Words that turn an otherwise-signed status into something else. Read first, so "Signed by 1 of 2",
 // "Partially Signed", "Not signed", "Unsigned" and "Signing declined" never count as complete.
-const NOT_DONE = /\b(?:not|un|partial(?:ly)?|pending|awaiting|waiting|declined|voided|void|cancel(?:led|ed)?|expired|rejected|failed|error|incomplete|\d+\s+of\s+\d+|resen[dt]|correct(?:ed|ion))\b|\bunsigned\b/i;
+const NOT_DONE = /\b(?:not|un|partial(?:ly)?|pending|awaiting|waiting|declined|voided|void|cancel(?:led|ed)?|expired|rejected|failed|error|incomplete|\d+\s+of\s+\d+|resen[dt]|correct(?:ed|ion)|outstanding|remaining|required|needed|countersign\w*|to\s+sign|next|left|in\s+progress|on\s+hold|installers?|contractors?|utility|senders?)\b|\bunsigned\b|(?<![\d/])\d+\s*\/\s*\d+(?![\d/])/i;
 
 // REQUESTED, POSITIVELY: the request went and the homeowner has not signed yet.
 const REQUESTED = new RegExp(

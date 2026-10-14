@@ -10,7 +10,8 @@
 //     the application's own status, or no status at all is "unreadable" and names why.
 // KILL TESTS: let SIGNED match any status containing "signed" → the "Partially Signed" / "1 of 2" checks
 // fail; read only the first status → the two-signer check fails; return "signed" for [] → the empty check
-// fails. Synthetic values only. Run: npx tsx portal-bot/src/signatureCompletion.test.ts
+// fails; put back the any-48-characters on/by/at tail or the old NOT_DONE → the "partial, another party's"
+// check fails. Synthetic values only. Run: npx tsx portal-bot/src/signatureCompletion.test.ts
 import assert from "node:assert/strict";
 import { readSignatureStatus, signatureCompletion } from "../../shared/src/signatureCompletion";
 
@@ -29,6 +30,20 @@ check("signed only on a positive match", () => {
 check("near misses are never signed", () => {
   for (const s of ["Preview Completed", "Completed Preview", "Partially Signed", "Signed by 1 of 2", "Not signed", "Unsigned", "Declined", "Voided", "Signing declined", "Signed but not submitted"]) {
     assert.notEqual(readSignatureStatus(s), "signed", s);
+  }
+});
+
+check("a partial, another party's or a placeholder tail never reads signed (Helm review of PR #332)", () => {
+  for (const s of [
+    "Signed by owner, co-owner to sign", "Signed by Jordan Testcase, sent to Alex Testcase", "Signed by owner - co-owner in progress",
+    "Signed by installer", "Completed by sender", "Signed by 1/2 signers", "Completed - 1 / 2", "Signed: 0 / 2",
+    "Signed on --/--/----", "Completed on hold", "Completed by 1 signer", "Executed by utility", "Signed by contractor",
+    "Signature outstanding", "Signed, countersignature required", "Completed, 1 remaining",
+  ]) {
+    assert.notEqual(readSignatureStatus(s), "signed", s);
+  }
+  for (const s of ["Signed - 10/12/2026 3:14 PM", "Completed by Jordan Testcase", "Signed on 10/12/2026", "Completed at 2026-10-12", "Signed 10/12/2026"]) {
+    assert.equal(readSignatureStatus(s), "signed", s);
   }
 });
 
