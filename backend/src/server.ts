@@ -159,6 +159,7 @@ import {
   finalSubmitJobPayload,
 } from "./repository";
 import { createSignatureRequestApproval } from "./signatureRequestApproval";
+import { confirmSignatureRequestSent } from "./signatureTrack";
 import { getSubmittalTracks, markTrackSubmitted } from "./submittalTracks";
 import { projectForTrack } from "./permitProcess";
 import { ahjProcessKnowledgeStatus, AHJ_PROCESS_REFERENCE_ENV } from "./processProfiles";
@@ -3399,6 +3400,20 @@ app.get("/api/projects/:id/submittal-tracks", (req, res) => {
 });
 
 const SUBMITTAL_TRACK_TYPES: SubmittalTrackType[] = ["nem", "building", "electrical", "combo", "permit", "mpu"];
+
+// "I SENT THE SIGNATURE REQUEST" (#310): a named person clicked the utility portal's Request
+// Signatures themselves. Recorded with who and when; the NEM track then waits on the homeowner's
+// signature (signatureTrack). The name is the signed-in user's when auth is on, never the body's.
+app.post("/api/projects/:id/submittal-tracks/:type/signature-request-sent", asyncHandler(async (req, res) => {
+  const type = String(req.params.type);
+  if (type !== "nem") throw new HttpError(400, "Request Signatures is a step of the utility (NEM) application.");
+  const detail = getProjectDetail(db, String(req.params.id));
+  const user = currentUser(db, req);
+  if (AUTH_ENABLED && !user) throw new HttpError(401, "Sign in to record a signature request.");
+  const confirmedBy = AUTH_ENABLED ? String(user?.name || user?.email || "").trim() : String(req.body?.confirmedBy || "").trim();
+  const signature = confirmSignatureRequestSent(db, detail.project.id, { confirmedBy, userId: user?.id ?? null });
+  res.json({ ok: true, signature, tracks: getSubmittalTracks(db, detail.project) });
+}));
 app.post("/api/projects/:id/submittal-tracks/:type/mark-submitted", asyncHandler(async (req, res) => {
   const type = String(req.params.type) as SubmittalTrackType;
   if (!SUBMITTAL_TRACK_TYPES.includes(type)) throw new HttpError(400, "Unknown submittal track type.");

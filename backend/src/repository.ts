@@ -99,6 +99,7 @@ import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger"
 import { logger } from "./logger";
 import { draftContinuationGaps, openPortalDraftFor, recordPortalDraft, type ObservedDraft } from "./portalDraft";
 import { claimSignatureRequestApproval, runningJobSignatureRequestApprovalId } from "./signatureRequestApproval";
+import { nemSignatureState, nemStageIsResume } from "./signatureTrack";
 import { siteKey } from "../../portal-bot/src/draftCreated";
 import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, type HostFit, type PortalUrlSource } from "./portalChannel";
 import { isPortalPaused } from "./portalPause";
@@ -8880,13 +8881,26 @@ export async function prepareSubmission(
   // The hand-coded adapters' delegated submit (allowFinalSubmit) answers to the same function, so
   // with no recipe it is refused: the ruling requires a valid recipe shape for any click.
   const runApproval = claimedApproval ? { approver: claimedApproval.approver, runId } : null;
+  // THIS PROJECT HAS A DRAFT ON THE PORTAL ALREADY (#302): a two-part portal's Part 1 Submit made
+  // it, and replaying the recipe would start the application again — a second number for the same
+  // house. The learner opens that draft's next form instead (AutoLearnAdapter continueDraft), or the
+  // run stops before a browser opens (below). Either way THE RECIPE ON FILE DOES NOT DRIVE THIS RUN.
+  const nemDraft = track === "nem" ? openPortalDraftFor(db, projectId, "nem") : null;
+  // THE GATE JUDGES THE RECIPE THAT RUNS (#310). A run that continues a draft replays no recipe:
+  // the click it could reach is Part 2's own Submit, which no recipe recorded. The NEM recipe on
+  // file was recorded through Part 1, and its flagged terminal click is Part 1's Submit (the one
+  // that only made the draft, #302) — counting that as "the recipe's single terminal isFinalSubmit"
+  // would let an approval reach a Submit the recipe never named. So the gate is asked with no
+  // recipe, unchanged, and refuses: the resumed run stops in front of step 5's Submit for a person.
+  const gateRecipeId = nemDraft ? null : (recipe?.id ?? null);
   const submitRefusals = wantsFinalSubmit
-    ? automaticSubmitRefusals(db, { recipeId: recipe?.id ?? null, runApproval, runId, borrowedFrom: borrowed?.learnedFor ?? null, relaxedSinceApproval })
+    ? automaticSubmitRefusals(db, { recipeId: gateRecipeId, runApproval, runId, borrowedFrom: borrowed?.learnedFor ?? null, relaxedSinceApproval })
     : [];
   const resolvedAutoSubmit = wantsFinalSubmit && submitRefusals.length === 0;
   if (wantsFinalSubmit && !resolvedAutoSubmit) {
     addAuditLog(db, projectId, "system", "submit gate", "portal.auto_submit_declined", {
       track: track ?? "permit", runId, approvedBy: runApproval?.approver ?? null, reasons: submitRefusals,
+      ...(nemDraft ? { continuesDraft: nemDraft.applicationNumber || "(number not recorded)", recipeOnFile: recipe?.id ?? null } : {}),
     });
   } else if (resolvedAutoSubmit) {
     addAuditLog(db, projectId, "system", "submit gate", "portal.auto_submit_allowed", {
@@ -9092,11 +9106,8 @@ export async function prepareSubmission(
     simulationEnabled: process.env.MOCK_PORTAL === "1",
     portalPaused,
   });
-  // THIS PROJECT HAS A DRAFT ON THE PORTAL ALREADY (#302): a two-part portal's Part 1 Submit made
-  // it, and replaying the recipe would start the application again — a second number for the same
-  // house. The learner opens that draft's next form instead (AutoLearnAdapter continueDraft).
-  // Only where the replay would otherwise run; every other decision stands as it was.
-  const nemDraft = track === "nem" ? openPortalDraftFor(db, projectId, "nem") : null;
+  // THE DRAFT ON RECORD (nemDraft, above) is continued by the learner, only where the replay would
+  // otherwise run; every other decision stands as it was.
   const runActorLabel = nemDraft && autoSeedEnabled && channelDecision.adapterLabel === "RecipeAdapter"
     ? "AutoLearnAdapter"
     : channelDecision.adapterLabel;
@@ -9565,8 +9576,13 @@ export async function prepareSubmission(
             headless: stageOptions.headless,
             // THIS PROJECT'S EXISTING DRAFT (#302): a recorded one is opened and never re-started; with
             // none recorded, the walk still looks for an unsubmitted draft listed for this street.
+            // A TRACK THAT WAITS ON THE HOMEOWNER'S SIGNATURE (#310) makes this stage a RESUME: the
+            // record's signature status is read before anything is opened, and only "signed" goes on.
             continueDraft: siteDraftParts
-              ? { ...siteDraftParts, applicationNumber: nemDraft?.applicationNumber || undefined, nextForm: nemDraft?.nextForm || undefined, required: Boolean(nemDraft) }
+              ? {
+                ...siteDraftParts, applicationNumber: nemDraft?.applicationNumber || undefined, nextForm: nemDraft?.nextForm || undefined, required: Boolean(nemDraft),
+                ...(nemDraft && nemStageIsResume(nemSignatureState(db, projectId)) ? { awaitingSignature: true } : {}),
+              }
               : undefined,
             // THIS RUN'S SIGNATURE-REQUEST APPROVAL (#308), claimed above; the gate decides at the click.
             signatureRequestApproval,
