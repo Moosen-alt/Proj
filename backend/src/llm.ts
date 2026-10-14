@@ -1416,6 +1416,26 @@ export function webSearchResultTitles(msg: { content?: unknown }, max = 400): Re
  *  cost — tokens are billed as used. */
 export const CODE_RESEARCH_MAX_TOKENS = 10000;
 
+/** The planner's user-half token budget (the reasoning and the measurements are on
+ *  ClaudeLLMProvider.PLANNER_USER_TOKEN_BUDGET). Module-level so the regression test holds the
+ *  planner payload to the same number the live warning uses (plannerBudget.test, #303). */
+export const PLANNER_USER_TOKEN_BUDGET = 4000;
+
+/** THE PLANNER'S USER HALF, exactly as planPortalFields sends it and countPlannerPrompt measures it.
+ *  One builder so a test can measure the real string instead of a copy of its shape (#303). */
+export function plannerUserMessage(input: PortalFieldPlanInput): string {
+  return JSON.stringify({
+    url: input.url, pageTitle: input.pageTitle, fields: input.fields,
+    bodyText: input.bodyText.slice(0, 2000), projectFields: input.projectFields,
+    alreadyFilledLabels: input.alreadyFilledLabels,
+    // isDashboard must be in the user message so the LLM actually sees it.
+    ...(input.isDashboard ? { isDashboard: true } : {}),
+    ...(input.kbContext ? { kbContext: input.kbContext } : {}),
+    ...(input.jurisdictionContext ? { jurisdictionContext: input.jurisdictionContext } : {}),
+    ...(input.recoveryHint ? { RECOVERY: input.recoveryHint } : {}),
+  });
+}
+
 export class ClaudeLLMProvider implements LLMProvider {
   private client: Anthropic;
 
@@ -1650,7 +1670,7 @@ export class ClaudeLLMProvider implements LLMProvider {
    *  4000 is chosen between them: roughly twice what a sixty-field page needs
    *  (fields are ~20 tokens each, digest ~300, bodyText ~500) and well under the
    *  measured regression, so a busy page is quiet and raw text is not. */
-  private static readonly PLANNER_USER_TOKEN_BUDGET = 4000;
+  private static readonly PLANNER_USER_TOKEN_BUDGET = PLANNER_USER_TOKEN_BUDGET;
 
   /** Count the planner prompt ONCE per process and write it to the call log.
    *
@@ -3045,16 +3065,7 @@ index keys) or an empty array/string; never omit a key:
  "navigateIndex": <index of dashboard nav link, or null>,
  "advanceIndex": <index, or null>, "finalSubmitIndex": <index, or null>,
  "atReview": <true if this is the review/confirm screen>, "confidence":"low|medium|high", "notes":"<short>"}`;
-    const user = JSON.stringify({
-      url: input.url, pageTitle: input.pageTitle, fields: input.fields,
-      bodyText: input.bodyText.slice(0, 2000), projectFields: input.projectFields,
-      alreadyFilledLabels: input.alreadyFilledLabels,
-      // isDashboard must be in the user message so the LLM actually sees it.
-      ...(input.isDashboard ? { isDashboard: true } : {}),
-      ...(input.kbContext ? { kbContext: input.kbContext } : {}),
-      ...(input.jurisdictionContext ? { jurisdictionContext: input.jurisdictionContext } : {}),
-      ...(input.recoveryHint ? { RECOVERY: input.recoveryHint } : {}),
-    });
+    const user = plannerUserMessage(input);
     let parsed: Partial<PortalFieldPlan> = {};
     // Use askLong: planning responses can be large (many fills + notes).
     try {
