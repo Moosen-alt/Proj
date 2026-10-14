@@ -1063,6 +1063,8 @@ function extractSnow(text: string, source: string, out: StatedDesignCriterion[],
 // labels sheet of the most common plan-set template).
 const CODE_BASIS_HEADER = /\b(governing\s+codes?|applicable\s+codes?|code\s+basis|design\s+codes?|codes?\s+and\s+standards|references\s+and\s+codes|building\s+codes?\s+used|codes?\s+used)\b\s*[:\-–]?|\bcodes\s*:|(?<!\bper\s{1,3})\bcode\s*:(?=\s*(?:(?:19|20)\d{2}\s+[A-Z]{2,6}\b|[A-Z]{2,6}\s+(?:19|20)\d{2}\b))/gi;
 const NAME_STOPWORDS = new Set(["OF", "THE", "AND", "FOR", "&", "PER", "BY", "IN", "TO", "WITH", "AS", "ON", "AT", "SEE"]);
+/** Qualifiers that make a generic mention of a code, not its name: "LOCAL FIRE CODE", "CURRENT BUILDING CODE". */
+const GENERIC_QUALIFIER = /^(?:(?:LOCAL|APPLICABLE|GOVERNING|ADOPTED|CURRENT|LATEST|MUNICIPAL|PREVAILING|REQUIRED|ALL)\s+)+/i;
 /** An abbreviation reads as a CODE only when it ends in C (NEC, IRC, OESC, IECC …) or is a
  *  known code token (FBC-R); "OREGON", "ASCE", "NDS" and every other capitalised word do not. */
 const CODE_ABBR = /^[A-Z]{1,5}C$/;
@@ -1190,8 +1192,10 @@ function namedCode(name: string, paren: string, tail: string): string {
 //
 // Case-sensitive on the capitals: every word of a code's printed name is capitalised, and "in 2021
 // the electrical code was…" is prose. A year that ends a DATE is not an edition: a portal page's
-// "06/03/2026 Result Code Approved". "CODE:" is a heading ("Building Code: Oregon Structural
-// Specialty Code, 2025 Edition", "PER CODE: NEC 690.54"), never the end of a name. A state named
+// "06/03/2026 Result Code Approved". "CODE:" is a heading when a year or a code abbreviation follows
+// it ("BUILDING CODE: 2023 ORSC", "PER CODE: NEC 690.54"); otherwise it ends a printed title ("2018
+// NORTH CAROLINA STATE BUILDING CODE: RESIDENTIAL CODE"), and a heading word left as a name of two
+// initials ("Building Code: Oregon Structural Specialty Code") is no code (#314). A state named
 // AFTER "CODE" is part of the name: "2020 RESIDENTIAL CODE OF NEW YORK STATE (2020 RCNYS)" is the
 // RCNYS, not a code named "RC"; so is "… CODE OF THE STATE OF X".
 const NAMED_CODE_ORDINAL = /\b((?:[A-Z][A-Za-z.'-]*\s+){1,6}?(?:CODE|Code))((?:\s*[,\-–]?\s*(?:RESIDENTIAL|BUILDING|Residential|Building))?),?\s*[-–]?\s*\d{1,2}(?:ST|ND|RD|TH|st|nd|rd|th)\s+(?:EDITION|Edition)\s*\(\s*((?:19|20)\d{2})\s*\)/g;
@@ -1209,6 +1213,9 @@ const RUN_GLUE = /^(?:\s|[,;:•·▪●■◦*/&\-–—]|\(\s*[a-z0-9]{1,2}\s*
 
 type CodeToken = {
   kind: "year" | "name" | "abbr";
+  /** A generic mention of a code ("THE BUILDING CODE", "LOCAL FIRE CODE"): it keeps its slot in a
+   *  list, so the items around it pair as printed, but it names no code and reads nothing. */
+  generic?: boolean;
   at: number;
   end: number;
   /** The year, the abbreviation, or the printed name with its state tail. */
@@ -1218,6 +1225,10 @@ type CodeToken = {
   tail?: string;
   /** The parenthetical printed directly after the token. */
   paren?: string;
+  /** Where a name starts without the words it took through a stopword ("LOS ANGELES BUILDING
+   *  CODE" in "2023 CITY OF LOS ANGELES BUILDING CODE"): those words are its own only when the year
+   *  before them is its edition (codeTokens). */
+  shortAt?: number;
 };
 
 /**
@@ -1232,22 +1243,56 @@ function codeTokens(text: string, windows: Array<[number, number]>, taken: Array
   const parenAt = (end: number): string | undefined => PAREN_AFTER.exec(text.slice(end, end + 56))?.[1]?.trim();
   const out: CodeToken[] = [];
   const words = [...blanked.matchAll(/\S+/g)];
+  const isYear = (w: string): boolean => /^(?:19|20)\d{2}$/.test(w);
   for (let i = 0; i < words.length; i++) {
-    if (!/^(?:CODE|Code)(?![A-Za-z:])/.test(words[i][0])) continue;
+    if (!/^(?:CODE|Code)(?![A-Za-z:])/.test(words[i][0]) && !/^(?:CODE|Code):$/.test(words[i][0])) continue;
     // The name runs back from CODE over capitalised words — never through a year, a CODES heading, a
-    // stopword, a list marker or a punctuation-terminated word, and never into the previous name.
+    // list marker or a punctuation-terminated word, and never into the previous name.
     let j = i;
+    // A stopword is part of a printed name only between two name words ("2023 CITY OF LOS ANGELES
+    // BUILDING CODE", "INTERNATIONAL SWIMMING POOL AND SPA CODE"), and only when a year opens the
+    // whole name, the year-first shape every cover sheet prints. Cut at "OF", the name was "LOS
+    // ANGELES BUILDING CODE", the year and the name no longer shared a run, and the name took the
+    // NEXT item's year (#314). Without a year before it the words are prose: "SHALL CONFORM TO
+    // CHICAGO ELECTRICAL CODE 2018" is the CEC, never "SCCEC". `atStopword` is where the walk would
+    // have stopped before: at its first stopword.
+    let atStopword = -1;
     while (j > 0 && i - j < 6) {
       const p = words[j - 1][0];
-      if (!NAME_WORD.test(p) || /^(?:19|20)\d{2}$/.test(p) || /^(?:CODES?|Codes?)$/.test(p) || NAME_STOPWORDS.has(p.toUpperCase())) break;
+      if (NAME_STOPWORDS.has(p.toUpperCase())) {
+        const before = j > 1 ? words[j - 2][0] : "";
+        const plain = NAME_WORD.test(before) && !/^(?:CODES?|Codes?|EDITION|Edition)$/.test(before) && !NAME_STOPWORDS.has(before.toUpperCase()) && !isCodeToken(before);
+        if (atStopword < 0) atStopword = j;
+        if (!plain) break;
+      } else if (!NAME_WORD.test(p) || isYear(p) || /^(?:CODES?|Codes?)$/.test(p)) break;
       j--;
+    }
+    // The longer name stands only when its edition is the year before it; codeBasisItems falls back
+    // to `shortAt` when the run pairs the name with the year AFTER it.
+    if (atStopword >= 0 && !(j > 0 && isYear(words[j - 1][0]))) j = atStopword;
+    const shortAt = atStopword >= 0 && j < atStopword ? words[atStopword].index! : undefined;
+    // "CODE:" ends a printed title ("2018 NORTH CAROLINA STATE BUILDING CODE: RESIDENTIAL CODE",
+    // "2021 INTERNATIONAL RESIDENTIAL CODE: SECTION R324") unless it is a HEADING: nothing names a
+    // code before it, or a year or a code abbreviation follows the colon ("BUILDING CODE: 2023 ORSC",
+    // "Design Criteria Code: 2021 WSBC", "ELECTRICAL CODE: NEC 2020", "PER CODE: NEC 690.54").
+    if (words[i][0].endsWith(":")) {
+      const from = words[i].index! + words[i][0].length;
+      const after = /^\s*((?:19|20)\d{2}|[A-Z]{2,6})\b/.exec(blanked.slice(from, from + 20))?.[1] ?? "";
+      if (j === i || isYear(after) || (after && isCodeToken(after))) continue;
     }
     const at = words[j].index!;
     const nameEnd = words[i].index! + 4;
     const tail = STATE_TAIL_AT.exec(blanked.slice(nameEnd, nameEnd + 60))?.[0] ?? "";
     const end = nameEnd + tail.length;
     if (!free(at, end)) continue;
-    out.push({ kind: "name", at, end, value: blanked.slice(at, end), bare: blanked.slice(at, nameEnd), tail: blanked.slice(end, end + 20), paren: parenAt(end) });
+    const token: CodeToken = { kind: "name", at, end, value: blanked.slice(at, end), bare: blanked.slice(at, nameEnd), tail: blanked.slice(end, end + 20), paren: parenAt(end), shortAt };
+    // A name of fewer than three initials, once a generic qualifier is set aside, is no code unless it
+    // is a known one ("THE BUILDING CODE", "LOCAL FIRE CODE", "Fire Code:"). It stays a token, so a
+    // list that prints its own year beside it ("BUILDING CODE 2021, NEC 2020") still pairs as printed,
+    // but it is GENERIC: it reads nothing, and pairCodeTokens may make it a run's stray (#314).
+    const code = nameTokenCode({ ...token, value: token.value.replace(GENERIC_QUALIFIER, ""), bare: token.bare!.replace(GENERIC_QUALIFIER, "") });
+    if (code.replace(/-.*$/, "").length < 3 && !(MODEL_CODES.has(code) || code in STATE_CODE_BASE)) token.generic = true;
+    out.push(token);
   }
   let m: RegExpExecArray | null;
   const years = new RegExp(`\\b(${YEAR})\\b`, "g");
@@ -1275,6 +1320,20 @@ function codeTokens(text: string, windows: Array<[number, number]>, taken: Array
   return out.sort((a, b) => a.at - b.at);
 }
 
+/** The printed name a name token stands for: "2021 INTERNATIONAL RESIDENTIAL CODE OF THE STATE OF
+ *  COLORADO" is the IRC, so a name that is a known code WITHOUT its state tail drops the tail; any
+ *  other takes it ("RESIDENTIAL CODE OF NEW YORK STATE" is the RCNYS, not a code named "RC"). */
+function nameTokenName(t: CodeToken): string {
+  const bareCode = namedCode(t.bare!.replace(/\s+/g, " ").trim().toUpperCase(), "", t.tail!);
+  return MODEL_CODES.has(bareCode) || bareCode in STATE_CODE_BASE ? t.bare! : t.value;
+}
+
+/** The code a name token reads as, before it is paired: its own parenthetical abbreviation, else its name. */
+function nameTokenCode(t: CodeToken): string {
+  const abbrParen = t.paren && !parenBase(t.paren) ? t.paren : "";
+  return namedCode(nameTokenName(t).replace(/\s+/g, " ").trim().toUpperCase(), abbrParen, t.tail!);
+}
+
 /**
  * THE ONE PAIRING. Tokens joined by nothing but glue (RUN_GLUE), kinds alternating, form a run; a
  * run is paired in order FROM ITS FIRST TOKEN, so the run's first token decides its shape: a run
@@ -1294,7 +1353,15 @@ function pairCodeTokens(tokens: CodeToken[], blanked: string): Array<{ code: Cod
     else runs.push([t]);
   }
   const pairs: Array<{ code: CodeToken; year: CodeToken; weak: boolean }> = [];
-  for (const run of runs) {
+  for (let run of runs) {
+    // In an odd run one token has no partner. When exactly one end is a generic mention, that end is
+    // it: "LOCAL FIRE CODE 2021 IRC 2020 NEC" is the IRC 2021 and NEC 2020, read surely, never a Local
+    // Fire Code that took the IRC's year and left the NEC without one (#314). Any other odd run stays
+    // weak: a real code at either end ("NEC 2023, OREGON RESIDENTIAL SPECIALTY CODE 2023, OREGON FIRE
+    // CODE") may be the dated one, and dropping it would slide every year onto the wrong code.
+    if (run.length >= 3 && run.length % 2 === 1 && !!run[0].generic !== !!run[run.length - 1].generic) {
+      run = run[0].generic ? run.slice(1) : run.slice(0, -1);
+    }
     if (run.length < 2) continue;
     const weak = run.length % 2 === 1;
     for (let i = 0; i + 1 < run.length; i += 2) {
@@ -1331,7 +1398,17 @@ function codeBasisItems(text: string): BasisItem[] {
   const windows: Array<[number, number]> = [];
   while ((m = header.exec(text))) windows.push([m.index + m[0].length, Math.min(text.length, m.index + m[0].length + 520)]);
   const tokens = codeTokens(text, windows, items.map((i) => [i.at, i.end]));
-  for (const { code, year, weak } of pairCodeTokens(tokens, blankParentheticals(text))) {
+  for (const pair of pairCodeTokens(tokens, blankParentheticals(text))) {
+    const { year, weak } = pair;
+    let code = pair.code;
+    if (code.generic) continue;
+    // A name paired with the year AFTER it (name-first) does not own the words before its stopword:
+    // in "CITY OF LOS ANGELES BUILDING CODE 2023 CITY OF LOS ANGELES ELECTRICAL CODE 2020" the 2023
+    // before the second "CITY OF" is the first code's edition, so the second is the LAEC like the first.
+    if (code.shortAt !== undefined && code.at < year.at) {
+      const cut = code.shortAt - code.at;
+      code = { ...code, at: code.shortAt, value: code.value.slice(cut), bare: code.bare!.slice(cut), shortAt: undefined };
+    }
     const last = code.at > year.at ? code : year;
     const parens = [...new Set([code.paren, last.paren].filter((p): p is string => !!p))];
     const parenEnd = last.paren ? last.end + (PAREN_AFTER.exec(text.slice(last.end, last.end + 56))?.[0].length ?? 0) : last.end;
@@ -1342,12 +1419,7 @@ function codeBasisItems(text: string): BasisItem[] {
       if (!items.some((i) => at < i.end && end > i.at)) items.push({ at, end, entry: { code: normCodeToken(code.value), edition: year.value, ...(base ?? {}) }, weak, abbreviation: true });
       continue;
     }
-    // "2021 INTERNATIONAL RESIDENTIAL CODE OF THE STATE OF COLORADO" is the IRC; only a name that is
-    // not a known code WITHOUT its state tail takes the tail ("RESIDENTIAL CODE OF NEW YORK STATE"
-    // is the RCNYS, not a code named "RC").
-    const bareCode = namedCode(code.bare!.replace(/\s+/g, " ").trim().toUpperCase(), "", code.tail!);
-    const known = MODEL_CODES.has(bareCode) || bareCode in STATE_CODE_BASE;
-    push(at, end, known ? code.bare! : code.value, year.value, parens, code.tail!, weak);
+    push(at, end, nameTokenName(code), year.value, parens, code.tail!, weak);
   }
   return items.sort((a, b) => a.at - b.at);
 }
