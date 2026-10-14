@@ -140,8 +140,11 @@ scoping them without a decision.
   bridges operator short names ("PGE", "APS") to imported legal names. Exact
   profile-key hits always win over fuzzy. State mismatch always loses.
 - LLM cost: the planner gets a compact `designNotesDigest`, NOT raw parser
-  text (long blobs excluded in `resolveRecipeFieldValues`). Keep it that way —
-  regressing this costs ~$10/run.
+  text (long blobs excluded in `resolveRecipeFieldValues`; the shorter narrative
+  texts, the parser's review prose and raw keys that only echo a canonical one are
+  left out of the prompt by `plannerFieldView` in `autoLearn.ts`, taken after the
+  secret filters, while the replay map keeps them; `PLANNER_USER_TOKEN_BUDGET` in
+  `llm.ts` is the tripwire). Keep it that way — regressing this costs ~$10/run.
 - `jobQueue` statically imports `repository`; anything in repository that needs
   jobQueue must use a dynamic `import()` (circular-import guard).
 - Frontend `esc()` everything interpolated into innerHTML.
