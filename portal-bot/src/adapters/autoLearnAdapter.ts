@@ -26,6 +26,8 @@ import { readApplicationLedgerInPage, type LedgerEntry } from "./submissionLedge
 import { LIST_LINK } from "../statusFinder";
 import { readSignatureRequestStep, stageSignatureRequestStep, type SignatureStepOutcome } from "./signatureRequestStep";
 import type { SignatureRequestApproval } from "../../../shared/src/signatureRequestGate";
+import { readSignatureStatuses, type SignatureCheck } from "./signatureStatusRead";
+import { signatureCompletion } from "../../../shared/src/signatureCompletion";
 
 /** See AutoLearnAdapter's continueDraft option (#302). */
 export interface ContinueDraft {
@@ -41,6 +43,11 @@ export interface ContinueDraft {
   siblingAtSameStreet?: boolean;
   /** A draft is ON RECORD for this project: never start a new application. */
   required?: boolean;
+  /** THE TRACK WAITS ON THE HOMEOWNER'S SIGNATURE (#310): Request Signatures was sent (an approved
+   *  click, or a person confirmed they clicked it). The record page's signature status is read
+   *  before anything is opened: signed, the walk continues to step 5 and stops in front of its
+   *  Submit; not signed, or unreadable, it stops on the record page and names why. */
+  awaitingSignature?: boolean;
 }
 import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
 import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
@@ -246,6 +253,10 @@ export interface LearnResult {
    *  (consents, eSign, Preview Document), and whether Request Signatures was left for a person
    *  (state "awaiting_signature_request", the default) or clicked in an approved run. */
   signatureStep?: SignatureStepOutcome;
+  /** A RESUME read the homeowner's signature (#310): signed (the walk went on toward step 5's
+   *  Submit), never requested (the signature step was staged again), or still awaited / unreadable
+   *  (the walk stopped and says why). */
+  signatureCheck?: SignatureCheck;
 }
 
 // Live progress signal emitted while learning a portal, so the UI can show a real
@@ -2086,6 +2097,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   private runId: string;
   /** What the signature-request step staged, once the walk reached it (#308). */
   private signatureStep: SignatureStepOutcome | undefined;
+  private signatureCheck: SignatureCheck | undefined;
   /** Lines for the person at review that come from the PAGE, not the run (#302: PSE's red
    *  "file as a modification on the original record" notice). */
   private pageReviewNotes: string[] = [];
@@ -3419,6 +3431,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    */
   private async openExistingDraft(cd: ContinueDraft): Promise<
     | { kind: "opened"; applicationNumber: string; form: string; why: string }
+    | { kind: "held"; applicationNumber: string; why: string }
     | { kind: "none" | "refused"; why: string }
   > {
     const page = this.page;
@@ -3465,6 +3478,23 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // A record that no longer reads as an unsubmitted draft was completed (by hand, or by another
     // run): there is nothing to continue, and the forms it offers now belong to a filed application.
     if (!readsAsUnsubmittedDraft(recordText)) return { kind: "refused", why: `the record ${appNo} does not read as an unsubmitted draft any more — nothing to continue` };
+    // THE HOMEOWNER'S SIGNATURE, READ ON THE RECORD PAGE BEFORE ANY FORM IS OPENED (#310). Every
+    // signature status the page shows, never the application's own; signed only on a positive read
+    // of every one (signatureCompletion). Never requested: the walk goes on and stages the signature
+    // step again. Requested, or anything unfamiliar or unread: the walk stops here and says why.
+    if (cd.awaitingSignature) {
+      const read = signatureCompletion(await readSignatureStatuses(this.page));
+      const statuses = read.statuses.map((x) => this.scrubSecrets(x));
+      const why = this.scrubSecrets(read.why);
+      if (read.reading === "signed") {
+        this.signatureCheck = { state: "signed", reading: read.reading, statuses, where: "record", why: `the record ${appNo}: ${why}` };
+      } else if (read.reading === "not_requested") {
+        this.signatureCheck = { state: "not_requested", reading: read.reading, statuses, where: "record", why: `the record ${appNo}: ${why} — the signature step is staged again` };
+      } else {
+        this.signatureCheck = { state: "awaiting_customer_signature", reading: read.reading, statuses, where: "record", why: `the record ${appNo}: ${why}` };
+        return { kind: "held", applicationNumber: appNo, why: this.signatureCheck.why };
+      }
+    }
     let scanFailed = false;
     const rows = (await this.page!.evaluate(scanProjectForms).catch(() => { scanFailed = true; return []; })) as ProjectFormRow[];
     if (scanFailed) return { kind: "refused", why: `the form list on the draft ${appNo} could not be read` };
@@ -3540,6 +3570,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       if (this.signatureStep) {
         const sig = this.signatureStep;
         result = { ...result, signatureStep: sig, message: `${result.message} SIGNATURE STEP: ${sig.why}.` };
+      }
+      if (this.signatureCheck) {
+        const chk = this.signatureCheck;
+        result = { ...result, signatureCheck: chk, message: `${result.message} HOMEOWNER SIGNATURE: ${chk.why}.` };
       }
       if (result.reachedReview) {
         const reviewUrl = (() => { try { return typeof this.page?.url === "function" ? String(this.page.url() || "") : ""; } catch { return ""; } })();
@@ -5743,6 +5777,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           this.continuedDraft = { applicationNumber: opened.applicationNumber, form: opened.form, why: opened.why };
           continue;
         }
+        if (opened.kind === "held") {
+          // AWAITING THE HOMEOWNER'S SIGNATURE (#310): the record page is the hand-off. No form was
+          // opened and nothing was clicked on it; the track keeps waiting and the result says why.
+          this.continuedDraft = { applicationNumber: opened.applicationNumber, form: "", why: opened.why };
+          reachedReview = true;
+          backstopFor(this.page)?.lockReview("learner on the draft's record page, awaiting the homeowner's signature");
+          break;
+        }
         if (opened.kind === "refused" || this.continueDraft.required) {
           return {
             ...fail(steps, this.portalName, `Stopped before starting an application: ${opened.why}. This project already has a draft on the portal${this.continueDraft.applicationNumber ? ` (${this.continueDraft.applicationNumber})` : ""}, and starting again would create a second one. Open the draft by hand, or correct the recorded draft, then stage again.`, null, pageCount, portalNotices),
@@ -5758,7 +5800,30 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //      Signatures — or, in a run a named person approved and only when signatureRequestGate
       //      allows it, one click on it. The planner never sees this page, so it can never pick Sign
       //      and Upload, a Browse, or Request Signatures itself (isOffLimitsButton refuses the last).
-      if (this.page && !this.signatureStep) {
+      if (this.page && !this.signatureStep && this.signatureCheck?.state === "signed") {
+        // A RESUME WHOSE RECORD READ SIGNED (#310). The signature step is never staged again and
+        // nothing on it is clicked (Request Signatures stays off-limits to the planner): a page that
+        // shows a signature status must read signed too, or the walk stops here and names why. A
+        // page that reads signed is walked on to step 5, where the Submit is recorded and stopped in
+        // front of — clicked only under hard rule 1's gate, as on any run.
+        const sigRead = await readSignatureRequestStep(this.page);
+        const shown = await readSignatureStatuses(this.page);
+        const here = shown.length ? shown : (sigRead?.statuses ?? []);
+        if (sigRead || here.length) {
+          const read = signatureCompletion(here);
+          const statuses = read.statuses.map((x) => this.scrubSecrets(x));
+          this.debug?.event({ type: "signature_resume_check", page: pageCount, reading: read.reading, statuses });
+          if (!read.signed) {
+            this.signatureCheck = { state: "awaiting_customer_signature", reading: read.reading, statuses, where: "signature step",
+              why: `the record read signed, but on the signature step ${this.scrubSecrets(read.why)}` };
+            reachedReview = true;
+            backstopFor(this.page)?.lockReview("learner at the signature step, awaiting the homeowner's signature");
+            break;
+          }
+          const note = `The homeowner's signature reads complete (${statuses.map((x) => `"${x}"`).join(", ")}); nothing on the signature step was clicked.`;
+          if (!this.pageReviewNotes.includes(note)) this.pageReviewNotes.push(note);
+        }
+      } else if (this.page && !this.signatureStep) {
         const sigRead = await readSignatureRequestStep(this.page);
         if (sigRead) {
           this.debug?.event({ type: "signature_request_step", page: pageCount, request: sigRead.request.length, consents: sigRead.consents.length, status: this.scrubSecrets(sigRead.status) });

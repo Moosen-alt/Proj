@@ -69,6 +69,7 @@ import { billingTrack } from "./submissionFees";
 import { findingHoldScope, gateCheckDefaultScope, scopeHoldsTrack, tracksHeld } from "./gateScope";
 import { issuingAuthorityForTrack } from "./applicationDocsAgency";
 import { parseJobProgressNote } from "./jobProgress";
+import { SIGNATURE_REQUEST_CONFIRMED_ACTION, reduceNemSignatureState } from "./signatureTrack";
 import { visionRelaxedBlockers } from "./reviewerVision";
 import { startedAtLabel } from "./formAcquisitionPlan";
 import {
@@ -229,6 +230,10 @@ export interface TrackFacts {
   /** The CLIENT's payment for this track is outstanding: a per-submission client with no paid /
    *  waived submission_payments row — exactly what assertSubmissionPaid's 402 refuses on. */
   paymentDue: boolean;
+  /** NEM only (#310): where the staged draft stands between the signature request and the filing
+   *  (signatureTrack.reduceNemSignatureState over the staged run and any person's confirmation), or
+   *  undefined when the staged run is not at the signature part of the flow. */
+  signatureState?: string;
   /** WHO ISSUES THIS TRACK: the utility for NEM; for a permit, the one predicate
    *  (applicationDocsAgency.issuingAuthorityForTrack -> formAuthorityFor), so a county-issued
    *  electrical permit is named as the county's. Optional: absent, the answer falls back to the
@@ -469,12 +474,27 @@ export function loadNextStepFacts(db: AppDb, projects: ProjectRecord[]): Map<str
   // Gap-fill lists for the staged drafts only (result_json can be large; never load it for all runs).
   if (stagedRunIds.length) {
     const rph = stagedRunIds.map(() => "?").join(",");
-    const gaps = new Map(
-      db.query<Row>(`SELECT id, result_json FROM portal_runs WHERE id IN (${rph})`, stagedRunIds)
-        .map((r) => [s(r.id), reviewInfoFromResultJson(r.result_json).gapFillMissing] as const),
+    const stagedRows = db.query<Row>(`SELECT id, result_json FROM portal_runs WHERE id IN (${rph})`, stagedRunIds);
+    const gaps = new Map(stagedRows.map((r) => [s(r.id), reviewInfoFromResultJson(r.result_json).gapFillMissing] as const));
+    // THE SIGNATURE PART OF THE NEM FLOW (#310): the staged run's review state, moved on by a person's
+    // "I sent the signature request" recorded after it. Read-only, like everything here.
+    const reviewStates = new Map(stagedRows.map((r) => [s(r.id), s(parseJson<Row>(s(r.result_json) || "{}", {}).reviewState)] as const));
+    const confirmations = groupBy(
+      db.query<Row>(`SELECT project_id, details, created_at FROM audit_logs WHERE project_id IN (${ph}) AND action = ?`, [...ids, SIGNATURE_REQUEST_CONFIRMED_ACTION]),
+      (r) => s(r.project_id),
     );
     for (const facts of out.values()) {
-      for (const t of facts.tracks) if (t.stagedRun) t.gapFillMissing = gaps.get(t.stagedRun.id) ?? [];
+      for (const t of facts.tracks) {
+        if (!t.stagedRun) continue;
+        t.gapFillMissing = gaps.get(t.stagedRun.id) ?? [];
+        const reviewState = reviewStates.get(t.stagedRun.id) ?? "";
+        if (t.track !== "nem" || !reviewState) continue;
+        const view = reduceNemSignatureState([
+          { kind: "run", reviewState, at: t.stagedRun.startedAt },
+          ...(confirmations.get(facts.projectId) ?? []).map((r) => ({ kind: "confirmed" as const, by: s(parseJson<Row>(s(r.details) || "{}", {}).confirmedBy), at: s(r.created_at) })),
+        ], null);
+        if (view) t.signatureState = view.state;
+      }
     }
   }
   return out;
@@ -521,6 +541,14 @@ const GATE_BLOCKER_ASK: Record<string, string> = {
   // The fix is per document (find the form / upload the blank, or attach / split out) — it rides
   // in the check's nextAction, the `why` line; the headline names only the problem.
   "document-inventory": "required document(s) are missing",
+};
+
+/** The headline tail for a NEM draft held at the signature part of its flow (rule 10a, #310). */
+const SIGNATURE_HOLD_HEADLINE: Record<string, string> = {
+  awaiting_signature_request: "is staged to its signature step — click Request Signatures on the portal and confirm it on the track card, or approve a run that clicks it.",
+  signature_request_unconfirmed: "has a signature request the portal did not confirm — check the portal's signature status before anyone clicks it again.",
+  awaiting_customer_signature: "is waiting on the homeowner's DocuSign signature — press Check signature now on the track card once they have signed.",
+  ready_to_submit: "is signed by the homeowner — stage it again to reach step 5's Submit.",
 };
 
 const TRACK_NAME: Record<SubmittalTrackType, string> = {
@@ -722,8 +750,20 @@ export function decideNextStep(facts: NextStepFacts): NextStep {
       facts.openCorrections.map(correctionWhy), null);
   }
 
+  // 10a. A STAGED NEM DRAFT AT THE SIGNATURE PART OF ITS FLOW (#310) is not a draft to approve and
+  // submit: the filing waits on Request Signatures, or on the homeowner's DocuSign signature. Said
+  // as such, and never as filed. Signed and staged up to the Submit is an ordinary staged draft (10).
+  const signatureHeld = unfinished.filter((t) => t.stagedRun && t.signatureState && SIGNATURE_HOLD_HEADLINE[t.signatureState]);
+  const staged = unfinished.filter((t) => t.stagedRun && !signatureHeld.includes(t));
+  if (signatureHeld.length && !staged.length) {
+    const t = signatureHeld[0];
+    const waitsOnHomeowner = t.signatureState === "awaiting_customer_signature";
+    return make("awaiting_signature", waitsOnHomeowner ? "customer" : "me", waitsOnHomeowner ? "waiting" : "today",
+      `The ${trackWithAgency(facts, t)} application ${SIGNATURE_HOLD_HEADLINE[t.signatureState!]}`,
+      [why("It is an unsubmitted draft on the utility portal until step 5's Submit — nothing is filed yet.", "submittalTracks")],
+      null, t.stagedRun!.startedAt);
+  }
   // 10/11. Staged drafts waiting on a person (per track).
-  const staged = unfinished.filter((t) => t.stagedRun);
   if (staged.length) {
     const approvedRuns = new Set(facts.approvedRunIds);
     const awaitingApproval = staged.filter((t) => !approvedRuns.has(t.stagedRun!.id));

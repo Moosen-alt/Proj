@@ -113,6 +113,8 @@ export interface AutoLearnResult {
   /** The walk ended at the signature-request step (#308): what it staged, and whether Request
    *  Signatures waits on a person or was clicked in an approved run. Carried onto the run row. */
   signatureStep?: import("../../portal-bot/src/adapters/signatureRequestStep").SignatureStepOutcome;
+  /** A resume read the homeowner's signature (#310): signed, never requested, or still awaited. */
+  signatureCheck?: import("../../portal-bot/src/adapters/signatureStatusRead").SignatureCheck;
 }
 
 // Lines in the long design/plan-set texts that answer the portal's JUDGMENT questions.
@@ -1419,7 +1421,9 @@ async function autoLearnPortalInner(
       : r;
     // A walk that ended at the signature-request step (#308) says so on every result, recipe or not.
     const sigStep = withNotes.signatureStep ?? (learn as { signatureStep?: AutoLearnResult["signatureStep"] } | undefined)?.signatureStep;
-    const result: AutoLearnResult = { ...withNotes, debugDir, ...(sigStep ? { signatureStep: sigStep } : {}) };
+    // ...and a resume that read the homeowner's signature (#310), likewise.
+    const sigCheck = withNotes.signatureCheck ?? (learn as { signatureCheck?: AutoLearnResult["signatureCheck"] } | undefined)?.signatureCheck;
+    const result: AutoLearnResult = { ...withNotes, debugDir, ...(sigStep ? { signatureStep: sigStep } : {}), ...(sigCheck ? { signatureCheck: sigCheck } : {}) };
     if (debugDir) {
       try {
         fs.writeFileSync(path.join(debugDir, "llm-calls.json"), JSON.stringify({
@@ -1553,7 +1557,22 @@ async function autoLearnPortalInner(
           preview: sig.preview.kind, statusBefore: sig.statusBefore, statusAfter: sig.statusAfter,
         });
     }
-    const msg = sig
+    // A RESUME READ THE HOMEOWNER'S SIGNATURE (#310). Audited either way: "signed" is what lets a
+    // run reach step 5's Submit, and "still awaited" is what a person reads on the track card.
+    const chk = learn.signatureCheck;
+    if (chk) {
+      addAuditLog(db, projectId, "system", "signature check", "portal.signature_checked", {
+        state: chk.state, reading: chk.reading, where: chk.where, statuses: chk.statuses.slice(0, 6), why: chk.why.slice(0, 240),
+        runId: input.runId ?? null, reachedSubmit: staged && learn.finalSubmitRecorded === true,
+      });
+    }
+    const msg = chk && chk.state === "awaiting_customer_signature"
+      ? `Opened this project's existing draft ${cd.applicationNumber}: AWAITING CUSTOMER SIGNATURE — ${chk.why}. The run stopped on the ${chk.where === "record" ? "record page (no form was opened)" : "signature step (nothing on it was clicked)"}, and the application is NOT submitted. Check again once the homeowner has signed.`
+      : chk && chk.state === "signed"
+        ? (staged && learn.finalSubmitRecorded === true
+          ? `Opened this project's existing draft ${cd.applicationNumber}: the homeowner has SIGNED (${chk.why}). "${cd.form}" was staged to its final Submit and stopped there: the application is NOT submitted until that Submit is clicked. ${learn.message}`
+          : `Opened this project's existing draft ${cd.applicationNumber}: the homeowner has SIGNED (${chk.why}), but the walk did not reach the final Submit: ${learn.message}`)
+        : sig
       ? (sig.state === "awaiting_signature_request"
         ? `Opened this project's existing draft ${cd.applicationNumber} and staged "${cd.form}" through its signature step: AWAITING SIGNATURE REQUEST. Nothing was submitted and no signature request was sent. ${learn.message}`
         : `Opened this project's existing draft ${cd.applicationNumber} and staged "${cd.form}" through its signature step: ${sig.state === "awaiting_customer_signature" ? "AWAITING CUSTOMER SIGNATURE" : "SIGNATURE REQUEST UNCONFIRMED"}. The application is NOT submitted. ${learn.message}`)
