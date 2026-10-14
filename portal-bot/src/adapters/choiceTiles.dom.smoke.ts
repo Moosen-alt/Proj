@@ -59,6 +59,11 @@ const check = (label: string, ok: boolean, detail = ""): void => {
 // Fixtures
 // ------------------------------------------------------------------------------------------
 const INFO_SOLAR = "See more information about Solar Permit requirements.";
+// THE SIGNED-IN INSTALLER, as DevHub's header shows it (#328). Synthetic, and deliberately NOT
+// "Example …": the entry vocabulary refuses \bexample\b (a document about applying), so #319's
+// "Example Solar Co" never reached the permit-type vocabulary at all — which is exactly why
+// that fixture could not see the live bug. Pinned below as a premise check.
+const ACCOUNT = "Placeholder Solar Co";
 const SOLAR = "Solar Permit Request";
 
 /** One tile, as captured: the portal's own ids and class names, a title, prose, a chevron. */
@@ -107,8 +112,8 @@ const HOME_TILES = [
 /** The captured home's "Learn More About…" accordion: repeated items with a heading and a
  *  button each — the shape of a tile, except that the BUTTON is the control. */
 const ACCORDION = `<div class="accordion" id="acc">
-  <div class="accordion-item"><h2 class="accordion-header"><button class="accordion-button collapsed" type="button">Want to know more about submittal requirements?</button></h2><div class="accordion-collapse collapse" style="display:none">…</div></div>
-  <div class="accordion-item"><h2 class="accordion-header"><button class="accordion-button collapsed" type="button">Getting a Trade Permit?</button></h2><div class="accordion-collapse collapse" style="display:none">…</div></div>
+  <div class="accordion-item"><h2 class="accordion-header"><button id="acc1" class="accordion-button collapsed" type="button" data-bs-toggle="collapse" aria-expanded="true" aria-controls="acc1body">Want to know more about submittal requirements?</button></h2><div id="acc1body" class="accordion-collapse collapse" style="display:none">…</div></div>
+  <div class="accordion-item"><h2 class="accordion-header"><button id="acc2" class="accordion-button collapsed" type="button" data-bs-toggle="collapse" aria-expanded="true" aria-controls="acc2body">Getting a Trade Permit?</button></h2><div id="acc2body" class="accordion-collapse collapse" style="display:none">…</div></div>
 </div>`;
 
 /** The sidebar every page carries — the 10 links the live run's field discovery listed. */
@@ -145,10 +150,18 @@ const shell = (o: { title: string; content: string; applyHref?: string; nav?: bo
 <style>body{font:14px sans-serif;margin:0} .row{display:flex} .left-section{width:200px} .right-section{flex:1}
 .card{display:flex;border:1px solid #ccc;margin:8px 0;padding:8px;min-height:60px} .card-body{flex:1} .card-next{width:32px}</style>
 </head><body class="apply-permit">
-<div id="top-header"><div id="signin-menu">
-  <button id="signedin-menu-btn" type="button" class="dropdown-toggle" aria-expanded="false"><i class="bi bi-person-fill"></i><div>Example Solar Co</div></button>
-  <ul class="dropdown-menu" style="display:none"><li><a class="dropdown-item" href="/profile">My Profile</a></li><li><a class="dropdown-item" href="#" onclick="return false">Sign Out</a></li></ul>
-</div></div>
+<div id="top-header">
+	<div class="container-xxl d-flex">
+	<a href="/home"><img id="top-header-logo" alt="City seal"></a>
+	<div id="signin-menu" class="ms-auto">
+	<button id="signedin-menu-btn" type="button" class="dropdown-toggle" data-bs-toggle="dropdown" aria-expanded="false"><i class="bi bi-person-fill"></i><div>${ACCOUNT}</div></button>
+			<ul class="dropdown-menu" aria-labelledby="userMenuButton" style="display:none">
+				<li><a class="dropdown-item" href="/profile">My Profile</a></li>
+				<li><a class="dropdown-item" href="#" onclick="return false">Sign Out<i class="bi bi-box-arrow-right"></i></a></li>
+			</ul>
+	</div>
+	</div>
+</div>
 <div id="sec-header"><h1>Development Hub Fixture</h1><h2>Online License &amp; Permit Services</h2></div>
 <div id="breadcrumb"><nav aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="/home">Home</a></li>${o.nav === false ? "" : `<li class="breadcrumb-item"><a href="${o.applyHref ?? "/apply"}">Apply For A Permit</a></li>`}</ol></nav></div>
 <div id="main-content"><form id="smartguide" action="/post" method="POST" class="form-content smartguide_form">
@@ -176,6 +189,16 @@ const PAGES: Record<string, string> = {
   "/home-tiles-only": shell({ title: "Welcome", content: HOME_TILES, nav: false, script: DELEGATION(HOME_MAP) }),
   // The captured "Apply for a Permit" page: nine tiles, nothing fillable.
   "/apply": shell({ title: "Apply for a Permit", content: APPLY_TILES, script: DELEGATION(TO_CHOSEN) }),
+  // #328: a home whose only way in is the SIDEBAR link (inside <nav role="navigation">), under
+  // the signed-in header — the entry finder must still find it (frame chrome is not cut there).
+  "/home-nav-only": shell({ title: "Welcome", content: "<p>Welcome to the permit portal.</p>" }),
+  // #328 belt and braces: the company's name shown OUTSIDE any chrome, as a plain content link.
+  "/apply-name-in-content": shell({
+    title: "Apply for a Permit",
+    content: `<p class="welcome">Welcome back, <a href="/profile">${ACCOUNT}</a></p>${APPLY_TILES}`,
+    applyHref: "/apply-name-in-content",
+    script: DELEGATION(TO_CHOSEN),
+  }),
   // The same page with no solar tile — the stop path.
   "/home-none": shell({ title: "Welcome", content: HOME_TILES, applyHref: "/apply-none", script: DELEGATION("function (t) { return t === 'Apply For A Permit' ? '/apply-none' : '/unknown'; }") }),
   "/apply-none": shell({ title: "Apply for a Permit", content: NO_SOLAR_TILES, applyHref: "/apply-none", script: DELEGATION(TO_CHOSEN) }),
@@ -213,7 +236,7 @@ const PAGES: Record<string, string> = {
   // (2026-09-26): a false stop on a legitimate step is a bug — the learner enters it.
   "/home-single": `<!doctype html><html><head><style>.card{display:flex;border:1px solid #ccc;padding:12px;min-height:60px} .card-body{flex:1}</style></head><body>
     <h1>Welcome to the Permit Portal</h1>
-    <p>Signed in as Example Solar Co.</p>
+    <p>Signed in as ${ACCOUNT}.</p>
     <div id="sgControls">
       <div class="card"><div class="card-body"><div class="card-title">Begin Submittal</div><div class="card-text">Start a new permit submittal with the city.</div></div><div class="card-next"><i class="fa fa-chevron-right"></i></div></div>
     </div>
@@ -255,6 +278,40 @@ const PAGES: Record<string, string> = {
     <label for="q">Search permit types</label><input id="q" name="q" type="search">
     <div id="sgControls">${NO_SOLAR_TILES}</div>
     ${DELEGATION(TO_CHOSEN)}
+  </body></html>`,
+  // #328 review 1 (Helm): PERMIT TYPES THAT LIVE IN "FRAME" MARKUP. The frame stamp is wide (any
+  // header/footer, an <article>'s own header, any class containing "menu"/"progress"), so the
+  // chooser reads it as a SECOND pool — only when nothing outside the frame names the job, and
+  // there only a label that reads as an application.
+  "/types-article-header": `<!doctype html><html><body><main>
+    <h1>Choose a permit type</h1>
+    <article class="type-card"><header><a href="/chosen?tile=Building%20Permit%20Request">Building Permit Request</a></header><p>Additions and alterations.</p></article>
+    <article class="type-card"><header><a href="/chosen?tile=Solar%20Permit%20Request">Solar Permit Request</a></header><p>Rooftop PV.</p></article>
+    <article class="type-card"><header><a href="/chosen?tile=Fence%20Permit%20Request">Fence Permit Request</a></header><p>Fences over six feet.</p></article>
+  </main></body></html>`,
+  "/types-permit-menu": `<!doctype html><html><body><main>
+    <h1>Apply for a permit</h1>
+    <ul class="permit-menu"><li><a href="/chosen?tile=Fence%20Permit">Fence Permit</a></li><li><a href="/chosen?tile=Solar%20Permit">Solar Permit</a></li><li><a href="/chosen?tile=Sign%20Permit">Sign Permit</a></li></ul>
+  </main></body></html>`,
+  "/types-in-progress": `<!doctype html><html><body><div class="in-progress-applications">
+    <h1>New application</h1>
+    <a href="/chosen?tile=Fence%20Permit">Fence Permit</a> <a href="/chosen?tile=Building%20Permit">Building Permit</a> <a href="/chosen?tile=Sign%20Permit">Sign Permit</a>
+  </div></body></html>`,
+  "/types-nav-sidebar": `<!doctype html><html><body>
+    <nav class="sidebar"><a href="/chosen?tile=Fence%20Permit">Fence Permit</a><a href="/chosen?tile=Solar%20Permit">Solar Permit</a><a href="/chosen?tile=Sign%20Permit">Sign Permit</a></nav>
+    <main><h1>Pick a permit type from the list.</h1></main>
+  </body></html>`,
+  // MUST EXCLUDE: a site header's "Going Solar" and a footer's "Solar Energy Program" are never
+  // the type — beside the page's own type, and with no type in the page at all.
+  "/types-header-trap": `<!doctype html><html><body>
+    <header><a href="/going-solar">Going Solar</a></header>
+    <main><a href="/chosen?tile=Electrical%20Permit">Electrical Permit</a> <a href="/chosen?tile=Fence%20Permit">Fence Permit</a></main>
+    <footer><a href="/program">Solar Energy Program</a></footer>
+  </body></html>`,
+  "/types-header-only": `<!doctype html><html><body>
+    <header><a href="/going-solar">Going Solar</a></header>
+    <main><a href="/chosen?tile=Fence%20Permit">Fence Permit</a> <a href="/chosen?tile=Sign%20Permit">Sign Permit</a></main>
+    <footer><a href="/program">Solar Energy Program</a></footer>
   </body></html>`,
   // MUST EXCLUDE: a dashboard of the operator's RECORDS as pointer-cursor cards. A record's
   // title carries a number; a type's never does.
@@ -305,7 +362,14 @@ const harvest = async (page: any): Promise<RawField[]> => {
 // ===========================================================================================
 // 1) MUST PASS — the chooser: the tile that names the job, clicked as a CARD, on every track.
 // ===========================================================================================
-console.log("\n[1] the captured 'Apply for a Permit' page: nine tiles, nothing fillable");
+console.log("\n[1] the captured 'Apply for a Permit' page: nine tiles, nothing fillable, the signed-in header above them");
+// PREMISES (#328): the header's scrubbed name must reach the permit-type vocabulary, or every
+// header case below is blind — #319's "Example Solar Co" was refused by \bexample\b before the
+// vocabulary ever saw it, and the live company name was not.
+check(`PREMISE: the scrubbed account name ${JSON.stringify(ACCOUNT)} is NOT refused by the entry vocabulary`,
+  !isExcludedEntryLabel(ACCOUNT), "the header case would be blind: pick another synthetic name");
+check("PREMISE (why #319's fixture missed it): \"Example Solar Co\" IS refused, by \\bexample\\b",
+  isExcludedEntryLabel("Example Solar Co"), "if this ever flips, the old fixture name is usable again");
 const page = await ctx.newPage();
 await page.goto(`${base}/apply`);
 const scanned = scanChoiceTiles ? await scanChoiceTiles(page) : null;
@@ -371,10 +435,10 @@ if (tileRaw) {
 // 3) MUST PASS — THE LEARNER, end to end from the captured home, on every track.
 // ===========================================================================================
 console.log("\n[3] the learner from the home page: entry → tile → the application");
-const runLearn = async (start: string, project: Record<string, string>, planner: LearnPlanner = stubPlanner) => {
+const runLearn = async (start: string, project: Record<string, string>, planner: LearnPlanner = stubPlanner, options: Record<string, unknown> = {}) => {
   const pw = await ctx.newPage();
   await pw.goto(`${base}${start}`);
-  const a = new AutoLearnAdapter("Choice Tiles Walk", planner, { maxPages: 3, budgetMs: 120_000 });
+  const a = new AutoLearnAdapter("Choice Tiles Walk", planner, { maxPages: 3, budgetMs: 120_000, ...options });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (a as any).page = pw;
   const r = await a.learn(
@@ -566,6 +630,90 @@ for (const door of ["advance", "navigate"] as const) {
   check(`${door} door: ...and the run never reports "nothing fillable" about a page of choices`,
     !/nothing fillable/i.test(w.r.message), w.r.message);
 }
+
+// ===========================================================================================
+// 10) #328 — SITE CHROME AND THE INSTALLER'S OWN ACCOUNT ARE NEVER A PERMIT TYPE. One resolver
+//     (markSiteChromeInPage) stamps the chrome; the tile scan and the type chooser refuse every
+//     kind, the entry finder only the account. And the client's own names, from its record,
+//     are never a type even where the page shows them outside any chrome.
+// ===========================================================================================
+console.log("\n[10] chrome and the installer's own account");
+type Mark = ((scope: unknown) => Promise<void>) | undefined;
+const markSiteChrome = (entry as { markSiteChrome?: Mark }).markSiteChrome;
+await page.goto(`${base}/home`);
+if (markSiteChrome) await markSiteChrome(page);
+const stamps = await page.evaluate(() => ({
+  toggle: document.querySelector("#signedin-menu-btn")?.closest("[data-al-chrome='account']") ? "account" : "",
+  menu: document.querySelector(".dropdown-menu")?.closest("[data-al-chrome='account']") ? "account" : "",
+  sidebarApply: Array.from(document.querySelectorAll("nav a")).find((a) => a.textContent === "Apply For A Permit")?.closest("[data-al-chrome]")?.getAttribute("data-al-chrome") ?? "",
+  accordion: document.querySelector("#acc1")?.getAttribute("data-al-chrome") ?? "",
+}));
+check("the header's account button and its menu are stamped ACCOUNT chrome (a toggle whose menu holds Sign Out)",
+  !!markSiteChrome && stamps.toggle === "account" && stamps.menu === "account", JSON.stringify(stamps));
+check("the sidebar's 'Apply For A Permit' is FRAME chrome, never account — the entry finder still reads it",
+  stamps.sidebarApply === "frame", JSON.stringify(stamps));
+check("MUST EXCLUDE: an accordion's aria-expanded (it controls a collapse, not a menu) is not a toggle",
+  stamps.accordion === "", JSON.stringify(stamps));
+
+// The entry finder keeps navigation: a home whose ONLY way in is the sidebar link, under the
+// signed-in header, is still entered — and never through the account button.
+await page.goto(`${base}/home-nav-only`);
+const navEntry = await findApplicationEntry(page);
+check("entry finder: a nav-only home is entered through its <nav> link, never the account button",
+  !!navEntry && navEntry.match.label === "Apply For A Permit", JSON.stringify(navEntry?.match));
+
+// Belt and braces: the company's name rendered OUTSIDE any chrome (a plain link in the content).
+const OWN_NAMES = ["Placeholder Solar Co, LLC", "Placeholder Solar Company", "PSC Holdings"];
+await page.goto(`${base}/apply-name-in-content`);
+const noRecord = await chooseApplicationType(page, "structural");
+check("PREMISE: without the client record, the name in the content ties with the solar tile",
+  !noRecord.ok && noRecord.refusal.reason === "ambiguous", JSON.stringify(noRecord.ok ? noRecord.choice.label : noRecord.refusal));
+for (const track of ["electrical", "structural", "solar"]) {
+  await page.goto(`${base}/apply-name-in-content`);
+  const withRecord = await chooseApplicationType(page, track, { ownNames: OWN_NAMES } as never);
+  check(`${track} track, client record known: "${SOLAR}" ALONE — the company's own name is never a type`,
+    withRecord.ok && withRecord.choice.label === SOLAR,
+    withRecord.ok ? withRecord.choice.label : JSON.stringify(withRecord.refusal.matched));
+}
+{
+  const w = await runLearn("/apply-name-in-content", { permitType: "structural" }, stubPlanner, { contactIdentity: { ownNames: OWN_NAMES } });
+  check("the learner reads the names from contactIdentity.ownNames and picks the solar tile",
+    w.notes.some((n) => n === `permit type: ${SOLAR}`), `notes=${JSON.stringify(w.notes)} message=${w.r.message}`);
+}
+
+// ===========================================================================================
+// 11) #328 review 1 — permit types in FRAME markup are a second pool, not a cut. The chooser
+//     reads them only when nothing outside the frame names the job, and there only a label that
+//     reads as an application; a site header's "Going Solar" is never the type.
+// ===========================================================================================
+console.log("\n[11] permit types inside frame markup (article header, *-menu, *-progress wrapper, nav sidebar)");
+for (const [route, track, want, what] of [
+  ["/types-article-header", "solar", "Solar Permit Request", "type links as card titles inside <article><header>"],
+  ["/types-permit-menu", "solar", "Solar Permit", "type links in <ul class=\"permit-menu\"> inside <main>"],
+  ["/types-in-progress", "structural", "Building Permit", "the whole page inside <div class=\"in-progress-applications\">"],
+  ["/types-nav-sidebar", "solar", "Solar Permit", "a type list in <nav class=\"sidebar\">"],
+] as const) {
+  await page.goto(`${base}${route}`);
+  const picked = await chooseApplicationType(page, track);
+  check(`${what} (${track}): "${want}" is chosen`,
+    picked.ok && picked.choice.label === want,
+    picked.ok ? picked.choice.label : `refused: ${picked.refusal.reason} matched=${JSON.stringify(picked.refusal.matched)}`);
+  if (picked.ok && picked.choice.label === want) {
+    await picked.choice.locator.click({ timeout: 5000 }).catch(() => null);
+    await page.waitForLoadState("domcontentloaded").catch(() => null);
+    check(`${what}: ...and its click lands on that type`, decodeURIComponent(page.url()).includes(`tile=${want}`), `url=${page.url()}`);
+  }
+}
+await page.goto(`${base}/types-header-trap`);
+const trap = await chooseApplicationType(page, "electrical");
+check("MUST EXCLUDE: beside the page's own 'Electrical Permit', a header 'Going Solar' / footer 'Solar Energy Program' is never the type",
+  trap.ok && trap.choice.label === "Electrical Permit",
+  trap.ok ? trap.choice.label : `refused: ${trap.refusal.reason} matched=${JSON.stringify(trap.refusal.matched)}`);
+await page.goto(`${base}/types-header-only`);
+const headerOnly = await chooseApplicationType(page, "solar");
+check("MUST EXCLUDE: with no type in the page, 'Going Solar' / 'Solar Energy Program' are still never chosen",
+  !headerOnly.ok && !headerOnly.refusal.matched.some((m) => /going solar|solar energy program/i.test(m)),
+  headerOnly.ok ? `picked ${headerOnly.choice.label}` : JSON.stringify(headerOnly.refusal.matched));
 
 await browser.close();
 await new Promise<void>((r) => server.close(() => r()));
