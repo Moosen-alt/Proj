@@ -158,6 +158,7 @@ import {
   createRunApproval,
   finalSubmitJobPayload,
 } from "./repository";
+import { createSignatureRequestApproval } from "./signatureRequestApproval";
 import { getSubmittalTracks, markTrackSubmitted } from "./submittalTracks";
 import { projectForTrack } from "./permitProcess";
 import { ahjProcessKnowledgeStatus, AHJ_PROCESS_REFERENCE_ENV } from "./processProfiles";
@@ -3081,7 +3082,30 @@ app.post("/api/projects/:id/prepare-submission", (req, res) => {
   // many seconds (sometimes minutes), which would otherwise hang or time out the HTTP
   // request. Enqueue + kick the worker, return 202 with the jobId; the client polls
   // /api/jobs/:id and refetches the project once it's done. SSE still fires on completion.
-  const job = enqueueJob(db, "prepare_submission", finalSubmitJobPayload({ track, autoSubmit, allowFinalSubmit, approval }), { projectId, priority: 7, maxRetries: 0 });
+  // APPROVE & REQUEST SIGNATURES (#308; owner ruling 2026-10-14 on #305): a named person approves
+  // THIS run's click on the utility portal's Request Signatures (a DocuSign email to the homeowner).
+  // Its own approval, bound to this request the same way (the id rides in the job payload and is
+  // claimed by id); a request that names nobody records nothing and the run stops in front of it.
+  // One approval per run: asking for a final submit and a signature request at once is refused.
+  const requestSignatures = req.body?.requestSignatures === true || String(req.body?.requestSignatures) === "true";
+  let signatureApproval: { id: string } | null = null;
+  if (requestSignatures) {
+    if (autoSubmit || allowFinalSubmit) throw new HttpError(400, "Approve the signature request and the final submit in separate runs: the homeowner signs in between.");
+    const user = currentUser(db, req);
+    if (AUTH_ENABLED && !user) throw new HttpError(401, "Sign in to approve a signature request.");
+    const approverName = AUTH_ENABLED ? String(user?.name || user?.email || "").trim() : String(req.body?.approverName || "").trim();
+    if (approverName) {
+      signatureApproval = createSignatureRequestApproval(db, { projectId, track: track ?? "", approver: approverName, approverUserId: user?.id ?? null });
+    } else {
+      addAuditLog(db, projectId, "human", "dashboard", "portal.signature_request_not_approved", {
+        track: track ?? null, reason: "no named approver — the run will stop in front of Request Signatures",
+      });
+    }
+  }
+  const job = enqueueJob(db, "prepare_submission", {
+    ...finalSubmitJobPayload({ track, autoSubmit, allowFinalSubmit, approval }),
+    ...(signatureApproval ? { signatureRequestApprovalId: signatureApproval.id } : {}),
+  }, { projectId, priority: 7, maxRetries: 0 });
   processNextJob(db)
     .then(() => {
       // Check the JOB first: a staging-gate 409 (QC/docs/CCB/permit-path/host conflict)
