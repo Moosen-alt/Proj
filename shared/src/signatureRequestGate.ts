@@ -14,8 +14,9 @@
 //   - PORTAL_ALLOW_FINAL_SUBMIT is NOT read here. It is the final-submit switch, and "=1 alone"
 //     must never send a homeowner an email. This function takes no environment at all;
 //   - the page must be in the state the person approved: eSign chosen (never Sign and Upload),
-//     every required consent ticked, the document previewed, ONE request control, and no request
-//     already sent (a second click would email the homeowner twice).
+//     every required consent ticked, the document previewed, ONE request control, and EVERY
+//     signature status the step shows reading, positively, "not yet requested" (a status that is
+//     unfamiliar, unread or already sent refuses: a second click would email the homeowner twice).
 //
 // The default, with no approval, is the stop in front of Request Signatures (review state
 // "awaiting signature request"); a person clicks it, or approves a run that does.
@@ -40,6 +41,9 @@ export interface SignatureRequestPageState {
   consentsComplete: boolean;
   /** The signature status the page shows ("Not yet previewed", "Requested", ...), raw. */
   status: string;
+  /** EVERY signature status the step shows (a status line per signer, a table's Status column, a
+   *  history line "Requested on …"); the application's own status is left out. */
+  statuses?: string[];
 }
 
 export interface SignatureRequestContext {
@@ -56,8 +60,16 @@ const SIGNATURE_ALREADY_REQUESTED = /\b(requested|sent|delivered|awaiting\s+(cus
 /** Does the signature status say a request already went? A negated word ("Not yet requested",
  *  "Not signed") says the opposite and is cut first; an empty status says nothing. */
 export function signatureStatusSaysRequested(status: string | null | undefined): boolean {
-  const t = String(status ?? "").replace(/\bnot\s+(yet\s+)?[a-z]+/gi, " ").replace(/\bun(signed|sent|requested)\b/gi, " ");
+  const t = String(status ?? "").replace(/\bnot\s+(yet\s+)?[a-z]+/gi, " ").replace(/\bun(signed|sent|requested)\b/gi, " ").replace(/\bpreview(ed)?\s+complete(d)?\b/gi, " ");
   return SIGNATURE_ALREADY_REQUESTED.test(t);
+}
+
+/** A status that says, positively, that no request has gone yet: the ONLY state in which the bot may
+ *  send one. An empty, unfamiliar or misread status ("Pending Signature", a table header) is not it. */
+const NOT_YET_REQUESTED = /^\s*(?:not\s+(?:yet\s+)?(?:previewed|requested|sent|started)|unsent|draft|pending\s+preview|(?:document\s+)?previewed(?:\s+by\s+[\w .'-]{1,40})?|preview\s+complete(?:d)?|ready\s+(?:to|for)\s+(?:e-?signatures?|signatures?(?:\s+request)?|request(?:ing)?|send(?:ing)?)(?:\s+signatures?)?)(?:\s*[,;:–—-]+\s*(?:ready\s+to\s+request\s+signatures?|not\s+(?:yet\s+)?(?:requested|sent)))?\s*\.?\s*$/i;
+export function signatureStatusReadsUnrequested(status: string | null | undefined): boolean {
+  const t = String(status ?? "").replace(/\s+/g, " ").trim();
+  return !!t && NOT_YET_REQUESTED.test(t) && !signatureStatusSaysRequested(t);
 }
 
 /** Every reason automation may NOT click Request Signatures in this run. Empty only when all hold. */
@@ -82,7 +94,11 @@ export function signatureRequestRefusals(ctx: SignatureRequestContext | null | u
   if (p.signatureType !== "esign") out.push(p.signatureType === "sign_and_upload" ? "Sign and Upload is selected, not eSign" : "eSign is not selected");
   if (!p.consentsComplete) out.push("a required consent is not ticked");
   if (!p.previewed) out.push("the document was not previewed in this run");
-  if (signatureStatusSaysRequested(p.status)) out.push(`the signature status already reads "${String(p.status).slice(0, 60)}" — a second request would email the homeowner again`);
+  const list = (Array.isArray(p.statuses) ? p.statuses : [p.status]).map((x) => String(x ?? "").trim()).filter(Boolean);
+  const sent = list.find((x) => signatureStatusSaysRequested(x));
+  const odd = list.find((x) => !signatureStatusReadsUnrequested(x));
+  if (sent) out.push(`the signature status already reads "${sent.slice(0, 60)}" — a second request would email the homeowner again`);
+  else if (!list.length || odd) out.push(`the signature status ${odd ? `reads "${odd.slice(0, 60)}"` : "could not be read"}, not "not yet requested" — a person checks the portal, so the homeowner is never emailed twice`);
   return out;
 }
 

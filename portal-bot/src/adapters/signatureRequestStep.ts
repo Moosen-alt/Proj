@@ -37,7 +37,13 @@ import {
 import type { RecipeSelector, RecipeStep } from "../../../shared/src/types";
 
 export interface SignatureStepControl { i: number; id: string; name: string; label: string; tag: string; type: string }
-export interface SignatureConsent extends SignatureStepControl { text: string; checked: boolean; required: boolean; money: boolean }
+export interface SignatureConsent extends SignatureStepControl { text: string; checked: boolean; required: boolean; money: boolean; consent?: boolean; optional?: boolean }
+
+/** A box the application cannot go on without: marked required (the box, its label, or its own row),
+ *  or worded as the applicant's consent ("I agree…", "I understand…"), and not marked optional. */
+export function consentMustBeTicked(c: SignatureConsent): boolean {
+  return (c.required || c.consent === true) && c.optional !== true;
+}
 export interface SignatureTypeChoice extends SignatureStepControl { kind: "radio" | "option"; value: string; selected: boolean }
 
 /** The step-4 page as read in the browser. Controls carry data-al-sr-i so they can be found again. */
@@ -48,6 +54,8 @@ export interface SignatureStepRead {
   eSign: SignatureTypeChoice | null;
   signAndUpload: SignatureTypeChoice | null;
   status: string;
+  /** Every signature status the step shows (see SignatureRequestPageState.statuses). */
+  statuses?: string[];
 }
 
 export type SignatureStepState =
@@ -129,27 +137,72 @@ const READ_IN_PAGE = `(() => {
   var UPLOAD = /\\bsign\\s*(and|&)\\s*upload\\b|\\bwet\\s+sign|\\bupload\\b/i;
   var PREVIEW = /^\\s*preview(\\s+(the\\s+)?(document|application|form|pdf|agreement))?\\s*$/i;
   var clickables = document.querySelectorAll("button, a, input[type=button], input[type=submit], [role=button]");
+  var hiddenRequest = false;
+  var GENERIC_SEND = /^\\s*(?:send|request|send\\s+(?:the\\s+)?request|submit\\s+request|send\\s+now|request\\s+now)\\s*$/i;
+  var generic = [];
   for (var c = 0; c < clickables.length; c++) {
     var el = clickables[c];
-    if (!visible(el)) continue;
+    if (!visible(el)) {
+      var hl = squash(el.textContent || el.value || el.getAttribute("aria-label") || "");
+      if (hl && hl.length <= 60 && ps.isSignatureRequestControl(hl)) hiddenRequest = true;
+      continue;
+    }
     var label = squash(el.innerText || el.value || el.getAttribute("aria-label") || el.textContent || "");
     if (!label || label.length > 60) continue;
     if (ps.isSignatureRequestControl(label)) out.request.push(ctl(el, "request", label));
     else if (PREVIEW.test(label)) out.preview.push(ctl(el, "preview", label));
+    else if (GENERIC_SEND.test(label)) generic.push(el);
   }
-  if (!out.request.length) return out;
+  // On the signature step itself (a Preview Document control, or an eSign choice), a bare "Send" /
+  // "Request" / "Send Request" is the request: it is never left for the planner to click.
+  var sigContext = out.preview.length > 0;
+  var rads = document.querySelectorAll("input[type=radio]");
+  for (var rq = 0; rq < rads.length && !sigContext; rq++) if (rads[rq].checked && ESIGN.test(labelOf(rads[rq]) || squash(rads[rq].value))) sigContext = true;
+  if (!out.request.length && sigContext) for (var g = 0; g < generic.length; g++) out.request.push(ctl(generic[g], "request", squash(generic[g].innerText || generic[g].value || "")));
+  // The step is also the page that offers eSign AND Sign and Upload (Request Signatures can appear
+  // only once eSign is chosen): read the choice before deciding this is not the step.
+  var pairSeen = false;
+  var rs = document.querySelectorAll("input[type=radio]");
+  var seenE = false, seenU = false;
+  for (var q = 0; q < rs.length; q++) { if (!visible(rs[q]) && !(rs[q].labels && rs[q].labels[0] && visible(rs[q].labels[0]))) continue; var ql = labelOf(rs[q]) || squash(rs[q].value); if (UPLOAD.test(ql)) seenU = true; else if (ESIGN.test(ql)) seenE = true; }
+  // ...and only where a Request Signatures control is already in the page, waiting to be shown.
+  pairSeen = seenE && seenU && hiddenRequest;
+  if (!out.request.length && !pairSeen) return out;
   var boxes = document.querySelectorAll("input[type=checkbox]");
   for (var b = 0; b < boxes.length; b++) {
     var box = boxes[b];
     if (!visible(box) || box.disabled) continue;
     var text = textAround(box);
     var lab = labelOf(box);
-    var required = box.required || box.getAttribute("aria-required") === "true" || /\\*/.test(lab)
-      || !!(box.closest && box.closest(".required, [class*=required], [data-required=true]"));
-    if (/\\boptional\\b/i.test(text)) required = false;
+    // The box's OWN row: the widest ancestor holding no other checkbox. "Required" is read from the
+    // box, its label or that row, never from a wrapper around several boxes; money from the row's words.
+    var reqMark = function (e) {
+      var cls = " " + String(e.className && e.className.baseVal !== undefined ? e.className.baseVal : e.className || "").toLowerCase() + " ";
+      return /\\s(required|is-required|field-required|required-field|form-required)\\s/.test(cls)
+        || e.getAttribute("data-required") === "true" || e.getAttribute("aria-required") === "true";
+    };
+    var rowEl = null;
+    var required = box.required || reqMark(box) || /\\*/.test(lab);
+    if (box.labels) for (var lb = 0; lb < box.labels.length; lb++) if (reqMark(box.labels[lb])) required = true;
+    for (var up2 = box.parentElement, d2 = 0; up2 && d2 < 6; up2 = up2.parentElement, d2++) {
+      if (up2.querySelectorAll("input[type=checkbox]").length !== 1) break;
+      rowEl = up2;
+      if (reqMark(up2)) required = true;
+    }
+    var rowText = rowEl ? squash(rowEl.innerText || rowEl.textContent || "").slice(0, 600) : text;
+    // "(optional)" beside the label, in the box's NEAREST row (never a wider wrapper's words).
+    var near = "";
+    for (var up3 = box.parentElement, d3 = 0; up3 && d3 < 6 && up3 !== (rowEl && rowEl.parentElement); up3 = up3.parentElement, d3++) {
+      var nt = squash(up3.innerText || up3.textContent || "");
+      if (nt.length > lab.length + 2) { near = nt.slice(0, 200); break; }
+    }
+    var optional = /\\boptional\\b/i.test(lab + " " + text + " " + near);
+    if (optional) required = false;
     var row = ctl(box, "consent", lab || text.slice(0, 80));
-    row.text = text; row.checked = box.checked === true; row.required = !!required;
-    row.money = typeof ps.isPaymentWordedText === "function" ? ps.isPaymentWordedText(text) : /\\$\\s?\\d|\\bfees?\\b|\\bcharges?\\b/i.test(text);
+    row.text = text; row.checked = box.checked === true; row.required = !!required; row.optional = optional;
+    row.consent = /\\b(i\\s+)?(agree|accept|understand|acknowledge|certify|attest|consent)\\b|\\bi\\s+am\\s+responsible\\b|terms\\s+(and|&)\\s+conditions/i.test(lab || text);
+    var moneyText = rowText + " " + text;
+    row.money = (typeof ps.isPaymentWordedText === "function" ? ps.isPaymentWordedText(moneyText) : false) || /\\$\\s?\\d|\\bfees?\\b|\\bcharges?\\b/i.test(moneyText);
     out.consents.push(row);
   }
   var radios = document.querySelectorAll("input[type=radio]");
@@ -178,17 +231,42 @@ const READ_IN_PAGE = `(() => {
       }
     }
   }
-  // The signature status: the nearest "Status" line above the request control.
-  var anchor = document.querySelector("[data-al-sr=request]");
-  for (var up = anchor ? anchor.parentElement : null, depth = 0; up && depth < 8 && !out.status; up = up.parentElement, depth++) {
-    var lines = String(up.innerText || "").split(/\\n+/);
+  // EVERY signature status in the signature block: each "... status: value" line, a table's Status
+  // column, and a history line ("Requested on 10/12", "request emailed to the account holder").
+  // The application's own status ("Application Status: Unsubmitted Draft") is not a signature status.
+  var anchor = document.querySelector("[data-al-sr=request]") || document.querySelector("[data-al-sr=esign]") || document.querySelector("[data-al-sr=upload]");
+  var block = anchor ? (anchor.closest("fieldset, section, [role=group], .panel, .card") || anchor.parentElement) : null;
+  for (var lift = 0; block && lift < 3 && !/\\bstatus\\b|\\b(requested|sent|emailed|delivered)\\b/i.test(block.innerText || ""); lift++) block = block.parentElement;
+  var statuses = [];
+  var APP = /\\b(application|permit|project|record|draft|unsubmitted)\\b/i;
+  var HISTORY = /^\\s*(?:signature\\s+)?(?:request\\s+)?(?:requested|sent|emailed|delivered)\\b|\\b(?:requested|sent|emailed|delivered|signed)\\s+(?:on\\s+\\d|by\\s+[a-z])|\\b(?:was|were|has\\s+been|have\\s+been)\\s+(?:requested|sent|emailed|delivered|signed)\\b|\\b(?:request|envelope|document)\\s+(?:was\\s+)?(?:requested|sent|emailed|delivered)\\b/i;
+  if (block) {
+    var tables = block.querySelectorAll("table");
+    for (var tb = 0; tb < tables.length; tb++) {
+      var trs = tables[tb].querySelectorAll("tr");
+      if (!trs.length) continue;
+      var heads = trs[0].querySelectorAll("th, td"); var col = -1;
+      for (var hc = 0; hc < heads.length; hc++) if (/^\\s*(signature\\s+|signer\\s+|envelope\\s+)?status\\s*$/i.test(heads[hc].textContent || "")) col = hc;
+      if (col < 0) continue;
+      for (var tr = 1; tr < trs.length; tr++) { var cells = trs[tr].querySelectorAll("td, th"); if (cells[col]) { var cv = squash(cells[col].textContent); if (cv) statuses.push(cv.slice(0, 80)); } }
+      tables[tb].setAttribute("data-al-sr-read", "1");
+    }
+    var lines = String(block.innerText || "").split(/\\n+/);
     for (var li = 0; li < lines.length; li++) {
-      var m = lines[li].match(/\\bstatus\\b\\s*[:\\-–—]?\\s*(.*)$/i);
-      if (!m) continue;
-      var val = squash(m[1] || lines[li + 1] || "");
-      if (val) { out.status = val.slice(0, 80); break; }
+      var line = lines[li];
+      if (/\\t/.test(line)) continue; // a table row: read by column above
+      var m = line.match(/^(.*?)\\bstatus\\b\\s*[:\\-–—]?\\s*(.*)$/i);
+      if (m) {
+        var lbl = squash(m[1]); var val = squash(m[2] || lines[li + 1] || "");
+        if (!val || APP.test(lbl) || /^of\\s+(your|the|this)\\s+(application|permit|project|record)/i.test(val)) continue;
+        statuses.push(val.slice(0, 80));
+        continue;
+      }
+      if (HISTORY.test(line) && !/\\b(will|would|to)\\s+be\\b/i.test(line)) statuses.push(squash(line).slice(0, 80));
     }
   }
+  out.statuses = statuses;
+  out.status = statuses.join("; ").slice(0, 160);
   return out;
 })()`;
 
@@ -199,7 +277,8 @@ export async function readSignatureRequestStep(page: unknown): Promise<Signature
   if (!p || typeof p.evaluate !== "function") return null;
   await p.evaluate(PORTAL_SAFETY_IN_PAGE_SOURCE).catch(() => null);
   const read = (await p.evaluate(READ_IN_PAGE).catch(() => null)) as SignatureStepRead | null;
-  return read && Array.isArray(read.request) && read.request.length ? read : null;
+  if (!read || !Array.isArray(read.request)) return null;
+  return read.request.length || (read.eSign && read.signAndUpload) ? read : null;
 }
 
 const selectorFor = (c: SignatureStepControl): RecipeSelector => {
@@ -235,7 +314,7 @@ export async function stageSignatureRequestStep(page: unknown, first: SignatureS
   for (const c of read.consents) {
     if (c.checked) continue;
     const short = scrub(squash(c.text)).slice(0, 80);
-    if (!c.required) continue; // optional (a production meter, aggregation): a person's choice
+    if (!consentMustBeTicked(c)) continue; // optional (a production meter, aggregation): a person's choice
     if (c.money) { consentsLeft.push(`"${short}" speaks of a charge or fee — a person decides it`); continue; }
     const loc = at(c.i);
     const ok = await loc.check({ timeout: 5000 }).then(() => true)
@@ -316,13 +395,19 @@ export async function stageSignatureRequestStep(page: unknown, first: SignatureS
 
   // 4) THE STOP, recorded as such: never a click, never final, never replayed.
   const requestCtl = read.request[0];
+  if (!requestCtl) {
+    // eSign chosen (or not choosable) and still no Request Signatures control: a person continues.
+    return { consentTexts, consentsTicked, consentsLeft, signatureType, preview, statusBefore, statusAfter, state: "awaiting_signature_request",
+      why: "the signature step offers no Request Signatures control after eSign was chosen: a person continues from here",
+      approvedBy: opts.approval?.approver ?? null, refusals: opts.approval ? ["the page offers no Request Signatures control"] : [], requestClicked: false };
+  }
   const stopStep: RecipeStep = {
     action: "stopForReview", phase: "review", selector: selectorFor(requestCtl), isFinalSubmit: false, outwardAction: "request_signatures",
     note: `${requestCtl.label}: emails the homeowner a DocuSign request — not the filing; never replayed; clicked only in a run a named person approved`,
   };
   opts.steps.push(stopStep);
   const base = { consentTexts, consentsTicked, consentsLeft, signatureType, preview, statusBefore };
-  const consentsComplete = read.consents.every((c) => !c.required || c.checked);
+  const consentsComplete = read.consents.every((c) => !consentMustBeTicked(c) || c.checked);
 
   if (already || signatureStatusSaysRequested(statusAfter)) {
     return { ...base, statusAfter, state: "awaiting_customer_signature", why: `the signature status already reads "${statusAfter || statusBefore}": the request went before this run, so nothing was clicked`, approvedBy: opts.approval?.approver ?? null, refusals: opts.approval ? ["the signature request was already sent"] : [], requestClicked: false };
@@ -332,7 +417,7 @@ export async function stageSignatureRequestStep(page: unknown, first: SignatureS
   }
   const refusals = signatureRequestRefusals({
     runApproval: opts.approval, runId: opts.runId,
-    page: { requestControls: read.request.length, previewed, signatureType, consentsComplete, status: statusAfter },
+    page: { requestControls: read.request.length, previewed, signatureType, consentsComplete, status: statusAfter, statuses: (read.statuses ?? []).map((x) => scrub(x)) },
   });
   if (refusals.length) {
     ev({ type: "signature_request_refused", reasons: refusals });

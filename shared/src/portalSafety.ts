@@ -387,10 +387,19 @@ export function portalSafetyFactory() {
   // A SIGNATURE REQUEST (#308): PowerClerk's "Request Signatures" sends a DocuSign email to the
   // homeowner. It files nothing, so it is not the final submit (rule 1 and its gate are not about
   // it), but it is an outward action: no recorder captures it, no replay clicks it, and the learner
-  // clicks it only in a run a named person approved (shared/src/signatureRequestGate.ts). Word-
-  // bounded and verb-led, so a "Signature Request Status" heading or a "Requested By" column is not one.
-  const SIGNATURE_REQUEST = /^\s*(re-?)?(request|send|resend)\s+(an?\s+|the\s+|for\s+|to\s+)?(e-?\s*|docu)?(signatures?|signing|signers?|sign)\b/i;
-  const isSignatureRequestControl = (label: string | null | undefined): boolean => !!label && SIGNATURE_REQUEST.test(String(label).replace(/\s+/g, " "));
+  // clicks it only in a run a named person approved (shared/src/signatureRequestGate.ts). A request
+  // verb within four words before a sign word (or "Sign & Send", "Send Envelope"), so "Request Customer
+  // Signature" is one, while a "Signature Request Status" heading, a "Requested By" column, "Request
+  // Sign-off" and "Send Sign In Link" are not.
+  const SIGNATURE_REQUEST = /(?:^|[^\w])(?:re-?)?(?:request|send|e-?mail|forward|get|collect|start|initiate|invite|notify|route|submit)\b(?:\s+[\w'.&:-]+){0,4}?\s+(?:e-?\s*|docu)?(?:signatures?|signing(?![\s-]*officer)|signers?|sign(?![\s-]*(?:off|in|on|up|out)\b)(?![\s-]*permit))\b|sign\s*(?:&|and)\s*send\b|^\s*(?:e-?\s*sign(?:ature)?|docusign|signatures?)\s+requests?\s*$|\b(?:send|start|initiate|open)\s+(?:the\s+|a\s+)?(?:docusign|envelope)\b/i;
+  // "Submit and Sign" / "Submit & eSign" is the applicant signing AND FILING: the final submit,
+  // decided by rule 1's gate, never a signature request ("Submit for Signature" still is one).
+  const SUBMIT_AND_SIGN = /\bsubmit\s*(?:and|&|\+)\s*(?:e-?\s*)?sign\b/i;
+  const isSignatureRequestControl = (label: string | null | undefined): boolean => {
+    if (!label) return false;
+    const t = String(label).replace(/\s+/g, " ");
+    return SIGNATURE_REQUEST.test(t) && !SUBMIT_AND_SIGN.test(t);
+  };
 
   /** How a capture surface (human recorder, human patch) must treat a click on this control. */
   const classifyRecordedClick = (label: string | null | undefined, ctx?: ControlContext | null): RecordedClickClass => {
