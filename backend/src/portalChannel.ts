@@ -190,15 +190,34 @@ export function seedOutcomeToStageResult(seed: {
   // Path of the learn run's debug bundle — threaded into portal_runs.logs_path so a failed
   // stage links straight to its forensic artifacts (screenshots, trace, LLM call log).
   debugDir?: string | null;
+  // The walk ended at the signature-request step (#308). Its state is the run's REVIEW STATE
+  // (result_json.reviewState: "awaiting_signature_request", or "awaiting_customer_signature" after an
+  // approved run's request), read by the track card. Never a filing: finalSubmitClicked stays false.
+  signatureStep?: { state: string } | null;
+  // A RESUME read the homeowner's signature (#310). Signed: the run's review state is
+  // "awaiting_human_submit" when the walk stopped in front of step 5's Submit (staged, with the
+  // submit recorded), else "ready_to_submit". Not signed, or unreadable: "awaiting_customer_signature".
+  // Never requested: the signature step was staged again, and its own state (above) is the run's.
+  signatureCheck?: { state: string } | null;
+  finalSubmitRecorded?: boolean;
 }): Record<string, unknown> {
   const debugDir = seed.debugDir ?? null;
+  const chk = seed.signatureCheck ?? null;
+  const resumeState = !chk || seed.signatureStep ? ""
+    : chk.state === "signed" ? ((seed.status === "trusted" || seed.status === "draft") && seed.finalSubmitRecorded === true ? "awaiting_human_submit" : "ready_to_submit")
+      : chk.state === "awaiting_customer_signature" ? "awaiting_customer_signature" : "";
+  const sig = {
+    ...(seed.signatureStep ? { reviewState: seed.signatureStep.state, signatureStep: seed.signatureStep } : {}),
+    ...(chk ? { signatureCheck: chk } : {}),
+    ...(resumeState ? { reviewState: resumeState } : {}),
+  };
   if (seed.status === "paused") {
-    return { ok: false, finalSubmitClicked: false, pauseReason: seed.pauseReason, message: seed.message, steps: [], debugDir };
+    return { ok: false, finalSubmitClicked: false, pauseReason: seed.pauseReason, message: seed.message, steps: [], debugDir, ...sig };
   }
   if (seed.status === "failed") {
-    return { ok: false, finalSubmitClicked: false, pauseReason: null, message: seed.message, steps: [{ ok: false, message: seed.message }], debugDir };
+    return { ok: false, finalSubmitClicked: false, pauseReason: null, message: seed.message, steps: [{ ok: false, message: seed.message }], debugDir, ...sig };
   }
-  return { ok: true, finalSubmitClicked: false, pauseReason: null, message: seed.message, steps: [], debugDir };
+  return { ok: true, finalSubmitClicked: false, pauseReason: null, message: seed.message, steps: [], debugDir, ...sig };
 }
 
 

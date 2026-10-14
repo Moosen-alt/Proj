@@ -384,10 +384,27 @@ export function portalSafetyFactory() {
   const ACCEPT_TERMS = /\b(i\s+)?(agree|accept|certify|acknowledge|attest|consent)\b|terms\s+(and|&)\s+conditions|under\s+penalt/i;
   const isAcceptTermsLabel = (label: string | null | undefined): boolean => !!label && ACCEPT_TERMS.test(String(label));
 
+  // A SIGNATURE REQUEST (#308): PowerClerk's "Request Signatures" sends a DocuSign email to the
+  // homeowner. It files nothing, so it is not the final submit (rule 1 and its gate are not about
+  // it), but it is an outward action: no recorder captures it, no replay clicks it, and the learner
+  // clicks it only in a run a named person approved (shared/src/signatureRequestGate.ts). A request
+  // verb within four words before a sign word (or "Sign & Send", "Send Envelope"), so "Request Customer
+  // Signature" is one, while a "Signature Request Status" heading, a "Requested By" column, "Request
+  // Sign-off" and "Send Sign In Link" are not.
+  const SIGNATURE_REQUEST = /(?:^|[^\w])(?:re-?)?(?:request|send|e-?mail|forward|get|collect|start|initiate|invite|notify|route|submit)\b(?:\s+[\w'.&:-]+){0,4}?\s+(?:e-?\s*|docu)?(?:signatures?|signing(?![\s-]*officer)|signers?|sign(?![\s-]*(?:off|in|on|up|out)\b)(?![\s-]*permit))\b|sign\s*(?:&|and)\s*send\b|^\s*(?:e-?\s*sign(?:ature)?|docusign|signatures?)\s+requests?\s*$|\b(?:send|start|initiate|open)\s+(?:the\s+|a\s+)?(?:docusign|envelope)\b/i;
+  // "Submit and Sign" / "Submit & eSign" is the applicant signing AND FILING: the final submit,
+  // decided by rule 1's gate, never a signature request ("Submit for Signature" still is one).
+  const SUBMIT_AND_SIGN = /\bsubmit\s*(?:and|&|\+)\s*(?:e-?\s*)?sign\b/i;
+  const isSignatureRequestControl = (label: string | null | undefined): boolean => {
+    if (!label) return false;
+    const t = String(label).replace(/\s+/g, " ");
+    return SIGNATURE_REQUEST.test(t) && !SUBMIT_AND_SIGN.test(t);
+  };
+
   /** How a capture surface (human recorder, human patch) must treat a click on this control. */
   const classifyRecordedClick = (label: string | null | undefined, ctx?: ControlContext | null): RecordedClickClass => {
     if (isFinalSubmitControl(label, ctx)) return "finalSubmit";
-    if (isSubmitIntent(label, ctx) || isPayFee(label)) return "blocked";
+    if (isSubmitIntent(label, ctx) || isPayFee(label) || isSignatureRequestControl(label)) return "blocked";
     return "capture";
   };
 
@@ -1649,6 +1666,7 @@ export function portalSafetyFactory() {
     paymentDialogVerdict,
     isPayNowDialogText,
     isFinalSubmitControl,
+    isSignatureRequestControl,
     classifyRecordedClick,
     isSecretField,
     isPaymentField,
@@ -1688,6 +1706,7 @@ export const isPaymentWordedText = impl.isPaymentWordedText;
 export const paymentDialogVerdict = impl.paymentDialogVerdict;
 export const isPayNowDialogText = impl.isPayNowDialogText;
 export const isFinalSubmitControl = impl.isFinalSubmitControl;
+export const isSignatureRequestControl = impl.isSignatureRequestControl;
 export const classifyRecordedClick = impl.classifyRecordedClick;
 export const isSecretField = impl.isSecretField;
 export const isPaymentField = impl.isPaymentField;

@@ -900,6 +900,7 @@ export type NextStepKey =
   | "gap_fill_missing"
   | "resubmit_awaiting_me"
   | "staged_awaiting_submit"
+  | "awaiting_signature"
   | "approved_awaiting_filing"
   | "fee_due"
   | "correction_open"
@@ -1150,6 +1151,14 @@ export interface SubmittalTrack {
   /** No recipe of its own: the recipe this project's LAST run of this track borrowed (another entity's,
    *  same portal — portalRecipes.findBorrowableRecipe), read from that run's result. null = none used. */
   borrowedRecipe?: { recipeId: string; recipeVersion: number | null; learnedFor: string; recordType: string; portalHost: string; lastUsedAt: string } | null;
+  /** NEM only (#308, #310): where the track stands between the signature request and the filing
+   *  (backend signatureTrack.nemSignatureState) — "awaiting_signature_request" (stopped in front of
+   *  Request Signatures: a person clicks it, or approves a run that does), "signature_request_unconfirmed"
+   *  (an approved click the status did not confirm), "awaiting_customer_signature" (the request went:
+   *  an approved click, or a person confirmed it, `by`), "ready_to_submit" (a resume read every
+   *  signature status as signed) or "awaiting_human_submit" (signed, and step 5 staged up to its
+   *  Submit). `why` is what the deciding run read. null = not at that part of the flow, or filed. */
+  signatureRequest?: { state: string; at: string; by?: string; why?: string } | null;
   /** PERMIT tracks only: the agency that issues this track's permit and where that answer came from
    *  (permitProcess.trackIssuer) — every portal/recipe answer on this card is that agency's. */
   issuer?: TrackIssuerAnswer;
@@ -3920,6 +3929,11 @@ export interface RecipeStep {
    *  flagged; they are always blocked regardless. Without this flag, autoSubmit
    *  safely stops at the review screen and never clicks final submit. */
   isFinalSubmit?: boolean;
+  /** An OUTWARD action the step stands in front of, never replayed (#308): "request_signatures" is
+   *  PowerClerk's Request Signatures, which emails the homeowner a DocuSign request. Recorded on a
+   *  stopForReview marker, never on a click, and never isFinalSubmit (it files nothing). Only the
+   *  learner clicks it, and only in a run a named person approved (shared/src/signatureRequestGate.ts). */
+  outwardAction?: "request_signatures";
   note?: string;
   /** A SPLIT e-signature box (portalSafety signatureNamePartOf: "First name" / "Last name" under a
    *  signing statement): the step types that part of the client's authorized signer

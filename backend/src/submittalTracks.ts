@@ -37,6 +37,7 @@ import { nowIso } from "./time";
 import { hasMpuScope } from "./serviceScope";
 import { essPermitStep, type EssPermitStep } from "./essRequirements";
 import { randomUUID } from "node:crypto";
+import { nemSignatureState, type NemSignatureView } from "./signatureTrack";
 
 /** Words that claim the statewide portal ("Oregon ePermitting", "OR E-permitting") with no URL —
  *  on a learned row, often the generic fallback's own words laundered in (portal-truth D2/D4). */
@@ -644,6 +645,23 @@ function statusLabelFor(status: SubmittalTrackStatus, category: "utility" | "per
   return permitLabels[status];
 }
 
+// The NEM card between the signature request and the filing (#310): what it reads and what is next.
+// None of these says "submitted": the application is an unsubmitted draft until step 5's Submit.
+const SIGNATURE_STATUS_LABEL: Record<string, string> = {
+  awaiting_signature_request: "Staged — awaiting signature request",
+  signature_request_unconfirmed: "Signature request unconfirmed",
+  awaiting_customer_signature: "Awaiting customer signature",
+  ready_to_submit: "Signed — ready to submit",
+  awaiting_human_submit: "Signed — staged, awaiting manual submit",
+};
+const SIGNATURE_NEXT_ACTION: Record<string, string> = {
+  awaiting_signature_request: "Click Request Signatures on the portal (it emails the homeowner a DocuSign request), then confirm it here with \"I sent the signature request\" — or approve a run that clicks it. Nothing is submitted yet.",
+  signature_request_unconfirmed: "A Request Signatures click was not confirmed by the portal: check the portal's signature status before anyone clicks it again, then confirm it here if the request went.",
+  awaiting_customer_signature: "Waiting on the homeowner's DocuSign signature. Once they have signed, press \"Check signature now\": the bot reopens the draft, reads the signature status, and only if it reads signed stages step 5 up to its Submit. Not submitted yet.",
+  ready_to_submit: "The homeowner has signed. Stage again to reach step 5's Submit (the last run did not get there); the application is not submitted yet.",
+  awaiting_human_submit: "The homeowner has signed and step 5 is staged up to its Submit: verify it, click Submit on the portal, then record the number below.",
+};
+
 function nextActionFor(status: SubmittalTrackStatus, channel: string, type: SubmittalTrackType, prerequisites: PermitPrerequisiteStep[] = [], issuerName = ""): string {
   const base = nextActionCore(status, channel, type, issuerName);
   // A PREREQUISITE OFFICE IS ITS OWN STEP, BEFORE this filing (Waltham: "ALL Plans need to go to
@@ -770,6 +788,22 @@ export function getSubmittalTracks(db: AppDb, project: ProjectRecord): Submittal
     }
     if (!recipeRow && !borrowedRecipe) recipeRow = cardRecipe(findAnyRecipeForProject(db, resolverInput));
 
+    // WHERE THE NEM TRACK STANDS BETWEEN THE SIGNATURE REQUEST AND THE FILING (#308, #310): the card
+    // offers "Approve & request signatures" (and "I sent the signature request") only in front of
+    // Request Signatures, and "Check signature now" while the homeowner's signature is awaited. One
+    // derivation (signatureTrack.nemSignatureState), shared with the stage that resumes.
+    let signatureRequest: SubmittalTrackView["signatureRequest"] = null;
+    let signature: NemSignatureView | null = null;
+    if (type === "nem") {
+      signature = nemSignatureState(db, project.id);
+      if (signature && signature.state !== "submitted") {
+        signatureRequest = { state: signature.state, at: signature.at, ...(signature.by ? { by: signature.by } : {}), ...(signature.why ? { why: signature.why } : {}) };
+      }
+    }
+    // NOTHING READS AS FILED BEFORE THE FINAL SUBMIT: while the track is at the signature part of the
+    // flow (not filed, nothing past staged), the card's status and next action say where it waits.
+    const signatureHolds = Boolean(signatureRequest) && (status === "staged" || status === "not_started");
+
     // Fallback portal URL when no recipe exists yet — used by the credential-matching
     // chip so the operator can store a login before recording. Try in order:
     // 1. KB profile (user-accumulated knowledge from previous projects)
@@ -810,9 +844,13 @@ export function getSubmittalTracks(db: AppDb, project: ProjectRecord): Submittal
       status,
       // The portal's own words — unless they say "issued" of a track isTrackDone did not accept
       // (one pooled target cannot finish two tracks), where they would contradict the status.
-      statusLabel: (!state.done && (state.outcome === "issued" || state.outcome === "nem_approved") ? "" : state.statusLabel)
-        || statusLabelFor(status, category),
-      nextAction: nextActionFor(status, channel, type, prerequisites, issuerProject.trackView ? issuerProject.ahj : ""),
+      statusLabel: signatureHolds && signatureRequest
+        ? SIGNATURE_STATUS_LABEL[signatureRequest.state] ?? statusLabelFor(status, category)
+        : (!state.done && (state.outcome === "issued" || state.outcome === "nem_approved") ? "" : state.statusLabel)
+          || statusLabelFor(status, category),
+      nextAction: signatureHolds && signatureRequest && SIGNATURE_NEXT_ACTION[signatureRequest.state]
+        ? SIGNATURE_NEXT_ACTION[signatureRequest.state]
+        : nextActionFor(status, channel, type, prerequisites, issuerProject.trackView ? issuerProject.ahj : ""),
       captureFields: captureFieldsFor(type),
       applicationNumber: state.applicationNumber,
       permitNumber: state.permitNumber,
@@ -827,6 +865,7 @@ export function getSubmittalTracks(db: AppDb, project: ProjectRecord): Submittal
       recipeId: recipeRow ? s(recipeRow.id) : undefined,
       recipeScopeType: scopeType,
       borrowedRecipe,
+      ...(type === "nem" ? { signatureRequest } : {}),
       ...(issuer ? { issuer } : {}),
     };
   });

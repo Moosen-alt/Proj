@@ -97,6 +97,10 @@ import { readAndRecordPortalFees } from "./portalFeeReadings";
 import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential } from "./portalCredentials";
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
 import { logger } from "./logger";
+import { draftContinuationGaps, openPortalDraftFor, recordPortalDraft, type ObservedDraft } from "./portalDraft";
+import { claimSignatureRequestApproval, runningJobSignatureRequestApprovalId } from "./signatureRequestApproval";
+import { nemSignatureState, nemStageIsResume } from "./signatureTrack";
+import { siteKey } from "../../portal-bot/src/draftCreated";
 import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, type HostFit, type PortalUrlSource } from "./portalChannel";
 import { isPortalPaused } from "./portalPause";
 // The ONE creator of permit_check_targets rows (extracted from markTrackSubmitted).
@@ -1377,6 +1381,8 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     db.run("DELETE FROM portal_runs WHERE project_id = ?", [projectId]);
     // Approve & Submit approvals (migration v35) carry a FK to projects.
     db.run("DELETE FROM portal_run_approvals WHERE project_id = ?", [projectId]);
+    // Approve & request signatures approvals (migration v48, #308) carry the same FK.
+    db.run("DELETE FROM portal_signature_request_approvals WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM submissions WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM human_review_items WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM corrections WHERE project_id = ?", [projectId]);
@@ -8288,6 +8294,9 @@ export async function prepareSubmission(
   /** The approval THIS request minted (Approve & Submit). Omitted by the job handler: the running
    *  job's payload carries it. With neither, the run claims nothing and stops at review. */
   approvalId?: string | null,
+  /** The signature-request approval THIS request minted (Approve & request signatures, #308).
+   *  Omitted by the job handler: the running job's payload carries it. */
+  signatureRequestApprovalId?: string | null,
 ): Promise<ProjectDetail> {
   const detail = getProjectDetail(db, projectId);
   // A FINAL SUBMIT WAS ASKED FOR: take the named approval the Approve & Submit action recorded for
@@ -8312,7 +8321,26 @@ export async function prepareSubmission(
       reason: "no live approval by that id for this project and track — the run stops at review",
     });
   }
-  const runId = claimedApproval?.id ?? id();
+  // A SIGNATURE REQUEST WAS APPROVED (#308: PSE PowerClerk's Request Signatures, a DocuSign email to
+  // the homeowner). The same discipline as the final-submit approval above, in its own table: claimed
+  // by id, here, before the first gate, so a refused run has spent it; its id becomes the run's id.
+  // NEM only. It authorises nothing about the filing: the final submit's own gate is unchanged.
+  const signatureApprovalWanted = (signatureRequestApprovalId ?? runningJobSignatureRequestApprovalId(db, projectId)) || null;
+  const claimedSignatureApproval = signatureApprovalWanted && !claimedApproval
+    ? claimSignatureRequestApproval(db, projectId, track ?? "", signatureApprovalWanted)
+    : null;
+  if (claimedSignatureApproval) {
+    addAuditLog(db, projectId, "system", "signature request gate", "portal.signature_request_approval_claimed", {
+      approvalId: claimedSignatureApproval.id, approvedBy: claimedSignatureApproval.approver, track: track ?? null,
+    });
+  } else if (signatureApprovalWanted) {
+    addAuditLog(db, projectId, "system", "signature request gate", "portal.signature_request_approval_missing", {
+      track: track ?? null, approvalId: signatureApprovalWanted,
+      reason: claimedApproval ? "a final-submit approval drives this run; a run carries one approval" : "no live approval by that id for this project and track — the run stops in front of Request Signatures",
+    });
+  }
+  const runId = claimedApproval?.id ?? claimedSignatureApproval?.id ?? id();
+  const signatureRequestApproval = claimedSignatureApproval ? { approver: claimedSignatureApproval.approver, runId } : null;
   // AN OPERATOR'S HOLD STOPS STAGING — first, before anything is billed, built or opened.
   const hold = operatorHoldReason(db, projectId);
   if (hold !== null) {
@@ -8853,13 +8881,26 @@ export async function prepareSubmission(
   // The hand-coded adapters' delegated submit (allowFinalSubmit) answers to the same function, so
   // with no recipe it is refused: the ruling requires a valid recipe shape for any click.
   const runApproval = claimedApproval ? { approver: claimedApproval.approver, runId } : null;
+  // THIS PROJECT HAS A DRAFT ON THE PORTAL ALREADY (#302): a two-part portal's Part 1 Submit made
+  // it, and replaying the recipe would start the application again — a second number for the same
+  // house. The learner opens that draft's next form instead (AutoLearnAdapter continueDraft), or the
+  // run stops before a browser opens (below). Either way THE RECIPE ON FILE DOES NOT DRIVE THIS RUN.
+  const nemDraft = track === "nem" ? openPortalDraftFor(db, projectId, "nem") : null;
+  // THE GATE JUDGES THE RECIPE THAT RUNS (#310). A run that continues a draft replays no recipe:
+  // the click it could reach is Part 2's own Submit, which no recipe recorded. The NEM recipe on
+  // file was recorded through Part 1, and its flagged terminal click is Part 1's Submit (the one
+  // that only made the draft, #302) — counting that as "the recipe's single terminal isFinalSubmit"
+  // would let an approval reach a Submit the recipe never named. So the gate is asked with no
+  // recipe, unchanged, and refuses: the resumed run stops in front of step 5's Submit for a person.
+  const gateRecipeId = nemDraft ? null : (recipe?.id ?? null);
   const submitRefusals = wantsFinalSubmit
-    ? automaticSubmitRefusals(db, { recipeId: recipe?.id ?? null, runApproval, runId, borrowedFrom: borrowed?.learnedFor ?? null, relaxedSinceApproval })
+    ? automaticSubmitRefusals(db, { recipeId: gateRecipeId, runApproval, runId, borrowedFrom: borrowed?.learnedFor ?? null, relaxedSinceApproval })
     : [];
   const resolvedAutoSubmit = wantsFinalSubmit && submitRefusals.length === 0;
   if (wantsFinalSubmit && !resolvedAutoSubmit) {
     addAuditLog(db, projectId, "system", "submit gate", "portal.auto_submit_declined", {
       track: track ?? "permit", runId, approvedBy: runApproval?.approver ?? null, reasons: submitRefusals,
+      ...(nemDraft ? { continuesDraft: nemDraft.applicationNumber || "(number not recorded)", recipeOnFile: recipe?.id ?? null } : {}),
     });
   } else if (resolvedAutoSubmit) {
     addAuditLog(db, projectId, "system", "submit gate", "portal.auto_submit_allowed", {
@@ -8906,6 +8947,18 @@ export async function prepareSubmission(
     } catch { /* no planner available — stage with hand-coded/recipe fills only */ }
   }
 
+  // ANOTHER PROJECT OF THIS CLIENT ON THE SAME STREET LINE (#302): the portal's list row for a draft
+  // may name no city or ZIP, and then "1234 Main St" could be either house. Known here, decided there
+  // (draftCreated.ts findSiteDraft): with a sibling, such a row is never claimed.
+  const streetLineKey = (addr: string): string => { const k = siteKey({ street: addr }); return k ? `${k.house} ${k.words.join(" ")}` : ""; };
+  const ownStreetLine = track === "nem" ? streetLineKey(portalProject.projectAddress) : "";
+  const siblingAtSameStreet = Boolean(ownStreetLine) && db.query<Row>(
+    "SELECT project_address FROM projects WHERE client_id = ? AND id != ?", [portalProject.clientId ?? "", projectId],
+  ).some((r) => streetLineKey(text(r.project_address)) === ownStreetLine);
+  const siteDraftParts = track === "nem"
+    ? { street: portalProject.projectAddress, city: portalProject.city, zip: portalProject.zip, siblingAtSameStreet }
+    : undefined;
+
   const stageOptions = {
     beforeUpload: uploadDocumentGuard(db, projectId, track !== "nem"),
     encryptedStorageStatePath: portalProfile?.encrypted_storage_state ?? undefined,
@@ -8941,8 +8994,18 @@ export async function prepareSubmission(
     // WRITTEN ONLY WHEN THE READ IS CONFIDENT. Every downstream check keys on this value,
     // so a low-confidence read is recorded as a NOTE for the operator to confirm rather
     // than written as fact — the manual capture form keeps working exactly as it does now.
-    onSubmitCaptured: (capture: { recordNumber: string; confidence: string; reason: string; recordLink: string }) => {
+    onSubmitCaptured: (capture: { recordNumber: string; confidence: string; reason: string; recordLink: string; draftCreated?: ObservedDraft }) => {
       try {
+        // THE CLICK ONLY MADE A DRAFT (#302: PSE's Part 1 Submit). Nothing was filed: no submission,
+        // no record number. The draft is written down for the next stage to continue, and the
+        // replayed recipe's final-submit flag comes off the step that made it (portalDraft.ts).
+        if (capture.draftCreated) {
+          const healed = recordPortalDraft(db, { projectId, track: track ?? "permit", draft: capture.draftCreated, runId, recipeId: recipe?.id ?? null, source: "replay" });
+          logger.info("submit-capture", "the submit created a draft, not a filing — recorded for the next stage", {
+            project: projectId, track, healed: healed.healed, why: healed.why,
+          });
+          return;
+        }
         if (capture.confidence === "high" && capture.recordNumber) {
           // runId is minted above, before staging, and the row exists by the time a human
           // gets round to clicking submit — this fires from the left-open window, minutes
@@ -8977,6 +9040,8 @@ export async function prepareSubmission(
     // AND PacifiCorp on different subdomains) log in to the RIGHT portal instead of a
     // hardcoded default. Already permit/utility scoped by the credentialUrl resolution.
     loginUrl: credentialUrl || undefined,
+    // The replay's existing-draft check (#302): NEM only — the two-part utility portals.
+    siteDraft: siteDraftParts,
   };
 
   // UNIVERSAL-FIRST dispatch with SELF-SEED (see selectStagingActor):
@@ -9041,7 +9106,11 @@ export async function prepareSubmission(
     simulationEnabled: process.env.MOCK_PORTAL === "1",
     portalPaused,
   });
-  const runActorLabel = channelDecision.adapterLabel;
+  // THE DRAFT ON RECORD (nemDraft, above) is continued by the learner, only where the replay would
+  // otherwise run; every other decision stands as it was.
+  const runActorLabel = nemDraft && autoSeedEnabled && channelDecision.adapterLabel === "RecipeAdapter"
+    ? "AutoLearnAdapter"
+    : channelDecision.adapterLabel;
   // Now that the actor is known, name a real-but-profile-less portal by its track identity so the
   // status/audit text below doesn't read "Mock portal" for a run that actually drives a browser.
   if (!isRealPortal && runActorLabel !== "MockPortalAdapter") {
@@ -9182,6 +9251,14 @@ export async function prepareSubmission(
       // Kill-switch tripped: surface a manual handoff and drive NO automation.
       const msg = `${portalLabel} is paused (legal kill-switch). ${channelDecision.reason} Submit this application by hand and resume the portal once it's cleared.`;
       result = { ok: false, finalSubmitClicked: false, pauseReason: "portal_paused", message: msg, steps: [{ ok: false, message: msg }] };
+    } else if (nemDraft && (runActorLabel === "RecipeAdapter" || runActorLabel === "PowerClerkAdapter" || runActorLabel === "OregonEPermittingAdapter")) {
+      // THE DRAFT CAN ONLY BE CONTINUED BY THE LEARNER (#302). With PORTAL_AUTOSEED off, or a hand-coded
+      // adapter picked for this portal, this run would start the application again — a second number
+      // for the same house — so it stops before a browser opens, and says what unblocks it.
+      const why = autoSeedEnabled ? `${runActorLabel} is the actor for this portal` : "PORTAL_AUTOSEED is off on this server";
+      const msg = `Staging stopped before opening the portal: this project already has a draft on the utility portal${nemDraft.applicationNumber ? ` (${nemDraft.applicationNumber})` : ""}, and continuing it needs the learner, which this run cannot use (${why}). Starting the application again would create a second one. Turn the learner on and stage again, or complete the draft in the portal by hand and record the filing.`;
+      addAuditLog(db, projectId, "system", "submit gate", "portal.draft_continuation_unavailable", { track: "nem", actor: runActorLabel, autoSeedEnabled, applicationNumber: nemDraft.applicationNumber });
+      result = { ok: false, finalSubmitClicked: false, pauseReason: null, message: msg, steps: [{ ok: false, message: msg }] };
     } else if (recipe && runActorLabel === "RecipeAdapter" && recipeTrackConflict) {
       // TRACK/HOST GATE for the REPLAY path, BOTH WAYS: a pre-fix learn mis-keyed by the KB
       // poisoning bug can leave an AHJ-scoped COMPLETE recipe whose steps drive the utility NEM
@@ -9332,7 +9409,17 @@ export async function prepareSubmission(
       // → keep. Nothing attributable → keep AND flag for a human. A paused run (MFA/CAPTCHA
       // wall) is not a failure of anything and never reaches here.
       // Only a replay that FAILED (not a pause) is judged. A paused run stopped at a challenge.
-      const replayFailed = result && result.ok === false && !(typeof result.pauseReason === "string" && result.pauseReason);
+      // THE ADDRESS ALREADY HAD A DRAFT ON THE PORTAL (#302): the replay stopped before its first
+      // step, so nothing was started and nothing in the recipe failed. One found draft is written
+      // down — the next stage opens it (openPortalDraftFor) instead of replaying the start again.
+      const existingDraft = (result as { existingDraft?: { applicationNumber?: string; why?: string; ambiguous?: boolean } }).existingDraft ?? null;
+      if (existingDraft && track === "nem" && existingDraft.applicationNumber && !existingDraft.ambiguous) {
+        recordPortalDraft(db, {
+          projectId, track: "nem", runId, recipeId: null, source: "replay",
+          draft: { applicationNumber: existingDraft.applicationNumber, nextForm: "", evidence: String(existingDraft.why ?? ""), strength: "status" },
+        });
+      }
+      const replayFailed = result && result.ok === false && !(typeof result.pauseReason === "string" && result.pauseReason) && !existingDraft;
       // THE PORTAL SAID THIS ADDRESS IS NOT SERVED THERE (portal-truth D5). The replay stopped with
       // the portal's own words; nothing filed here is kept for this entity on that host: its own
       // recipe is refused (flagged, demoted — never replayed again until a person clears it); on a
@@ -9451,6 +9538,14 @@ export async function prepareSubmission(
           : `Staging stopped before opening a browser: ${credentialUrl} — ${learnFit.reason}.`;
         addAuditLog(db, projectId, "system", "submit gate", trackHostConflict ? "portal.track_host_conflict" : "portal.entity_host_conflict", { track: track ?? "permit", url: credentialUrl, code: learnFit.code });
         result = { ok: false, finalSubmitClicked: false, pauseReason: null, message: msg, steps: [{ ok: false, message: msg }] };
+      } else if (nemDraft && draftContinuationGaps(stagedProject).length) {
+        // PART 2 STEP 1 ASKS FOR THE ACCOUNT, THE METER, THE NAME ON THE BILL AND THE SERVICE
+        // ADDRESS (#302) — the "Validated Information" PSE checks against its records. Stopped here,
+        // named, before a browser opens: a draft continued without them cannot be submitted.
+        const gaps = draftContinuationGaps(stagedProject);
+        const msg = `Staging stopped before opening the portal: this project's draft${nemDraft.applicationNumber ? ` ${nemDraft.applicationNumber}` : ""} continues with the customer information the utility validates, and the project is missing ${gaps.join(", ")}. Add ${gaps.length > 1 ? "them" : "it"} to the project (from the customer's bill), then stage again. Nothing was opened.`;
+        addAuditLog(db, projectId, "system", "submit gate", "portal.draft_continuation_missing", { track: "nem", missing: gaps });
+        result = { ok: false, finalSubmitClicked: false, pauseReason: null, message: msg, steps: [{ ok: false, message: msg }] };
       } else {
         try {
           const { autoLearnPortal } = await import("./autoLearn");
@@ -9479,6 +9574,19 @@ export async function prepareSubmission(
             // Match the hand-coded/replay adapters' headed setting so the self-seed opens a visible
             // browser locally and leaves it open at review for the human (headless on a server).
             headless: stageOptions.headless,
+            // THIS PROJECT'S EXISTING DRAFT (#302): a recorded one is opened and never re-started; with
+            // none recorded, the walk still looks for an unsubmitted draft listed for this street.
+            // A TRACK THAT WAITS ON THE HOMEOWNER'S SIGNATURE (#310) makes this stage a RESUME: the
+            // record's signature status is read before anything is opened, and only "signed" goes on.
+            continueDraft: siteDraftParts
+              ? {
+                ...siteDraftParts, applicationNumber: nemDraft?.applicationNumber || undefined, nextForm: nemDraft?.nextForm || undefined, required: Boolean(nemDraft),
+                ...(nemDraft && nemStageIsResume(nemSignatureState(db, projectId)) ? { awaitingSignature: true } : {}),
+              }
+              : undefined,
+            // THIS RUN'S SIGNATURE-REQUEST APPROVAL (#308), claimed above; the gate decides at the click.
+            signatureRequestApproval,
+            runId,
           });
           result = seedOutcomeToStageResult(seed);
           // Say WHY this stage learned instead of replaying, so a re-learn on an AHJ that

@@ -52,6 +52,7 @@ import { hostFitsTrackAndEntity, trackSafeUrl, type PortalUrlSource } from "./po
 import { getCodeProfile } from "./codeProfiles";
 import { certifiedNamesForMake } from "./cecEquipment";
 import { annotateDraft, buildDraftTouch, recordDraftTouch, type DraftTouch } from "./draftLedger";
+import { healDraftCreatingFinalSubmit, recordPortalDraft, type ObservedDraft } from "./portalDraft";
 import { draftReferenceFromUrl } from "../../portal-bot/src/adapters/submissionLedger";
 import { issuingAgencyFor, projectForTrack } from "./permitProcess";
 import { DECLARED_VALUATION_FIELD, rebindsToValuation } from "./valuation";
@@ -109,6 +110,11 @@ export interface AutoLearnResult {
   /** Path of this run's debug bundle (data/learn-runs/<runId>) — everything needed to
    *  troubleshoot the run. Download it zipped via GET /api/learn-runs/<runId>/bundle.zip. */
   debugDir: string | null;
+  /** The walk ended at the signature-request step (#308): what it staged, and whether Request
+   *  Signatures waits on a person or was clicked in an approved run. Carried onto the run row. */
+  signatureStep?: import("../../portal-bot/src/adapters/signatureRequestStep").SignatureStepOutcome;
+  /** A resume read the homeowner's signature (#310): signed, never requested, or still awaited. */
+  signatureCheck?: import("../../portal-bot/src/adapters/signatureStatusRead").SignatureCheck;
 }
 
 // Lines in the long design/plan-set texts that answer the portal's JUDGMENT questions.
@@ -897,6 +903,16 @@ export async function autoLearnPortal(
      *  a real result; without it, a caller that gives up simply loses sight of a run that
      *  keeps going. Omit for no cap (the default for operator-initiated learns). */
     budgetMs?: number;
+    /** THIS PROJECT'S EXISTING DRAFT (#302) — passed by the NEM stage. With `required` (a draft
+     *  is on record) the walk opens that draft's next form and never starts an application; with
+     *  a street only, it looks for an unsubmitted draft for the address first. A walk that
+     *  continued a draft saves no recipe: its steps start inside one house's record. */
+    continueDraft?: import("../../portal-bot/src/adapters/autoLearnAdapter").ContinueDraft;
+    /** A NAMED PERSON'S APPROVAL OF THIS RUN'S SIGNATURE REQUEST (#308), claimed by prepareSubmission
+     *  (signatureRequestApproval.ts), and the run id it names. Without it the walk stops in front of
+     *  Request Signatures; with it, signatureRequestGate still decides at the click. */
+    signatureRequestApproval?: import("../../shared/src/signatureRequestGate").SignatureRequestApproval | null;
+    runId?: string;
   },
 ): Promise<AutoLearnResult> {
   const projectRow = db.get<Record<string, unknown>>("SELECT * FROM projects WHERE id = ?", [projectId]);
@@ -1066,7 +1082,17 @@ async function autoLearnPortalInner(
   // until the stub id is known, then flush. When an existing verified-complete recipe
   // is being protected, no stub is created and the buffer is deliberately discarded —
   // human fixes on an unverified pass must not mutate the trusted recipe.
-  const humanPatch: { recipeId: string | null; buffer: RecipeStep[]; count: number; submitObserved: boolean } = { recipeId: null, buffer: [], count: 0, submitObserved: false };
+  const humanPatch: { recipeId: string | null; buffer: RecipeStep[]; count: number; submitObserved: boolean; draft: ObservedDraft | null } = { recipeId: null, buffer: [], count: 0, submitObserved: false, draft: null };
+  // THE OPERATOR'S SUBMIT ONLY MADE A DRAFT (#302). portal-bot withholds the submit signal (so the
+  // recording is NOT promoted on a click that filed nothing) and reports the draft here instead:
+  // written down for the next stage, and the recorded final-submit flag comes off that step — now,
+  // or when the recipe row lands (below), whichever is later.
+  const onDraftCreated = (draft: ObservedDraft): void => {
+    try {
+      humanPatch.draft = draft;
+      recordPortalDraft(db, { projectId, track: learnTrack ?? "permit", draft, recipeId: humanPatch.recipeId, source: "learn" });
+    } catch { /* recording the draft must never disturb the operator's window */ }
+  };
   // Promote the recording once the HUMAN clicks the portal's final Submit in the left-open
   // browser: their manual submit of the (corrected) fill is the strongest end-to-end
   // demonstration the recipe works, so the draft graduates to a replayable "complete" and
@@ -1298,6 +1324,10 @@ async function autoLearnPortalInner(
       },
       onProgress: input.onProgress,
       onHumanStep,
+      onDraftCreated,
+      continueDraft: input.continueDraft,
+      signatureRequestApproval: input.signatureRequestApproval ?? null,
+      runId: input.runId,
     });
   // WRITE IT DOWN BEFORE WE TOUCH THE PORTAL, NOT AFTER. This run is about to log into a
   // REAL account and start a REAL application; a run that dies mid-way has still created
@@ -1413,7 +1443,11 @@ async function autoLearnPortalInner(
     const withNotes = handoffNotes.length && !handoffNotes.every((n) => String(r.message ?? "").includes(n))
       ? { ...r, message: `${r.message} ${handoffNotes.join(" ")}` }
       : r;
-    const result: AutoLearnResult = { ...withNotes, debugDir };
+    // A walk that ended at the signature-request step (#308) says so on every result, recipe or not.
+    const sigStep = withNotes.signatureStep ?? (learn as { signatureStep?: AutoLearnResult["signatureStep"] } | undefined)?.signatureStep;
+    // ...and a resume that read the homeowner's signature (#310), likewise.
+    const sigCheck = withNotes.signatureCheck ?? (learn as { signatureCheck?: AutoLearnResult["signatureCheck"] } | undefined)?.signatureCheck;
+    const result: AutoLearnResult = { ...withNotes, debugDir, ...(sigStep ? { signatureStep: sigStep } : {}), ...(sigCheck ? { signatureCheck: sigCheck } : {}) };
     if (debugDir) {
       try {
         fs.writeFileSync(path.join(debugDir, "llm-calls.json"), JSON.stringify({
@@ -1526,6 +1560,71 @@ async function autoLearnPortalInner(
   // (no steps, flagged with the words), or its existing row on that host is flagged — never a
   // complete recipe on another host touched. The next stage then neither lends this host as a
   // draft nor takes the statewide fallback onto it (statewideEvidence reads the flag).
+  // A WALK THAT CONTINUED THIS PROJECT'S EXISTING DRAFT (#302) IS NOT A RECIPE. Its first clicks
+  // opened one house's record ("NEM-…", then its Part 2) — replayed for any other project they
+  // would open that house's application. Nothing is saved or reset; the staged form is the result.
+  if (learn.continuedDraft) {
+    const cd = learn.continuedDraft;
+    addAuditLog(db, projectId, "system", "auto-learn", "portal.draft_continued", {
+      scope: scopeType, applicationNumber: cd.applicationNumber, form: cd.form.slice(0, 90), reachedReview: learn.reachedReview === true,
+    });
+    const staged = learn.ok && learn.reachedReview === true;
+    // THE WALK ENDED AT THE SIGNATURE-REQUEST STEP (#308): the stop is in front of Request Signatures
+    // (or, in an approved run, after it), not in front of a submit. Audited either way: a click on it
+    // emailed a homeowner, and an approval the gate refused was spent.
+    const sig = learn.signatureStep;
+    if (sig) {
+      addAuditLog(db, projectId, sig.requestClicked ? "portal_bot" : "system", "signature request",
+        sig.requestClicked ? "portal.signatures_requested" : sig.refusals.length ? "portal.signature_request_refused" : "portal.signature_request_staged", {
+          state: sig.state, approvedBy: sig.approvedBy, runId: input.runId ?? null, refusals: sig.refusals,
+          consentsTicked: sig.consentsTicked, consentsLeft: sig.consentsLeft.length, signatureType: sig.signatureType,
+          preview: sig.preview.kind, statusBefore: sig.statusBefore, statusAfter: sig.statusAfter,
+        });
+    }
+    // A RESUME READ THE HOMEOWNER'S SIGNATURE (#310). Audited either way: "signed" is what lets a
+    // run reach step 5's Submit, and "still awaited" is what a person reads on the track card.
+    const chk = learn.signatureCheck;
+    if (chk) {
+      addAuditLog(db, projectId, "system", "signature check", "portal.signature_checked", {
+        state: chk.state, reading: chk.reading, where: chk.where, statuses: chk.statuses.slice(0, 6), why: chk.why.slice(0, 240),
+        runId: input.runId ?? null, reachedSubmit: staged && learn.finalSubmitRecorded === true,
+      });
+    }
+    const msg = chk && chk.state === "awaiting_customer_signature"
+      ? `Opened this project's existing draft ${cd.applicationNumber}: AWAITING CUSTOMER SIGNATURE — ${chk.why}. The run stopped on the ${chk.where === "record" ? "record page (no form was opened)" : "signature step (nothing on it was clicked)"}, and the application is NOT submitted. Check again once the homeowner has signed.`
+      : chk && chk.state === "signed"
+        ? (staged && learn.finalSubmitRecorded === true
+          ? `Opened this project's existing draft ${cd.applicationNumber}: the homeowner has SIGNED (${chk.why}). "${cd.form}" was staged to its final Submit and stopped there: the application is NOT submitted until that Submit is clicked. ${learn.message}`
+          : `Opened this project's existing draft ${cd.applicationNumber}: the homeowner has SIGNED (${chk.why}), but the walk did not reach the final Submit: ${learn.message}`)
+        : sig
+      ? (sig.state === "awaiting_signature_request"
+        ? `Opened this project's existing draft ${cd.applicationNumber} and staged "${cd.form}" through its signature step: AWAITING SIGNATURE REQUEST. Nothing was submitted and no signature request was sent. ${learn.message}`
+        : `Opened this project's existing draft ${cd.applicationNumber} and staged "${cd.form}" through its signature step: ${sig.state === "awaiting_customer_signature" ? "AWAITING CUSTOMER SIGNATURE" : "SIGNATURE REQUEST UNCONFIRMED"}. The application is NOT submitted. ${learn.message}`)
+      : staged
+        ? `Opened this project's existing draft ${cd.applicationNumber} and staged "${cd.form}" to its review screen. Nothing was submitted: verify every field, then a person clicks its submit. ${learn.message}`
+        : `Opened this project's existing draft ${cd.applicationNumber} ("${cd.form}") but did not reach its review screen: ${learn.message}`;
+    emitDone(msg);
+    const keptRecipe = existingRecipe ?? null;
+    if (keptRecipe) {
+      return finalize({
+        recipe: keptRecipe, status: learn.pauseReason ? "paused" : staged ? "draft" : "failed", pauseReason: learn.pauseReason,
+        pageCount: learn.pageCount, finalSubmitRecorded: learn.finalSubmitRecorded, pageTrace: learn.pageTrace ?? [],
+        verification: { accurate: false, confidence: "low", matches: [], issues: staged ? [] : [learn.message] }, message: msg,
+        ...(sig ? { signatureStep: sig } : {}),
+      });
+    }
+    // No recipe on file at all: a row is still owed to the caller, so an EMPTY one is recorded as
+    // needs_rerecord — never these steps, and never anything that replays.
+    const stub = mkStub();
+    savePortalRecipeSteps(db, stub.id, [], { status: "needs_rerecord", notes: `Only an existing draft (${cd.applicationNumber}) was continued on this portal; record a fresh application to make a recipe.` });
+    return finalize({
+      recipe: getPortalRecipe(db, stub.id), status: learn.pauseReason ? "paused" : staged ? "draft" : "failed", pauseReason: learn.pauseReason,
+      pageCount: learn.pageCount, finalSubmitRecorded: learn.finalSubmitRecorded, pageTrace: learn.pageTrace ?? [],
+      verification: { accurate: false, confidence: "low", matches: [], issues: staged ? [] : [learn.message] }, message: msg,
+      ...(sig ? { signatureStep: sig } : {}),
+    });
+  }
+
   const notServedWords = notServedInResult(learn);
   if (notServedWords) {
     const where = scopeType === "utility" ? (project.utility || "this utility") : (project.ahj || "this AHJ");
@@ -1984,6 +2083,7 @@ async function autoLearnPortalInner(
   // Submit observed in the pre-flush window (human corrected + submitted before the
   // recipe row landed) — apply the promotion now that the row exists.
   if (humanPatch.submitObserved) promoteOnHumanSubmit(stub.id);
+  if (humanPatch.draft) healDraftCreatingFinalSubmit(db, stub.id, humanPatch.draft, { projectId });
 
   // Debug: dump the three verification signals + the trust-gate decision into the run bundle
   // so the operator can see WHY a recipe was (or wasn't) trusted — text vs vision vs

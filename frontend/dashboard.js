@@ -1260,6 +1260,7 @@ const NEXT_STEP_CHIP = {
   gap_fill_missing: { pill: "to_fix", tone: "warning", label: "Fields missing", count: (n) => `${n} field(s) missing` },
   resubmit_awaiting_me: { pill: "your_submit", tone: "warning", label: "Your resubmit" },
   staged_awaiting_submit: { pill: "your_submit", tone: "warning", label: "Your submit" },
+  awaiting_signature: { pill: "waiting", tone: "neutral", label: "Awaiting signature" },
   approved_awaiting_filing: { pill: "your_submit", tone: "warning", label: "Approved — file it" },
   fee_due: { pill: "to_fix", tone: "warning", label: "Fee due" },
   correction_open: { pill: "corrections", tone: "neutral", label: "Correction open" },
@@ -5040,7 +5041,17 @@ function trackCardHtml(t) {
     <div class="track-actions">
       <button type="button" class="secondary" data-track-stage="${esc(t.type)}" title="Auto-fill this filing's portal up to the final review screen — you submit manually"><i data-lucide="bot"></i><span>Stage in portal</span></button>
       <button type="button" class="secondary" data-track-approve="${esc(t.type)}" title="Your approval of THIS run lets the bot click the portal's application submit (needs the server switch PORTAL_ALLOW_FINAL_SUBMIT=1 and a recipe recorded through submit; otherwise it stages to review for you). Never pays fees; stops for CAPTCHA/MFA."><i data-lucide="check-check"></i><span>Approve &amp; auto-submit</span></button>
+      ${t.signatureRequest && t.signatureRequest.state === "awaiting_signature_request"
+        ? `<button type="button" class="secondary" data-track-request-signatures="${esc(t.type)}" title="The last run stopped in front of the utility portal's Request Signatures. Your approval of THIS run lets the bot click it once: the utility emails the homeowner a DocuSign request. It files nothing; the application is submitted only after the homeowner signs."><i data-lucide="pen-line"></i><span>Approve &amp; request signatures</span></button>`
+        : ""}
+      ${t.signatureRequest && (t.signatureRequest.state === "awaiting_signature_request" || t.signatureRequest.state === "signature_request_unconfirmed")
+        ? `<button type="button" class="ghost" data-track-signature-sent="${esc(t.type)}" title="You clicked Request Signatures on the utility portal yourself. Recorded under your name; the track then waits on the homeowner's signature. Clicks nothing, files nothing."><i data-lucide="mail-check"></i><span>I sent the signature request</span></button>`
+        : ""}
+      ${t.signatureRequest && (t.signatureRequest.state === "awaiting_customer_signature" || t.signatureRequest.state === "ready_to_submit")
+        ? `<button type="button" class="secondary" data-track-check-signature="${esc(t.type)}" title="The bot reopens the draft on the utility portal and reads the homeowner's signature status. Signed: it stages step 5 up to its Submit and stops there for you. Not signed, or unreadable: it stops on the record page and says why. It never re-sends the request and never submits."><i data-lucide="refresh-cw"></i><span>Check signature now</span></button>`
+        : ""}
     </div>
+    ${t.signatureRequest && t.signatureRequest.state ? `<p class="muted" style="font-size:12px;margin:4px 0" data-track-signature-state="${esc(t.signatureRequest.state)}">Signature step: ${esc(signatureStateText(t.signatureRequest))}</p>` : ""}
     ${recipeBlock}
     ${trackIssuerEditHtml(t)}
     <details class="track-submit"${t.status === "staged" ? " open" : ""}>
@@ -5051,6 +5062,20 @@ function trackCardHtml(t) {
       </div>
     </details>
   </article>`;
+}
+
+/** The NEM card's signature line (#308, #310). Never says submitted: the application is an
+ *  unsubmitted draft until step 5's Submit. */
+function signatureStateText(sr) {
+  const why = sr.why ? ` (${sr.why})` : "";
+  switch (sr.state) {
+    case "awaiting_signature_request": return "awaiting signature request (consents ticked, eSign chosen, document previewed)";
+    case "signature_request_unconfirmed": return "a signature request was clicked but not confirmed — check the portal before anyone clicks it again";
+    case "awaiting_customer_signature": return `signature requested${sr.by ? ` (confirmed by ${sr.by})` : ""} — awaiting the homeowner's DocuSign signature; not submitted yet${why}`;
+    case "ready_to_submit": return `the homeowner has signed — stage again to reach step 5's Submit; not submitted yet${why}`;
+    case "awaiting_human_submit": return `the homeowner has signed — step 5 is staged up to its Submit; a person clicks it${why}`;
+    default: return String(sr.state || "").replace(/_/g, " ");
+  }
 }
 
 /** "Utility — <program>" from the utility track's own label; "interconnection" when the label
@@ -5110,6 +5135,35 @@ function renderSubmittalTracks() {
       stageSubmittalTrack(btn.dataset.trackApprove, btn, true);
     });
   });
+  wrap.querySelectorAll("button[data-track-request-signatures]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (!confirm("Approve & request signatures?\n\nThis is your approval of THIS run, recorded under your name: the bot re-opens the staged application and clicks the utility portal's Request Signatures once, which emails the homeowner a DocuSign request. It files nothing and never chooses Sign and Upload. If anything on the signature step is not as staged, it stops in front of the button for you.")) return;
+      const approverName = String(prompt("Your name, recorded as the approver of this signature request:") || "").trim();
+      stageSubmittalTrack(btn.dataset.trackRequestSignatures, btn, false, { requestSignatures: true, approverName });
+    });
+  });
+  wrap.querySelectorAll("button[data-track-signature-sent]").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      if (!confirm("Did you click Request Signatures on the utility portal yourself?\n\nThis records, under your name, that the DocuSign request went to the homeowner. The track then waits on their signature. Nothing is clicked or filed.")) return;
+      const confirmedBy = String(prompt("Your name, recorded as the person who sent the signature request:") || "").trim();
+      btn.disabled = true;
+      try {
+        const res = await api(`/api/projects/${state.selectedProjectId}/submittal-tracks/${encodeURIComponent(btn.dataset.trackSignatureSent)}/signature-request-sent`, {
+          method: "POST", body: JSON.stringify({ confirmedBy }),
+        });
+        state.submittalTracks = res.tracks || state.submittalTracks;
+        state.detail = await api(`/api/projects/${state.selectedProjectId}`);
+        renderDetail();
+        showMessage("Recorded: the utility application now waits on the homeowner's signature. Nothing was submitted.", "info");
+      } catch (err) {
+        showMessage(err.message || "Could not record the signature request.", "error");
+        btn.disabled = false;
+      }
+    });
+  });
+  wrap.querySelectorAll("button[data-track-check-signature]").forEach((btn) => {
+    btn.addEventListener("click", () => stageSubmittalTrack(btn.dataset.trackCheckSignature, btn));
+  });
   wrap.querySelectorAll("button[data-track-stage]").forEach((btn) => {
     btn.addEventListener("click", () => stageSubmittalTrack(btn.dataset.trackStage, btn));
   });
@@ -5147,7 +5201,7 @@ function renderSubmittalTracks() {
   if (window.lucide) window.lucide.createIcons();
 }
 
-async function stageSubmittalTrack(type, btn, autoSubmit = false) {
+async function stageSubmittalTrack(type, btn, autoSubmit = false, extra = null) {
   if (!state.selectedProjectId || !type) return;
   if (btn) { btn.disabled = true; }
   showMessage(autoSubmit
@@ -5156,7 +5210,7 @@ async function stageSubmittalTrack(type, btn, autoSubmit = false) {
   try {
     // Staging runs as a background job (202 + jobId); poll to completion, then refetch detail.
     const { jobId } = await api(`/api/projects/${state.selectedProjectId}/prepare-submission`, {
-      method: "POST", body: JSON.stringify({ track: type, autoSubmit }),
+      method: "POST", body: JSON.stringify({ track: type, autoSubmit, ...(extra || {}) }),
     });
     const job = await waitForStagingJob(jobId);
     if (job.status === "failed") {

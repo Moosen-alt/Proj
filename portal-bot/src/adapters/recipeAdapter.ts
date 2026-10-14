@@ -4,6 +4,7 @@ import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep } from "..
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, ok, fail, type PortalContext, type PortalStepResult } from "../adapter";
 import { applyFormatHint } from "../formatHint";
 import { extractRecordNumber, pageConfirmsSubmission } from "../recordNumber";
+import { findSiteDraft, readDraftCreated } from "../draftCreated";
 import { armHumanCaptureOnPage, HUMAN_SUBMIT_OBSERVED_NOTE } from "../humanCapture";
 import { feeBracketCoverage, feeBracketCoverageMessage, decideFeeTier, FEE_TIER_DC_FIELD, FEE_TIER_RATING_FIELD, kvaText, parseFeeBracketFieldKey, readTierLabel, sameFeeTier, TIER_UNIT_RE, type TierBoxOnPage } from "../feeBracketQuantity";
 
@@ -87,7 +88,7 @@ import { batteryControlKind, batteryControlOfStep, batteryDeclarationAnswer, par
 import { imageToPdfBytes, shouldConvertToPdf } from "../imageToPdf";
 import { removeUploadStaging, uploadPayloadFor, type PreparedUpload } from "./uploadPayload";
 import { attachmentTypeFor, isDocumentTypeList } from "./attachmentTypes";
-import { cleanRecordLink } from "./submissionLedger";
+import { cleanRecordLink, readApplicationLedgerInPage, type LedgerEntry } from "./submissionLedger";
 import { exactUploadDocType, fileTypeAllowed, UPLOAD_LABEL_PATTERNS, uploadForbidsSubstitute } from "./autoLearnAdapter";
 import { reviewComparison, scrapeReviewScreen as scrapeReviewScreenShared, utilityIdentifiersEnteredBySteps, type ReviewMismatch } from "../reviewScreenScraper";
 import { sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
@@ -95,7 +96,7 @@ import { openPortal } from "../browser";
 import { selectWithFallback } from "../comboboxFill";
 import {
   classifySubmissionText, finalSubmitEnvAllows, finalSubmitRefusals, isFinalSubmitControl, isPayFee, isPayNowDialogText, mayClickFinalSubmit,
-  isRecipeShapeValid, isSignatureNameLabel, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
+  isRecipeShapeValid, isSignatureNameLabel, isSignatureRequestControl, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
   type HealedStep, type RunApproval, type SubmissionOutcome,
 } from "../../../shared/src/portalSafety";
 import { commitField, installSettleProbe, waitForSettled } from "../settle";
@@ -566,6 +567,10 @@ export class RecipeAdapter extends BasePortalAdapter {
        *  required list for THIS track, on file, in docsByType (the backend's owedAttachmentsFor).
        *  Attached through the page's own recorded attachment row, one row per document. */
       owedAttachments?: Array<{ docType: string; label: string }>;
+      /** THIS PROJECT'S SITE, for the existing-draft check (#302): before the recipe starts a new
+       *  application, an unsubmitted draft already listed for this street stops the replay, named
+       *  — a two-part portal made that draft at its Part 1 Submit, and a second one is a failure. */
+      siteDraft?: { street?: string; city?: string; zip?: string; siblingAtSameStreet?: boolean };
     } = {},
   ) {
     super();
@@ -651,6 +656,24 @@ export class RecipeAdapter extends BasePortalAdapter {
   // (navigation, fills, AND uploads interleaved exactly as recorded) inside
   // fillApplication, so multi-page portals stay in the right order.
   async openSubmission(_project: ProjectRecord): Promise<PortalStepResult> {
+    // THE ADDRESS ALREADY HAS A DRAFT ON THIS ACCOUNT (#302). Read-only: the list the sign-in
+    // landed on is read, nothing is clicked. A draft found here is reported (existingDraft) for the
+    // backend to record, so the next stage opens THAT draft's next form instead of replaying an
+    // application start that would mint a second number for the same house.
+    const street = String(this.options.siteDraft?.street ?? "").trim();
+    if (street && this.page && typeof this.page.evaluate === "function") {
+      const entries = (await this.page.evaluate(readApplicationLedgerInPage).catch(() => [])) as LedgerEntry[];
+      const find = findSiteDraft(entries, { ...this.options.siteDraft, street });
+      if (find.found || find.ambiguous) {
+        const appNo = find.found ? find.entry.id : "";
+        return fail(
+          find.found
+            ? `${this.portalName}: this address already has an unsubmitted draft on the portal (${appNo}) — the recipe was not replayed, so no second application was started. Stage again: the next run opens that draft and continues it.`
+            : `${this.portalName}: ${find.why} — the recipe was not replayed, so no second application was started. A person opens the right draft.`,
+          { existingDraft: { applicationNumber: appNo, why: find.why, ambiguous: !find.found }, needsHuman: !find.found },
+        );
+      }
+    }
     return ok("Recipe replay runs as a single ordered sequence; see fill step.");
   }
   /** GAP-FILL NEVER SIGNS. On an e-signature step (portalSafety signatureStepInPage) the LLM
@@ -914,12 +937,12 @@ export class RecipeAdapter extends BasePortalAdapter {
    * the one the learn path already uses, which distinguishes the FINAL submit from
    * mid-flow "Submit Documents" buttons.
    */
-  async armSubmitWatch(onSubmitObserved: () => void): Promise<boolean> {
+  async armSubmitWatch(onSubmitObserved: (clickedLabel?: string) => void): Promise<boolean> {
     if (!this.page) return false;
     return armHumanCaptureOnPage(this.page, (step) => {
       // The detector emits one submitObserved step when the final submit is clicked; every
       // other captured step belongs to the learn path and is ignored here.
-      if (String(step.note || "").includes(HUMAN_SUBMIT_OBSERVED_NOTE)) onSubmitObserved();
+      if (String(step.note || "").includes(HUMAN_SUBMIT_OBSERVED_NOTE)) onSubmitObserved(step.value || undefined);
     }).catch(() => false);
   }
 
@@ -933,6 +956,18 @@ export class RecipeAdapter extends BasePortalAdapter {
       // module also carries the history: these word boundaries were once literal BACKSPACE
       // characters written through a heredoc, so the regex silently matched nothing and a
       // PowerClerk APP-###### was never read out of the page.
+      // A SUBMIT THAT ONLY MADE A DRAFT FILED NOTHING (#302). PSE's Part 1 answers its Submit with
+      // "Your draft application NEM-… has been created. Please continue to … Part 2 …": the labelled
+      // reader below would take that draft's number as the filing's, and the caller records it as
+      // submitted. Read the draft first and report it as a draft — never as a record number.
+      const draft = readDraftCreated(bodyText);
+      if (draft.draft) {
+        return ok(`The click created a DRAFT${draft.applicationNumber ? ` (${draft.applicationNumber})` : ""}, not a filing${draft.nextForm ? ` — the filing is in "${draft.nextForm}"` : ""}.`, {
+          permitNumber: "",
+          recordLink: cleanRecordLink(typeof this.page.url === "function" ? String(this.page.url() ?? "") : ""),
+          draftCreated: draft,
+        });
+      }
       const read = extractRecordNumber(bodyText);
       const permitNumber = read.value;
       // Accela record suffix encodes the discipline: -STR (structural), -ELE (electrical), etc.
@@ -4793,6 +4828,10 @@ export class RecipeAdapter extends BasePortalAdapter {
       // Only executeClick's flagged branch sets this, after finalSubmitRefusalsNow() passed.
       return "";
     }
+    // 1b) A SIGNATURE REQUEST (#308: PowerClerk's "Request Signatures" emails the homeowner a DocuSign
+    //     request). Not the filing, but never a replay's to click: only the learner clicks it, in a run
+    //     a named person approved (signatureRequestGate).
+    if (isSignatureRequestControl(label)) return refuse(`"${label.slice(0, 60)}" sends the homeowner a signature request — a person clicks it, or an approved run`);
     const ctx = await this.pageSafetyContext();
     // 2) THE filing click, as the shared predicate knows it: submit-worded, or "Continue
     //    Application" on a page that names itself the review step.

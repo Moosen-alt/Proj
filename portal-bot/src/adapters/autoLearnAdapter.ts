@@ -20,7 +20,36 @@ import { parseStreetName, parseStreetNumber, parseStreetLine, correctTruncatedAd
 import { portalUploadCapBytes } from "../uploadCap";
 import { LearnRunDebug } from "../learnDebug";
 import { armHumanCaptureOnPage } from "../humanCapture";
-import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isSignatureNameLabel, isTypeSignatureToggleLabel, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
+import { chooseDraftForm, findSiteDraft, isDraftFormRefusal, modificationOnOriginalNotice, readsAsUnsubmittedDraft } from "../draftCreated";
+import { scanProjectForms, type ProjectFormRow } from "./correctionForm";
+import { readApplicationLedgerInPage, type LedgerEntry } from "./submissionLedger";
+import { LIST_LINK } from "../statusFinder";
+import { readSignatureRequestStep, stageSignatureRequestStep, type SignatureStepOutcome } from "./signatureRequestStep";
+import type { SignatureRequestApproval } from "../../../shared/src/signatureRequestGate";
+import { readSignatureStatuses, type SignatureCheck } from "./signatureStatusRead";
+import { signatureCompletion } from "../../../shared/src/signatureCompletion";
+
+/** See AutoLearnAdapter's continueDraft option (#302). */
+export interface ContinueDraft {
+  /** The draft's number as a run recorded it ("NEM-44131"), when one did. */
+  applicationNumber?: string;
+  /** The form the draft page said to continue to, when a run recorded it. */
+  nextForm?: string;
+  /** The project's street address, for finding an unsubmitted draft no run recorded. */
+  street?: string;
+  city?: string;
+  zip?: string;
+  /** Another project of this client shares the house number and street words (backend-known). */
+  siblingAtSameStreet?: boolean;
+  /** A draft is ON RECORD for this project: never start a new application. */
+  required?: boolean;
+  /** THE TRACK WAITS ON THE HOMEOWNER'S SIGNATURE (#310): Request Signatures was sent (an approved
+   *  click, or a person confirmed they clicked it). The record page's signature status is read
+   *  before anything is opened: signed, the walk continues to step 5 and stops in front of its
+   *  Submit; not signed, or unreadable, it stops on the record page and names why. */
+  awaitingSignature?: boolean;
+}
+import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
 import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
 import { hostOfUrl, sameCredentialScope } from "../siteOf";
@@ -224,6 +253,17 @@ export interface LearnResult {
   /** What the person taking the review page must know before submitting (unsaved answers, held
    *  calls) — the same lines are appended to `message`. B3 / B14. */
   reviewHandoffNotes?: string[];
+  /** This walk opened the project's EXISTING draft and continued it (#302) instead of starting
+   *  an application. Its steps start inside that one record, so they are not a recipe. */
+  continuedDraft?: { applicationNumber: string; form: string; why: string };
+  /** The walk ended at a SIGNATURE-REQUEST step (#308: PSE Part 2 step 4): what it staged there
+   *  (consents, eSign, Preview Document), and whether Request Signatures was left for a person
+   *  (state "awaiting_signature_request", the default) or clicked in an approved run. */
+  signatureStep?: SignatureStepOutcome;
+  /** A RESUME read the homeowner's signature (#310): signed (the walk went on toward step 5's
+   *  Submit), never requested (the signature step was staged again), or still awaited / unreadable
+   *  (the walk stopped and says why). */
+  signatureCheck?: SignatureCheck;
 }
 
 // Live progress signal emitted while learning a portal, so the UI can show a real
@@ -887,6 +927,7 @@ export function isForwardExitLabel(label: string | undefined): boolean {
  *  re-admitted by the exemption as if it were a way forward. */
 function rawIsOffLimits(r: RawField): boolean {
   return isPayFee(r.label) || isPayFee(r.name) || isPayFee(r.text)
+    || isSignatureRequestControl(r.label) || isSignatureRequestControl(r.text)
     || EXISTING_RECORD_ACTION.test(r.label || "")
     || EXISTING_RECORD_ACTION.test(r.name || "")
     || EXISTING_RECORD_ACTION.test(r.text || "");
@@ -1059,7 +1100,7 @@ export type TerminalVerdict =
 /** isOffLimitsButton at module scope, so the classifier and the click paths refuse the same
  *  controls without the classifier needing an adapter instance. */
 function labelIsOffLimits(label: string): boolean {
-  return isPayFee(label) || EXISTING_RECORD_ACTION.test(label);
+  return isPayFee(label) || EXISTING_RECORD_ACTION.test(label) || isSignatureRequestControl(label);
 }
 
 /** Does the terminal verb in this label govern an APPLICATION, or something else entirely?
@@ -2054,6 +2095,19 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   // Who and where this project is, for choosing between versions of an address on a
   // disambiguation grid. Not fill data — identity used to REJECT another property's row.
   private siteIdentity: SiteIdentity | undefined;
+  /** #302 — see the continueDraft option. */
+  private continueDraft: ContinueDraft | undefined;
+  /** The existing draft this walk opened instead of starting an application (#302). */
+  private continuedDraft: LearnResult["continuedDraft"];
+  /** #308 — see the signatureRequestApproval option. */
+  private signatureRequestApproval: SignatureRequestApproval | null;
+  private runId: string;
+  /** What the signature-request step staged, once the walk reached it (#308). */
+  private signatureStep: SignatureStepOutcome | undefined;
+  private signatureCheck: SignatureCheck | undefined;
+  /** Lines for the person at review that come from the PAGE, not the run (#302: PSE's red
+   *  "file as a modification on the original record" notice). */
+  private pageReviewNotes: string[] = [];
   // Operator delegation for the final submit, honoured only alongside PORTAL_ALLOW_FINAL_SUBMIT=1.
   private allowFinalSubmit = false;
   // Tri-state on purpose: false means the project SAYS there is no battery (guard it),
@@ -2238,6 +2292,17 @@ export class AutoLearnAdapter extends BasePortalAdapter {
        *  itself, named. Default 360 000 (live Accela reaches its first fill ~4 pages / ~250 s in). A page that never becomes fillable must not cost
        *  90 s x N advance passes. */
       noProgressBudgetMs?: number;
+      /** THIS PROJECT'S EXISTING DRAFT (#302): before starting a new application, look for the
+       *  project's unsubmitted draft — by the number a run recorded, else by an unsubmitted row on
+       *  the project's street — and open the form that continues it ("Interconnection Application
+       *  - Part 2" [Begin]). `required`: a draft is on record, so a new application is never
+       *  started: a draft that cannot be opened stops the run, named. */
+      continueDraft?: ContinueDraft;
+      /** A NAMED PERSON'S APPROVAL OF THIS RUN'S SIGNATURE REQUEST (#308), and the run's id. With
+       *  neither, the walk stops in front of Request Signatures; with both, signatureRequestGate
+       *  still decides at the click. Never PORTAL_ALLOW_FINAL_SUBMIT: it files nothing. */
+      signatureRequestApproval?: SignatureRequestApproval | null;
+      runId?: string;
     } = {},
   ) {
     super();
@@ -2246,6 +2311,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     this.policyProfile = options.policyProfile ?? "residential_nem";
     this.bindableFields = new Set(options.bindableFields ?? []);
     this.siteIdentity = options.siteIdentity;
+    this.continueDraft = options.continueDraft;
+    this.signatureRequestApproval = options.signatureRequestApproval ?? null;
+    this.runId = String(options.runId ?? "");
     this.allowFinalSubmit = options.allowFinalSubmit === true;
     this.hasBattery = options.hasBattery;
     this.equipment = options.equipment ?? {};
@@ -3357,6 +3425,107 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     if (this.hbTimer) { clearInterval(this.hbTimer); this.hbTimer = null; }
   }
 
+  private continueDraftTried = false;
+
+  /**
+   * OPEN THIS PROJECT'S EXISTING DRAFT AND THE FORM THAT CONTINUES IT (#302). Clicks only two
+   * things, both chosen by what they say: the draft's own record link (the number on the account's
+   * list, exact text) and its next form's own row control (chooseDraftForm — by name, never a
+   * cancellation, never a "View" receipt). Every uncertain outcome is "none" (nothing listed for
+   * this project: the walk starts an application as before, unless a draft is on record) or
+   * "refused" (something is there and cannot be chosen safely: the walk stops, named). Nothing is
+   * recorded as a recipe step — these clicks belong to one house's record.
+   */
+  private async openExistingDraft(cd: ContinueDraft): Promise<
+    | { kind: "opened"; applicationNumber: string; form: string; why: string }
+    | { kind: "held"; applicationNumber: string; why: string }
+    | { kind: "none" | "refused"; why: string }
+  > {
+    const page = this.page;
+    if (!page || typeof page.evaluate !== "function") return { kind: "none", why: "no page to read" };
+    const readList = async (): Promise<LedgerEntry[]> => (await page.evaluate(readApplicationLedgerInPage).catch(() => [])) as LedgerEntry[];
+    let find = findSiteDraft(await readList(), cd);
+    // A recorded draft that is not on the landing page: the portal's own application list, once,
+    // by read-only navigation (the link that names the list — statusFinder's LIST_LINK).
+    if (!find.found && !find.ambiguous && cd.applicationNumber) {
+      const links = page.locator("a, [role='link']");
+      const n: number = await links.count().catch(() => 0);
+      for (let i = 0; i < Math.min(n, 80); i++) {
+        const t = String(await links.nth(i).innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+        if (!LIST_LINK.test(t)) continue;
+        const beforeUrl = String(page.url?.() ?? "");
+        const beforeFp = await this.pageFingerprint();
+        if (await links.nth(i).click({ timeout: 8000 }).then(() => true).catch(() => false)) {
+          await this.waitAfterClick(beforeUrl, beforeFp, this.tabCount());
+          find = findSiteDraft(await readList(), cd);
+        }
+        break;
+      }
+    }
+    if (!find.found) return { kind: find.ambiguous ? "refused" : "none", why: find.why };
+    const appNo = find.entry.id;
+    // The record's own link: exact text first, so NEM-4413 can never open NEM-44131.
+    const linkish = this.page!.locator("a, [role='link']").filter({ hasText: appNo });
+    const count: number = await linkish.count().catch(() => 0);
+    let target: { click: (o?: { timeout?: number }) => Promise<void> } | null = null;
+    for (let i = 0; i < Math.min(count, 25); i++) {
+      const t = String(await linkish.nth(i).innerText().catch(() => "")).replace(/\s+/g, " ").trim();
+      if (t === appNo) { target = linkish.nth(i); break; }
+    }
+    if (!target) return { kind: "refused", why: `the draft ${appNo} is listed, but no link on the list is exactly "${appNo}"` };
+    {
+      const beforeUrl = String(this.page!.url?.() ?? "");
+      const beforeFp = await this.pageFingerprint();
+      const clicked = await target.click({ timeout: 10_000 }).then(() => true).catch(() => false);
+      if (!clicked) return { kind: "refused", why: `the draft ${appNo}'s link could not be clicked` };
+      await this.waitAfterClick(beforeUrl, beforeFp, this.tabCount());
+    }
+    const recordText = String(await this.page!.locator("body").innerText().catch(() => ""));
+    if (!recordText.includes(appNo)) return { kind: "refused", why: `the page the draft's link opened does not mention ${appNo}` };
+    // A record that no longer reads as an unsubmitted draft was completed (by hand, or by another
+    // run): there is nothing to continue, and the forms it offers now belong to a filed application.
+    if (!readsAsUnsubmittedDraft(recordText)) return { kind: "refused", why: `the record ${appNo} does not read as an unsubmitted draft any more — nothing to continue` };
+    // THE HOMEOWNER'S SIGNATURE, READ ON THE RECORD PAGE BEFORE ANY FORM IS OPENED (#310). Every
+    // signature status the page shows, never the application's own; signed only on a positive read
+    // of every one (signatureCompletion). Never requested: the walk goes on and stages the signature
+    // step again. Requested, or anything unfamiliar or unread: the walk stops here and says why.
+    if (cd.awaitingSignature) {
+      const read = signatureCompletion(await readSignatureStatuses(this.page));
+      const statuses = read.statuses.map((x) => this.scrubSecrets(x));
+      const why = this.scrubSecrets(read.why);
+      if (read.reading === "signed") {
+        this.signatureCheck = { state: "signed", reading: read.reading, statuses, where: "record", why: `the record ${appNo}: ${why}` };
+      } else if (read.reading === "not_requested") {
+        this.signatureCheck = { state: "not_requested", reading: read.reading, statuses, where: "record", why: `the record ${appNo}: ${why} — the signature step is staged again` };
+      } else {
+        this.signatureCheck = { state: "awaiting_customer_signature", reading: read.reading, statuses, where: "record", why: `the record ${appNo}: ${why}` };
+        return { kind: "held", applicationNumber: appNo, why: this.signatureCheck.why };
+      }
+    }
+    let scanFailed = false;
+    const rows = (await this.page!.evaluate(scanProjectForms).catch(() => { scanFailed = true; return []; })) as ProjectFormRow[];
+    if (scanFailed) return { kind: "refused", why: `the form list on the draft ${appNo} could not be read` };
+    const choice = chooseDraftForm(rows, cd.nextForm ?? "");
+    if (isDraftFormRefusal(choice)) return { kind: "refused", why: `draft ${appNo}: ${choice.why} (offered: ${choice.offered.join(" | ").slice(0, 200) || "nothing"})` };
+    const beforeUrl = String(this.page!.url?.() ?? "");
+    const beforeFp = await this.pageFingerprint();
+    const control = this.page!.locator(`[data-al-cform="${choice.row.key}"]`).first();
+    const clicked = await control.click({ timeout: 10_000 }).then(() => true).catch(() => false);
+    if (!clicked) return { kind: "refused", why: `draft ${appNo}: the "${choice.row.name}" [${choice.row.action}] control could not be clicked` };
+    await this.waitAfterClick(beforeUrl, beforeFp, this.tabCount());
+    const moved = String(this.page!.url?.() ?? "") !== beforeUrl || (await this.pageFingerprint()) !== beforeFp;
+    if (!moved) return { kind: "refused", why: `draft ${appNo}: clicking "${choice.row.name}" [${choice.row.action}] did not open the form` };
+    return { kind: "opened", applicationNumber: appNo, form: choice.row.name, why: `${find.why}; ${choice.why}` };
+  }
+
+  /** The left-open page's visible text, scrubbed of every secret this run knows. Read-only: the
+   *  caller (index.ts draftAwareHumanSink) reads what a person's submit click produced (#302). */
+  async readCurrentPageText(): Promise<string> {
+    if (!this.page) return "";
+    const body = await this.page.locator("body").innerText({ timeout: 5000 }).catch(() => "");
+    return this.scrubSecrets(String(body ?? ""));
+  }
+
   // PATCH-BY-DEMONSTRATION: arm the (still-open, headed) page so anything the human
   // fixes by hand at the review handoff — a missed dropdown, an unmapped field — is
   // captured as RecipeSteps and streamed to the caller for merging into the learned
@@ -3404,10 +3573,19 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // answers the portal may not have saved, and the portal's own background calls the lockdown
       // held back (a section may render incomplete). The learner cannot tell how the page was
       // reached, so the advice is the portal's own navigation, never a reload.
+      if (this.continuedDraft) result = { ...result, continuedDraft: this.continuedDraft };
+      if (this.signatureStep) {
+        const sig = this.signatureStep;
+        result = { ...result, signatureStep: sig, message: `${result.message} SIGNATURE STEP: ${sig.why}.` };
+      }
+      if (this.signatureCheck) {
+        const chk = this.signatureCheck;
+        result = { ...result, signatureCheck: chk, message: `${result.message} HOMEOWNER SIGNATURE: ${chk.why}.` };
+      }
       if (result.reachedReview) {
         const reviewUrl = (() => { try { return typeof this.page?.url === "function" ? String(this.page.url() || "") : ""; } catch { return ""; } })();
         const blockedCalls = backstop ? portalOwnCallsBlockedAtReview(backstop.aborts, reviewUrl) : [];
-        const handoff = [this.reviewUnsavedWarning, reviewBlockedCallsLine(blockedCalls, null)].filter(Boolean);
+        const handoff = [this.reviewUnsavedWarning, reviewBlockedCallsLine(blockedCalls, null), ...this.pageReviewNotes].filter(Boolean);
         if (handoff.length) {
           result = { ...result, reviewPageBlockedCalls: blockedCalls, reviewHandoffNotes: handoff, message: `${result.message} ${handoff.join(" ")}` };
           this.debug?.event({ type: "review_handoff_notes", notes: handoff.map((h) => h.slice(0, 200)) });
@@ -5593,6 +5771,86 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         }
       }
 
+      // b8z) THIS PROJECT'S EXISTING DRAFT (#302) — before anything could start a NEW application.
+      //      A two-part portal (PSE PowerClerk) made a draft at Part 1's Submit; starting again would
+      //      mint a second application number for the same house (owner ruling 2026-10-10). Once
+      //      per run, and only while nothing has been filled.
+      if (this.continueDraft && !this.continueDraftTried && !reviewSignals && this.page
+        && !steps.some((st) => st.action === "fill" || st.action === "select" || st.action === "check")) {
+        this.continueDraftTried = true;
+        const opened = await this.openExistingDraft(this.continueDraft);
+        this.debug?.event({ type: "existing_draft", page: pageCount, kind: opened.kind, why: opened.why.slice(0, 200) });
+        if (opened.kind === "opened") {
+          this.continuedDraft = { applicationNumber: opened.applicationNumber, form: opened.form, why: opened.why };
+          continue;
+        }
+        if (opened.kind === "held") {
+          // AWAITING THE HOMEOWNER'S SIGNATURE (#310): the record page is the hand-off. No form was
+          // opened and nothing was clicked on it; the track keeps waiting and the result says why.
+          this.continuedDraft = { applicationNumber: opened.applicationNumber, form: "", why: opened.why };
+          reachedReview = true;
+          backstopFor(this.page)?.lockReview("learner on the draft's record page, awaiting the homeowner's signature");
+          break;
+        }
+        if (opened.kind === "refused" || this.continueDraft.required) {
+          return {
+            ...fail(steps, this.portalName, `Stopped before starting an application: ${opened.why}. This project already has a draft on the portal${this.continueDraft.applicationNumber ? ` (${this.continueDraft.applicationNumber})` : ""}, and starting again would create a second one. Open the draft by hand, or correct the recorded draft, then stage again.`, null, pageCount, portalNotices),
+            stopReason: "existing_draft_not_opened",
+          };
+        }
+      }
+
+      // b8y) THE SIGNATURE-REQUEST STEP (#308; PSE Part 2 step 4 "Project Agreements and
+      //      Signature"). A page that offers "Request Signatures" (a DocuSign email to the homeowner)
+      //      is staged deterministically and ENDS the walk: required consents ticked, eSign selected
+      //      (never Sign and Upload), Preview Document clicked, and a stop in front of Request
+      //      Signatures — or, in a run a named person approved and only when signatureRequestGate
+      //      allows it, one click on it. The planner never sees this page, so it can never pick Sign
+      //      and Upload, a Browse, or Request Signatures itself (isOffLimitsButton refuses the last).
+      if (this.page && !this.signatureStep && this.signatureCheck?.state === "signed") {
+        // A RESUME WHOSE RECORD READ SIGNED (#310). The signature step is never staged again and
+        // nothing on it is clicked (Request Signatures stays off-limits to the planner): a page that
+        // shows a signature status must read signed too, or the walk stops here and names why. A
+        // page that reads signed is walked on to step 5, where the Submit is recorded and stopped in
+        // front of — clicked only under hard rule 1's gate, as on any run.
+        const sigRead = await readSignatureRequestStep(this.page);
+        const shown = await readSignatureStatuses(this.page);
+        const here = shown.length ? shown : (sigRead?.statuses ?? []);
+        if (sigRead || here.length) {
+          const read = signatureCompletion(here);
+          const statuses = read.statuses.map((x) => this.scrubSecrets(x));
+          this.debug?.event({ type: "signature_resume_check", page: pageCount, reading: read.reading, statuses });
+          if (!read.signed) {
+            this.signatureCheck = { state: "awaiting_customer_signature", reading: read.reading, statuses, where: "signature step",
+              why: `the record read signed, but on the signature step ${this.scrubSecrets(read.why)}` };
+            reachedReview = true;
+            backstopFor(this.page)?.lockReview("learner at the signature step, awaiting the homeowner's signature");
+            break;
+          }
+          const note = `The homeowner's signature reads complete (${statuses.map((x) => `"${x}"`).join(", ")}); nothing on the signature step was clicked.`;
+          if (!this.pageReviewNotes.includes(note)) this.pageReviewNotes.push(note);
+        }
+      } else if (this.page && !this.signatureStep) {
+        const sigRead = await readSignatureRequestStep(this.page);
+        if (sigRead) {
+          this.debug?.event({ type: "signature_request_step", page: pageCount, request: sigRead.request.length, consents: sigRead.consents.length, status: this.scrubSecrets(sigRead.status) });
+          this.signatureStep = await stageSignatureRequestStep(this.page, sigRead, {
+            steps,
+            approval: this.signatureRequestApproval,
+            runId: this.runId,
+            scrub: (t) => this.scrubSecrets(t),
+            debugEvent: (e) => this.debug?.event(e),
+          });
+          const sig = this.signatureStep;
+          if (sig.consentTexts.length) this.pageReviewNotes.push(`The homeowner agrees to (${sig.consentTexts.length} consent${sig.consentTexts.length > 1 ? "s" : ""} on the signature step): ${sig.consentTexts.map((t) => `"${t.slice(0, 200)}"`).join(" | ")}`);
+          if (sig.consentsLeft.length) this.pageReviewNotes.push(`Consents left for a person: ${sig.consentsLeft.join("; ")}.`);
+          reachedReview = true;
+          // Nothing the run decided posts from here on: the page goes to a person (or waits on the homeowner).
+          backstopFor(this.page)?.lockReview("learner at the signature-request step");
+          break;
+        }
+      }
+
       // b9) DETERMINISTIC APPLICATION ENTRY (portal-agnostic). On a logged-in DASHBOARD the
       //     only useful move is "start a new application", and every vendor words that
       //     control differently ("Create an Application", a bare "Apply" tile, "Apply for a
@@ -6053,6 +6311,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // Scrubbed before they are kept: a portal repeats a typed account back ("Account number …
           // could not be found"), and these leave the process (result.portalNotices, messages).
           const notices = (await collectPortalNoticesFrom(this.page)).map((n) => this.scrubSecrets(n));
+          // PSE's red Part 1 notice (#302): a change to an existing system goes on the ORIGINAL
+          // record as a modification, when one exists. A person decides that — a review note, never
+          // a stop.
+          {
+            const mod = modificationOnOriginalNotice(this.scrubSecrets(bodyText || ""));
+            const line = mod ? `The portal says: "${mod}" Check whether this project has an original interconnection record before submitting.` : "";
+            if (line && !this.pageReviewNotes.includes(line)) this.pageReviewNotes.push(line);
+          }
           const fresh = notices.filter((n) => !portalNotices.includes(n));
           if (fresh.length) {
             for (const n of fresh) portalNotices.push(n);
@@ -9307,6 +9573,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   private isOffLimitsButton(field: ExtractedField): boolean {
     const sel = field.selector;
     return isPayFee(field.label) || isPayFee(sel?.name) || isPayFee(sel?.text)
+      || isSignatureRequestControl(field.label) || isSignatureRequestControl(sel?.text)
       || EXISTING_RECORD_ACTION.test(field.label || "")
       || EXISTING_RECORD_ACTION.test(sel?.name || "")
       || EXISTING_RECORD_ACTION.test(sel?.text || "");
