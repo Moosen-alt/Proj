@@ -378,6 +378,88 @@ export interface RecipeProgress {
   stepIndex?: number;
 }
 
+// ---------------------------------------------------------------------------
+// #339 — THE ARRAY ROWS, MARKED ONCE, READ BY EVERY DOOR.
+//
+// A PV Array row is the container owning one visible "Delete Array" / "Remove PV Array"
+// marker: the LARGEST ancestor that still contains exactly that one marker and none of the
+// section-level controls (Add …, Clone System, Calculate) that live outside every row — with
+// ONE row on the page, "exactly one marker" is true all the way up, and the climb must stop
+// below the section or the "row" swallows the inverter's identically-labelled Manufacturer.
+// This is the rule readArrayRowsBack has always used; it now lives here once, stamps each row
+// data-al-arrayrow="N" (1-based, page order), and countArrayRows, readArrayRowsBack and the
+// per-array step scope (RecipeAdapter.locator) all read the stamp.
+//
+// mode "mark" stamps and returns the row count. "watch" also re-stamps after every DOM change
+// until "unwatch": PowerClerk re-renders the whole section (fresh elements, fresh ids) as a
+// row saves, and a scoped write must not lose its row mid-step. The watcher is armed only for
+// the length of one row fill.
+//
+// Runs INSIDE the page: self-contained, no module references, no named inner functions.
+// ---------------------------------------------------------------------------
+export function arrayRowsInPage(mode: string): number {
+  const w = window as unknown as { __alMarkArrayRows?: () => number; __alArrayRowsObserver?: MutationObserver | null };
+  if (typeof w.__alMarkArrayRows !== "function") {
+    w.__alMarkArrayRows = function (): number {
+      for (const old of Array.from(document.querySelectorAll("[data-al-arrayrow]"))) old.removeAttribute("data-al-arrayrow");
+      const markers: HTMLElement[] = [];
+      for (const el of Array.from(document.querySelectorAll("a, button, span, div")) as HTMLElement[]) {
+        // Portal-agnostic repeater vocabulary, but "array" stays required: it is the domain's
+        // own word for a roof plane, while a bare "Remove"/"Delete Row" would count unrelated
+        // repeaters (contacts, attachments).
+        if (!/^(delete|remove)\s+(pv\s+)?array$/i.test((el.innerText || "").trim())) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) markers.push(el);
+      }
+      // Innermost only: a wrapper around the real control repeats its innerText.
+      const inner = markers.filter((el) => !markers.some((o) => o !== el && el.contains(o)));
+      const sectionCtl: HTMLElement[] = [];
+      for (const el of Array.from(document.querySelectorAll("a, button")) as HTMLElement[]) {
+        if (!/^add\s|clone\s*system|^(re)?calculate$/i.test((el.innerText || "").trim())) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width > 0 && r.height > 0) sectionCtl.push(el);
+      }
+      let n = 0;
+      for (const marker of inner) {
+        let row: HTMLElement = marker;
+        let up: HTMLElement | null = marker.parentElement;
+        while (up && up !== document.body
+          && inner.filter((m) => up!.contains(m)).length === 1
+          && !sectionCtl.some((c) => up!.contains(c))) {
+          row = up;
+          up = up.parentElement;
+        }
+        n++;
+        row.setAttribute("data-al-arrayrow", String(n));
+      }
+      return n;
+    };
+  }
+  if (mode === "unwatch") {
+    if (w.__alArrayRowsObserver) { w.__alArrayRowsObserver.disconnect(); w.__alArrayRowsObserver = null; }
+    return 0;
+  }
+  if (mode === "watch" && !w.__alArrayRowsObserver && document.body) {
+    let queued = false;
+    const obs = new MutationObserver(() => {
+      if (queued) return;
+      queued = true;
+      // Only childList is observed, so the stamping's own attribute writes never re-trigger it.
+      Promise.resolve().then(() => { queued = false; if (w.__alMarkArrayRows) w.__alMarkArrayRows(); });
+    });
+    obs.observe(document.body, { childList: true, subtree: true });
+    w.__alArrayRowsObserver = obs;
+  }
+  return (w.__alMarkArrayRows as () => number)();
+}
+
+/** How long a row-scoped step waits for its control to RENDER in its row: a fresh PowerClerk
+ *  row shows only Qty, and each next control arrives after the previous one saves. */
+const ROW_CONTROL_WAIT_MS = 10_000;
+/** How long the row read-back lets a debounced autosave land before reading what the portal
+ *  kept (settle cannot see a debounce: nothing is in flight until it fires). */
+const ROW_READBACK_GRACE_MS = 2_000;
+
 export class RecipeAdapter extends BasePortalAdapter {
   portalName: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -474,6 +556,20 @@ export class RecipeAdapter extends BasePortalAdapter {
   private arrayBlockEnd = -1;
   /** The post-pass held-check runs exactly once, after the last array pass. */
   private arrayVerifyDone = false;
+  /** #339 — ROW MODE: a multi-array project on a page whose PV Array rows are countable (each
+   *  owns a "Delete Array" marker). Per-array steps then run INSIDE their own row container,
+   *  never by a page-wide nth. null until the first per-array step decides it. */
+  private arrayRowMode: boolean | null = null;
+  /** The row (1-based) every resolution is scoped to while a row is being filled; 0 = page. */
+  private arrayRowScope = 0;
+  /** Which project arrays each rendered row holds: [[1],[2],…] by default. A merge (the
+   *  portal refused a new row; same tilt/azimuth) appends to an existing row's list. */
+  private rowArrays: number[][] = [];
+  /** A merged row's summed module quantity, by row. */
+  private rowQtyOverride = new Map<number, string>();
+  /** What a row's select showed right after this run set it ("row:field") — the read-back's
+   *  second witness for a select whose landed spelling is the portal's, not the plan set's. */
+  private rowSelectLanded = new Map<string, string>();
   /** Select-step fields that reported SUCCESS this run — the held-check's candidates.
    *  A field that never landed (ambiguous model left blank for the human) is not
    *  "lost to a re-render" and must not be repaired or reported as such. */
@@ -1367,6 +1463,33 @@ export class RecipeAdapter extends BasePortalAdapter {
       // module-model step — "landed nothing though 58 option(s) were showing". They
       // already ran on pass 1; nothing per-array is lost by not repeating them.
       if (this.arrayPass > 1 && inArrayBlock && !this.isPerArrayStep(recordedStep)) continue;
+      // #339 — ON A MULTI-ARRAY PROJECT, A ROW IS FILLED AS A ROW, INSIDE THE ROW.
+      //
+      // Live PacifiCorp (six arrays): every pass wrote into ROW 1 — a page-wide nth shifted by
+      // pass-1 cannot target row N when row N's later controls do not exist yet (a fresh row
+      // renders ONLY Qty; Manufacturer appears after Qty saves, Model after a manufacturer is
+      // chosen, Tilt/Azimuth after the model), so the write fell back to a match that did —
+      // row 1, re-chosen by its volatile recorded id. In row mode the per-array steps are not
+      // run one by one here: at the block's end the whole row is filled by fillArrayRow, scoped
+      // to the Nth row container, in the order the row unlocks itself.
+      if (inArrayBlock && this.isPerArrayStep(recordedStep) && await this.useArrayRowMode()) {
+        if (stepIdx !== this.arrayBlockEnd) continue;
+        closePrevStepTiming();
+        prevStart = Date.now();
+        prevStep = { i: stepIdx, action: "array-row", note: `array row ${this.arrayPass}` };
+        const filled = await this.fillArrayRow(this.arrayPass);
+        executed += filled.done;
+        skipped.push(...filled.skipped);
+        const rowPage = await currentPageLabel();
+        for (const t of filled.trace) trace.push({ ...t, page: rowPage });
+        const next = await this.afterArrayBlock();
+        if (next.stop) {
+          closePrevStepTiming();
+          return fail(next.stop, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, failedStepIndex: stepIdx, trace, slowSteps, requiredStillEmpty: this.requiredStillEmpty, unresolvedFields: this.unresolvedFields, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, requiredFieldsSeen: this.requiredFieldsSeen, stoppedAtPayment: this.stoppedAtPayment, pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath });
+        }
+        if (next.repeat) stepIdx = this.arrayBlockStart - 1; // the loop's ++ lands us back on the block
+        continue;
+      }
       // ON A REPEAT PASS, TARGET THE Nth RENDERED COPY OF EACH CONTROL.
       //
       // The recorded selector points at the FIRST array's control, because that is the only
@@ -1985,33 +2108,16 @@ export class RecipeAdapter extends BasePortalAdapter {
       // failure to the Preparer/Customer overwrite, and just as invisible. When no row can
       // be added we say so loudly and file array 1, which is no worse than before.
       if (stepIdx === this.arrayBlockEnd && this.arrayBlockStart >= 0) {
-        const want = this.projectArrayCount();
-        if (this.arrayPass < want) {
-          if (await this.addAnotherArrayRow()) {
-            this.arrayPass++;
-            this.driftWarnings.push(`added array row ${this.arrayPass} of ${want} and refilled the recorded array block for it`);
-            stepIdx = this.arrayBlockStart - 1; // the loop's ++ lands us back on the block
-            continue;
-          }
-          this.driftWarnings.push(
-            `project has ${want} arrays but no array row could be added — filed array 1 only `
-            + `(${this.fieldValues.array1ModuleQuantity ?? "?"} of ${this.fieldValues.totalModuleQuantity ?? "?"} modules). REVIEW BEFORE SUBMIT.`,
-          );
-          this.arrayPass = want; // do not retry the add on every later pass
+        // Shared with the row-mode path above (afterArrayBlock): add the next row or merge,
+        // then the held-check once the last pass is done.
+        const next = await this.afterArrayBlock();
+        if (next.stop) {
+          closePrevStepTiming();
+          return fail(next.stop, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, failedStepIndex: stepIdx, trace, slowSteps, requiredStillEmpty: this.requiredStillEmpty, unresolvedFields: this.unresolvedFields, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, requiredFieldsSeen: this.requiredFieldsSeen, stoppedAtPayment: this.stoppedAtPayment, pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath });
         }
-        // DID THE FILLS ACTUALLY HOLD? Adding a row makes PowerClerk re-render the whole
-        // spec section from SERVER state, and a select that was never committed (blur) is
-        // rendered back to its placeholder — measured live: array 1's module manufacturer
-        // reverted to "Please select..." after the row-add, and nothing noticed because
-        // every write had individually reported success. The learner has verified its
-        // equipment fills persist since the beginning (equipment_fill_not_held); replay
-        // now does the same for the array rows it owns: read each row back, re-run the
-        // recorded per-array steps for any row left on a placeholder, and say so loudly
-        // when even the repair does not hold.
-        if (this.arrayPass >= this.projectArrayCount() && !this.arrayVerifyDone) {
-          this.arrayVerifyDone = true;
-          await this.verifyAndRepairArrayRows();
-          await this.verifyEquipmentSelectsHeld();
+        if (next.repeat) {
+          stepIdx = this.arrayBlockStart - 1; // the loop's ++ lands us back on the block
+          continue;
         }
       }
     }
@@ -2252,6 +2358,11 @@ export class RecipeAdapter extends BasePortalAdapter {
         const certified = this.fieldValues[`${step.field}Certified`];
         if (certified) return certified;
       }
+      // #339 — A MERGED ROW FILES THE SUM of its same-orientation arrays (only ever when the
+      // portal refused a new row; mergeUnaddableArrays says so in the run's warnings).
+      if (step.field === "array1ModuleQuantity" && this.rowQtyOverride.has(this.arrayPass)) {
+        return String(this.rowQtyOverride.get(this.arrayPass));
+      }
       // ON A REPEAT PASS, array1Tilt means array2Tilt. The recipe only ever records ONE
       // array block (the learner fills the block the portal renders), so replaying it for
       // a second roof plane is a matter of reading the second array's values into the
@@ -2381,19 +2492,16 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  "Delete Array" control, which makes counting them a reliable proxy — and gives the
    *  add below something to verify against rather than trusting a click. */
   private async countArrayRows(): Promise<number> {
+    // ONE ROW PREDICATE (#339): the rows counted here are the rows read back and the rows a
+    // per-array step is scoped to — arrayRowsInPage stamps them, everything else reads that.
+    return await this.markArrayRows();
+  }
+
+  /** Stamp (and with "watch", keep re-stamping across re-renders) the rendered array rows.
+   *  Returns the row count; 0 on a page that cannot be read. Never throws. */
+  private async markArrayRows(mode: "mark" | "watch" | "unwatch" = "mark"): Promise<number> {
     if (!this.page || typeof this.page.evaluate !== "function") return 0;
-    return await this.page.evaluate(() => {
-      const els = Array.from(document.querySelectorAll("a, button, span, div")) as HTMLElement[];
-      return els.filter((el) => {
-        const t = (el.innerText || "").trim();
-        // Portal-agnostic repeater vocabulary, but "array" stays required: it is the
-        // domain's own word for a roof plane (the field family is array1*), while a bare
-        // "Remove"/"Delete Row" would count unrelated repeaters (contacts, attachments).
-        if (!/^(delete|remove)\s+(pv\s+)?array$/i.test(t)) return false;
-        const r = el.getBoundingClientRect();
-        return r.width > 0 && r.height > 0;
-      }).length;
-    }).catch(() => 0) as number;
+    return await this.page.evaluate(arrayRowsInPage, mode).catch(() => 0) as number;
   }
 
   /** Add one PV Array row, and return whether the page actually gained one. */
@@ -2432,6 +2540,311 @@ export class RecipeAdapter extends BasePortalAdapter {
     return /^array1[A-Z]/.test(f) || f === "moduleMake" || f === "moduleModel";
   }
 
+  // ---------------------------------------------------------------------------
+  // #339 — ROW MODE: each array is written INSIDE ITS OWN ROW, then proved there.
+  // ---------------------------------------------------------------------------
+
+  /** Decide once, at the first per-array step: a project with more than one array, on a page
+   *  whose rows are countable. Anything else keeps the recorded-selector path unchanged — a
+   *  single-array project (the common case) and a portal with no "Delete Array" marker. */
+  private async useArrayRowMode(): Promise<boolean> {
+    if (this.arrayRowMode === null) {
+      let rows = 0;
+      if (this.projectArrayCount() > 1) {
+        // The row may still be painting when the block is reached; look a few times.
+        for (let k = 0; k < 6 && rows === 0; k++) {
+          rows = await this.markArrayRows();
+          if (!rows) await sleep(500);
+        }
+      }
+      this.arrayRowMode = rows >= 1;
+      if (this.arrayRowMode) this.rowArrays = [[1]];
+    }
+    return this.arrayRowMode;
+  }
+
+  /** After the block's last step: add the next row (or merge when the portal refuses one), then
+   *  the held-check once the last pass is done. Shared by both paths. `stop` ends the run. */
+  private async afterArrayBlock(): Promise<{ repeat: boolean; stop?: string }> {
+    const want = this.projectArrayCount();
+    if (this.arrayPass < want) {
+      if (await this.addAnotherArrayRow()) {
+        this.arrayPass++;
+        if (this.arrayRowMode) this.rowArrays.push([this.arrayPass]);
+        this.driftWarnings.push(`added array row ${this.arrayPass} of ${want} and refilled the recorded array block for it`);
+        return { repeat: true };
+      }
+      if (this.arrayRowMode) {
+        await this.mergeUnaddableArrays(want);
+      } else {
+        this.driftWarnings.push(
+          `project has ${want} arrays but no array row could be added — filed array 1 only `
+          + `(${this.fieldValues.array1ModuleQuantity ?? "?"} of ${this.fieldValues.totalModuleQuantity ?? "?"} modules). REVIEW BEFORE SUBMIT.`,
+        );
+      }
+      this.arrayPass = want; // do not retry the add on every later pass
+    }
+    // DID THE FILLS ACTUALLY HOLD? Adding a row makes PowerClerk re-render the whole spec
+    // section from SERVER state, and a value never committed (blur) comes back as its
+    // placeholder. Row mode compares every row with ITS array and stops on a row that will not
+    // hold; the recorded-selector path keeps its placeholder-and-number check.
+    let stop: string | null = null;
+    if (this.arrayPass >= this.projectArrayCount() && !this.arrayVerifyDone) {
+      this.arrayVerifyDone = true;
+      if (this.arrayRowMode) stop = await this.verifyArrayRowsByRow();
+      else await this.verifyAndRepairArrayRows();
+      await this.verifyEquipmentSelectsHeld();
+    }
+    return stop ? { repeat: false, stop } : { repeat: false };
+  }
+
+  /** The block's per-array steps in the order a row unlocks itself: Qty, then the module
+   *  manufacturer, then its model (whose list cascades from the manufacturer), then the rest
+   *  (tilt, azimuth, …) in recorded order. A recording made top-down already reads this way; a
+   *  recording that does not would ask for a control the row has not rendered yet. */
+  private rowStepsInOrder(): RecipeStep[] {
+    if (this.arrayBlockStart < 0) return [];
+    const rank = (s: RecipeStep): number => {
+      const f = String(s.field ?? "");
+      return f === "array1ModuleQuantity" ? 0 : f === "moduleMake" ? 1 : f === "moduleModel" ? 2 : 3;
+    };
+    return this.recipe.steps
+      .slice(this.arrayBlockStart, this.arrayBlockEnd + 1)
+      .map((s, k) => ({ s, k }))
+      .filter(({ s }) => this.isPerArrayStep(s))
+      .sort((a, b) => rank(a.s) - rank(b.s) || a.k - b.k)
+      .map(({ s }) => s);
+  }
+
+  /** The recorded step re-aimed INSIDE row `n`: by its label (the row holds one control per
+   *  label), with no page-wide nth anywhere, and without a volatile learn-time id — an id like
+   *  "#pcInputBase57" is a render-order counter that, mid-run, names some OTHER control (live:
+   *  row 1's). A class/structural css the step was recorded with is kept, row-scoped. */
+  private rowScopedStep(s: RecipeStep, n: number): RecipeStep {
+    const sel = s.selector ?? {};
+    const volatileId = (css?: string): boolean => /^#[A-Za-z_][\w:.-]*$/.test(String(css ?? "").trim());
+    const bare = (x: RecipeSelector): RecipeSelector => ({ ...x, nth: undefined, fallbacks: undefined });
+    const labelSrc = sel.label ? sel : sel.fallbacks?.find((f) => f.label);
+    const rest = (sel.fallbacks ?? []).filter((f) => f !== labelSrc && !volatileId(f.css)).map(bare);
+    let selector: RecipeSelector;
+    if (labelSrc?.label) {
+      const keepCss = labelSrc !== sel && sel.css && !volatileId(sel.css) ? [{ css: sel.css }] : [];
+      selector = { label: labelSrc.label, exact: labelSrc.exact, fallbacks: [...keepCss, ...rest] };
+    } else {
+      selector = { ...bare(sel), fallbacks: rest };
+    }
+    return { ...s, selector, note: `${s.note ?? s.field ?? ""} [array ${n}]` };
+  }
+
+  /** The first VISIBLE control a row-scoped step resolves to, trying its levels in order. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async rowLocator(rs: RecipeStep): Promise<any | null> {
+    const sel = rs.selector;
+    if (!sel) return null;
+    for (const level of [sel, ...(sel.fallbacks ?? [])]) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let loc: any;
+      try { loc = this.locator({ ...level, fallbacks: undefined }); } catch { continue; }
+      const count = loc && typeof loc.count === "function" ? await loc.count().catch(() => 0) : 0;
+      for (let k = 0; k < Math.min(count, 4); k++) {
+        if (await this.isTrulyVisible(loc.nth(k))) return loc.nth(k);
+      }
+    }
+    return null;
+  }
+
+  /** Wait for a row-scoped step's control to RENDER in its row (re-stamping as the section
+   *  re-renders). False when it never appears — the step is then skipped and the row read-back
+   *  names it, rather than the write falling back to some other row's control. */
+  private async waitForRowControl(rs: RecipeStep, ms: number): Promise<boolean> {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      await this.markArrayRows();
+      if (await this.rowLocator(rs)) return true;
+      if (Date.now() >= deadline) return false;
+      await sleep(250);
+    }
+  }
+
+  /** Fill row `n` with ITS array, every step scoped to that row's container, in row order.
+   *  Each fill/select is the ordinary executeStep (blur-commit, the cascade waits, the make
+   *  aliases); what changes is only WHERE it looks. Also the repair: re-running a row is
+   *  calling this again. */
+  private async fillArrayRow(n: number): Promise<{ done: number; skipped: string[]; trace: Array<{ i: number; action: string; note: string; outcome: string }> }> {
+    const out = { done: 0, skipped: [] as string[], trace: [] as Array<{ i: number; action: string; note: string; outcome: string }> };
+    const savedPass = this.arrayPass;
+    this.arrayPass = n; // resolveValue maps array1* -> array{n}*
+    await this.markArrayRows("watch");
+    try {
+      for (const s of this.rowStepsInOrder()) {
+        const rs = this.rowScopedStep(s, n);
+        let rendered = false;
+        let ok = false;
+        this.arrayRowScope = n;
+        try {
+          rendered = await this.waitForRowControl(rs, ROW_CONTROL_WAIT_MS);
+          if (rendered) ok = await this.executeStep(rs, false).catch(() => false);
+          if (ok && s.action === "select") {
+            if (s.field) this.landedSelectFields.add(String(s.field));
+            const shown = await this.rowLocator(rs).then((loc) => loc?.evaluate((el: Element) => {
+              if ((el.tagName || "").toLowerCase() === "select") {
+                const sl = el as HTMLSelectElement;
+                return (sl.options[sl.selectedIndex]?.textContent || "").trim();
+              }
+              return String((el as HTMLInputElement).value ?? "").trim();
+            })).catch(() => "");
+            if (shown) this.rowSelectLanded.set(`${n}:${String(s.field ?? "")}`, String(shown));
+          }
+        } finally {
+          this.arrayRowScope = 0;
+        }
+        const note = String(rs.note ?? s.action).slice(0, 70);
+        if (ok) out.done++;
+        else out.skipped.push(rendered ? note : `${note} (its control never rendered in row ${n})`);
+        out.trace.push({ i: this.recipe.steps.indexOf(s), action: s.action, note: note.slice(0, 52), outcome: ok ? "ok" : "SKIPPED" });
+      }
+    } finally {
+      this.arrayPass = savedPass;
+      await this.markArrayRows("unwatch");
+    }
+    return out;
+  }
+
+  /** Does what row `row` shows for step `s` hold the value it should? Numbers by value (a "6"
+   *  is not a "16", which a containment match would bless); selects by the shared read-back
+   *  predicate, the certified make aliases, or exactly what this run saw land in that row. */
+  private rowValueHolds(s: RecipeStep, row: number, got: string, want: string, tag: string): boolean {
+    if (s.action !== "select" && tag !== "select") {
+      const g = toBareNumber(got);
+      const w = toBareNumber(want);
+      if (g !== "" && w !== "") return Number(g) === Number(w);
+      return got.trim() === want.trim();
+    }
+    if (readbackMatches(got, want)) return true;
+    if (this.isManufacturerStep(s) && equipmentMakeCandidates(want).some((alt) => readbackMatches(got, alt))) return true;
+    const landed = this.rowSelectLanded.get(`${row}:${String(s.field ?? "")}`);
+    return !!landed && landed === got.trim();
+  }
+
+  /**
+   * THE READ-BACK THAT COMPARES, ROW BY ROW. For each row the run filed, every per-array value
+   * (qty, make, model, tilt, azimuth) must be on that row and equal ITS array's — a row holding
+   * ANOTHER array's numbers is exactly what the old placeholder-only check blessed (live: row 1
+   * read roof #2's quantity beside roof #1's azimuth). A row that does not hold is re-filled
+   * once, inside that row; a row that still does not hold STOPS the run, naming the row and the
+   * values it should carry. Never "staged" with wrong rows.
+   */
+  private async verifyArrayRowsByRow(): Promise<string | null> {
+    const steps = this.rowStepsInOrder();
+    if (!steps.length || !this.rowArrays.length) return null;
+    type Gap = { row: number; problems: string[]; expected: string[] };
+    const savedPass = this.arrayPass;
+    const audit = async (): Promise<Gap[]> => {
+      // READ WHAT THE PORTAL KEPT, NOT WHAT WAS JUST TYPED. A per-field autosave can be
+      // debounced — nothing on the wire for a beat after the blur — so "the page is quiet"
+      // arrives before the save does, and a portal that rewrites the value on save (another
+      // row's number, a reformat, a refusal) would read as held. Let it answer first.
+      await this.settle(4000);
+      await sleep(ROW_READBACK_GRACE_MS);
+      const rows = await this.readArrayRowsBack();
+      const gaps: Gap[] = [];
+      for (let r = 1; r <= this.rowArrays.length; r++) {
+        const row = rows[r - 1];
+        const problems: string[] = [];
+        const expected: string[] = [];
+        this.arrayPass = r;
+        for (const s of steps) {
+          const want = this.resolveValue(s).trim();
+          if (!want) continue;
+          const name = this.stepLabel(s) || String(s.note ?? s.field ?? "");
+          expected.push(`${name} ${want}`);
+          if (!row) continue;
+          const lbl = name.toLowerCase();
+          const ctl = row.find((c) => {
+            const own = c.label.toLowerCase();
+            return !!own && !!lbl && (own.includes(lbl) || lbl.includes(own));
+          });
+          if (!ctl) { problems.push(`${name} is not on the row`); continue; }
+          const got = String(ctl.value ?? "").trim();
+          if (ctl.placeholder || !got) { problems.push(`${name} is empty`); continue; }
+          if (!this.rowValueHolds(s, r, got, want, ctl.tag)) problems.push(`${name} reads "${got.slice(0, 40)}"`);
+        }
+        if (!row) problems.unshift("the row is not on the page");
+        if (problems.length) gaps.push({ row: r, problems, expected });
+      }
+      return gaps;
+    };
+    try {
+      const first = await audit();
+      if (!first.length) return null;
+      for (const g of first) {
+        this.driftWarnings.push(`array row ${g.row} does not hold its own array (${g.problems.join("; ")}) — re-filling that row once, inside the row`);
+        await this.fillArrayRow(g.row);
+      }
+      const still = await audit();
+      if (!still.length) return null;
+      for (const g of still) {
+        const m = `array row ${g.row}: ${g.problems.join("; ")} — expected ${g.expected.join(", ")}`;
+        if (!this.requiredStillEmpty.includes(m)) this.requiredStillEmpty.push(m);
+      }
+      return `Stopped before review: ${still.length} PV array row(s) still do not hold their own array after one repair inside the row — `
+        + still.map((g) => `row ${g.row} should hold ${g.expected.join(", ")} (${g.problems.join("; ")})`).join(" | ")
+        + ". The application was NOT staged at review; correct these rows by hand before anyone submits.";
+    } finally {
+      this.arrayPass = savedPass;
+    }
+  }
+
+  /**
+   * THE PORTAL REFUSED ANOTHER ROW — the fallback, and only then. An array whose tilt AND
+   * azimuth equal those of a row already filed is folded into that row (quantities summed): the
+   * row's orientation is still true and more of the system is filed. An array matching no row
+   * stays unfiled. Both are stated in the run's warnings; the default stays one row per array.
+   */
+  private async mergeUnaddableArrays(want: number): Promise<void> {
+    const v = (a: number, f: string): string => String(this.fieldValues[`array${a}${f}`] ?? "").trim();
+    const orient = (a: number): string => {
+      const t = toBareNumber(v(a, "Tilt"));
+      const z = toBareNumber(v(a, "Azimuth"));
+      return t !== "" && z !== "" ? `${Number(t)}/${Number(z)}` : "";
+    };
+    const qty = (a: number): number => Number(toBareNumber(v(a, "ModuleQuantity"))) || 0;
+    const rowsHad = this.rowArrays.length;
+    const unfiled: number[] = [];
+    let merged = 0;
+    for (let j = rowsHad + 1; j <= want; j++) {
+      const o = orient(j);
+      const r = o ? this.rowArrays.findIndex((arrs) => orient(arrs[0]) === o) : -1;
+      if (r >= 0) { this.rowArrays[r].push(j); merged++; } else unfiled.push(j);
+    }
+    for (let r = 0; r < this.rowArrays.length; r++) {
+      const arrs = this.rowArrays[r];
+      if (arrs.length < 2) continue;
+      this.rowQtyOverride.set(r + 1, String(arrs.reduce((sum, a) => sum + qty(a), 0)));
+      await this.fillArrayRow(r + 1);
+    }
+    if (!merged && rowsHad === 1) {
+      this.driftWarnings.push(
+        `project has ${want} arrays but no array row could be added — filed array 1 only `
+        + `(${this.fieldValues.array1ModuleQuantity ?? "?"} of ${this.fieldValues.totalModuleQuantity ?? "?"} modules). REVIEW BEFORE SUBMIT.`,
+      );
+      return;
+    }
+    const filed = this.rowArrays.reduce((sum, arrs) => sum + arrs.reduce((s2, a) => s2 + qty(a), 0), 0);
+    const mergedTxt = this.rowArrays
+      .map((arrs, r) => arrs.length > 1
+        ? `row ${r + 1} holds arrays ${arrs.join(" + ")} (same tilt ${v(arrs[0], "Tilt")}° / azimuth ${v(arrs[0], "Azimuth")}°: ${this.rowQtyOverride.get(r + 1)} modules)`
+        : "")
+      .filter(Boolean)
+      .join("; ");
+    this.driftWarnings.push(
+      `project has ${want} arrays but only ${rowsHad} array row(s) could be added on the portal — `
+      + (mergedTxt ? `merged same-orientation arrays as a fallback: ${mergedTxt}; ` : "")
+      + (unfiled.length ? `arrays ${unfiled.join(", ")} NOT filed; ` : "")
+      + `${filed} of ${this.fieldValues.totalModuleQuantity ?? "?"} modules filed. REVIEW BEFORE SUBMIT.`,
+    );
+  }
+
   /**
    * The recorded step re-targeted at array row `pass`. The recorded selector (and each of
    * its fallbacks) ranked Nth among the page-wide matches AT LEARN TIME — one array row on
@@ -2465,35 +2878,18 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  them — each rendered PV Array owns a "Delete Array" control. */
   private async readArrayRowsBack(): Promise<Array<Array<{ label: string; tag: string; value: string; placeholder: boolean }>>> {
     if (!this.page || typeof this.page.evaluate !== "function") return [];
+    // The rows are the ones arrayRowsInPage stamps — the same containers the per-array steps
+    // were scoped to, so the read-back checks exactly the rows the writes went to.
+    await this.markArrayRows();
     return await this.page.evaluate(() => {
       const visible = (el: HTMLElement) => {
         const r = el.getBoundingClientRect();
         return r.width > 0 && r.height > 0;
       };
-      const markers = (Array.from(document.querySelectorAll("a, button, span, div")) as HTMLElement[])
-        .filter((el) => /^(delete|remove)\s+(pv\s+)?array$/i.test((el.innerText || "").trim()) && visible(el));
-      // Innermost only: a wrapper around the real control repeats its innerText.
-      const inner = markers.filter((el) => !markers.some((o) => o !== el && el.contains(o)));
+      const rowEls = (Array.from(document.querySelectorAll("[data-al-arrayrow]")) as HTMLElement[])
+        .sort((a, b) => Number(a.getAttribute("data-al-arrayrow")) - Number(b.getAttribute("data-al-arrayrow")));
       const rows: Array<Array<{ label: string; tag: string; value: string; placeholder: boolean }>> = [];
-      // Section-level controls bound the climb: with ONE rendered row, "contains exactly
-      // one marker" is true of every ancestor up to the page, and the "row" would balloon
-      // to the whole section — reading the INVERTER's Manufacturer for the module step.
-      // Generic adder/section vocabulary: "Add …" and Calculate-style controls live
-      // OUTSIDE any row on every repeater layout seen so far; a wider net here only
-      // stops the climb EARLIER, which is the safe direction.
-      const sectionCtl = (Array.from(document.querySelectorAll("a, button")) as HTMLElement[])
-        .filter((el) => /^add\s|clone\s*system|^(re)?calculate$/i.test((el.innerText || "").trim()) && visible(el));
-      for (const marker of inner) {
-        // The row container: the largest ancestor still containing exactly this one marker
-        // and none of the section-level controls that live OUTSIDE any row.
-        let row: HTMLElement = marker;
-        let up: HTMLElement | null = marker.parentElement;
-        while (up && up !== document.body
-          && inner.filter((m) => up!.contains(m)).length === 1
-          && !sectionCtl.some((c) => up!.contains(c))) {
-          row = up;
-          up = up.parentElement;
-        }
+      for (const row of rowEls) {
         const controls = (Array.from(row.querySelectorAll("input, select, textarea")) as HTMLElement[])
           .filter((el) => visible(el) && (el.getAttribute("type") || "").toLowerCase() !== "hidden");
         rows.push(controls.map((el) => {
@@ -7374,6 +7770,9 @@ export class RecipeAdapter extends BasePortalAdapter {
   // cannot be seen does not end the search; only when NO level yields a visible control does
   // the first non-empty level stand, so the familiar failure is preserved.
   private async resolveLocator(sel?: RecipeSelector, hint?: string) {
+    // A row scope is only as good as its stamp: re-stamp before each resolution, because the
+    // portal re-renders the section (fresh ids, fresh elements) as rows save.
+    if (this.arrayRowScope > 0) await this.markArrayRows();
     const primary = this.locator(sel);
     // A SELECTOR WITH NO FALLBACKS STILL DESERVES THE USABILITY CHECKS.
     //
@@ -7619,7 +8018,11 @@ export class RecipeAdapter extends BasePortalAdapter {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     // frameSelectorFor understands both name/id keys and the "src:<pathname>" keys the
     // learner records for frames with no name/id (incl. cross-origin embeds).
-    const scope: any = sel.frame ? this.page.frameLocator(frameSelectorFor(sel.frame)) : this.page;
+    // #339: while an array row is being filled, every selector resolves INSIDE that row's
+    // container (stamped by arrayRowsInPage) — never by a page-wide rank.
+    const scope: any = sel.frame ? this.page.frameLocator(frameSelectorFor(sel.frame))
+      : this.arrayRowScope > 0 ? this.page.locator(`[data-al-arrayrow="${this.arrayRowScope}"]`)
+        : this.page;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     let loc: any;
     if (sel.role && sel.name) loc = scope.getByRole(sel.role, { name: sel.name, exact: sel.exact });
