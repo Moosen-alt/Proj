@@ -60,6 +60,13 @@ export interface ContactIdentity {
    *  signature step PAUSES for the operator. Carried here because it is the filing contractor's
    *  identity, and this is the object the learn runner already passes through. */
   signerName?: string;
+  /** THE FILING COMPANY'S OWN NAMES — the client record's company name, legal business name and
+   *  DBA (backend learnClientNames reads the client row; never the plan set, never the page).
+   *  Read by the permit-type chooser: a candidate that is, or contains, one of them is the
+   *  installer's own account showing in the portal, never a permit type (#328 — live DevHub's
+   *  header button reads the company name, and nearly every installer's name contains "Solar").
+   *  Carried here for the signerName reason: it is the filing contractor's identity. */
+  ownNames?: string[];
   /** The PROPERTY's assessor parcel number (site contact only) — the ACA work-location pass
    *  searches by it, dashes removed, when the address search finds nothing (Lee County). */
   parcel?: string;
@@ -5662,7 +5669,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           const track = /elec/i.test(this.permitDiscipline) ? "electrical"
             : /struct|build/i.test(this.permitDiscipline) ? "structural"
             : "solar";
-          const picked = await chooseApplicationType(this.page, track).catch(() => null);
+          const picked = await chooseApplicationType(this.page, track, { ownNames: this.contactIdentity.ownNames }).catch(() => null);
           if (picked && picked.ok) {
             const beforeTypeUrl = typeof this.page.url === "function" ? String(this.page.url() ?? "") : "";
             const beforeTypeFp = await this.pageFingerprint();

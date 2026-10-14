@@ -161,6 +161,187 @@ function entryRank(label: string): number {
 }
 
 // ---------------------------------------------------------------------------
+// SITE CHROME AND THE INSTALLER'S OWN ACCOUNT — never a permit type, never a tile (#328).
+//
+// Live Portland DevHub (2026-10-14, after #319): the learner read all nine tiles, then stopped
+// AMBIGUOUS between "Solar Permit Request" and the signed-in installer's account button in the
+// page header —
+//
+//   <div id="signin-menu" class="ms-auto">
+//     <button id="signedin-menu-btn" class="dropdown-toggle" data-bs-toggle="dropdown"
+//       aria-expanded="false"><i class="bi bi-person-fill"></i><div>{company name}</div></button>
+//     <ul class="dropdown-menu" aria-labelledby="userMenuButton"> My Profile · Sign Out </ul>
+//
+// — because the company's name contains "Solar", and #319 made a type that names the job
+// outrank the discipline. Nearly every client's name contains "Solar". The header is a
+// <div id="top-header">, not a <header>, so a frame rule alone does not see it: what gives the
+// button away is that it OPENS A MENU, and the menu holds Sign Out.
+//
+// ONE RESOLVER, READ BY EVERY DOOR. markSiteChromeInPage stamps data-al-chrome="<kind>" (the
+// data-al-activescope precedent: one element marked, consumers read rather than re-decide):
+//
+//   account — a menu toggle whose menu holds an account action (sign/log out|off, my profile,
+//             my account, update profile — loginFlow's words for an account menu), or whose own
+//             label names a user/account menu; that menu; any account-action control; and the
+//             nearest small container NAMED for sign-in/user/account/profile around one of them
+//             (at most three visible controls, so a page wrapper called #userContent is never
+//             swallowed). Anchored on the action, never on a name alone.
+//   toggle  — any other dropdown/popup opener (data-bs-toggle/data-toggle="dropdown",
+//             .dropdown-toggle, aria-haspopup true|menu|listbox, or aria-expanded on a control
+//             whose controlled element IS a menu). A toggle opens a choice; it is never one. An
+//             accordion's aria-expanded (it controls a collapse, not a menu) is not a toggle.
+//   frame   — the page's frame: nav/header/footer and their landmark roles, menus, navbars,
+//             breadcrumbs, and the step-bar vocabulary portalSafety cuts.
+//
+// Which door reads which kind, and why they differ:
+//   - the tile scan and the permit-type chooser refuse ALL kinds: a type is never in the frame,
+//     never a menu opener, never the installer's own account;
+//   - the entry finder refuses ACCOUNT only. Entries legitimately live in navigation —
+//     openCollapsedNav exists precisely to reach one inside a shut menu, and DevHub's own
+//     "Apply For A Permit" sits in <nav role="navigation"> — and an entry can be a dropdown
+//     ("New Application ▾"); cutting either would stop the walk at its first page.
+//
+// <body>/<html> are never stamped: a page-state class ("menu-open") is not chrome.
+//
+// Runs INSIDE the page: self-contained, no module references, no named inner functions.
+// ---------------------------------------------------------------------------
+
+/** Stamp the page's chrome — account, toggle, frame — for every door to read. Returns counts. */
+export function markSiteChromeInPage(): { account: number; toggle: number; frame: number } {
+  for (const prev of Array.from(document.querySelectorAll("[data-al-chrome]"))) prev.removeAttribute("data-al-chrome");
+  const FRAME = "nav, header, footer, [role='navigation'], [role='banner'], [role='contentinfo'], [role='tablist'], "
+    + "[role='menu'], [role='menubar'], [aria-label*='step' i], [class*='stepper'], [class*='steps'], [class*='stepNav'], "
+    + "[class*='step-nav'], [class*='step-header'], [class*='progress'], [class*='breadcrumb'], [class*='navbar'], [class*='menu']";
+  const MENU = ".dropdown-menu, [role='menu'], [role='menubar'], [role='listbox']";
+  const CONTROL = "a, button, [role='button'], input[type='button'], input[type='submit']";
+  // An account ACTION: loginFlow's sign-out words, plus the profile/account entries an account
+  // menu carries. Whole words, so "Profiles of Solar Installations" never reads as one.
+  const ACCOUNT_ACTION = /(log|sign)\s?-?\s?(out|off)\b|\bmy\s+(profile|account)\b|\b(update|edit|view|manage)\s+(my\s+)?(profile|account)\b|\baccount\s+settings\b|^\s*(profile|my account|account)\s*$/i;
+  // A toggle's OWN label naming a user/account menu (EnerGov: "User dropdown menu to update
+  // profile, view invoices, or logout"; "Signed in as …").
+  const ACCOUNT_LABEL = /\b(user|account|profile)\b[^.]{0,40}\b(menu|dropdown)\b|\b(menu|dropdown)\b[^.]{0,40}\b(user|account|profile)\b|\bsigned\s+in\s+as\b/i;
+  // id/class tokens that NAME a sign-in/user/account/profile container (camelCase split).
+  const ACCOUNT_TOKEN = /^(signin|signedin|login|loggedin|logon|user|users|usermenu|account|accounts|myaccount|accountmenu|profile)$/;
+  const counts = { account: 0, toggle: 0, frame: 0 };
+  const root = document.documentElement;
+  const body = document.body;
+
+  const anchors: Element[] = [];
+  // Toggles first: decide "account" or "toggle" by what the menu they open holds.
+  for (const t of Array.from(document.querySelectorAll("[data-bs-toggle='dropdown'], [data-toggle='dropdown'], .dropdown-toggle, [aria-haspopup], [aria-expanded]"))) {
+    if (t === root || t === body) continue;
+    let menu: Element | null = null;
+    const ctl = (t.getAttribute("aria-controls") || "").split(/\s+/).filter(Boolean)[0];
+    if (ctl) menu = document.getElementById(ctl);
+    if (!menu || !menu.matches(MENU)) {
+      menu = null;
+      let s = t.nextElementSibling;
+      for (let k = 0; s && k < 3 && !menu; k++) { if (s.matches(MENU)) menu = s; s = s.nextElementSibling; }
+    }
+    const pop = (t.getAttribute("aria-haspopup") || "").toLowerCase();
+    const declared = t.matches("[data-bs-toggle='dropdown'], [data-toggle='dropdown'], .dropdown-toggle")
+      || pop === "true" || pop === "menu" || pop === "listbox";
+    if (!declared && !menu) continue; // aria-expanded alone — an accordion, a disclosure — is not a toggle
+    const ownLabel = `${t.getAttribute("aria-label") || ""} ${t.getAttribute("title") || ""}`;
+    const accountish = (menu !== null && ACCOUNT_ACTION.test(menu.textContent || ""))
+      || ACCOUNT_LABEL.test(ownLabel);
+    if (accountish) {
+      t.setAttribute("data-al-chrome", "account");
+      if (menu) menu.setAttribute("data-al-chrome", "account");
+      anchors.push(t);
+      counts.account++;
+    } else if (!t.hasAttribute("data-al-chrome")) {
+      t.setAttribute("data-al-chrome", "toggle");
+      counts.toggle++;
+    }
+  }
+  // An account-action control on its own (a plain "Sign Out" link beside the name).
+  for (const c of Array.from(document.querySelectorAll(CONTROL))) {
+    const own = (c.textContent || (c as HTMLInputElement).value || "").replace(/\s+/g, " ").trim();
+    if (!own || own.length > 40 || !ACCOUNT_ACTION.test(own)) continue;
+    if (c.getAttribute("data-al-chrome") !== "account") { c.setAttribute("data-al-chrome", "account"); counts.account++; }
+    anchors.push(c);
+  }
+  // Widen each anchor to the nearest small container NAMED for the account.
+  for (const a of anchors) {
+    let node: Element | null = a.parentElement;
+    for (let hop = 0; node && hop < 4; hop++) {
+      if (node === root || node === body || node.matches("main, form, [role='main']")) break;
+      const tokens = `${node.id || ""} ${typeof node.className === "string" ? node.className : ""}`
+        .replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+      const named = tokens.some((tk) => ACCOUNT_TOKEN.test(tk))
+        || tokens.join(" ").includes("sign in") || tokens.join(" ").includes("signed in") || tokens.join(" ").includes("log in");
+      if (named) {
+        let visible = 0;
+        for (const c of Array.from(node.querySelectorAll(CONTROL))) {
+          const r = c.getBoundingClientRect();
+          if (r.width > 2 && r.height > 2) visible++;
+        }
+        if (visible <= 3) {
+          if (node.getAttribute("data-al-chrome") !== "account") { node.setAttribute("data-al-chrome", "account"); counts.account++; }
+        }
+        break;
+      }
+      node = node.parentElement;
+    }
+  }
+  // The frame last, never over an account mark (the entry finder reads that one).
+  for (const f of Array.from(document.querySelectorAll(FRAME))) {
+    if (f === root || f === body || f.hasAttribute("data-al-chrome")) continue;
+    f.setAttribute("data-al-chrome", "frame");
+    counts.frame++;
+  }
+  return counts;
+}
+
+/** Stamp the chrome in ONE scope. Never throws: an unreadable page is simply unmarked, which
+ *  leaves every door exactly as it was before this existed. */
+export async function markSiteChrome(scope: Page | Frame): Promise<void> {
+  if (!scope || typeof (scope as Frame).evaluate !== "function") return;
+  try { await (scope as Frame).evaluate(markSiteChromeInPage); } catch { /* fail open */ }
+}
+
+// ---------------------------------------------------------------------------
+// THE INSTALLER'S OWN NAME IS NEVER A PERMIT TYPE — belt and braces for a portal that renders
+// the signed-in company outside any chrome the resolver can see. The names come from the
+// project's CLIENT RECORD (company, legal business name, DBA — backend learnClientNames),
+// never from the page.
+//
+// A name is usable only when it can be told apart from a type: after the corporate suffix is
+// dropped, at least one of its words must lie outside the job/type vocabulary. A client
+// literally called "Solar Systems Inc" would otherwise erase "Solar Systems Permit".
+// ---------------------------------------------------------------------------
+const CORPORATE_SUFFIX = new Set(["inc", "incorporated", "llc", "co", "corp", "corporation", "company", "ltd", "limited", "lp", "llp", "pllc", "pc", "plc", "dba"]);
+const TYPE_WORDS = new Set([
+  "solar", "pv", "photovoltaic", "photovoltaics", "energy", "renewable", "renewables", "power", "electric", "electrical",
+  "electrician", "electricians", "permit", "permits", "request", "requests", "system", "systems", "service", "services",
+  "solutions", "installation", "installations", "installer", "installers", "residential", "commercial", "home", "homes",
+  "roof", "roofing", "construction", "contractor", "contractors", "building", "battery", "storage", "interconnection",
+  "the", "and", "of", "a", "an",
+]);
+
+/** Lower-case words, diacritics off, "&" read as "and", dots dropped ("L.L.C." -> "llc"). */
+export function identityWords(text: string): string[] {
+  return String(text ?? "")
+    .normalize("NFKD").replace(/[̀-ͯ]/g, "")
+    .toLowerCase().replace(/&/g, " and ").replace(/[.'’]/g, "")
+    .split(/[^a-z0-9]+/).filter(Boolean);
+}
+
+/** True when `label` IS, or contains, one of the client's own names (whole words, in order). */
+export function isOwnIdentityLabel(label: string, names: readonly string[] | undefined): boolean {
+  if (!names || !names.length) return false;
+  const hay = ` ${identityWords(label).filter((w) => !CORPORATE_SUFFIX.has(w)).join(" ")} `;
+  if (!hay.trim()) return false;
+  for (const name of names) {
+    const words = identityWords(name).filter((w) => !CORPORATE_SUFFIX.has(w));
+    if (!words.length || words.every((w) => TYPE_WORDS.has(w))) continue; // cannot be told apart from a type
+    if (hay.includes(` ${words.join(" ")} `)) return true;
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // CHOICE TILES — a page whose controls are CARDS, not links or buttons.
 //
 // Portland DevHub (live, 2026-10-13) answers "Apply For A Permit" with a column of tiles:
@@ -195,8 +376,9 @@ function entryRank(label: string): number {
 //
 // Never inside page chrome: a chevron-separated step bar is a row of "heading + arrow"
 // siblings — a tile's shape to the letter — and its "Review and Submit" item would reach the
-// review classifier as a button-typed field. The chrome vocabulary is portalSafety's step-bar
-// cut, plus nav/header/footer/menus/tables.
+// review classifier as a button-typed field. Chrome is what markSiteChromeInPage stamped (one
+// resolver for every door: the frame, menu toggles, the installer's own account); the tile scan
+// adds two cuts of its own shape — a table row and an aria-hidden subtree are never a card.
 //
 // Runs INSIDE the page (page.evaluate): self-contained, no module references, and no named
 // inner functions (esbuild's keepNames wraps those in __name, which a raw page lacks — see
@@ -218,9 +400,9 @@ export function markChoiceTilesInPage(): ChoiceTileRaw[] {
     prev.removeAttribute("data-al-tile-label");
   }
   const TITLE = "h1, h2, h3, h4, h5, h6, [class*='title'], [class*='heading'], [class*='header'], strong, b, dt, legend";
-  const CHROME = "nav, header, footer, table, [role='navigation'], [role='tablist'], [role='menu'], [role='menubar'], "
-    + "[aria-hidden='true'], [aria-label*='step' i], [class*='stepper'], [class*='steps'], [class*='stepNav'], "
-    + "[class*='step-nav'], [class*='step-header'], [class*='progress'], [class*='breadcrumb'], [class*='navbar'], [class*='menu']";
+  // Chrome is READ from markSiteChromeInPage's stamps (scanChoiceTiles runs it first); the two
+  // cuts below are the tile scan's own: shapes that are never a card, whatever the page is.
+  const CHROME = "[data-al-chrome], table, [aria-hidden='true']";
   const FILLABLE = "input:not([type='hidden']), select, textarea, [contenteditable='true']";
   const OWN_CONTROL = "button, input[type='button'], input[type='submit'], [role='button']";
   // Material / icon-font ligatures and bare glyphs that draw a forward arrow.
@@ -365,6 +547,8 @@ export interface ChoiceTile {
  */
 export async function scanChoiceTiles(scope: Page | Frame): Promise<ChoiceTile[]> {
   if (!scope || typeof (scope as Frame).evaluate !== "function") return [];
+  // The chrome the tile scan cuts is the chrome every door reads — stamped here, first.
+  await markSiteChrome(scope);
   let raws: unknown;
   try { raws = await (scope as Frame).evaluate(markChoiceTilesInPage); } catch { return []; }
   if (!Array.isArray(raws)) return [];
@@ -398,6 +582,9 @@ export async function findApplicationEntry(page: Page): Promise<{ locator: Locat
   for (const scope of scopes) {
     let scan: { candidates: Array<{ label: string; href: string; index: number; fromText: boolean }>; fillable: number } =
       { candidates: [], fillable: 0 };
+    // The installer's own ACCOUNT controls are never the way in (#328). Only that kind: an entry
+    // legitimately lives in navigation and may be a dropdown — see markSiteChromeInPage.
+    await markSiteChrome(scope);
     try {
       scan = await (scope as Frame).evaluate(() => {
         const vis = (el: Element) => {
@@ -422,6 +609,7 @@ export async function findApplicationEntry(page: Page): Promise<{ locator: Locat
         const meaningful = (t: string): boolean => t.length >= 3 && !/^[+\-–—·•*]+$/.test(t) && !/^[a-z][a-z0-9_]{1,24}$/.test(t);
         const candidates = (Array.from(document.querySelectorAll("a, button, input[type=button], input[type=submit], [role=button]")) as HTMLElement[])
           .filter(vis)
+          .filter((el) => !el.closest("[data-al-chrome='account']"))
           .map((el, index) => {
             const own = ((el as HTMLInputElement).value || el.textContent || "").replace(/\s+/g, " ").trim();
             const aria = (el.getAttribute("aria-label") || "").replace(/\s+/g, " ").trim();
@@ -734,12 +922,19 @@ const TYPE_EXCLUDE: RegExp[] = [
   /\bfees?\b|\binvoices?\b|\bpayments?\b/i,
 ];
 
-export function permitTypeCandidates(labels: string[], track: string): string[] {
+export function permitTypeCandidates(
+  labels: string[],
+  track: string,
+  /** `ownNames`: the client's company / legal / DBA names, from the client record (#328). */
+  opts: { ownNames?: readonly string[] } = {},
+): string[] {
   const eligible = labels.filter((raw) => {
     const label = (raw || "").replace(/\s+/g, " ").trim();
     if (!label || label.length > 80) return false;
     if (TYPE_EXCLUDE.some((re) => re.test(label))) return false;
     if (isExcludedEntryLabel(label)) return false;
+    // The installer's own name is never a permit type, however "Solar" it reads.
+    if (isOwnIdentityLabel(label, opts.ownNames)) return false;
     return true;
   });
   // First tier with a hit wins; several hits in that tier is the caller's ambiguity.
@@ -754,12 +949,20 @@ export function permitTypeCandidates(labels: string[], track: string): string[] 
 export async function chooseApplicationType(
   page: Page,
   track: string,
+  /** `ownNames`: the client's company / legal / DBA names from the CLIENT RECORD — never read
+   *  off the page. A candidate that is, or contains, one of them is never a permit type. */
+  opts: { ownNames?: readonly string[] } = {},
 ): Promise<{ ok: true; choice: PermitTypeChoice } | { ok: false; refusal: PermitTypeRefusal }> {
   const scopes: Array<Page | Frame> = typeof page.frames === "function" ? page.frames() : [page];
   const offeredAll: string[] = [];
   const tilesAll: string[] = [];
   const tileChoices: Array<{ label: string; locator: Locator }> = [];
   for (const scope of scopes) {
+    // A permit type offered as a CARD is a candidate by its title — same vocabulary, same
+    // exclusions, same refusals as a link. The information links inside the cards are in
+    // `labels` below, under their own text, and the exclusion list refuses them there.
+    // Scanned FIRST: scanChoiceTiles stamps the page's chrome, which the label pool reads.
+    const tiles = await scanChoiceTiles(scope);
     let labels: string[] = [];
     try {
       labels = await (scope as Frame).evaluate(() => {
@@ -767,23 +970,23 @@ export async function chooseApplicationType(
           const r = (el as HTMLElement).getBoundingClientRect();
           return r.width > 0 && r.height > 0;
         };
+        // NEVER CHROME (#328): not the frame, not a menu toggle, not the installer's own
+        // account. Live DevHub's account button reads the company's name, which contains
+        // "Solar", and tied with "Solar Permit Request" as the job's type.
         return (Array.from(document.querySelectorAll("a, button, [role=button], input[type=button]")) as HTMLElement[])
           .filter(vis)
+          .filter((el) => !el.closest("[data-al-chrome]"))
           .map((el) => ((el as HTMLInputElement).value || el.textContent || "").replace(/\s+/g, " ").trim())
           .filter((t) => t.length >= 3);
       });
     } catch { labels = []; }
-    // A permit type offered as a CARD is a candidate by its title — same vocabulary, same
-    // exclusions, same refusals as a link. The information links inside the cards are in
-    // `labels` already, under their own text, and the exclusion list refuses them there.
-    const tiles = await scanChoiceTiles(scope);
     const tileLabels = tiles.map((t) => t.label);
     if (!labels.length && !tiles.length) continue;
     for (const l of [...labels, ...tileLabels]) if (!offeredAll.includes(l)) offeredAll.push(l);
     for (const l of tileLabels) if (!tilesAll.includes(l)) tilesAll.push(l);
     for (const t of tiles) tileChoices.push({ label: t.label, locator: (scope as Frame).locator(`[data-al-tile="${t.key}"]`).first() as Locator });
 
-    const matched = [...new Set(permitTypeCandidates([...labels, ...tileLabels], track))];
+    const matched = [...new Set(permitTypeCandidates([...labels, ...tileLabels], track, { ownNames: opts.ownNames }))];
     if (matched.length === 1) {
       const label = matched[0];
       // A link/button that carries the label is the control; a tile is the control only when
@@ -808,6 +1011,7 @@ export async function chooseApplicationType(
   // to the caller as such — never when its title is a real-filing control ("Pay Fees Due",
   // "My Permits", "Resume …"), which the entry vocabulary refuses.
   const singleTile: PermitTypeChoice | undefined = tileChoices.length === 1 && !isExcludedEntryLabel(tileChoices[0].label)
+    && !isOwnIdentityLabel(tileChoices[0].label, opts.ownNames)
     ? { locator: tileChoices[0].locator, label: tileChoices[0].label, kind: "tile" }
     : undefined;
   return { ok: false, refusal: { reason: "none", offered: offeredAll.slice(0, 40), matched: [], tiles: tilesAll, singleTile } };

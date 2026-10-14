@@ -491,6 +491,28 @@ export function learnSignerName(db: AppDb, project: Pick<ProjectRecord, "clientI
   }
 }
 
+/** THE FILING COMPANY'S OWN NAMES, from the CLIENT ROW — company name, legal business name and
+ *  DBA — for the permit-type chooser to refuse (#328: live DevHub showed the signed-in company's
+ *  name, which contains "Solar", in its header, and the chooser read it as a solar permit type).
+ *  Read here like learnSignerName, not from projectFields (which layers plan-set data under the
+ *  client overlay): the rule is that the installer's identity comes from its own record, never
+ *  from a document or the page. Distinct, whitespace-collapsed, non-empty; [] with no client. */
+export function learnClientNames(db: AppDb, project: Pick<ProjectRecord, "clientId">): string[] {
+  if (!project.clientId) return [];
+  try {
+    const row = db.get<{ company_name?: string | null; legal_business_name?: string | null; dba?: string | null }>(
+      "SELECT company_name, legal_business_name, dba FROM clients WHERE id = ?", [project.clientId]);
+    const out: string[] = [];
+    for (const v of [row?.company_name, row?.legal_business_name, row?.dba]) {
+      const name = String(v ?? "").replace(/\s+/g, " ").trim();
+      if (name && !out.some((o) => o.toLowerCase() === name.toLowerCase())) out.push(name);
+    }
+    return out;
+  } catch {
+    return [];
+  }
+}
+
 export function buildPortalPlanner(
   db: AppDb,
   project: ProjectRecord,
@@ -1152,6 +1174,8 @@ async function autoLearnPortalInner(
         // here from the row, not from projectFields (which layers the plan-set snapshot under the
         // client overlay). No signer = the typed signature step pauses for the operator.
         signerName: learnSignerName(db, project),
+        // The company's own names, from the client row: never a permit type (#328).
+        ownNames: learnClientNames(db, project),
         // "Full Name" / "Name of Business" (City of Corvallis's Applicant dialog) — the SAME keys
         // the operator-approved building recipe binds that dialog to (installerContactName /
         // installerCompanyName). Without them the pass typed no name, the dialog refused its

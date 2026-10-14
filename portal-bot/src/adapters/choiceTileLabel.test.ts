@@ -127,5 +127,37 @@ check("two solar-named tiles stay AMBIGUOUS — the chooser reports both so the 
   assert.equal(two.length, 2, JSON.stringify(two));
 });
 
+// #328 — THE INSTALLER'S OWN NAME IS NEVER A PERMIT TYPE. Live DevHub showed the signed-in
+// company in its header; the name contains "Solar" and tied with "Solar Permit Request". The
+// names come from the client record (company / legal / DBA), never the page.
+const isOwnIdentityLabel = (entry as { isOwnIdentityLabel?: (label: string, names: readonly string[]) => boolean }).isOwnIdentityLabel;
+const OWN = ["Placeholder Solar Co", "Placeholder Solar Holdings, L.L.C.", "Bright Path Energy"];
+
+check("THE OWN NAME: a label that IS or CONTAINS the client's name is recognised, case/punctuation-insensitive", () => {
+  assert.equal(typeof isOwnIdentityLabel, "function", "applicationEntry exports isOwnIdentityLabel");
+  assert.equal(isOwnIdentityLabel!("Placeholder Solar Co", OWN), true);
+  assert.equal(isOwnIdentityLabel!("PLACEHOLDER SOLAR, INC.", OWN), true, "corporate suffix and punctuation ignored");
+  assert.equal(isOwnIdentityLabel!("Welcome, Placeholder Solar", OWN), true, "contains the name");
+  assert.equal(isOwnIdentityLabel!("Bright Path Energy LLC", OWN), true, "the DBA too");
+});
+
+check("...and never a permit type, or a name it only shares a word with", () => {
+  assert.equal(isOwnIdentityLabel!("Solar Permit Request", OWN), false);
+  assert.equal(isOwnIdentityLabel!("Placeholder Permit", OWN), false, "one shared word is not the name");
+  assert.equal(isOwnIdentityLabel!("Residential Solar Permit", OWN), false);
+});
+
+check("MUST EXCLUDE: a client name made only of job/type words can't be told from a type, so it is never used", () => {
+  assert.equal(isOwnIdentityLabel!("Solar Permit Request", ["Solar Inc"]), false, "\"Solar Inc\" must not erase a solar permit");
+  assert.equal(isOwnIdentityLabel!("Solar Energy Systems Permit", ["Solar Energy Systems, LLC"]), false);
+});
+
+check("THE DECISION (#328): with the account name among the candidates, every track picks the solar tile ALONE", () => {
+  for (const track of ["solar", "electrical", "structural"]) {
+    const picked = permitTypeCandidates(["Placeholder Solar Co", ...PORTLAND_TILES, ...PORTLAND_LINKS], track, { ownNames: OWN } as never);
+    assert.deepEqual(picked, ["Solar Permit Request"], `${track}: ${JSON.stringify(picked)}`);
+  }
+});
+
 if (failures) { console.error(`\n${failures} choiceTileLabel check(s) FAILED.`); process.exit(1); }
 console.log("\nAll choiceTileLabel checks passed.");
