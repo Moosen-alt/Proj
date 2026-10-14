@@ -6244,16 +6244,19 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //      input on the page and none of the review screen's OWN shape — a submit-worded or
       //      final-submit control, a terms/certify box, a review URL — prose about review or
       //      submission no longer makes it one. ONLY EVER FEWER REVIEW PAGES, AND NEVER WHERE DATA
-      //      COULD EXIST: a run that continues a draft or resumes after a signature carries
-      //      entries this run did not make, so it keeps the old reading in full; any submit-shaped
-      //      control keeps the old reading; nothing here touches what the backstop reads.
+      //      COULD EXIST: a run that OPENED an existing draft (continuedDraft) or read a record's
+      //      signature to resume (signatureCheck) carries entries this run did not make, so it
+      //      keeps the old reading in full. (Not the continueDraft OPTION: every NEM stage passes
+      //      one to LOOK for a draft, and a run that found none is starting fresh.) Any
+      //      submit-shaped control keeps the old reading; nothing here touches what the backstop
+      //      reads.
       const onPageControl = (f: ExtractedField): boolean =>
         !navOnly.has(String(f.label ?? "").replace(/\s+/g, " ").trim().toLowerCase());
       const reviewShaped = hasSubmitIntentBtn || hasAcceptTermsCheckbox || looksLikeReviewUrl(url)
         || fields.some((f) => f.fieldType === "button" && onPageControl(f) && isFinalSubmitControl(f.label));
       const plannerSaidReview = plan.atReview === true;
       const interstitial = !hasFillable && !reviewShaped && !anyFormMutationRecorded && !entryDisclaimer
-        && !this.continueDraft && !this.continuedDraft && !this.signatureCheck && !signatureDone
+        && !this.continuedDraft && !this.signatureCheck && !signatureDone
         && (!isDashboard || plannerSaidReview);
       const isReviewPage =
         ((!hasFillable && !isDashboard) ||

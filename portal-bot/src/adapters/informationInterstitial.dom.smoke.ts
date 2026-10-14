@@ -38,11 +38,17 @@
 //                     Previous as its advance: nothing is clicked, nothing is review.
 //   [6] MUST EXCLUDE — the same prose above a list of records whose rows each say "Continue":
 //                     not one way forward, so no row is pressed (and nothing is review).
+//   [7] NEM STAGE   — a run that LOOKED for an existing draft (every NEM stage passes the
+//                     continueDraft option) and found none is starting fresh: the interstitial
+//                     is passed exactly as in [2].
+// In [1], [2] and [7] the sidebar's records / fees / corrections / profile pages are never
+// requested (the upload pass now runs on the interstitial, and the sidebar is on every page).
 //
-// Against origin/main's autoLearnAdapter.ts this is 29 FAIL banners, not a crash: main stops at
-// every interstitial as review (lockReview armed there, "advance: Next" never recorded) and, under
-// [2]'s planner, records the interstitial's Next as an isFinalSubmit step. [3] cannot be reached
-// on main (the walk never gets past the interstitial); its rule-1 lines hold on both.
+// Against origin/main's autoLearnAdapter.ts every MUST PASS line above is a FAIL banner, not a
+// crash: main stops at every interstitial as review (lockReview armed there, "advance: Next"
+// never recorded) and, under [2]'s planner, records the interstitial's Next as an isFinalSubmit
+// step. [3] cannot be reached on main (the walk never gets past the interstitial); its rule-1
+// lines hold on both.
 //
 //   npx tsx portal-bot/src/adapters/informationInterstitial.dom.smoke.ts
 import "../smokeArtifactDirs"; // hand-run safe: artifact dirs default to a temp folder, never data/
@@ -193,7 +199,7 @@ const reviewNextPage = (p: string, addr: string): string => shell(p, {
   nav: PREV_NEXT,
 });
 
-const PREFIXES = ["/post", "/get", "/next-files", "/stuck", "/noforward", "/rows"] as const;
+const PREFIXES = ["/post", "/get", "/next-files", "/stuck", "/noforward", "/rows", "/nem"] as const;
 const hits: Array<{ method: string; url: string }> = [];
 const server = http.createServer((q, r) => {
   const url = q.url || "/";
@@ -260,7 +266,7 @@ interface Walk {
   notes: string[]; finals: string[]; events: Array<Record<string, unknown>>; locks: string[]; hits: Array<{ method: string; url: string }>;
   plannerPages: string[];
 }
-const runLearn = async (prefix: string, planner: (req: LearnPlanRequest) => LearnPlanResponse | null): Promise<Walk> => {
+const runLearn = async (prefix: string, planner: (req: LearnPlanRequest) => LearnPlanResponse | null, options: Record<string, unknown> = {}): Promise<Walk> => {
   const before = hits.length;
   const pw = await ctx.newPage();
   await pw.goto(`${base}${prefix}/home`);
@@ -269,7 +275,7 @@ const runLearn = async (prefix: string, planner: (req: LearnPlanRequest) => Lear
     plannerPages.push(pathOf(req.url));
     return planner(req) ?? { fills: [], atReview: false };
   };
-  const a = new AutoLearnAdapter("Interstitial Walk", plan, { maxPages: 8, budgetMs: 240_000 });
+  const a = new AutoLearnAdapter("Interstitial Walk", plan, { maxPages: 8, budgetMs: 240_000, ...options });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (a as any).page = pw;
   // Every debug event the walk emits (the run bundle's timeline), captured in order.
@@ -306,6 +312,10 @@ const runLearn = async (prefix: string, planner: (req: LearnPlanRequest) => Lear
 const pageTrace = (w: Walk, path: string): string =>
   String(w.events.find((e) => e.type === "page" && String(e.trace ?? "").includes(path))?.trace ?? "");
 const interstitialEvents = (w: Walk) => w.events.filter((e) => e.type === "interstitial_not_review");
+/** The sidebar's / footer's / header's other destinations: the account's records, fees,
+ *  corrections, profile, help, policy pages, and the wrong tile. None is ever the way forward. */
+const OFF_PATH = /^\/[a-z-]+\/(profile|my-permits|fees|corrections|help|ada|privacy|about|unknown|other-type|cancel)\b/;
+const offPath = (w: Walk): string[] => w.hits.map((h) => h.url).filter((u) => OFF_PATH.test(u));
 
 // ===========================================================================================
 // [0] The forward control's vocabulary — both directions.
@@ -342,6 +352,7 @@ console.log("\n[1] the captured Permitting Information page (POST form): home �
     w.notes.includes("advance: Next") && !w.notes.some((n) => /previous/i.test(n)), JSON.stringify(w.notes));
   check("nothing was recorded as a final submit", w.finals.length === 0, JSON.stringify(w.finals));
   check("the run did not end 'at review'", w.reachedReview !== true, `reachedReview=${w.reachedReview} message=${w.message}`);
+  check("no records / fees / corrections / profile page was ever requested", offPath(w).length === 0, JSON.stringify(offPath(w)));
   // KNOWN RESIDUAL (filed separately, not this issue's file): the network backstop reads the
   // same page as terminal (shared reviewSignals: "review your submission"), so the Next's form
   // POST is aborted and the run stops NAMED by the backstop. Reported here so the line is seen.
@@ -383,6 +394,7 @@ console.log("\n[2] the interstitial → the form page → the real review page (
   check("'Submit Application' is recorded as the final submit (recorded, NOT clicked)",
     w.finals.length === 1 && /Submit Application/.test(w.finals[0]) && /NOT clicked/.test(w.finals[0]), JSON.stringify(w.finals));
   check("the filing POST never reached the server", !w.hits.some((h) => h.url.startsWith("/get/file")), JSON.stringify(w.hits.map((h) => `${h.method} ${h.url}`)));
+  check("no records / fees / corrections / profile page was ever requested", offPath(w).length === 0, JSON.stringify(offPath(w)));
 }
 
 // ===========================================================================================
@@ -456,6 +468,31 @@ console.log("\n[6] MUST EXCLUDE: review prose above three record rows, each with
   check("three same-worded controls are not ONE way forward: no forward control adopted",
     interstitialEvents(w).some((e) => e.forward === null && e.candidates === 3), JSON.stringify(interstitialEvents(w)));
   check("no row's Continue was pressed", !w.hits.some((h) => h.url.startsWith("/rows/clicked-continue")), JSON.stringify(w.hits.map((h) => h.url)));
+}
+
+// ===========================================================================================
+// [7] A NEM STAGE: the run was told to LOOK for this project's draft (every NEM stage is) and
+//     there is none on the portal — it is starting fresh, so the interstitial is passed.
+// ===========================================================================================
+console.log("\n[7] an NEM-stage run (continueDraft option set, no draft on the portal)");
+{
+  const w = await runLearn("/nem", (req) => {
+    const at = pathOf(req.url);
+    if (at === "/nem/project") return { fills: [{ selectorIndex: idx(req, "Site Address"), value: ADDRESS }], atReview: false, advanceSelectorIndex: idx(req, "Next") };
+    if (at === "/nem/review") return { fills: [], atReview: true, finalSubmitSelectorIndex: idx(req, "Submit Application") };
+    return null;
+  }, { continueDraft: { street: ADDRESS, city: "Springfield", zip: "62701" } });
+  check("premise: the run looked for an existing draft and found none",
+    w.events.some((e) => e.type === "existing_draft" && e.kind === "none"), JSON.stringify(w.events.filter((e) => e.type === "existing_draft")));
+  check("the interstitial is still not review: Next is the way forward",
+    interstitialEvents(w).some((e) => e.forward === "Next"), JSON.stringify(interstitialEvents(w)));
+  check("Next was clicked exactly once and the walk reached the form page",
+    w.hits.filter((h) => h.url.startsWith("/nem/sg?") && h.url.includes("t_n1685049573549")).length === 1 && w.plannerPages.includes("/nem/project"),
+    JSON.stringify({ hits: w.hits.map((h) => h.url), planner: w.plannerPages }));
+  check("...and stopped at the real review page, lockReview armed there only",
+    w.reachedReview === true && pathOf(w.url) === "/nem/review" && w.locks.length === 1 && w.locks[0].startsWith("/nem/review ::"),
+    JSON.stringify({ reachedReview: w.reachedReview, url: w.url, locks: w.locks, message: w.message }));
+  check("no records / fees / corrections / profile page was ever requested", offPath(w).length === 0, JSON.stringify(offPath(w)));
 }
 
 await browser.close();
