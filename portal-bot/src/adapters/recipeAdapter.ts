@@ -96,7 +96,7 @@ import { openPortal } from "../browser";
 import { selectWithFallback } from "../comboboxFill";
 import {
   classifySubmissionText, finalSubmitEnvAllows, finalSubmitRefusals, isFinalSubmitControl, isPayFee, isPayNowDialogText, mayClickFinalSubmit,
-  isRecipeShapeValid, isSignatureNameLabel, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
+  isRecipeShapeValid, isSignatureNameLabel, isSignatureRequestControl, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
   type HealedStep, type RunApproval, type SubmissionOutcome,
 } from "../../../shared/src/portalSafety";
 import { commitField, installSettleProbe, waitForSettled } from "../settle";
@@ -4828,6 +4828,10 @@ export class RecipeAdapter extends BasePortalAdapter {
       // Only executeClick's flagged branch sets this, after finalSubmitRefusalsNow() passed.
       return "";
     }
+    // 1b) A SIGNATURE REQUEST (#308: PowerClerk's "Request Signatures" emails the homeowner a DocuSign
+    //     request). Not the filing, but never a replay's to click: only the learner clicks it, in a run
+    //     a named person approved (signatureRequestGate).
+    if (isSignatureRequestControl(label)) return refuse(`"${label.slice(0, 60)}" sends the homeowner a signature request — a person clicks it, or an approved run`);
     const ctx = await this.pageSafetyContext();
     // 2) THE filing click, as the shared predicate knows it: submit-worded, or "Continue
     //    Application" on a page that names itself the review step.

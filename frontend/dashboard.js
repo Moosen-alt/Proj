@@ -5040,7 +5040,11 @@ function trackCardHtml(t) {
     <div class="track-actions">
       <button type="button" class="secondary" data-track-stage="${esc(t.type)}" title="Auto-fill this filing's portal up to the final review screen — you submit manually"><i data-lucide="bot"></i><span>Stage in portal</span></button>
       <button type="button" class="secondary" data-track-approve="${esc(t.type)}" title="Your approval of THIS run lets the bot click the portal's application submit (needs the server switch PORTAL_ALLOW_FINAL_SUBMIT=1 and a recipe recorded through submit; otherwise it stages to review for you). Never pays fees; stops for CAPTCHA/MFA."><i data-lucide="check-check"></i><span>Approve &amp; auto-submit</span></button>
+      ${t.signatureRequest && t.signatureRequest.state === "awaiting_signature_request"
+        ? `<button type="button" class="secondary" data-track-request-signatures="${esc(t.type)}" title="The last run stopped in front of the utility portal's Request Signatures. Your approval of THIS run lets the bot click it once: the utility emails the homeowner a DocuSign request. It files nothing; the application is submitted only after the homeowner signs."><i data-lucide="pen-line"></i><span>Approve &amp; request signatures</span></button>`
+        : ""}
     </div>
+    ${t.signatureRequest && t.signatureRequest.state ? `<p class="muted" style="font-size:12px;margin:4px 0" data-track-signature-state="${esc(t.signatureRequest.state)}">Signature step: ${esc(t.signatureRequest.state === "awaiting_signature_request" ? "awaiting signature request (consents ticked, eSign chosen, document previewed)" : t.signatureRequest.state === "awaiting_customer_signature" ? "signature requested — awaiting the homeowner's DocuSign signature; not submitted yet" : "a signature request was clicked but not confirmed — check the portal before anyone clicks it again")}</p>` : ""}
     ${recipeBlock}
     ${trackIssuerEditHtml(t)}
     <details class="track-submit"${t.status === "staged" ? " open" : ""}>
@@ -5110,6 +5114,13 @@ function renderSubmittalTracks() {
       stageSubmittalTrack(btn.dataset.trackApprove, btn, true);
     });
   });
+  wrap.querySelectorAll("button[data-track-request-signatures]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (!confirm("Approve & request signatures?\n\nThis is your approval of THIS run, recorded under your name: the bot re-opens the staged application and clicks the utility portal's Request Signatures once, which emails the homeowner a DocuSign request. It files nothing and never chooses Sign and Upload. If anything on the signature step is not as staged, it stops in front of the button for you.")) return;
+      const approverName = String(prompt("Your name, recorded as the approver of this signature request:") || "").trim();
+      stageSubmittalTrack(btn.dataset.trackRequestSignatures, btn, false, { requestSignatures: true, approverName });
+    });
+  });
   wrap.querySelectorAll("button[data-track-stage]").forEach((btn) => {
     btn.addEventListener("click", () => stageSubmittalTrack(btn.dataset.trackStage, btn));
   });
@@ -5147,7 +5158,7 @@ function renderSubmittalTracks() {
   if (window.lucide) window.lucide.createIcons();
 }
 
-async function stageSubmittalTrack(type, btn, autoSubmit = false) {
+async function stageSubmittalTrack(type, btn, autoSubmit = false, extra = null) {
   if (!state.selectedProjectId || !type) return;
   if (btn) { btn.disabled = true; }
   showMessage(autoSubmit
@@ -5156,7 +5167,7 @@ async function stageSubmittalTrack(type, btn, autoSubmit = false) {
   try {
     // Staging runs as a background job (202 + jobId); poll to completion, then refetch detail.
     const { jobId } = await api(`/api/projects/${state.selectedProjectId}/prepare-submission`, {
-      method: "POST", body: JSON.stringify({ track: type, autoSubmit }),
+      method: "POST", body: JSON.stringify({ track: type, autoSubmit, ...(extra || {}) }),
     });
     const job = await waitForStagingJob(jobId);
     if (job.status === "failed") {

@@ -98,6 +98,7 @@ import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCreden
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
 import { logger } from "./logger";
 import { draftContinuationGaps, openPortalDraftFor, recordPortalDraft, type ObservedDraft } from "./portalDraft";
+import { claimSignatureRequestApproval, runningJobSignatureRequestApprovalId } from "./signatureRequestApproval";
 import { siteKey } from "../../portal-bot/src/draftCreated";
 import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, type HostFit, type PortalUrlSource } from "./portalChannel";
 import { isPortalPaused } from "./portalPause";
@@ -1379,6 +1380,8 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     db.run("DELETE FROM portal_runs WHERE project_id = ?", [projectId]);
     // Approve & Submit approvals (migration v35) carry a FK to projects.
     db.run("DELETE FROM portal_run_approvals WHERE project_id = ?", [projectId]);
+    // Approve & request signatures approvals (migration v48, #308) carry the same FK.
+    db.run("DELETE FROM portal_signature_request_approvals WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM submissions WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM human_review_items WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM corrections WHERE project_id = ?", [projectId]);
@@ -8290,6 +8293,9 @@ export async function prepareSubmission(
   /** The approval THIS request minted (Approve & Submit). Omitted by the job handler: the running
    *  job's payload carries it. With neither, the run claims nothing and stops at review. */
   approvalId?: string | null,
+  /** The signature-request approval THIS request minted (Approve & request signatures, #308).
+   *  Omitted by the job handler: the running job's payload carries it. */
+  signatureRequestApprovalId?: string | null,
 ): Promise<ProjectDetail> {
   const detail = getProjectDetail(db, projectId);
   // A FINAL SUBMIT WAS ASKED FOR: take the named approval the Approve & Submit action recorded for
@@ -8314,7 +8320,26 @@ export async function prepareSubmission(
       reason: "no live approval by that id for this project and track — the run stops at review",
     });
   }
-  const runId = claimedApproval?.id ?? id();
+  // A SIGNATURE REQUEST WAS APPROVED (#308: PSE PowerClerk's Request Signatures, a DocuSign email to
+  // the homeowner). The same discipline as the final-submit approval above, in its own table: claimed
+  // by id, here, before the first gate, so a refused run has spent it; its id becomes the run's id.
+  // NEM only. It authorises nothing about the filing: the final submit's own gate is unchanged.
+  const signatureApprovalWanted = (signatureRequestApprovalId ?? runningJobSignatureRequestApprovalId(db, projectId)) || null;
+  const claimedSignatureApproval = signatureApprovalWanted && !claimedApproval
+    ? claimSignatureRequestApproval(db, projectId, track ?? "", signatureApprovalWanted)
+    : null;
+  if (claimedSignatureApproval) {
+    addAuditLog(db, projectId, "system", "signature request gate", "portal.signature_request_approval_claimed", {
+      approvalId: claimedSignatureApproval.id, approvedBy: claimedSignatureApproval.approver, track: track ?? null,
+    });
+  } else if (signatureApprovalWanted) {
+    addAuditLog(db, projectId, "system", "signature request gate", "portal.signature_request_approval_missing", {
+      track: track ?? null, approvalId: signatureApprovalWanted,
+      reason: claimedApproval ? "a final-submit approval drives this run; a run carries one approval" : "no live approval by that id for this project and track — the run stops in front of Request Signatures",
+    });
+  }
+  const runId = claimedApproval?.id ?? claimedSignatureApproval?.id ?? id();
+  const signatureRequestApproval = claimedSignatureApproval ? { approver: claimedSignatureApproval.approver, runId } : null;
   // AN OPERATOR'S HOLD STOPS STAGING — first, before anything is billed, built or opened.
   const hold = operatorHoldReason(db, projectId);
   if (hold !== null) {
@@ -9543,6 +9568,9 @@ export async function prepareSubmission(
             continueDraft: siteDraftParts
               ? { ...siteDraftParts, applicationNumber: nemDraft?.applicationNumber || undefined, nextForm: nemDraft?.nextForm || undefined, required: Boolean(nemDraft) }
               : undefined,
+            // THIS RUN'S SIGNATURE-REQUEST APPROVAL (#308), claimed above; the gate decides at the click.
+            signatureRequestApproval,
+            runId,
           });
           result = seedOutcomeToStageResult(seed);
           // Say WHY this stage learned instead of replaying, so a re-learn on an AHJ that

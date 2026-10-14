@@ -190,15 +190,20 @@ export function seedOutcomeToStageResult(seed: {
   // Path of the learn run's debug bundle — threaded into portal_runs.logs_path so a failed
   // stage links straight to its forensic artifacts (screenshots, trace, LLM call log).
   debugDir?: string | null;
+  // The walk ended at the signature-request step (#308). Its state is the run's REVIEW STATE
+  // (result_json.reviewState: "awaiting_signature_request", or "awaiting_customer_signature" after an
+  // approved run's request), read by the track card. Never a filing: finalSubmitClicked stays false.
+  signatureStep?: { state: string } | null;
 }): Record<string, unknown> {
   const debugDir = seed.debugDir ?? null;
+  const sig = seed.signatureStep ? { reviewState: seed.signatureStep.state, signatureStep: seed.signatureStep } : {};
   if (seed.status === "paused") {
-    return { ok: false, finalSubmitClicked: false, pauseReason: seed.pauseReason, message: seed.message, steps: [], debugDir };
+    return { ok: false, finalSubmitClicked: false, pauseReason: seed.pauseReason, message: seed.message, steps: [], debugDir, ...sig };
   }
   if (seed.status === "failed") {
-    return { ok: false, finalSubmitClicked: false, pauseReason: null, message: seed.message, steps: [{ ok: false, message: seed.message }], debugDir };
+    return { ok: false, finalSubmitClicked: false, pauseReason: null, message: seed.message, steps: [{ ok: false, message: seed.message }], debugDir, ...sig };
   }
-  return { ok: true, finalSubmitClicked: false, pauseReason: null, message: seed.message, steps: [], debugDir };
+  return { ok: true, finalSubmitClicked: false, pauseReason: null, message: seed.message, steps: [], debugDir, ...sig };
 }
 
 

@@ -770,6 +770,21 @@ export function getSubmittalTracks(db: AppDb, project: ProjectRecord): Submittal
     }
     if (!recipeRow && !borrowedRecipe) recipeRow = cardRecipe(findAnyRecipeForProject(db, resolverInput));
 
+    // WHERE THE LAST NEM RUN STOPPED, WHEN IT WAS THE SIGNATURE-REQUEST STEP (#308): the card offers
+    // "Approve & request signatures" only in front of Request Signatures (result_json.reviewState).
+    let signatureRequest: SubmittalTrackView["signatureRequest"] = null;
+    if (type === "nem") {
+      const last = db.get<Row>(
+        `SELECT result_json, started_at FROM portal_runs
+          WHERE project_id = ? AND permit_type IN (${family.map(() => "?").join(",")}) AND run_type = 'prepare_submit'
+          ORDER BY started_at DESC, rowid DESC LIMIT 1`,
+        [project.id, ...family],
+      );
+      let reviewState = "";
+      try { reviewState = String((JSON.parse(s(last?.result_json) || "{}") as { reviewState?: unknown }).reviewState ?? ""); } catch { /* unreadable: not at that step */ }
+      if (reviewState) signatureRequest = { state: reviewState, at: s(last?.started_at) };
+    }
+
     // Fallback portal URL when no recipe exists yet — used by the credential-matching
     // chip so the operator can store a login before recording. Try in order:
     // 1. KB profile (user-accumulated knowledge from previous projects)
@@ -827,6 +842,7 @@ export function getSubmittalTracks(db: AppDb, project: ProjectRecord): Submittal
       recipeId: recipeRow ? s(recipeRow.id) : undefined,
       recipeScopeType: scopeType,
       borrowedRecipe,
+      ...(type === "nem" ? { signatureRequest } : {}),
       ...(issuer ? { issuer } : {}),
     };
   });

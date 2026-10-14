@@ -24,6 +24,8 @@ import { chooseDraftForm, findSiteDraft, isDraftFormRefusal, modificationOnOrigi
 import { scanProjectForms, type ProjectFormRow } from "./correctionForm";
 import { readApplicationLedgerInPage, type LedgerEntry } from "./submissionLedger";
 import { LIST_LINK } from "../statusFinder";
+import { readSignatureRequestStep, stageSignatureRequestStep, type SignatureStepOutcome } from "./signatureRequestStep";
+import type { SignatureRequestApproval } from "../../../shared/src/signatureRequestGate";
 
 /** See AutoLearnAdapter's continueDraft option (#302). */
 export interface ContinueDraft {
@@ -40,7 +42,7 @@ export interface ContinueDraft {
   /** A draft is ON RECORD for this project: never start a new application. */
   required?: boolean;
 }
-import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isSignatureNameLabel, isTypeSignatureToggleLabel, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
+import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
 import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
 import { hostOfUrl, sameCredentialScope } from "../siteOf";
@@ -240,6 +242,10 @@ export interface LearnResult {
   /** This walk opened the project's EXISTING draft and continued it (#302) instead of starting
    *  an application. Its steps start inside that one record, so they are not a recipe. */
   continuedDraft?: { applicationNumber: string; form: string; why: string };
+  /** The walk ended at a SIGNATURE-REQUEST step (#308: PSE Part 2 step 4): what it staged there
+   *  (consents, eSign, Preview Document), and whether Request Signatures was left for a person
+   *  (state "awaiting_signature_request", the default) or clicked in an approved run. */
+  signatureStep?: SignatureStepOutcome;
 }
 
 // Live progress signal emitted while learning a portal, so the UI can show a real
@@ -903,6 +909,7 @@ export function isForwardExitLabel(label: string | undefined): boolean {
  *  re-admitted by the exemption as if it were a way forward. */
 function rawIsOffLimits(r: RawField): boolean {
   return isPayFee(r.label) || isPayFee(r.name) || isPayFee(r.text)
+    || isSignatureRequestControl(r.label) || isSignatureRequestControl(r.text)
     || EXISTING_RECORD_ACTION.test(r.label || "")
     || EXISTING_RECORD_ACTION.test(r.name || "")
     || EXISTING_RECORD_ACTION.test(r.text || "");
@@ -1075,7 +1082,7 @@ export type TerminalVerdict =
 /** isOffLimitsButton at module scope, so the classifier and the click paths refuse the same
  *  controls without the classifier needing an adapter instance. */
 function labelIsOffLimits(label: string): boolean {
-  return isPayFee(label) || EXISTING_RECORD_ACTION.test(label);
+  return isPayFee(label) || EXISTING_RECORD_ACTION.test(label) || isSignatureRequestControl(label);
 }
 
 /** Does the terminal verb in this label govern an APPLICATION, or something else entirely?
@@ -2074,6 +2081,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   private continueDraft: ContinueDraft | undefined;
   /** The existing draft this walk opened instead of starting an application (#302). */
   private continuedDraft: LearnResult["continuedDraft"];
+  /** #308 — see the signatureRequestApproval option. */
+  private signatureRequestApproval: SignatureRequestApproval | null;
+  private runId: string;
+  /** What the signature-request step staged, once the walk reached it (#308). */
+  private signatureStep: SignatureStepOutcome | undefined;
   /** Lines for the person at review that come from the PAGE, not the run (#302: PSE's red
    *  "file as a modification on the original record" notice). */
   private pageReviewNotes: string[] = [];
@@ -2267,6 +2279,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
        *  - Part 2" [Begin]). `required`: a draft is on record, so a new application is never
        *  started: a draft that cannot be opened stops the run, named. */
       continueDraft?: ContinueDraft;
+      /** A NAMED PERSON'S APPROVAL OF THIS RUN'S SIGNATURE REQUEST (#308), and the run's id. With
+       *  neither, the walk stops in front of Request Signatures; with both, signatureRequestGate
+       *  still decides at the click. Never PORTAL_ALLOW_FINAL_SUBMIT: it files nothing. */
+      signatureRequestApproval?: SignatureRequestApproval | null;
+      runId?: string;
     } = {},
   ) {
     super();
@@ -2276,6 +2293,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     this.bindableFields = new Set(options.bindableFields ?? []);
     this.siteIdentity = options.siteIdentity;
     this.continueDraft = options.continueDraft;
+    this.signatureRequestApproval = options.signatureRequestApproval ?? null;
+    this.runId = String(options.runId ?? "");
     this.allowFinalSubmit = options.allowFinalSubmit === true;
     this.hasBattery = options.hasBattery;
     this.equipment = options.equipment ?? {};
@@ -3518,6 +3537,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // held back (a section may render incomplete). The learner cannot tell how the page was
       // reached, so the advice is the portal's own navigation, never a reload.
       if (this.continuedDraft) result = { ...result, continuedDraft: this.continuedDraft };
+      if (this.signatureStep) {
+        const sig = this.signatureStep;
+        result = { ...result, signatureStep: sig, message: `${result.message} SIGNATURE STEP: ${sig.why}.` };
+      }
       if (result.reachedReview) {
         const reviewUrl = (() => { try { return typeof this.page?.url === "function" ? String(this.page.url() || "") : ""; } catch { return ""; } })();
         const blockedCalls = backstop ? portalOwnCallsBlockedAtReview(backstop.aborts, reviewUrl) : [];
@@ -5725,6 +5748,34 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             ...fail(steps, this.portalName, `Stopped before starting an application: ${opened.why}. This project already has a draft on the portal${this.continueDraft.applicationNumber ? ` (${this.continueDraft.applicationNumber})` : ""}, and starting again would create a second one. Open the draft by hand, or correct the recorded draft, then stage again.`, null, pageCount, portalNotices),
             stopReason: "existing_draft_not_opened",
           };
+        }
+      }
+
+      // b8y) THE SIGNATURE-REQUEST STEP (#308; PSE Part 2 step 4 "Project Agreements and
+      //      Signature"). A page that offers "Request Signatures" (a DocuSign email to the homeowner)
+      //      is staged deterministically and ENDS the walk: required consents ticked, eSign selected
+      //      (never Sign and Upload), Preview Document clicked, and a stop in front of Request
+      //      Signatures — or, in a run a named person approved and only when signatureRequestGate
+      //      allows it, one click on it. The planner never sees this page, so it can never pick Sign
+      //      and Upload, a Browse, or Request Signatures itself (isOffLimitsButton refuses the last).
+      if (this.page && !this.signatureStep) {
+        const sigRead = await readSignatureRequestStep(this.page);
+        if (sigRead) {
+          this.debug?.event({ type: "signature_request_step", page: pageCount, request: sigRead.request.length, consents: sigRead.consents.length, status: this.scrubSecrets(sigRead.status) });
+          this.signatureStep = await stageSignatureRequestStep(this.page, sigRead, {
+            steps,
+            approval: this.signatureRequestApproval,
+            runId: this.runId,
+            scrub: (t) => this.scrubSecrets(t),
+            debugEvent: (e) => this.debug?.event(e),
+          });
+          const sig = this.signatureStep;
+          if (sig.consentTexts.length) this.pageReviewNotes.push(`The homeowner agrees to (${sig.consentTexts.length} consent${sig.consentTexts.length > 1 ? "s" : ""} on the signature step): ${sig.consentTexts.map((t) => `"${t.slice(0, 200)}"`).join(" | ")}`);
+          if (sig.consentsLeft.length) this.pageReviewNotes.push(`Consents left for a person: ${sig.consentsLeft.join("; ")}.`);
+          reachedReview = true;
+          // Nothing the run decided posts from here on: the page goes to a person (or waits on the homeowner).
+          backstopFor(this.page)?.lockReview("learner at the signature-request step");
+          break;
         }
       }
 
@@ -9450,6 +9501,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   private isOffLimitsButton(field: ExtractedField): boolean {
     const sel = field.selector;
     return isPayFee(field.label) || isPayFee(sel?.name) || isPayFee(sel?.text)
+      || isSignatureRequestControl(field.label) || isSignatureRequestControl(sel?.text)
       || EXISTING_RECORD_ACTION.test(field.label || "")
       || EXISTING_RECORD_ACTION.test(sel?.name || "")
       || EXISTING_RECORD_ACTION.test(sel?.text || "");

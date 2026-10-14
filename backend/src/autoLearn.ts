@@ -110,6 +110,9 @@ export interface AutoLearnResult {
   /** Path of this run's debug bundle (data/learn-runs/<runId>) — everything needed to
    *  troubleshoot the run. Download it zipped via GET /api/learn-runs/<runId>/bundle.zip. */
   debugDir: string | null;
+  /** The walk ended at the signature-request step (#308): what it staged, and whether Request
+   *  Signatures waits on a person or was clicked in an approved run. Carried onto the run row. */
+  signatureStep?: import("../../portal-bot/src/adapters/signatureRequestStep").SignatureStepOutcome;
 }
 
 // Lines in the long design/plan-set texts that answer the portal's JUDGMENT questions.
@@ -881,6 +884,11 @@ export async function autoLearnPortal(
      *  a street only, it looks for an unsubmitted draft for the address first. A walk that
      *  continued a draft saves no recipe: its steps start inside one house's record. */
     continueDraft?: import("../../portal-bot/src/adapters/autoLearnAdapter").ContinueDraft;
+    /** A NAMED PERSON'S APPROVAL OF THIS RUN'S SIGNATURE REQUEST (#308), claimed by prepareSubmission
+     *  (signatureRequestApproval.ts), and the run id it names. Without it the walk stops in front of
+     *  Request Signatures; with it, signatureRequestGate still decides at the click. */
+    signatureRequestApproval?: import("../../shared/src/signatureRequestGate").SignatureRequestApproval | null;
+    runId?: string;
   },
 ): Promise<AutoLearnResult> {
   const projectRow = db.get<Record<string, unknown>>("SELECT * FROM projects WHERE id = ?", [projectId]);
@@ -1292,6 +1300,8 @@ async function autoLearnPortalInner(
       onHumanStep,
       onDraftCreated,
       continueDraft: input.continueDraft,
+      signatureRequestApproval: input.signatureRequestApproval ?? null,
+      runId: input.runId,
     });
   // WRITE IT DOWN BEFORE WE TOUCH THE PORTAL, NOT AFTER. This run is about to log into a
   // REAL account and start a REAL application; a run that dies mid-way has still created
@@ -1407,7 +1417,9 @@ async function autoLearnPortalInner(
     const withNotes = handoffNotes.length && !handoffNotes.every((n) => String(r.message ?? "").includes(n))
       ? { ...r, message: `${r.message} ${handoffNotes.join(" ")}` }
       : r;
-    const result: AutoLearnResult = { ...withNotes, debugDir };
+    // A walk that ended at the signature-request step (#308) says so on every result, recipe or not.
+    const sigStep = withNotes.signatureStep ?? (learn as { signatureStep?: AutoLearnResult["signatureStep"] } | undefined)?.signatureStep;
+    const result: AutoLearnResult = { ...withNotes, debugDir, ...(sigStep ? { signatureStep: sigStep } : {}) };
     if (debugDir) {
       try {
         fs.writeFileSync(path.join(debugDir, "llm-calls.json"), JSON.stringify({
@@ -1529,9 +1541,25 @@ async function autoLearnPortalInner(
       scope: scopeType, applicationNumber: cd.applicationNumber, form: cd.form.slice(0, 90), reachedReview: learn.reachedReview === true,
     });
     const staged = learn.ok && learn.reachedReview === true;
-    const msg = staged
-      ? `Opened this project's existing draft ${cd.applicationNumber} and staged "${cd.form}" to its review screen. Nothing was submitted: verify every field, then a person clicks its submit. ${learn.message}`
-      : `Opened this project's existing draft ${cd.applicationNumber} ("${cd.form}") but did not reach its review screen: ${learn.message}`;
+    // THE WALK ENDED AT THE SIGNATURE-REQUEST STEP (#308): the stop is in front of Request Signatures
+    // (or, in an approved run, after it), not in front of a submit. Audited either way: a click on it
+    // emailed a homeowner, and an approval the gate refused was spent.
+    const sig = learn.signatureStep;
+    if (sig) {
+      addAuditLog(db, projectId, sig.requestClicked ? "portal_bot" : "system", "signature request",
+        sig.requestClicked ? "portal.signatures_requested" : sig.refusals.length ? "portal.signature_request_refused" : "portal.signature_request_staged", {
+          state: sig.state, approvedBy: sig.approvedBy, runId: input.runId ?? null, refusals: sig.refusals,
+          consentsTicked: sig.consentsTicked, consentsLeft: sig.consentsLeft.length, signatureType: sig.signatureType,
+          preview: sig.preview.kind, statusBefore: sig.statusBefore, statusAfter: sig.statusAfter,
+        });
+    }
+    const msg = sig
+      ? (sig.state === "awaiting_signature_request"
+        ? `Opened this project's existing draft ${cd.applicationNumber} and staged "${cd.form}" through its signature step: AWAITING SIGNATURE REQUEST. Nothing was submitted and no signature request was sent. ${learn.message}`
+        : `Opened this project's existing draft ${cd.applicationNumber} and staged "${cd.form}" through its signature step: ${sig.state === "awaiting_customer_signature" ? "AWAITING CUSTOMER SIGNATURE" : "SIGNATURE REQUEST UNCONFIRMED"}. The application is NOT submitted. ${learn.message}`)
+      : staged
+        ? `Opened this project's existing draft ${cd.applicationNumber} and staged "${cd.form}" to its review screen. Nothing was submitted: verify every field, then a person clicks its submit. ${learn.message}`
+        : `Opened this project's existing draft ${cd.applicationNumber} ("${cd.form}") but did not reach its review screen: ${learn.message}`;
     emitDone(msg);
     const keptRecipe = existingRecipe ?? null;
     if (keptRecipe) {
@@ -1539,6 +1567,7 @@ async function autoLearnPortalInner(
         recipe: keptRecipe, status: learn.pauseReason ? "paused" : staged ? "draft" : "failed", pauseReason: learn.pauseReason,
         pageCount: learn.pageCount, finalSubmitRecorded: learn.finalSubmitRecorded, pageTrace: learn.pageTrace ?? [],
         verification: { accurate: false, confidence: "low", matches: [], issues: staged ? [] : [learn.message] }, message: msg,
+        ...(sig ? { signatureStep: sig } : {}),
       });
     }
     // No recipe on file at all: a row is still owed to the caller, so an EMPTY one is recorded as
@@ -1549,6 +1578,7 @@ async function autoLearnPortalInner(
       recipe: getPortalRecipe(db, stub.id), status: learn.pauseReason ? "paused" : staged ? "draft" : "failed", pauseReason: learn.pauseReason,
       pageCount: learn.pageCount, finalSubmitRecorded: learn.finalSubmitRecorded, pageTrace: learn.pageTrace ?? [],
       verification: { accurate: false, confidence: "low", matches: [], issues: staged ? [] : [learn.message] }, message: msg,
+      ...(sig ? { signatureStep: sig } : {}),
     });
   }
 

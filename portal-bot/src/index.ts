@@ -824,6 +824,9 @@ export async function learnPortal(input: {
   onDraftCreated?: (draft: DraftCreatedObserved) => void;
   /** This project's existing draft to continue instead of starting an application (#302). */
   continueDraft?: import("./adapters/autoLearnAdapter").ContinueDraft;
+  /** A named person's approval of THIS run's signature request (#308), and the run's id. */
+  signatureRequestApproval?: import("../../shared/src/signatureRequestGate").SignatureRequestApproval | null;
+  runId?: string;
   // Equipment identity (inverterMake/inverterModel/moduleMake/moduleModel) for the
   // adapter's deterministic PV-spec combobox pass.
   equipment?: Record<string, string>;
@@ -864,7 +867,7 @@ export async function learnPortal(input: {
       input.onProgress?.({ phase: "page", pageCount: 0, maxPages: input.maxPages ?? 18, message: `Paused for a person: ${String(info.reason ?? "").slice(0, 200)}` });
     } catch { /* a notifier must never change the outcome */ }
   };
-  const adapter = new AutoLearnAdapter(input.portalName, input.planner, { parkMs: input.parkMs, credentialForUrl: input.credentialForUrl, noProgressBudgetMs: input.noProgressBudgetMs, maxPages: input.maxPages, budgetMs: input.budgetMs, docsByType: input.docsByType, beforeUpload: input.beforeUpload, uploadMode: input.uploadMode, policyProfile: input.policyProfile, bindableFields: input.bindableFields, onProgress: input.onProgress, onPark, equipment: input.equipment, certifiedAliases: input.certifiedAliases, contactIdentity: input.contactIdentity, siteContactIdentity: input.siteContactIdentity, siteIdentity: input.siteIdentity, allowFinalSubmit: input.allowFinalSubmit, hasBattery: input.hasBattery, allowConsentAccept: input.allowConsentAccept, continueDraft: input.continueDraft });
+  const adapter = new AutoLearnAdapter(input.portalName, input.planner, { parkMs: input.parkMs, credentialForUrl: input.credentialForUrl, noProgressBudgetMs: input.noProgressBudgetMs, maxPages: input.maxPages, budgetMs: input.budgetMs, docsByType: input.docsByType, beforeUpload: input.beforeUpload, uploadMode: input.uploadMode, policyProfile: input.policyProfile, bindableFields: input.bindableFields, onProgress: input.onProgress, onPark, equipment: input.equipment, certifiedAliases: input.certifiedAliases, contactIdentity: input.contactIdentity, siteContactIdentity: input.siteContactIdentity, siteIdentity: input.siteIdentity, allowFinalSubmit: input.allowFinalSubmit, hasBattery: input.hasBattery, allowConsentAccept: input.allowConsentAccept, continueDraft: input.continueDraft, signatureRequestApproval: input.signatureRequestApproval ?? null, runId: input.runId });
   let tmpStatePath: string | undefined;
   let leaveOpen = false;
   // A browser left open by a prior guided-manual stage holds this profile's lock — close it

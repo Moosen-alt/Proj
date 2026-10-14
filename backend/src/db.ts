@@ -2556,6 +2556,32 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       healStructuralLetterColumns(db);
     },
   },
+  {
+    version: 48,
+    name: "portal_signature_request_approvals",
+    up: (db) => {
+      // A NAMED PERSON'S APPROVAL OF ONE RUN'S SIGNATURE REQUEST (#308; owner ruling 2026-10-14 on
+      // #305). PSE PowerClerk's "Request Signatures" emails the homeowner a DocuSign request: the bot
+      // clicks it only in a run a person approved (signatureRequestApproval.ts claims the row by id,
+      // single use, its id becomes the run's id). Kept apart from portal_run_approvals (the final-
+      // submit approval) so neither can be claimed as the other. A child of the project: it reaches
+      // an org through projects.org_id, so no org_id column (CLAUDE.md tenancy model).
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS portal_signature_request_approvals (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          track TEXT NOT NULL DEFAULT 'nem',
+          approver TEXT NOT NULL,
+          approver_user_id TEXT,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          consumed_at TEXT,
+          FOREIGN KEY (project_id) REFERENCES projects(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_signature_request_approvals_project ON portal_signature_request_approvals(project_id, track, consumed_at);
+      `);
+    },
+  },
 ];
 
 /** v47 was edited in place while #218 was open (Helm's review at 0116f98a): a DB that ran an earlier

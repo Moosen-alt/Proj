@@ -384,10 +384,18 @@ export function portalSafetyFactory() {
   const ACCEPT_TERMS = /\b(i\s+)?(agree|accept|certify|acknowledge|attest|consent)\b|terms\s+(and|&)\s+conditions|under\s+penalt/i;
   const isAcceptTermsLabel = (label: string | null | undefined): boolean => !!label && ACCEPT_TERMS.test(String(label));
 
+  // A SIGNATURE REQUEST (#308): PowerClerk's "Request Signatures" sends a DocuSign email to the
+  // homeowner. It files nothing, so it is not the final submit (rule 1 and its gate are not about
+  // it), but it is an outward action: no recorder captures it, no replay clicks it, and the learner
+  // clicks it only in a run a named person approved (shared/src/signatureRequestGate.ts). Word-
+  // bounded and verb-led, so a "Signature Request Status" heading or a "Requested By" column is not one.
+  const SIGNATURE_REQUEST = /^\s*(re-?)?(request|send|resend)\s+(an?\s+|the\s+|for\s+|to\s+)?(e-?\s*|docu)?(signatures?|signing|signers?|sign)\b/i;
+  const isSignatureRequestControl = (label: string | null | undefined): boolean => !!label && SIGNATURE_REQUEST.test(String(label).replace(/\s+/g, " "));
+
   /** How a capture surface (human recorder, human patch) must treat a click on this control. */
   const classifyRecordedClick = (label: string | null | undefined, ctx?: ControlContext | null): RecordedClickClass => {
     if (isFinalSubmitControl(label, ctx)) return "finalSubmit";
-    if (isSubmitIntent(label, ctx) || isPayFee(label)) return "blocked";
+    if (isSubmitIntent(label, ctx) || isPayFee(label) || isSignatureRequestControl(label)) return "blocked";
     return "capture";
   };
 
@@ -1649,6 +1657,7 @@ export function portalSafetyFactory() {
     paymentDialogVerdict,
     isPayNowDialogText,
     isFinalSubmitControl,
+    isSignatureRequestControl,
     classifyRecordedClick,
     isSecretField,
     isPaymentField,
@@ -1688,6 +1697,7 @@ export const isPaymentWordedText = impl.isPaymentWordedText;
 export const paymentDialogVerdict = impl.paymentDialogVerdict;
 export const isPayNowDialogText = impl.isPayNowDialogText;
 export const isFinalSubmitControl = impl.isFinalSubmitControl;
+export const isSignatureRequestControl = impl.isSignatureRequestControl;
 export const classifyRecordedClick = impl.classifyRecordedClick;
 export const isSecretField = impl.isSecretField;
 export const isPaymentField = impl.isPaymentField;
