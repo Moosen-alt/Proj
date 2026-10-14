@@ -282,8 +282,12 @@ check("the run still completes", () => {
   assert.equal(r1.ok, true, `${String(r1.message ?? "").slice(0, 200)}`);
 });
 
-// CASE 2 — THE SAFETY CASE. No way to add a row: array 1 must keep ITS OWN numbers and the
-// run must say so, rather than quietly overwriting them with array 2's.
+// CASE 2 — THE SAFETY CASE. No way to add a row: array 1 must never be overwritten by ANOTHER
+// array's numbers, and the run must say what it filed. Since #339 the one permitted change to
+// row 1 is the fallback merge: an array with the SAME tilt and azimuth as array 1 (here array
+// 4, 6 modules at 22°/270°) is folded into row 1 — 10 + 6 = 16 — and the warning says so;
+// arrays 2 and 3 (other orientations) are reported NOT filed. Row 1's orientation stays
+// array 1's; its quantity is exactly the same-orientation sum, never another array's.
 const p2 = await context.newPage();
 await p2.goto(`${base}/norow`);
 const a2 = new RecipeAdapter(mkRecipe(`${base}/norow`), FIELDS, {}, { autoSubmit: false });
@@ -295,14 +299,18 @@ const only = await p2.evaluate(() => Array.from(document.querySelectorAll(".arra
 })));
 const warnings = ((r2 as unknown as { data?: { driftWarnings?: string[] } }).data?.driftWarnings ?? []).join(" | ");
 
-check("array 1 keeps its own numbers when no row can be added", () => {
+check("no row can be added: row 1 keeps ARRAY 1's orientation and holds only same-orientation modules (10 + 6)", () => {
   assert.equal(only.length, 1, `got ${only.length} rows`);
-  assert.deepEqual(only[0], { qty: "10", tilt: "22" },
-    `array 1 was overwritten by a later array — ${JSON.stringify(only[0])}`);
+  assert.equal(only[0].tilt, "22", `row 1's tilt is no longer array 1's — ${JSON.stringify(only[0])}`);
+  // Exactly the same-orientation sum: never another array's own quantity (3, 5) nor the
+  // whole system (24) nor an unrelated sum.
+  assert.equal(only[0].qty, "16", `row 1 qty should be 10 + 6 (array 4 shares 22°/270°) — ${JSON.stringify(only[0])}`);
 });
-check("and the shortfall is reported, not swallowed", () => {
-  assert.match(warnings, /filed array 1 only/i, `warnings were: ${warnings.slice(0, 300)}`);
-  assert.match(warnings, /10 of 24 modules/i, `the warning should name the shortfall; got: ${warnings.slice(0, 300)}`);
+check("and the merge and the shortfall are both reported, not swallowed", () => {
+  assert.match(warnings, /merged same-orientation arrays as a fallback/i, `warnings were: ${warnings.slice(0, 300)}`);
+  assert.match(warnings, /holds arrays 1 \+ 4/i, `the warning should name the merge; got: ${warnings.slice(0, 300)}`);
+  assert.match(warnings, /arrays 2, 3 NOT filed/i, `the warning should name what was not filed; got: ${warnings.slice(0, 300)}`);
+  assert.match(warnings, /16 of 24 modules/i, `the warning should name the shortfall; got: ${warnings.slice(0, 300)}`);
 });
 
 // CASE 3 — POWERCLERK'S SHAPE. Everything below was measured failing on a live Rowland
