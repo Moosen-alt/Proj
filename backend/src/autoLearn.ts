@@ -26,6 +26,7 @@ import fs from "node:fs";
 import type { AppDb } from "./db";
 import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../shared/src/types";
 import { FINAL_SUBMIT_GATE_SENTENCE, redactSecretValues } from "../../shared/src/portalSafety";
+import { isPlannerSecretKey, projectSecretValues } from "./projectSecrets";
 import { perJobAnswerKeyFor, perJobControlOfField } from "../../shared/src/perJobQuestions";
 import { parseHasBattery } from "../../shared/src/batteryControls";
 import { learnPortal, browserLimiter } from "../../portal-bot/src/index";
@@ -115,7 +116,7 @@ export interface AutoLearnResult {
 // Keyed on the topics the planner prompt's solar defaults reference: disconnect location,
 // meter mounting, battery/ESS + backup mode, export limiting, smart-inverter settings,
 // attic runs, panel/service upgrades, and tilt/azimuth/tracking for array rows.
-const DESIGN_NOTE_TOPICS = /\bdisconnect\b|within 10|meter.{0,20}pole|pole.{0,20}(mount|meter)|\bbattery\b|\bess\b|powerwall|encharge|backup|export (limit|capacit)|limit(ed|ing)? export|ul\s*1741|smart inverter|attic (run|fan)|shutdown -|rapid shutdown|main panel|service upgrade|\bmpu\b|derat|tilt|azimuth|tracking|ground.?mount|existing (pv|solar|system|array|generation)|combined system|system addition/i;
+const DESIGN_NOTE_TOPICS = /\bdisconnect\b|within 10(?!\d)|meter.{0,20}pole|pole.{0,20}(mount|meter)|\bbattery\b|\bess\b|powerwall|encharge|backup|export (limit|capacit)|limit(ed|ing)? export|ul\s*1741|smart inverter|attic (run|fan)|shutdown -|rapid shutdown|main panel|service upgrade|\bmpu\b|derat|tilt|azimuth|tracking|ground.?mount|existing (pv|solar|system|array|generation)|combined system|system addition/i;
 
 // Extract only decision-relevant lines from the parser snapshot's long text fields.
 // Deterministic and cheap (no LLM); capped so it can never re-inflate the prompt.
@@ -128,31 +129,9 @@ export function designNotesDigest(project: ProjectRecord, maxChars = 1200, extra
   return digestLines(project, maxChars, (line) => DESIGN_NOTE_TOPICS.test(line) || (learned ? learned.test(line) : false), projectSecretValues(project));
 }
 
-// SAFETY RULE 2 — which parser/field keys hold a secret. ONE predicate for the planner's key
-// filter and for collecting the values to redact from free text. Who HOLDS the account
-// (ubAccountHolder*) is identity the portal asks for, not a secret (see buildPortalPlanner).
-const PLANNER_SECRET_KEY = /acc(oun)?t|meter|ssn|social|passw|agreement\s*num|application\s*num|agreementnumber|applicationnumber|\besi\b|esiid|service\s*agreement/i;
-const PLANNER_IDENTITY_KEY = /^ubAccountHolder/i;
-export function isPlannerSecretKey(k: string): boolean {
-  return PLANNER_SECRET_KEY.test(k) && !PLANNER_IDENTITY_KEY.test(k);
-}
-
-/** Every known secret on the project: the canonical account/meter plus any parser-snapshot
- *  value under a secret key (the parser's own aliases: "account", "meter", "ubMeterNumber"...). */
-export function projectSecretValues(project: ProjectRecord): string[] {
-  const out = new Set<string>();
-  const add = (v: unknown) => {
-    const s = v == null ? "" : String(v).trim();
-    if (s.length >= 4) out.add(s);
-  };
-  add(project.accountNumber);
-  add(project.meterNumber);
-  const snap = (project.parserSnapshot || {}) as Record<string, unknown>;
-  for (const [k, v] of Object.entries(snap)) {
-    if ((typeof v === "string" || typeof v === "number") && isPlannerSecretKey(k)) add(v);
-  }
-  return [...out];
-}
+// SAFETY RULE 2 — which values are secrets lives in the leaf module projectSecrets.ts (#260 review);
+// re-exported here for the planner's existing callers.
+export { isPlannerSecretKey, projectSecretValues };
 
 /** SAFETY RULE 2 — a secret EMBEDDED in free text. The planner's value filter drops a field
  *  whose WHOLE value equals a secret; prose is not caught that way. Live (City of Jefferson,
@@ -164,12 +143,17 @@ export function projectSecretValues(project: ProjectRecord): string[] {
  *  backend's callers and the kbLearnLookup test. */
 export { redactSecretValues };
 
+// The parser's long narrative texts — the ones designNotesDigest reads its decision lines from.
+// One list for the digest and for the planner's view (plannerFieldView), which leaves the raw
+// texts out BECAUSE the digest already carries what in them answers a portal question.
+const DESIGN_NOTE_SOURCES = [
+  "sitePlanNotesText", "roofPlanNotesText", "projectDescriptionText", "electricalCalcText",
+  "structuralCalcText", "labelsText", "reviewFlags", "utilityUploadNotesText", "planSetExtractedText",
+] as const;
+
 function digestLines(project: ProjectRecord, maxChars: number, matches: (line: string) => boolean, secrets: string[] = []): string {
   const snap = (project.parserSnapshot || {}) as Record<string, unknown>;
-  const sources = [
-    "sitePlanNotesText", "roofPlanNotesText", "projectDescriptionText", "electricalCalcText",
-    "structuralCalcText", "labelsText", "reviewFlags", "utilityUploadNotesText", "planSetExtractedText",
-  ];
+  const sources = DESIGN_NOTE_SOURCES;
   const seen = new Set<string>();
   const out: string[] = [];
   let total = 0;
@@ -191,6 +175,75 @@ function digestLines(project: ProjectRecord, maxChars: number, matches: (line: s
     }
   }
   return out.join(" | ").slice(0, maxChars);
+}
+
+// THE PLANNER SEES A COMPACT VIEW OF projectFields, NOT ALL OF IT (#303).
+//
+// resolveRecipeFieldValues is the REPLAY map: it spreads every parser-snapshot scalar under 400
+// characters, so the parser's narrative summaries (electricalCalcText, sitePlanNotesText,
+// projectDescriptionText…, each written up to that cap) rode into every planner call raw — right
+// beside the designNotes digest that already holds the lines of them that answer a portal
+// question — and so did every raw parser key next to the canonical key the resolver derives from
+// it (dcKw beside systemSizeDcKw, pvMicroModel beside inverterModel, combinedDcKw beside
+// totalSystemSizeDcKw). Live (a PowerClerk NEM stage of a system addition, 2026-10-10): the user half
+// measured 5301 tokens against the 4000 budget. An addition is the worst case: its summaries are
+// the longest the parser writes (its prompt asks for existing + new + combined in
+// projectDescriptionText) and it carries a second set of raw existing-system keys.
+//
+// Left out of what the MODEL is sent (the returned projectFields — the learn's fill and binding
+// map — is unchanged, so nothing a recipe binds goes missing at replay):
+//   - the narrative texts the digest reads (DESIGN_NOTE_SOURCES);
+//   - the parser's own review chatter (its `notes`, the packet-readiness line): what the parser
+//     doubted and what the packet lacks are questions for the reviewer, not portal answers;
+//   - a raw parser key that only repeats the canonical key it is the source of — the key the
+//     planner prompt names, so a recording binds the canonical one. Only when the canonical key
+//     carries the SAME value: where it is missing or says something else, the raw key is kept.
+// Nothing is added, so no new value — and no secret — can reach the model by this route (rule 2:
+// the secret filters ran on projectFields before this view is taken).
+const PLANNER_REVIEW_PROSE_KEYS = ["notes", "packetReadinessText"] as const;
+const PLANNER_ALIAS_OF_CANONICAL: Readonly<Record<string, string>> = {
+  owner: "homeownerName",
+  dcKw: "systemSizeDcKw",
+  acKw: "systemSizeAcKw",
+  exportKw: "totalExportKw",
+  interco: "interconnectionMethod",
+  invMake: "inverterMake",
+  pvMicroMake: "inverterMake",
+  inverterManufacturer: "inverterMake",
+  invModel: "inverterModel",
+  pvMicroModel: "inverterModel",
+  invQty: "inverterQty",
+  pvMicroQty: "inverterQty",
+  inverterQuantity: "inverterQty",
+  moduleManufacturer: "moduleMake",
+  moduleWatts: "moduleWattage",
+  moduleQuantity: "moduleQty",
+  totalModuleQuantity: "moduleQty",
+  acDiscQty: "disconnectQty",
+  acDiscAmps: "disconnectAmps",
+  acDiscVoltage: "disconnectVoltage",
+  acDiscFused: "disconnectType",
+  existingSystem: "hasExistingSystem",
+  existingDcKw: "existingSystemSizeDcKw",
+  existingAcKw: "existingSystemSizeAcKw",
+  combinedDcKw: "totalSystemSizeDcKw",
+  combinedAcKw: "totalSystemSizeAcKw",
+  existingInvMake: "existingInverterMake",
+  existingInvModel: "existingInverterModel",
+  existingInvQty: "existingInverterQty",
+};
+export function plannerFieldView(projectFields: Record<string, string>): Record<string, string> {
+  const omit = new Set<string>([...DESIGN_NOTE_SOURCES, ...PLANNER_REVIEW_PROSE_KEYS]);
+  const same = (a: string | undefined, b: string | undefined) =>
+    String(a ?? "").trim().toLowerCase() === String(b ?? "").trim().toLowerCase();
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(projectFields)) {
+    if (omit.has(k)) continue;
+    const canonical = PLANNER_ALIAS_OF_CANONICAL[k];
+    if (canonical && projectFields[canonical] && same(v, projectFields[canonical])) continue;
+    out[k] = v;
+  }
+  return out;
 }
 
 function clip(value: string | undefined, max: number): string {
@@ -549,6 +602,11 @@ export function buildPortalPlanner(
     ].filter(Boolean).join("\n");
   }
 
+  // What the model is sent (plannerFieldView): the narrative parser texts (designNotes carries their
+  // decision lines) and the raw parser keys that only echo a canonical one stay out. Taken AFTER
+  // every secret filter above; the returned projectFields stays the whole map.
+  const plannerFields = plannerFieldView(projectFields);
+
   const llm = learnLlmFactory();
   const planner = async (req: LearnPlanRequest): Promise<LearnPlanResponse> => {
     const indexedFields = req.fields.map((f, i) => ({ index: i, label: f.label, fieldType: f.fieldType, options: f.options, section: f.section }));
@@ -557,7 +615,7 @@ export function buildPortalPlanner(
       pageTitle: req.pageTitle,
       fields: indexedFields,
       bodyText: req.bodyText,
-      projectFields,
+      projectFields: plannerFields,
       alreadyFilledLabels: req.alreadyFilledLabels,
       kbContext: kbContext || undefined,
       jurisdictionContext: jurisdictionContext || undefined,

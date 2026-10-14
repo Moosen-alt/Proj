@@ -43,6 +43,7 @@ import {
   deleteProjectDocument,
 } from "./projectDocuments";
 import { buildUtilityPackage } from "./docSplitter";
+import { sniffFileKind } from "./fileTypes";
 import { buildSubmittalEmailDraft } from "./applicationDocs";
 import type { EvidenceTopic } from "./projectEvidence";
 import { createClient, deleteClient, getClient, listClients, updateClient } from "./clients";
@@ -58,6 +59,7 @@ import { extractZipToWorkdir } from "./batchZip";
 import { AUTH_ENABLED, currentUser, login, logout, me, requireAuth, seedAdminUser, entitlementGate, requestOrg, createApiKey, ADMIN_ROLES } from "./auth";
 import { PRODUCTS, PRODUCT_KEYS, grantProduct, revokeProduct, orgEntitlements, productsForEdition } from "./entitlements";
 import { requestScope, orgFilter, orgClause, reqOrgFilter, assertInScope, auditCrossOrgAccess } from "./scope";
+import { folderScanPayload } from "./batchZip";
 import type { RequestScope } from "./scope";
 import { DEFAULT_ORG_ID } from "./db";
 import { ensureStatusShareToken, statusShareUrl } from "./clientNotifier";
@@ -2251,10 +2253,30 @@ app.post(
     res.status(201).json(saved);
   },
 );
+function storedFileIsPdf(filePath: string): boolean {
+  try {
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const head = Buffer.alloc(16);
+      fs.readSync(fd, head, 0, head.length, 0);
+      return sniffFileKind(head) === "pdf";
+    } finally { fs.closeSync(fd); }
+  } catch {
+    return false;
+  }
+}
 app.get("/api/projects/:id/documents/:docId", (req, res) => {
   const file = getProjectDocumentFile(db, String(req.params.id), String(req.params.docId));
   res.setHeader("Content-Type", file.contentType);
-  res.setHeader("Content-Disposition", `attachment; filename="${file.filename.replace(/[^A-Za-z0-9._-]+/g, "_")}"`);
+  // ?inline=1 opens a PDF in the browser's viewer (the structural-letter card links "#page=N"
+  // into it, #198) — only a file whose BYTES are a PDF, never sniffed into anything else (an
+  // uploaded HTML file labelled application/pdf stays a download). The default stays a download.
+  let disposition = "attachment";
+  if (req.query.inline === "1") {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    if (file.contentType === "application/pdf" && storedFileIsPdf(file.path)) disposition = "inline";
+  }
+  res.setHeader("Content-Disposition", `${disposition}; filename="${file.filename.replace(/[^A-Za-z0-9._-]+/g, "_")}"`);
   res.sendFile(file.path);
 });
 app.delete("/api/projects/:id/documents/:docId", (req, res) => {
@@ -2331,9 +2353,16 @@ app.post("/api/jobs", (req, res) => {
   // (GET /api/jobs returns payloads) at a higher priority, was a run that person never approved.
   // Approve & Submit enqueues through POST /api/projects/:id/prepare-submission, which mints the
   // approval for THIS request; through /api/jobs a staging run carries its track and nothing else.
+  // A FOLDER SCAN IS CONFINED HERE TOO (#276): this door used to enqueue the body verbatim,
+  // so a tenant could scan any server folder that /api/batch-import/scan refuses.
+  let scanPayload: Record<string, unknown> | null = null;
+  if (jobType === "folder_scan") {
+    scanPayload = folderScanPayload(scope, payload || {});
+    if (!scanPayload) throw new HttpError(404, `Folder not found: ${String(payload?.folderPath || "")}`);
+  }
   const jobPayload = jobType === "prepare_submission"
     ? (typeof payload?.track === "string" && payload.track.trim() ? { track: payload.track.trim() } : {})
-    : payload || {};
+    : scanPayload || payload || {};
   res.status(201).json(enqueueJob(db, jobType, jobPayload, { priority, assignedToUser, projectId, scheduledAt, orgId: scope.orgId }));
 });
 // Batch folder scan — enqueues a background job to classify + import all PDFs in a folder
@@ -2670,12 +2699,20 @@ app.get("/api/ahj-templates/:id/pdf", (req, res) => {
   res.send(row.pdf_blob);
 });
 
+// A SERVER FOLDER IS NOT A TENANT'S TO NAME (#276). The scan job is stamped with the
+// caller's org, so whatever folder it reads comes back through that org's job list:
+// pointed at PROJECT_DOCS_DIR or another org's upload, it returned their document paths and
+// homeowner-named filenames. folderScanPayload (batchZip.ts) is the one answer, shared with
+// POST /api/jobs and re-checked by the worker. Refused is the SAME 404 as missing (rule 6).
 app.post("/api/batch-import/scan", (req, res) => {
-  const { folderPath, defaultState, defaultAhj, defaultUtility, useLlm } = req.body || {};
+  const { folderPath } = req.body || {};
   if (!folderPath) throw new HttpError(400, "folderPath is required.");
+  const scope = requestScope(db, req);
+  const payload = folderScanPayload(scope, req.body || {});
+  if (!payload) throw new HttpError(404, `Folder not found: ${folderPath}`);
   if (!fs.existsSync(folderPath)) throw new HttpError(404, `Folder not found: ${folderPath}`);
   if (!fs.statSync(folderPath).isDirectory()) throw new HttpError(400, "Path must be a directory.");
-  const job = enqueueJob(db, "folder_scan", { folderPath, defaultState, defaultAhj, defaultUtility, useLlm: !!useLlm }, { priority: 2, maxRetries: 1, orgId: requestScope(db, req).orgId });
+  const job = enqueueJob(db, "folder_scan", payload, { priority: 2, maxRetries: 1, orgId: scope.orgId });
   res.status(201).json(job);
 });
 
@@ -2692,23 +2729,27 @@ app.post(
     const label = String(req.query.label || "batch");
     let extracted;
     try {
-      extracted = extractZipToWorkdir(body, label);
+      extracted = extractZipToWorkdir(body, label, requestScope(db, req).orgId);
     } catch (err) {
       throw new HttpError(400, `Could not read that zip file. ${(err as Error).message || ""}`.trim());
     }
     if (extracted.pdfCount === 0) {
       throw new HttpError(400, `Zip extracted (${extracted.totalEntries} entries) but contained no PDF files.`);
     }
+    // Through the same payload builder as /scan, so the job carries its `scanAs` marker. The
+    // folder was just extracted under the caller's own root, so it always passes.
+    const scanPayload = folderScanPayload(requestScope(db, req), {
+      folderPath: extracted.folderPath,
+      defaultState: req.query.defaultState ? String(req.query.defaultState) : undefined,
+      defaultAhj: req.query.defaultAhj ? String(req.query.defaultAhj) : undefined,
+      defaultUtility: req.query.defaultUtility ? String(req.query.defaultUtility) : undefined,
+      useLlm: String(req.query.useLlm || "") === "true",
+    });
+    if (!scanPayload) throw new HttpError(404, "Folder not found.");
     const job = enqueueJob(
       db,
       "folder_scan",
-      {
-        folderPath: extracted.folderPath,
-        defaultState: req.query.defaultState ? String(req.query.defaultState) : undefined,
-        defaultAhj: req.query.defaultAhj ? String(req.query.defaultAhj) : undefined,
-        defaultUtility: req.query.defaultUtility ? String(req.query.defaultUtility) : undefined,
-        useLlm: String(req.query.useLlm || "") === "true",
-      },
+      scanPayload,
       // The scan writes org-scoped historical-failure rows under the JOB's org, so the job
       // must carry the caller's — /scan above already did; this one fell back to the default.
       { priority: 2, maxRetries: 1, orgId: requestScope(db, req).orgId },
@@ -2717,9 +2758,12 @@ app.post(
   },
 );
 
-// Check folder scan job status + get full result
+// Check folder scan job status + get full result. SCOPED to the caller's org: a folder_scan
+// job's payload carries a server folderPath and its results name every scanned PDF's path, and
+// /scan + /upload-zip stamp the caller's org on it. Without the orgId, listJobs fell back to the
+// default org, so every tenant saw the default org's scans and never its own (#276).
 app.get("/api/batch-import/jobs", (req, res) => {
-  res.json(listJobs(db, { jobType: "folder_scan", limit: 20 }));
+  res.json(listJobs(db, { jobType: "folder_scan", limit: 20, orgId: reqOrgFilter(db, req) }));
 });
 
 // LLM-assisted parser extraction. The browser does the PDF text / OCR extraction
@@ -2934,6 +2978,45 @@ app.post("/api/projects/:id/fee-sheet/confirm", asyncHandler(async (req, res) =>
     track: outcome.track, verified: outcome.verified, alreadyVerified: outcome.alreadyVerified,
   });
   res.json({ outcome, feeSheet: buildProjectFeeSheet(db, detail.project) });
+}));
+
+// THE ENGINEER'S STRUCTURAL LETTER: A NAMED PERSON CONFIRMS IT (#198; owner ruling 2026-10-08).
+// Text matching only suggests the candidate; this is the ONLY door that credits the letter and
+// releases city.struct.stamped-engineering-missing (structuralLetter.ts). WHO comes from the
+// session when auth is on, never the body; with auth off it is the name the person typed, and a
+// placeholder is refused (feeConfirm.isConfirmingPerson). The body names the document (and page)
+// the person looked at — it must be one of THIS project's `structural` documents, else 404. Under
+// /api/projects/:id, so the tenant scope guard answers 404 for another org's project (rule 6).
+function structuralLetterPerson(
+  req: Request, typed: unknown, isConfirmingPerson: (n: string) => boolean, act: "confirm" | "withdraw",
+): { name: string; userId: string } {
+  const what = act === "confirm" ? "confirm the structural letter" : "withdraw the structural-letter confirmation";
+  const user = currentUser(db, req);
+  if (AUTH_ENABLED && !user) throw new HttpError(401, `Sign in to ${what}.`);
+  // A signed-in account whose display name is a role ("Admin") is recorded by its email.
+  const name = AUTH_ENABLED
+    ? String((user?.name && isConfirmingPerson(user.name) ? user.name : user?.email) || "").trim()
+    : String(typed || "").trim();
+  if (!isConfirmingPerson(name)) throw new HttpError(400, `A named person must ${what} — type your name.`);
+  return { name, userId: user?.id ?? "" };
+}
+app.post("/api/projects/:id/structural-letter/confirm", asyncHandler(async (req, res) => {
+  const { isConfirmingPerson } = await import("./feeConfirm");
+  const { confirmStructuralLetter, structuralLetterState } = await import("./structuralLetter");
+  const detail = getProjectDetail(db, String(req.params.id));
+  const who = structuralLetterPerson(req, req.body?.confirmedBy, isConfirmingPerson, "confirm");
+  const confirmation = await confirmStructuralLetter(db, detail.project.id, {
+    documentId: String(req.body?.documentId || ""), page: Number(req.body?.page || 0), confirmedBy: who.name, userId: who.userId,
+  });
+  res.json({ confirmation, structuralLetter: structuralLetterState(db, detail.project.id) });
+}));
+app.post("/api/projects/:id/structural-letter/withdraw", asyncHandler(async (req, res) => {
+  const { isConfirmingPerson } = await import("./feeConfirm");
+  const { withdrawStructuralLetterConfirmation, structuralLetterState } = await import("./structuralLetter");
+  const detail = getProjectDetail(db, String(req.params.id));
+  const who = structuralLetterPerson(req, req.body?.withdrawnBy ?? req.body?.confirmedBy, isConfirmingPerson, "withdraw");
+  const outcome = withdrawStructuralLetterConfirmation(db, detail.project.id, who.name, who.userId);
+  res.json({ outcome, structuralLetter: structuralLetterState(db, detail.project.id) });
 }));
 
 // READ THE PORTAL'S OWN FEE NOW (portalFeeReadings.readProjectPortalFees): every filed permit

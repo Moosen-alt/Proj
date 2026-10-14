@@ -20,6 +20,7 @@ import {
 import { adoptedNecEdition, necEditionRequirements, NEC_EDITION_REQUIREMENTS } from "./necEditions";
 import { moduleLevelElectronicsEquipment, type ModuleLevelElectronicsEvidence } from "./moduleLevelElectronics";
 import { designText, mountKind, type MountKind } from "./mountKind";
+import { microEvidenceSupersededIn } from "./normalize";
 export { designText, engineeredGroundMount, groundMountFromField, isGroundMount, mountKind, mountKindForProject, type MountKind } from "./mountKind";
 
 const oregonElectrical2023: CodeReference = {
@@ -238,9 +239,24 @@ const MLPE_TOPOLOGY = [
 // characters — so a field holding just the model read as a string design and was hard-blocked
 // (#213). The suffix is letters only, so "IQ Battery 5P" (no digit after IQ) stays out.
 const ENPHASE_MICRO = /enphase|\biq\s?[678](?:[a-z]+)?\b/i;
+// A MICRO IS NAMED BY ITS MODEL FAMILY TOO (#270, Helm re-review on PR #274). A person correcting the
+// micro to a different micro ("the micros are HMS-2000-4T") records a supersession, and from then on
+// only the inverter fields answer — so a model with no make in it (Hoymiles HM/HMS/HMT, APsystems
+// DS3/QS1/EZ1/YC, Enphase M215/M250) must still read as a micro, or a correct human statement fires
+// the rapid-shutdown blocker. Read from the inverter fields only, never the sheets (the fallback below
+// asks for topology words).
+const MICRO_MODEL_FAMILIES = [
+  /\bhm[st]?-?\d/i,
+  /\bds3/i,
+  /\bqs1\b/i,
+  /\bez1\b/i,
+  /\byc\d{3,4}\b/i,
+  /\bm2(?:15|50)\b/i,
+];
 const MLPE_INVERTER_BRANDS = [
   ENPHASE_MICRO,
-  /ap\s?systems|apsystems|\bds3\b|\bqs1\b|\byc600\b/i,
+  /ap\s?systems|apsystems/i,
+  ...MICRO_MODEL_FAMILIES,
   /hoymiles/i,
   /tigo\s?(ts4|rsd)/i,
 ];
@@ -257,11 +273,22 @@ function mlpeDesign(project: ProjectRecord, allText: string, texts: DesignTextSo
   return { mlpe: equipment.present || isMicroOrMlpeInverter(project, allText), equipment };
 }
 
+// A PERSON'S "THAT IS NOT THE MICRO" OUTRANKS THE RAW MICRO EVIDENCE (#270). Both human edit doors
+// write inverterModel but keep the parser's pvMicro* fields — evidence is never deleted — so joined
+// here, a micro-parsed design verified to "Sunny Boy …" kept its rapid-shutdown blocker softened.
+// The supersession is a recorded human statement (normalize.recordMicroSupersession), NEVER string
+// inequality: the parser itself writes a Powerwall into invModel next to a micro, and a verify that
+// only fixes the micro's spelling is no change of inverter (Helm rulings on PR #274). Can only turn
+// MLPE off, and only on a person's word.
+function microEvidenceSuperseded(project: ProjectRecord): boolean {
+  return microEvidenceSupersededIn(project.parserSnapshot ?? {});
+}
+
 function isMicroOrMlpeInverter(project: ProjectRecord, allText: string): boolean {
-  const microModel = str(project, "pvMicroModel");
+  const superseded = microEvidenceSuperseded(project);
   const inverterText = [
-    microModel,
-    str(project, "pvMicroQty") ? "microinverter" : "",
+    superseded ? "" : str(project, "pvMicroModel"),
+    !superseded && str(project, "pvMicroQty") ? "microinverter" : "",
     str(project, "invModel"),
     str(project, "inverterModel"),
   ].filter(Boolean).join("\n");
@@ -288,8 +315,43 @@ const NEGATION_BEFORE = /(?:\b(?:not|no|never|without|missing|lacks?|lacking|oth
 // "… (NOT USED)", "… IS NOT USED"), like "N/A" and "NONE". Never in the 30-character window:
 // affirmedIn joins whitespace, so the next schedule row ("EV CHARGER: N/A", "HOA: N/A") would
 // deny a real mention before it. A dash before a bare "NO" denies only when the NO stands alone:
-// "MOBILE HOME - NO BASEMENT" and "RSD INITIATOR - NO ACCESS RESTRICTIONS" affirm the mention.
-const NEGATION_AFTER = /^[^.;]{0,30}?\b(?:not\s+(?:provided|shown|found|included|listed|evaluated|verified|checked|analy[sz]ed|addressed|applicable)|missing|by\s+others|excluded)\b|^\s*[?:]?\s*(?:no|n\/a|none|not\s+used)\b|^\s*[?:\u2013\u2014-]?\s*\(?\s*(?:is\s+)?(?:n\/a|none|not\s+used)\b|^\s*[\u2013\u2014-]\s*no(?=\s*(?:$|[.;,)]))/i;
+// "MOBILE HOME - NO BASEMENT" and "RSD INITIATOR - NO ACCESS RESTRICTIONS" affirm the mention, and
+// so does the number abbreviation "NO. 1" ("RAPID SHUTDOWN INITIATOR - NO. 1 AT MAIN SERVICE").
+// "NOT APPLICABLE", "MISSING", "EXCLUDED" and "BY OTHERS" read only the mention's own cell (#271):
+// see CELL_DENIAL_AFTER.
+const NEGATION_AFTER = /^[^.;]{0,30}?\b(?:not\s+(?:provided|shown|found|included|listed|evaluated|verified|checked|analy[sz]ed|addressed))\b|^\s*[?:]?\s*(?:no|n\/a|none|not\s+used)\b|^\s*[?:\u2013\u2014-]?\s*\(?\s*(?:is\s+)?(?:n\/a|none|not\s+used)\b|^\s*[\u2013\u2014-]\s*no(?=\s*(?:$|[;,)]|\.(?!\s*\d)))/i;
+// THE MENTION'S OWN CELL (#271). These four words used to deny anywhere in the 30-character
+// window, and affirmedIn joins whitespace — so "LISTED RSD EQUIPMENT" followed by the next row,
+// "EV CHARGER: NOT APPLICABLE", read as one denied cell. The line break is gone by then (the
+// package texts arrive flattened), so the cell is read from the words themselves. The denial counts:
+//   - with no separator crossed: "UL 2703 LISTING MISSING", "RSD EQUIPMENT BY OTHERS" — a colon,
+//     an en/em dash or a spaced hyphen starts another label's value; or
+//   - after ONE separator, when everything before it is the mention's own label running on
+//     ("LISTED RSD EQUIPMENT: NOT APPLICABLE", "UL 2703 LISTING - MISSING", "(… ): EXCLUDED").
+//     Another row's label ("EV CHARGER:", "TRENCHING:") is not one of those words. The label also
+//     runs on through its own joiners (Helm on #284): a parenthetical ("LISTED RSD EQUIPMENT (SEE
+//     NOTE 4): BY OTHERS", "MANUFACTURED HOME (HUD): NOT APPLICABLE") and a slash naming an
+//     alternative ("EQUIPMENT/DEVICES", "MANUFACTURED HOME / MOBILE HOME"). A slash never starts
+//     another row, so up to three words after it belong to this label.
+//     Missing a joiner here is the unsafe direction: the denied mention reads as affirmed and the
+//     gap it should raise (690.12(B)(2)) is missed.
+//     After the separator, the value cell may carry words before the denial word ("PROVIDED BY
+//     OTHERS", "TO BE VERIFIED BY OTHERS", "CURRENTLY MISSING"), up to 25 characters that do not
+//     cross another separator (CELL_VALUE_LEAD; Helm re-review on #284). Only "is"/"are" used to be
+//     allowed, so "LISTED RSD EQUIPMENT: PROVIDED BY OTHERS" read as affirmed. The lead does not
+//     enter a parenthetical unless the denial opens it: "INSTALLED (BATTERY BY OTHERS)" is about
+//     the battery, "SUPPLIED (BY OTHERS)" is this cell's own denial.
+//     A second label joined with "&", "AND"/"OR", a comma or "+" ("LISTED RSD EQUIPMENT & LABELS:
+//     BY OTHERS") is the same label running on — the joiners STORAGE_RUN_THEN_DENIAL already takes.
+const CELL_LABEL_WORD = String.raw`(?:equipment|system|systems|device|devices|switch|initiator|listing|listings|listed|label|labels|hardware|components?|units?|certificat(?:e|ion)|documentation|details|specs?|sheets?|letter|calcs?|calculations?|modules?|racking|mounting|placards?|location|analysis|gateway|anchoring|package|installation|scope|supply)(?:-[a-z]+)?`;
+const CELL_LABEL_RUN = String.raw`(?:(?:\s*(?:&|,|\+)\s*|\s+(?:and|or)\s+|\s+)${CELL_LABEL_WORD}\b|\s*\([^()]{0,30}\)|\s*\/\s*[a-z0-9][\w-]*(?:\s+[a-z0-9][\w-]*){0,2})*`;
+const CELL_DENIAL_WORD = String.raw`(?:not\s+applicable|missing|excluded|by\s+others)`;
+const CELL_VALUE_LEAD = String.raw`(?:(?!\s-\s)[^.;:\u2013\u2014(]|\((?=\s*${CELL_DENIAL_WORD})){0,25}?`;
+const CELL_DENIAL_AFTER = new RegExp(
+  String.raw`^(?:(?!\s-\s)[^.;:\u2013\u2014]){0,30}?\b${CELL_DENIAL_WORD}\b`
+  + String.raw`|^${CELL_LABEL_RUN}\s*\)?\s*[?:\u2013\u2014-]\s*\(?${CELL_VALUE_LEAD}\b${CELL_DENIAL_WORD}\b`,
+  "i",
+);
 
 interface Affirmed {
   source: string;
@@ -309,7 +371,7 @@ function affirmedIn(sources: DesignTextSource[], patterns: RegExp[], notAStateme
         if (m[0].length === 0) { re.lastIndex++; continue; }
         const before = text.slice(Math.max(0, m.index - 40), m.index);
         const after = text.slice(m.index + m[0].length, m.index + m[0].length + 40);
-        if (NEGATION_BEFORE.test(before) || NEGATION_AFTER.test(after) || /\b(?:not|no|without)\b/i.test(m[0])) continue;
+        if (NEGATION_BEFORE.test(before) || NEGATION_AFTER.test(after) || CELL_DENIAL_AFTER.test(after) || /\b(?:not|no|without)\b/i.test(m[0])) continue;
         if (notAStatement?.(text, m.index, m[0])) continue;
         // The matched phrase itself, not a window: the sentence around it on a cover sheet is
         // the title block (homeowner name, address).
@@ -530,10 +592,12 @@ function withoutRsdOptionTitle(sources: DesignTextSource[]): DesignTextSource[] 
 /** city.ess.details-missing's trigger: a mention of storage scope. */
 const ESS_TRIGGER_PATTERNS: RegExp[] = [/battery/i, /\bESS\b/i, /powerwall/i, /encharge/i, /backup/i];
 const STORAGE_WORD = String.raw`(?:batter(?:y|ies)|ESS|backup|powerwall|encharge|energy\s+storage(?:\s+system)?|storage)`;
-const STORAGE_RUN_THEN_DENIAL = new RegExp(String.raw`^(?:\s*(?:\/|&|,|\+|and|or)?\s*${STORAGE_WORD}\b)*\s*\)?\s*(?:[?:]?\s*(?:no|none|n\/a|not\s+(?:used|applicable|included|proposed|provided))\b|[\u2013\u2014-]\s*(?:(?:none|n\/a|not\s+(?:used|applicable|included|proposed|provided))\b|no(?=\s*(?:$|[.;,)]))))`, "i");
+const STORAGE_RUN_THEN_DENIAL = new RegExp(String.raw`^(?:\s*(?:\/|&|,|\+|and|or)?\s*${STORAGE_WORD}\b)*\s*\)?\s*(?:[?:]?\s*(?:no|none|n\/a|not\s+(?:used|applicable|included|proposed|provided)|excluded|by\s+others)\b|[\u2013\u2014-]\s*(?:(?:none|n\/a|not\s+(?:used|applicable|included|proposed|provided)|excluded|by\s+others)\b|no(?=\s*(?:$|[;,)]|\.(?!\s*\d))))|[?:\u2013\u2014-]\s*\(?${CELL_VALUE_LEAD}\b${CELL_DENIAL_WORD}\b)`, "i");
 const DENIAL_THEN_STORAGE_RUN = new RegExp(String.raw`\b(?:no|without)\s+(?:${STORAGE_WORD}\s*(?:\/|&|,|\+|and|or)\s*)+$`, "i");
 /** "BATTERY / ESS: NONE", "(BATTERY BACKUP): NOT USED": the denial sits after the next storage
- *  word (or its closing parenthesis), past NEGATION_AFTER's reach. */
+ *  word (or its closing parenthesis), past NEGATION_AFTER's reach. After an explicit separator the
+ *  cell's own words may lead up to the cell denial ("BATTERY STORAGE - FURNISHED BY OTHERS"), as in
+ *  CELL_DENIAL_AFTER. */
 const essMentionDenied: MentionGuard = (text, index, matched) =>
   STORAGE_RUN_THEN_DENIAL.test(text.slice(index + matched.length, index + matched.length + 60))
   || DENIAL_THEN_STORAGE_RUN.test(text.slice(Math.max(0, index - 60), index));
@@ -554,9 +618,11 @@ function readableDocumentText(text: unknown): boolean {
 
 /** A microinverter design has no DC PV source circuits to label beyond the module leads. */
 function isMicroinverterDesign(project: ProjectRecord, allText: string): boolean {
-  if (str(project, "pvMicroModel") || str(project, "pvMicroQty")) return true;
+  // Same supersession rule as isMicroOrMlpeInverter (#270), so the two readers agree on a row
+  // verified away from its micro parse: its DC-circuit labels come back.
+  if (!microEvidenceSuperseded(project) && (str(project, "pvMicroModel") || str(project, "pvMicroQty"))) return true;
   const inverter = [str(project, "invModel"), str(project, "inverterModel")].filter(Boolean).join("\n");
-  if (inverter.trim()) return /micro.?inverter|hoymiles|apsystems/i.test(inverter) || ENPHASE_MICRO.test(inverter);
+  if (inverter.trim()) return /micro.?inverter|hoymiles|apsystems/i.test(inverter) || ENPHASE_MICRO.test(inverter) || hasAny(inverter, MICRO_MODEL_FAMILIES);
   return /micro.?inverter/i.test(allText);
 }
 
@@ -687,6 +753,10 @@ export function evaluateDesignCodeFindings(
   /** Per-document text (one source per uploaded document), so a design-criteria conflict
    *  can name "plan set vs engineer's letter" rather than one merged text blob. */
   documentTexts: DesignTextSource[] = [],
+  /** A named person confirmed a `structural` document is the engineer's sealed letter (#198; owner
+   *  ruling 2026-10-08): the letter is in the package and only its seal — an image the text layer
+   *  cannot read — is left to verify. Never set from text. */
+  structuralCertification: { confirmedBy: string; confirmedAt: string } | null = null,
 ): ReviewerFinding[] {
   const out: ReviewerFinding[] = [];
   const all = designText(project);
@@ -870,7 +940,25 @@ export function evaluateDesignCodeFindings(
   const claimsEngineered = resolvedPath !== "prescriptive" && (
     pathWordingScope(str(project, "permitPath")) === "engineered"
     || hasAny(all, [/stamped structural/i, /structural letter/i, /sealed by/i, /\bP\.?E\.?\b/, /engineering (calc|letter|review|analysis)/i]));
-  if (roofMounted && claimsEngineered && !hasStampedEngineering) {
+  if (roofMounted && claimsEngineered && !hasStampedEngineering && structuralCertification) {
+    // A PERSON CONFIRMED THE LETTER; ONLY ITS SEAL IS UNSEEN (#198). A named person confirmed that
+    // the engineer's letter bound into the plan set (split as `structural`) is the sealed letter for
+    // this job, so the engineering this design leans on IS attached. The seal is an image the text
+    // layer never sees, so a person verifies it: a warning, never a hold. Same id, so the tile rule
+    // below does not raise it again.
+    const by = `${structuralCertification.confirmedBy} ${structuralCertification.confirmedAt.slice(0, 10)}`;
+    out.push(finding({
+      id: "city.struct.stamped-engineering-missing",
+      severity: "warning",
+      category: "structural",
+      title: "Engineer's structural letter on file (confirmed) — verify the seal on the structural pages",
+      message: `The engineer's structural letter is on file as the structural document, confirmed by ${by}. The text layer cannot see a PE seal, so whether it is sealed is for a person to verify, not missing.`,
+      cityFeedback: "The structural calculations or engineer's letter must carry the engineer's wet or digital seal.",
+      designTeamAction: "Open the structural pages and confirm the engineer's seal and signature are on the letter before submittal.",
+      evidenceNeeded: ["PE seal and signature on the engineer's structural letter"],
+      codeReferences: [...oregonWorksheetRefs, roofLoadsRef],
+    }));
+  } else if (roofMounted && claimsEngineered && !hasStampedEngineering) {
     out.push(finding({
       id: "city.struct.stamped-engineering-missing",
       // The design DEPENDS on it when it declares the engineered path — that is a blocker,
@@ -1012,13 +1100,20 @@ export function evaluateDesignCodeFindings(
     if (needsStamp && !hasStampedEngineering && !out.some((f) => f.id === "city.struct.stamped-engineering-missing")) {
       out.push(finding({
         id: "city.struct.tile-stamped-engineering-missing",
-        severity: "blocker",
+        // A person confirmed the engineer's letter (#198): only its seal is left to verify.
+        severity: structuralCertification ? "warning" : "blocker",
         category: "structural",
-        title: "Tile roof on the engineered path with no stamped engineering",
-        message: `The roof is ${roofLabel}; ${project.state.toUpperCase() === "OR" ? "Oregon's prescriptive roofing row does not admit tile, so" : "the resolved permit path is engineered, so"} the job files the engineered/structural application and needs a stamped structural calculation — none is in the package.`,
+        title: structuralCertification
+          ? "Tile roof on the engineered path — verify the seal on the structural pages"
+          : "Tile roof on the engineered path with no stamped engineering",
+        message: `The roof is ${roofLabel}; ${project.state.toUpperCase() === "OR" ? "Oregon's prescriptive roofing row does not admit tile, so" : "the resolved permit path is engineered, so"} the job files the engineered/structural application and needs a stamped structural calculation — ${structuralCertification
+          ? `the engineer's structural letter is on file, confirmed by ${structuralCertification.confirmedBy} ${structuralCertification.confirmedAt.slice(0, 10)}; the text layer cannot see a seal, so a person verifies it.`
+          : "none is in the package."}`,
         cityFeedback: "Provide the stamped/sealed structural calculation or engineer's letter covering the tile roof's dead load, the framing, and the tile attachment point loads.",
-        designTeamAction: "Obtain the sealed engineering from the engineer of record and file the engineered/structural application (not the prescriptive checklist).",
-        evidenceNeeded: ["Stamped/sealed structural calculation or letter", "Roof dead load including tile", "Tile attachment point loads"],
+        designTeamAction: structuralCertification
+          ? "Verify the seal on the structural pages: confirm the engineer's seal and signature are on the letter, and that it covers the tile roof's dead load and attachment point loads."
+          : "Obtain the sealed engineering from the engineer of record and file the engineered/structural application (not the prescriptive checklist).",
+        evidenceNeeded: [structuralCertification ? "PE seal and signature on the engineer's structural letter" : "Stamped/sealed structural calculation or letter", "Roof dead load including tile", "Tile attachment point loads"],
         codeReferences: [...oregonWorksheetRefs, roofLoadsRef],
       }));
     }

@@ -75,6 +75,7 @@ import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier
 // detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget.
 import { publicPermitStatusCheck } from "./publicPermitStatus";
 import { planSetTextForProject, projectDocsByType, DOCS_DIR, PLAN_TEXT_DOC_TYPES } from "./projectDocuments";
+import { activeStructuralLetterConfirmation, structuralLetterState } from "./structuralLetter";
 import type { DesignTextSource } from "./designCriteria";
 import { describeCited, lookedUpRecordType, issuingAgencyFor, permitAnswerForTrack, stateRulesFor, isStatewidePortalUrl, permitProcessKey, projectForTrack, refuseTrackIssuerValue, trackIssuer } from "./permitProcess";
 import { statewideDecisionFor, statewideUrlRefusal } from "./statewideEvidence";
@@ -135,7 +136,7 @@ import {
   isVerifiedKnowledge,
   type ClassifiedMboxMessage,
 } from "./knowledgeBase";
-import { canonicalAliasForVerifiedField, canonicalizeSnapshot, compactAlnum, divergedAliases, existingSystemFromSnapshot, fieldAliases, mergeEditOverSnapshot, normalizeProject, normalizeTokens, TRACK_ISSUER_SNAPSHOT_KEYS, withTrackIssuers } from "./normalize";
+import { canonicalAliasForVerifiedField, canonicalizeSnapshot, compactAlnum, divergedAliases, existingSystemFromSnapshot, fieldAliases, mergeEditOverSnapshot, MICRO_SUPERSEDED_KEY, normalizeProject, recordMicroSupersession, normalizeTokens, TRACK_ISSUER_SNAPSHOT_KEYS, withTrackIssuers } from "./normalize";
 import {
   classificationDrift, classifyPermitStatusText, effectiveCheckDays, extractStatusDate, isAuthWallText, isNemApprovalOutcome, nextCheckIso, outcomeTrack, portalStatedStatus,
   readingMayFinishTrack, shouldRecordStatusCheck, trackKind, UNCONFIRMED_READING_LABEL,
@@ -212,7 +213,10 @@ export function buildReviewerReportFor(db: AppDb, project: ProjectRecord): Revie
   // undefined = not read (the note says so); null = read, and the AHJ has no row of its own.
   let codeProfileRow: { ahj: string; confidence: "seeded" | "verified" } | null | undefined;
   try { const own = ownCodeProfileRow(db, project.state, project.ahj); codeProfileRow = own ? { ahj: own.profile.ahj, confidence: own.profile.confidence } : null; } catch { codeProfileRow = undefined; }
-  return buildReviewerReport(project, { codeContext, codeProfileRow, uploadedDocTypes, documentTexts: designDocumentTexts(db, project.id), pvWorksheet: filedPvWorksheetInput(db, project) });
+  // A named person's confirmation of the engineer's letter (#198; owner ruling 2026-10-08) — the
+  // only thing that turns the stamped-structural hold into "verify the seal". Text never does.
+  const structuralCertification = activeStructuralLetterConfirmation(db, project.id);
+  return buildReviewerReport(project, { codeContext, codeProfileRow, uploadedDocTypes, documentTexts: designDocumentTexts(db, project.id), pvWorksheet: filedPvWorksheetInput(db, project), structuralCertification });
 }
 
 // WHAT HOLDS THIS FILING: ONE ANSWER (#214). The text report with the cached vision verdicts folded
@@ -689,7 +693,9 @@ export function createProject(
    *  knowledge base (L3). Written in the INSERT, so even the birth learn below skips it. */
   options: { learningExcluded?: boolean } = {},
 ): ProjectDetail {
-  const project = normalizeProject(id(), payload);
+  // A new project is parser/intake output: it never carries a human micro-supersession (#270).
+  const { [MICRO_SUPERSEDED_KEY]: _forgedMarker, ...parsed } = payload as Record<string, unknown>;
+  const project = normalizeProject(id(), parsed as ParserPayload);
   db.transaction(() => {
     db.run(
       `INSERT INTO projects (
@@ -821,7 +827,14 @@ export { researchWithFittedUrl };
 // over the existing parser snapshot — so a re-parse of a corrected plan set
 // updates the record (including the canonical electrical/structural/evidence
 // keys) without losing prior data — then re-runs QC.
-export function updateProject(db: AppDb, projectId: string, payload: ParserPayload): ProjectDetail {
+export function updateProject(
+  db: AppDb,
+  projectId: string,
+  payload: ParserPayload,
+  /** humanInverterEdit: ONLY a human-only caller (corrections-apply, a person's approval) may set it —
+   *  never PUT /api/projects/:id, which the parser and API keys use (#270). See recordMicroSupersession. */
+  options: { humanInverterEdit?: boolean } = {},
+): ProjectDetail {
   const existing = getProjectDetail(db, projectId).project;
   // Drop the non-persistent plan-set text overlay (re-derived from project_documents
   // on every load) so document text never bloats the stored parser_json.
@@ -835,7 +848,12 @@ export function updateProject(db: AppDb, projectId: string, payload: ParserPaylo
   // so editing invModel moves inverterModel with it. An alias set on its own (differs from its
   // source) is kept, and one sent in THIS payload wins over everything via the merge.
   // normalizeProject canonicalizes the result. (The review queue's applyVerifiedField shares this.)
-  const mergedSnapshot: ParserPayload = mergeEditOverSnapshot(existingSnapshot as ParserPayload, payload);
+  // THE MICRO-SUPERSESSION MARKER IS NEVER RECEIVED (#270): a re-sent snapshot can't forge or move it,
+  // and the stored one rides through the merge. A payload's inverterModel is NOT a person's statement
+  // (the parser sends it on every save); only a human-only caller's explicit option records one.
+  const { [MICRO_SUPERSEDED_KEY]: _forgedMarker, ...edit } = payload as Record<string, unknown>;
+  const mergedSnapshot: ParserPayload = mergeEditOverSnapshot(existingSnapshot as ParserPayload, edit as ParserPayload);
+  if (options.humanInverterEdit && String(edit.inverterModel ?? "").trim()) recordMicroSupersession(mergedSnapshot, "correction_apply");
   // WHICH PORTAL THIS FILES ON IS NOT A SIDE EFFECT OF AN EDIT.
   //
   // normalizeProject re-derives every column from the snapshot, so a project whose stored
@@ -1376,6 +1394,8 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     // Project-scoped tables added later — must also be cleared or the FK on projects fails.
     db.run("DELETE FROM project_metrics WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM filing_metrics WHERE project_id = ?", [projectId]);
+    // A person's confirmation of the structural letter (migration v47) is bound to a document here.
+    db.run("DELETE FROM structural_letter_confirmations WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM project_documents WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM project_intake_requests WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM submission_payments WHERE project_id = ?", [projectId]);
@@ -3897,7 +3917,9 @@ export function getSubmitGateReport(db: AppDb, projectId: string): SubmitGateRep
       title: "Required documents attached",
       lane: gateDocs.owed.some((d) => d.lane === "nem") && !gateDocs.owed.some((d) => d.lane === "permit") ? "nem" : "permit",
       // An application set nobody knows is a WARNING (seen, never blocking) — never "pass".
-      status: gateDocs.owed.length ? "blocker" : docInventory.missingAdvisory.length || gateDocs.acquiredAtStaging.length || docInventory.applicationSetUnknown ? "warning" : "pass",
+      // A row present with something left for a person to check (the confirmed structural letter's
+      // seal, #198) is a WARNING too — confirmed is not the same as sealed.
+      status: gateDocs.owed.length ? "blocker" : docInventory.missingAdvisory.length || gateDocs.acquiredAtStaging.length || docInventory.applicationSetUnknown || docInventory.presence.some((d) => d.present && d.warning) ? "warning" : "pass",
       ownerRole: "Permit Ops",
       requirement: "Every required submittal document must be attached as a file (or identified in the uploaded plan set) before staging — the AHJ rejects incomplete packages.",
       evidence: [
@@ -3905,7 +3927,9 @@ export function getSubmitGateReport(db: AppDb, projectId: string): SubmitGateRep
         // Never dropped by the evidence cap ("NOT KNOWN:" names a document question, like MISSING):
         // the count above is of a set that may not include the AHJ's applications at all.
         ...(docInventory.applicationSetUnknown ? [`NOT KNOWN: ${docInventory.applicationSetUnknown}`] : []),
-        ...docInventory.presence.filter((d) => d.present).slice(0, 4).map((d) => documentPresenceLine(d.label, d.via)),
+        // A present row a person must still check is listed first, so the cap never hides it.
+        ...docInventory.presence.filter((d) => d.present).sort((a, b) => Number(Boolean(b.warning)) - Number(Boolean(a.warning)))
+          .slice(0, 4).map((d) => documentPresenceLine(d.label, d.via)),
         ...gateDocs.filledAtStaging.map((d) => `Filled at staging: ${d.label} — the form's template is on file; staging fills it and offers it to any upload slot that asks for it (check the portal's attachment list before submitting)`),
         ...gateDocs.acquiredAtStaging.map((d) => `Stage downloads and fills it: ${d.label} — ${acquisitionSentence(gateDocs.acquiredVia.get(d))}`),
         ...gateDocs.owed.map((d) => `MISSING (required): ${d.label} — ${d.why}`),
@@ -4077,6 +4101,13 @@ export function getSubmitGateReport(db: AppDb, projectId: string): SubmitGateRep
     passCount,
     checks,
     manualSubmitChecklist,
+    // THE ENGINEER'S LETTER CARD (#198): the candidate a person can confirm and the standing
+    // confirmation, beside the stamped-structural hold and the inventory row — only when the job
+    // owes the letter and no stamped-letter file settles it (the row is missing or stands on a
+    // confirmation, or a stamped-engineering finding was raised).
+    ...(docInventory.presence.some((d) => d.docType === "structural_letter" && (!d.present || d.warning))
+      || reviewerReport.findings.some((f) => f.id === "city.struct.stamped-engineering-missing" || f.id === "city.struct.tile-stamped-engineering-missing")
+      ? { structuralLetter: structuralLetterState(db, projectId) } : {}),
   };
 
   return {
@@ -4665,7 +4696,7 @@ export async function runEmailTracker(
 
       for (const message of classified.messages) {
         if (message.record.type === "spam_irrelevant") continue;
-        if (db.get<Row>("SELECT id FROM email_project_matches WHERE source_signature = ?", [message.sourceSignature])) {
+        if (db.get<Row>("SELECT id FROM email_project_matches WHERE source_signature IN (?, ?)", [message.sourceSignature, message.legacySourceSignature])) {
           result.skippedDuplicates += 1;
           continue;
         }
@@ -5533,7 +5564,9 @@ export function applyCorrectionProposals(
     const key = CORRECTION_FIELD_TO_PAYLOAD[p.field] || p.field;
     payload[key] = p.proposedValue;
   }
-  if (Object.keys(payload).length) updateProject(db, projectId, payload);
+  // A person approved these proposals (/api/corrections/:id/apply): their inverter model is a human
+  // statement (#270).
+  if (Object.keys(payload).length) updateProject(db, projectId, payload, { humanInverterEdit: true });
 
   const ts = nowIso();
   db.run("UPDATE corrections SET human_approved = 1 WHERE id = ?", [correctionId]);
@@ -9853,6 +9886,10 @@ function applyVerifiedField(db: AppDb, projectId: string, stored: ParserPayload,
   const canonicalKey = canonicalAliasForVerifiedField(fieldName, aliases[0]);
   const edit: ParserPayload = { [aliases[0]]: value, ...(canonicalKey ? { [canonicalKey]: value } : {}) };
   const payload = canonicalizeSnapshot(mergeEditOverSnapshot(stored, edit));
+  // A person verified the inverter model: record it, so the reader can tell their word from the
+  // parser's own inv*/pvMicro* split (#270). recordMicroSupersession decides whether it is a statement
+  // at all (not a spelling fix of the micro, not the ESS inverter).
+  if (canonicalKey === "inverterModel") recordMicroSupersession(payload, "review_queue");
   const numeric = Number.parseFloat(value.replace(/[^0-9.-]/g, ""));
   const numberValue = Number.isFinite(numeric) ? numeric : null;
 
@@ -9893,8 +9930,9 @@ export function listDivergedAliasProjects(
   orgId: string | null = DEFAULT_ORG_ID,
 ): Array<{ projectId: string; status: string; aliases: Array<{ key: string; stored: string; derived: string }> }> {
   const rows = db.query<{ id: string; status: string; parser_json: string }>(
-    `SELECT id, status, parser_json FROM projects${orgId ? " WHERE org_id = ?" : ""} ORDER BY created_at ASC`,
-    orgId ? [orgId] : [],
+    // null — and only null — reads every org (#270): '' is an org id that matches nothing, never "all".
+    `SELECT id, status, parser_json FROM projects${orgId !== null ? " WHERE org_id = ?" : ""} ORDER BY created_at ASC`,
+    orgId !== null ? [orgId] : [],
   );
   const out: Array<{ projectId: string; status: string; aliases: Array<{ key: string; stored: string; derived: string }> }> = [];
   for (const row of rows) {
