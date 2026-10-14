@@ -36,9 +36,13 @@
 //                     stops and names the page (stopReason interstitial_loop) — never a review.
 //   [5] NEVER BACK  — an interstitial with only Previous / Cancel and a planner that names
 //                     Previous as its advance: nothing is clicked, nothing is review.
+//   [6] MUST EXCLUDE — the same prose above a list of records whose rows each say "Continue":
+//                     not one way forward, so no row is pressed (and nothing is review).
 //
-// Against origin/main's autoLearnAdapter.ts the MUST PASS lines of [0], [1], [2], [4] and [5]
-// are FAIL banners (main stops at the interstitial as review); [3] passes on both.
+// Against origin/main's autoLearnAdapter.ts this is 29 FAIL banners, not a crash: main stops at
+// every interstitial as review (lockReview armed there, "advance: Next" never recorded) and, under
+// [2]'s planner, records the interstitial's Next as an isFinalSubmit step. [3] cannot be reached
+// on main (the walk never gets past the interstitial); its rule-1 lines hold on both.
 //
 //   npx tsx portal-bot/src/adapters/informationInterstitial.dom.smoke.ts
 import "../smokeArtifactDirs"; // hand-run safe: artifact dirs default to a temp folder, never data/
@@ -189,7 +193,7 @@ const reviewNextPage = (p: string, addr: string): string => shell(p, {
   nav: PREV_NEXT,
 });
 
-const PREFIXES = ["/post", "/get", "/next-files", "/stuck", "/noforward"] as const;
+const PREFIXES = ["/post", "/get", "/next-files", "/stuck", "/noforward", "/rows"] as const;
 const hits: Array<{ method: string; url: string }> = [];
 const server = http.createServer((q, r) => {
   const url = q.url || "/";
@@ -209,6 +213,11 @@ const server = http.createServer((q, r) => {
       // Next does nothing but tell the server it was pressed.
       return send(shell(p, { title: "Permitting Information", content: PERMITTING_INFORMATION,
         nav: `<button type="button" class="btn btn-primary ms-auto" onclick="fetch('${p}/clicked-next')">Next</button>` }));
+    }
+    if (p === "/rows") {
+      // The same prose above a list of the account's records, each with its own "Continue".
+      const row = (n: number): string => `<tr><td>Request ${n}</td><td>In progress</td><td><button type="button" class="btn" onclick="fetch('${p}/clicked-continue?row=${n}')">Continue</button></td></tr>`;
+      return send(shell(p, { title: "Permitting Information", content: `${PERMITTING_INFORMATION}<table class="records"><tbody>${row(1)}${row(2)}${row(3)}</tbody></table>` }));
     }
     if (p === "/noforward") {
       return send(shell(p, { title: "Permitting Information", method: "GET", content: PERMITTING_INFORMATION,
@@ -230,7 +239,7 @@ const server = http.createServer((q, r) => {
   }
   if (rest === "/review") return send(reviewPage(p, qs.get("addr") ?? ""));
   if (rest === "/review-next") return send(reviewNextPage(p, qs.get("addr") ?? ""));
-  if (rest === "/clicked-next") { r.writeHead(204); return r.end(); }
+  if (rest === "/clicked-next" || rest === "/clicked-continue") { r.writeHead(204); return r.end(); }
   return send(`<!doctype html><html><body><h1>${esc(rest)}</h1><p>Automation must never land here.</p></body></html>`);
 });
 await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
@@ -337,7 +346,8 @@ console.log("\n[1] the captured Permitting Information page (POST form): home �
   // same page as terminal (shared reviewSignals: "review your submission"), so the Next's form
   // POST is aborted and the run stops NAMED by the backstop. Reported here so the line is seen.
   const posted = w.hits.some((h) => h.method === "POST" && h.url.startsWith("/post/sg"));
-  console.log(`  note - the Next POST ${posted ? "reached the server" : "was held by the network backstop"}: stopReason=${w.stopReason ?? "-"}; ${w.message.slice(0, 260)}`);
+  const pressed = w.notes.includes("advance: Next");
+  console.log(`  note - ${!pressed ? "the Next was never pressed" : posted ? "the Next POST reached the server" : "the Next POST was held by the network backstop"}: stopReason=${w.stopReason ?? "-"}; ${w.message.slice(0, 260)}`);
   check("if the backstop held the POST, the stop is its LIVE reading — never the learner's review lockdown",
     posted || (w.stopReason === "backstop_abort" && /the page this request came from/.test(w.message) && !/the run is at review/.test(w.message)),
     `stopReason=${w.stopReason} message=${w.message}`);
@@ -431,6 +441,21 @@ console.log("\n[5] an interstitial with no way forward (Previous / Cancel only)"
     !w.hits.some((h) => h.url.includes("t_p1685049573549") || h.url.startsWith("/noforward/cancel")), JSON.stringify(w.hits.map((h) => h.url)));
   check("not a review stop: no lockReview, no final submit, not reachedReview",
     w.locks.length === 0 && w.finals.length === 0 && w.reachedReview !== true, JSON.stringify({ locks: w.locks, finals: w.finals, reachedReview: w.reachedReview, message: w.message }));
+}
+
+// ===========================================================================================
+// [6] MUST EXCLUDE: the same prose above a list whose rows each say "Continue" — somebody's
+//     records, not one way forward. Not review, and no row is pressed.
+// ===========================================================================================
+console.log("\n[6] MUST EXCLUDE: review prose above three record rows, each with its own Continue");
+{
+  const w = await runLearn("/rows", () => null);
+  check("premise: the planner saw the page", w.plannerPages.includes("/rows/info"), JSON.stringify(w.plannerPages));
+  check("not a review stop (nothing entered, no review shape): no lockReview, no final submit",
+    w.locks.length === 0 && w.finals.length === 0 && w.reachedReview !== true, JSON.stringify({ locks: w.locks, finals: w.finals, reachedReview: w.reachedReview }));
+  check("three same-worded controls are not ONE way forward: no forward control adopted",
+    interstitialEvents(w).some((e) => e.forward === null && e.candidates === 3), JSON.stringify(interstitialEvents(w)));
+  check("no row's Continue was pressed", !w.hits.some((h) => h.url.startsWith("/rows/clicked-continue")), JSON.stringify(w.hits.map((h) => h.url)));
 }
 
 await browser.close();
