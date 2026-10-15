@@ -59,6 +59,7 @@ import {
   type ContactFieldKind, type ContactRole, type ContactTrack,
 } from "../../../shared/src/contactRoles";
 import { portalSaysNotServed } from "../../../shared/src/portalNotServed";
+import { prepareComputeSettle, waitForComputeSettled } from "../computeSettle";
 
 // AutoLearnAdapter — AUTONOMOUSLY learns an unknown AHJ/utility portal form instead of
 // having a human record it. Each page is scraped into a structured snapshot
@@ -493,6 +494,32 @@ const POLICY_RADIO_DEFAULTS: Array<{ question: RegExp; answer: "Yes" | "No"; enf
   // planner's No is corrected.
   { question: /consent\s+to\s+drone|drones?\b.{0,60}\binspections?\b|drone\s+inspection/i, answer: "Yes", enforce: true, scope: "permit" },
 ];
+
+/** A POLICY SCOPE: "nem" on a utility interconnection, "permit" on an AHJ, "none" when the operator
+ *  turned the policy answers off (PORTAL_POLICY_DEFAULTS=off — backend autoLearn.ts sets the learn's
+ *  policyProfile by the same rule, and policyScopeFor below mirrors it for the replay). */
+export type PolicyScope = "nem" | "permit" | "none";
+
+/** THE LEARNER'S STANDING ANSWER TO A QUESTION, read from POLICY_RADIO_DEFAULTS — the one table
+ *  (issue #352). The replay asks it for a REQUIRED control its recipe has no step for (PacifiCorp's
+ *  knife-blade question renders only for a larger system, so a recipe learned on a small one never
+ *  recorded it), so a learn and a replay give one question one answer. "" when no rule matches or the
+ *  scope is "none". `enforce` is the learner's correction of a planner's other pick; a caller that
+ *  only ever answers an EMPTY control has nothing to correct, so it does not apply. */
+export function policyDefaultAnswerFor(question: string, scope: PolicyScope): "Yes" | "No" | "" {
+  if (scope === "none") return "";
+  const text = String(question ?? "");
+  const hit = POLICY_RADIO_DEFAULTS.find((p) => (p.scope ?? "nem") === scope && p.question.test(text));
+  return hit ? hit.answer : "";
+}
+
+/** The policy scope a replay runs under: the learn's own rule (backend autoLearn.ts policyProfile)
+ *  applied to the recipe's scope — off by the operator's switch, else a utility recipe is NEM and
+ *  anything else a permit. */
+export function policyScopeFor(scopeType: string | null | undefined, env: NodeJS.ProcessEnv = process.env): PolicyScope {
+  if (env.PORTAL_POLICY_DEFAULTS === "off" || env.PORTAL_POLICY_DEFAULTS === "0") return "none";
+  return scopeType === "utility" ? "nem" : "permit";
+}
 
 // Sensitive field labels whose literal value must NEVER be stored in a recorded step.
 // FREE-TEXT IDENTIFIERS. An account or meter number is typed; it is never one of three
@@ -9145,7 +9172,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const label = ((await btn.textContent().catch(() => "")) || "").trim();
       // Defense in depth: never click something that's actually a pay or submit control.
       if (isPayFee(label) || SUBMIT_INTENT.test(label)) return false;
+      // WAIT FOR THE RESULT, NOT THE CLICK (issue #352). A question the computed rating decides
+      // (PacifiCorp's AC disconnect section) renders only when the result is back; reading the page
+      // before that recorded nothing for it, and the learn's own sweep then found it required and
+      // never filled. The shared settle reads the page's own "still computing" signals, bounded.
+      await prepareComputeSettle(this.page);
       await this.clickResilient(btn);
+      const computed = await waitForComputeSettled(this.page);
+      this.debug?.event({ type: "compute_settled", label: label.slice(0, 40), settled: computed.settled, ms: computed.waitedMs, reason: computed.reason.slice(0, 160) });
       await this.waitForDynamicFieldsSettle();
       await this.clearOverlays();
       steps.push({

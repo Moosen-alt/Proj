@@ -112,7 +112,9 @@ import { findFilingStatus } from "../statusFinder";
 import { performLogin, portalErrorPage } from "./loginFlow";
 import { chooseCorrectionForm, correctionFormSelector, isRefusal, scanProjectForms, type ProjectFormRow } from "./correctionForm";
 import { type ExtractedField, EXTRACT_SEL, extractFieldsInPage, toExtractedField, dismissPageModals, clearPageOverlays, equipmentMakeCandidates, pageFingerprintOf, collectValidationErrorsFrom, acaApplyEntryFrom, advanceSignatureOf } from "./autoLearnAdapter";
-import { tagUploadControls, visibleBodyText } from "./autoLearnAdapter";
+import { tagUploadControls, visibleBodyText, policyScopeFor } from "./autoLearnAdapter";
+import { answerForUnrecordedControl, missingRequiredStopMessage } from "../unrecordedControls";
+import { isComputeTotalsStep, prepareComputeSettle, waitForComputeSettled } from "../computeSettle";
 import { portalSaysNotServed } from "../../../shared/src/portalNotServed";
 
 // RecipeAdapter — replays a recorded portal recipe (see portal_recipes / the recorder).
@@ -626,6 +628,9 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  render. Cleared on each advance. */
   private pendingPolicyRetries: RecipeStep[] = [];
   private inPolicyRetry = false;
+  /** Required controls the recipe has no step for, answered from this job (answerUnrecordedRequired,
+   *  issue #352) — labels, never values. */
+  private unrecordedAnswered: string[] = [];
   /** Drift-precheck annotations ("this page barely matches the recipe") — surfaced
    *  in every result payload so a run that squeaked through via heals still tells
    *  the operator the portal likely changed. */
@@ -1538,6 +1543,21 @@ export class RecipeAdapter extends BasePortalAdapter {
       if (step.action === "click" || step.action === "stopForReview") {
         await this.timed("upload-sweep", () => this.sweepUnrecordedUploads().catch(() => 0));
       }
+      // A REQUIRED CONTROL THE RECIPE HAS NO STEP FOR (issue #352) — answered from this job before the
+      // page is left (an advancing click) or handed to a person (the review stop / the recorded final
+      // submit), never past review. What was typed makes this an input page again, so the persist-
+      // settle and gap-fill below run before the click; a control it knows but this job has no value
+      // for stops the run here, by name.
+      if (!pastReview && ((step.action === "click" && /^advance\b/i.test(String(step.note ?? "").trim()))
+        || step.action === "stopForReview" || isFinalSubmitStep(step))) {
+        const unrecorded = await this.timed("unrecorded-required", () => this.answerUnrecordedRequired());
+        if (unrecorded.filled.length) { prevWasInput = true; wroteToThisPage = true; }
+        if (unrecorded.missing.length) {
+          closePrevStepTiming();
+          return await this.stopForMissingRequired(unrecorded.missing, `"${String(step.note ?? step.action).slice(0, 44)}"`,
+            { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: stepIdx, trace, slowSteps, gapFill: this.gapFillReport, unresolvedFields: this.unresolvedFields, stoppedAtPayment: this.stoppedAtPayment });
+        }
+      }
 
       // THE E-SIGNATURE IS TYPED ONLY AS THE CLIENT'S AUTHORIZED SIGNER (operator ruling
       // 2026-09-26). A recorded signature step is bound to authorizedSignerName; when this
@@ -2187,6 +2207,16 @@ export class RecipeAdapter extends BasePortalAdapter {
     // way out of earlier pages, and then left blank on the final page because no advance
     // ever followed them. Five required fields, on the page a person is asked to check.
     // Nothing here clicks; it only re-fills values the run already decided.
+    // ...and FIRST, a required control the recipe has no step for (issue #352), answered from this
+    // job — the run that simply runs out of recorded steps reaches review through here without an
+    // advance or a review step to ask it. Never past review, never on the payment stop.
+    if (!pastReview && !this.stoppedAtPayment) {
+      const unrecorded = await this.answerUnrecordedRequired();
+      if (unrecorded.missing.length) {
+        return await this.stopForMissingRequired(unrecorded.missing, "review",
+          { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, trace, slowSteps, gapFill: this.gapFillReport, unresolvedFields: this.unresolvedFields, stoppedAtPayment: this.stoppedAtPayment });
+      }
+    }
     await this.reassertBlanksOnce(false);
     // AND GAP-FILL IT, for the same reason and in the right order. Re-asserting can only put
     // back a value the recipe already knows how to write; it cannot fill a required field the
@@ -2242,7 +2272,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       requiredStillEmpty: this.requiredStillEmpty, unresolvedFields: this.unresolvedFields, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, requiredFieldsSeen: this.requiredFieldsSeen, stoppedAtPayment: this.stoppedAtPayment, pageShotDir: this.pageShotDir,
       outcomeShotPath: this.outcomeShotPath,
       reviewFieldsSeen: review.fieldsSeen, reviewFieldsConfirmed: review.confirmed, reviewMismatches: review.mismatches,
-      attachmentLedger: this.attachmentLedger,
+      attachmentLedger: this.attachmentLedger, unrecordedAnswered: this.unrecordedAnswered,
     };
     // HONEST STATUS (runs-finish item 3). Live run 191e45c8 said "stopped at review" on Accela's
     // attachments page with 0 of 5 project values found, and was recorded ready-to-submit. A run
@@ -5801,12 +5831,25 @@ export class RecipeAdapter extends BasePortalAdapter {
     // Values too, not just identity — so a click that computed a total can prove it did.
     const beforeEffect = await this.pageEffect();
 
+    // A "compute totals" click (Calculate) is done when the RESULT is on the page, not when the click
+    // returns (issue #352): PacifiCorp renders its required AC disconnect section from the computed
+    // rating, and the advance that followed at once swept the page with Calculate still spinning.
+    // The probe goes in before the click so the request it starts is counted.
+    const computing = isComputeTotalsStep(step);
+    if (computing) await prepareComputeSettle(this.page);
     await waitForElement(scoped);
     await this.guardedClick(scoped, `recipe click${step.note ? ` (${String(step.note).slice(0, 50)})` : ""}`);
     // A recorded Next/Continue advances a Vue wizard to a not-yet-bound section. Wait for an
     // interactive control to mount before the next fill so we never type onto an unmounted page
     // (best-effort; never skips — the retry/reload loop still recovers a genuine miss).
     await waitForInteractiveControls(this.page);
+    if (computing) {
+      // Before the effect comparison below, so "did the click do anything" reads the computed page.
+      const computed = await this.timed("compute-settle", () => waitForComputeSettled(this.page));
+      if (!computed.settled) {
+        this.driftWarnings.push(`"${String(step.note ?? "Calculate").slice(0, 44)}": the page still showed it was computing after ${Math.round(computed.waitedMs / 1000)}s (${computed.reason.slice(0, 120)}) — went on; check the totals and any section they reveal before submit`);
+      }
+    }
     await this.assertAdvanced(step, beforeUrl, beforeFp, beforeEffect);
     return true;
   }
@@ -7567,6 +7610,108 @@ export class RecipeAdapter extends BasePortalAdapter {
       if (!this.agingNotes.includes(note)) this.agingNotes.push(note);
     });
     return held;
+  }
+
+  /** A REQUIRED CONTROL THE RECIPE HAS NO STEP FOR, ANSWERED FROM THIS JOB (issue #352).
+   *
+   *  A recipe records what its learn project triggered. PacifiCorp's AC disconnect section renders
+   *  only when the computed rating requires one, and the live recipe was learned on a 5.4 kW system:
+   *  no step for "Disconnect Switch Manufacturer" *, "Disconnect Switch Model" *, the knife-blade or
+   *  the distance question. A 16 kW job reached review with all four blank and the report clean.
+   *
+   *  Asked when the page is as filled as the recipe will make it — before an advancing click and at
+   *  the review stop. The required sweep (the one predicate for "required and still empty", which
+   *  also records what the portal asked for) names the candidates; the page extraction gives each
+   *  one's control, options and selector; answerForUnrecordedControl (unrecordedControls.ts) is the
+   *  one answer: the AC disconnect part from disconnectMake / disconnectModel, a per-job question
+   *  from the job's own answer (else the operator's standing one), a policy question from the
+   *  learner's own table. Anything else is left to gap-fill and the sweep, as before.
+   *
+   *  Writes go through executeStep as a synthesized step, so commit, read-back and fieldsVerified
+   *  are the same as a recorded step's. Never overwrites: a control is touched only when it reads
+   *  empty. A control it knows but this job has NO value for is returned in `missing` — the caller
+   *  stops the run by name; it is never typed blank and never guessed. */
+  private async answerUnrecordedRequired(): Promise<{ filled: string[]; missing: Array<{ label: string; key: string }> }> {
+    const out = { filled: [] as string[], missing: [] as Array<{ label: string; key: string }> };
+    if (!this.page || typeof this.page.$$eval !== "function" || typeof this.page.evaluate !== "function") return out;
+    const swept = await this.sweepRequired().catch(() => null);
+    if (!swept || !swept.empty.length) return out;
+    const clean = (s: string): string => String(s || "").replace(/\s*\*\s*$/, "").replace(/\s+/g, " ").trim().slice(0, 70);
+    const emptyNames = new Set(swept.empty.map((e) => clean(e.name)));
+    let raws: unknown[] = [];
+    try { raws = (await this.page.$$eval(EXTRACT_SEL, extractFieldsInPage)) as unknown[]; } catch { return out; }
+    if (!Array.isArray(raws)) return out;
+    const scope = policyScopeFor(this.recipe.scopeType);
+    const seen = new Set<string>();
+    for (const f of (raws as Parameters<typeof toExtractedField>[0][]).map(toExtractedField)) {
+      const name = clean(f.label);
+      // One answer per label per pass: a label two controls share is never answered twice.
+      if (!name || !emptyNames.has(name) || seen.has(name) || isPayFee(f.label)) continue;
+      seen.add(name);
+      const ans = answerForUnrecordedControl(f, this.fieldValues, scope);
+      if (!ans) continue;
+      if (!ans.value) {
+        if (ans.kind === "bound") out.missing.push({ label: f.label, key: ans.key });
+        continue;
+      }
+      // NEVER OVER A VALUE: the sweep said empty a moment ago; the control itself confirms it now.
+      const loc = await this.resolveLocator(f.selector).catch(() => null);
+      if (!loc || typeof loc.first !== "function") continue;
+      const empty = await loc.first().evaluate((el: Element) => {
+        if (el.tagName === "SELECT") {
+          const s = el as HTMLSelectElement;
+          const t = (s.options[s.selectedIndex]?.textContent || "").trim();
+          return !s.value || /^(please\s+)?(select|choose)\b/i.test(t);
+        }
+        return !String((el as HTMLInputElement).value ?? "").trim();
+      }).catch(() => null);
+      if (empty !== true) continue;
+      const step = {
+        action: f.fieldType === "select" || (f.fieldType === "other" && (f.options?.length ?? 0) > 0) ? "select" : "fill",
+        phase: "fill",
+        selector: f.selector,
+        note: f.label.replace(/\s+/g, " ").trim().slice(0, 120),
+        ...(ans.kind === "bound" ? { field: ans.key } : { value: ans.value }),
+      } as RecipeStep;
+      const done = await this.executeStep(step, false).catch(() => false);
+      const shown = f.label.replace(/\s+/g, " ").trim().slice(0, 60);
+      if (done) {
+        out.filled.push(shown);
+        if (!this.unrecordedAnswered.includes(shown)) this.unrecordedAnswered.push(shown);
+        // The value landed and was read back; only the RECIPE is aging (it has no step for this).
+        this.agingNotes.push(`answered "${shown}" from ${ans.kind === "bound" ? ans.key : ans.why} — a required control the recipe has no step for`);
+      } else {
+        this.driftWarnings.push(`"${shown}" is required and the recipe has no step for it; ${ans.kind === "bound" ? ans.key : "the standing answer"} could not be entered — enter it by hand before submit`);
+      }
+    }
+    return out;
+  }
+
+  /** The required controls answerUnrecordedRequired knows but this job has no value for: named in
+   *  the report, photographed, and the run STOPS here — before the click that would leave the page,
+   *  or before review. The words say "no value was supplied", which the backend's failure classifier
+   *  reads as the project's data (never the recipe's drift), so the recipe is neither demoted nor
+   *  flagged for it. */
+  private async stopForMissingRequired(
+    missing: Array<{ label: string; key: string }>,
+    before: string,
+    data: Record<string, unknown>,
+  ): Promise<PortalStepResult> {
+    const where = await this.pageLabelNow().catch(() => "");
+    for (const m of missing) {
+      const shown = m.label.replace(/\s+/g, " ").trim().slice(0, 70);
+      const named = where ? `${shown} [${where}]` : shown;
+      if (!this.requiredStillEmpty.includes(named)) this.requiredStillEmpty.push(named);
+    }
+    await this.capturePageShot("REQUIRED-NO-VALUE", true).catch(() => null);
+    return {
+      ...fail(missingRequiredStopMessage(before, missing), {
+        ...data, needsHuman: true, requiredStillEmpty: this.requiredStillEmpty, unrecordedAnswered: this.unrecordedAnswered,
+        requiredFieldsSeen: this.requiredFieldsSeen, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified,
+        pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath,
+      }),
+      pauseReason: "required_value_missing",
+    };
   }
 
   /** A FIELD WE FILLED THAT HAS SINCE GONE BLANK IS A RE-RENDER, NOT A MISSING VALUE.
