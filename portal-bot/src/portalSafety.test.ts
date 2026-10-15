@@ -283,11 +283,13 @@ await check("isReviewPageText: the page NAMES itself the review step (MUST-MATCH
   for (const t of MUST) { assert.ok(isReviewPageText(t), `"${t}" is not a review page`); assert.ok(pageCopy.isReviewPageText(t), `page copy: "${t}"`); }
   for (const t of NOT) { assert.ok(!isReviewPageText(t), `"${t}" wrongly reads as a review page`); assert.ok(!pageCopy.isReviewPageText(t), `page copy: "${t}"`); }
 });
-await check("#344: SOMEONE ELSE'S FUTURE REVIEW is not the page naming itself the review step; the applicant's own review still is (MUST-EXCLUDE / MUST-PASS)", () => {
-  // MUST-EXCLUDE: City of Portland DevHub's PERMITTING INFORMATION page (captured live
-  // 2026-10-14, learn-runs …city-of-portland_lb60/page-p002 — these sentences carry no name),
-  // which comes BEFORE the form; read as review, the backstop aborted its Next POST. Plus the
-  // same shape with the other modals and an adverb between.
+await check("#344: SOMEONE ELSE'S FUTURE REVIEW is not the review step PRE-FORM, and still is by default (main's reading); the applicant's own review is review in both (MUST-EXCLUDE / MUST-PASS)", () => {
+  // MUST-EXCLUDE (pre-form only): City of Portland DevHub's PERMITTING INFORMATION page (captured
+  // live 2026-10-14, learn-runs …city-of-portland_lb60/page-p002 — these sentences carry no
+  // name), which comes BEFORE the form; read as review, the backstop aborted its Next POST. Plus
+  // the same shape with the other modals and an adverb between. By DEFAULT (no preForm) each of
+  // them still reads as review: a real review page whose only review wording is "Staff will
+  // review your application" must stop (Helm's review of #349).
   const EXCLUDE = [
     "A Permit Tech will review your submission for minimum submittal standards, and if met, a permit will be created.",
     "This is a permit request only.\nA Permit Tech will review your submission for minimum submittal standards, and if met, a permit will be created. Once your permit has been deemed complete for intake, you will be provided with instructions via email for how to pay your intake fees. If you already have the information you need to apply, scroll to the bottom of the page and click \"Continue\". Please do not submit additional requests for the same scope of work as this will only further delay the review of your project.",
@@ -329,20 +331,27 @@ await check("#344: SOMEONE ELSE'S FUTURE REVIEW is not the page naming itself th
     "You may review your application below before submitting", "You are going to review your details below",
     "You're going to review your application", "You’re going to review your application", "You will then review your information",
   ];
+  const PRE = { preForm: true };
+  // PSE's agreement wording is false in BOTH readings (no "review your/the …" after "review").
+  const WIDE_TOO = new Set(["I understand PSE will review and approve this application and may revise it."]);
   for (const t of EXCLUDE) {
-    assert.ok(!isReviewPageText(t), `"${t}" wrongly reads as a review page`);
-    assert.ok(!pageCopy.isReviewPageText(t), `page copy: "${t}" wrongly reads as a review page`);
-    assert.ok(!reviewSignals(t, "https://devhub.example.gov/permits/sfjsp"), `reviewSignals: "${t}"`);
-    assert.ok(!pageCopy.reviewSignals(t, "https://devhub.example.gov/permits/sfjsp"), `page copy reviewSignals: "${t}"`);
+    assert.ok(!isReviewPageText(t, PRE), `"${t}" wrongly reads as a review page pre-form`);
+    assert.ok(!pageCopy.isReviewPageText(t, PRE), `page copy: "${t}" wrongly reads as a review page pre-form`);
+    assert.ok(!reviewSignals(t, "https://devhub.example.gov/permits/sfjsp", PRE), `reviewSignals pre-form: "${t}"`);
+    assert.ok(!pageCopy.reviewSignals(t, "https://devhub.example.gov/permits/sfjsp", PRE), `page copy reviewSignals pre-form: "${t}"`);
+    // MAIN'S READING EVERYWHERE ELSE: after a form, someone else's future review still names the page.
+    if (!WIDE_TOO.has(t)) { assert.ok(isReviewPageText(t), `"${t}" must still read as review by default`); assert.ok(pageCopy.isReviewPageText(t), `page copy default: "${t}"`); }
   }
   for (const t of PASS) {
-    assert.ok(isReviewPageText(t), `"${t}" is not a review page`);
-    assert.ok(pageCopy.isReviewPageText(t), `page copy: "${t}" is not a review page`);
-    assert.ok(reviewSignals(t, "https://p.example.gov/apply/12"), `reviewSignals: "${t}"`);
-    assert.ok(pageCopy.reviewSignals(t, "https://p.example.gov/apply/12"), `page copy reviewSignals: "${t}"`);
+    for (const o of [undefined, PRE]) {
+      assert.ok(isReviewPageText(t, o), `"${t}" is not a review page (${JSON.stringify(o)})`);
+      assert.ok(pageCopy.isReviewPageText(t, o), `page copy: "${t}" is not a review page (${JSON.stringify(o)})`);
+      assert.ok(reviewSignals(t, "https://p.example.gov/apply/12", o), `reviewSignals: "${t}"`);
+      assert.ok(pageCopy.reviewSignals(t, "https://p.example.gov/apply/12", o), `page copy reviewSignals: "${t}"`);
+    }
   }
   // A review URL still names the page whatever its prose says.
-  assert.ok(reviewSignals(EXCLUDE[0], "https://aca.example.gov/Cap/CapConfirm.aspx"), "a review URL with the modal prose");
+  assert.ok(reviewSignals(EXCLUDE[0], "https://aca.example.gov/Cap/CapConfirm.aspx", PRE), "a review URL with the modal prose");
 });
 await check("reviewSignals: the page text OR a bounded review URL; '/reviewer' and '/review-comments' are not it", () => {
   for (const u of ["https://aca.example.gov/Cap/CapConfirm.aspx?x=1", "https://p.example.gov/apply/12/review", "https://p.example.gov/apply/review/", "https://p.example.gov/Confirm.aspx", "https://p.example.gov/app/review?step=7", "https://p.example.gov/app/review.aspx"]) {

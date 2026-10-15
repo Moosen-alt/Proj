@@ -21,7 +21,8 @@
 //   [1] MUST PASS   — the captured page as served (POST form). The learner does NOT call it
 //                     review: no review stop, no lockReview, no upload skip, no final submit; it
 //                     records "advance: Next" and clicks it. And the network backstop agrees
-//                     (#344): its live reading no longer takes "A Permit Tech will review your
+//                     (#344): while no form page has been left on the run (the learner's
+//                     setPreForm), its live reading does not take "A Permit Tech will review your
 //                     submission" for the review step, so the Next's POST reaches the server and
 //                     the walk lands on the form page behind it (asserted; it was aborted before).
 //   [2] MUST PASS   — the same page whose Next navigates by GET, with a planner that ALSO calls
@@ -46,6 +47,15 @@
 //   [10] PAY-NOW (#344) — one bare "Continue" under "Pay the $350 application fee now by card to
 //                     continue": never pressed (its POST goes to a non-payment URL, so only the
 //                     learner can refuse it); the split-sentence shape is the reported coverage limit.
+//   [11] MUST EXCLUDE (Helm's review of #349, finding 1, rule 1) — m2–m5: a prefilled form → a
+//                     real review page whose ONLY review wording is "Staff will review your
+//                     application…" (or "The City will review the information…", "A plans examiner
+//                     may review your submission…"), a forward-worded control that files, a planner
+//                     that calls it an advance: stops at review, nothing reaches /file (main's
+//                     behaviour; the narrowed reading used everywhere FILED here).
+//   [12] MUST EXCLUDE (Helm's review of #349, finding 2) — d1/d2: after the permit-type tile, a
+//                     notice of somebody's in-progress draft with ONE Continue, planner silent:
+//                     never pressed, the draft never opened or saved over (main's behaviour).
 // In [1], [2] and [7] the sidebar's records / fees / corrections / profile pages are never
 // requested (the upload pass now runs on the interstitial, and the sidebar is on every page).
 //
@@ -199,7 +209,7 @@ const homePage = (p: string): string => shell(p, {
 const applyPage = (p: string): string => shell(p, {
   title: "Apply for a Permit", content: APPLY_TILES,
   // The review-1 shapes have no interstitial: the tile leads straight to the (prefilled) form.
-  script: delegation(`function (t) { return t === '${SOLAR}' ? '${p}${SHAPES[p] ? "/form" : "/info"}' : '${p}/other-type'; }`),
+  script: delegation(`function (t) { return t === '${SOLAR}' ? '${p}${shapeOf(p) ? "/form" : "/info"}' : '${p}/other-type'; }`),
 });
 
 // ------------------------------------------------------------------------------------------
@@ -218,6 +228,18 @@ const SHAPES: Record<string, Shape> = {
   "/s5": { what: "POST, static review wording, \"Save and Continue\" files", method: "POST", heading: "Confirmation", prose: "Please review your information below.", control: "Save and Continue" },
   "/s6": { what: "GET form, \"Review your application below\", \"Continue »\" files, the planner calls it an advance", method: "GET", heading: "Confirmation", prose: "Review your application below.", control: "Continue »", plannerAdvances: true },
 };
+// HELM'S REVIEW OF #349, FINDING 1 (rule 1): the same prefilled form → a REAL review page whose
+// ONLY review wording is someone else's future review, a forward-worded control that FILES, and a
+// planner that calls that control an advance. No heading, imperative, review URL or submit word:
+// on main that one sentence is the last thing that stops it. With the narrowed reading used
+// everywhere (this PR's first head) m2–m5 FILED.
+const MODAL_SHAPES: Record<string, Shape> = {
+  "/m2": { what: "POST, \"Staff will review your application…\", Next files", method: "POST", heading: "Application Summary", prose: "Staff will review your application within 5 business days. Click Next to send it to the city.", control: "Next", plannerAdvances: true },
+  "/m3": { what: "POST, \"The City will review the information you entered…\", Continue files", method: "POST", heading: "Application Summary", prose: "The City will review the information you entered within 5 business days. Click Continue to send it to the city.", control: "Continue", plannerAdvances: true },
+  "/m4": { what: "POST, \"A plans examiner may review your submission…\", Proceed files", method: "POST", heading: "Application Summary", prose: "A plans examiner may review your submission within 5 business days. Click Proceed to send it to the city.", control: "Proceed", plannerAdvances: true },
+  "/m5": { what: "GET form, \"Staff will review your application…\", Next files", method: "GET", heading: "Application Summary", prose: "Staff will review your application within 5 business days. Click Next to send it to the city.", control: "Next", plannerAdvances: true },
+};
+const shapeOf = (p: string): Shape | undefined => SHAPES[p] ?? MODAL_SHAPES[p];
 const prefilledFormPage = (p: string): string => shell(p, {
   title: "Project Information", method: "GET", action: `${p}/to-step3`,
   content: `<div class="form-group"><label for="addr" class="control-label">Site Address</label><input id="addr" name="addr" type="text" value="${ADDRESS}"></div>`,
@@ -274,17 +296,32 @@ const reviewNextPage = (p: string, addr: string): string => shell(p, {
  *  pay in order to continue, above ONE bare "Continue" — a POST to a NON-payment URL (so the
  *  backstop's payment-URL rule cannot mask whether the learner pressed it), which leads to a
  *  card page. /paynow names the control in its money sentence; /paynow-split does not (the
- *  coverage limit, reported). */
+ *  coverage limit, reported). Each carries the DevHub sentence so it READS as review on main's
+ *  (wide) reading and reaches the interstitial gate; without it the page is a plain dashboard and
+ *  simply stops (Helm's review of #349). */
 const PAY_NOW_PAGES: Record<string, string> = {
-  "/paynow": `<p>Your solar permit request has an application fee.</p><p>Pay the $350 application fee now by card to continue.</p>`,
-  "/paynow-split": `<p>Your solar permit request has an application fee.</p><p>A $350 fee is due now. Click Continue to proceed.</p>`,
+  "/paynow": `<p>Your solar permit request has an application fee. A Permit Tech will review your submission for minimum submittal standards.</p><p>Pay the $350 application fee now by card to continue.</p>`,
+  "/paynow-split": `<p>Your solar permit request has an application fee. A Permit Tech will review your submission for minimum submittal standards.</p><p>A $350 fee is due now. Click Continue to proceed.</p>`,
 };
+/** HELM'S REVIEW OF #349, FINDING 2: after the permit-type tile, a no-field NOTICE of somebody's
+ *  draft with ONE "Continue" (no review wording; the planner returns nothing). Continue opens the
+ *  draft (synthetic: Draft 2026-0141, 77 Other Ave), whose form POSTs a save. Never pressed. */
+const DRAFT_NOTICES: Record<string, string> = {
+  "/d1": `<p>You have an application in progress.</p><p>Draft 2026-0141, 77 Other Ave.</p>`,
+  "/d2": `<h3>Saved applications</h3><p>Draft 2026-0141 — 77 Other Ave — In progress</p>`,
+};
+const otherDraftPage = (p: string): string => shell(p, {
+  title: "Draft 2026-0141", method: "POST", action: `${p}/act/save-draft-0141`,
+  content: `<div class="form-group"><label for="addr" class="control-label">Site Address</label><input id="addr" name="addr" type="text" value="77 Other Ave"></div>`,
+  nav: `<button type="submit" name="t_save" class="btn btn-primary ms-auto">Next</button>`,
+});
 const cardPage = (p: string): string => shell(p, {
   title: "Payment", method: "POST", action: `${p}/pay`,
   content: `<div class="form-group"><label for="cc" class="control-label">Card Number</label><input id="cc" name="cardnumber" autocomplete="cc-number" type="text"></div>`,
   nav: `<button type="submit" name="pay" class="btn btn-primary ms-auto">Pay $350.00</button>`,
 });
-const PREFIXES = ["/post", "/get", "/next-files", "/stuck", "/noforward", "/rows", "/nem", ...Object.keys(PAY_NOW_PAGES), ...Object.keys(SHAPES), ...Object.keys(ACCOUNT_HOMES)];
+const PREFIXES = ["/post", "/get", "/next-files", "/stuck", "/noforward", "/rows", "/nem", ...Object.keys(PAY_NOW_PAGES), ...Object.keys(DRAFT_NOTICES),
+  ...Object.keys(SHAPES), ...Object.keys(MODAL_SHAPES), ...Object.keys(ACCOUNT_HOMES)];
 const hits: Array<{ method: string; url: string }> = [];
 const server = http.createServer((q, r) => {
   const url = q.url || "/";
@@ -302,10 +339,18 @@ const server = http.createServer((q, r) => {
     if (rest === "/draft-0141") return send(draftPage(p));
     if (rest.startsWith("/act/")) return send(`<!doctype html><html><body><h1>Saved</h1><p>${esc(rest)}</p></body></html>`);
   }
-  if (SHAPES[p]) {
+  if (DRAFT_NOTICES[p]) {
+    if (rest === "/info") return send(shell(p, { title: "Permitting Information", method: "POST", content: DRAFT_NOTICES[p],
+      nav: `<button type="submit" name="t_c1" class="btn btn-primary ms-auto">Continue</button>` }));
+    if (rest === "/sg") return redirect(`${p}/draft-0141`);
+    if (rest === "/draft-0141") return send(otherDraftPage(p));
+    if (rest.startsWith("/act/")) return send(`<!doctype html><html><body><h1>Saved</h1><p>${esc(rest)}</p></body></html>`);
+  }
+  const shape = shapeOf(p);
+  if (shape) {
     if (rest === "/form") return send(prefilledFormPage(p));
     if (rest === "/to-step3") return redirect(`${p}/step3`);
-    if (rest === "/step3") return send(shapeStep3(p, SHAPES[p]));
+    if (rest === "/step3") return send(shapeStep3(p, shape));
     if (rest === "/file") return send(`<!doctype html><html><body><h1>Application filed</h1><p>Your application was submitted.</p></body></html>`);
   }
   if (rest === "/home") return send(homePage(p));
@@ -476,7 +521,8 @@ console.log("\n[1] the captured Permitting Information page (POST form): home �
   // THE BACKSTOP AGREES (#344). It judges the Next's form POST by the shared live reading
   // (terminalPageInPage → reviewSignals), which read "A Permit Tech will review your submission"
   // as the page naming itself the review step: the POST was aborted and the run stopped NAMED by
-  // the backstop on this page. Someone else's future review is not the review step, so the POST
+  // the backstop on this page. Before any form page has been left on the run the learner sets the
+  // backstop pre-form, where someone else's future review is not the review step, so the POST
   // goes through and the walk lands on the form page behind it.
   const posted = w.hits.some((h) => h.method === "POST" && h.url.startsWith("/post/sg"));
   const pressed = w.notes.includes("advance: Next");
@@ -589,11 +635,10 @@ console.log("\n[5] an interstitial with no way forward (Previous / Cancel only)"
 // ===========================================================================================
 console.log("\n[6] MUST EXCLUDE: review prose above three record rows, each with its own Continue (worst planner)");
 {
-  // Since #344 the prose no longer reads as review, so with a silent planner this page is a plain
-  // dashboard and never reaches the one-way-forward test — "nothing pressed" would then hold
-  // against ANY learner. The worst planner (it calls the page review AND names a row's Continue
-  // as the advance) takes it through the interstitial gate, so the refusal under test is the
-  // one-way-forward test itself: three same-worded controls are not one way forward.
+  // The worst planner (it calls the page review AND names a row's Continue as the advance): the
+  // page reaches the interstitial gate whatever its reading, so the refusal under test is the
+  // one-way-forward test itself — three same-worded controls are not one way forward — and the
+  // planner's advance onto a row is dropped. (A silent planner would leave nothing to refuse.)
   const w = await runLearn("/rows", (req) => {
     if (pathOf(req.url) === "/rows/info") return { fills: [], atReview: true, advanceSelectorIndex: idx(req, "Continue") };
     return null;
@@ -722,6 +767,50 @@ console.log("\n[10] #344 pay-now probe: one bare Continue under \"Pay the $350 a
   console.log(`  note - coverage limit (/paynow-split): Continue ${pressed ? "WAS pressed (the money sentence does not name it)" : "was not pressed"}; ${JSON.stringify(interstitialEvents(w))}`);
   check("coverage limit: whatever was pressed, no card value was typed and no payment request reached the server",
     w.fillValues.every((v) => v === "") && !w.hits.some((h) => h.url.startsWith("/paynow-split/pay")), JSON.stringify({ fillValues: w.fillValues, hits: w.hits.map((h) => `${h.method} ${h.url}`) }));
+}
+
+// ===========================================================================================
+// [11] HELM'S REVIEW OF #349, FINDING 1 (rule 1): a prefilled form → a REAL review page whose ONLY
+//      review wording is someone else's future review, with a forward-worded filing control the
+//      planner calls an advance. Main's behaviour: it stops at review, the filing request never
+//      reaches the server. (The pre-form narrowing must not reach a page after a form.)
+// ===========================================================================================
+console.log("\n[11] modal-only review wording after a form: \"Staff will review your application…\" over a filing Next / Continue / Proceed");
+for (const [p, s] of Object.entries(MODAL_SHAPES)) {
+  const w = await runLearn(p, (req) => {
+    const at = pathOf(req.url);
+    if (at === `${p}/form`) return { fills: [], atReview: false, advanceSelectorIndex: idx(req, "Next") };
+    if (at === `${p}/step3`) return { fills: [], atReview: false, advanceSelectorIndex: idx(req, s.control) };
+    return null;
+  });
+  const filing = w.hits.filter((h) => h.url.startsWith(`${p}/file`)).map((h) => `${h.method} ${h.url}`);
+  console.log(`  note - ${p} (${s.what}): FILING REQUEST REACHED SERVER: ${filing.length ? `YES [${filing.join(", ")}]` : "no"}`);
+  check(`${p} premise: the walk reached the summary page after the form page`, w.plannerPages.includes(`${p}/step3`), JSON.stringify(w.plannerPages));
+  check(`${p} filing request reached server: NO`, filing.length === 0, JSON.stringify(filing));
+  check(`${p} the run stopped at review, on the summary page, with the lockdown armed there`,
+    w.reachedReview === true && pathOf(w.url) === `${p}/step3` && w.locks.some((l) => l.startsWith(`${p}/step3 ::`)),
+    JSON.stringify({ reachedReview: w.reachedReview, url: w.url, locks: w.locks, message: w.message.slice(0, 200) }));
+  const formAdvances = s.control === "Next" ? 1 : 0;
+  check(`${p} the filing control "${s.control}" was never recorded as an advance off the summary page`,
+    w.notes.filter((n) => n === `advance: ${s.control}`).length === formAdvances, JSON.stringify(w.notes));
+}
+
+// ===========================================================================================
+// [12] HELM'S REVIEW OF #349, FINDING 2: after the permit-type tile, a no-field notice of
+//      somebody's draft ("You have an application in progress. Draft 2026-0141 …") with ONE
+//      Continue, and a planner that returns nothing. Main's behaviour: the walk stops on the
+//      notice — Continue is never pressed, the draft is never opened, nothing is saved over it.
+// ===========================================================================================
+console.log("\n[12] an in-progress-draft notice with one Continue after the permit-type tile (planner silent)");
+for (const p of Object.keys(DRAFT_NOTICES)) {
+  const w = await runLearn(p, () => null);
+  const touched = w.hits.filter((h) => h.url.startsWith(`${p}/sg`) || h.url.startsWith(`${p}/draft-0141`) || h.url.startsWith(`${p}/act/`))
+    .map((h) => `${h.method} ${h.url}`);
+  check(`${p} premise: the walk chose the Solar tile and reached the notice`,
+    w.notes.includes(`permit type: ${SOLAR}`) && w.plannerPages.includes(`${p}/info`), JSON.stringify({ notes: w.notes, planner: w.plannerPages }));
+  check(`${p} Continue was never pressed: the draft was never opened and nothing was saved over it`, touched.length === 0, JSON.stringify(touched));
+  check(`${p} ...and never recorded as an advance; nothing filled`, !w.notes.some((n) => /^advance:/.test(n)) && w.formSteps === 0, JSON.stringify(w.notes));
+  check(`${p} not a review stop: no lockReview, no final submit`, w.locks.length === 0 && w.finals.length === 0, JSON.stringify({ locks: w.locks, finals: w.finals }));
 }
 
 await browser.close();

@@ -116,6 +116,11 @@ export interface FilingBackstop {
   openDrain(page: unknown, why: string): () => void;
   /** Where (origin + path) each request the drain let through went, in order. */
   readonly drainRequests: string[];
+  /** The learner's PRE-FORM state: true only while no page with a form control has been left on
+   *  this run. While true, the review lockdown's page reading (4b) does not take someone else's
+   *  future review ("A Permit Tech will review your submission") for the review step. Default
+   *  false. Never widens 4a, the filing-URL rule, payment or the windows. */
+  setPreForm(on: boolean): void;
   /** The run is at review: abort every state-changing request until dispose() hands the page to
    *  a person. Sticky. */
   lockReview(why: string): void;
@@ -324,21 +329,26 @@ export function reviewBlockedCallsLine(paths: string[], lastDocumentMethod: stri
  *  which need no page read). */
 const TERMINAL_READ_TIMEOUT_MS = 1500;
 
-/** Read the shared terminal-page predicate in a page's main frame: true / false, or null when it
+/** Both readings of one page: main's (wide) and the pre-form one (someone else's future review
+ *  is not review). The judgement picks one by the run's preForm state AT THE REQUEST. */
+interface TerminalReading { wide: boolean; preForm: boolean }
+
+/** Read the shared terminal-page predicate in a page's main frame: both readings, or null when it
  *  cannot be read (a navigating or blocked page). */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function mainFrameIsTerminal(main: any): Promise<boolean | null> {
+async function mainFrameIsTerminal(main: any): Promise<TerminalReading | null> {
   if (!main || typeof main.evaluate !== "function") return null;
-  const read = (async (): Promise<boolean | null> => {
+  const read = (async (): Promise<TerminalReading | null> => {
     await main.evaluate(PORTAL_SAFETY_IN_PAGE_SOURCE).catch(() => null);
     const r = await main.evaluate((g: string) => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const ps = (globalThis as any)[g];
       if (!ps || typeof ps.terminalPageInPage !== "function") return null;
-      const t = ps.terminalPageInPage();
-      return typeof t.terminal === "boolean" ? t.terminal : null;
+      const wide = ps.terminalPageInPage();
+      const pre = ps.terminalPageInPage({ preForm: true });
+      return typeof wide.terminal === "boolean" && typeof pre.terminal === "boolean" ? { wide: wide.terminal, preForm: pre.terminal } : null;
     }, PORTAL_SAFETY_GLOBAL).catch(() => null);
-    return typeof r === "boolean" ? r : null;
+    return r && typeof r.wide === "boolean" ? r as TerminalReading : null;
   })();
   let timer: ReturnType<typeof setTimeout> | null = null;
   const timeout = new Promise<null>((r) => { timer = setTimeout(() => r(null), TERMINAL_READ_TIMEOUT_MS); });
@@ -455,13 +465,17 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // classification is also read on every load and on every live read, and a navigation request
   // is judged by the page's last reading. A server-rendered page's review text is there at load;
   // an SPA's posts are fetch/XHR, which are read live.
-  const lastReading = new WeakMap<object, boolean>();
+  const lastReading = new WeakMap<object, TerminalReading>();
+  // PRE-FORM (Helm review of #349): set by the learner while no page with a form control has been
+  // left on this run; default false (main's wide reading) so a caller that never sets it is safe.
+  let preForm = false;
+  const pick = (r: TerminalReading | null | undefined): boolean | null => (r ? (preForm ? r.preForm : r.wide) : null);
   const unwatch: Array<() => void> = [];
   const watched = new WeakSet<object>();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const refresh = (pg: any): void => {
     if (disposed || !pg || typeof pg.mainFrame !== "function") return;
-    void mainFrameIsTerminal(pg.mainFrame()).then((v) => { if (typeof v === "boolean") lastReading.set(pg, v); }).catch(() => null);
+    void mainFrameIsTerminal(pg.mainFrame()).then((v) => { if (v) lastReading.set(pg, v); }).catch(() => null);
   };
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const watch = (pg: any): void => {
@@ -558,10 +572,11 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       let navigation = true;
       try { navigation = !!request.isNavigationRequest(); } catch { /* unknown: treat as navigation (no live read) */ }
       let terminal: boolean | null = null;
-      if (navigation) terminal = pg ? lastReading.get(pg) ?? null : null;
+      if (navigation) terminal = pg ? pick(lastReading.get(pg)) : null;
       else if (pg) {
-        terminal = await mainFrameIsTerminal(pg.mainFrame());
-        if (typeof terminal === "boolean") lastReading.set(pg, terminal);
+        const v = await mainFrameIsTerminal(pg.mainFrame());
+        if (v) lastReading.set(pg, v);
+        terminal = pick(v);
       }
       if (terminal === true && !disposed) {
         // THE RUN'S OWN WRITE (autosubmit-close item 7): a recorded value written on a
@@ -687,6 +702,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     drainRequests,
     approvedSlotOpen() { return slotLive(); },
     closeApprovedSlot() { closeSlot(); },
+    setPreForm(on: boolean) { preForm = on === true; },
     lockReview(why: string) {
       if (!locked) locked = `the run is at review (${String(why || label).slice(0, 100)}) — nothing legitimate posts from here until a person takes the page`;
     },

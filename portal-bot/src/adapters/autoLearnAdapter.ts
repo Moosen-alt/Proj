@@ -5363,6 +5363,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         break;
       }
       pageCount++;
+      // PRE-FORM (Helm review of #349): until a page with a form control has been LEFT on this run
+      // (and never for a resumed draft or a signature check), the backstop does not read someone
+      // else's future review as the review step. formPageSeen is set on the form page itself, so
+      // that page's own POSTs are still judged pre-form; from the next page on, main's reading.
+      backstopFor(this.page)?.setPreForm(!this.formPageSeen && !this.continuedDraft && !this.signatureCheck);
       // THE BACKSTOP ABORTED A FILING, A PAYMENT OR A REVIEW-PAGE POST: stop here, named. Walking
       // on would drive the same page (and its filing control) again. learn() reports every abort.
       {
@@ -6272,23 +6277,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const reviewShaped = hasSubmitIntentBtn || hasAcceptTermsCheckbox || looksLikeReviewUrl(url)
         || fields.some((f) => f.fieldType === "button" && onPageControl(f) && isFinalSubmitControl(f.label));
       const plannerSaidReview = plan.atReview === true;
-      //      THE LEARNER'S DASHBOARD CLAUSE (#344). The gate below used to end "(!isDashboard ||
-      //      plannerSaidReview)", and the way forward was adopted only on a non-dashboard page —
-      //      i.e. a page that READ as review. DevHub's interstitial read as review only because
-      //      the shared reading took "A Permit Tech will review your submission" for the page
-      //      naming itself the review step; #344 removed that false positive (the backstop had
-      //      aborted the page's Next POST on it), and with it the page became dashboard-shaped
-      //      (no field, no submit control, no review wording) and its Next was never pressed. So a
-      //      dashboard-shaped page is ALSO an interstitial when it carries exactly ONE way forward:
-      //      one bare forward-worded control (isInterstitialForwardLabel — never Previous / Back /
-      //      Cancel, never submit-, pay- or record-worded), a top and a bottom copy at most, one
-      //      label, not off-limits. Every other guard above is unchanged and still has to hold: an
-      //      application was entered on this run, nothing has been entered, no form page has been
-      //      seen, not a resumed draft or signature check, no review shape (submit / final-submit
-      //      control, terms box, review URL). And the click is still judged by the network
-      //      backstop like any other request. What still stops: an account home (no application
-      //      entered yet — [9]), a list whose rows each say "Continue" (several controls — [6]),
-      //      any review shape, and a page whose forward sentence pays now (below).
+      //      THE ONE WAY FORWARD (used in c2i' below), computed here. It is NOT a gate of its own
+      //      (#344, Helm's review of #349): a DASHBOARD-shaped page with one bare "Continue" after
+      //      the permit-type tile is as likely an in-progress-draft notice ("You have an application
+      //      in progress … Continue") as an interstitial — passing it opened somebody's draft and
+      //      saved over it. A page reaches the interstitial path only by READING as review (main's
+      //      wide reading — DevHub's interstitial does) or by the planner calling it review, and
+      //      its way forward is adopted only on a non-dashboard page.
       const norm = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
       const fwdCands = fields.map((f, i) => ({ f, i })).filter(({ f }) => f.fieldType === "button" && !f.disabled && !f.tile
         && onPageControl(f) && isInterstitialForwardLabel(f.label) && !this.isOffLimitsButton(f));
@@ -6298,7 +6293,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         && !this.continuedDraft && !this.signatureCheck && !signatureDone
         && !this.formPageSeen
         && steps.some((s) => /^(application entry|permit type):/.test(String(s.note ?? "")))
-        && (!isDashboard || plannerSaidReview || oneForward);
+        && (!isDashboard || plannerSaidReview);
       if (hasFillable) this.formPageSeen = true;
       const isReviewPage =
         ((!hasFillable && !isDashboard) ||
@@ -6381,11 +6376,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //       fingerprint (DevHub serves every SmartGuide step at one path, so the path alone would
       //       refuse a second, different interstitial); back on the SAME page, the walk stops and
       //       says so instead of clicking it again.
-      //       ONE WAY FORWARD (oneForward, computed with the gate above): the forward-worded
-      //       controls must be one control (a top and a bottom copy at most, one label) — a list
-      //       whose rows each say "Continue" is somebody's records, not an interstitial. Since #344
-      //       this holds on a dashboard-shaped page too (the learner's dashboard clause, above): a
-      //       page the shared reading does not call review is advanced only through this test.
+      //       ONE WAY FORWARD, on the page that READ as review: the forward-worded controls must
+      //       be one control (a top and a bottom copy at most, one label) — a list whose rows each
+      //       say "Continue" is somebody's records, not an interstitial — and a page that was a
+      //       dashboard by structure (only the planner called it review) is not advanced here.
       //       NEVER TOWARD A PAYMENT (#344). A no-field page whose words tell the walker to PAY in
       //       order to press its forward control ("Pay the $350 application fee now by card to
       //       continue") is not passed. The ONE pay-now reading (paymentDialogVerdict, via
@@ -6399,7 +6393,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //       card fields are never filled, and the backstop aborts every payment request.
       let interstitialAdvanceKey = "";
       if (interstitial) {
-        let fwd = oneForward ? fwdCands[0].i : -1;
+        let fwd = !isDashboard && oneForward ? fwdCands[0].i : -1;
         let payNow = false;
         if (fwd >= 0) {
           const words = norm(fields[fwd].label).toLowerCase().match(/[a-z]+/g) ?? [];
