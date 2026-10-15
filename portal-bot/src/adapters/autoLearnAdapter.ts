@@ -908,20 +908,23 @@ function isPanelAdvanceLabel(label: string | undefined): boolean {
   return ADVANCE_ONLY.test(t);
 }
 
-/** THE PLAIN WAY FORWARD ON AN INFORMATION INTERSTITIAL (#341). The advance the engine is allowed
- *  to click (isPanelAdvanceLabel, to the letter: Next / Continue / Proceed, never a submit, never a
- *  pager) plus a WHOLE-label Begin / Start / Get Started, which is how a "before you apply" page
- *  words the same thing. Never a backward or exit control (Previous / Back / Cancel / Exit / Save
- *  and Exit / Continue Later), never anything the shared final-submit reading or the pay list
- *  claims. Read only on a page the walk has already proved is an interstitial (see c2i). */
-const INTERSTITIAL_START = /^\s*(begin|start|get started)\s*[»›>→]*\s*$/i;
+/** THE PLAIN WAY FORWARD ON AN INFORMATION INTERSTITIAL (#341). The WHOLE label is a bare forward
+ *  word — Next / Continue / Proceed / Begin / Start / Get Started — optionally arrowed or "Save and
+ *  …" (review 1: a label that merely STARTS with one, "Next Record", "Continue Draft", is not it).
+ *  Never a backward or exit control (Previous / Back / Cancel / Exit / Save and Exit / Continue
+ *  Later), never anything the shared final-submit reading or the pay list claims. Read only on a
+ *  page the walk has already proved is an interstitial (see c2i). */
+// WHOLE LABEL ONLY: the bare forward word, arrowed or "Save and …". A word after it names WHAT
+// the click continues ("Next Record", "Continue Draft", "Continue Renewal", "Proceed with
+// Deletion"), and that is somebody's record or an action on it, never the page's way forward.
+const INTERSTITIAL_FORWARD = /^\s*(save\s+and\s+)?(next|continue|proceed|begin|start|get\s+started)\s*[»›>→]*\s*$/i;
 const BACKWARD_OR_EXIT = /\b(previous|prev|back|cancel|exit|close|later|quit)\b/i;
 export function isInterstitialForwardLabel(label: string | undefined): boolean {
   const t = String(label ?? "").replace(/\s+/g, " ").trim();
   if (!t || t.length > 40) return false;
   if (BACKWARD_OR_EXIT.test(t)) return false;
   if (isPayFee(t) || isFinalSubmitControl(t)) return false;
-  return isPanelAdvanceLabel(t) || INTERSTITIAL_START.test(t);
+  return INTERSTITIAL_FORWARD.test(t);
 }
 
 /** RE-ADMISSION: is this label shaped like a page's WAY FORWARD at all? Union of the
@@ -2197,6 +2200,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    *  forward progress. Keyed by path so a label that legitimately recurs on a LATER page
    *  ("Continue" on a multi-step wizard) is still allowed. */
   private readonly navClicksByPath = new Set<string>();
+  /** #341: has this run been on a page with a fillable control yet? An information interstitial
+   *  comes BEFORE the application's form pages; a no-input page after them is the review screen,
+   *  whether or not this run recorded a fill (a prefilled draft, a tiles-and-uploads flow). */
+  private formPageSeen = false;
   /** Pages (by pathname) whose choice tiles the chooser refused — none named this job, or
    *  several did. A run that ends on one of them says which choices the page offered rather
    *  than "nothing fillable". (The planner never clicks a tile anywhere — see the navigate
@@ -6250,6 +6257,16 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //      one to LOOK for a draft, and a run that found none is starting fresh.) Any
       //      submit-shaped control keeps the old reading; nothing here touches what the backstop
       //      reads.
+      //      AN INTERSTITIAL COMES BEFORE THE APPLICATION'S FORM, NEVER AFTER IT (review 1, rule 1).
+      //      "Nothing recorded" is not "nothing entered": a re-learn over a prefilled draft, a
+      //      tiles-and-uploads flow and the skip-already-answered passes reach the REAL review with
+      //      no fill step, and a review whose filing control is a plain "Next" / "Continue »" has
+      //      none of the shape above — read as an interstitial, its Next FILED (#346: GET is never
+      //      judged by the backstop). So the page must also come before any page with a fillable
+      //      control this run (formPageSeen), and after the walk has ENTERED an application (an
+      //      "application entry:" or "permit type:" click): an account home that says "Review your
+      //      application status below" above one "Continue" is somebody's records, not a pass-
+      //      through page.
       const onPageControl = (f: ExtractedField): boolean =>
         !navOnly.has(String(f.label ?? "").replace(/\s+/g, " ").trim().toLowerCase());
       const reviewShaped = hasSubmitIntentBtn || hasAcceptTermsCheckbox || looksLikeReviewUrl(url)
@@ -6257,7 +6274,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const plannerSaidReview = plan.atReview === true;
       const interstitial = !hasFillable && !reviewShaped && !anyFormMutationRecorded && !entryDisclaimer
         && !this.continuedDraft && !this.signatureCheck && !signatureDone
+        && !this.formPageSeen
+        && steps.some((s) => /^(application entry|permit type):/.test(String(s.note ?? "")))
         && (!isDashboard || plannerSaidReview);
+      if (hasFillable) this.formPageSeen = true;
       const isReviewPage =
         ((!hasFillable && !isDashboard) ||
           (reviewSignals && hasSubmitIntentBtn) ||
@@ -6362,8 +6382,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           };
         }
         // No forward control: still not review (no lockdown, no final submit) — the walk's ordinary
-        // no-advance path takes the page; the planner's advance is dropped so a Previous / Cancel
-        // it may have named is never the click here.
+        // no-advance path takes the page. The planner's ADVANCE is dropped, so a Previous / Cancel
+        // it named as the advance is never clicked here. Its NAVIGATE is kept (only when no forward
+        // control exists) and goes through the navigate door's own refusals, exactly as on main —
+        // those do not refuse every backward control, so this is not a "never Previous" promise.
         plan = {
           ...plan,
           atReview: false,
