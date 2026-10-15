@@ -6272,11 +6272,33 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const reviewShaped = hasSubmitIntentBtn || hasAcceptTermsCheckbox || looksLikeReviewUrl(url)
         || fields.some((f) => f.fieldType === "button" && onPageControl(f) && isFinalSubmitControl(f.label));
       const plannerSaidReview = plan.atReview === true;
+      //      THE LEARNER'S DASHBOARD CLAUSE (#344). The gate below used to end "(!isDashboard ||
+      //      plannerSaidReview)", and the way forward was adopted only on a non-dashboard page —
+      //      i.e. a page that READ as review. DevHub's interstitial read as review only because
+      //      the shared reading took "A Permit Tech will review your submission" for the page
+      //      naming itself the review step; #344 removed that false positive (the backstop had
+      //      aborted the page's Next POST on it), and with it the page became dashboard-shaped
+      //      (no field, no submit control, no review wording) and its Next was never pressed. So a
+      //      dashboard-shaped page is ALSO an interstitial when it carries exactly ONE way forward:
+      //      one bare forward-worded control (isInterstitialForwardLabel — never Previous / Back /
+      //      Cancel, never submit-, pay- or record-worded), a top and a bottom copy at most, one
+      //      label, not off-limits. Every other guard above is unchanged and still has to hold: an
+      //      application was entered on this run, nothing has been entered, no form page has been
+      //      seen, not a resumed draft or signature check, no review shape (submit / final-submit
+      //      control, terms box, review URL). And the click is still judged by the network
+      //      backstop like any other request. What still stops: an account home (no application
+      //      entered yet — [9]), a list whose rows each say "Continue" (several controls — [6]),
+      //      any review shape, and a page whose forward sentence pays now (below).
+      const norm = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
+      const fwdCands = fields.map((f, i) => ({ f, i })).filter(({ f }) => f.fieldType === "button" && !f.disabled && !f.tile
+        && onPageControl(f) && isInterstitialForwardLabel(f.label) && !this.isOffLimitsButton(f));
+      const oneForward = fwdCands.length > 0 && fwdCands.length <= 2
+        && new Set(fwdCands.map(({ f }) => norm(f.label).toLowerCase())).size === 1;
       const interstitial = !hasFillable && !reviewShaped && !anyFormMutationRecorded && !entryDisclaimer
         && !this.continuedDraft && !this.signatureCheck && !signatureDone
         && !this.formPageSeen
         && steps.some((s) => /^(application entry|permit type):/.test(String(s.note ?? "")))
-        && (!isDashboard || plannerSaidReview);
+        && (!isDashboard || plannerSaidReview || oneForward);
       if (hasFillable) this.formPageSeen = true;
       const isReviewPage =
         ((!hasFillable && !isDashboard) ||
@@ -6359,18 +6381,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //       fingerprint (DevHub serves every SmartGuide step at one path, so the path alone would
       //       refuse a second, different interstitial); back on the SAME page, the walk stops and
       //       says so instead of clicking it again.
-      //       ONE WAY FORWARD, on the page that READ as review: the forward-worded controls must
-      //       be one control (a top and a bottom copy at most, one label) — a list whose rows each
-      //       say "Continue" is somebody's records, not an interstitial — and a page that was a
-      //       dashboard by structure (only the planner called it review) is not advanced here.
+      //       ONE WAY FORWARD (oneForward, computed with the gate above): the forward-worded
+      //       controls must be one control (a top and a bottom copy at most, one label) — a list
+      //       whose rows each say "Continue" is somebody's records, not an interstitial. Since #344
+      //       this holds on a dashboard-shaped page too (the learner's dashboard clause, above): a
+      //       page the shared reading does not call review is advanced only through this test.
       let interstitialAdvanceKey = "";
       if (interstitial) {
-        const norm = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
-        const fwdCands = fields.map((f, i) => ({ f, i })).filter(({ f }) => f.fieldType === "button" && !f.disabled && !f.tile
-          && onPageControl(f) && isInterstitialForwardLabel(f.label) && !this.isOffLimitsButton(f));
-        const oneWay = !isDashboard && fwdCands.length > 0 && fwdCands.length <= 2
-          && new Set(fwdCands.map(({ f }) => norm(f.label).toLowerCase())).size === 1;
-        const fwd = oneWay ? fwdCands[0].i : -1;
+        const fwd = oneForward ? fwdCands[0].i : -1;
         const fwdLabel = fwd >= 0 ? norm(fields[fwd].label) : "";
         const key = fwd >= 0 ? this.navClickKey(url, `${fwdLabel} @ ${loopFp}`) : "";
         const repeat = !!key && this.navClicksByPath.has(key);
