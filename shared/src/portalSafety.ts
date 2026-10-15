@@ -330,8 +330,24 @@ export function portalSafetyFactory() {
   // production false stop as the "(Read-only)" marker. "Review and Confirm" counts only as a
   // heading (end of line / sentence) or followed by the application / submission / permit /
   // request it confirms.
+  // NOT "<someone> will / shall / may / would / is going to review your submission": that is prose
+  // about SOMEONE ELSE'S FUTURE review of what will be filed, not the page naming itself the step
+  // where the applicant reviews it. City of Portland DevHub (live, 2026-10-14, #344): the
+  // PERMITTING INFORMATION page that comes BEFORE the form says "A Permit Tech will review your
+  // submission for minimum submittal standards"; read as the review page, the network backstop's
+  // live review lockdown aborted its Next POST and the permit run stopped there with nothing
+  // entered (the learner already passes it as an interstitial, #341). The lookbehind covers that
+  // one alternative only, a bounded modal set with at most one short adverb between ("will then
+  // review", "will carefully review"). Deliberately NOT "to review your …" ("Take a moment to
+  // review your application before submitting") and NOT must / can / should ("You must review
+  // your application before submitting") — both are the review page talking to the applicant.
+  // And NOT a present-tense "we review": PacifiCorp's PowerClerk submit page names no step and its
+  // ONE review wording is "Once we review the application and confirm it is eligible …" — any
+  // wider cut un-names a real filing page. A review page that also says "Staff will review your
+  // application" still reads as review through its own heading, an imperative "Please review
+  // your application", a review URL, or read-only + a filing control (terminalPageInPage).
   const REVIEW_PAGE =
-    /\bstep\s*\d+\s*[:.\-–—]?\s*review\b|\breview\s+(and|&)\s+(submit|sign|file|certify|finish)\b|\breview\s+(and|&)\s+confirm\b(?=\s*($|[\n.:!])|\s+(your|the|this)\s+(application|submission|permit|request)\b)|\breview\s+(all\s+(of\s+)?(your\s+|the\s+)?|(your|the)\s+)(application|information|details|entries|submission)\b|\bwill\s+not\s+be\s+submitted\s+until\b/i;
+    /\bstep\s*\d+\s*[:.\-–—]?\s*review\b|\breview\s+(and|&)\s+(submit|sign|file|certify|finish)\b|\breview\s+(and|&)\s+confirm\b(?=\s*($|[\n.:!])|\s+(your|the|this)\s+(application|submission|permit|request)\b)|(?<!\b(will|shall|may|would|going\s+to)\s+((\w+ly|then|also|first|next|not)\s+)?)\breview\s+(all\s+(of\s+)?(your\s+|the\s+)?|(your|the)\s+)(application|information|details|entries|submission)\b|\bwill\s+not\s+be\s+submitted\s+until\b/i;
   const isReviewPageText = (text: string | null | undefined): boolean => REVIEW_PAGE.test(String(text ?? ""));
   /** A URL that names the review step: Accela's CapConfirm / Confirm.aspx, a "/review" path
    *  segment (bounded — "/reviewer", "/review-comments" are not it). */
