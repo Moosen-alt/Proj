@@ -283,6 +283,59 @@ await check("isReviewPageText: the page NAMES itself the review step (MUST-MATCH
   for (const t of MUST) { assert.ok(isReviewPageText(t), `"${t}" is not a review page`); assert.ok(pageCopy.isReviewPageText(t), `page copy: "${t}"`); }
   for (const t of NOT) { assert.ok(!isReviewPageText(t), `"${t}" wrongly reads as a review page`); assert.ok(!pageCopy.isReviewPageText(t), `page copy: "${t}"`); }
 });
+await check("#344: SOMEONE ELSE'S FUTURE REVIEW is not the page naming itself the review step; the applicant's own review still is (MUST-EXCLUDE / MUST-PASS)", () => {
+  // MUST-EXCLUDE: City of Portland DevHub's PERMITTING INFORMATION page (captured live
+  // 2026-10-14, learn-runs …city-of-portland_lb60/page-p002 — these sentences carry no name),
+  // which comes BEFORE the form; read as review, the backstop aborted its Next POST. Plus the
+  // same shape with the other modals and an adverb between.
+  const EXCLUDE = [
+    "A Permit Tech will review your submission for minimum submittal standards, and if met, a permit will be created.",
+    "This is a permit request only.\nA Permit Tech will review your submission for minimum submittal standards, and if met, a permit will be created. Once your permit has been deemed complete for intake, you will be provided with instructions via email for how to pay your intake fees. If you already have the information you need to apply, scroll to the bottom of the page and click \"Continue\". Please do not submit additional requests for the same scope of work as this will only further delay the review of your project.",
+    "Staff shall review the application", "staff shall review the application", "The utility may review your information",
+    "the utility may review your information", "We would review your details within 10 days", "Our team is going to review your application",
+    "A Permit Tech will then review your submission", "Staff will carefully review the application", "We will not review your application until fees are paid",
+    "When a project is submitted, we will review the application to verify it is complete within 3 business days.",
+    // PSE's agreement wording (#305/#308, the signature step — not review); already false, pinned.
+    "I understand PSE will review and approve this application and may revise it.",
+  ];
+  // MUST-PASS: the issue's list, the imperative forms Helm pinned, and wording taken verbatim
+  // from REAL captured review / submit pages.
+  const PASS = [
+    "Please review your application before submitting", "Review your information below", "Step 3: Review", "Review and Submit",
+    "Take a moment to review your application before submitting", "You must review your application before submitting",
+    // Oregon ePermitting CapConfirm, captured (data/portal-replicas/city-of-coos-bay.json):
+    "Step 3 : Review",
+    "Please review all information below. To make a change to a section, click the Edit buttons shown on the gray bars. If everything is correct, click the Continue Application button below.",
+    // City of Corvallis (Accela) review page, captured (learn-runs …city-of-corvallis_suts/page-p019):
+    "Please review all information below. Click the \"Edit\" buttons to make changes to sections or \"Continue Application\" to move on.",
+    // PacifiCorp PowerClerk's submit page, captured (data/portal-replicas/pacific-power.json,
+    // learn-runs …pacificorp_0upf/page-p010). Its ONE review wording has no modal: a present-
+    // tense "we review" stays review, or a real filing page loses its name.
+    "Press Submit below to submit your Interconnection Application.\nOnce we review the application and confirm it is eligible for interconnection, we will send a request for signatures through DocuSign.",
+    // PSE Part 2 step 5 (#332's PSE-shaped wording; no PSE review page is captured on disk).
+    "SUBMIT application to PSE once customer signature is complete. Please review your application before submitting.",
+    // BOTH on one page: someone else's review AND the imperative — the imperative still names it.
+    "Staff will review your application. Please review your application before submitting.",
+    "A Permit Tech will review your submission for minimum submittal standards. Please review your application before submitting.",
+    "Please review your application before submitting. A Permit Tech will review your submission for minimum submittal standards.",
+    // The other alternatives are untouched by the modal: a heading / "review and submit" after one.
+    "Staff will review and submit the application", "Your application will not be submitted until you click Submit",
+  ];
+  for (const t of EXCLUDE) {
+    assert.ok(!isReviewPageText(t), `"${t}" wrongly reads as a review page`);
+    assert.ok(!pageCopy.isReviewPageText(t), `page copy: "${t}" wrongly reads as a review page`);
+    assert.ok(!reviewSignals(t, "https://devhub.example.gov/permits/sfjsp"), `reviewSignals: "${t}"`);
+    assert.ok(!pageCopy.reviewSignals(t, "https://devhub.example.gov/permits/sfjsp"), `page copy reviewSignals: "${t}"`);
+  }
+  for (const t of PASS) {
+    assert.ok(isReviewPageText(t), `"${t}" is not a review page`);
+    assert.ok(pageCopy.isReviewPageText(t), `page copy: "${t}" is not a review page`);
+    assert.ok(reviewSignals(t, "https://p.example.gov/apply/12"), `reviewSignals: "${t}"`);
+    assert.ok(pageCopy.reviewSignals(t, "https://p.example.gov/apply/12"), `page copy reviewSignals: "${t}"`);
+  }
+  // A review URL still names the page whatever its prose says.
+  assert.ok(reviewSignals(EXCLUDE[0], "https://aca.example.gov/Cap/CapConfirm.aspx"), "a review URL with the modal prose");
+});
 await check("reviewSignals: the page text OR a bounded review URL; '/reviewer' and '/review-comments' are not it", () => {
   for (const u of ["https://aca.example.gov/Cap/CapConfirm.aspx?x=1", "https://p.example.gov/apply/12/review", "https://p.example.gov/apply/review/", "https://p.example.gov/Confirm.aspx", "https://p.example.gov/app/review?step=7", "https://p.example.gov/app/review.aspx"]) {
     assert.ok(looksLikeReviewUrl(u), `"${u}" should read as a review URL`); assert.ok(pageCopy.looksLikeReviewUrl(u), `page copy: "${u}"`);
