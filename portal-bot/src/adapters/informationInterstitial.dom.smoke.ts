@@ -37,11 +37,15 @@
 //                     stops and names the page (stopReason interstitial_loop) — never a review.
 //   [5] NEVER BACK  — an interstitial with only Previous / Cancel and a planner that names
 //                     Previous as its advance: nothing is clicked, nothing is review.
-//   [6] MUST EXCLUDE — the same prose above a list of records whose rows each say "Continue":
-//                     not one way forward, so no row is pressed (and nothing is review).
+//   [6] MUST EXCLUDE — the same prose above a list of records whose rows each say "Continue",
+//                     with a planner that calls it review and names a row as the advance: not
+//                     one way forward, so no row is pressed (and nothing is review).
 //   [7] NEM STAGE   — a run that LOOKED for an existing draft (every NEM stage passes the
 //                     continueDraft option) and found none is starting fresh: the interstitial
 //                     is passed exactly as in [2].
+//   [10] PAY-NOW (#344) — one bare "Continue" under "Pay the $350 application fee now by card to
+//                     continue": never pressed (its POST goes to a non-payment URL, so only the
+//                     learner can refuse it); the split-sentence shape is the reported coverage limit.
 // In [1], [2] and [7] the sidebar's records / fees / corrections / profile pages are never
 // requested (the upload pass now runs on the interstitial, and the sidebar is on every page).
 //
@@ -266,7 +270,21 @@ const reviewNextPage = (p: string, addr: string): string => shell(p, {
   nav: PREV_NEXT,
 });
 
-const PREFIXES = ["/post", "/get", "/next-files", "/stuck", "/noforward", "/rows", "/nem", ...Object.keys(SHAPES), ...Object.keys(ACCOUNT_HOMES)];
+/** #344 PAY-NOW PROBE: a no-field page after the permit-type tile whose words tell the walker to
+ *  pay in order to continue, above ONE bare "Continue" — a POST to a NON-payment URL (so the
+ *  backstop's payment-URL rule cannot mask whether the learner pressed it), which leads to a
+ *  card page. /paynow names the control in its money sentence; /paynow-split does not (the
+ *  coverage limit, reported). */
+const PAY_NOW_PAGES: Record<string, string> = {
+  "/paynow": `<p>Your solar permit request has an application fee.</p><p>Pay the $350 application fee now by card to continue.</p>`,
+  "/paynow-split": `<p>Your solar permit request has an application fee.</p><p>A $350 fee is due now. Click Continue to proceed.</p>`,
+};
+const cardPage = (p: string): string => shell(p, {
+  title: "Payment", method: "POST", action: `${p}/pay`,
+  content: `<div class="form-group"><label for="cc" class="control-label">Card Number</label><input id="cc" name="cardnumber" autocomplete="cc-number" type="text"></div>`,
+  nav: `<button type="submit" name="pay" class="btn btn-primary ms-auto">Pay $350.00</button>`,
+});
+const PREFIXES = ["/post", "/get", "/next-files", "/stuck", "/noforward", "/rows", "/nem", ...Object.keys(PAY_NOW_PAGES), ...Object.keys(SHAPES), ...Object.keys(ACCOUNT_HOMES)];
 const hits: Array<{ method: string; url: string }> = [];
 const server = http.createServer((q, r) => {
   const url = q.url || "/";
@@ -307,15 +325,22 @@ const server = http.createServer((q, r) => {
       return send(shell(p, { title: "Permitting Information", method: "GET", content: PERMITTING_INFORMATION,
         nav: `<button type="submit" name="t_p1685049573549" class="btn btn-primary">Previous</button><a href="${p}/cancel" class="btn">Cancel</a>` }));
     }
+    if (PAY_NOW_PAGES[p]) {
+      return send(shell(p, { title: "Application Fee", method: "POST", content: PAY_NOW_PAGES[p],
+        nav: `<button type="submit" name="t_c1" class="btn btn-primary ms-auto">Continue</button>` }));
+    }
     return send(shell(p, { title: "Permitting Information", content: PERMITTING_INFORMATION, nav: PREV_NEXT, method: p === "/post" ? "POST" : "GET" }));
   }
   if (rest === "/sg") {
+    // The pay-now probe's Continue leads to the card page.
+    if (PAY_NOW_PAGES[p]) return redirect(`${p}/card`);
     // The interstitial's own form: Next → the project page, Previous → back to Apply. A POST is
     // read the same way (the body is not needed to route it — only Next reaches here unaborted).
     if (method === "POST" || qs.has("t_n1685049573549")) return redirect(`${p}/project`);
     return redirect(`${p}/apply`);
   }
   if (rest === "/project") return send(projectPage(p));
+  if (rest === "/card" && PAY_NOW_PAGES[p]) return send(cardPage(p));
   if (rest === "/sg2") {
     const addr = qs.get("addr") ?? "";
     if (qs.has("t_p1685049573549")) return redirect(`${p}/info`);
@@ -345,6 +370,8 @@ interface Walk {
   plannerPages: string[];
   /** Recorded form-data steps (fill / select / check / uncheck). */
   formSteps: number;
+  /** The VALUES the recorded fill steps carry (a sensitive field is recorded with none). */
+  fillValues: string[];
 }
 const runLearn = async (prefix: string, planner: (req: LearnPlanRequest) => LearnPlanResponse | null, options: Record<string, unknown> = {}): Promise<Walk> => {
   const before = hits.length;
@@ -390,6 +417,7 @@ const runLearn = async (prefix: string, planner: (req: LearnPlanRequest) => Lear
     finals: r.steps.filter((s) => s.isFinalSubmit).map((s) => String(s.note ?? "")),
     events, locks, hits: hits.slice(before), plannerPages,
     formSteps: r.steps.filter((s) => ["fill", "select", "check", "uncheck"].includes(String(s.action))).length,
+    fillValues: r.steps.filter((s) => s.action === "fill").map((s) => String(s.value ?? "")),
   };
 };
 const pageTrace = (w: Walk, path: string): string =>
@@ -559,15 +587,26 @@ console.log("\n[5] an interstitial with no way forward (Previous / Cancel only)"
 // [6] MUST EXCLUDE: the same prose above a list whose rows each say "Continue" — somebody's
 //     records, not one way forward. Not review, and no row is pressed.
 // ===========================================================================================
-console.log("\n[6] MUST EXCLUDE: review prose above three record rows, each with its own Continue");
+console.log("\n[6] MUST EXCLUDE: review prose above three record rows, each with its own Continue (worst planner)");
 {
-  const w = await runLearn("/rows", () => null);
+  // Since #344 the prose no longer reads as review, so with a silent planner this page is a plain
+  // dashboard and never reaches the one-way-forward test — "nothing pressed" would then hold
+  // against ANY learner. The worst planner (it calls the page review AND names a row's Continue
+  // as the advance) takes it through the interstitial gate, so the refusal under test is the
+  // one-way-forward test itself: three same-worded controls are not one way forward.
+  const w = await runLearn("/rows", (req) => {
+    if (pathOf(req.url) === "/rows/info") return { fills: [], atReview: true, advanceSelectorIndex: idx(req, "Continue") };
+    return null;
+  });
   check("premise: the planner saw the page", w.plannerPages.includes("/rows/info"), JSON.stringify(w.plannerPages));
+  check("premise: the page reached the interstitial gate (the planner called it review)",
+    interstitialEvents(w).some((e) => e.plannerSaidReview === true), JSON.stringify(interstitialEvents(w)));
   check("not a review stop (nothing entered, no review shape): no lockReview, no final submit",
     w.locks.length === 0 && w.finals.length === 0 && w.reachedReview !== true, JSON.stringify({ locks: w.locks, finals: w.finals, reachedReview: w.reachedReview }));
   check("three same-worded controls are not ONE way forward: no forward control adopted",
     interstitialEvents(w).some((e) => e.forward === null && e.candidates === 3), JSON.stringify(interstitialEvents(w)));
-  check("no row's Continue was pressed", !w.hits.some((h) => h.url.startsWith("/rows/clicked-continue")), JSON.stringify(w.hits.map((h) => h.url)));
+  check("no row's Continue was pressed (the planner's advance was dropped)", !w.hits.some((h) => h.url.startsWith("/rows/clicked-continue")), JSON.stringify(w.hits.map((h) => h.url)));
+  check("...and never recorded as an advance", !w.notes.some((n) => n === "advance: Continue"), JSON.stringify(w.notes));
 }
 
 // ===========================================================================================
@@ -651,6 +690,38 @@ for (const [p, h] of Object.entries(ACCOUNT_HOMES)) {
     touched.length === 0 && !w.notes.some((n) => n === `advance: ${h.label}`), JSON.stringify({ touched, notes: w.notes }));
   check(`${p}: the account home is not an interstitial`, !interstitialEvents(w).length, JSON.stringify(interstitialEvents(w)));
   check(`${p}: no records / profile page was requested`, offPath(w).length === 0, JSON.stringify(offPath(w)));
+}
+
+// ===========================================================================================
+// [10] #344 PAY-NOW PROBE (rule 1, never toward a payment): after the permit-type tile, a
+//      no-field page — dashboard-shaped, exactly ONE bare "Continue", the shape the learner's
+//      dashboard clause now passes — whose sentence naming that Continue says to pay now by card.
+//      The Continue posts to a NON-payment URL, so only the learner can refuse it.
+// ===========================================================================================
+console.log("\n[10] #344 pay-now probe: one bare Continue under \"Pay the $350 application fee now by card to continue\"");
+{
+  const w = await runLearn("/paynow", () => null);
+  const ev = interstitialEvents(w);
+  check("premise: the walk chose the Solar tile and reached the fee page's gate (one forward candidate)",
+    w.notes.includes(`permit type: ${SOLAR}`) && ev.some((e) => e.candidates === 1), JSON.stringify({ notes: w.notes, ev }));
+  check("the learner says it pays now: no forward control adopted (payNow recorded)",
+    ev.some((e) => e.payNow === true && e.forward === null), JSON.stringify(ev));
+  check("its Continue was never pressed: no POST reached /paynow/sg and the card page was never served",
+    !w.hits.some((h) => h.url.startsWith("/paynow/sg") || h.url.startsWith("/paynow/card")), JSON.stringify(w.hits.map((h) => `${h.method} ${h.url}`)));
+  check("...and never recorded as an advance", !w.notes.some((n) => /^advance:/.test(n)), JSON.stringify(w.notes));
+  check("not a review stop: no lockReview, no final submit, not reachedReview",
+    w.locks.length === 0 && w.finals.length === 0 && w.reachedReview !== true, JSON.stringify({ locks: w.locks, finals: w.finals, reachedReview: w.reachedReview }));
+}
+// THE COVERAGE LIMIT, reported (not asserted away): the money sentence does not name the control
+// ("A $350 fee is due now. Click Continue to proceed."), so this refusal does not fire; the hard
+// lines still hold — no card value is typed (the card box is recorded by name, with no value) and
+// no payment request reaches the server.
+{
+  const w = await runLearn("/paynow-split", () => null);
+  const pressed = w.hits.some((h) => h.method === "POST" && h.url.startsWith("/paynow-split/sg"));
+  console.log(`  note - coverage limit (/paynow-split): Continue ${pressed ? "WAS pressed (the money sentence does not name it)" : "was not pressed"}; ${JSON.stringify(interstitialEvents(w))}`);
+  check("coverage limit: whatever was pressed, no card value was typed and no payment request reached the server",
+    w.fillValues.every((v) => v === "") && !w.hits.some((h) => h.url.startsWith("/paynow-split/pay")), JSON.stringify({ fillValues: w.fillValues, hits: w.hits.map((h) => `${h.method} ${h.url}`) }));
 }
 
 await browser.close();

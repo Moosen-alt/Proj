@@ -49,7 +49,7 @@ export interface ContinueDraft {
    *  Submit; not signed, or unreadable, it stops on the record page and names why. */
   awaitingSignature?: boolean;
 }
-import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
+import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isPayNowDialogText, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
 import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
 import { hostOfUrl, sameCredentialScope } from "../siteOf";
@@ -6386,13 +6386,33 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //       whose rows each say "Continue" is somebody's records, not an interstitial. Since #344
       //       this holds on a dashboard-shaped page too (the learner's dashboard clause, above): a
       //       page the shared reading does not call review is advanced only through this test.
+      //       NEVER TOWARD A PAYMENT (#344). A no-field page whose words tell the walker to PAY in
+      //       order to press its forward control ("Pay the $350 application fee now by card to
+      //       continue") is not passed. The ONE pay-now reading (paymentDialogVerdict, via
+      //       isPayNowDialogText) is asked of the sentences that NAME the forward control — not of
+      //       the whole page: that reading is fail-closed on any fee mention by design (right for a
+      //       dialog), and on DevHub's own interstitial it reads pays_now ("you will be provided with
+      //       instructions via email for how to pay your intake fees"), while the sentence that
+      //       names its control is 'click "Continue"'. Coverage limit: a pay page whose money
+      //       sentence does not name the control ("A $350 fee is due now. Click Continue.") is not
+      //       refused HERE; the hard lines are unchanged — pay-worded controls are off-limits,
+      //       card fields are never filled, and the backstop aborts every payment request.
       let interstitialAdvanceKey = "";
       if (interstitial) {
-        const fwd = oneForward ? fwdCands[0].i : -1;
+        let fwd = oneForward ? fwdCands[0].i : -1;
+        let payNow = false;
+        if (fwd >= 0) {
+          const words = norm(fields[fwd].label).toLowerCase().match(/[a-z]+/g) ?? [];
+          const names = words.length ? new RegExp(`\\b${words.join("\\s+")}\\b`, "i") : null;
+          const forwardSentences = String(reading?.text ?? bodyText ?? "").split(/[.?!;](?=\s|$)|\n+/)
+            .filter((s) => !!names && names.test(s));
+          payNow = isPayNowDialogText(forwardSentences.join(". "));
+          if (payNow) fwd = -1;
+        }
         const fwdLabel = fwd >= 0 ? norm(fields[fwd].label) : "";
         const key = fwd >= 0 ? this.navClickKey(url, `${fwdLabel} @ ${loopFp}`) : "";
         const repeat = !!key && this.navClicksByPath.has(key);
-        this.debug?.event({ type: "interstitial_not_review", page: pageCount, forward: fwdLabel.slice(0, 40) || null, candidates: fwdCands.length, plannerSaidReview, repeat });
+        this.debug?.event({ type: "interstitial_not_review", page: pageCount, forward: fwdLabel.slice(0, 40) || null, candidates: fwdCands.length, plannerSaidReview, repeat, ...(payNow ? { payNow: true } : {}) });
         if (repeat) {
           return {
             ...fail(steps, this.portalName, `Stopped on an information page ("${(redactStatusText(pageTitle) || "this page").slice(0, 60)}"): its "${fwdLabel.slice(0, 40)}" was clicked once already and the walk is back on the same page, so it is not clicked again. Nothing has been entered on this run. Continue past the page by hand, or record the portal.`, null, pageCount, portalNotices),
