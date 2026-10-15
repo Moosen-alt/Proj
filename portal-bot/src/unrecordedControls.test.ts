@@ -8,7 +8,7 @@
 // Run: npx tsx portal-bot/src/unrecordedControls.test.ts
 import assert from "node:assert/strict";
 import { answerForUnrecordedControl, disconnectPartKeyFor, missingRequiredStopMessage, readDisconnectPart } from "./unrecordedControls";
-import { policyDefaultAnswerFor, policyScopeFor } from "./adapters/autoLearnAdapter";
+import { policyDefaultAnswerFor, policyProfileFor, policyScopeFor } from "./adapters/autoLearnAdapter";
 import { operatorPolicyAnswer } from "../../shared/src/perJobQuestions";
 
 let failures = 0;
@@ -175,6 +175,20 @@ check("scope: a permit learn's policy never answers a utility question, and the 
   assert.equal(policyDefaultAnswerFor("I consent to drone inspection(s) for this project.", "permit"), "Yes");
   assert.equal(policyScopeFor("utility", {} as NodeJS.ProcessEnv), "nem");
   assert.equal(policyScopeFor("ahj", {} as NodeJS.ProcessEnv), "permit");
+});
+
+check("ONE policy rule: the learn's profile (policyProfileFor, which backend autoLearn.ts passes the learner) and the replay's scope agree", () => {
+  const envs = [{}, { PORTAL_POLICY_DEFAULTS: "off" }, { PORTAL_POLICY_DEFAULTS: "0" }, { PORTAL_POLICY_DEFAULTS: "on" }] as NodeJS.ProcessEnv[];
+  const asScope = { residential_nem: "nem", permit_standard: "permit", none: "none" } as const;
+  for (const env of envs) {
+    for (const scopeType of ["utility", "ahj", "", null, undefined]) {
+      assert.equal(policyScopeFor(scopeType, env), asScope[policyProfileFor(scopeType, env)], `${JSON.stringify(env)} ${String(scopeType)}`);
+    }
+  }
+  assert.equal(policyProfileFor("utility", {} as NodeJS.ProcessEnv), "residential_nem");
+  assert.equal(policyProfileFor("ahj", {} as NodeJS.ProcessEnv), "permit_standard");
+  assert.equal(policyProfileFor("utility", { PORTAL_POLICY_DEFAULTS: "off" } as NodeJS.ProcessEnv), "none");
+  assert.equal(policyProfileFor("ahj", { PORTAL_POLICY_DEFAULTS: "0" } as NodeJS.ProcessEnv), "none");
 });
 
 check("the stop's message names every control within the first 300 characters", () => {

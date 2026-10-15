@@ -496,9 +496,22 @@ const POLICY_RADIO_DEFAULTS: Array<{ question: RegExp; answer: "Yes" | "No"; enf
 ];
 
 /** A POLICY SCOPE: "nem" on a utility interconnection, "permit" on an AHJ, "none" when the operator
- *  turned the policy answers off (PORTAL_POLICY_DEFAULTS=off — backend autoLearn.ts sets the learn's
- *  policyProfile by the same rule, and policyScopeFor below mirrors it for the replay). */
+ *  turned the policy answers off (PORTAL_POLICY_DEFAULTS=off). Read from policyProfileFor below — the
+ *  one rule the learn (backend autoLearn.ts) and the replay (policyScopeFor) both ask. */
 export type PolicyScope = "nem" | "permit" | "none";
+
+/** Which deterministic policy-answer set a run may use (the learner's constructor option). */
+export type PolicyProfile = "residential_nem" | "permit_standard" | "none";
+
+/** THE ONE RULE FOR WHICH POLICY ANSWERS APPLY (PR #353 round 2: the backend's learn and the replay
+ *  each carried a copy). Deterministic policy answers (export capacity → No, UL 1741 → Yes) are
+ *  standard-residential-NEM domain policy: a UTILITY interconnection gets them, an AHJ/permit portal
+ *  gets the permit set, and PORTAL_POLICY_DEFAULTS=off (or 0) disables them everywhere (non-standard
+ *  projects; the planner + project data then decide). */
+export function policyProfileFor(scopeType: string | null | undefined, env: NodeJS.ProcessEnv = process.env): PolicyProfile {
+  if (env.PORTAL_POLICY_DEFAULTS === "off" || env.PORTAL_POLICY_DEFAULTS === "0") return "none";
+  return scopeType === "utility" ? "residential_nem" : "permit_standard";
+}
 
 /** THE LEARNER'S STANDING ANSWER TO A QUESTION, read from POLICY_RADIO_DEFAULTS — the one table
  *  (issue #352). The replay asks it for a REQUIRED control its recipe has no step for (PacifiCorp's
@@ -513,12 +526,11 @@ export function policyDefaultAnswerFor(question: string, scope: PolicyScope): "Y
   return hit ? hit.answer : "";
 }
 
-/** The policy scope a replay runs under: the learn's own rule (backend autoLearn.ts policyProfile)
- *  applied to the recipe's scope — off by the operator's switch, else a utility recipe is NEM and
- *  anything else a permit. */
+/** The policy scope a replay runs under: the learn's own profile (policyProfileFor) for the recipe's
+ *  scope, as the scope POLICY_RADIO_DEFAULTS rules carry. */
 export function policyScopeFor(scopeType: string | null | undefined, env: NodeJS.ProcessEnv = process.env): PolicyScope {
-  if (env.PORTAL_POLICY_DEFAULTS === "off" || env.PORTAL_POLICY_DEFAULTS === "0") return "none";
-  return scopeType === "utility" ? "nem" : "permit";
+  const profile = policyProfileFor(scopeType, env);
+  return profile === "none" ? "none" : profile === "residential_nem" ? "nem" : "permit";
 }
 
 // Sensitive field labels whose literal value must NEVER be stored in a recorded step.
