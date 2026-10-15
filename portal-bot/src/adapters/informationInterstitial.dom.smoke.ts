@@ -739,9 +739,10 @@ for (const [p, h] of Object.entries(ACCOUNT_HOMES)) {
 
 // ===========================================================================================
 // [10] #344 PAY-NOW PROBE (rule 1, never toward a payment): after the permit-type tile, a
-//      no-field page — dashboard-shaped, exactly ONE bare "Continue", the shape the learner's
-//      dashboard clause now passes — whose sentence naming that Continue says to pay now by card.
-//      The Continue posts to a NON-payment URL, so only the learner can refuse it.
+//      no-field page that reads as review on the wide reading (it carries DevHub's sentence), so
+//      it reaches the interstitial gate with exactly ONE bare "Continue" — whose sentence naming
+//      that Continue says to pay now by card. The Continue posts to a NON-payment URL, so only
+//      the learner can refuse it.
 // ===========================================================================================
 console.log("\n[10] #344 pay-now probe: one bare Continue under \"Pay the $350 application fee now by card to continue\"");
 {
