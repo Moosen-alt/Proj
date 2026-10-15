@@ -294,7 +294,8 @@ await check("#344: SOMEONE ELSE'S FUTURE REVIEW is not the page naming itself th
     "Staff shall review the application", "staff shall review the application", "The utility may review your information",
     "the utility may review your information", "We would review your details within 10 days", "Our team is going to review your application",
     "A Permit Tech will then review your submission", "Staff will carefully review the application", "We will not review your application until fees are paid",
-    "When a project is submitted, we will review the application to verify it is complete within 3 business days.",
+    // A utility's intake-timing line on its FIRST form page (a form page, not review).
+    "Once a project is submitted, we will review the application for completeness.",
     // PSE's agreement wording (#305/#308, the signature step — not review); already false, pinned.
     "I understand PSE will review and approve this application and may revise it.",
   ];
