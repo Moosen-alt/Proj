@@ -2713,12 +2713,14 @@ export class RecipeAdapter extends BasePortalAdapter {
     return (await loc.evaluate(comboboxFaceInPage, "probe").catch(() => "")) === "preferred";
   }
 
-  /** The ONE usable control a row-scoped step resolves to, trying its levels in order, and how
-   *  many usable controls the most crowded level showed. A level that shows two is ambiguous (a
-   *  per-row microinverter's "Manufacturer" beside the module's) and is never guessed at: the
-   *  next level is tried; when none is unique, `loc` is null and the read-back names the clash. */
+  /** The ONE usable control a row-scoped step resolves to, trying its levels in order, the
+   *  level that named it (what the fill writes through), and how many controls the most crowded
+   *  level named. A level that names two is ambiguous (a per-row microinverter's "Manufacturer"
+   *  beside the module's) and is never guessed at: the next level is tried. A level that names
+   *  exactly one control that is not usable is a veto, not a fall-through. When none is unique,
+   *  `loc` is null and the read-back names the clash. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private async rowResolve(rs: RecipeStep): Promise<{ loc: any | null; ambiguous: number }> {
+  private async rowResolve(rs: RecipeStep): Promise<{ loc: any | null; ambiguous: number; level?: RecipeSelector }> {
     const sel = rs.selector;
     let ambiguous = 0;
     if (!sel) return { loc: null, ambiguous };
@@ -2727,13 +2729,27 @@ export class RecipeAdapter extends BasePortalAdapter {
       let loc: any;
       try { loc = this.locator({ ...level, fallbacks: undefined }); } catch { continue; }
       const count = loc && typeof loc.count === "function" ? await loc.count().catch(() => 0) : 0;
+      // COUNT EVERY CONTROL THE LEVEL NAMES — visible, or a hidden combobox whatever its face —
+      // then ask whether the one is usable. Counting only the usable ones turned "two
+      // Manufacturers, one with a face this walk does not know" into "one Manufacturer": the
+      // per-row microinverter's, which the fill then overwrote (#348 review). Uncertain = veto.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const seen: any[] = [];
+      const named: any[] = [];
       for (let k = 0; k < Math.min(count, 4); k++) {
-        if (await this.rowControlUsable(loc.nth(k))) seen.push(loc.nth(k));
+        const c = loc.nth(k);
+        const comboish = await c.evaluate((el: Element) => el.getAttribute("role") === "combobox"
+          || (el.getAttribute("aria-haspopup") || "").toLowerCase() === "listbox").catch(() => false);
+        if (comboish || await this.isTrulyVisible(c)) named.push(c);
       }
-      if (seen.length === 1) return { loc: seen[0], ambiguous };
-      if (seen.length > ambiguous) ambiguous = seen.length;
+      if (named.length === 1) {
+        // One control, and it is not usable (no face a person could use): this level NAMED the
+        // control, so a broader level must not be asked for a different one. Not yet rendered
+        // is the same answer — waitForRowControl keeps polling.
+        return await this.rowControlUsable(named[0])
+          ? { loc: named[0], ambiguous, level: { ...level, fallbacks: undefined } }
+          : { loc: null, ambiguous };
+      }
+      if (named.length > ambiguous) ambiguous = named.length;
     }
     return { loc: null, ambiguous: ambiguous > 1 ? ambiguous : 0 };
   }
@@ -2774,7 +2790,13 @@ export class RecipeAdapter extends BasePortalAdapter {
         this.arrayRowScope = n;
         try {
           rendered = await this.waitForRowControl(rs, ROW_CONTROL_WAIT_MS);
-          if (rendered) ok = await this.executeStep(rs, false).catch(() => false);
+          // THE FILL WRITES THE CONTROL THE RESOLVER CHOSE (#348 review): executeStep's own
+          // level walk could take a different one than rowResolve, so the read-back then checked
+          // a control the fill never touched. It is given the ONE level rowResolve accepted (that
+          // level names exactly one control in the row), re-resolved at write time so a widget
+          // the make's cascade re-renders is still found.
+          const won = rendered ? await this.rowResolve(rs).catch(() => null) : null;
+          if (won?.loc && won.level) ok = await this.executeStep({ ...rs, selector: won.level }, false).catch(() => false);
           if (ok && s.action === "select") {
             if (s.field) this.landedSelectFields.add(String(s.field));
             // What the row SHOWS now — through the same resolver and reader as the read-back, so
@@ -2797,20 +2819,25 @@ export class RecipeAdapter extends BasePortalAdapter {
     return out;
   }
 
-  /** Does what row `row` shows for step `s` hold the value it should? Numbers by value (a "6"
-   *  is not a "16", which a containment match would bless); selects by the shared read-back
-   *  predicate, the certified make aliases, or exactly what this run saw land in that row. */
-  private rowValueHolds(s: RecipeStep, row: number, got: string, want: string, tag: string): boolean {
+  /** Does what a row shows (`got`) for step `s` hold the value it should? Numbers by value (a
+   *  "6" is not a "16", which a containment match would bless). A select holds only when the
+   *  row SHOWS the wanted value — or, for a make, one of its certified aliases ("Znshine
+   *  PV-Tech" for "ZNShine Solar") — and the match runs ONE way: the shown text must contain
+   *  it. A shown text that is merely PART of the wanted one ("Model", a stray label, for
+   *  "440W (Model ZXM7-UHLDD108-440/N)") does not hold, and what this run saw land in the row
+   *  is no evidence either: it was read the same way, after any portal rewrite (#348 review).
+   *  rowSelectLanded still feeds the stop message's expected text. */
+  private rowValueHolds(s: RecipeStep, got: string, want: string, tag: string): boolean {
     if (s.action !== "select" && tag !== "select") {
       const g = toBareNumber(got);
       const w = toBareNumber(want);
       if (g !== "" && w !== "") return Number(g) === Number(w);
       return got.trim() === want.trim();
     }
-    if (readbackMatches(got, want)) return true;
-    if (this.isManufacturerStep(s) && equipmentMakeCandidates(want).some((alt) => readbackMatches(got, alt))) return true;
-    const landed = this.rowSelectLanded.get(`${row}:${String(s.field ?? "")}`);
-    return !!landed && landed === got.trim();
+    const norm = (v: string): string => v.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const shows = (w: string): boolean => !!norm(w) && norm(got).includes(norm(w)) && readbackMatches(got, w);
+    if (shows(want)) return true;
+    return this.isManufacturerStep(s) && equipmentMakeCandidates(want).some((alt) => shows(alt));
   }
 
   /**
@@ -2872,7 +2899,7 @@ export class RecipeAdapter extends BasePortalAdapter {
             const got = String((await this.shownBy(loc))?.text ?? "").trim();
             const tag = String(await loc.evaluate((el: Element) => (el.tagName || "").toLowerCase()).catch(() => "")) || "input";
             if (placeholder(got)) { problems.push(`${name} is empty`); continue; }
-            if (!this.rowValueHolds(s, r, got, want, tag)) problems.push(`${name} reads "${got.slice(0, 40)}"`);
+            if (!this.rowValueHolds(s, got, want, tag)) problems.push(`${name} reads "${got.slice(0, 40)}"`);
           } finally {
             this.arrayRowScope = 0;
           }

@@ -377,11 +377,21 @@ export async function readClosedComboboxOptions(page: any, loc: any): Promise<st
  * Runs IN THE PAGE (loc.evaluate): self-contained, no module references.
  */
 export function comboboxFaceInPage(el: Element, mode: string): string {
+  // READING ("probe" / "text") never goes past the widget's own container, and never takes a
+  // label or another form control for the face: an ancestor that also holds ANOTHER select or
+  // combobox input is the row (its face belongs to that other control), and a <label
+  // class="control-label">Model</label> is not what the widget shows. "click" is unchanged.
+  const reading = mode !== "click";
+  const otherControl = (n: Element): boolean => n !== el && (n.tagName === "SELECT"
+    || (/^(INPUT|TEXTAREA)$/.test(n.tagName) && (n.getAttribute("role") === "combobox"
+      || (n.getAttribute("aria-haspopup") || "").toLowerCase() === "listbox")));
   let root: Element = el;
   for (let k = 0; k < 5 && root.parentElement; k++) {
     root = root.parentElement;
+    if (reading && Array.from(root.querySelectorAll("*")).some(otherControl)) break;
     const cands = Array.from(root.querySelectorAll<HTMLElement>("*")).filter((n) => {
       if (n === el || n.getAttribute("role") === "listbox" || n.getAttribute("role") === "option") return false;
+      if (reading && /^(LABEL|INPUT|SELECT|TEXTAREA|OPTION)$/.test(n.tagName)) return false;
       const r = n.getBoundingClientRect();
       const s = getComputedStyle(n);
       return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
