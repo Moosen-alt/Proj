@@ -38,6 +38,31 @@ export interface EmptyRequired {
 }
 
 /**
+ * IS THIS CONTROL STILL UNANSWERED? — THE ONE READING (PR #353 round 2).
+ *
+ * "Filled" must mean filled. A native select resting on its placeholder reports that option's
+ * text as .value, and a custom combobox is an input whose .value IS the placeholder — both read
+ * as non-empty and blessed unanswered controls. So: no value, or what the control SHOWS is a
+ * placeholder ("Select...", "Please choose", anything starting "--", whatever its value attribute
+ * says — "<option value="0">-- Select --</option>" is unanswered).
+ *
+ * The sweep below and every caller that asks about ONE control (the replay's answer to a required
+ * control its recipe never recorded) read the same function — a second copy disagreed: a
+ * "-- Select --" with a value was empty to the sweep and answered to the replay, so nothing filled it.
+ *
+ * SELF-CONTAINED ON PURPOSE: the page runs this very function text (the sweep embeds its source; a
+ * caller passes it to locator.evaluate), so it has no outer references, no nested functions and its
+ * regexes inline.
+ */
+export function controlReadsUnanswered(el: Element): boolean {
+  const raw = String((el as HTMLInputElement).value || "").trim();
+  const isSelect = String(el.tagName || "").toLowerCase() === "select";
+  const opt = isSelect ? (el as HTMLSelectElement).options[(el as HTMLSelectElement).selectedIndex] : null;
+  const shown = isSelect ? String((opt && opt.textContent) || "").trim() : raw;
+  return !raw || /^(please\s+)?(select|choose)\b\.{0,3}$/i.test(shown) || /^--/.test(shown);
+}
+
+/**
  * Every visible required control still empty on the current page.
  *
  * Deliberately conservative about FALSE positives: a warning that fires on a correctly
@@ -48,7 +73,27 @@ export async function sweepEmptyRequiredControls(
   page: Page,
 ): Promise<{ empty: EmptyRequired[]; requiredSeen: string[] }> {
   if (!page || typeof page.evaluate !== "function") return { empty: [], requiredSeen: [] };
-  const swept = await page.evaluate(() => {
+  // The page runs the sweep with THE answered-reading (controlReadsUnanswered) handed in as source —
+  // the same function text a single-control caller evaluates. The __name shim first: tsx/esbuild
+  // wraps the sweep's inner arrow functions in __name(…) calls the page does not define.
+  const swept = await page.evaluate(
+    `globalThis.__name = globalThis.__name || function (fn) { return fn; };\n(${sweepInPage.toString()})(${controlReadsUnanswered.toString()})`,
+  ).catch(() => ({ empty: [], requiredSeen: [] })) as { empty: EmptyRequired[]; requiredSeen: string[] };
+
+  // NORMALISE BEFORE RETURNING. The .catch above absorbs a page that throws, but not a page
+  // that RESOLVES with something else — a stub, a page mid-navigation, an evaluate the portal
+  // interrupted. This is a diagnostic: the worst it may ever do is report nothing. Iterating
+  // an undefined here would abort a filing that was otherwise going fine, which is the only
+  // outcome worse than a missing warning.
+  return {
+    empty: Array.isArray(swept?.empty) ? swept.empty : [],
+    requiredSeen: Array.isArray(swept?.requiredSeen) ? swept.requiredSeen : [],
+  };
+}
+
+/** The sweep, as the page runs it. `unanswered` is controlReadsUnanswered (see the caller). */
+const sweepInPage = (unanswered: (el: Element) => boolean): { empty: Array<{ name: string; why: string }>; requiredSeen: string[] } => {
+  {
     // TWO GRADES OF COMPLAINT, BECAUSE ONE OF THEM IS ALSO ORDINARY PROSE.
     //
     // "This field is required" is a portal refusing a filing. "Please select an option" is
@@ -74,7 +119,6 @@ export async function sweepEmptyRequiredControls(
     // something, not refusing their filing.
     const ADVISORY = /^\s*(please note|note|notice|important|reminder|attention)\b[:,]?/i;
     const COMPLAINT = new RegExp(`${HARD.source}|${SOFT.source}`, "i");
-    const PLACEHOLDER = /^(please\s+)?(select|choose)\b\.{0,3}$/i;
     const out: Array<{ name: string; why: string }> = [];
     const requiredSeen: string[] = [];
     const push = (name: string, why: string): void => {
@@ -118,11 +162,7 @@ export async function sweepEmptyRequiredControls(
     // IS THIS CONTROL ANSWERED? Needed before attribution, not after — see below.
     const emptyish = new Set<HTMLElement>();
     for (const el of controls) {
-      const raw = ((el as HTMLInputElement).value || "").trim();
-      const shown = (el.tagName || "").toLowerCase() === "select"
-        ? ((((el as HTMLSelectElement).options[(el as HTMLSelectElement).selectedIndex] || {}).textContent) || "").trim()
-        : raw;
-      if (!raw || PLACEHOLDER.test(shown) || /^--/.test(shown)) emptyish.add(el);
+      if (unanswered(el)) emptyish.add(el);
     }
 
     const claimed = new Set<HTMLElement>();
@@ -197,14 +237,8 @@ export async function sweepEmptyRequiredControls(
         if (seenName && !requiredSeen.includes(seenName)) requiredSeen.push(seenName);
       }
 
-      // "Filled" must mean filled. A native select resting on its placeholder reports that
-      // option's text as .value, and a custom combobox is an input whose .value IS the
-      // placeholder — both read as non-empty and blessed unanswered controls.
-      const raw = ((el as HTMLInputElement).value || "").trim();
-      const shown = (el.tagName || "").toLowerCase() === "select"
-        ? ((((el as HTMLSelectElement).options[(el as HTMLSelectElement).selectedIndex] || {}).textContent) || "").trim()
-        : raw;
-      if (raw && !PLACEHOLDER.test(shown) && !/^--/.test(shown)) continue;
+      // "Filled" must mean filled — controlReadsUnanswered, the one reading.
+      if (!unanswered(el)) continue;
 
       const name = labelText
         || (containerText && containerText.length <= 90 ? containerText : "")
@@ -238,15 +272,5 @@ export async function sweepEmptyRequiredControls(
     }
 
     return { empty: out.slice(0, 14), requiredSeen: requiredSeen.slice(0, 120) };
-  }).catch(() => ({ empty: [], requiredSeen: [] })) as { empty: EmptyRequired[]; requiredSeen: string[] };
-
-  // NORMALISE BEFORE RETURNING. The .catch above absorbs a page that throws, but not a page
-  // that RESOLVES with something else — a stub, a page mid-navigation, an evaluate the portal
-  // interrupted. This is a diagnostic: the worst it may ever do is report nothing. Iterating
-  // an undefined here would abort a filing that was otherwise going fine, which is the only
-  // outcome worse than a missing warning.
-  return {
-    empty: Array.isArray(swept?.empty) ? swept.empty : [],
-    requiredSeen: Array.isArray(swept?.requiredSeen) ? swept.requiredSeen : [],
-  };
-}
+  }
+};

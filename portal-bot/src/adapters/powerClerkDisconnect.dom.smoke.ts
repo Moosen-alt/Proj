@@ -21,6 +21,11 @@
 //   [C] a 6.2 kW job (the section never renders) with no standard → no stop, reaches review
 //       (a question the portal did not ask is not a reason to stop);
 //   [D] the job's own recorded distance answer ("No") wins over the standing "Yes";
+//   [E] (round 2) a display:none twin, a filled same-label box and a "-- Select --" placeholder with a
+//       value: the empty sibling gets the part, the filled box and the twin are never touched, and
+//       the placeholder reads unanswered (the sweep's own predicate) so the knife-blade gets its Yes;
+//   [F] (round 2) a DC disconnect's part with the AC part on file: never filed into it — the run stops
+//       naming it;
 //   [L] the LEARNER's Calculate (clickComputeButton) returns only once the result is on the page,
 //       so its rescan sees the four controls and its policy pass records the two Yes/No answers.
 //
@@ -68,6 +73,29 @@ ${req("DTYPEInput", LABEL.knife, yesNo("DTYPEInput", "discKnife"))}
 ${req("DDISTInput", LABEL.dist, yesNo("DDISTInput", "discDist"))}
 `;
 
+// [E] (PR #353 round 2 nits): the same section with three traps. A display:none TWIN of the
+// manufacturer box comes first (the extraction lists it; the sweep does not count it); the first
+// VISIBLE manufacturer box already holds "Square D"; an EMPTY visible sibling with the same label
+// follows — the one the sweep names. The knife-blade select rests on "-- Select --" whose value
+// attribute is "0" (unanswered to the sweep, so it must be to the answer too).
+const SECTION_E = `<div class="literal-element"><b>Pacific Power requires a knife blade type, visible, lockable disconnect.</b></div>
+<div style="display:none">${req("DMAKEHidden", LABEL.make, '<input class="form-control" type="text" id="DMAKEHidden" data-test-role="textbox-element" required data-k="hiddenMake">')}</div>
+${req("DMAKEInput", LABEL.make, '<input class="form-control" type="text" id="DMAKEInput" data-test-role="textbox-element" maxlength="2048" required data-k="discMake" value="Square D">')}
+${req("DMAKE2Input", LABEL.make, '<input class="form-control" type="text" id="DMAKE2Input" data-test-role="textbox-element" maxlength="2048" required data-k="discMake2">')}
+${req("DMODELInput", LABEL.model, '<input class="form-control" type="text" id="DMODELInput" data-test-role="textbox-element" maxlength="2048" required data-k="discModel">')}
+${req("DTYPEInput", LABEL.knife, '<select class="form-select" id="DTYPEInput" data-test-role="dropdownlist-element" required data-k="discKnife"><option value="0">-- Select --</option><option value="24449">Yes</option><option value="24450">No</option></select>')}
+${req("DDISTInput", LABEL.dist, yesNo("DDISTInput", "discDist"))}
+`;
+
+// [F] (PR #353 round 2): a DC disconnect's part. The AC part on file (Eaton DG221URB) is never filed
+// into it; with no project value for a DC disconnect, the run stops naming it.
+const DC_MAKE = "DC Disconnect Manufacturer";
+const SECTION_F = `${req("DCMAKEInput", DC_MAKE, '<input class="form-control" type="text" id="DCMAKEInput" data-test-role="textbox-element" maxlength="2048" required data-k="dcMake">')}
+${req("DMODELInput", LABEL.model, '<input class="form-control" type="text" id="DMODELInput" data-test-role="textbox-element" maxlength="2048" required data-k="discModel">')}
+${req("DTYPEInput", LABEL.knife, yesNo("DTYPEInput", "discKnife"))}
+${req("DDISTInput", LABEL.dist, yesNo("DDISTInput", "discDist"))}
+`;
+
 const SPEC_PAGE = `<!doctype html><html><head><meta charset="utf-8"><style>
   body{font:14px sans-serif;padding:12px} .loader{display:flex;justify-content:center}
   .spinner-border{width:24px;height:24px;border:3px solid #888;border-right-color:transparent;border-radius:50%;animation:s .8s linear infinite}
@@ -83,18 +111,21 @@ const SPEC_PAGE = `<!doctype html><html><head><meta charset="utf-8"><style>
   ${req("MACCInput", LABEL.meterAccess, '<select class="form-select" id="MACCInput" data-test-role="dropdownlist-element" required data-k="meterAccess"><option value="">Select...</option><option value="13">None</option><option value="14">Dog at residence</option><option value="15">Locked gate</option><option value="17">Other</option></select>')}
   <button id="next" type="button">Next</button>
   <script>
-    var server = { exportKw: "", discMake: "", discModel: "", discKnife: "", discDist: "", meterLoc: "", meterAccess: "", calculated: false };
+    var server = { exportKw: "", discMake: "", discMake2: "", hiddenMake: "", dcMake: "", discModel: "", discKnife: "", discDist: "", meterLoc: "", meterAccess: "", calculated: false };
     window.__server = server;
-    // PER-FIELD AUTOSAVE on blur / change (a select saves its visible option text).
+    // PER-FIELD AUTOSAVE on blur / change (a select saves its visible option text). A box the
+    // portal rendered already holding a value starts the server with it.
     function wire(root) {
       var els = root.querySelectorAll("[data-k]");
       for (var i = 0; i < els.length; i++) (function (el) {
         var save = function () { server[el.getAttribute("data-k")] = el.tagName === "SELECT" ? (el.value ? el.options[el.selectedIndex].text : "") : el.value; };
+        if (el.tagName !== "SELECT" && el.value) save();
         el.addEventListener(el.tagName === "SELECT" ? "change" : "blur", save);
       })(els[i]);
     }
     wire(document);
-    var SECTION = ${JSON.stringify(SECTION)};
+    var V = new URLSearchParams(location.search).get("v") || "";
+    var SECTION = V === "e" ? ${JSON.stringify(SECTION_E)} : V === "f" ? ${JSON.stringify(SECTION_F)} : ${JSON.stringify(SECTION)};
     // CALCULATE: spinner in the loader, the stale marker stays, the server answers later; the
     // disconnect section renders only when the computed rating requires it (over 10 kW here).
     document.getElementById("calc").addEventListener("click", function () {
@@ -174,10 +205,10 @@ type Committed = Record<string, string | boolean>;
 const browser = await chromium.launch();
 const context = await browser.newContext();
 await context.addInitScript("globalThis.__name = globalThis.__name || function (fn) { return fn; };");
-const run = async (fields: Record<string, string>) => {
+const run = async (fields: Record<string, string>, path = "/") => {
   const p = await context.newPage();
-  await p.goto(`${base}/`);
-  const a = new RecipeAdapter(recipe(`${base}/`), fields, {}, { autoSubmit: false });
+  await p.goto(`${base}${path}`);
+  const a = new RecipeAdapter(recipe(`${base}${path}`), fields, {}, { autoSubmit: false });
   (a as unknown as { page: unknown }).page = p;
   const r = await a.fillApplication({} as never);
   const committed = await p.evaluate(() => (window as unknown as { __server: Record<string, string | boolean> }).__server);
@@ -234,6 +265,25 @@ console.log("\n[D] 16.1 kW, the job recorded its own distance answer: No");
 const D = await run({ totalExportKw: "16.128", disconnectMake: "Eaton", disconnectModel: "DG221URB", disconnectWithin10ft: "No" });
 console.log(`   ${outline(D)}`);
 check("[D] the job's own answer wins over the standing Yes", D.committed.discDist === "No" && atReview(D), outline(D));
+
+console.log("\n[E] the same section with a hidden twin, a filled same-label box and a \"-- Select --\" placeholder that has a value");
+const E = await run({ totalExportKw: "16.128", disconnectMake: "Eaton", disconnectModel: "DG221URB", disconnectWithin10ft: "" }, "/?v=e");
+console.log(`   ${outline(E)}`);
+check("[E] the EMPTY same-label sibling gets the part (a filled namesake does not use up its label)", E.committed.discMake2 === "Eaton", outline(E));
+check("[E] the box that already held a value is never overwritten", E.committed.discMake === "Square D", outline(E));
+check("[E] the display:none twin is never answered", E.committed.hiddenMake === "", outline(E));
+check("[E] \"-- Select --\" with a value attribute is unanswered to the answer too — the knife-blade question = Yes", E.committed.discKnife === "Yes", outline(E));
+check("[E] the run reaches review with nothing required left blank",
+  atReview(E) && ((E.data.requiredStillEmpty as string[] | undefined) ?? []).length === 0, `${outline(E)} blanks=${JSON.stringify(E.data.requiredStillEmpty ?? [])}`);
+
+console.log("\n[F] a DC disconnect's part, with the AC part (Eaton / DG221URB) on file");
+const F = await run({ totalExportKw: "16.128", disconnectMake: "Eaton", disconnectModel: "DG221URB", disconnectWithin10ft: "" }, "/?v=f");
+console.log(`   ${outline(F)}`);
+const fMsg = String(F.r.message ?? "");
+check("[F] the AC part is never filed into the DC disconnect's box", F.committed.dcMake === "", outline(F));
+check("[F] the run stops before review, naming the DC disconnect within the first 300 characters, a person's to finish",
+  F.r.ok === false && !atReview(F) && fMsg.slice(0, 300).includes(DC_MAKE) && F.data.needsHuman === true, outline(F));
+check("[F] nothing was filed", F.filed === false, outline(F));
 
 // ---------------------------------------------------------------------------
 // [L] THE LEARNER'S Calculate: a fresh learn must SEE the section to record it. The learner clicks

@@ -91,7 +91,7 @@ import { attachmentTypeFor, isDocumentTypeList } from "./attachmentTypes";
 import { cleanRecordLink, readApplicationLedgerInPage, type LedgerEntry } from "./submissionLedger";
 import { exactUploadDocType, fileTypeAllowed, UPLOAD_LABEL_PATTERNS, uploadForbidsSubstitute } from "./autoLearnAdapter";
 import { reviewComparison, scrapeReviewScreen as scrapeReviewScreenShared, utilityIdentifiersEnteredBySteps, type ReviewMismatch } from "../reviewScreenScraper";
-import { sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
+import { controlReadsUnanswered, sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
 import { openPortal } from "../browser";
 import { selectWithFallback, comboboxFaceInPage } from "../comboboxFill";
 import {
@@ -7645,8 +7645,10 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  no step for "Disconnect Switch Manufacturer" *, "Disconnect Switch Model" *, the knife-blade or
    *  the distance question. A 16 kW job reached review with all four blank and the report clean.
    *
-   *  Asked when the page is as filled as the recipe will make it — before an advancing click and at
-   *  the review stop. The required sweep (the one predicate for "required and still empty", which
+   *  Asked when the page is as filled as the recipe will make it — on the advancing click that really
+   *  leaves the page (after the extra-advance guard has decided it is not skipped: an answer given
+   *  before that guard read as "this page was written to" and stood it down), at the review stop and
+   *  at the end of the run. The required sweep (the one predicate for "required and still empty", which
    *  also records what the portal asked for) names the candidates; the page extraction gives each
    *  one's control, options and selector; answerForUnrecordedControl (unrecordedControls.ts) is the
    *  one answer: the AC disconnect part from disconnectMake / disconnectModel, a per-job question
@@ -7654,9 +7656,11 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  learner's own table. Anything else is left to gap-fill and the sweep, as before.
    *
    *  Writes go through executeStep as a synthesized step, so commit, read-back and fieldsVerified
-   *  are the same as a recorded step's. Never overwrites: a control is touched only when it reads
-   *  empty. A control it knows but this job has NO value for is returned in `missing` — the caller
-   *  stops the run by name; it is never typed blank and never guessed. */
+   *  are the same as a recorded step's, aimed at the exact control read (its id, else its ordinal
+   *  among same-label controls). Never overwrites: a control is touched only when it is on the page
+   *  (a box, as the sweep counts it) and reads unanswered by the sweep's own predicate
+   *  (controlReadsUnanswered). A control it knows but this job has NO value for is returned in
+   *  `missing` — the caller stops the run by name; it is never typed blank and never guessed. */
   private async answerUnrecordedRequired(): Promise<{ filled: string[]; missing: MissingRequired[] }> {
     const out = { filled: [] as string[], missing: [] as MissingRequired[] };
     if (!this.page || typeof this.page.$$eval !== "function" || typeof this.page.evaluate !== "function") return out;
@@ -7668,36 +7672,57 @@ export class RecipeAdapter extends BasePortalAdapter {
     try { raws = (await this.page.$$eval(EXTRACT_SEL, extractFieldsInPage)) as unknown[]; } catch { return out; }
     if (!Array.isArray(raws)) return out;
     const scope = policyScopeFor(this.recipe.scopeType);
-    const seen = new Set<string>();
-    for (const f of (raws as Parameters<typeof toExtractedField>[0][]).map(toExtractedField)) {
+    const rawFields = raws as Parameters<typeof toExtractedField>[0][];
+    const fields = rawFields.map(toExtractedField);
+    // How many extracted controls carry each label — a shared label needs an ordinal to say WHICH.
+    const labelCount = new Map<string, number>();
+    for (const f of fields) { const n = clean(f.label); labelCount.set(n, (labelCount.get(n) ?? 0) + 1); }
+    const ordinal = new Map<string, number>();
+    // ONE ANSWER PER LABEL PER PASS — marked only once THE control being answered reads visible and
+    // empty (PR #353 round 2): marked on first sight, a filled control (or a display:none twin, which
+    // the extraction lists and the sweep does not) used up the label and its empty sibling — the one
+    // the sweep named — was never answered.
+    const answered = new Set<string>();
+    const named = new Set<string>();
+    for (let i = 0; i < fields.length; i++) {
+      const f = fields[i];
       const name = clean(f.label);
-      // One answer per label per pass: a label two controls share is never answered twice.
-      if (!name || !emptyNames.has(name) || seen.has(name) || isPayFee(f.label)) continue;
-      seen.add(name);
+      const nth = ordinal.get(name) ?? 0;
+      ordinal.set(name, nth + 1);
+      if (!name || !emptyNames.has(name) || answered.has(name) || isPayFee(f.label)) continue;
       const ans = answerForUnrecordedControl(f, this.fieldValues, scope);
       if (!ans) continue;
-      // Another piece of equipment's disconnect part: no project key answers it, never typed.
-      if (ans.kind === "unbound") { out.missing.push({ label: f.label, key: null }); continue; }
-      if (!ans.value) {
-        if (ans.kind === "bound") out.missing.push({ label: f.label, key: ans.key });
+      // NO VALUE TO GIVE IT (another piece of equipment's disconnect part — no project key answers it
+      // — or a bound key this project has nothing for): named once, never typed. The sweep is the
+      // evidence: a visible required control of this name is empty.
+      if (ans.kind === "unbound" || !ans.value) {
+        if (!named.has(name)) {
+          named.add(name);
+          out.missing.push({ label: f.label, key: ans.kind === "bound" ? ans.key : null });
+        }
         continue;
       }
-      // NEVER OVER A VALUE: the sweep said empty a moment ago; the control itself confirms it now.
-      const loc = await this.resolveLocator(f.selector).catch(() => null);
+      // THIS control, exactly: by its id when it has one, else by its place among the controls that
+      // share its label — the label alone resolves to the first of them, which may be the filled one.
+      const rawId = String(rawFields[i]?.id ?? "");
+      const selector: RecipeSelector = rawId
+        ? { css: `[id=${JSON.stringify(rawId)}]` }
+        : (labelCount.get(name) ?? 0) > 1 ? { ...f.selector, nth } : f.selector;
+      const loc = await this.resolveLocator(selector).catch(() => null);
       if (!loc || typeof loc.first !== "function") continue;
-      const empty = await loc.first().evaluate((el: Element) => {
-        if (el.tagName === "SELECT") {
-          const s = el as HTMLSelectElement;
-          const t = (s.options[s.selectedIndex]?.textContent || "").trim();
-          return !s.value || /^(please\s+)?(select|choose)\b/i.test(t);
-        }
-        return !String((el as HTMLInputElement).value ?? "").trim();
-      }).catch(() => null);
+      const control = loc.first();
+      // ON THE PAGE: what the sweep counts (a box), never a display:none twin of a visible control.
+      const box = await control.boundingBox({ timeout: 2000 }).catch(() => null);
+      if (!box || (box.width <= 0 && box.height <= 0)) continue;
+      // NEVER OVER A VALUE: the sweep's own reading (controlReadsUnanswered — a "-- Select --" with a
+      // value attribute is unanswered to both), asked of this control now.
+      const empty = await control.evaluate(controlReadsUnanswered).catch(() => null);
       if (empty !== true) continue;
+      answered.add(name);
       const step = {
         action: f.fieldType === "select" || (f.fieldType === "other" && (f.options?.length ?? 0) > 0) ? "select" : "fill",
         phase: "fill",
-        selector: f.selector,
+        selector,
         note: f.label.replace(/\s+/g, " ").trim().slice(0, 120),
         ...(ans.kind === "bound" ? { field: ans.key } : { value: ans.value }),
       } as RecipeStep;
