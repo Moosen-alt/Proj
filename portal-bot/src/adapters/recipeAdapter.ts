@@ -423,7 +423,18 @@ export function arrayRowsInPage(mode: string): number {
       for (const marker of inner) {
         let row: HTMLElement = marker;
         let up: HTMLElement | null = marker.parentElement;
+        // ONE MARKER ON THE PAGE BOUNDS NOTHING: "exactly one marker" holds all the way up, and
+        // only a section control stops the climb. When that control sits elsewhere, or is worded
+        // "+ Add Array" or carries only an aria-label, the "row" became the whole section and the
+        // inverter's identically labelled Manufacturer/Model was written as the module's. So with
+        // one row the climb stops at the FIRST container that holds a fillable control: a fresh
+        // row always renders its Qty beside its marker, and later controls render inside it.
         while (up && up !== document.body
+          && !(inner.length === 1 && Array.from(row.querySelectorAll("input, select, textarea")).some((c) => {
+            const t = ((c as HTMLElement).getAttribute("type") || "").toLowerCase();
+            const cr = (c as HTMLElement).getBoundingClientRect();
+            return t !== "hidden" && cr.width > 0 && cr.height > 0;
+          }))
           && inner.filter((m) => up!.contains(m)).length === 1
           && !sectionCtl.some((c) => up!.contains(c))) {
           row = up;
@@ -2636,7 +2647,24 @@ export class RecipeAdapter extends BasePortalAdapter {
     return { ...s, selector, note: `${s.note ?? s.field ?? ""} [array ${n}]` };
   }
 
-  /** The first VISIBLE control a row-scoped step resolves to, trying its levels in order. */
+  /** While a row is being filled, a rescue or re-anchor may only hand back a control INSIDE that
+   *  row: the fingerprint id, the test hook, the section scan and the label scan all search the
+   *  whole page, and a learn-time id like "#pcInputBase57" names some other control mid-run
+   *  (live: row 1's, or the inverter's identically labelled Manufacturer). True outside row mode. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async insideArrayRow(loc: any): Promise<boolean> {
+    if (this.arrayRowScope <= 0) return true;
+    if (!loc || typeof loc.evaluate !== "function") return false;
+    return await loc.evaluate(
+      (el: Element, k: string) => !!el.closest(`[data-al-arrayrow="${k}"]`),
+      String(this.arrayRowScope),
+    ).catch(() => false) as boolean;
+  }
+
+  /** The ONE visible control a row-scoped step resolves to, trying its levels in order. A level
+   *  that shows two visible controls in the row is ambiguous (a per-row microinverter's
+   *  "Manufacturer" beside the module's) and is never guessed at: the next level is tried, and
+   *  when none is unique the step is skipped and the row read-back stops the run. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async rowLocator(rs: RecipeStep): Promise<any | null> {
     const sel = rs.selector;
@@ -2646,9 +2674,12 @@ export class RecipeAdapter extends BasePortalAdapter {
       let loc: any;
       try { loc = this.locator({ ...level, fallbacks: undefined }); } catch { continue; }
       const count = loc && typeof loc.count === "function" ? await loc.count().catch(() => 0) : 0;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const seen: any[] = [];
       for (let k = 0; k < Math.min(count, 4); k++) {
-        if (await this.isTrulyVisible(loc.nth(k))) return loc.nth(k);
+        if (await this.isTrulyVisible(loc.nth(k))) seen.push(loc.nth(k));
       }
+      if (seen.length === 1) return seen[0];
     }
     return null;
   }
@@ -2760,10 +2791,12 @@ export class RecipeAdapter extends BasePortalAdapter {
           expected.push(`${name} ${want}`);
           if (!row) continue;
           const lbl = name.toLowerCase();
-          const ctl = row.find((c) => {
+          const hits = row.filter((c) => {
             const own = c.label.toLowerCase();
             return !!own && !!lbl && (own.includes(lbl) || lbl.includes(own));
           });
+          if (hits.length > 1) { problems.push(`${name} matches ${hits.length} controls on the row`); continue; }
+          const ctl = hits[0];
           if (!ctl) { problems.push(`${name} is not on the row`); continue; }
           const got = String(ctl.value ?? "").trim();
           if (ctl.placeholder || !got) { problems.push(`${name} is empty`); continue; }
@@ -2838,7 +2871,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       .filter(Boolean)
       .join("; ");
     this.driftWarnings.push(
-      `project has ${want} arrays but only ${rowsHad} array row(s) could be added on the portal — `
+      `project has ${want} arrays but only ${rowsHad} array row(s) could be filed on the portal — `
       + (mergedTxt ? `merged same-orientation arrays as a fallback: ${mergedTxt}; ` : "")
       + (unfiled.length ? `arrays ${unfiled.join(", ")} NOT filed; ` : "")
       + `${filed} of ${this.fieldValues.totalModuleQuantity ?? "?"} modules filed. REVIEW BEFORE SUBMIT.`,
@@ -3319,7 +3352,7 @@ export class RecipeAdapter extends BasePortalAdapter {
           ? this.page.locator(`[id="${String(fp.id).replace(/["\\]/g, "\\$&")}"]`)
           : this.page.locator(`[name="${String(fp.name).replace(/["\\]/g, "\\$&")}"]`);
         const n = await target.count().catch(() => 0);
-        if (n === 1) {
+        if (n === 1 && await this.insideArrayRow(target.first())) {
           const meant = await target.first().evaluate((el: Element) => {
             const id = el.getAttribute("id");
             const forLbl = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
@@ -3391,10 +3424,17 @@ export class RecipeAdapter extends BasePortalAdapter {
     }, { words: wanted }).catch(() => "") as string;
 
     if (foundId) {
+      const reanchored = this.page.locator(`#${CSS_ESCAPE(foundId)}`);
+      if (await this.insideArrayRow(reanchored)) {
+        this.driftWarnings.push(
+          `step "${recorded.slice(0, 44)}" resolved onto "${actual.slice(0, 34)}" — re-anchored by label to #${foundId}`,
+        );
+        return reanchored;
+      }
       this.driftWarnings.push(
-        `step "${recorded.slice(0, 44)}" resolved onto "${actual.slice(0, 34)}" — re-anchored by label to #${foundId}`,
+        `step "${recorded.slice(0, 44)}" in array row ${this.arrayRowScope}: the label re-anchor pointed outside that row (#${foundId.slice(0, 40)}) — SKIPPED rather than written into another row or the inverter`,
       );
-      return this.page.locator(`#${CSS_ESCAPE(foundId)}`);
+      return "abort";
     }
 
     // No better candidate. ABORT the step — never act on a control we have just proven is
@@ -3957,10 +3997,10 @@ export class RecipeAdapter extends BasePortalAdapter {
       const usable = async (loc: unknown): Promise<boolean> =>
         !!loc && await this.isTrulyVisible(loc as never).catch(() => false);
       const byHook = await this.resolveByTestHook(step);
-      if (await usable(byHook)) scoped = byHook as never;
+      if (await usable(byHook) && await this.insideArrayRow(byHook)) scoped = byHook as never;
       else if (step.fingerprint?.section) {
         const bySection = await this.resolveBySection(step);
-        if (await usable(bySection)) scoped = bySection as never;
+        if (await usable(bySection) && await this.insideArrayRow(bySection)) scoped = bySection as never;
         else if (bySection || byHook) {
           this.resolveTrail.push(`  ...rescue: ${byHook ? "the test hook" : "the section"} resolved a control that is STILL concealed — the portal puts its hook on the hidden native input; kept the original`);
         }
