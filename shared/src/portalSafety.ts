@@ -341,9 +341,9 @@ export function portalSafetyFactory() {
   // REVIEW_PAGE_PRE_FORM drops that ONE alternative under a bounded modal (at most one short
   // adverb between: "will then review", "will carefully review"). It is asked ONLY with
   // { preForm: true }, and only the backstop's 4b passes that, only while the learner says no page
-  // with a form control has been left yet on this run (filingBackstop setPreForm). Everywhere else —
+  // with a form control has been seen yet on this run (filingBackstop setPreForm). Everywhere else —
   // the learner's own classification, replay's click gate, the signature reader, and the backstop
-  // once a form has been left — main's WIDE reading holds: a real review page whose ONLY review
+  // from the first form page on — main's WIDE reading holds: a real review page whose ONLY review
   // wording is "Staff will review your application within 5 business days. Click Next to send it"
   // must stop. On the narrowed reading everywhere such a page FILED (Helm's probes m2–m5, PR #349):
   // with no review signal left it was neither the learner's review page nor the backstop's terminal

@@ -116,8 +116,8 @@ export interface FilingBackstop {
   openDrain(page: unknown, why: string): () => void;
   /** Where (origin + path) each request the drain let through went, in order. */
   readonly drainRequests: string[];
-  /** The learner's PRE-FORM state: true only while no page with a form control has been left on
-   *  this run. While true, the review lockdown's page reading (4b) does not take someone else's
+  /** The learner's PRE-FORM state: true only while no page with a form control has been seen on
+   *  this run (the learner switches it off on the form page itself). While true, the review lockdown's page reading (4b) does not take someone else's
    *  future review ("A Permit Tech will review your submission") for the review step. Default
    *  false. Never widens 4a, the filing-URL rule, payment or the windows. */
   setPreForm(on: boolean): void;
@@ -467,7 +467,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // an SPA's posts are fetch/XHR, which are read live.
   const lastReading = new WeakMap<object, TerminalReading>();
   // PRE-FORM (Helm review of #349): set by the learner while no page with a form control has been
-  // left on this run; default false (main's wide reading) so a caller that never sets it is safe.
+  // seen on this run; default false (main's wide reading) so a caller that never sets it is safe.
   let preForm = false;
   const pick = (r: TerminalReading | null | undefined): boolean | null => (r ? (preForm ? r.preForm : r.wide) : null);
   const unwatch: Array<() => void> = [];

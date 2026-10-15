@@ -5363,10 +5363,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         break;
       }
       pageCount++;
-      // PRE-FORM (Helm review of #349): until a page with a form control has been LEFT on this run
+      // PRE-FORM (Helm review of #349): until a page with a form control has been SEEN on this run
       // (and never for a resumed draft or a signature check), the backstop does not read someone
-      // else's future review as the review step. formPageSeen is set on the form page itself, so
-      // that page's own POSTs are still judged pre-form; from the next page on, main's reading.
+      // else's future review as the review step. The switch OFF happens on the form page itself,
+      // where formPageSeen is set (c2i, below) — not only here at the next boundary: a page that
+      // fires a POST on load right after a form (shape m6) was judged pre-form for one page while
+      // the flag waited for this boundary, and its POST reached the server where main holds it.
+      // The cost: the form page's own POSTs are judged on main's reading too, so PGE's first
+      // application page (a checkbox under "we will review the application …") goes back to
+      // main's lockdown reading.
       backstopFor(this.page)?.setPreForm(!this.formPageSeen && !this.continuedDraft && !this.signatureCheck);
       // THE BACKSTOP ABORTED A FILING, A PAYMENT OR A REVIEW-PAGE POST: stop here, named. Walking
       // on would drive the same page (and its filing control) again. learn() reports every abort.
@@ -6294,7 +6299,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         && !this.formPageSeen
         && steps.some((s) => /^(application entry|permit type):/.test(String(s.note ?? "")))
         && (!isDashboard || plannerSaidReview);
-      if (hasFillable) this.formPageSeen = true;
+      if (hasFillable) {
+        this.formPageSeen = true;
+        // Main's review reading for the backstop from THIS page on (#344, shape m6): see PRE-FORM
+        // at the page boundary.
+        backstopFor(this.page)?.setPreForm(false);
+      }
       const isReviewPage =
         ((!hasFillable && !isDashboard) ||
           (reviewSignals && hasSubmitIntentBtn) ||
