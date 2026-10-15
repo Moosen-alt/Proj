@@ -20,6 +20,9 @@
 // Case 2 is the guard this must not break: a genuinely duplicate advance, with no fills
 // between, still has to be skipped (the Oregon ePermitting page-count case).
 //
+// Case 3 is Case 2 with a required dropdown on every section that no recipe step touches: the
+// replay's answer to such a control (issue #352) must not change which advances are skipped.
+//
 // Run: npx tsx portal-bot/src/adapters/identicalSections.dom.smoke.ts
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -62,7 +65,24 @@ const PAGE = `<!doctype html><html><body>
   </script>
 </body></html>`;
 
-const server = http.createServer((_q, r) => { r.writeHead(200, { "Content-Type": "text/html" }); r.end(PAGE); });
+// CASE 3's page: the same wizard, plus ONE REQUIRED DROPDOWN ON EVERY SECTION THAT NO RECIPE STEP
+// TOUCHES — PacifiCorp's knife-blade question, which the replay answers from the learner's standing
+// policy answer (issue #352). Next banks it with the rest and resets it for the next section.
+const KNIFE = "Please indicate if the AC disconnect(s) for this installation are manually operated, lockable, load break, accessible, and has a visible open (knife blade type).";
+const PAGE_KB = PAGE
+  .replace(`<label for="f_addr">Address</label><input id="f_addr">`,
+    `<label for="f_addr">Address</label><input id="f_addr">
+    <label for="f_kb">${KNIFE}</label><select id="f_kb" required><option value="">Select...</option><option value="1">Yes</option><option value="2">No</option></select>`)
+  .replace(`name: name.value, last: last.value, addr: addr.value,`,
+    `name: name.value, last: last.value, addr: addr.value,
+        kb: (function (k) { return k.value ? k.options[k.selectedIndex].text : ''; })(document.getElementById('f_kb')),`)
+  .replace(`name.value = ''; last.value = ''; addr.value = '';`,
+    `name.value = ''; last.value = ''; addr.value = ''; document.getElementById('f_kb').value = '';`);
+
+const server = http.createServer((q, r) => {
+  r.writeHead(200, { "Content-Type": "text/html" });
+  r.end(String(q.url ?? "").startsWith("/kb") ? PAGE_KB : PAGE);
+});
 await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
 const port = (server.address() as { port: number }).port;
 const url = `http://127.0.0.1:${port}/`;
@@ -152,6 +172,55 @@ check("a genuinely duplicate advance is still skipped", () => {
   assert.equal(r2.ok, true, `run failed: ${String(r2.message ?? "").slice(0, 200)}`);
   assert.equal(heading, "Customer Information",
     `the redundant advance was taken and the run overshot to ${JSON.stringify(heading)}`);
+});
+
+// CASE 3 — CASE 2 ON A PAGE WITH A REQUIRED CONTROL THE RECIPE NEVER RECORDED (PR #353 round 2).
+//
+// The replay answers a required control its recipe has no step for before it leaves a page
+// (issue #352). That answer must never decide whether an advance is "extra": run before the skip
+// guard, its fill marked the page as written, the guard stood down, the duplicate Next was clicked,
+// and the homeowner's details were typed one page too far — onto "System". The skip has to read
+// exactly as it did before #352 (Case 2), and the unrecorded answer is given only on the advance
+// that actually leaves the page, and on the page the run ends on.
+const p3 = await context.newPage();
+await p3.goto(`${url}kb`);
+const a3 = new RecipeAdapter(mkRecipe([
+  advance,
+  advance,
+  f("#f_name", "homeownerFirstName", "Name"), f("#f_last", "homeownerLastName", "Last"), f("#f_addr", "street", "Address"),
+]), FIELD_VALUES, {}, { autoSubmit: false });
+(a3 as unknown as { page: unknown }).page = p3;
+const r3 = await a3.fillApplication({} as never);
+const heading3 = await p3.locator("#heading").innerText();
+const live3 = await p3.evaluate(() => ({
+  name: (document.getElementById("f_name") as HTMLInputElement).value,
+  last: (document.getElementById("f_last") as HTMLInputElement).value,
+  addr: (document.getElementById("f_addr") as HTMLInputElement).value,
+  kb: (() => { const k = document.getElementById("f_kb") as HTMLSelectElement; return k.value ? k.options[k.selectedIndex].text : ""; })(),
+}));
+const saved3 = await p3.evaluate(() => (window as unknown as { __saved: Record<string, { name: string; last: string; addr: string; kb: string }> }).__saved);
+const data3 = ((r3 as unknown as { data?: Record<string, unknown> }).data ?? {}) as Record<string, unknown>;
+const drift3 = ((data3.driftWarnings as string[] | undefined) ?? []);
+const story3 = `ok=${r3.ok} heading=${JSON.stringify(heading3)} live=${JSON.stringify(live3)} saved=${JSON.stringify(saved3)} message=${String(r3.message ?? "").slice(0, 200)}`;
+
+check("[3] the duplicate advance is skipped exactly as without the unrecorded answer (the drift note says so)", () => {
+  assert.ok(drift3.some((w) => w.includes("skipped an advance this jurisdiction does not need")),
+    `no skip noted — drift: ${JSON.stringify(drift3).slice(0, 400)}; ${story3}`);
+});
+check("[3] the run ends on the customer section, not one page past it", () => {
+  assert.equal(r3.ok, true, story3);
+  assert.equal(heading3, "Customer Information", `overshot — ${story3}`);
+  assert.equal(saved3["Customer Information"], undefined, `the customer section was left — ${story3}`);
+});
+check("[3] the homeowner's details are typed on the customer section (the section showing when they were typed)", () => {
+  // One set of inputs serves every section, so the values alone do not say WHERE they went: the
+  // heading showing above them does.
+  assert.deepEqual({ section: heading3, name: live3.name, last: live3.last, addr: live3.addr },
+    { section: "Customer Information", name: "Randal", last: "Rowland", addr: "7625 NW Logan Rd" }, story3);
+});
+check("[3] the unrecorded required control is answered on the page the real advance leaves, and on the page the run ends on", () => {
+  assert.equal(saved3["Preparer Information"]?.kb, "Yes", story3);
+  assert.equal(live3.kb, "Yes", story3);
 });
 
 await browser.close();

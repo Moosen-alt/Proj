@@ -1544,12 +1544,11 @@ export class RecipeAdapter extends BasePortalAdapter {
         await this.timed("upload-sweep", () => this.sweepUnrecordedUploads().catch(() => 0));
       }
       // A REQUIRED CONTROL THE RECIPE HAS NO STEP FOR (issue #352) — answered from this job before the
-      // page is left (an advancing click) or handed to a person (the review stop / the recorded final
-      // submit), never past review. What was typed makes this an input page again, so the persist-
-      // settle and gap-fill below run before the click; a control it knows but this job has no value
-      // for stops the run here, by name.
-      if (!pastReview && ((step.action === "click" && /^advance\b/i.test(String(step.note ?? "").trim()))
-        || step.action === "stopForReview" || isFinalSubmitStep(step))) {
+      // page is handed to a person (the review stop / the recorded final submit), never past review.
+      // The gap-fill those two run next sees what was typed; a control it knows but this job has no
+      // value for stops the run here, by name. (An ADVANCING click asks the same question further
+      // down, only once the extra-advance guard has decided the page is really being left.)
+      if (!pastReview && (step.action === "stopForReview" || isFinalSubmitStep(step))) {
         const unrecorded = await this.timed("unrecorded-required", () => this.answerUnrecordedRequired());
         if (unrecorded.filled.length) { prevWasInput = true; wroteToThisPage = true; }
         if (unrecorded.missing.length) {
@@ -1638,6 +1637,65 @@ export class RecipeAdapter extends BasePortalAdapter {
       if (step.action === "click") await this.timed("autosave-wait", () => this.waitForAutosaveCommitted());
       // Nor while its loading mask is up ("Please wait..."): a click under it lands nowhere (runs-finish item 4).
       if (step.action === "click") await this.timed("overlay-wait", () => this.waitForLoadingMaskClear(`"${String(step.note ?? "the click").slice(0, 50)}"`));
+
+      // DO NOT ADVANCE PAST A PAGE YOU STILL NEED TO FILL.
+      //
+      // One portal, many jurisdictions, DIFFERENT PAGE COUNTS. Oregon ePermitting lets each
+      // participating city configure its own Building application, so a recipe learned in
+      // one city can carry an advance the next city does not need. Measured live: the Coos
+      // Bay recipe has TWO consecutive "advance: Continue Application" steps, and replaying
+      // it in Hood River the second one skipped clean over the page holding Job Value,
+      // Category of Construction and Project Name — the run then stopped reporting 0 of 4
+      // fields, from inside the wizard, two pages past where it should have been.
+      //
+      // So before an advancing click, look at what the NEXT segment expects: if those fields
+      // are on the page right now, this advance is one the recipe brought from another
+      // jurisdiction. Skip it and let the fills happen. Deliberately conservative — it needs
+      // a real overlap of the next segment's labels, not a single incidental match.
+      //
+      // DECIDED HERE, BEFORE THE UNRECORDED-REQUIRED ANSWER CAN WRITE TO THE PAGE (PR #353 round 2).
+      // For an advancing click, what runs above this point is what ran before #352 (the top-of-
+      // iteration answer is for the review stop and a recorded final submit, which leave the loop
+      // before here). The persist-settle below used to come first, but it only ever ran when
+      // wroteToThisPage was already set (prevWasInput is set only together with it) — i.e. when this
+      // guard cannot skip — and it never touches wroteToThisPage. So the decision is the one it
+      // always was. Asked BEFORE this guard, the unrecorded answer's fill marked the page as
+      // written, the guard stood down, and a duplicate Next carried the next section's values one
+      // page too far (identicalSections.dom.smoke case 3).
+      if (step.action === "click" && /^advance\b/i.test(String(step.note ?? ""))) {
+        const upcoming = this.expectedLabelsForSegment(stepIdx + 1);
+        // NEVER skip an advance off a page we just filled. Label overlap alone cannot tell
+        // two DIFFERENT sections apart when a portal reuses one contact block — PowerClerk's
+        // "Preparer Information" and "Customer Information" pages carry byte-identical
+        // labels (Name, Last, Address, City, State, Zip, Email, Phone), so this guard saw
+        // the customer segment "already on the page", skipped the Next, and the homeowner
+        // steps overwrote the installer's details. Measured live: Charles Bitton of TML
+        // INTERNATIONAL replaced by the homeowner Randal Rowland, with the homeowner's
+        // site address, in the PREPARER block of a real interconnection application.
+        // Recorded steps carry section="" so there is no heading to disambiguate with —
+        // but "we just wrote to this page" is decisive on its own and needs no recording.
+        if (upcoming.length >= 3 && !wroteToThisPage && await this.segmentIsOnThisPage(upcoming)) {
+          this.driftWarnings.push(`skipped an advance this jurisdiction does not need — the next section's fields (${upcoming.slice(0, 3).join(", ")}…) are already on this page`);
+          continue;
+        }
+      }
+
+      // A REQUIRED CONTROL THE RECIPE HAS NO STEP FOR (issue #352), on the advance that REALLY leaves
+      // the page — the guard above has just kept it. Answered from this job with the page as filled
+      // as the recipe makes it (and its autosave and loading mask settled); what was typed makes
+      // this an input page, so the persist-settle and gap-fill below run before the click. A control
+      // it knows but this job has no value for stops the run here, by name. Never past review; a
+      // recorded final submit asked it at the top of the iteration.
+      if (!pastReview && step.action === "click" && /^advance\b/i.test(String(step.note ?? "")) && !isFinalSubmitStep(step)) {
+        const unrecorded = await this.timed("unrecorded-required", () => this.answerUnrecordedRequired());
+        if (unrecorded.filled.length) { prevWasInput = true; wroteToThisPage = true; }
+        if (unrecorded.missing.length) {
+          closePrevStepTiming();
+          return await this.stopForMissingRequired(unrecorded.missing, `"${String(step.note ?? step.action).slice(0, 44)}"`,
+            { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: stepIdx, trace, slowSteps, gapFill: this.gapFillReport, unresolvedFields: this.unresolvedFields, stoppedAtPayment: this.stoppedAtPayment });
+        }
+      }
+
       // PERSIST SETTLE before an advancing click. PowerClerk autosaves each page (~3s) and
       // only commits fields on blur; advancing too soon saves a BLANK draft. If the prior
       // steps filled fields, wait for the autosave to settle before this click.
@@ -1661,38 +1719,6 @@ export class RecipeAdapter extends BasePortalAdapter {
         await this.timed("gap-fill", () => this.withProgress("wait", "Checking the page for required fields the recipe missed", () => this.runGapFill(this.page), stepIdx));
         this.gapFilledPage = await this.pageIdentity().catch(() => "");
         prevWasInput = false;
-      }
-
-      // DO NOT ADVANCE PAST A PAGE YOU STILL NEED TO FILL.
-      //
-      // One portal, many jurisdictions, DIFFERENT PAGE COUNTS. Oregon ePermitting lets each
-      // participating city configure its own Building application, so a recipe learned in
-      // one city can carry an advance the next city does not need. Measured live: the Coos
-      // Bay recipe has TWO consecutive "advance: Continue Application" steps, and replaying
-      // it in Hood River the second one skipped clean over the page holding Job Value,
-      // Category of Construction and Project Name — the run then stopped reporting 0 of 4
-      // fields, from inside the wizard, two pages past where it should have been.
-      //
-      // So before an advancing click, look at what the NEXT segment expects: if those fields
-      // are on the page right now, this advance is one the recipe brought from another
-      // jurisdiction. Skip it and let the fills happen. Deliberately conservative — it needs
-      // a real overlap of the next segment's labels, not a single incidental match.
-      if (step.action === "click" && /^advance\b/i.test(String(step.note ?? ""))) {
-        const upcoming = this.expectedLabelsForSegment(stepIdx + 1);
-        // NEVER skip an advance off a page we just filled. Label overlap alone cannot tell
-        // two DIFFERENT sections apart when a portal reuses one contact block — PowerClerk's
-        // "Preparer Information" and "Customer Information" pages carry byte-identical
-        // labels (Name, Last, Address, City, State, Zip, Email, Phone), so this guard saw
-        // the customer segment "already on the page", skipped the Next, and the homeowner
-        // steps overwrote the installer's details. Measured live: Charles Bitton of TML
-        // INTERNATIONAL replaced by the homeowner Randal Rowland, with the homeowner's
-        // site address, in the PREPARER block of a real interconnection application.
-        // Recorded steps carry section="" so there is no heading to disambiguate with —
-        // but "we just wrote to this page" is decisive on its own and needs no recording.
-        if (upcoming.length >= 3 && !wroteToThisPage && await this.segmentIsOnThisPage(upcoming)) {
-          this.driftWarnings.push(`skipped an advance this jurisdiction does not need — the next section's fields (${upcoming.slice(0, 3).join(", ")}…) are already on this page`);
-          continue;
-        }
       }
 
       // CLEAR THE WAY BEFORE A CLICK. Replay had no modal handling at all, while the
