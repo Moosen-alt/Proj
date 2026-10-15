@@ -298,6 +298,9 @@ await check("#344: SOMEONE ELSE'S FUTURE REVIEW is not the page naming itself th
     "Once a project is submitted, we will review the application for completeness.",
     // PSE's agreement wording (#305/#308, the signature step — not review); already false, pinned.
     "I understand PSE will review and approve this application and may revise it.",
+    // The "you" guard looks only at the modal's own subject: a "you" in an earlier sentence or
+    // clause does not keep someone else's review as review.
+    "Thank you. We will review your application.", "Thank you, staff will review your application.",
   ];
   // MUST-PASS: the issue's list, the imperative forms Helm pinned, and wording taken verbatim
   // from REAL captured review / submit pages.
@@ -321,6 +324,10 @@ await check("#344: SOMEONE ELSE'S FUTURE REVIEW is not the page naming itself th
     "Please review your application before submitting. A Permit Tech will review your submission for minimum submittal standards.",
     // The other alternatives are untouched by the modal: a heading / "review and submit" after one.
     "Staff will review and submit the application", "Your application will not be submitted until you click Submit",
+    // THE APPLICANT AS SUBJECT (a conservative default Helm may remove): the modal's subject is
+    // "you" — the page talking to the person who files — so it stays review.
+    "You may review your application below before submitting", "You are going to review your details below",
+    "You're going to review your application", "You’re going to review your application", "You will then review your information",
   ];
   for (const t of EXCLUDE) {
     assert.ok(!isReviewPageText(t), `"${t}" wrongly reads as a review page`);

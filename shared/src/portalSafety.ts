@@ -346,8 +346,13 @@ export function portalSafetyFactory() {
   // wider cut un-names a real filing page. A review page that also says "Staff will review your
   // application" still reads as review through its own heading, an imperative "Please review
   // your application", a review URL, or read-only + a filing control (terminalPageInPage).
+  // THE APPLICANT AS SUBJECT STAYS REVIEW (a conservative default Helm may remove): in "You may
+  // review your application below before submitting" / "You're going to review your details" the
+  // modal's subject is "you" (you / you are / you're) — the page talking to the person who files,
+  // so the narrowing does not apply. No captured page has that shape; it is kept review so the
+  // narrowing stays on someone ELSE's review only. Not widened past "you".
   const REVIEW_PAGE =
-    /\bstep\s*\d+\s*[:.\-–—]?\s*review\b|\breview\s+(and|&)\s+(submit|sign|file|certify|finish)\b|\breview\s+(and|&)\s+confirm\b(?=\s*($|[\n.:!])|\s+(your|the|this)\s+(application|submission|permit|request)\b)|(?<!\b(will|shall|may|would|going\s+to)\s+((\w+ly|then|also|first|next|not)\s+)?)\breview\s+(all\s+(of\s+)?(your\s+|the\s+)?|(your|the)\s+)(application|information|details|entries|submission)\b|\bwill\s+not\s+be\s+submitted\s+until\b/i;
+    /\bstep\s*\d+\s*[:.\-–—]?\s*review\b|\breview\s+(and|&)\s+(submit|sign|file|certify|finish)\b|\breview\s+(and|&)\s+confirm\b(?=\s*($|[\n.:!])|\s+(your|the|this)\s+(application|submission|permit|request)\b)|(?<!(?<!\byou\s+(are\s+)?|\byou['’]re\s+)\b(will|shall|may|would|going\s+to)\s+((\w+ly|then|also|first|next|not)\s+)?)\breview\s+(all\s+(of\s+)?(your\s+|the\s+)?|(your|the)\s+)(application|information|details|entries|submission)\b|\bwill\s+not\s+be\s+submitted\s+until\b/i;
   const isReviewPageText = (text: string | null | undefined): boolean => REVIEW_PAGE.test(String(text ?? ""));
   /** A URL that names the review step: Accela's CapConfirm / Confirm.aspx, a "/review" path
    *  segment (bounded — "/reviewer", "/review-comments" are not it). */
