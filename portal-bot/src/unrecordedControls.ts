@@ -111,7 +111,7 @@ export function answerForUnrecordedControl(
 /** Why a bound key has no value, in the operator's terms — the stop names it. */
 export function missingValueHint(key: string): string {
   if (/^disconnect(Make|Model|MakeModel)$/.test(key)) {
-    return "no AC disconnect part is on file — the plan set names none and the client has no standard disconnect make/model (or the standard part conflicts with the plan set; QC says which)";
+    return "no AC disconnect part is on file (the plan set names none and the client has no standard disconnect make/model, or the standard part conflicts with the plan set; QC says which)";
   }
   if (key === "disconnectWithin10ft" || key === "ownershipModel" || key === "systemConfiguration") {
     return "it is a per-job question only a person answers (the project's portal questions, or the intake link)";
