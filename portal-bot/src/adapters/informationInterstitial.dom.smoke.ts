@@ -20,9 +20,10 @@
 //                     every submit- and pay-worded label, and a pager, never do.
 //   [1] MUST PASS   — the captured page as served (POST form). The learner does NOT call it
 //                     review: no review stop, no lockReview, no upload skip, no final submit; it
-//                     records "advance: Next" and clicks it. What happens to that POST is the
-//                     network backstop's business (see [1]'s KNOWN RESIDUAL note) — reported, not
-//                     asserted away.
+//                     records "advance: Next" and clicks it. And the network backstop agrees
+//                     (#344): its live reading no longer takes "A Permit Tech will review your
+//                     submission" for the review step, so the Next's POST reaches the server and
+//                     the walk lands on the form page behind it (asserted; it was aborted before).
 //   [2] MUST PASS   — the same page whose Next navigates by GET, with a planner that ALSO calls
 //                     it review and names its Next as the final submit (the worst planner): the
 //                     learner clicks Next ONCE, lands on the form page, fills it, reaches the real
@@ -444,15 +445,23 @@ console.log("\n[1] the captured Permitting Information page (POST form): home �
   check("nothing was recorded as a final submit", w.finals.length === 0, JSON.stringify(w.finals));
   check("the run did not end 'at review'", w.reachedReview !== true, `reachedReview=${w.reachedReview} message=${w.message}`);
   check("no records / fees / corrections / profile page was ever requested", offPath(w).length === 0, JSON.stringify(offPath(w)));
-  // KNOWN RESIDUAL (filed separately, not this issue's file): the network backstop reads the
-  // same page as terminal (shared reviewSignals: "review your submission"), so the Next's form
-  // POST is aborted and the run stops NAMED by the backstop. Reported here so the line is seen.
+  // THE BACKSTOP AGREES (#344). It judges the Next's form POST by the shared live reading
+  // (terminalPageInPage → reviewSignals), which read "A Permit Tech will review your submission"
+  // as the page naming itself the review step: the POST was aborted and the run stopped NAMED by
+  // the backstop on this page. Someone else's future review is not the review step, so the POST
+  // goes through and the walk lands on the form page behind it.
   const posted = w.hits.some((h) => h.method === "POST" && h.url.startsWith("/post/sg"));
   const pressed = w.notes.includes("advance: Next");
   console.log(`  note - ${!pressed ? "the Next was never pressed" : posted ? "the Next POST reached the server" : "the Next POST was held by the network backstop"}: stopReason=${w.stopReason ?? "-"}; ${w.message.slice(0, 260)}`);
-  check("if the backstop held the POST, the stop is its LIVE reading — never the learner's review lockdown",
-    posted || (w.stopReason === "backstop_abort" && /the page this request came from/.test(w.message) && !/the run is at review/.test(w.message)),
-    `stopReason=${w.stopReason} message=${w.message}`);
+  check("#344: the Next's form POST reached the fixture server (the backstop did not read the interstitial as terminal)",
+    posted, `hits=${JSON.stringify(w.hits.map((h) => `${h.method} ${h.url}`))} stopReason=${w.stopReason} message=${w.message}`);
+  check("#344: ...and the walk landed on the form page behind it",
+    w.hits.some((h) => h.method === "GET" && h.url.startsWith("/post/project")) && w.plannerPages.includes("/post/project"),
+    `planner=${JSON.stringify(w.plannerPages)} hits=${JSON.stringify(w.hits.map((h) => `${h.method} ${h.url}`))}`);
+  check("#344: no backstop abort on the interstitial (the run was not stopped by the review-page lockdown there)",
+    !(w.stopReason === "backstop_abort" && /\/post\/sg/.test(w.message)), `stopReason=${w.stopReason} message=${w.message}`);
+  check("nothing filed: no filing request reached the server", !w.hits.some((h) => h.url.startsWith("/post/file")),
+    JSON.stringify(w.hits.map((h) => `${h.method} ${h.url}`)));
 }
 
 // ===========================================================================================
