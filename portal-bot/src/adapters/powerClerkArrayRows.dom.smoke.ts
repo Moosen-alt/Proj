@@ -82,11 +82,18 @@ const page = (stickyRow: number, adder: "inside" | "toolbar" | "none" = "inside"
         var q = nid();
         h += lab(q, 'Qty') + '<input id="' + q + '" data-k="qty" value="' + (r.qty || '') + '">';
         // A FRESH ROW RENDERS ONLY ITS QTY. The rest arrives in sequence, each from server state.
-        if (r.qty && ROWINV) {
-          // A per-row MICROINVERTER pair, before the module's, with the same bare labels.
-          var ri = nid(), rm = nid();
+        if (ROWINV) {
+          // A FLAT row (everything rendered at once) carrying a per-row MICROINVERTER pair BEFORE
+          // the module's, with the same bare labels and its own make -> model cascade.
+          var ri = nid(), rm = nid(), fm = nid(), fmd = nid(), ft = nid(), fa = nid();
           h += lab(ri, 'Manufacturer') + sel(ri, MAKES, r.rinvMfr, 'rinvMfr')
-            + lab(rm, 'Model') + sel(rm, MODELS['Altenergy Power System'], r.rinvModel, 'rinvModel');
+            + lab(rm, 'Model') + sel(rm, r.rinvMfr ? MODELS[r.rinvMfr] || [] : [], r.rinvModel, 'rinvModel')
+            + lab(fm, 'Manufacturer') + sel(fm, MAKES, r.mfr, 'mfr')
+            + lab(fmd, 'Model') + sel(fmd, r.mfr ? MODELS[r.mfr] || [] : [], r.model, 'model')
+            + lab(ft, 'Tilt') + '<input id="' + ft + '" data-k="tilt" value="' + (r.tilt || '') + '">'
+            + lab(fa, 'Azimuth') + '<input id="' + fa + '" data-k="azi" value="' + (r.azi || '') + '">';
+          h += '</div>';
+          continue;
         }
         if (r.qty) { var m = nid(); h += lab(m, 'Manufacturer') + sel(m, MAKES, r.mfr, 'mfr'); }
         if (r.mfr) { var md = nid(); h += lab(md, 'Model') + sel(md, MODELS[r.mfr] || [], r.model, 'model'); }
@@ -143,14 +150,15 @@ const page = (stickyRow: number, adder: "inside" | "toolbar" | "none" = "inside"
         (function (el) {
           el.addEventListener('blur', function () { commit(el); }); // per-field autosave, on blur only
           var key = el.getAttribute('data-k');
-          if (key === 'mfr' || key === 'invMfr') {
+          if (key === 'mfr' || key === 'invMfr' || key === 'rinvMfr') {
             el.addEventListener('change', function () {
               var make = valueOf(el);
               // THE CASCADE: the model list loads ~600 ms after the manufacturer changes.
               setTimeout(function () {
                 var opts = MODELS[make] || [];
-                if (key === 'invMfr') {
-                  var im = document.querySelector('[data-k="invModel"]');
+                if (key === 'invMfr' || key === 'rinvMfr') {
+                  var scope0 = key === 'rinvMfr' ? el.closest('.pv-array') : document;
+                  var im = scope0 ? scope0.querySelector(key === 'rinvMfr' ? '[data-k="rinvModel"]' : '[data-k="invModel"]') : null;
                   if (im) { var h = '<option>Please select...</option>'; for (var k = 0; k < opts.length; k++) h += '<option>' + opts[k] + '</option>'; im.innerHTML = h; }
                   return;
                 }
@@ -344,8 +352,10 @@ check("no adder: the same-orientation fallback files 9 + 6 = 15 into row 1, stat
 
 // ===========================================================================================
 // 5) REVIEW 1 (c) — a per-row MICROINVERTER Manufacturer/Model before the module's, inside each
-//    row. "Manufacturer" is ambiguous in the row; it is never guessed at, and the run must not
-//    finish as if row 1 held its module.
+//    FLAT row (everything rendered at once, as in Helm's probe). "Manufacturer" is ambiguous in
+//    the row; it is never guessed at, and the run must not finish as if row 1 held its module
+//    (before: the module's make and model went into the row inverter's pair, the read-back's
+//    first label match was that same control, and the run passed with the module blank).
 // ===========================================================================================
 console.log("\n[5] a per-row inverter Manufacturer/Model before the module's");
 const ri = await run("/?rowinv=1", TWO);
