@@ -9,6 +9,7 @@
 import assert from "node:assert/strict";
 import { answerForUnrecordedControl, disconnectPartKeyFor, missingRequiredStopMessage } from "./unrecordedControls";
 import { policyDefaultAnswerFor, policyScopeFor } from "./adapters/autoLearnAdapter";
+import { operatorPolicyAnswer } from "../../shared/src/perJobQuestions";
 
 let failures = 0;
 const check = (label: string, fn: () => void): void => {
@@ -47,6 +48,33 @@ check("PacifiCorp's section: make/model bound to the project's part, knife-blade
   const dist = answerForUnrecordedControl({ label: DIST, fieldType: "select", options: YES_NO }, STD, "nem");
   assert.equal(dist?.kind, "policy");
   assert.equal(dist?.value, "Yes");
+});
+
+// PR #353 round 2: the standing answer is read BY THE KEY the per-job rule returned, not by re-matching
+// the wording against the learner's regexes. Each of these reads as the distance question to the shared
+// rule (DISCONNECT_DISTANCE_QUESTION) but matches no POLICY_RADIO_DEFAULTS regex — so a wording lookup
+// gave nothing, the answer came back bound-empty and the run stopped mid-wizard.
+const DIST_REWORDED = [
+  "Is the AC disconnect within ten feet of the utility meter?",
+  "Is the disconnect located within 10 feet of the meter?",
+  "Is the AC disconnect switch installed within 10 ft. of the revenue meter?",
+  "Within 10 feet of the meter, is there a visible lockable disconnect?",
+];
+check("the distance question's standing answer comes BY ITS KEY, whatever the wording (the reviewer's four wordings)", () => {
+  for (const label of DIST_REWORDED) {
+    assert.equal(policyDefaultAnswerFor(label, "nem"), "", `precondition: the learner's wording table does not carry ${JSON.stringify(label)}`);
+    assert.deepEqual(answerForUnrecordedControl({ label, fieldType: "select", options: YES_NO }, STD, "nem"),
+      { kind: "policy", value: "Yes", why: "the operator's standing answer (this job recorded none)" }, label);
+    // ...and the job's own answer still wins, by the same key.
+    assert.deepEqual(answerForUnrecordedControl({ label, fieldType: "select", options: YES_NO }, { ...STD, disconnectWithin10ft: "No" }, "nem"),
+      { kind: "bound", key: "disconnectWithin10ft", value: "No" }, label);
+  }
+});
+
+check("the standing answer is the shared table's, read by key (the one the intake reads)", () => {
+  assert.equal(operatorPolicyAnswer("disconnectWithin10ft"), "Yes");
+  assert.equal(operatorPolicyAnswer("ownershipModel"), "");
+  assert.equal(operatorPolicyAnswer("constructor"), "", "an Object.prototype name is not a key in the table");
 });
 
 check("the job's own per-job answer wins over the standing one", () => {

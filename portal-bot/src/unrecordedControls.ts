@@ -11,19 +11,20 @@
 //      part, else the client's standard part). Never another project's literal.
 //   2. A PER-JOB QUESTION only a person answers (shared perJobAnswerKeyFor — the same predicate as
 //      the question bank, the binders and the stage gate): the job's own recorded answer; when the job
-//      has none, the operator's standing answer if there is one (below); else nothing.
+//      has none, the operator's standing answer for THAT KEY if there is one (below); else nothing.
 //   3. A POLICY QUESTION — the learner's own table (autoLearnAdapter policyDefaultAnswerFor), so a
 //      learn and a replay give one question one answer.
 // A control none of these knows is not this module's: the LLM gap-fill and the required sweep keep it.
 //
-// THE STANDING ANSWER FOR AN UNRECORDED PER-JOB CONTROL IS THE LEARNER'S POLICY ANSWER. The distance
-// question ("within the state's required distance from the utility meter") is per-job in principle;
-// the operator's standing answer is "Yes" (backend intakeRequests OPERATOR_POLICY_ANSWERS), which is
-// the same answer POLICY_RADIO_DEFAULTS files at learn time. A RECORDED step bound to the key still
-// stops the stage before a browser opens when the job has not answered (recipeReplayBinding
+// THE STANDING ANSWER FOR AN UNRECORDED PER-JOB CONTROL IS READ BY ITS KEY. The distance question
+// ("within the state's required distance from the utility meter") is per-job in principle; the
+// operator's standing answer is "Yes", kept in ONE table keyed by the binding (shared
+// perJobQuestions OPERATOR_POLICY_ANSWERS — the table the intake reads too), and it is the same
+// answer POLICY_RADIO_DEFAULTS files at learn time. A RECORDED step bound to the key still stops the
+// stage before a browser opens when the job has not answered (recipeReplayBinding
 // openPerJobQuestions) — this module does not touch that; it only answers a control the recipe could
 // not have asked about, and only when it is EMPTY.
-import { perJobAnswerKeyFor, perJobControlOfField } from "../../shared/src/perJobQuestions";
+import { operatorPolicyAnswer, perJobAnswerKeyFor, perJobControlOfField } from "../../shared/src/perJobQuestions";
 import { isSensitiveLabel, policyDefaultAnswerFor, type PolicyScope } from "./adapters/autoLearnAdapter";
 
 export type DisconnectPartKey = "disconnectMake" | "disconnectModel" | "disconnectMakeModel";
@@ -98,7 +99,13 @@ export function answerForUnrecordedControl(
     if (perJob) {
       const own = String(fieldValues?.[perJob] ?? "").trim();
       if (own) return { kind: "bound", key: perJob, value: own };
-      const standing = offered(options, policyDefaultAnswerFor(label, scope));
+      // THE STANDING ANSWER IS LOOKED UP BY THE KEY, never re-derived from the wording (PR #353 round
+      // 2): the per-job rule already decided WHICH question this is, and the operator's standing
+      // answers are keyed by that question (shared OPERATOR_POLICY_ANSWERS — the table the intake
+      // reads). Matching the label against the learner's regexes instead stopped the run on four
+      // wordings of the distance question those regexes do not carry. Off with the policy answers
+      // (scope "none"): the job answers, or the run stops by name.
+      const standing = scope === "none" ? "" : offered(options, operatorPolicyAnswer(perJob));
       if (standing) return { kind: "policy", value: standing, why: "the operator's standing answer (this job recorded none)" };
       return { kind: "bound", key: perJob, value: "" };
     }
