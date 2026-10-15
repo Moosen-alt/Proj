@@ -359,6 +359,46 @@ export async function readClosedComboboxOptions(page: any, loc: any): Promise<st
  * Fill a custom (non-native-<select>) combobox. Returns true if an option was
  * clicked, false if it fell through to Enter / could not resolve.
  */
+/**
+ * THE VISIBLE FACE OF A COMBOBOX WHOSE OWN INPUT IS HIDDEN — the one walk for it (#347).
+ *
+ * PowerClerk's Vue "filtered select" keeps the labelled control (input[role=combobox],
+ * aria-label "Manufacturer") `visually-hidden`; what a person sees and clicks is a sibling face
+ * (div.form-select[data-test-role=filteredSelectField] showing the selected text). Walk up to
+ * five levels from the control and take the first level with a visible node, preferring a
+ * select-like display/toggle so a popup's own options are never taken for the face.
+ *
+ *   mode "click" — click that face (else any visible node there, else the control itself): how
+ *                  fillCustomCombobox opens such a widget. Returns "preferred" | "any" | "".
+ *   mode "probe" — the same walk, no click: "preferred" means the hidden control has a real face
+ *                  a person could use (the replay's row resolver accepts it as usable).
+ *   mode "text"  — the preferred face's text: what the widget SHOWS as selected ("" if none).
+ *
+ * Runs IN THE PAGE (loc.evaluate): self-contained, no module references.
+ */
+export function comboboxFaceInPage(el: Element, mode: string): string {
+  let root: Element = el;
+  for (let k = 0; k < 5 && root.parentElement; k++) {
+    root = root.parentElement;
+    const cands = Array.from(root.querySelectorAll<HTMLElement>("*")).filter((n) => {
+      if (n === el || n.getAttribute("role") === "listbox" || n.getAttribute("role") === "option") return false;
+      const r = n.getBoundingClientRect();
+      const s = getComputedStyle(n);
+      return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
+    });
+    if (!cands.length) continue;
+    const preferred = cands.find((n) => /form-select|\bselect\b|display|toggle|control|dropdown/i.test(n.className || "") || n.getAttribute("role") === "button");
+    if (mode === "click") {
+      (preferred || cands[0]).click();
+      return preferred ? "preferred" : "any";
+    }
+    if (mode === "text") return preferred ? String(preferred.innerText || preferred.textContent || "").replace(/\s+/g, " ").trim() : "";
+    return preferred ? "preferred" : "any";
+  }
+  if (mode === "click") (el as HTMLElement).click();
+  return "";
+}
+
 export async function fillCustomCombobox(page: any, loc: any, value: string): Promise<boolean> {
   const v = (value ?? "").trim();
   if (!v) return false;
@@ -409,25 +449,9 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
     try { await loc.click({ timeout: 5000 }); openedWidget = true; } catch { /* fall through */ }
   }
   if (!openedWidget) {
-    await loc.evaluate((el: Element) => {
-      const isVis = (n: Element) => {
-        const r = n.getBoundingClientRect();
-        const s = getComputedStyle(n as HTMLElement);
-        return r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none";
-      };
-      // Walk up a few levels and click the widget's visible opener — prefer a select-like
-      // display/toggle over any visible node, so the popup's own options aren't clicked.
-      let root: Element = el;
-      for (let k = 0; k < 5 && root.parentElement; k++) {
-        root = root.parentElement;
-        const cands = Array.from(root.querySelectorAll<HTMLElement>("*")).filter((n) => n !== el && n.getAttribute("role") !== "listbox" && n.getAttribute("role") !== "option" && isVis(n));
-        if (!cands.length) continue;
-        const preferred = cands.find((n) => /form-select|\bselect\b|display|toggle|control|dropdown/i.test(n.className || "") || n.getAttribute("role") === "button");
-        (preferred || cands[0]).click();
-        return;
-      }
-      (el as HTMLElement).click();
-    }).catch(() => {});
+    // Walk up a few levels and click the widget's visible opener — prefer a select-like
+    // display/toggle over any visible node, so the popup's own options aren't clicked.
+    await loc.evaluate(comboboxFaceInPage, "click").catch(() => {});
     await loc.focus().catch(() => {});
   }
   await page.waitForTimeout?.(300).catch(() => {});

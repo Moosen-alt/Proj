@@ -93,7 +93,7 @@ import { exactUploadDocType, fileTypeAllowed, UPLOAD_LABEL_PATTERNS, uploadForbi
 import { reviewComparison, scrapeReviewScreen as scrapeReviewScreenShared, utilityIdentifiersEnteredBySteps, type ReviewMismatch } from "../reviewScreenScraper";
 import { sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
 import { openPortal } from "../browser";
-import { selectWithFallback } from "../comboboxFill";
+import { selectWithFallback, comboboxFaceInPage } from "../comboboxFill";
 import {
   classifySubmissionText, finalSubmitEnvAllows, finalSubmitRefusals, isFinalSubmitControl, isPayFee, isPayNowDialogText, mayClickFinalSubmit,
   isRecipeShapeValid, isSignatureNameLabel, isSignatureRequestControl, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
@@ -470,6 +470,20 @@ const ROW_CONTROL_WAIT_MS = 10_000;
 /** How long the row read-back lets a debounced autosave land before reading what the portal
  *  kept (settle cannot see a debounce: nothing is in flight until it fires). */
 const ROW_READBACK_GRACE_MS = 2_000;
+
+/** #347 — EACH PER-ARRAY FIELD'S OWN HOOK IN A POWERCLERK ROW, and the name a person reads for
+ *  it. The component test-roles are stable across renders and tenants (PacifiCorp, PGE, PSE);
+ *  the recorded label often is not ("pv array quantity" is the test-role humanised — the row's
+ *  own label is "Qty"). A hook naming a WRAPPER (the make/model filtered selects) resolves to
+ *  the control inside it. */
+const ROW_FIELD_HOOKS: Record<string, { role: string; name: string }> = {
+  array1ModuleQuantity: { role: "pv-array-quantity", name: "Qty" },
+  moduleMake: { role: "pv-array-manufacturer-select", name: "Manufacturer" },
+  moduleModel: { role: "pv-array-model-select", name: "Model" },
+  array1Tilt: { role: "tilt-input", name: "Tilt" },
+  array1Azimuth: { role: "azimuth-input", name: "Azimuth" },
+  array1Tracking: { role: "tracking-select", name: "Tracking" },
+};
 
 export class RecipeAdapter extends BasePortalAdapter {
   portalName: string;
@@ -1496,7 +1510,8 @@ export class RecipeAdapter extends BasePortalAdapter {
         const next = await this.afterArrayBlock();
         if (next.stop) {
           closePrevStepTiming();
-          return fail(next.stop, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, failedStepIndex: stepIdx, trace, slowSteps, requiredStillEmpty: this.requiredStillEmpty, unresolvedFields: this.unresolvedFields, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, requiredFieldsSeen: this.requiredFieldsSeen, stoppedAtPayment: this.stoppedAtPayment, pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath });
+          const rowStopContext = await this.captureArrayRowStop(stepIdx);
+          return fail(`${next.stop}${rowStopContext}`, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, failedStepIndex: stepIdx, trace, slowSteps, requiredStillEmpty: this.requiredStillEmpty, unresolvedFields: this.unresolvedFields, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, requiredFieldsSeen: this.requiredFieldsSeen, stoppedAtPayment: this.stoppedAtPayment, pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath });
         }
         if (next.repeat) stepIdx = this.arrayBlockStart - 1; // the loop's ++ lands us back on the block
         continue;
@@ -2124,7 +2139,8 @@ export class RecipeAdapter extends BasePortalAdapter {
         const next = await this.afterArrayBlock();
         if (next.stop) {
           closePrevStepTiming();
-          return fail(next.stop, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, failedStepIndex: stepIdx, trace, slowSteps, requiredStillEmpty: this.requiredStillEmpty, unresolvedFields: this.unresolvedFields, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, requiredFieldsSeen: this.requiredFieldsSeen, stoppedAtPayment: this.stoppedAtPayment, pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath });
+          const rowStopContext = await this.captureArrayRowStop(stepIdx);
+          return fail(`${next.stop}${rowStopContext}`, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, failedStepIndex: stepIdx, trace, slowSteps, requiredStillEmpty: this.requiredStillEmpty, unresolvedFields: this.unresolvedFields, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, requiredFieldsSeen: this.requiredFieldsSeen, stoppedAtPayment: this.stoppedAtPayment, pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath });
         }
         if (next.repeat) {
           stepIdx = this.arrayBlockStart - 1; // the loop's ++ lands us back on the block
@@ -2627,24 +2643,46 @@ export class RecipeAdapter extends BasePortalAdapter {
       .map(({ s }) => s);
   }
 
-  /** The recorded step re-aimed INSIDE row `n`: by its label (the row holds one control per
-   *  label), with no page-wide nth anywhere, and without a volatile learn-time id — an id like
-   *  "#pcInputBase57" is a render-order counter that, mid-run, names some OTHER control (live:
-   *  row 1's). A class/structural css the step was recorded with is kept, row-scoped. */
+  /**
+   * The recorded step re-aimed INSIDE row `n`, as an ordered list of row-relative levels — no
+   * page-wide nth anywhere, and no volatile learn-time id ("#pcInputBase57" is a render-order
+   * counter that, mid-run, names some OTHER control):
+   *   1. the row's own HOOK for the field — the recorded step's data-test-role when it has one,
+   *      else ROW_FIELD_HOOKS (#347: a PowerClerk row's make/model are found by their wrapper's
+   *      test-role, which resolves to the combobox inside it);
+   *   2. the recorded label;
+   *   3. a recorded class/structural css (never an #id);
+   *   4. the field's own name as the row labels it ("Qty", "Tilt" — aria-label or label-for).
+   * Every level resolves inside [data-al-arrayrow=n] (locator() scopes to the row).
+   */
   private rowScopedStep(s: RecipeStep, n: number): RecipeStep {
     const sel = s.selector ?? {};
     const volatileId = (css?: string): boolean => /^#[A-Za-z_][\w:.-]*$/.test(String(css ?? "").trim());
     const bare = (x: RecipeSelector): RecipeSelector => ({ ...x, nth: undefined, fallbacks: undefined });
-    const labelSrc = sel.label ? sel : sel.fallbacks?.find((f) => f.label);
-    const rest = (sel.fallbacks ?? []).filter((f) => f !== labelSrc && !volatileId(f.css)).map(bare);
-    let selector: RecipeSelector;
-    if (labelSrc?.label) {
-      const keepCss = labelSrc !== sel && sel.css && !volatileId(sel.css) ? [{ css: sel.css }] : [];
-      selector = { label: labelSrc.label, exact: labelSrc.exact, fallbacks: [...keepCss, ...rest] };
-    } else {
-      selector = { ...bare(sel), fallbacks: rest };
+    const all = [sel, ...(sel.fallbacks ?? [])];
+    const hookOf = (x: RecipeSelector): string =>
+      /^\[data-test-role=["']?([^"'\]]+)["']?\]$/.exec(String(x.css ?? "").trim())?.[1] ?? "";
+    const known = ROW_FIELD_HOOKS[String(s.field ?? "")];
+    const role = all.map(hookOf).find(Boolean) || known?.role || "";
+    const levels: RecipeSelector[] = [];
+    if (role) levels.push({ css: `:is(input, select, textarea)[data-test-role="${role}"], [data-test-role="${role}"] :is(input, select, textarea)` });
+    const labelSrc = all.find((x) => x.label);
+    if (labelSrc?.label) levels.push({ label: labelSrc.label, exact: labelSrc.exact });
+    for (const x of all) {
+      if (x.css && !volatileId(x.css) && !hookOf(x)) levels.push(bare({ css: x.css }));
+      else if (x.role && x.name) levels.push(bare(x));
     }
-    return { ...s, selector, note: `${s.note ?? s.field ?? ""} [array ${n}]` };
+    if (known && known.name.toLowerCase() !== String(labelSrc?.label ?? "").trim().toLowerCase()) {
+      levels.push({ label: known.name, exact: true });
+    }
+    if (!levels.length) levels.push(bare(sel));
+    const [first, ...rest] = levels;
+    return { ...s, selector: { ...first, fallbacks: rest }, note: `${s.note ?? s.field ?? ""} [array ${n}]` };
+  }
+
+  /** The name a person reads for a per-array step's control (used in the read-back's words). */
+  private rowFieldName(s: RecipeStep): string {
+    return ROW_FIELD_HOOKS[String(s.field ?? "")]?.name || this.stepLabel(s) || String(s.note ?? s.field ?? "");
   }
 
   /** While a row is being filled, a rescue or re-anchor may only hand back a control INSIDE that
@@ -2661,14 +2699,29 @@ export class RecipeAdapter extends BasePortalAdapter {
     ).catch(() => false) as boolean;
   }
 
-  /** The ONE visible control a row-scoped step resolves to, trying its levels in order. A level
-   *  that shows two visible controls in the row is ambiguous (a per-row microinverter's
-   *  "Manufacturer" beside the module's) and is never guessed at: the next level is tried, and
-   *  when none is unique the step is skipped and the row read-back stops the run. */
+  /** Is this row control one a person could use? Truly visible — or a combobox whose own
+   *  labelled input is hidden but which has a real visible FACE (PowerClerk's filtered select:
+   *  the input is `visually-hidden`, the face is div[data-test-role=filteredSelectField]). The
+   *  face is found by comboboxFaceInPage, the same walk fillCustomCombobox opens it with. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private async rowLocator(rs: RecipeStep): Promise<any | null> {
+  private async rowControlUsable(loc: any): Promise<boolean> {
+    if (await this.isTrulyVisible(loc)) return true;
+    if (!loc || typeof loc.evaluate !== "function") return false;
+    const comboish = await loc.evaluate((el: Element) => el.getAttribute("role") === "combobox"
+      || (el.getAttribute("aria-haspopup") || "").toLowerCase() === "listbox").catch(() => false);
+    if (!comboish) return false;
+    return (await loc.evaluate(comboboxFaceInPage, "probe").catch(() => "")) === "preferred";
+  }
+
+  /** The ONE usable control a row-scoped step resolves to, trying its levels in order, and how
+   *  many usable controls the most crowded level showed. A level that shows two is ambiguous (a
+   *  per-row microinverter's "Manufacturer" beside the module's) and is never guessed at: the
+   *  next level is tried; when none is unique, `loc` is null and the read-back names the clash. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async rowResolve(rs: RecipeStep): Promise<{ loc: any | null; ambiguous: number }> {
     const sel = rs.selector;
-    if (!sel) return null;
+    let ambiguous = 0;
+    if (!sel) return { loc: null, ambiguous };
     for (const level of [sel, ...(sel.fallbacks ?? [])]) {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       let loc: any;
@@ -2677,11 +2730,18 @@ export class RecipeAdapter extends BasePortalAdapter {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const seen: any[] = [];
       for (let k = 0; k < Math.min(count, 4); k++) {
-        if (await this.isTrulyVisible(loc.nth(k))) seen.push(loc.nth(k));
+        if (await this.rowControlUsable(loc.nth(k))) seen.push(loc.nth(k));
       }
-      if (seen.length === 1) return seen[0];
+      if (seen.length === 1) return { loc: seen[0], ambiguous };
+      if (seen.length > ambiguous) ambiguous = seen.length;
     }
-    return null;
+    return { loc: null, ambiguous: ambiguous > 1 ? ambiguous : 0 };
+  }
+
+  /** The ONE usable control a row-scoped step resolves to, or null. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async rowLocator(rs: RecipeStep): Promise<any | null> {
+    return (await this.rowResolve(rs)).loc;
   }
 
   /** Wait for a row-scoped step's control to RENDER in its row (re-stamping as the section
@@ -2717,14 +2777,10 @@ export class RecipeAdapter extends BasePortalAdapter {
           if (rendered) ok = await this.executeStep(rs, false).catch(() => false);
           if (ok && s.action === "select") {
             if (s.field) this.landedSelectFields.add(String(s.field));
-            const shown = await this.rowLocator(rs).then((loc) => loc?.evaluate((el: Element) => {
-              if ((el.tagName || "").toLowerCase() === "select") {
-                const sl = el as HTMLSelectElement;
-                return (sl.options[sl.selectedIndex]?.textContent || "").trim();
-              }
-              return String((el as HTMLInputElement).value ?? "").trim();
-            })).catch(() => "");
-            if (shown) this.rowSelectLanded.set(`${n}:${String(s.field ?? "")}`, String(shown));
+            // What the row SHOWS now — through the same resolver and reader as the read-back, so
+            // "the certified name the fill chose" ("Znshine PV-Tech") is what it is compared with.
+            const shown = (await this.shownBy(await this.rowLocator(rs).catch(() => null)))?.text.trim() ?? "";
+            if (shown && !/^(please\s+)?select\.{0,3}$/i.test(shown)) this.rowSelectLanded.set(`${n}:${String(s.field ?? "")}`, shown);
           }
         } finally {
           this.arrayRowScope = 0;
@@ -2768,8 +2824,18 @@ export class RecipeAdapter extends BasePortalAdapter {
   private async verifyArrayRowsByRow(): Promise<string | null> {
     const steps = this.rowStepsInOrder();
     if (!steps.length || !this.rowArrays.length) return null;
-    type Gap = { row: number; problems: string[]; expected: string[] };
+    type Gap = { row: number; problems: string[]; expected: string[]; want: string };
     const savedPass = this.arrayPass;
+    const placeholder = (v: string): boolean => !v.trim() || /^(please\s+)?select\.{0,3}$/i.test(v.trim()) || /^--/.test(v.trim());
+    // The value a row is expected to SHOW for a step: for a make/model, the certified name the
+    // fill chose in that row (else the make's certified alias); for a number, the project's own.
+    const expectedShown = (s: RecipeStep, r: number, want: string): string => {
+      if (s.action !== "select") return want;
+      const landed = this.rowSelectLanded.get(`${r}:${String(s.field ?? "")}`);
+      if (landed) return landed;
+      if (this.isManufacturerStep(s)) return equipmentMakeCandidates(want)[1] ?? want;
+      return want;
+    };
     const audit = async (): Promise<Gap[]> => {
       // READ WHAT THE PORTAL KEPT, NOT WHAT WAS JUST TYPED. A per-field autosave can be
       // debounced — nothing on the wire for a beat after the blur — so "the page is quiet"
@@ -2777,33 +2843,44 @@ export class RecipeAdapter extends BasePortalAdapter {
       // row's number, a reformat, a refusal) would read as held. Let it answer first.
       await this.settle(4000);
       await sleep(ROW_READBACK_GRACE_MS);
-      const rows = await this.readArrayRowsBack();
+      const onPage = await this.markArrayRows();
       const gaps: Gap[] = [];
       for (let r = 1; r <= this.rowArrays.length; r++) {
-        const row = rows[r - 1];
         const problems: string[] = [];
         const expected: string[] = [];
+        const nums: Record<string, string> = {};
         this.arrayPass = r;
         for (const s of steps) {
           const want = this.resolveValue(s).trim();
           if (!want) continue;
-          const name = this.stepLabel(s) || String(s.note ?? s.field ?? "");
-          expected.push(`${name} ${want}`);
-          if (!row) continue;
-          const lbl = name.toLowerCase();
-          const hits = row.filter((c) => {
-            const own = c.label.toLowerCase();
-            return !!own && !!lbl && (own.includes(lbl) || lbl.includes(own));
-          });
-          if (hits.length > 1) { problems.push(`${name} matches ${hits.length} controls on the row`); continue; }
-          const ctl = hits[0];
-          if (!ctl) { problems.push(`${name} is not on the row`); continue; }
-          const got = String(ctl.value ?? "").trim();
-          if (ctl.placeholder || !got) { problems.push(`${name} is empty`); continue; }
-          if (!this.rowValueHolds(s, r, got, want, ctl.tag)) problems.push(`${name} reads "${got.slice(0, 40)}"`);
+          const name = this.rowFieldName(s);
+          const shownWant = expectedShown(s, r, want);
+          expected.push(`${name} ${shownWant}`);
+          if (s.action !== "select") nums[String(s.field ?? name)] = want;
+          if (r > onPage) continue;
+          // THROUGH THE SAME RESOLVER THE FILL USED (#347): the row's hook, the recorded label,
+          // a recorded css, the field's own name — so "pv array quantity" (the test-role,
+          // humanised) is the row's Qty, and a hidden-input combobox is read off its face.
+          this.arrayRowScope = r;
+          try {
+            await this.markArrayRows();
+            const { loc, ambiguous } = await this.rowResolve(this.rowScopedStep(s, r));
+            if (!loc) {
+              problems.push(ambiguous > 1 ? `${name} matches ${ambiguous} controls on the row` : `${name} is not on the row`);
+              continue;
+            }
+            const got = String((await this.shownBy(loc))?.text ?? "").trim();
+            const tag = String(await loc.evaluate((el: Element) => (el.tagName || "").toLowerCase()).catch(() => "")) || "input";
+            if (placeholder(got)) { problems.push(`${name} is empty`); continue; }
+            if (!this.rowValueHolds(s, r, got, want, tag)) problems.push(`${name} reads "${got.slice(0, 40)}"`);
+          } finally {
+            this.arrayRowScope = 0;
+          }
         }
-        if (!row) problems.unshift("the row is not on the page");
-        if (problems.length) gaps.push({ row: r, problems, expected });
+        if (r > onPage) problems.unshift("the row is not on the page");
+        const q = nums.array1ModuleQuantity, t = nums.array1Tilt, z = nums.array1Azimuth;
+        const want = q && t && z ? `${q} @ ${t}°/${z}°` : Object.values(nums).join(", ");
+        if (problems.length) gaps.push({ row: r, problems, expected, want });
       }
       return gaps;
     };
@@ -2820,12 +2897,38 @@ export class RecipeAdapter extends BasePortalAdapter {
         const m = `array row ${g.row}: ${g.problems.join("; ")} — expected ${g.expected.join(", ")}`;
         if (!this.requiredStillEmpty.includes(m)) this.requiredStillEmpty.push(m);
       }
-      return `Stopped before review: ${still.length} PV array row(s) still do not hold their own array after one repair inside the row — `
-        + still.map((g) => `row ${g.row} should hold ${g.expected.join(", ")} (${g.problems.join("; ")})`).join(" | ")
-        + ". The application was NOT staged at review; correct these rows by hand before anyone submits.";
+      return this.arrayRowStopMessage(still);
     } finally {
       this.arrayPass = savedPass;
     }
+  }
+
+  /**
+   * THE STOP, WHOLE. Live (#347) the message was cut mid-word by a downstream reader that keeps
+   * ~300 characters of a failure, and it had listed only row 1 by then. So every failing row and
+   * its expected numbers come FIRST and compactly ("row 2 wants 6 @ 24°/82°"), the module once,
+   * then what was found, rows with identical findings grouped. Full per-row detail is in
+   * requiredStillEmpty.
+   */
+  private arrayRowStopMessage(still: Array<{ row: number; problems: string[]; expected: string[]; want: string }>): string {
+    const groups = new Map<string, number[]>();
+    for (const g of still) {
+      const k = g.problems.join("; ");
+      groups.set(k, [...(groups.get(k) ?? []), g.row]);
+    }
+    const module = (still[0]?.expected ?? []).filter((e) => /^(manufacturer|model)\b/i.test(e)).map((e) => e.replace(/^\S+\s+/, "")).join(" / ");
+    return `Stopped before review: ${still.length} of ${this.rowArrays.length} PV array row(s) still do not hold their own array after one repair inside the row — `
+      + still.map((g) => `row ${g.row} wants ${g.want}`).join(", ")
+      + (module ? `. Module: ${module}` : "")
+      + `. Found: ${Array.from(groups.entries()).map(([k, rows]) => `${rows.length > 1 ? "rows" : "row"} ${rows.join(", ")}: ${k}`).join(" | ")}`
+      + ". Not staged at review; correct these rows by hand before anyone submits.";
+  }
+
+  /** The row read-back stop keeps the page, as every other stop does: a screenshot and the
+   *  sanitized HTML/text (captureFailureContext), whose summary is appended to the message. */
+  private async captureArrayRowStop(stepIdx: number): Promise<string> {
+    await this.capturePageShot("ARRAY-ROWS-NOT-HELD", true).catch(() => null);
+    return await this.captureFailureContext({ action: "check", note: "array rows not held" } as RecipeStep, stepIdx).catch(() => "");
   }
 
   /**
@@ -7075,8 +7178,22 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  of a native select, the value/text of a combobox face. null = could not read (not
    *  evidence either way). */
   private async selectionHeld(scoped: unknown, want: string): Promise<boolean | null> {
-    const loc = scoped as { evaluate?: (fn: (el: Element) => string) => Promise<string> } | null;
-    if (!loc || typeof loc.evaluate !== "function" || !want.trim()) return null;
+    if (!want.trim()) return null;
+    const shown = await this.shownBy(scoped);
+    if (!shown) return null;
+    if (!shown.text.trim() && !shown.value.trim()) return false;
+    return readbackMatches(shown.text, want) || (!!shown.value && readbackMatches(shown.value, want));
+  }
+
+  /** WHAT A CONTROL SHOWS — the one reader for the select held-check and the array-row
+   *  read-back: a native select's selected option (text and value), an input's value or text,
+   *  and — for a combobox whose own labelled input is hidden and empty — the text on its visible
+   *  FACE (#347: PowerClerk's filtered select shows "Znshine PV-Tech" on
+   *  div[data-test-role=filteredSelectField]; the face is found by comboboxFaceInPage, the same
+   *  walk fillCustomCombobox opens it with). null = could not read (not evidence either way). */
+  private async shownBy(scoped: unknown): Promise<{ text: string; value: string } | null> {
+    const loc = scoped as { evaluate?: (fn: unknown, arg?: unknown) => Promise<unknown> } | null;
+    if (!loc || typeof loc.evaluate !== "function") return null;
     const shown = await loc.evaluate((el: Element) => {
       if (el.tagName === "SELECT") {
         const s = el as HTMLSelectElement;
@@ -7085,11 +7202,16 @@ export class RecipeAdapter extends BasePortalAdapter {
       }
       const i = el as HTMLInputElement;
       return String((typeof i.value === "string" && i.value) || el.textContent || "");
-    }).catch(() => null as unknown as string);
+    }).catch(() => null) as string | null;
     if (shown === null || shown === undefined) return null;
     const [text, value] = String(shown).split("\u0001");
-    if (!String(text ?? "").trim() && !String(value ?? "").trim()) return false;
-    return readbackMatches(String(text ?? ""), want) || (value !== undefined && readbackMatches(value, want));
+    let shownText = String(text ?? "");
+    if (!shownText.trim() && value === undefined) {
+      const comboish = await loc.evaluate((el: Element) => el.getAttribute("role") === "combobox"
+        || (el.getAttribute("aria-haspopup") || "").toLowerCase() === "listbox").catch(() => false);
+      if (comboish) shownText = String(await loc.evaluate(comboboxFaceInPage, "text").catch(() => "") ?? "");
+    }
+    return { text: shownText, value: String(value ?? "") };
   }
 
   private async fillHeld(
