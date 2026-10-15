@@ -100,10 +100,13 @@ await check("classifier: production messages land in the right family (MUST-PASS
   // value for (the AC disconnect part with no plan-set part and no client standard; an unanswered
   // per-job question) is the PROJECT's missing data — the recipe is kept, never demoted or flagged.
   // The adapter's own message builder, so the words the run writes are the words tested here.
-  const { missingRequiredStopMessage } = await import("../../portal-bot/src/unrecordedControls");
+  const { missingRequiredStopMessage, UNPINNED_CONTROL_WHY } = await import("../../portal-bot/src/unrecordedControls");
   cases.push(
     [missingRequiredStopMessage('"advance: Next"', [{ label: "Disconnect Switch Manufacturer", key: "disconnectMake" }, { label: "Disconnect Switch Model", key: "disconnectModel" }]), "not_recipe"],
     [missingRequiredStopMessage("review", [{ label: "Will the System be Customer-Owned or Third-Party Owned?", key: "ownershipModel" }]), "not_recipe"],
+    // PR #353 round 3: the value is on file but the empty control could not be pinned to one element
+    // (two empty namesakes) — the recipe has no step for it, so this is not the recipe's failure either.
+    [missingRequiredStopMessage('"advance: Next"', [{ label: "Disconnect Switch Model", key: "disconnectModel", why: UNPINNED_CONTROL_WHY }]), "not_recipe"],
   );
   for (const [text, want] of cases) {
     assert.equal(recipes.replayFailureBlamesRecipe(text).attribution, want, `"${text.slice(0, 90)}" should be ${want}`);

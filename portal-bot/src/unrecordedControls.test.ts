@@ -7,7 +7,7 @@
 //
 // Run: npx tsx portal-bot/src/unrecordedControls.test.ts
 import assert from "node:assert/strict";
-import { answerForUnrecordedControl, disconnectPartKeyFor, missingRequiredStopMessage, readDisconnectPart } from "./unrecordedControls";
+import { answerForUnrecordedControl, disconnectPartKeyFor, missingRequiredStopMessage, readDisconnectPart, UNPINNED_CONTROL_WHY } from "./unrecordedControls";
 import { policyDefaultAnswerFor, policyProfileFor, policyScopeFor } from "./adapters/autoLearnAdapter";
 import { operatorPolicyAnswer } from "../../shared/src/perJobQuestions";
 
@@ -57,16 +57,48 @@ const NOT_THE_AC_DISCONNECT = [
   "AC/DC Disconnect Model",
   "Battery Disconnect Manufacturer",
   "EV Charger Disconnect Model",
+  // PR #353 round 3: the round-2 DENY-list let through every equipment it did not name (the reviewer's
+  // probe: each of these got acDisconnect:true and the client's Eaton DG221URB). An ALLOW-list now.
+  "EVSE Disconnect Manufacturer",
+  "Backup Gateway Disconnect Manufacturer",
+  "Gateway Disconnect Model",
+  "Transfer Switch Disconnect Manufacturer",
+  "Subpanel Disconnect Manufacturer",
+  "Load center disconnect manufacturer",
+  "Wind turbine disconnect manufacturer",
+  "Turbine Disconnect Model",
+  "Fuel cell disconnect manufacturer",
+  "EVSE AC Disconnect Model",
 ];
 const THE_AC_DISCONNECT: Array<[string, string]> = [
   ["Disconnect Switch Manufacturer", "disconnectMake"],
   ["Disconnect Switch Model", "disconnectModel"],
+  ["AC Disconnect Manufacturer", "disconnectMake"],
   ["AC Disconnect Make/Model", "disconnectMakeModel"],
-  ["Inverter AC Disconnect Manufacturer", "disconnectMake"],
+  ["AC Disconnect(s) Model Number", "disconnectModel"],
+  ["A.C. Disconnect Model #", "disconnectModel"],
+  ["Disconnect Switch Model No.", "disconnectModel"],
+  ["Disconnect Switch Manufacturer Name", "disconnectMake"],
+  ["Disconnect Switch Manufacturer *", "disconnectMake"],
   ["Utility AC Disconnect Model", "disconnectModel"],
-  ["Fused AC Disconnect Manufacturer", "disconnectMake"],
-  ["Non-Fused Disconnect Switch Model", "disconnectModel"],
+  ["Utility External Disconnect Switch Model", "disconnectModel"],
+  ["Lockable Disconnect Switch Manufacturer", "disconnectMake"],
+  ["Disconnect for the Utility Model", "disconnectModel"],
   ["Visible, Lockable Disconnect Brand", "disconnectMake"],
+];
+// THE ACCEPTED SAFE DIRECTION (PR #353 round 3): an AC wording that carries a word the allow-list does
+// not — an inverter, a meter, a rating, a location, a fuse — is no longer bound. It stops by name with
+// the AC part on file, which a person then enters. The first three bound in round 2; the other five
+// are the round-2 review's nit (they stopped in round 2 as well, through the deny-list).
+const AC_WORDING_THAT_NOW_STOPS = [
+  "Inverter AC Disconnect Manufacturer",
+  "Fused AC Disconnect Manufacturer",
+  "Non-Fused Disconnect Switch Model",
+  "Inverter Output Disconnect Manufacturer",
+  "Production Meter Disconnect Manufacturer",
+  "Disconnect Switch Manufacturer (near meter)",
+  "Service-rated Disconnect Manufacturer",
+  "Disconnect Make (Main)",
 ];
 check("MUST-EXCLUDE: a DC / rapid-shutdown / inverter / combiner / service / storage disconnect is never bound to the AC disconnect's keys", () => {
   for (const label of NOT_THE_AC_DISCONNECT) {
@@ -80,6 +112,23 @@ check("MUST-PASS: the AC disconnect, named or bare, binds to its keys", () => {
     assert.deepEqual(answerForUnrecordedControl({ label, fieldType: "text" }, STD, "nem"),
       { kind: "bound", key, value: (STD as Record<string, string>)[key] }, label);
   }
+});
+check("an AC wording with a word the allow-list does not carry is never bound: it stops by name (the accepted safe direction)", () => {
+  // The two meter-named text boxes are not this module's at all: the identifier guard (a free-text
+  // box whose label names a meter) runs before the part is read, as it did in round 2 — never typed,
+  // left to the sweep. As a dropdown, the same labels stop by name.
+  const identifierGuarded = new Set(["Production Meter Disconnect Manufacturer", "Disconnect Switch Manufacturer (near meter)"]);
+  for (const label of AC_WORDING_THAT_NOW_STOPS) {
+    assert.equal(disconnectPartKeyFor(label), null, label);
+    assert.equal(readDisconnectPart(label)?.acDisconnect, false, label);
+    const asText = answerForUnrecordedControl({ label, fieldType: "text" }, STD, "nem");
+    assert.deepEqual(identifierGuarded.has(label) ? asText : asText?.kind, identifierGuarded.has(label) ? null : "unbound", `${label} → ${JSON.stringify(asText)}`);
+    assert.equal(answerForUnrecordedControl({ label, fieldType: "select", options: ["Select...", "Eaton", "Square D"] }, STD, "nem")?.kind, "unbound", label);
+  }
+});
+check("the detection itself is not widened: \"Disconnecting Means\" alone names no disconnect part (the NEC's words for any disconnect, DC included)", () => {
+  assert.equal(readDisconnectPart("Disconnecting Means Manufacturer"), null);
+  assert.equal(readDisconnectPart("PV System Disconnecting Means Model"), null);
 });
 check("another equipment's disconnect part is recognized and never typed — it stops by name (unbound), with the AC part on file", () => {
   for (const label of NOT_THE_AC_DISCONNECT) {
@@ -195,6 +244,14 @@ check("the stop's message names every control within the first 300 characters", 
   const msg = missingRequiredStopMessage('"advance: Next"', [{ label: "Disconnect Switch Manufacturer", key: "disconnectMake" }, { label: "Disconnect Switch Model", key: "disconnectModel" }]);
   assert.ok(msg.slice(0, 300).includes("Disconnect Switch Manufacturer") && msg.slice(0, 300).includes("Disconnect Switch Model"), msg);
   assert.ok(/no value was supplied/.test(msg), msg);
+});
+
+check("a control that could not be pinned to one element stops with the replay's own reason (and still reads as the project's, not the recipe's)", () => {
+  const msg = missingRequiredStopMessage('"advance: Next"', [{ label: "Disconnect Switch Model", key: "disconnectModel", why: UNPINNED_CONTROL_WHY }]);
+  assert.ok(msg.slice(0, 300).includes("Disconnect Switch Model"), msg);
+  assert.ok(/no value was supplied by this run/.test(msg), msg);
+  assert.ok(msg.includes(UNPINNED_CONTROL_WHY) && !/no AC disconnect part is on file/.test(msg), msg);
+  assert.ok(!/add the value and stage again/.test(msg), `the value is on file — the remedy is the browser: ${msg}`);
 });
 
 if (failures) { console.error(`\n${failures} unrecordedControls check(s) FAILED.`); process.exit(1); }
