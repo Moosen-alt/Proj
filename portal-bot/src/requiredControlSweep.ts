@@ -91,8 +91,40 @@ export async function sweepEmptyRequiredControls(
   };
 }
 
-/** The sweep, as the page runs it. `unanswered` is controlReadsUnanswered (see the caller). */
-const sweepInPage = (unanswered: (el: Element) => boolean): { empty: Array<{ name: string; why: string }>; requiredSeen: string[] } => {
+/** The attribute pinEmptyRequiredControl stamps on the one control it pins. */
+export const PINNED_CONTROL_ATTR = "data-al-unrec";
+
+/**
+ * PIN THE ONE EMPTY REQUIRED CONTROL THE SWEEP NAMES `name` — by the sweep's own reading, not by
+ * re-resolving the name (PR #353 round 3).
+ *
+ * The replay's answer to a required control its recipe never recorded wrote by LABEL: an ordinal
+ * among same-label controls, resolved through a case-insensitive SUBSTRING label match. With no ids,
+ * "Disconnect Switch Model".nth(1) landed on "Disconnect Switch Model Notes" (an optional textarea
+ * between a filled namesake and the empty one), wrote the AC part there, left the required box blank
+ * and reported it answered. A label resolves to a SET; the sweep found an ELEMENT.
+ *
+ * So the page runs the sweep itself, and every visible, required, unanswered control whose sweep
+ * name (cleaned exactly as the sweep's list is) equals `name` is collected at the point the sweep
+ * would list it. Exactly one → it is stamped `data-al-unrec="<token>"` (any earlier stamp is cleared
+ * first) and 1 is returned. None, or several the name cannot tell apart → nothing is stamped and the
+ * count is returned: the caller types nothing. The page is otherwise untouched.
+ */
+export async function pinEmptyRequiredControl(page: Page, name: string, token: string): Promise<number> {
+  if (!page || typeof page.evaluate !== "function") return 0;
+  const pin = JSON.stringify({ name: String(name ?? ""), token: String(token ?? ""), attr: PINNED_CONTROL_ATTR });
+  const res = await page.evaluate(
+    `globalThis.__name = globalThis.__name || function (fn) { return fn; };\n(${sweepInPage.toString()})(${controlReadsUnanswered.toString()}, ${pin})`,
+  ).catch(() => null) as { pinned?: unknown } | null;
+  return typeof res?.pinned === "number" ? res.pinned : 0;
+}
+
+/** The sweep, as the page runs it. `unanswered` is controlReadsUnanswered (see the caller). `pin`,
+ *  when given, is pinEmptyRequiredControl's request: the sweep's own list is not returned then. */
+const sweepInPage = (
+  unanswered: (el: Element) => boolean,
+  pin?: { name: string; token: string; attr: string } | null,
+): { empty: Array<{ name: string; why: string }>; requiredSeen: string[]; pinned?: number } => {
   {
     // TWO GRADES OF COMPLAINT, BECAUSE ONE OF THEM IS ALSO ORDINARY PROSE.
     //
@@ -121,10 +153,13 @@ const sweepInPage = (unanswered: (el: Element) => boolean): { empty: Array<{ nam
     const COMPLAINT = new RegExp(`${HARD.source}|${SOFT.source}`, "i");
     const out: Array<{ name: string; why: string }> = [];
     const requiredSeen: string[] = [];
+    // ONE cleaning for the list and for the pin: the name a pin asks for is a name from this list.
+    const cleanName = (name: string): string => String(name || "").replace(/\s*\*\s*$/, "").replace(/\s+/g, " ").trim().slice(0, 70);
     const push = (name: string, why: string): void => {
-      const clean = String(name || "").replace(/\s*\*\s*$/, "").replace(/\s+/g, " ").trim().slice(0, 70);
+      const clean = cleanName(name);
       if (clean && !out.some((o) => o.name === clean)) out.push({ name: clean, why });
     };
+    const pinnedEls: HTMLElement[] = [];
 
     const visible = (el: Element): boolean => {
       const r = el.getBoundingClientRect();
@@ -247,6 +282,14 @@ const sweepInPage = (unanswered: (el: Element) => boolean): { empty: Array<{ nam
         || el.getAttribute("name")
         || "(unlabelled control)";
       push(name, claimed.has(el) ? "complaint" : el.hasAttribute("required") || el.getAttribute("aria-required") === "true" ? "attribute" : "asterisk");
+      // THE PIN (pinEmptyRequiredControl): this very element, at the point the sweep lists it.
+      if (pin && cleanName(name) === pin.name) pinnedEls.push(el);
+    }
+
+    if (pin) {
+      document.querySelectorAll(`[${pin.attr}]`).forEach((e) => e.removeAttribute(pin.attr));
+      if (pinnedEls.length === 1) pinnedEls[0].setAttribute(pin.attr, pin.token);
+      return { empty: [], requiredSeen: [], pinned: pinnedEls.length };
     }
 
     // ---- unanswered required radio GROUPS -------------------------------------------

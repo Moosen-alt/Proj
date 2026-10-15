@@ -91,7 +91,7 @@ import { attachmentTypeFor, isDocumentTypeList } from "./attachmentTypes";
 import { cleanRecordLink, readApplicationLedgerInPage, type LedgerEntry } from "./submissionLedger";
 import { exactUploadDocType, fileTypeAllowed, UPLOAD_LABEL_PATTERNS, uploadForbidsSubstitute } from "./autoLearnAdapter";
 import { reviewComparison, scrapeReviewScreen as scrapeReviewScreenShared, utilityIdentifiersEnteredBySteps, type ReviewMismatch } from "../reviewScreenScraper";
-import { controlReadsUnanswered, sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
+import { controlReadsUnanswered, pinEmptyRequiredControl, PINNED_CONTROL_ATTR, sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
 import { openPortal } from "../browser";
 import { selectWithFallback, comboboxFaceInPage } from "../comboboxFill";
 import {
@@ -113,7 +113,7 @@ import { performLogin, portalErrorPage } from "./loginFlow";
 import { chooseCorrectionForm, correctionFormSelector, isRefusal, scanProjectForms, type ProjectFormRow } from "./correctionForm";
 import { type ExtractedField, EXTRACT_SEL, extractFieldsInPage, toExtractedField, dismissPageModals, clearPageOverlays, equipmentMakeCandidates, pageFingerprintOf, collectValidationErrorsFrom, acaApplyEntryFrom, advanceSignatureOf } from "./autoLearnAdapter";
 import { tagUploadControls, visibleBodyText, policyScopeFor } from "./autoLearnAdapter";
-import { answerForUnrecordedControl, missingRequiredStopMessage, type MissingRequired } from "../unrecordedControls";
+import { answerForUnrecordedControl, missingRequiredStopMessage, UNPINNED_CONTROL_WHY, type MissingRequired } from "../unrecordedControls";
 import { isComputeTotalsStep, prepareComputeSettle, waitForComputeSettled } from "../computeSettle";
 import { portalSaysNotServed } from "../../../shared/src/portalNotServed";
 
@@ -631,6 +631,8 @@ export class RecipeAdapter extends BasePortalAdapter {
   /** Required controls the recipe has no step for, answered from this job (answerUnrecordedRequired,
    *  issue #352) — labels, never values. */
   private unrecordedAnswered: string[] = [];
+  /** A fresh token per pin (pinEmptyRequiredControl), so a stamp from an earlier pass never matches. */
+  private unrecordedPinSeq = 0;
   /** Drift-precheck annotations ("this page barely matches the recipe") — surfaced
    *  in every result payload so a run that squeaked through via heals still tells
    *  the operator the portal likely changed. */
@@ -7656,85 +7658,119 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  learner's own table. Anything else is left to gap-fill and the sweep, as before.
    *
    *  Writes go through executeStep as a synthesized step, so commit, read-back and fieldsVerified
-   *  are the same as a recorded step's, aimed at the exact control read (its id, else its ordinal
-   *  among same-label controls). Never overwrites: a control is touched only when it is on the page
-   *  (a box, as the sweep counts it) and reads unanswered by the sweep's own predicate
-   *  (controlReadsUnanswered). A control it knows but this job has NO value for is returned in
-   *  `missing` — the caller stops the run by name; it is never typed blank and never guessed. */
+   *  are the same as a recorded step's.
+   *
+   *  THE CONTROL WRITTEN IS THE ELEMENT THE SWEEP FOUND EMPTY, AND ONLY THAT ONE (PR #353 round 3).
+   *  Round 2 re-resolved the sweep's NAME: by id, else by an ordinal among same-label controls — and a
+   *  label resolves through a case-insensitive SUBSTRING match, so with no ids "Disconnect Switch
+   *  Model".nth(1) was the optional "Disconnect Switch Model Notes" box between a filled namesake and
+   *  the empty one. The AC part went into Notes, the required box stayed blank, and the report said
+   *  it was answered. Now the page runs the sweep itself and stamps the one visible, required,
+   *  unanswered control of that name (pinEmptyRequiredControl); the answer is read from THAT
+   *  element's own extraction, whose label must clean to the sweep's name; and the step targets it —
+   *  by its id only when no other element carries the id, else by the stamp. A name the pin cannot
+   *  tie to exactly one element (several empty namesakes, or none found again) is NEVER typed: with a
+   *  value on file it is returned in `missing` with that reason (UNPINNED_CONTROL_WHY), and the run
+   *  stops by name.
+   *
+   *  Never overwrites: the pinned control reads unanswered by the sweep's own predicate
+   *  (controlReadsUnanswered), asked again just before the write. Never drives a concealed control:
+   *  executeStep's rescue for a control that is not truly visible looks for ANOTHER one (a test hook,
+   *  a section) — the very wrong-control write the pin prevents — so a pinned control that is not
+   *  truly visible is left to gap-fill and the sweep, as before #352. A control it knows but this
+   *  job has NO value for is returned in `missing` — the caller stops the run by name; it is never
+   *  typed blank and never guessed. */
   private async answerUnrecordedRequired(): Promise<{ filled: string[]; missing: MissingRequired[] }> {
     const out = { filled: [] as string[], missing: [] as MissingRequired[] };
     if (!this.page || typeof this.page.$$eval !== "function" || typeof this.page.evaluate !== "function") return out;
     const swept = await this.sweepRequired().catch(() => null);
     if (!swept || !swept.empty.length) return out;
+    // The sweep's own cleaning (requiredControlSweep's cleanName): a name here IS a name from its list.
     const clean = (s: string): string => String(s || "").replace(/\s*\*\s*$/, "").replace(/\s+/g, " ").trim().slice(0, 70);
-    const emptyNames = new Set(swept.empty.map((e) => clean(e.name)));
     let raws: unknown[] = [];
     try { raws = (await this.page.$$eval(EXTRACT_SEL, extractFieldsInPage)) as unknown[]; } catch { return out; }
     if (!Array.isArray(raws)) return out;
     const scope = policyScopeFor(this.recipe.scopeType);
-    const rawFields = raws as Parameters<typeof toExtractedField>[0][];
-    const fields = rawFields.map(toExtractedField);
-    // How many extracted controls carry each label — a shared label needs an ordinal to say WHICH.
-    const labelCount = new Map<string, number>();
-    for (const f of fields) { const n = clean(f.label); labelCount.set(n, (labelCount.get(n) ?? 0) + 1); }
-    const ordinal = new Map<string, number>();
-    // ONE ANSWER PER LABEL PER PASS — marked only once THE control being answered reads visible and
-    // empty (PR #353 round 2): marked on first sight, a filled control (or a display:none twin, which
-    // the extraction lists and the sweep does not) used up the label and its empty sibling — the one
-    // the sweep named — was never answered.
-    const answered = new Set<string>();
-    const named = new Set<string>();
-    for (let i = 0; i < fields.length; i++) {
-      const f = fields[i];
-      const name = clean(f.label);
-      const nth = ordinal.get(name) ?? 0;
-      ordinal.set(name, nth + 1);
-      if (!name || !emptyNames.has(name) || answered.has(name) || isPayFee(f.label)) continue;
-      const ans = answerForUnrecordedControl(f, this.fieldValues, scope);
-      if (!ans) continue;
-      // NO VALUE TO GIVE IT (another piece of equipment's disconnect part — no project key answers it
-      // — or a bound key this project has nothing for): named once, never typed. The sweep is the
-      // evidence: a visible required control of this name is empty.
-      if (ans.kind === "unbound" || !ans.value) {
-        if (!named.has(name)) {
-          named.add(name);
-          out.missing.push({ label: f.label, key: ans.kind === "bound" ? ans.key : null });
+    type Raw = Parameters<typeof toExtractedField>[0];
+    const fields = (raws as Raw[]).map(toExtractedField);
+    // ONE ANSWER PER NAME PER PASS: the sweep lists each empty name once.
+    const seen = new Set<string>();
+    let stamped = false;
+    try {
+      for (const e of swept.empty) {
+        const name = clean(e.name);
+        if (!name || seen.has(name) || isPayFee(name)) continue;
+        seen.add(name);
+        // A CONTROL THIS MODULE KNOWS? Asked of the extracted controls carrying the name, before
+        // anything is touched — a name none of them answers stays gap-fill's and the sweep's.
+        const known = fields.filter((f) => clean(f.label) === name)
+          .map((f) => answerForUnrecordedControl(f, this.fieldValues, scope))
+          .find((a) => a !== null) ?? null;
+        if (!known) continue;
+        // PIN THE ELEMENT THE SWEEP FOUND EMPTY, then read the answer from THAT element.
+        const token = `u${++this.unrecordedPinSeq}`;
+        const count = await pinEmptyRequiredControl(this.page, name, token).catch(() => 0);
+        stamped = true;
+        const pinnedSel = `[${PINNED_CONTROL_ATTR}="${token}"]`;
+        let raw: Raw | null = null;
+        if (count === 1) {
+          const one = await this.page.$$eval(pinnedSel, extractFieldsInPage).catch(() => null) as Raw[] | null;
+          if (Array.isArray(one) && one.length === 1) raw = one[0];
         }
-        continue;
+        const f = raw ? toExtractedField(raw) : null;
+        if (!f || clean(f.label) !== name) {
+          // NOT PINNED TO ONE ELEMENT: never typed. With a value on file the stop gives the replay's
+          // own reason; with none, the ordinary missing value.
+          const hasValue = known.kind !== "unbound" && !!known.value;
+          out.missing.push({ label: name, key: known.kind === "bound" ? known.key : null, ...(hasValue ? { why: UNPINNED_CONTROL_WHY } : {}) });
+          continue;
+        }
+        if (isPayFee(f.label)) continue;
+        const ans = answerForUnrecordedControl(f, this.fieldValues, scope);
+        if (!ans) continue; // the pinned control itself is not one this module answers
+        // NO VALUE TO GIVE IT (a disconnect part no project key answers, or a bound key this project
+        // has nothing for): named, never typed.
+        if (ans.kind === "unbound" || !ans.value) {
+          out.missing.push({ label: f.label, key: ans.kind === "bound" ? ans.key : null });
+          continue;
+        }
+        // THIS element: by its id only when the id is on no other element (an id survives a
+        // re-render, a stamp does not), else by the stamp.
+        const rawId = String(raw?.id ?? "");
+        const idSel = rawId ? `[id=${JSON.stringify(rawId)}]` : "";
+        const idUnique = !!idSel && (await this.page.locator(idSel).count().catch(() => 0)) === 1;
+        const selector: RecipeSelector = { css: idUnique ? idSel : pinnedSel };
+        const control = this.page.locator(selector.css as string).first();
+        // NOT A CONCEALED CONTROL (executeStep's rescues would look for another one).
+        if (!(await this.isTrulyVisible(control))) continue;
+        // NEVER OVER A VALUE: the sweep's own reading (controlReadsUnanswered — a "-- Select --" with a
+        // value attribute is unanswered to both), asked of this control now.
+        const empty = await control.evaluate(controlReadsUnanswered).catch(() => null);
+        if (empty !== true) continue;
+        const step = {
+          action: f.fieldType === "select" || (f.fieldType === "other" && (f.options?.length ?? 0) > 0) ? "select" : "fill",
+          phase: "fill",
+          selector,
+          note: f.label.replace(/\s+/g, " ").trim().slice(0, 120),
+          ...(ans.kind === "bound" ? { field: ans.key } : { value: ans.value }),
+        } as RecipeStep;
+        const done = await this.executeStep(step, false).catch(() => false);
+        const shown = f.label.replace(/\s+/g, " ").trim().slice(0, 60);
+        if (done) {
+          out.filled.push(shown);
+          if (!this.unrecordedAnswered.includes(shown)) this.unrecordedAnswered.push(shown);
+          // The value landed and was read back; only the RECIPE is aging (it has no step for this).
+          this.agingNotes.push(`answered "${shown}" from ${ans.kind === "bound" ? ans.key : ans.why} — a required control the recipe has no step for`);
+        } else {
+          this.driftWarnings.push(`"${shown}" is required and the recipe has no step for it; ${ans.kind === "bound" ? ans.key : "the standing answer"} could not be entered — enter it by hand before submit`);
+        }
       }
-      // THIS control, exactly: by its id when it has one, else by its place among the controls that
-      // share its label — the label alone resolves to the first of them, which may be the filled one.
-      const rawId = String(rawFields[i]?.id ?? "");
-      const selector: RecipeSelector = rawId
-        ? { css: `[id=${JSON.stringify(rawId)}]` }
-        : (labelCount.get(name) ?? 0) > 1 ? { ...f.selector, nth } : f.selector;
-      const loc = await this.resolveLocator(selector).catch(() => null);
-      if (!loc || typeof loc.first !== "function") continue;
-      const control = loc.first();
-      // ON THE PAGE: what the sweep counts (a box), never a display:none twin of a visible control.
-      const box = await control.boundingBox({ timeout: 2000 }).catch(() => null);
-      if (!box || (box.width <= 0 && box.height <= 0)) continue;
-      // NEVER OVER A VALUE: the sweep's own reading (controlReadsUnanswered — a "-- Select --" with a
-      // value attribute is unanswered to both), asked of this control now.
-      const empty = await control.evaluate(controlReadsUnanswered).catch(() => null);
-      if (empty !== true) continue;
-      answered.add(name);
-      const step = {
-        action: f.fieldType === "select" || (f.fieldType === "other" && (f.options?.length ?? 0) > 0) ? "select" : "fill",
-        phase: "fill",
-        selector,
-        note: f.label.replace(/\s+/g, " ").trim().slice(0, 120),
-        ...(ans.kind === "bound" ? { field: ans.key } : { value: ans.value }),
-      } as RecipeStep;
-      const done = await this.executeStep(step, false).catch(() => false);
-      const shown = f.label.replace(/\s+/g, " ").trim().slice(0, 60);
-      if (done) {
-        out.filled.push(shown);
-        if (!this.unrecordedAnswered.includes(shown)) this.unrecordedAnswered.push(shown);
-        // The value landed and was read back; only the RECIPE is aging (it has no step for this).
-        this.agingNotes.push(`answered "${shown}" from ${ans.kind === "bound" ? ans.key : ans.why} — a required control the recipe has no step for`);
-      } else {
-        this.driftWarnings.push(`"${shown}" is required and the recipe has no step for it; ${ans.kind === "bound" ? ans.key : "the standing answer"} could not be entered — enter it by hand before submit`);
+    } finally {
+      // The stamp is ours: take it off the portal's page once the pass is done.
+      if (stamped) {
+        await this.page.evaluate((attr: string) => {
+          document.querySelectorAll(`[${attr}]`).forEach((el) => el.removeAttribute(attr));
+        }, PINNED_CONTROL_ATTR).catch(() => null);
       }
     }
     return out;

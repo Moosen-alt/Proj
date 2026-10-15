@@ -26,6 +26,10 @@
 //       the placeholder reads unanswered (the sweep's own predicate) so the knife-blade gets its Yes;
 //   [F] (round 2) a DC disconnect's part with the AC part on file: never filed into it — the run stops
 //       naming it;
+//   [N] (round 3) no ids, <label>-wrapped: a filled "Disconnect Switch Model", an optional "Disconnect
+//       Switch Model Notes" textarea, then the empty one — Notes is never written, the empty one gets
+//       DG221URB (the pass writes only the element the sweep found empty);
+//   [M] (round 3) two EMPTY same-name boxes with no ids — neither is typed; the run stops by name;
 //   [L] the LEARNER's Calculate (clickComputeButton) returns only once the result is on the page,
 //       so its rescan sees the four controls and its policy pass records the two Yes/No answers.
 //
@@ -96,6 +100,31 @@ ${req("DTYPEInput", LABEL.knife, yesNo("DTYPEInput", "discKnife"))}
 ${req("DDISTInput", LABEL.dist, yesNo("DDISTInput", "discDist"))}
 `;
 
+// [N] (PR #353 round 3 — the round-2 review's probe N1): controls with NO id, each wrapped in its
+// <label>. A FILLED "Disconnect Switch Model", then an OPTIONAL "Disconnect Switch Model Notes"
+// textarea (a label that CONTAINS the model's), then the EMPTY "Disconnect Switch Model" the sweep
+// names. Round 2 re-resolved the name by label + ordinal; a label match is a substring match, so
+// ordinal 1 was the Notes box: the AC part went there and the required box stayed blank.
+const plainLabelled = (label: string, control: string): string => `<div class="p-2"><label>${label} ${control}</label></div>`;
+const SECTION_N = `<div class="literal-element"><b>Pacific Power requires a knife blade type, visible, lockable disconnect.</b></div>
+${req("DMAKEInput", LABEL.make, '<input class="form-control" type="text" id="DMAKEInput" data-test-role="textbox-element" maxlength="2048" required data-k="discMake">')}
+${plainLabelled(LABEL.model, '<input class="form-control" type="text" required data-k="discModel" value="QO">')}
+${plainLabelled(`${LABEL.model} Notes`, '<textarea class="form-control" data-k="discNotes"></textarea>')}
+${plainLabelled(LABEL.model, '<input class="form-control" type="text" required data-k="discModel2">')}
+${req("DTYPEInput", LABEL.knife, yesNo("DTYPEInput", "discKnife"))}
+${req("DDISTInput", LABEL.dist, yesNo("DDISTInput", "discDist"))}
+`;
+
+// [M] (PR #353 round 3): TWO EMPTY required "Disconnect Switch Model" boxes with no ids. Nothing on the
+// page says which one the sweep's name means, so neither is typed: the run stops by name.
+const SECTION_M = `<div class="literal-element"><b>Pacific Power requires a knife blade type, visible, lockable disconnect.</b></div>
+${req("DMAKEInput", LABEL.make, '<input class="form-control" type="text" id="DMAKEInput" data-test-role="textbox-element" maxlength="2048" required data-k="discMake">')}
+${plainLabelled(LABEL.model, '<input class="form-control" type="text" required data-k="discModel">')}
+${plainLabelled(LABEL.model, '<input class="form-control" type="text" required data-k="discModel2">')}
+${req("DTYPEInput", LABEL.knife, yesNo("DTYPEInput", "discKnife"))}
+${req("DDISTInput", LABEL.dist, yesNo("DDISTInput", "discDist"))}
+`;
+
 const SPEC_PAGE = `<!doctype html><html><head><meta charset="utf-8"><style>
   body{font:14px sans-serif;padding:12px} .loader{display:flex;justify-content:center}
   .spinner-border{width:24px;height:24px;border:3px solid #888;border-right-color:transparent;border-radius:50%;animation:s .8s linear infinite}
@@ -111,7 +140,7 @@ const SPEC_PAGE = `<!doctype html><html><head><meta charset="utf-8"><style>
   ${req("MACCInput", LABEL.meterAccess, '<select class="form-select" id="MACCInput" data-test-role="dropdownlist-element" required data-k="meterAccess"><option value="">Select...</option><option value="13">None</option><option value="14">Dog at residence</option><option value="15">Locked gate</option><option value="17">Other</option></select>')}
   <button id="next" type="button">Next</button>
   <script>
-    var server = { exportKw: "", discMake: "", discMake2: "", hiddenMake: "", dcMake: "", discModel: "", discKnife: "", discDist: "", meterLoc: "", meterAccess: "", calculated: false };
+    var server = { exportKw: "", discMake: "", discMake2: "", hiddenMake: "", dcMake: "", discModel: "", discModel2: "", discNotes: "", discKnife: "", discDist: "", meterLoc: "", meterAccess: "", calculated: false };
     window.__server = server;
     // PER-FIELD AUTOSAVE on blur / change (a select saves its visible option text). A box the
     // portal rendered already holding a value starts the server with it.
@@ -125,7 +154,7 @@ const SPEC_PAGE = `<!doctype html><html><head><meta charset="utf-8"><style>
     }
     wire(document);
     var V = new URLSearchParams(location.search).get("v") || "";
-    var SECTION = V === "e" ? ${JSON.stringify(SECTION_E)} : V === "f" ? ${JSON.stringify(SECTION_F)} : ${JSON.stringify(SECTION)};
+    var SECTION = V === "e" ? ${JSON.stringify(SECTION_E)} : V === "f" ? ${JSON.stringify(SECTION_F)} : V === "n" ? ${JSON.stringify(SECTION_N)} : V === "m" ? ${JSON.stringify(SECTION_M)} : ${JSON.stringify(SECTION)};
     // CALCULATE: spinner in the loader, the stale marker stays, the server answers later; the
     // disconnect section renders only when the computed rating requires it (over 10 kW here).
     document.getElementById("calc").addEventListener("click", function () {
@@ -284,6 +313,32 @@ check("[F] the AC part is never filed into the DC disconnect's box", F.committed
 check("[F] the run stops before review, naming the DC disconnect within the first 300 characters, a person's to finish",
   F.r.ok === false && !atReview(F) && fMsg.slice(0, 300).includes(DC_MAKE) && F.data.needsHuman === true, outline(F));
 check("[F] nothing was filed", F.filed === false, outline(F));
+
+console.log("\n[N] no ids, <label>-wrapped: a filled \"Disconnect Switch Model\", an optional \"Disconnect Switch Model Notes\", then the EMPTY one");
+const N = await run({ totalExportKw: "16.128", disconnectMake: "Eaton", disconnectModel: "DG221URB", disconnectWithin10ft: "" }, "/?v=n");
+console.log(`   ${outline(N)}`);
+const nMsg = String(N.r.message ?? "");
+check("[N] the Notes box (a label that merely CONTAINS the model's) is never written", N.committed.discNotes === "", outline(N));
+check("[N] the filled namesake keeps its value (QO)", N.committed.discModel === "QO", outline(N));
+check("[N] the EMPTY namesake the sweep named gets DG221URB and the run reaches review — or the run stops naming it with nothing typed",
+  (atReview(N) && N.committed.discModel2 === "DG221URB")
+    || (N.r.ok === false && !atReview(N) && nMsg.slice(0, 300).includes(LABEL.model) && N.committed.discModel2 === "" && N.data.needsHuman === true),
+  outline(N));
+check("[N] the answer is reported only for a control that holds it (no \"answered\" note over a blank required box)",
+  !(((N.data.agingNotes as string[] | undefined) ?? []).some((n) => n.includes(`answered "${LABEL.model}"`))) || N.committed.discModel2 === "DG221URB",
+  `${outline(N)} aging=${JSON.stringify(N.data.agingNotes ?? []).slice(0, 400)}`);
+check("[N] nothing was filed", N.filed === false, outline(N));
+
+console.log("\n[M] no ids: TWO empty required \"Disconnect Switch Model\" boxes — nothing says which one the name means");
+const M = await run({ totalExportKw: "16.128", disconnectMake: "Eaton", disconnectModel: "DG221URB", disconnectWithin10ft: "" }, "/?v=m");
+console.log(`   ${outline(M)}`);
+const mMsg = String(M.r.message ?? "");
+check("[M] neither namesake is typed into (never a guess between two)", M.committed.discModel === "" && M.committed.discModel2 === "", outline(M));
+check("[M] the run stops before review, naming the control within the first 300 characters, a person's to finish",
+  M.r.ok === false && !atReview(M) && mMsg.slice(0, 300).includes(LABEL.model) && M.data.needsHuman === true, outline(M));
+check("[M] the stop says the value is on file but the control could not be told apart (not \"no part on file\")",
+  /could not be told apart/.test(mMsg) && !/no AC disconnect part is on file/.test(mMsg), mMsg.slice(0, 600));
+check("[M] nothing was filed", M.filed === false, outline(M));
 
 // ---------------------------------------------------------------------------
 // [L] THE LEARNER'S Calculate: a fresh learn must SEE the section to record it. The learner clicks
