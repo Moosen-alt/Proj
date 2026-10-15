@@ -7,7 +7,7 @@
 //
 // Run: npx tsx portal-bot/src/unrecordedControls.test.ts
 import assert from "node:assert/strict";
-import { answerForUnrecordedControl, disconnectPartKeyFor, missingRequiredStopMessage } from "./unrecordedControls";
+import { answerForUnrecordedControl, disconnectPartKeyFor, missingRequiredStopMessage, readDisconnectPart } from "./unrecordedControls";
 import { policyDefaultAnswerFor, policyScopeFor } from "./adapters/autoLearnAdapter";
 import { operatorPolicyAnswer } from "../../shared/src/perJobQuestions";
 
@@ -18,6 +18,8 @@ const check = (label: string, fn: () => void): void => {
 };
 
 const YES_NO = ["Select...", "Yes", "No"];
+/** The value an answer would type, or undefined (an "unbound" answer types nothing). */
+const valueOf = (a: ReturnType<typeof answerForUnrecordedControl>): string | undefined => (a && "value" in a ? a.value : undefined);
 const KNIFE = "Please indicate if the AC disconnect(s) for this installation are manually operated, lockable, load break, accessible, and has a visible open (knife blade type).";
 const DIST = "Are the AC disconnect(s) for this installation within the states required distance from the utility meter?  (California - 3 Ft., Oregon - 10 Ft., Washington - 3 Ft.)";
 const STD = { disconnectMake: "Eaton", disconnectModel: "DG221URB", disconnectMakeModel: "Eaton DG221URB", disconnectWithin10ft: "" };
@@ -41,13 +43,62 @@ check("MUST-EXCLUDE: another device's disconnect, a question about the disconnec
   assert.equal(disconnectPartKeyFor(KNIFE), null);
 });
 
+// PR #353 round 2: the AC disconnect's part (the client's standard Eaton DG221URB) was bound into a DC
+// disconnect's, a rapid-shutdown disconnect's and an inverter's DC disconnect's fields. Both directions.
+const NOT_THE_AC_DISCONNECT = [
+  "DC Disconnect Manufacturer",
+  "DC Disconnect Switch Model",
+  "Inverter DC Disconnect Make",
+  "Rapid Shutdown Disconnect Manufacturer",
+  "RSD Disconnect Model",
+  "Inverter Disconnect Manufacturer",
+  "Combiner Box Disconnect Model",
+  "Main Service Disconnect Manufacturer",
+  "AC/DC Disconnect Model",
+  "Battery Disconnect Manufacturer",
+  "EV Charger Disconnect Model",
+];
+const THE_AC_DISCONNECT: Array<[string, string]> = [
+  ["Disconnect Switch Manufacturer", "disconnectMake"],
+  ["Disconnect Switch Model", "disconnectModel"],
+  ["AC Disconnect Make/Model", "disconnectMakeModel"],
+  ["Inverter AC Disconnect Manufacturer", "disconnectMake"],
+  ["Utility AC Disconnect Model", "disconnectModel"],
+  ["Fused AC Disconnect Manufacturer", "disconnectMake"],
+  ["Non-Fused Disconnect Switch Model", "disconnectModel"],
+  ["Visible, Lockable Disconnect Brand", "disconnectMake"],
+];
+check("MUST-EXCLUDE: a DC / rapid-shutdown / inverter / combiner / service / storage disconnect is never bound to the AC disconnect's keys", () => {
+  for (const label of NOT_THE_AC_DISCONNECT) {
+    assert.equal(disconnectPartKeyFor(label), null, label);
+    assert.equal(readDisconnectPart(label)?.acDisconnect, false, label);
+  }
+});
+check("MUST-PASS: the AC disconnect, named or bare, binds to its keys", () => {
+  for (const [label, key] of THE_AC_DISCONNECT) {
+    assert.equal(disconnectPartKeyFor(label), key, label);
+    assert.deepEqual(answerForUnrecordedControl({ label, fieldType: "text" }, STD, "nem"),
+      { kind: "bound", key, value: (STD as Record<string, string>)[key] }, label);
+  }
+});
+check("another equipment's disconnect part is recognized and never typed — it stops by name (unbound), with the AC part on file", () => {
+  for (const label of NOT_THE_AC_DISCONNECT) {
+    const ans = answerForUnrecordedControl({ label, fieldType: "text" }, STD, "nem");
+    assert.equal(ans?.kind, "unbound", `${label} → ${JSON.stringify(ans)}`);
+    assert.ok(!("value" in (ans ?? {})), `${label} carries no value to type: ${JSON.stringify(ans)}`);
+  }
+  const msg = missingRequiredStopMessage('"advance: Next"', [{ label: "DC Disconnect Manufacturer", key: null }]);
+  assert.ok(msg.slice(0, 300).includes("DC Disconnect Manufacturer"), msg);
+  assert.ok(/no value was supplied/.test(msg) && /another piece of equipment's disconnect/.test(msg), msg);
+});
+
 check("PacifiCorp's section: make/model bound to the project's part, knife-blade and distance standing Yes", () => {
   assert.deepEqual(answerForUnrecordedControl({ label: "Disconnect Switch Manufacturer", fieldType: "text" }, STD, "nem"), { kind: "bound", key: "disconnectMake", value: "Eaton" });
   assert.deepEqual(answerForUnrecordedControl({ label: "Disconnect Switch Model", fieldType: "text" }, STD, "nem"), { kind: "bound", key: "disconnectModel", value: "DG221URB" });
-  assert.equal(answerForUnrecordedControl({ label: KNIFE, fieldType: "select", options: YES_NO }, STD, "nem")?.value, "Yes");
+  assert.equal(valueOf(answerForUnrecordedControl({ label: KNIFE, fieldType: "select", options: YES_NO }, STD, "nem")), "Yes");
   const dist = answerForUnrecordedControl({ label: DIST, fieldType: "select", options: YES_NO }, STD, "nem");
   assert.equal(dist?.kind, "policy");
-  assert.equal(dist?.value, "Yes");
+  assert.equal(valueOf(dist), "Yes");
 });
 
 // PR #353 round 2: the standing answer is read BY THE KEY the per-job rule returned, not by re-matching

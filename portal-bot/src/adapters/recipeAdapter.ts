@@ -113,7 +113,7 @@ import { performLogin, portalErrorPage } from "./loginFlow";
 import { chooseCorrectionForm, correctionFormSelector, isRefusal, scanProjectForms, type ProjectFormRow } from "./correctionForm";
 import { type ExtractedField, EXTRACT_SEL, extractFieldsInPage, toExtractedField, dismissPageModals, clearPageOverlays, equipmentMakeCandidates, pageFingerprintOf, collectValidationErrorsFrom, acaApplyEntryFrom, advanceSignatureOf } from "./autoLearnAdapter";
 import { tagUploadControls, visibleBodyText, policyScopeFor } from "./autoLearnAdapter";
-import { answerForUnrecordedControl, missingRequiredStopMessage } from "../unrecordedControls";
+import { answerForUnrecordedControl, missingRequiredStopMessage, type MissingRequired } from "../unrecordedControls";
 import { isComputeTotalsStep, prepareComputeSettle, waitForComputeSettled } from "../computeSettle";
 import { portalSaysNotServed } from "../../../shared/src/portalNotServed";
 
@@ -7657,8 +7657,8 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  are the same as a recorded step's. Never overwrites: a control is touched only when it reads
    *  empty. A control it knows but this job has NO value for is returned in `missing` — the caller
    *  stops the run by name; it is never typed blank and never guessed. */
-  private async answerUnrecordedRequired(): Promise<{ filled: string[]; missing: Array<{ label: string; key: string }> }> {
-    const out = { filled: [] as string[], missing: [] as Array<{ label: string; key: string }> };
+  private async answerUnrecordedRequired(): Promise<{ filled: string[]; missing: MissingRequired[] }> {
+    const out = { filled: [] as string[], missing: [] as MissingRequired[] };
     if (!this.page || typeof this.page.$$eval !== "function" || typeof this.page.evaluate !== "function") return out;
     const swept = await this.sweepRequired().catch(() => null);
     if (!swept || !swept.empty.length) return out;
@@ -7676,6 +7676,8 @@ export class RecipeAdapter extends BasePortalAdapter {
       seen.add(name);
       const ans = answerForUnrecordedControl(f, this.fieldValues, scope);
       if (!ans) continue;
+      // Another piece of equipment's disconnect part: no project key answers it, never typed.
+      if (ans.kind === "unbound") { out.missing.push({ label: f.label, key: null }); continue; }
       if (!ans.value) {
         if (ans.kind === "bound") out.missing.push({ label: f.label, key: ans.key });
         continue;
@@ -7719,7 +7721,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  reads as the project's data (never the recipe's drift), so the recipe is neither demoted nor
    *  flagged for it. */
   private async stopForMissingRequired(
-    missing: Array<{ label: string; key: string }>,
+    missing: MissingRequired[],
     before: string,
     data: Record<string, unknown>,
   ): Promise<PortalStepResult> {
