@@ -31,6 +31,7 @@
 // ---------------------------------------------------------------------------------------------
 
 import type { RecipeSelector } from "./types";
+import type { InfoPageIdentityMaterial } from "./infoPagePass";
 
 /** What a page tells us about itself when classifying a control on it. Every field optional:
  *  an absent field means UNKNOWN, and each predicate says which way unknown falls. */
@@ -1651,7 +1652,303 @@ export function portalSafetyFactory() {
     return "";
   };
 
+  // THE PLAIN WAY FORWARD ON AN INFORMATION INTERSTITIAL (#341; moved here from autoLearnAdapter.ts
+  // unchanged for #344, so the information-page pass and the learner read ONE answer). The WHOLE
+  // label is a bare forward word — Next / Continue / Proceed / Begin / Start / Get Started —
+  // optionally arrowed or "Save and …" (review 1: a label that merely STARTS with one, "Next
+  // Record", "Continue Draft", is not it). Never a backward or exit control (Previous / Back /
+  // Cancel / Exit / Save and Exit / Continue Later), never anything the shared final-submit reading
+  // or the pay list claims. A word after the forward word names WHAT the click continues ("Next
+  // Record", "Continue Draft", "Continue Renewal", "Proceed with Deletion"), and that is somebody's
+  // record or an action on it, never the page's way forward.
+  const INTERSTITIAL_FORWARD = /^\s*(save\s+and\s+)?(next|continue|proceed|begin|start|get\s+started)\s*[»›>→]*\s*$/i;
+  const BACKWARD_OR_EXIT = /\b(previous|prev|back|cancel|exit|close|later|quit)\b/i;
+  const isInterstitialForwardLabel = (label: string | undefined | null): boolean => {
+    const t = String(label ?? "").replace(/\s+/g, " ").trim();
+    if (!t || t.length > 40) return false;
+    if (BACKWARD_OR_EXIT.test(t)) return false;
+    if (isPayFee(t) || isFinalSubmitControl(t)) return false;
+    return INTERSTITIAL_FORWARD.test(t);
+  };
+
+  /**
+   * Runs IN THE PAGE: THE INFORMATION PAGE'S IDENTITY (#344, option B) — the one reading a
+   * human-verified pass is matched on. Read ONLY by the network backstop (openInfoPagePass), fresh,
+   * on the exact control it is about to admit; hashed in Node (shared/src/infoPagePass.ts). Any
+   * change to what it returns must bump INFO_PAGE_IDENTITY_VERSION (it voids every pass: re-verify).
+   *
+   * WHAT IT READS: the address (origin, path, query), the title, every heading, every form (method,
+   * enctype, action, target and each element's tag / type / name, hidden values), every fillable
+   * control VISIBLE OR NOT, every clickable (links by origin + path + query KEYS), every frame, the
+   * body's textContent — NOT innerText, so the CSS state a run changes (dismissed modals, scrim
+   * bypass, data-al-invisible) does not move it — and what the control sends, built per the HTML
+   * entry-list rules. NEVER an element's id or class (a form's id/name aside), any data-al-* mark,
+   * a style, or the value of anything but a hidden input.
+   *
+   * CLOBBERING-SAFE: form and button facts come from the DOM prototypes' own getters and
+   * Element.prototype.getAttribute, never from properties a named element can shadow. Walks the LIVE
+   * DOM (no clone: cloning runs custom-element constructors). Threat model: a benign portal.
+   *
+   * THE ONE MASK: at most one button[type=button] with aria-expanded / aria-haspopup, outside every
+   * form, inside a header / banner / nav landmark, of 60 chars or fewer (a signed-in account toggle),
+   * reads as "‹toggle›" — it cannot send the request. Two that qualify refuse the read.
+   *
+   * Refuses ({ ok: false, why }) — never a partial identity — when the control is not one named
+   * effective submit button with a form owner, an open shadow root or a form-associated custom
+   * element exists, the form carries a file input or an image submitter is the control, an attribute
+   * read is not a string, or the body is over 200 000 chars.
+   */
+  const INFO_PAGE_IDENTITY_VERSION = 1;
+  const infoPageIdentityInPage = (control: Element | null | undefined): { ok: true; material: InfoPageIdentityMaterial } | { ok: false; why: string } => {
+    const g = globalThis as unknown as Record<string, any>; // eslint-disable-line @typescript-eslint/no-explicit-any
+    const d = g.document as Document | undefined;
+    if (!d || !control) return { ok: false, why: "no document or no control" };
+    const fail = (why: string): { ok: false; why: string } => ({ ok: false, why });
+    try {
+      const EP = g.Element.prototype;
+      const NP = g.Node.prototype;
+      const DP = g.Document.prototype;
+      const getterOf = (proto: unknown, prop: string): ((this: unknown) => unknown) | null => {
+        let p: unknown = proto;
+        while (p) {
+          const desc = Object.getOwnPropertyDescriptor(p, prop);
+          if (desc && typeof desc.get === "function") return desc.get as (this: unknown) => unknown;
+          p = Object.getPrototypeOf(p);
+        }
+        return null;
+      };
+      let badAttr = false;
+      const attr = (el: Element, name: string): string | null => {
+        const v = EP.getAttribute.call(el, name);
+        if (v !== null && typeof v !== "string") { badAttr = true; return null; }
+        return v;
+      };
+      const localNameGet = getterOf(EP, "localName");
+      const tagOf = (el: Element): string => String(localNameGet ? localNameGet.call(el) : "").toLowerCase();
+      const qsa = (root: unknown, sel: string): Element[] => Array.from((root === d ? DP : EP).querySelectorAll.call(root, sel) as ArrayLike<Element>);
+      const closest = (el: Element, sel: string): Element | null => EP.closest.call(el, sel) as Element | null;
+      const matches = (el: Element, sel: string): boolean => { try { return !!EP.matches.call(el, sel); } catch { return false; } };
+      const contains = (a: Node, b: Node): boolean => !!NP.contains.call(a, b);
+      const textContentGet = getterOf(NP, "textContent");
+      const textOf = (n: Node): string => String((textContentGet ? textContentGet.call(n) : "") ?? "");
+      const collapse = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
+      const shadowGet = getterOf(EP, "shadowRoot");
+      const formGetters: Record<string, ((this: unknown) => unknown) | null> = {
+        button: getterOf(g.HTMLButtonElement.prototype, "form"),
+        input: getterOf(g.HTMLInputElement.prototype, "form"),
+        select: getterOf(g.HTMLSelectElement.prototype, "form"),
+        textarea: getterOf(g.HTMLTextAreaElement.prototype, "form"),
+      };
+      const formOf = (el: Element): HTMLFormElement | null => {
+        const get = formGetters[tagOf(el)];
+        return get ? (get.call(el) as HTMLFormElement | null) : null;
+      };
+      const elementsGet = getterOf(g.HTMLFormElement.prototype, "elements");
+      const elementsOf = (f: HTMLFormElement): Element[] => Array.from((elementsGet ? elementsGet.call(f) : []) as ArrayLike<Element>);
+      const inputValueGet = getterOf(g.HTMLInputElement.prototype, "value");
+      const inputCheckedGet = getterOf(g.HTMLInputElement.prototype, "checked");
+      const textareaValueGet = getterOf(g.HTMLTextAreaElement.prototype, "value");
+      const optionsGet = getterOf(g.HTMLSelectElement.prototype, "options");
+      const optionSelectedGet = getterOf(g.HTMLOptionElement.prototype, "selected");
+      const optionValueGet = getterOf(g.HTMLOptionElement.prototype, "value");
+      const titleGet = getterOf(DP, "title");
+      const bodyGet = getterOf(DP, "body");
+      const urlGet = getterOf(DP, "URL");
+      const baseURIGet = getterOf(NP, "baseURI");
+      const body = (bodyGet ? bodyGet.call(d) : null) as HTMLElement | null;
+      if (!body) return fail("the page has no body");
+      const docUrl = String(urlGet ? urlGet.call(d) : "");
+      const baseUri = String(baseURIGet ? baseURIGet.call(d) : docUrl);
+      const resolve = (u: string): URL | null => { try { return new URL(u, baseUri); } catch { return null; } };
+      const placeKey = (u: URL | null): string => {
+        if (!u) return "";
+        const keys = Array.from(new Set(Array.from(u.searchParams.keys()))).sort();
+        return `${u.protocol === "http:" || u.protocol === "https:" ? u.origin : u.protocol}${u.pathname}${keys.length ? `?${keys.join("&")}` : ""}`;
+      };
+      const loc = resolve(docUrl);
+      if (!loc) return fail("the page's address could not be read");
+      const all = qsa(d, "*");
+      // Refusals first: nothing partial is ever returned.
+      if (all.some((el) => !!(shadowGet && shadowGet.call(el)))) return fail("the page has an open shadow root the identity cannot read");
+      const ce = g.customElements;
+      if (all.some((el) => { const n = tagOf(el); return n.includes("-") && !!ce && !!(ce.get(n) && (ce.get(n) as { formAssociated?: boolean }).formAssociated); })) {
+        return fail("the page carries a form-associated custom element");
+      }
+      const allText = textOf(body);
+      if (allText.length > 200_000) return fail("the page's text is over 200 000 characters");
+      // The control: one named, effective SUBMIT button with a form owner.
+      const ctag = tagOf(control);
+      const ctypeAttr = String(attr(control, "type") ?? "").trim().toLowerCase();
+      const ctype = ctag === "button" ? (ctypeAttr === "button" || ctypeAttr === "reset" ? ctypeAttr : "submit") : ctag === "input" ? (ctypeAttr || "text") : "";
+      if (ctag === "input" && ctype === "image") return fail("the control is an image submitter");
+      if (!((ctag === "button" && ctype === "submit") || (ctag === "input" && ctype === "submit"))) return fail("the control is not a submit button");
+      const cname = attr(control, "name") ?? "";
+      if (!cname) return fail("the control has no name");
+      const form = formOf(control);
+      if (!form) return fail("the control has no form");
+      const forms = qsa(d, "form") as HTMLFormElement[];
+      const formIndexOf = (el: Element): number => { const f = formOf(el); return f ? forms.indexOf(f) : -1; };
+      const formElements = elementsOf(form);
+      if (formElements.some((el) => tagOf(el) === "input" && String(attr(el, "type") ?? "").toLowerCase() === "file")) return fail("the control's form carries a file input");
+      // Effective method / enctype / action / target, per HTML (formX on the submitter wins).
+      const normMethod = (v: string | null): string => { const m = String(v ?? "").trim().toLowerCase(); return m === "post" || m === "dialog" || m === "get" ? m : "get"; };
+      const normEnctype = (v: string | null): string => {
+        const e = String(v ?? "").trim().toLowerCase();
+        return e === "multipart/form-data" || e === "text/plain" ? e : "application/x-www-form-urlencoded";
+      };
+      const fm = attr(control, "formmethod");
+      const method = normMethod(fm !== null ? fm : attr(form, "method"));
+      const fe = attr(control, "formenctype");
+      const enctype = normEnctype(fe !== null ? fe : attr(form, "enctype"));
+      const fa = attr(control, "formaction");
+      const actionAttr = fa !== null ? fa : attr(form, "action");
+      const actionUrl = resolve(actionAttr && actionAttr.trim() ? actionAttr.trim() : docUrl);
+      if (!actionUrl) return fail("the form's action could not be resolved");
+      actionUrl.hash = "";
+      const ft = attr(control, "formtarget");
+      const target = String((ft !== null ? ft : attr(form, "target")) ?? "").trim();
+      const baseEl = qsa(d, "base[target]")[0];
+      const baseTarget = baseEl ? String(attr(baseEl, "target") ?? "").trim() : "";
+      // The entry list this control's submission sends (tree order; the submitter at its place).
+      const entries: Array<[string, string]> = [];
+      const hiddenNames: string[] = [];
+      for (const el of formElements) {
+        const t = tagOf(el);
+        const name = attr(el, "name") ?? "";
+        const ty = String(attr(el, "type") ?? "").trim().toLowerCase();
+        if (t === "input" && ty === "hidden" && name) hiddenNames.push(name);
+        if (!name || matches(el, ":disabled")) continue;
+        if (t === "button") { if (el === control) entries.push([name, attr(el, "value") ?? ""]); continue; }
+        if (t === "input") {
+          if (/^(submit|image|button|reset)$/.test(ty)) { if (el === control) entries.push([name, attr(el, "value") ?? ""]); continue; }
+          if (ty === "checkbox" || ty === "radio") {
+            if (inputCheckedGet && inputCheckedGet.call(el)) entries.push([name, attr(el, "value") ?? "on"]);
+            continue;
+          }
+          entries.push([name, String(inputValueGet ? inputValueGet.call(el) : "")]);
+          continue;
+        }
+        if (t === "select") {
+          const opts = Array.from((optionsGet ? optionsGet.call(el) : []) as ArrayLike<Element>);
+          for (const o of opts) {
+            if (optionSelectedGet && optionSelectedGet.call(o) && !matches(o, ":disabled")) entries.push([name, String(optionValueGet ? optionValueGet.call(o) : "")]);
+          }
+          continue;
+        }
+        if (t === "textarea") { entries.push([name, String(textareaValueGet ? textareaValueGet.call(el) : "")]); continue; }
+      }
+      // Structure.
+      const headings: Array<[string, string]> = qsa(d, "h1, h2, h3, h4, h5, h6, [role=heading]").map((h) => {
+        const t = tagOf(h);
+        const lvl = /^h[1-6]$/.test(t) ? t.slice(1) : String(attr(h, "aria-level") ?? "");
+        return [lvl, collapse(textOf(h))];
+      });
+      const formsOut = forms.map((f) => {
+        const fact = resolve(String(attr(f, "action") ?? "").trim() || docUrl);
+        if (fact) fact.hash = "";
+        return {
+          id: attr(f, "id") ?? "",
+          name: attr(f, "name") ?? "",
+          method: normMethod(attr(f, "method")),
+          enctype: normEnctype(attr(f, "enctype")),
+          action: fact ? fact.toString() : "",
+          target: String(attr(f, "target") ?? ""),
+          elements: elementsOf(f).map((el): [string, string, string, string | null] => {
+            const t = tagOf(el);
+            const ty = String(attr(el, "type") ?? "").trim().toLowerCase();
+            const hidden = t === "input" && ty === "hidden";
+            return [t, ty, attr(el, "name") ?? "", hidden ? String(inputValueGet ? inputValueGet.call(el) : "") : null];
+          }),
+        };
+      });
+      const fillable: Array<[string, string, string, number]> = qsa(d, "input, select, textarea, [contenteditable]").filter((el) => {
+        const t = tagOf(el);
+        if (t === "input") return !/^(hidden|submit|button|image|reset)$/.test(String(attr(el, "type") ?? "").trim().toLowerCase());
+        if (t === "select" || t === "textarea") return true;
+        return String(attr(el, "contenteditable") ?? "").trim().toLowerCase() !== "false";
+      }).map((el) => [tagOf(el), String(attr(el, "type") ?? "").trim().toLowerCase(), attr(el, "name") ?? "", formIndexOf(el)]);
+      const clickables: Array<[string, string, string, number, string]> = qsa(d, "button, input[type=submit], input[type=button], input[type=image], input[type=reset], a[href], [role=button], [role=link]").map((el) => {
+        const t = tagOf(el);
+        const href = t === "a" ? attr(el, "href") : null;
+        return [t, String(attr(el, "type") ?? "").trim().toLowerCase(), attr(el, "name") ?? "", formIndexOf(el), href !== null ? placeKey(resolve(href)) : ""];
+      });
+      const frames: Array<[string, string, number, number, boolean]> = qsa(d, "iframe, frame, object, embed").map((el) => {
+        const t = tagOf(el);
+        const src = t === "object" ? attr(el, "data") : attr(el, "src");
+        const u = src && src.trim() ? resolve(src.trim()) : null;
+        const r = EP.getBoundingClientRect.call(el) as DOMRect;
+        const sameOrigin = !u || u.protocol === "about:" || attr(el, "srcdoc") !== null || u.origin === loc.origin;
+        return [t, u ? `${u.protocol === "http:" || u.protocol === "https:" ? u.origin : u.protocol}${u.pathname}` : "", Math.round(r.width), Math.round(r.height), sameOrigin];
+      });
+      const CHROME = "header, footer, nav, [role=banner], [role=contentinfo], [role=navigation]";
+      const summaries = qsa(d, "dl, dd, th");
+      const summaryOutsideChrome = summaries.filter((el) => !closest(el, CHROME)).length;
+      const summaryInForm = summaries.filter((el) => contains(form, el)).length;
+      const controlLabels = qsa(d, "button, input[type=submit], input[type=button], input[type=image], [role=button]").map((el) => collapse(controlLabelInPage(el)));
+      const customFormElements = 0;
+      // The one tenant mask.
+      const maskable = qsa(d, "button").filter((el) => String(attr(el, "type") ?? "").trim().toLowerCase() === "button"
+        && (attr(el, "aria-expanded") !== null || attr(el, "aria-haspopup") !== null)
+        && !formOf(el) && !closest(el, "form")
+        && !!closest(el, "header, nav, [role=banner], [role=navigation]")
+        && collapse(textOf(el)).length <= 60);
+      if (maskable.length > 1) return fail("more than one control qualifies for the tenant mask");
+      const masked = maskable[0] ?? null;
+      // The text: the LIVE body walked (script / style / noscript / template skipped), the masked
+      // toggle's whole text replaced by one token.
+      const parts: string[] = [];
+      const SKIP = new Set(["script", "style", "noscript", "template"]);
+      const NF = g.NodeFilter;
+      const walker = DP.createTreeWalker.call(d, body, NF.SHOW_ELEMENT | NF.SHOW_TEXT, {
+        acceptNode: (n: Node): number => {
+          if (n.nodeType === 3) { parts.push(String((n as Text).data ?? "")); return NF.FILTER_SKIP; }
+          const el = n as Element;
+          if (SKIP.has(tagOf(el))) return NF.FILTER_REJECT;
+          if (masked && el === masked) { parts.push(" ‹toggle› "); return NF.FILTER_REJECT; }
+          return NF.FILTER_SKIP;
+        },
+      });
+      while (walker.nextNode()) { /* every node is collected in acceptNode */ }
+      if (badAttr) return fail("an attribute read did not return a string");
+      const submitters = elementsOf(form).filter((el) => {
+        const t = tagOf(el);
+        const ty = String(attr(el, "type") ?? "").trim().toLowerCase();
+        return (t === "button" && ty !== "button" && ty !== "reset") || (t === "input" && (ty === "submit" || ty === "image"));
+      });
+      const query: Array<[string, string]> = Array.from(loc.searchParams.entries()).map(([k, v]) => [k, v] as [string, string])
+        .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+      const material: InfoPageIdentityMaterial = {
+        version: INFO_PAGE_IDENTITY_VERSION,
+        page: { origin: loc.origin, path: loc.pathname, query },
+        title: collapse(titleGet ? titleGet.call(d) : ""),
+        structure: { headings, forms: formsOut, fillable, clickables, frames },
+        facts: {
+          fileInputsInForm: 0,
+          customFormElements,
+          summaryOutsideChrome,
+          summaryInForm,
+          controlLabels,
+          hiddenNames,
+          masked: masked ? 1 : 0,
+          baseTarget,
+        },
+        text: collapse(parts.join("")),
+        control: {
+          tag: ctag, type: ctype, name: cname, value: attr(control, "value") ?? "", label: collapse(controlLabelInPage(control)),
+          formIndex: forms.indexOf(form), submitterIndex: submitters.indexOf(control), method, action: actionUrl.toString(), enctype, target,
+        },
+        request: { method: method.toUpperCase(), url: actionUrl.toString(), media: enctype, body: entries },
+      };
+      return { ok: true, material };
+    } catch (e) {
+      return fail(`the page could not be read (${String((e as { message?: string })?.message ?? e).slice(0, 80)})`);
+    }
+  };
+
   return {
+    INFO_PAGE_IDENTITY_VERSION,
+    isInterstitialForwardLabel,
+    infoPageIdentityInPage,
     dismissalRefusalInPage,
     implicitSubmitInPage,
     implicitSubmitRefusalInPage,
@@ -1719,6 +2016,12 @@ export const isSignatureNameBox = impl.isSignatureNameBox;
 export const signatureNamePartOf = impl.signatureNamePartOf;
 export const splitSignerName = impl.splitSignerName;
 export const isTypeSignatureToggleLabel = impl.isTypeSignatureToggleLabel;
+/** The interstitial's plain forward control (#341) — the learner's c2i' and the information-page
+ *  pass (#344) read this one answer. */
+export const isInterstitialForwardLabel = impl.isInterstitialForwardLabel;
+/** Bump on ANY change to infoPageIdentityInPage's output: every verified information page is then
+ *  void (fail closed — a person verifies again). */
+export const INFO_PAGE_IDENTITY_VERSION = impl.INFO_PAGE_IDENTITY_VERSION;
 
 /** The minimum of a recorded step the form-data question needs. */
 export interface FormDataStep {

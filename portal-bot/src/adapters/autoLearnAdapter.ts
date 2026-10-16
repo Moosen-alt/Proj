@@ -49,7 +49,7 @@ export interface ContinueDraft {
    *  Submit; not signed, or unreadable, it stops on the record page and names why. */
   awaitingSignature?: boolean;
 }
-import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
+import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isInterstitialForwardLabel as sharedIsInterstitialForwardLabel, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
 import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
 import { hostOfUrl, sameCredentialScope } from "../siteOf";
@@ -908,24 +908,11 @@ function isPanelAdvanceLabel(label: string | undefined): boolean {
   return ADVANCE_ONLY.test(t);
 }
 
-/** THE PLAIN WAY FORWARD ON AN INFORMATION INTERSTITIAL (#341). The WHOLE label is a bare forward
- *  word — Next / Continue / Proceed / Begin / Start / Get Started — optionally arrowed or "Save and
- *  …" (review 1: a label that merely STARTS with one, "Next Record", "Continue Draft", is not it).
- *  Never a backward or exit control (Previous / Back / Cancel / Exit / Save and Exit / Continue
- *  Later), never anything the shared final-submit reading or the pay list claims. Read only on a
- *  page the walk has already proved is an interstitial (see c2i). */
-// WHOLE LABEL ONLY: the bare forward word, arrowed or "Save and …". A word after it names WHAT
-// the click continues ("Next Record", "Continue Draft", "Continue Renewal", "Proceed with
-// Deletion"), and that is somebody's record or an action on it, never the page's way forward.
-const INTERSTITIAL_FORWARD = /^\s*(save\s+and\s+)?(next|continue|proceed|begin|start|get\s+started)\s*[»›>→]*\s*$/i;
-const BACKWARD_OR_EXIT = /\b(previous|prev|back|cancel|exit|close|later|quit)\b/i;
-export function isInterstitialForwardLabel(label: string | undefined): boolean {
-  const t = String(label ?? "").replace(/\s+/g, " ").trim();
-  if (!t || t.length > 40) return false;
-  if (BACKWARD_OR_EXIT.test(t)) return false;
-  if (isPayFee(t) || isFinalSubmitControl(t)) return false;
-  return INTERSTITIAL_FORWARD.test(t);
-}
+/** THE PLAIN WAY FORWARD ON AN INFORMATION INTERSTITIAL (#341). Read only on a page the walk has
+ *  already proved is an interstitial (see c2i). One answer since #344: it lives in the shared
+ *  portalSafety factory (the information-page pass reads it too) and is re-exported here, where
+ *  the smokes have always read it. */
+export const isInterstitialForwardLabel = sharedIsInterstitialForwardLabel;
 
 /** RE-ADMISSION: is this label shaped like a page's WAY FORWARD at all? Union of the
  *  advance wording and the submit wording, minus a paginator. Submits count HERE because a
