@@ -44,6 +44,7 @@ import { logger } from "./logger";
 import { ensurePlanSetSplit } from "./docSplitter";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
+import { infoPagePriorProgress, liveInfoPagePasses, recordInfoPageCandidate, recordInfoPagePassUses } from "./infoPages";
 import { formPurposeMismatch } from "./formPurpose";
 import { looksBotBlocked } from "./runAbort";
 import { id } from "./ids";
@@ -1141,6 +1142,12 @@ async function autoLearnPortalInner(
   // server, where a headed launch cannot work and the retry would just cost time.
   let headlessForAttempt = input.headless;
   let headedRetryUsed = false;
+  // #344 — read here, never lazily inside the walk: an unreadable table means no pass (and the
+  // progress question unknown = refused), never a failed learn.
+  const infoPageInput = (() => {
+    try { return { passes: liveInfoPagePasses(db), priorProgress: infoPagePriorProgress(db, projectId, portalUrl, scopeType) }; }
+    catch { return { passes: [] as ReturnType<typeof liveInfoPagePasses>, priorProgress: true }; }
+  })();
   let learn;
   // THE BUDGET IS FOR THE PORTAL, NOT FOR EACH ATTEMPT.
   //
@@ -1328,6 +1335,10 @@ async function autoLearnPortalInner(
       continueDraft: input.continueDraft,
       signatureRequestApproval: input.signatureRequestApproval ?? null,
       runId: input.runId,
+      // #344: the human-verified information pages, read once per run (a withdrawal applies from
+      // the next run), and whether this project already made progress on this portal (refuses).
+      infoPagePasses: infoPageInput.passes,
+      infoPagePriorProgress: infoPageInput.priorProgress,
     });
   // WRITE IT DOWN BEFORE WE TOUCH THE PORTAL, NOT AFTER. This run is about to log into a
   // REAL account and start a REAL application; a run that dies mid-way has still created
@@ -1439,10 +1450,41 @@ async function autoLearnPortalInner(
   // have saved, and the portal's own background calls the lockdown held back — carried into EVERY
   // outcome's message, since the learn's own message is not what the operator reads.
   const handoffNotes = (learn.reviewHandoffNotes ?? []).filter(Boolean);
+  // #344 — AN INFORMATION PAGE THE BACKSTOP HELD, FOR A PERSON TO VERIFY (and every verified one this
+  // walk passed, on record). Written once, here, before any outcome is chosen: the ONE writer of a
+  // candidate (infoPages.recordInfoPageCandidate). A database failure never fails the learn — it is
+  // named in the message. A learn with no project row (a benchmark) writes nothing.
+  let infoPageLine = "";
+  let infoPageSummary: { identitySha256: string; origin: string; path: string; controlLabel: string } | null = null;
+  {
+    const learnRunId = debugDir ? path.basename(debugDir) : "";
+    const projectRow = (() => { try { return db.get<{ id: string }>("SELECT id FROM projects WHERE id = ?", [projectId]); } catch { return null; } })();
+    const cand = learn.infoPageCandidate;
+    if (cand && cand.observed && projectRow) {
+      try {
+        const rec = recordInfoPageCandidate(db, projectId, learnRunId, cand);
+        if (rec) {
+          infoPageSummary = { identitySha256: cand.identitySha256, origin: cand.origin, path: cand.path, controlLabel: String(cand.controlLabel ?? "").slice(0, 80) };
+          if (rec.inserted) {
+            addAuditLog(db, projectId, "portal_bot", "network backstop", "portal.info_page_candidate_recorded", {
+              candidateId: rec.id, origin: cand.origin, path: cand.path, controlLabel: infoPageSummary.controlLabel, identitySha256Prefix: cand.identitySha256.slice(0, 12), learnRunId,
+            });
+          }
+          infoPageLine = rec.status === "dismissed"
+            ? ` A person marked this page "not an information page" (${rec.decidedBy || "a person"}, ${rec.decidedAt.slice(0, 10)}); it stays held.`
+            : " Recorded for a person to verify (project → Portal runs).";
+        }
+      } catch (err) {
+        infoPageLine = ` The held information page could not be recorded for verification (${err instanceof Error ? err.message.slice(0, 120) : String(err)}).`;
+      }
+    }
+    if (projectRow && Array.isArray(learn.infoPagePassed) && learn.infoPagePassed.length) recordInfoPagePassUses(db, projectId, learnRunId, learn.infoPagePassed);
+  }
   const finalize = (r: Omit<AutoLearnResult, "debugDir">): AutoLearnResult => {
-    const withNotes = handoffNotes.length && !handoffNotes.every((n) => String(r.message ?? "").includes(n))
-      ? { ...r, message: `${r.message} ${handoffNotes.join(" ")}` }
-      : r;
+    const withInfoPage = infoPageLine && !String(r.message ?? "").includes(infoPageLine.trim()) ? { ...r, message: `${r.message}${infoPageLine}` } : r;
+    const withNotes = handoffNotes.length && !handoffNotes.every((n) => String(withInfoPage.message ?? "").includes(n))
+      ? { ...withInfoPage, message: `${withInfoPage.message} ${handoffNotes.join(" ")}` }
+      : withInfoPage;
     // A walk that ended at the signature-request step (#308) says so on every result, recipe or not.
     const sigStep = withNotes.signatureStep ?? (learn as { signatureStep?: AutoLearnResult["signatureStep"] } | undefined)?.signatureStep;
     // ...and a resume that read the homeowner's signature (#310), likewise.
@@ -1464,6 +1506,8 @@ async function autoLearnPortalInner(
           message: result.message,
           recipeId: result.recipe?.id ?? null,
           recipeStatus: result.recipe?.status ?? null,
+          // #344: the information page held for a person to verify (no text — that stays on the row).
+          ...(infoPageSummary ? { infoPageCandidate: infoPageSummary } : {}),
         }, null, 2));
       } catch { /* non-fatal */ }
     }

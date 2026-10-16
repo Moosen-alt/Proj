@@ -18,11 +18,20 @@
 //   [0] VOCABULARY  — the interstitial's forward control: Next / Continue / Proceed / Begin /
 //                     Start pass; Previous / Back / Cancel / Continue Later / Save and Exit /
 //                     every submit- and pay-worded label, and a pager, never do.
-//   [1] MUST PASS   — the captured page as served (POST form). The learner does NOT call it
-//                     review: no review stop, no lockReview, no upload skip, no final submit; it
-//                     records "advance: Next" and clicks it. What happens to that POST is the
-//                     network backstop's business (see [1]'s KNOWN RESIDUAL note) — reported, not
-//                     asserted away.
+//   [1] MUST PASS   — the captured page as served (a MULTIPART POST form, as live). The learner does
+//                     NOT call it review: no review stop, no lockReview, no upload skip, no final
+//                     submit; it records "advance: Next" and clicks it. #344 (option B):
+//       [1a] no verified page: the network backstop holds the POST exactly as on main, the run
+//            stops "HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED" (stopReason backstop_abort)
+//            and hands back the page as a CANDIDATE: identity, the exact prefix, the held request
+//            (body names [t_n…]), scrubbed evidence, a screenshot.
+//       [1b] a person verified [1a]'s candidate (the entry built from it by the product's own
+//            builder): the POST reaches the server with the submitter, the walk lands on the form
+//            page, fills it, reaches the REAL review and stops THERE (lockReview armed only there,
+//            the final submit recorded and never clicked); infoPagePassed has one entry.
+//       [1c] AN ORDINARY INTERSTITIAL (its review wording arrives after load, so the backstop's
+//            load-time reading — the one 4(b) judges a form POST by — is not terminal and main
+//            lets its Next through): no candidate is recorded (the wide-terminal precondition).
 //   [2] MUST PASS   — the same page whose Next navigates by GET, with a planner that ALSO calls
 //                     it review and names its Next as the final submit (the worst planner): the
 //                     learner clicks Next ONCE, lands on the form page, fills it, reaches the real
@@ -70,6 +79,9 @@ import { chromium } from "playwright";
 import * as adapterModule from "./autoLearnAdapter";
 import { AutoLearnAdapter, type LearnPlanner, type LearnPlanRequest, type LearnPlanResponse } from "./autoLearnAdapter";
 import { backstopFor } from "../filingBackstop";
+import { sha256Hex, verifiedInfoPageFromCandidate, type InfoPageDigest, type InfoPageEvidence, type InfoPageObservedRequest, type InfoPagePrefixStep } from "../../../shared/src/infoPagePass";
+import type { InfoPageCandidateCapture, VerifiedInfoPage } from "../../../shared/src/types";
+import { bodyNamesOf } from "./infoPageFixture";
 
 // The entry finder keeps re-reading a page for ENTRY_SETTLE_MS (30 s by default) before it
 // concludes there is no way in; read at call time, so set before the first learn.
@@ -151,7 +163,7 @@ const sidebar = (p: string): string => `<div class="col left-section no-print"><
 
 /** The DevHub shell, as captured: signed-in menu (name scrubbed), breadcrumb, sidebar, the
  *  SmartGuide form (method/action per scenario), its #navigation bar, a footer. */
-const shell = (p: string, o: { title: string; content: string; nav?: string; method?: string; action?: string; script?: string }): string => `<!doctype html><html><head><meta charset="utf-8"><title>Development Hub Fixture</title>
+const shell = (p: string, o: { title: string; content: string; nav?: string; method?: string; action?: string; script?: string; enctype?: string }): string => `<!doctype html><html><head><meta charset="utf-8"><title>Development Hub Fixture</title>
 <style>body{font:14px sans-serif;margin:0} .row{display:flex} .left-section{width:200px} .right-section{flex:1}
 .card{display:flex;border:1px solid #ccc;margin:8px 0;padding:8px;min-height:60px} .card-body{flex:1} .card-next{width:32px}
 #navigation{display:flex;gap:12px;margin:16px 0}</style>
@@ -168,7 +180,7 @@ const shell = (p: string, o: { title: string; content: string; nav?: string; met
 </div></div>
 <div id="sec-header"><h1>Development Hub Fixture</h1><h2>Online License &amp; Permit Services</h2></div>
 <div id="breadcrumb"><nav aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="${p}/home">Home</a></li><li class="breadcrumb-item"><a href="${p}/apply">Apply For A Permit</a></li></ol></nav></div>
-<div id="main-content"><form id="smartguide_ApplyForAPermit" action="${o.action ?? `${p}/sg`}" method="${o.method ?? "POST"}" class="form-content smartguide_form" accept-charset="UTF-8">
+<div id="main-content"><form id="smartguide_ApplyForAPermit" action="${o.action ?? `${p}/sg`}" method="${o.method ?? "POST"}"${o.enctype ? ` enctype="${o.enctype}"` : ""} class="form-content smartguide_form" accept-charset="UTF-8">
 <div class="row">
  ${sidebar(p)}
  <div class="col-md-10 right-section"><div id="page-content">
@@ -265,12 +277,19 @@ const reviewNextPage = (p: string, addr: string): string => shell(p, {
   nav: PREV_NEXT,
 });
 
-const PREFIXES = ["/post", "/get", "/next-files", "/stuck", "/noforward", "/rows", "/nem", ...Object.keys(SHAPES), ...Object.keys(ACCOUNT_HOMES)];
-const hits: Array<{ method: string; url: string }> = [];
+const PREFIXES = ["/post", "/late", "/get", "/next-files", "/stuck", "/noforward", "/rows", "/nem", ...Object.keys(SHAPES), ...Object.keys(ACCOUNT_HOMES)];
+const hits: Array<{ method: string; url: string; names?: string[] }> = [];
+// The POST bodies are read (multipart / urlencoded field NAMES only) before the handler routes them.
 const server = http.createServer((q, r) => {
+  const chunks: Buffer[] = [];
+  q.on("data", (c: Buffer) => chunks.push(c));
+  q.on("end", () => route(q, r, Buffer.concat(chunks)));
+});
+const route = (q: http.IncomingMessage, r: http.ServerResponse, body: Buffer): void => {
   const url = q.url || "/";
   const method = String(q.method || "GET").toUpperCase();
-  hits.push({ method, url });
+  const names = method === "GET" ? [] : bodyNamesOf(String(q.headers["content-type"] || ""), body);
+  hits.push({ method, url, names });
   const [pathOnly, query = ""] = url.split("?");
   const p = PREFIXES.find((x) => pathOnly === x || pathOnly.startsWith(`${x}/`)) ?? "";
   const rest = pathOnly.slice(p.length);
@@ -306,12 +325,20 @@ const server = http.createServer((q, r) => {
       return send(shell(p, { title: "Permitting Information", method: "GET", content: PERMITTING_INFORMATION,
         nav: `<button type="submit" name="t_p1685049573549" class="btn btn-primary">Previous</button><a href="${p}/cancel" class="btn">Cancel</a>` }));
     }
-    return send(shell(p, { title: "Permitting Information", content: PERMITTING_INFORMATION, nav: PREV_NEXT, method: p === "/post" ? "POST" : "GET" }));
+    if (p === "/late") {
+      // AN ORDINARY INTERSTITIAL: the same prose, rendered by script 300 ms after load — the
+      // backstop's load-time reading is not terminal, so main lets its Next POST through.
+      return send(shell(p, { title: "Permitting Information", content: `<div id="lateProse"></div>`, nav: PREV_NEXT, method: "POST", enctype: "multipart/form-data",
+        script: `<script>setTimeout(function () { document.getElementById('lateProse').innerHTML = ${JSON.stringify(PERMITTING_INFORMATION)}; }, 300);</script>` }));
+    }
+    // /post is the live shape: a MULTIPART POST to the form's own action.
+    return send(shell(p, { title: "Permitting Information", content: PERMITTING_INFORMATION, nav: PREV_NEXT, method: p === "/post" ? "POST" : "GET", enctype: p === "/post" ? "multipart/form-data" : undefined }));
   }
   if (rest === "/sg") {
     // The interstitial's own form: Next → the project page, Previous → back to Apply. A POST is
-    // read the same way (the body is not needed to route it — only Next reaches here unaborted).
-    if (method === "POST" || qs.has("t_n1685049573549")) return redirect(`${p}/project`);
+    // routed by its BODY, as DevHub's is: only a body that carries Next's submitter goes forward.
+    const names = hits[hits.length - 1].names ?? [];
+    if ((method === "POST" && names.includes("t_n1685049573549")) || qs.has("t_n1685049573549")) return redirect(`${p}/project`);
     return redirect(`${p}/apply`);
   }
   if (rest === "/project") return send(projectPage(p));
@@ -322,9 +349,9 @@ const server = http.createServer((q, r) => {
   }
   if (rest === "/review") return send(reviewPage(p, qs.get("addr") ?? ""));
   if (rest === "/review-next") return send(reviewNextPage(p, qs.get("addr") ?? ""));
-  if (rest === "/clicked-next" || rest === "/clicked-continue") { r.writeHead(204); return r.end(); }
+  if (rest === "/clicked-next" || rest === "/clicked-continue") { r.writeHead(204); r.end(); return; }
   return send(`<!doctype html><html><body><h1>${esc(rest)}</h1><p>Automation must never land here.</p></body></html>`);
-});
+};
 await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
 const port = (server.address() as { port: number }).port;
 const base = `http://127.0.0.1:${port}`;
@@ -340,10 +367,13 @@ const idx = (req: LearnPlanRequest, label: string): number => req.fields.findInd
 
 interface Walk {
   ok: boolean; message: string; stopReason?: string; reachedReview?: boolean; url: string;
-  notes: string[]; finals: string[]; events: Array<Record<string, unknown>>; locks: string[]; hits: Array<{ method: string; url: string }>;
+  notes: string[]; finals: string[]; events: Array<Record<string, unknown>>; locks: string[]; hits: Array<{ method: string; url: string; names?: string[] }>;
   plannerPages: string[];
   /** Recorded form-data steps (fill / select / check / uncheck). */
   formSteps: number;
+  /** #344: the unverified information page the backstop held, and the verified ones it passed. */
+  candidate?: InfoPageCandidateCapture;
+  passed?: Array<{ passId: string; where: string }>;
 }
 const runLearn = async (prefix: string, planner: (req: LearnPlanRequest) => LearnPlanResponse | null, options: Record<string, unknown> = {}): Promise<Walk> => {
   const before = hits.length;
@@ -389,6 +419,8 @@ const runLearn = async (prefix: string, planner: (req: LearnPlanRequest) => Lear
     finals: r.steps.filter((s) => s.isFinalSubmit).map((s) => String(s.note ?? "")),
     events, locks, hits: hits.slice(before), plannerPages,
     formSteps: r.steps.filter((s) => ["fill", "select", "check", "uncheck"].includes(String(s.action))).length,
+    candidate: (r as { infoPageCandidate?: InfoPageCandidateCapture }).infoPageCandidate,
+    passed: (r as { infoPagePassed?: Array<{ passId: string; where: string }> }).infoPagePassed,
   };
 };
 const pageTrace = (w: Walk, path: string): string =>
@@ -426,9 +458,11 @@ console.log("\n[0] the interstitial's forward control: what passes, what never d
 // ===========================================================================================
 // [1] The captured page, as served (POST form), the plain stub planner.
 // ===========================================================================================
-console.log("\n[1] the captured Permitting Information page (POST form): home → entry → tile → interstitial");
+console.log("\n[1a] the captured Permitting Information page (MULTIPART POST form), NO verified page: held, captured");
+let candidate1a: InfoPageCandidateCapture | undefined;
 {
-  const w = await runLearn("/post", () => null);
+  const w = await runLearn("/post", () => null, { infoPagePriorProgress: false });
+  candidate1a = w.candidate;
   check("premise: the walk entered through 'Apply For A Permit' and chose the Solar tile",
     w.notes.some((n) => /^application entry: Apply For A Permit/.test(n)) && w.notes.includes(`permit type: ${SOLAR}`), JSON.stringify(w.notes));
   const trace = pageTrace(w, "/post/info");
@@ -444,15 +478,76 @@ console.log("\n[1] the captured Permitting Information page (POST form): home �
   check("nothing was recorded as a final submit", w.finals.length === 0, JSON.stringify(w.finals));
   check("the run did not end 'at review'", w.reachedReview !== true, `reachedReview=${w.reachedReview} message=${w.message}`);
   check("no records / fees / corrections / profile page was ever requested", offPath(w).length === 0, JSON.stringify(offPath(w)));
-  // KNOWN RESIDUAL (filed separately, not this issue's file): the network backstop reads the
-  // same page as terminal (shared reviewSignals: "review your submission"), so the Next's form
-  // POST is aborted and the run stops NAMED by the backstop. Reported here so the line is seen.
+  // #344: with no verified page, the network backstop holds the Next's multipart POST exactly as
+  // on main (its terminal reading: "review your submission"), and the run hands the page back as a
+  // candidate for a person to verify.
   const posted = w.hits.some((h) => h.method === "POST" && h.url.startsWith("/post/sg"));
-  const pressed = w.notes.includes("advance: Next");
-  console.log(`  note - ${!pressed ? "the Next was never pressed" : posted ? "the Next POST reached the server" : "the Next POST was held by the network backstop"}: stopReason=${w.stopReason ?? "-"}; ${w.message.slice(0, 260)}`);
-  check("if the backstop held the POST, the stop is its LIVE reading — never the learner's review lockdown",
-    posted || (w.stopReason === "backstop_abort" && /the page this request came from/.test(w.message) && !/the run is at review/.test(w.message)),
-    `stopReason=${w.stopReason} message=${w.message}`);
+  check("[1a] the Next's POST was HELD (never reached the server)", !posted, JSON.stringify(w.hits.map((h) => `${h.method} ${h.url}`)));
+  check("[1a] the stop is the backstop's LIVE reading, named as an unverified information page (stopReason backstop_abort)",
+    w.ok === false && w.stopReason === "backstop_abort" && w.message.startsWith("HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED") && /the page this request came from/.test(w.message) && !/the run is at review/.test(w.message),
+    `ok=${w.ok} stopReason=${w.stopReason} message=${w.message}`);
+  const c = w.candidate;
+  const digest = c?.digest as InfoPageDigest | undefined;
+  const observed = c?.observed as InfoPageObservedRequest | null | undefined;
+  const evidence = c?.evidence as InfoPageEvidence | undefined;
+  check("[1a] a candidate: identity, version, origin + path, the control", !!c && /^[0-9a-f]{64}$/.test(c.identitySha256) && c.identityVersion === 1
+    && c.path === "/post/info" && c.controlLabel === "Next" && !!digest && digest.identitySha256 === c.identitySha256, JSON.stringify(c ? { ...c, digest: undefined, evidence: undefined, screenshotBase64: c.screenshotBase64 ? "…" : undefined } : null).slice(0, 600));
+  check("[1a] the candidate's prefix is exactly the walk's [goto entry url, application entry, permit type]",
+    !!c && JSON.stringify(c.prefix.map((s: InfoPagePrefixStep) => [s[0], s[1]])) === JSON.stringify([["goto", "entry url"], ["click", "application entry: Apply For A Permit"], ["click", `permit type: ${SOLAR}`]]),
+    JSON.stringify(c?.prefix));
+  check("[1a] the held request was observed: POST /post/sg, multipart, body [[t_n…, sha('')]]",
+    !!observed && observed.method === "POST" && /\/post\/sg$/.test(observed.where) && observed.media === "multipart/form-data"
+    && JSON.stringify(observed.body) === JSON.stringify([["t_n1685049573549", sha256Hex("")]]), JSON.stringify(observed));
+  check("[1a] the evidence carries the page's prose and no field value", !!evidence && evidence.text.includes("A Permit Tech will review your submission")
+    && evidence.forms.every((f) => f.fields.every((x) => x.length === 3)), JSON.stringify(evidence ? { ...evidence, text: evidence.text.slice(0, 120) } : null));
+  check("[1a] a masked screenshot was taken before the click", !!c?.screenshotBase64 && c.screenshotBase64.length > 1000, String(c?.screenshotBase64?.length ?? 0));
+}
+
+// ===========================================================================================
+// [1b] The same page, verified by a named person from [1a]'s candidate: the ONE Next passes.
+// ===========================================================================================
+console.log("\n[1b] the same page, VERIFIED from [1a]'s candidate: Next passes, the walk fills the form and stops at the real review");
+{
+  const c = candidate1a;
+  const entry: VerifiedInfoPage | null = c
+    ? { id: "pass-post", verifiedAt: "2026-10-15T12:00:00.000Z", ...verifiedInfoPageFromCandidate({ identityVersion: c.identityVersion, identitySha256: c.identitySha256, digest: c.digest as InfoPageDigest, prefix: c.prefix }) }
+    : null;
+  const w = await runLearn("/post", (req) => {
+    const at = pathOf(req.url);
+    if (at === "/post/project") return { fills: [{ selectorIndex: idx(req, "Site Address"), value: ADDRESS }], atReview: false, advanceSelectorIndex: idx(req, "Next") };
+    if (at === "/post/review") return { fills: [], atReview: true, finalSubmitSelectorIndex: idx(req, "Submit Application") };
+    return null;
+  }, { infoPagePasses: entry ? [entry] : [], infoPagePriorProgress: false });
+  const nexts = w.hits.filter((h) => h.method === "POST" && h.url.startsWith("/post/sg"));
+  check("[1b] premise: [1a] produced a candidate to verify", !!entry);
+  check("[1b] the Next's multipart POST reached the server ONCE, carrying the submitter",
+    nexts.length === 1 && (nexts[0].names ?? []).includes("t_n1685049573549"), JSON.stringify(w.hits.map((h) => `${h.method} ${h.url} ${(h.names ?? []).join(",")}`)));
+  check("[1b] the walk passed the information page once (infoPagePassed)", (w.passed ?? []).length === 1 && w.passed![0].passId === "pass-post", JSON.stringify(w.passed));
+  check("[1b] ...landed on the form page and filled it", w.plannerPages.includes("/post/project")
+    && w.events.some((e) => e.type === "page" && /\/post\/project/.test(String(e.trace ?? "")) && /fills=1/.test(String(e.trace ?? ""))), JSON.stringify(w.plannerPages));
+  check("[1b] ...and stopped at the REAL review page, lockReview armed there only",
+    w.reachedReview === true && pathOf(w.url) === "/post/review" && w.locks.length === 1 && w.locks[0].startsWith("/post/review ::"),
+    JSON.stringify({ reachedReview: w.reachedReview, url: w.url, locks: w.locks, message: w.message.slice(0, 300) }));
+  check("[1b] 'Submit Application' is recorded as the final submit (recorded, NOT clicked); the filing never reached the server",
+    w.finals.length === 1 && /Submit Application/.test(w.finals[0]) && /NOT clicked/.test(w.finals[0]) && !w.hits.some((h) => h.url.startsWith("/post/file")),
+    JSON.stringify({ finals: w.finals, hits: w.hits.map((h) => h.url) }));
+  check("[1b] no candidate is recorded for a verified page", !w.candidate, JSON.stringify(w.candidate ? { id: w.candidate.identitySha256 } : null));
+}
+
+// ===========================================================================================
+// [1c] AN ORDINARY INTERSTITIAL: the backstop would not hold its Next (its load-time reading is
+//      not terminal), so no pass is asked for and no candidate is recorded.
+// ===========================================================================================
+console.log("\n[1c] an ordinary interstitial (review wording rendered after load): no candidate");
+{
+  const w = await runLearn("/late", () => null, { infoPagePriorProgress: false });
+  const posted = w.hits.some((h) => h.method === "POST" && h.url.startsWith("/late/sg"));
+  check("[1c] premise: the learner took the page as an interstitial and pressed Next",
+    interstitialEvents(w).some((e) => e.forward === "Next") && w.notes.includes("advance: Next"), JSON.stringify(interstitialEvents(w)));
+  check("[1c] main's backstop does not hold this Next (its POST reached the server, exactly as on main)", posted, JSON.stringify(w.hits.map((h) => `${h.method} ${h.url}`)));
+  check("[1c] NO candidate was recorded (the wide-terminal precondition)", !w.candidate, JSON.stringify(w.candidate ? { identity: w.candidate.identitySha256, observed: w.candidate.observed } : null));
+  check("[1c] the refusal named the reading", w.events.some((e) => e.type === "info_page_refused" && JSON.stringify(e.refusals ?? []).includes("does not read this page as terminal")),
+    JSON.stringify(w.events.filter((e) => String(e.type).startsWith("info_page"))));
 }
 
 // ===========================================================================================

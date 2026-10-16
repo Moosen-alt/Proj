@@ -827,6 +827,11 @@ export async function learnPortal(input: {
   /** A named person's approval of THIS run's signature request (#308), and the run's id. */
   signatureRequestApproval?: import("../../shared/src/signatureRequestGate").SignatureRequestApproval | null;
   runId?: string;
+  /** #344: the human-verified information pages (backend infoPages.liveInfoPagePasses) and the
+   *  backend's answer to "did this project already make progress on this portal origin?" (not
+   *  given = yes: refuses). Only the network backstop reads them. */
+  infoPagePasses?: import("../../shared/src/types").VerifiedInfoPage[];
+  infoPagePriorProgress?: boolean;
   // Equipment identity (inverterMake/inverterModel/moduleMake/moduleModel) for the
   // adapter's deterministic PV-spec combobox pass.
   equipment?: Record<string, string>;
@@ -867,7 +872,7 @@ export async function learnPortal(input: {
       input.onProgress?.({ phase: "page", pageCount: 0, maxPages: input.maxPages ?? 18, message: `Paused for a person: ${String(info.reason ?? "").slice(0, 200)}` });
     } catch { /* a notifier must never change the outcome */ }
   };
-  const adapter = new AutoLearnAdapter(input.portalName, input.planner, { parkMs: input.parkMs, credentialForUrl: input.credentialForUrl, noProgressBudgetMs: input.noProgressBudgetMs, maxPages: input.maxPages, budgetMs: input.budgetMs, docsByType: input.docsByType, beforeUpload: input.beforeUpload, uploadMode: input.uploadMode, policyProfile: input.policyProfile, bindableFields: input.bindableFields, onProgress: input.onProgress, onPark, equipment: input.equipment, certifiedAliases: input.certifiedAliases, contactIdentity: input.contactIdentity, siteContactIdentity: input.siteContactIdentity, siteIdentity: input.siteIdentity, allowFinalSubmit: input.allowFinalSubmit, hasBattery: input.hasBattery, allowConsentAccept: input.allowConsentAccept, continueDraft: input.continueDraft, signatureRequestApproval: input.signatureRequestApproval ?? null, runId: input.runId });
+  const adapter = new AutoLearnAdapter(input.portalName, input.planner, { parkMs: input.parkMs, credentialForUrl: input.credentialForUrl, noProgressBudgetMs: input.noProgressBudgetMs, maxPages: input.maxPages, budgetMs: input.budgetMs, docsByType: input.docsByType, beforeUpload: input.beforeUpload, uploadMode: input.uploadMode, policyProfile: input.policyProfile, bindableFields: input.bindableFields, onProgress: input.onProgress, onPark, equipment: input.equipment, certifiedAliases: input.certifiedAliases, contactIdentity: input.contactIdentity, siteContactIdentity: input.siteContactIdentity, siteIdentity: input.siteIdentity, allowFinalSubmit: input.allowFinalSubmit, hasBattery: input.hasBattery, allowConsentAccept: input.allowConsentAccept, continueDraft: input.continueDraft, signatureRequestApproval: input.signatureRequestApproval ?? null, runId: input.runId, infoPagePasses: input.infoPagePasses, infoPagePriorProgress: input.infoPagePriorProgress });
   let tmpStatePath: string | undefined;
   let leaveOpen = false;
   // A browser left open by a prior guided-manual stage holds this profile's lock — close it

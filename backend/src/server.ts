@@ -56,7 +56,7 @@ import { startMonitorScheduler } from "./scheduler";
 import { startAhjFormRefreshScheduler, startKbLinkCheckScheduler } from "./ahjFormRefresh";
 import { startCecSyncScheduler, primeCecCache, syncCecEquipment } from "./cecEquipment";
 import { extractZipToWorkdir } from "./batchZip";
-import { AUTH_ENABLED, currentUser, login, logout, me, requireAuth, seedAdminUser, entitlementGate, requestOrg, createApiKey, ADMIN_ROLES } from "./auth";
+import { AUTH_ENABLED, currentUser, login, logout, me, requireAuth, seedAdminUser, entitlementGate, requestOrg, createApiKey, ADMIN_ROLES, ROLE_SUPERADMIN } from "./auth";
 import { PRODUCTS, PRODUCT_KEYS, grantProduct, revokeProduct, orgEntitlements, productsForEdition } from "./entitlements";
 import { requestScope, orgFilter, orgClause, reqOrgFilter, assertInScope, auditCrossOrgAccess } from "./scope";
 import { folderScanPayload } from "./batchZip";
@@ -3019,6 +3019,116 @@ app.post("/api/projects/:id/structural-letter/withdraw", asyncHandler(async (req
   const who = structuralLetterPerson(req, req.body?.withdrawnBy ?? req.body?.confirmedBy, isConfirmingPerson, "withdraw");
   const outcome = withdrawStructuralLetterConfirmation(db, detail.project.id, who.name, who.userId);
   res.json({ outcome, structuralLetter: structuralLetterState(db, detail.project.id) });
+}));
+
+// ---------------------------------------------------------------------------
+// HUMAN-VERIFIED INFORMATION PAGES (#344, owner ruling 2026-10-15: option B). A learn the network
+// backstop held at an information page (its Next held by rule 4b, nothing entered) records the page
+// as a CANDIDATE on the project; a NAMED PERSON marks it "an information page — OK to advance", and
+// the backstop then lets that exact page's ONE forward request through 4(b) on later runs
+// (backend/src/infoPages.ts, shared/src/infoPagePass.ts). One verification relaxes rule 1's
+// lockdown for every tenant on that page, so the decision routes are guarded three ways:
+//   - SAME ORIGIN (critique [6]): JSON only; Sec-Fetch-Site same-origin or an Origin equal to this
+//     server's own; with auth off (the live install: no login, 127.0.0.1), a Host of
+//     127.0.0.1 / localhost:<port> — a DNS-rebinding page cannot pose as the dashboard.
+//   - A NAMED PERSON: the session user when auth is on (a body name is ignored), else the typed
+//     name; either must pass feeConfirm.isConfirmingPerson ("operator" / "admin" / "bot" are not
+//     people). A sibling of structuralLetterPerson (whose texts stay untouched).
+//   - WHO MAY (critique [7]): with auth on, verify and withdraw need ROLE_SUPERADMIN (the platform
+//     operator); an org admin may dismiss its own project's candidate (requireAdmin + the scope guard).
+// The project routes sit under /api/projects/:id (the scope guard answers 404 for another org's
+// project, rule 6). /api/info-page-passes is shared knowledge (names and places only), justified in
+// routeScope.test.ts.
+// ---------------------------------------------------------------------------
+function requireSameOriginMutation(req: Request): void {
+  if (!/^application\/json\b/i.test(String(req.headers["content-type"] || ""))) throw new HttpError(415, "Send this decision as JSON.");
+  const host = String(req.headers.host || "");
+  const site = String(req.headers["sec-fetch-site"] || "").toLowerCase();
+  const origin = String(req.headers.origin || "");
+  const sameOrigin = site === "same-origin" || (!!origin && !!host && (origin === `http://${host}` || origin === `https://${host}`));
+  if (!sameOrigin) throw new HttpError(403, "This decision is taken only from the dashboard itself (same origin).");
+  if (!AUTH_ENABLED && !new RegExp(`^(127\\.0\\.0\\.1|localhost|\\[::1\\]):${port}$`, "i").test(host)) {
+    throw new HttpError(403, "With no login, this decision is taken only on this machine's own address (127.0.0.1 / localhost).");
+  }
+}
+function infoPagePerson(req: Request, typed: unknown, isConfirmingPerson: (n: string) => boolean, what: string): { name: string; userId: string } {
+  const user = currentUser(db, req);
+  if (AUTH_ENABLED && !user) throw new HttpError(401, `Sign in to ${what}.`);
+  const name = AUTH_ENABLED
+    ? String((user?.name && isConfirmingPerson(user.name) ? user.name : user?.email) || "").trim()
+    : String(typed || "").trim().slice(0, 120);
+  if (!isConfirmingPerson(name)) throw new HttpError(400, `A named person must ${what} — type your name.`);
+  return { name, userId: user?.id ?? "" };
+}
+function requireSuperadminWhenSignedIn(req: Request, what: string): void {
+  if (!AUTH_ENABLED) return;
+  const user = currentUser(db, req);
+  if (!user) throw new HttpError(401, `Sign in to ${what}.`);
+  if (user.role !== ROLE_SUPERADMIN) throw new HttpError(403, `Only the platform operator (superadmin) may ${what}: one verification applies to every tenant.`);
+}
+const UUIDISH = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const infoPageProjectId = (req: Request): string => {
+  const pid = String(req.params.id);
+  if (!db.get<{ id: string }>("SELECT id FROM projects WHERE id = ?", [pid])) throw new HttpError(404, "Project not found.");
+  return pid;
+};
+const infoPageCandidateId = (req: Request): string => {
+  const cid = String(req.params.cid || "");
+  if (!UUIDISH.test(cid)) throw new HttpError(404, "Information page candidate not found.");
+  return cid;
+};
+app.get("/api/projects/:id/info-page-candidates", asyncHandler(async (req, res) => {
+  const { listInfoPageCandidates } = await import("./infoPages");
+  res.json({ candidates: listInfoPageCandidates(db, infoPageProjectId(req)) });
+}));
+app.get("/api/projects/:id/info-page-candidates/:cid/screenshot", asyncHandler(async (req, res) => {
+  const { infoPageCandidateScreenshot } = await import("./infoPages");
+  const png = infoPageCandidateScreenshot(db, infoPageProjectId(req), infoPageCandidateId(req));
+  if (!png) throw new HttpError(404, "No screenshot for this candidate.");
+  res.setHeader("Content-Type", "image/png");
+  res.setHeader("Cache-Control", "no-store");
+  res.end(png);
+}));
+app.post("/api/projects/:id/info-page-candidates/:cid/verify", asyncHandler(async (req, res) => {
+  requireSameOriginMutation(req);
+  requireSuperadminWhenSignedIn(req, "verify an information page");
+  const { isConfirmingPerson } = await import("./feeConfirm");
+  const { verifyInfoPageCandidate, listInfoPageCandidates } = await import("./infoPages");
+  const pid = infoPageProjectId(req);
+  const cid = infoPageCandidateId(req);
+  const identitySha256 = String(req.body?.identitySha256 || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(identitySha256)) throw new HttpError(400, "identitySha256 (the card's page identity) is required.");
+  const who = infoPagePerson(req, req.body?.verifiedBy, isConfirmingPerson, "verify an information page");
+  const out = verifyInfoPageCandidate(db, pid, cid, { identitySha256, verifiedBy: who.name, userId: who.userId });
+  res.json({ passId: out.passId, candidates: listInfoPageCandidates(db, pid) });
+}));
+app.post("/api/projects/:id/info-page-candidates/:cid/dismiss", asyncHandler(async (req, res) => {
+  requireSameOriginMutation(req);
+  requireAdmin(req);
+  const { isConfirmingPerson } = await import("./feeConfirm");
+  const { dismissInfoPageCandidate, listInfoPageCandidates } = await import("./infoPages");
+  const pid = infoPageProjectId(req);
+  const cid = infoPageCandidateId(req);
+  const who = infoPagePerson(req, req.body?.dismissedBy, isConfirmingPerson, "dismiss an information page candidate");
+  dismissInfoPageCandidate(db, pid, cid, { dismissedBy: who.name, userId: who.userId });
+  res.json({ candidates: listInfoPageCandidates(db, pid) });
+}));
+app.get("/api/info-page-passes", asyncHandler(async (_req, res) => {
+  const { listInfoPagePasses } = await import("./infoPages");
+  res.json({ passes: listInfoPagePasses(db) });
+}));
+app.post("/api/info-page-passes/:passId/withdraw", asyncHandler(async (req, res) => {
+  requireSameOriginMutation(req);
+  requireSuperadminWhenSignedIn(req, "withdraw a verified information page");
+  const { isConfirmingPerson } = await import("./feeConfirm");
+  const { withdrawInfoPagePass, listInfoPagePasses } = await import("./infoPages");
+  const passId = String(req.params.passId || "");
+  if (!UUIDISH.test(passId)) throw new HttpError(404, "Verified information page not found.");
+  const reason = String(req.body?.reason || "").trim();
+  if (!reason || reason.length > 200) throw new HttpError(400, "A reason (up to 200 characters) is required to withdraw a verified page.");
+  const who = infoPagePerson(req, req.body?.withdrawnBy, isConfirmingPerson, "withdraw a verified information page");
+  withdrawInfoPagePass(db, passId, { by: who.name, userId: who.userId, reason });
+  res.json({ passes: listInfoPagePasses(db) });
 }));
 
 // READ THE PORTAL'S OWN FEE NOW (portalFeeReadings.readProjectPortalFees): every filed permit

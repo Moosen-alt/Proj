@@ -2313,6 +2313,94 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       addColumnIfMissing(db, "portal_recipes", "flagged_at", "TEXT");
     },
   },
+  // v49 sits here, beside the portal-run trust tables (v35), rather than at the end of the list:
+  // parallel PRs appending at the end collide (see v43 / v46).
+  {
+    version: 49,
+    name: "portal_info_pages",
+    up: (db) => {
+      // HUMAN-VERIFIED INFORMATION PAGES (#344, owner ruling 2026-10-15: option B). Hard rule 1's
+      // network backstop holds every request off a page that reads as review (4b); Portland
+      // DevHub's "Permitting Information" page says "A Permit Tech will review your submission", so
+      // its Next is held before anything is entered. A NAMED PERSON may mark that exact page once;
+      // the backstop then lets its ONE forward request through 4(b) only (shared/src/infoPagePass.ts).
+      //
+      // portal_info_page_candidates — TENANT EVIDENCE, a child of the project (reaches an org through
+      // projects.org_id; no org_id column, CLAUDE.md tenancy). Written by a learn that was held at
+      // an unverified information page: the identity digest (hashes, names, structure), the exact
+      // prefix, the held request (hashes), the scrubbed page text and the masked screenshot.
+      //
+      // portal_info_page_passes — SHARED KNOWLEDGE, like portal_recipes (the owner: the page is the
+      // same for every tenant). Hashes, names and structure only: never page text, a screenshot, a
+      // hidden value or a project id. Written ONLY by a person's verify (INSERT) and withdraw
+      // (UPDATE of the withdrawn_* columns) in backend/src/infoPages.ts — never by a learn, an
+      // import, research, a replay or a migration (rule 3). Rows are never deleted.
+      //
+      // Both tables and every index are created HERE, never lazily in a read path.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS portal_info_page_candidates (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          learn_run_id TEXT NOT NULL DEFAULT '',
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          seen_count INTEGER NOT NULL DEFAULT 1,
+          origin TEXT NOT NULL,
+          path TEXT NOT NULL,
+          identity_version INTEGER NOT NULL,
+          identity_sha256 TEXT NOT NULL,
+          digest_json TEXT NOT NULL,
+          prefix_json TEXT NOT NULL DEFAULT '[]',
+          evidence_json TEXT NOT NULL,
+          observed_json TEXT NOT NULL,
+          screenshot_png BLOB,
+          status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'dismissed', 'verified')),
+          decided_by TEXT NOT NULL DEFAULT '',
+          decided_by_user_id TEXT NOT NULL DEFAULT '',
+          decided_at TEXT NOT NULL DEFAULT '',
+          pass_id TEXT NOT NULL DEFAULT '',
+          FOREIGN KEY (project_id) REFERENCES projects(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_info_page_cand_live ON portal_info_page_candidates(project_id, identity_sha256) WHERE status <> 'verified';
+        CREATE INDEX IF NOT EXISTS idx_info_page_cand_project ON portal_info_page_candidates(project_id, status);
+        CREATE TABLE IF NOT EXISTS portal_info_page_passes (
+          id TEXT PRIMARY KEY,
+          origin TEXT NOT NULL,
+          path TEXT NOT NULL,
+          query_keys_json TEXT NOT NULL DEFAULT '[]',
+          identity_version INTEGER NOT NULL,
+          identity_sha256 TEXT NOT NULL,
+          page_sha256 TEXT NOT NULL,
+          title_sha256 TEXT NOT NULL,
+          structure_sha256 TEXT NOT NULL,
+          text_sha256 TEXT NOT NULL,
+          control_sha256 TEXT NOT NULL,
+          request_sha256 TEXT NOT NULL,
+          control_label TEXT NOT NULL,
+          control_name TEXT NOT NULL,
+          control_tag TEXT NOT NULL,
+          control_type TEXT NOT NULL,
+          request_method TEXT NOT NULL,
+          request_where TEXT NOT NULL,
+          request_action_sha256 TEXT NOT NULL,
+          request_media TEXT NOT NULL,
+          request_body_json TEXT NOT NULL,
+          prefix_json TEXT NOT NULL,
+          summary_json TEXT NOT NULL,
+          verified_at TEXT NOT NULL,
+          verified_by TEXT NOT NULL,
+          verified_by_user_id TEXT NOT NULL DEFAULT '',
+          source_candidate_id TEXT NOT NULL,
+          withdrawn_at TEXT NOT NULL DEFAULT '',
+          withdrawn_by TEXT NOT NULL DEFAULT '',
+          withdrawn_by_user_id TEXT NOT NULL DEFAULT '',
+          withdraw_reason TEXT NOT NULL DEFAULT ''
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_info_page_pass_live ON portal_info_page_passes(identity_sha256) WHERE withdrawn_at = '';
+        CREATE INDEX IF NOT EXISTS idx_info_page_pass_origin ON portal_info_page_passes(origin, path);
+      `);
+    },
+  },
   {
     version: 36,
     name: "permit_process_lookups",

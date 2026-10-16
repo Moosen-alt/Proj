@@ -93,6 +93,7 @@ const UNSCOPED_BY_DESIGN: Record<string, string> = {
   "/api/ahj-forms": "shared AHJ form registry",
   "/api/ahj-templates": "shared AHJ form templates",
   "/api/portal-recipes": "shared portal automation recipes",
+  "/api/info-page-passes": "shared verified information pages (#344, rule-1 4(b) one-request pass): places, names and dates only — no page text, no hash of a value, no verifier, no project; verification happens under /api/projects/:id; withdraw is same-origin and superadmin-gated",
   "/api/kb": "shared knowledge base",
   "/api/cec-equipment": "shared CEC equipment listings",
 
