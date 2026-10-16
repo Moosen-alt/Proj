@@ -1,0 +1,497 @@
+// HUMAN-VERIFIED INFORMATION PAGES, THE BACKEND (#344, option B): backend/src/infoPages.ts, migration
+// v49, autoLearn's finalize and the six routes — on a scratch DB, through the real write paths.
+//
+//   MIGRATION — v49 creates both tables and all four indexes, and replays after its schema_meta row is
+//               deleted; listing on a fresh DB writes nothing.
+//   CAPTURE   — a learn the backstop held at an unverified page (the learner stubbed through
+//               setAutoLearnSeamsForTests) records ONE open candidate with its screenshot through
+//               autoLearn's finalize, audits it, and says so in the message; the learn is handed
+//               the live passes and the prior-progress answer. A second sighting bumps it; a
+//               dismissed one stays dismissed (and the message names who); a verified one is never
+//               touched; after a withdrawal a re-capture is a NEW open row.
+//   VERIFY    — refuses (409) a stale card, a non-open row, no screenshot, an older identity version,
+//               a page with a field / a GET form / a filing action, a missing / unreadable / file-
+//               carrying / different held request, the project's own values on the page, a prefix
+//               that is not entry clicks, and a duplicate live identity. Success writes the shared
+//               row FROM THE ROW, audits it, stamps the candidate.
+//   RULE 3    — a re-capture with another identity leaves the pass byte-identical; withdraw stamps,
+//               audits and drops the row from liveInfoPagePasses; nothing deletes a pass.
+//   SHARED    — GET /api/info-page-passes carries no text, no hash of a value, no verifier, no project.
+//   PROGRESS  — a tracking number on the same origin, a staged submission on the same side or a
+//               recorded draft refuses; another origin / the other side does not; unknown refuses.
+//   ROUTES    — auth OFF: JSON only (415); cross-origin and a rebinding Host are 403 and write
+//               nothing; no name / "operator" is 400; a typed name verifies. Auth ON: 401 signed
+//               out; an org ADMIN is 403 on verify (superadmin only) and the superadmin's verify
+//               ignores a body name; another org's admin gets 404; withdraw needs a reason.
+//
+//   npx tsx backend/test/infoPages.test.ts
+import "./_isolate"; // FIRST
+import assert from "node:assert/strict";
+import http from "node:http";
+import { spawn, type ChildProcess } from "node:child_process";
+import path from "node:path";
+import { REPO } from "./_isolate";
+import { setupStageFixture, check, finish } from "./_stageFixture";
+import {
+  INFO_PAGE_IDENTITY_VERSION, digestInfoPageIdentity, infoPageEvidence, infoPagePrefixOf, sha256Hex,
+  type InfoPageIdentityMaterial,
+} from "../../shared/src/infoPagePass";
+import type { InfoPageCandidateCapture } from "../../shared/src/types";
+
+const fx = await setupStageFixture("info-pages");
+const { db } = fx;
+const IP = await import("../src/infoPages");
+const autoLearn = await import("../src/autoLearn");
+
+const ORIGIN = "https://permits.example.test";
+const PROSE = "This is a permit request only. A Permit Tech will review your submission for minimum submittal standards. Please do not submit additional requests.";
+const material = (patch: (m: InfoPageIdentityMaterial) => void = () => undefined): InfoPageIdentityMaterial => {
+  const m: InfoPageIdentityMaterial = {
+    version: INFO_PAGE_IDENTITY_VERSION,
+    page: { origin: ORIGIN, path: "/permits/sfjsp", query: [] },
+    title: "Development Hub Fixture",
+    structure: {
+      headings: [["1", "Development Hub Fixture"]],
+      forms: [{ id: "smartguide_ApplyForAPermit", name: "", method: "post", enctype: "multipart/form-data", action: `${ORIGIN}/permits/sfjsp`, target: "", elements: [["button", "submit", "t_p1", null], ["button", "submit", "t_n1", null]] }],
+      fillable: [], clickables: [["button", "submit", "t_p1", 0, ""], ["button", "submit", "t_n1", 0, ""]], frames: [],
+    },
+    facts: { fileInputsInForm: 0, customFormElements: 0, summaryOutsideChrome: 0, summaryInForm: 0, controlLabels: ["Previous", "Next"], hiddenNames: [], masked: 0, baseTarget: "" },
+    text: `Development Hub Fixture Permitting Information ${PROSE} Previous Next`,
+    control: { tag: "button", type: "submit", name: "t_n1", value: "", label: "Next", formIndex: 0, submitterIndex: 1, method: "post", action: `${ORIGIN}/permits/sfjsp`, enctype: "multipart/form-data", target: "" },
+    request: { method: "POST", url: `${ORIGIN}/permits/sfjsp`, media: "multipart/form-data", body: [["t_n1", ""]] },
+  };
+  patch(m);
+  return m;
+};
+const PREFIX = infoPagePrefixOf([
+  { action: "goto", note: "entry url", value: `${ORIGIN}/permits/sfjsp?interviewID=Home` },
+  { action: "click", note: "application entry: Apply For A Permit" },
+  { action: "click", note: "permit type: Solar Permit Request" },
+]);
+const PNG = Buffer.from("89504e470d0a1a0a0000000d4948445200000001000000010806000000", "hex").toString("base64");
+const capture = (m: InfoPageIdentityMaterial = material(), o: Partial<InfoPageCandidateCapture> = {}): InfoPageCandidateCapture => {
+  const d = digestInfoPageIdentity(m);
+  return {
+    identityVersion: d.version, identitySha256: d.identitySha256, origin: d.origin, path: d.path, controlLabel: d.control.label,
+    digest: d, prefix: PREFIX,
+    observed: { method: "POST", where: d.expected.where, actionUrlSha: d.expected.actionUrlSha, media: d.expected.media, body: d.expected.body, hasFilenamePart: false },
+    evidence: infoPageEvidence(m), screenshotBase64: PNG, ...o,
+  };
+};
+const cand = (projectId: string) => db.query<Record<string, unknown>>("SELECT * FROM portal_info_page_candidates WHERE project_id = ? ORDER BY first_seen_at, rowid", [projectId]);
+const passRows = () => db.query<Record<string, unknown>>("SELECT * FROM portal_info_page_passes ORDER BY verified_at, rowid");
+const verifyFn = (projectId: string, cid: string, identitySha256: string) => IP.verifyInfoPageCandidate(db, projectId, cid, { identitySha256, verifiedBy: "Pat Verifier", userId: "" });
+const expect409 = (fn: () => unknown, re: RegExp): void => {
+  try { fn(); } catch (e) {
+    const err = e as { status?: number; message?: string };
+    assert.equal(err.status, 409, `status ${err.status}: ${err.message}`);
+    assert.match(String(err.message), re);
+    return;
+  }
+  assert.fail("expected a 409");
+};
+
+// ── MIGRATION ─────────────────────────────────────────────────────────────────────────────────
+await check("v49 creates both tables and all four indexes", () => {
+  const names = db.query<{ name: string }>("SELECT name FROM sqlite_master WHERE name LIKE '%info_page%' AND name NOT LIKE 'sqlite_%'").map((r) => r.name).sort();
+  assert.deepEqual(names, ["idx_info_page_cand_project", "idx_info_page_pass_origin", "portal_info_page_candidates", "portal_info_page_passes", "ux_info_page_cand_live", "ux_info_page_pass_live"]);
+});
+await check("listing on a fresh DB writes nothing (reads write nothing)", () => {
+  const before = Number(db.get<{ n: number }>("SELECT total_changes() AS n")!.n);
+  IP.liveInfoPagePasses(db); IP.listInfoPagePasses(db); IP.listInfoPageCandidates(db, "no-such-project");
+  assert.equal(Number(db.get<{ n: number }>("SELECT total_changes() AS n")!.n), before);
+});
+
+// ── CAPTURE through autoLearn's finalize ──────────────────────────────────────────────────────
+let handed: { infoPagePasses?: unknown[]; infoPagePriorProgress?: boolean } | null = null;
+let nextCapture: InfoPageCandidateCapture | undefined;
+let nextPassed: Array<{ passId: string; where: string }> | undefined;
+const stubLearn = () => ({
+  ok: false, portalName: "stub", steps: [], reviewScreen: { fields: [], bodyTextSnippet: "" }, finalSubmitRecorded: false, pageCount: 2, pauseReason: null,
+  message: "HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: the network backstop held \"Next\".", stopReason: "backstop_abort",
+  ...(nextCapture ? { infoPageCandidate: nextCapture } : {}), ...(nextPassed ? { infoPagePassed: nextPassed } : {}),
+});
+autoLearn.setAutoLearnSeamsForTests({ learnPortal: (async (input: typeof handed) => { handed = input; return stubLearn(); }) as never });
+const runLearn = async (projectId: string, c?: InfoPageCandidateCapture, passed?: Array<{ passId: string; where: string }>) => {
+  nextCapture = c; nextPassed = passed; handed = null;
+  return autoLearn.autoLearnPortal(db, projectId, { scope: "ahj", portalUrl: `${ORIGIN}/permits/sfjsp?interviewID=Home`, createdBy: "operator", permitType: "structural" });
+};
+
+const P1 = fx.newProject();
+let cid1 = "";
+await check("a held learn records ONE open candidate through autoLearn's finalize, with its screenshot, audited and named in the message", async () => {
+  const r = await runLearn(P1, capture());
+  const rows = cand(P1);
+  assert.equal(rows.length, 1);
+  cid1 = String(rows[0].id);
+  assert.equal(rows[0].status, "open");
+  assert.ok(Buffer.isBuffer(rows[0].screenshot_png) && (rows[0].screenshot_png as Buffer).length > 0, "no screenshot stored");
+  assert.equal(fx.audits("portal.info_page_candidate_recorded").length, 1);
+  assert.match(String(r.message), /Recorded for a person to verify/);
+});
+await check("the learn was handed the live passes (none yet) and the prior-progress answer (false: a fresh project)", () => {
+  assert.ok(handed, "the stub learn was reached");
+  assert.deepEqual(handed!.infoPagePasses, []);
+  assert.equal(handed!.infoPagePriorProgress, false);
+});
+await check("a learn whose candidate was never held (no observed request) records nothing", async () => {
+  const P = fx.newProject();
+  await runLearn(P, capture(material(), { observed: null as never }));
+  assert.equal(cand(P).length, 0);
+});
+await check("a second sighting bumps the open row (seen_count 2), never a second row", async () => {
+  await runLearn(P1, capture());
+  const rows = cand(P1);
+  assert.equal(rows.length, 1);
+  assert.equal(Number(rows[0].seen_count), 2);
+});
+await check("the card lists it with no refusal (DevHub's shape) and the fee / review WARNINGS", () => {
+  const list = IP.listInfoPageCandidates(db, P1);
+  assert.equal(list.length, 1);
+  assert.deepEqual(list[0].refusals, []);
+  assert.ok(list[0].warnings.some((w) => /review wording/.test(w)), JSON.stringify(list[0].warnings));
+  assert.equal(list[0].hasScreenshot, true);
+  assert.ok(!("screenshot_png" in (list[0] as unknown as Record<string, unknown>)));
+});
+
+// ── VERIFY: every refusal is a 409 that writes nothing ────────────────────────────────────────
+const refusalCase = async (what: string, m: InfoPageIdentityMaterial, o: Partial<InfoPageCandidateCapture>, re: RegExp, after?: (cid: string) => void) => {
+  await check(`verify refuses (409, nothing written): ${what}`, async () => {
+    const P = fx.newProject();
+    const c = capture(m, o);
+    await runLearn(P, c);
+    const cid = String(cand(P)[0].id);
+    after?.(cid);
+    const before = passRows().length;
+    expect409(() => verifyFn(P, cid, c.identitySha256), re);
+    assert.equal(passRows().length, before);
+    assert.equal(String(cand(P)[0].status) === "verified", false);
+  });
+};
+await check("verify refuses a STALE card (the identity on the card is not the row's)", () => {
+  expect409(() => verifyFn(P1, cid1, sha256Hex("another page")), /changed/);
+});
+await refusalCase("no screenshot", material(), { screenshotBase64: undefined }, /no screenshot/);
+await refusalCase("an older identity version", material(), {}, /identity version/, (cid) => db.run("UPDATE portal_info_page_candidates SET identity_version = ? WHERE id = ?", [INFO_PAGE_IDENTITY_VERSION - 1, cid]));
+await refusalCase("a page with a field", material((m) => { m.structure.fillable.push(["input", "text", "addr", 0]); }), {}, /fillable/);
+await refusalCase("a GET form", material((m) => { m.request.method = "GET"; }), {}, /not POST/);
+await refusalCase("a filing-shaped action", material((m) => { m.request.url = `${ORIGIN}/permits/submitApplication`; }), {}, /filing/);
+await refusalCase("the held request missing", material(), {}, /./, (cid) => db.run("UPDATE portal_info_page_candidates SET observed_json = 'null' WHERE id = ?", [cid]));
+await refusalCase("the held request's body unreadable", material(), {}, /could not be read/, (cid) => {
+  const o = JSON.parse(String(cand(db.get<{ project_id: string }>("SELECT project_id FROM portal_info_page_candidates WHERE id = ?", [cid])!.project_id)[0].observed_json));
+  db.run("UPDATE portal_info_page_candidates SET observed_json = ? WHERE id = ?", [JSON.stringify({ ...o, body: null }), cid]);
+});
+await refusalCase("the held request carried a file part", material(), {}, /file/, (cid) => {
+  const row = db.get<{ observed_json: string }>("SELECT observed_json FROM portal_info_page_candidates WHERE id = ?", [cid])!;
+  db.run("UPDATE portal_info_page_candidates SET observed_json = ? WHERE id = ?", [JSON.stringify({ ...JSON.parse(row.observed_json), hasFilenamePart: true }), cid]);
+});
+await refusalCase("the held request differs from what the control sends", material(), {}, /not what the page's control sends/, (cid) => {
+  const row = db.get<{ observed_json: string }>("SELECT observed_json FROM portal_info_page_candidates WHERE id = ?", [cid])!;
+  db.run("UPDATE portal_info_page_candidates SET observed_json = ? WHERE id = ?", [JSON.stringify({ ...JSON.parse(row.observed_json), body: [["t_n1", sha256Hex("")], ["addr", sha256Hex("1 Main")]] }), cid]);
+});
+await refusalCase("a prefix that is not entry clicks", material(), { prefix: [...PREFIX, ["click", "advance: Yes", ""]] }, /not an entry click/);
+await check("verify refuses (409): the project's own street on the page", async () => {
+  const P = fx.newProject({ street: "4421 Unique Lane" });
+  const c = capture(material((m) => { m.text += " Site: 4421 Unique Lane"; }));
+  await runLearn(P, c);
+  expect409(() => verifyFn(P, String(cand(P)[0].id), c.identitySha256), /own values/);
+});
+
+let pass1 = "";
+await check("a person's verify writes the shared row FROM THE ROW, audits it and stamps the candidate", () => {
+  const out = verifyFn(P1, cid1, capture().identitySha256);
+  pass1 = out.passId;
+  const p = passRows();
+  assert.equal(p.length, 1);
+  const c = capture();
+  assert.equal(p[0].identity_sha256, c.identitySha256);
+  assert.equal(p[0].verified_by, "Pat Verifier");
+  assert.equal(p[0].source_candidate_id, cid1);
+  assert.equal(p[0].prefix_json, JSON.stringify(PREFIX));
+  assert.ok(!JSON.stringify(p[0]).includes("Permit Tech"), "page text reached the shared row");
+  assert.equal(String(cand(P1)[0].status), "verified");
+  assert.equal(String(cand(P1)[0].pass_id), pass1);
+  const a = fx.audits("portal.info_page_verified");
+  assert.equal(a.length, 1);
+  assert.equal(JSON.parse(a[0].details).identitySha256Prefix, c.identitySha256.slice(0, 12));
+});
+await check("verify refuses an already verified candidate (409)", () => { expect409(() => verifyFn(P1, cid1, capture().identitySha256), /verified, not open/); });
+await check("a second project's candidate of the SAME page cannot make a second live pass (409 duplicate identity)", async () => {
+  const P = fx.newProject();
+  await runLearn(P, capture());
+  expect409(() => verifyFn(P, String(cand(P)[0].id), capture().identitySha256), /already exists/);
+});
+await check("liveInfoPagePasses hands the bot the verified page, with its exact prefix", () => {
+  const live = IP.liveInfoPagePasses(db);
+  assert.equal(live.length, 1);
+  assert.equal(live[0].id, pass1);
+  assert.deepEqual(live[0].prefix, PREFIX);
+  assert.deepEqual(live[0].request.body, [["t_n1", sha256Hex("")]]);
+});
+await check("the next learn is handed that pass", async () => {
+  await runLearn(fx.newProject());
+  assert.equal((handed!.infoPagePasses as unknown[]).length, 1);
+});
+await check("a learn that PASSED a verified page records each use (portal.info_page_passed)", async () => {
+  const before = fx.audits("portal.info_page_passed").length;
+  await runLearn(fx.newProject(), undefined, [{ passId: pass1, where: `${ORIGIN}/permits/sfjsp` }]);
+  assert.equal(fx.audits("portal.info_page_passed").length, before + 1);
+});
+await check("RULE 3: a re-capture with ANOTHER identity is a new candidate; the pass row stays byte-identical", async () => {
+  const before = JSON.stringify(passRows());
+  await runLearn(P1, capture(material((m) => { m.text += " New paragraph."; })));
+  assert.equal(JSON.stringify(passRows()), before);
+  assert.equal(cand(P1).filter((r) => r.status === "open").length, 1);
+});
+await check("RULE 3: a re-capture of the VERIFIED identity never touches the verified row", async () => {
+  const verifiedBefore = JSON.stringify(cand(P1).filter((r) => r.status === "verified").map((r) => ({ ...r, screenshot_png: null })));
+  await runLearn(P1, capture());
+  assert.equal(JSON.stringify(cand(P1).filter((r) => r.status === "verified").map((r) => ({ ...r, screenshot_png: null }))), verifiedBefore);
+});
+
+// ── DISMISS ──────────────────────────────────────────────────────────────────────────────────────
+await check("a dismissed page stays dismissed on a re-capture, and the run says who dismissed it", async () => {
+  const P = fx.newProject();
+  const c = capture(material((m) => { m.title = "Another Info Page"; }));
+  await runLearn(P, c);
+  IP.dismissInfoPageCandidate(db, P, String(cand(P)[0].id), { dismissedBy: "Dana Dismisser", userId: "" });
+  const r = await runLearn(P, c);
+  const rows = cand(P);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].status, "dismissed");
+  assert.equal(Number(rows[0].seen_count), 2);
+  assert.match(String(r.message), /not an information page.*Dana Dismisser/);
+  assert.equal(fx.audits("portal.info_page_candidate_dismissed").length, 1);
+});
+
+// ── WITHDRAW ─────────────────────────────────────────────────────────────────────────────────────
+await check("withdraw stamps the row (never deletes it), audits, and the bot no longer receives it", () => {
+  IP.withdrawInfoPagePass(db, pass1, { by: "Wren Withdrawer", userId: "", reason: "the page changed" });
+  const p = passRows();
+  assert.equal(p.length, 1);
+  assert.ok(String(p[0].withdrawn_at));
+  assert.equal(p[0].withdrawn_by, "Wren Withdrawer");
+  assert.equal(IP.liveInfoPagePasses(db).length, 0);
+  assert.equal(fx.audits("portal.info_page_pass_withdrawn").length, 1);
+});
+await check("after a withdrawal a re-capture of that page is a NEW open row (the verified one untouched)", async () => {
+  const P = fx.newProject();
+  await runLearn(P, capture());
+  assert.equal(cand(P).length, 1);
+  assert.equal(cand(P)[0].status, "open");
+});
+await check("the shared list carries places, names and dates only — no text, no hash of a value, no verifier, no project", () => {
+  const l = IP.listInfoPagePasses(db);
+  const s = JSON.stringify(l);
+  for (const banned of ["Permit Tech", "Pat Verifier", "Wren Withdrawer", P1, capture().digest && (capture().digest as { components: { textSha: string } }).components.textSha, sha256Hex("")]) {
+    assert.ok(!s.includes(String(banned)), `the shared list carries ${banned}`);
+  }
+  assert.equal(l[0].identityPrefix.length, 12);
+  assert.deepEqual(l[0].request.fieldNames, ["t_n1"]);
+});
+
+// ── PRIOR PROGRESS ───────────────────────────────────────────────────────────────────────────────
+await check("prior progress: a tracking number on the SAME origin refuses; another origin does not; unknown refuses", () => {
+  const P = fx.newProject();
+  const url = `${ORIGIN}/permits/sfjsp?interviewID=Home`;
+  assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), false);
+  db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", [`t-${P}`, P, "https://other.example.test/x", "A-1", "2026-10-15", "2026-10-15"]);
+  assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), false);
+  db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", [`u-${P}`, P, `${ORIGIN}/records/1`, "B-2", "2026-10-15", "2026-10-15"]);
+  assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), true);
+  assert.equal(IP.infoPagePriorProgress(db, P, "not a url", "ahj"), true);
+});
+await check("prior progress: a staged submission on the same side refuses; one on the other side does not", () => {
+  const P = fx.newProject();
+  const url = `${ORIGIN}/permits/sfjsp`;
+  db.run("INSERT INTO submissions (id, project_id, submission_type, permit_type, status, created_at) VALUES (?, ?, 'portal', 'nem', 'awaiting_human_submit', '2026-10-15')", [`s1-${P}`, P]);
+  assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), false);
+  assert.equal(IP.infoPagePriorProgress(db, P, url, "utility"), true);
+  db.run("INSERT INTO submissions (id, project_id, submission_type, permit_type, status, created_at) VALUES (?, ?, 'portal', 'structural', 'submitted', '2026-10-15')", [`s2-${P}`, P]);
+  assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), true);
+});
+
+// ── ROUTES ───────────────────────────────────────────────────────────────────────────────────────
+// Everything the routes need is written now; the in-process handle closes before a server opens it.
+const routeP = fx.newProject();
+await runLearn(routeP, capture(material((m) => { m.title = "Route Info Page"; })));
+const routeCid = String(cand(routeP)[0].id);
+const routeIdentity = String(cand(routeP)[0].identity_sha256);
+const authP = fx.newProject();
+await runLearn(authP, capture(material((m) => { m.title = "Auth Info Page"; })));
+const authCid = String(cand(authP)[0].id);
+const authIdentity = String(cand(authP)[0].identity_sha256);
+const { setUserPassword } = await import("../src/auth");
+const { grantProduct } = await import("../src/entitlements");
+db.run("INSERT INTO orgs (id, name, edition, created_at) VALUES ('org-b', 'Org B', 'full', '2026-10-15')");
+grantProduct(db, "org-b", "autopilot");
+db.run("INSERT INTO users (id, name, email, role, color, active, created_at, org_id) VALUES ('u-super', 'Sam Superadmin', 'super@info.test', 'superadmin', '#000', 1, '2026-10-15', 'org-default')");
+setUserPassword(db, "u-super", "info-test-password-1");
+db.run("INSERT INTO users (id, name, email, role, color, active, created_at, org_id) VALUES ('u-admin', 'Ada Orgadmin', 'admin@info.test', 'admin', '#000', 1, '2026-10-15', 'org-default')");
+setUserPassword(db, "u-admin", "info-test-password-1");
+db.run("INSERT INTO users (id, name, email, role, color, active, created_at, org_id) VALUES ('u-other', 'Otto Otherorg', 'other@info.test', 'admin', '#000', 1, '2026-10-15', 'org-b')");
+setUserPassword(db, "u-other", "info-test-password-1");
+const dbPath = String(process.env.AUTOPILOT_DB_PATH);
+db.close();
+
+await check("v49 replays after its schema_meta row is deleted (CREATE … IF NOT EXISTS; nothing lost)", async () => {
+  const dbMod = await import("../src/db");
+  const before = await (async () => { const d = await dbMod.openDatabase(); try { const n = d.query("SELECT id FROM portal_info_page_candidates").length; d.run("DELETE FROM schema_meta WHERE version >= 49"); return n; } finally { d.close(); } })();
+  const d = await dbMod.openDatabase();
+  try {
+    assert.equal(Number(d.get<{ v: number }>("SELECT MAX(version) AS v FROM schema_meta")!.v) >= 49, true);
+    assert.equal(d.query("SELECT id FROM portal_info_page_candidates").length, before);
+    assert.equal(d.query("SELECT name FROM sqlite_master WHERE name LIKE '%info_page%' AND name NOT LIKE 'sqlite_%'").length, 6);
+  } finally { d.close(); }
+});
+
+const stop = (server: ChildProcess): void => { try { process.kill(-server.pid!, "SIGKILL"); } catch { try { server.kill("SIGKILL"); } catch { /* gone */ } } };
+async function boot(port: number, auth: boolean): Promise<ChildProcess> {
+  const env: Record<string, string | undefined> = {
+    ...process.env, AUTOPILOT_DB_PATH: dbPath, PORT: String(port), AUTOPILOT_AUTO_START: "0", SEED_TEST_INSTALLER: "false", MONITOR_INTERVAL_MINUTES: "0",
+    LOG_LEVEL: "warn", ANTHROPIC_API_KEY: "", CODE_RESEARCH: "off", SESSION_ENCRYPTION_KEY: "unit-test-key-not-a-real-secret",
+    AUTH_ENABLED: auth ? "true" : "false", ADMIN_EMAIL: "seed@info.test", ADMIN_PASSWORD: "info-test-password-1", NO_PROXY: "*", no_proxy: "*",
+  };
+  for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]) delete env[k];
+  const server = spawn(process.execPath, [path.join(REPO, "node_modules/tsx/dist/cli.mjs"), path.join(REPO, "backend/src/server.ts")], {
+    env: env as NodeJS.ProcessEnv, cwd: process.cwd(), stdio: ["ignore", "pipe", "pipe"], detached: true,
+  });
+  let log = "";
+  server.stdout?.on("data", (d) => { log += String(d); });
+  server.stderr?.on("data", (d) => { log += String(d); });
+  for (let i = 0; i < 90; i++) {
+    try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) return server; } catch { /* not up yet */ }
+    await new Promise((r) => setTimeout(r, 1000));
+  }
+  stop(server);
+  throw new Error(`server never came up:\n${log.slice(-1500)}`);
+}
+/** One request with full control of Host / Origin / Sec-Fetch-Site (fetch forbids setting Host). */
+const call = (port: number, method: string, p: string, o: { body?: unknown; headers?: Record<string, string>; json?: boolean } = {}): Promise<{ status: number; text: string; headers: http.IncomingHttpHeaders }> =>
+  new Promise((resolve, reject) => {
+    const body = o.body === undefined ? undefined : (o.json === false ? String(o.body) : JSON.stringify(o.body));
+    const req = http.request({ host: "127.0.0.1", port, method, path: p, headers: {
+      ...(body !== undefined ? { "content-type": o.json === false ? "application/x-www-form-urlencoded" : "application/json", "content-length": Buffer.byteLength(body) } : {}),
+      ...(o.headers ?? {}),
+    } }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on("data", (c: Buffer) => chunks.push(c));
+      res.on("end", () => resolve({ status: res.statusCode ?? 0, text: Buffer.concat(chunks).toString("utf8"), headers: res.headers }));
+    });
+    req.on("error", reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+const readDb = async <T>(fn: (d: typeof db) => T): Promise<T> => {
+  const dbMod = await import("../src/db");
+  const d = await dbMod.openDatabase();
+  try { return fn(d); } finally { d.close(); }
+};
+
+{
+  const PORT = 5340 + Math.floor(Math.random() * 15);
+  const server = await boot(PORT, false);
+  const same = { "sec-fetch-site": "same-origin", origin: `http://127.0.0.1:${PORT}` };
+  const verifyUrl = `/api/projects/${routeP}/info-page-candidates/${routeCid}/verify`;
+  try {
+    await check("auth off: GET candidates lists the card (no screenshot bytes) and the screenshot route serves the PNG", async () => {
+      const r = await call(PORT, "GET", `/api/projects/${routeP}/info-page-candidates`);
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const j = JSON.parse(r.text);
+      assert.equal(j.candidates[0].id, routeCid);
+      assert.ok(!r.text.includes("screenshot_png"));
+      const s = await call(PORT, "GET", `/api/projects/${routeP}/info-page-candidates/${routeCid}/screenshot`);
+      assert.equal(s.status, 200);
+      assert.equal(s.headers["content-type"], "image/png");
+    });
+    await check("auth off: a CROSS-ORIGIN verify is 403 and writes nothing", async () => {
+      const r = await call(PORT, "POST", verifyUrl, { body: { identitySha256: routeIdentity, verifiedBy: "Pat Synthetic" }, headers: { origin: "http://evil.example", "sec-fetch-site": "cross-site" } });
+      assert.equal(r.status, 403, r.text);
+      assert.equal(await readDb((d) => d.query("SELECT id FROM portal_info_page_passes WHERE identity_sha256 = ?", [routeIdentity]).length), 0);
+    });
+    await check("auth off: a form-encoded (non-JSON) verify is 415", async () => {
+      const r = await call(PORT, "POST", verifyUrl, { body: `identitySha256=${routeIdentity}&verifiedBy=Pat`, json: false, headers: same });
+      assert.equal(r.status, 415, r.text);
+    });
+    await check("auth off: a DNS-rebinding Host (same-origin to itself, but not 127.0.0.1 / localhost) is 403", async () => {
+      const r = await call(PORT, "POST", verifyUrl, { body: { identitySha256: routeIdentity, verifiedBy: "Pat Synthetic" }, headers: { host: `rebind.example:${PORT}`, origin: `http://rebind.example:${PORT}`, "sec-fetch-site": "same-origin" } });
+      assert.equal(r.status, 403, r.text);
+    });
+    await check("auth off: no name, a blank one, 'operator', 'admin' or 'bot' is a 400", async () => {
+      for (const n of [undefined, "  ", "operator", "admin", "bot"]) {
+        const r = await call(PORT, "POST", verifyUrl, { body: { identitySha256: routeIdentity, verifiedBy: n }, headers: same });
+        assert.equal(r.status, 400, `${n}: ${r.text}`);
+      }
+    });
+    await check("auth off: a stale identity is a 409", async () => {
+      const r = await call(PORT, "POST", verifyUrl, { body: { identitySha256: sha256Hex("x"), verifiedBy: "Pat Synthetic" }, headers: same });
+      assert.equal(r.status, 409, r.text);
+    });
+    let routePass = "";
+    await check("auth off: a named person's same-origin verify writes the pass (extra body fields ignored)", async () => {
+      const r = await call(PORT, "POST", verifyUrl, { body: { identitySha256: routeIdentity, verifiedBy: "Pat Synthetic", origin: "https://evil.example", controlName: "x" }, headers: { origin: `http://localhost:${PORT}`, host: `localhost:${PORT}` } });
+      assert.equal(r.status, 200, r.text);
+      routePass = JSON.parse(r.text).passId;
+      const row = await readDb((d) => d.get<Record<string, unknown>>("SELECT * FROM portal_info_page_passes WHERE id = ?", [routePass]));
+      assert.equal(row?.verified_by, "Pat Synthetic");
+      assert.equal(row?.origin, ORIGIN);
+    });
+    await check("auth off: the shared list (GET /api/info-page-passes) shows it — names and places only", async () => {
+      const r = await call(PORT, "GET", "/api/info-page-passes");
+      assert.equal(r.status, 200);
+      assert.ok(r.text.includes(routePass));
+      assert.ok(!r.text.includes("Pat Synthetic") && !r.text.includes(routeP) && !r.text.includes("Permit Tech"), r.text.slice(0, 400));
+    });
+    await check("auth off: withdraw needs a reason (400), then stamps it (same origin)", async () => {
+      const u = `/api/info-page-passes/${routePass}/withdraw`;
+      const none = await call(PORT, "POST", u, { body: { withdrawnBy: "Pat Synthetic" }, headers: same });
+      assert.equal(none.status, 400, none.text);
+      const cross = await call(PORT, "POST", u, { body: { withdrawnBy: "Pat Synthetic", reason: "x" }, headers: { origin: "http://evil.example" } });
+      assert.equal(cross.status, 403, cross.text);
+      const ok = await call(PORT, "POST", u, { body: { withdrawnBy: "Pat Synthetic", reason: "the page changed" }, headers: same });
+      assert.equal(ok.status, 200, ok.text);
+      assert.ok(JSON.parse(ok.text).passes.some((p: { id: string; status: string }) => p.id === routePass && p.status === "withdrawn"));
+    });
+  } finally { stop(server); }
+}
+
+{
+  const PORT = 5360 + Math.floor(Math.random() * 15);
+  const server = await boot(PORT, true);
+  const login = async (email: string): Promise<string> => {
+    const r = await call(PORT, "POST", "/api/auth/login", { body: { email, password: "info-test-password-1" } });
+    assert.equal(r.status, 200, r.text);
+    return String((r.headers["set-cookie"] ?? [])[0] ?? "").split(";")[0];
+  };
+  const same = { "sec-fetch-site": "same-origin", origin: `http://127.0.0.1:${PORT}` };
+  const verifyUrl = `/api/projects/${authP}/info-page-candidates/${authCid}/verify`;
+  try {
+    await check("auth on: signed out, verify is 401 and writes nothing", async () => {
+      const r = await call(PORT, "POST", verifyUrl, { body: { identitySha256: authIdentity, verifiedBy: "Forged Name" }, headers: same });
+      assert.equal(r.status, 401, r.text);
+    });
+    await check("auth on: an ORG ADMIN (not superadmin) is 403 on verify — one verification relaxes rule 1 for every tenant", async () => {
+      const cookie = await login("admin@info.test");
+      const r = await call(PORT, "POST", verifyUrl, { body: { identitySha256: authIdentity }, headers: { ...same, cookie } });
+      assert.equal(r.status, 403, r.text);
+      assert.equal(await readDb((d) => d.query("SELECT id FROM portal_info_page_passes WHERE identity_sha256 = ?", [authIdentity]).length), 0);
+    });
+    await check("auth on: ANOTHER ORG's admin gets 404 for this project's candidates (rule 6), never 403", async () => {
+      const cookie = await login("other@info.test");
+      const g = await call(PORT, "GET", `/api/projects/${authP}/info-page-candidates`, { headers: { cookie } });
+      assert.equal(g.status, 404, g.text);
+      const d = await call(PORT, "POST", `/api/projects/${authP}/info-page-candidates/${authCid}/dismiss`, { body: {}, headers: { ...same, cookie } });
+      assert.equal(d.status, 404, d.text);
+    });
+    await check("auth on: the SUPERADMIN verifies; a body verifiedBy is ignored (the session's name is recorded)", async () => {
+      const cookie = await login("super@info.test");
+      const r = await call(PORT, "POST", verifyUrl, { body: { identitySha256: authIdentity, verifiedBy: "Forged Name" }, headers: { ...same, cookie } });
+      assert.equal(r.status, 200, r.text);
+      const row = await readDb((d) => d.get<Record<string, unknown>>("SELECT verified_by, verified_by_user_id FROM portal_info_page_passes WHERE identity_sha256 = ?", [authIdentity]));
+      assert.equal(row?.verified_by, "Sam Superadmin");
+      assert.equal(row?.verified_by_user_id, "u-super");
+    });
+  } finally { stop(server); }
+}
+
+finish("infoPages");
