@@ -7826,6 +7826,7 @@ function infoPageCandidateCardsHtml(candidates, projectId) {
       <div class="item-title"><span>Information page to verify</span><span class="badge warning">held by the network backstop</span></div>
       <p>The run stopped at <strong>${esc(c.origin)}${esc(c.path)}</strong>${(c.queryKeys || []).length ? ` (query keys: ${esc(c.queryKeys.join(", "))})` : ""}: its <strong>${esc(c.controlLabel)}</strong> was held because the page's own words read as review. Nothing was sent.</p>
       <p class="muted" style="font-size:12px">Held request: ${esc(req.method)} ${esc(req.where)} · ${esc(req.media)} · fields: ${esc((req.fieldNames || []).join(", ") || "none")} · seen ${esc(String(c.seenCount || 1))} time(s), first ${esc(String(c.firstSeenAt || "").slice(0, 10))}, last ${esc(String(c.lastSeenAt || "").slice(0, 10))}</p>
+      <p class="muted" style="font-size:12px">Reached by exactly these steps (a pass never applies after other ones): ${esc((Array.isArray(c.steps) ? c.steps : []).join(" → ") || "none recorded")}</p>
       ${shot}
       <details class="fold"><summary>The page's text, headings and forms</summary>
         <pre style="white-space:pre-wrap;max-height:240px;overflow:auto;font-size:12px">${esc(ev.text || "")}</pre>

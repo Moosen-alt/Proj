@@ -45,7 +45,7 @@ const H = `<img src=x onerror=alert(1)>`;
 const candidate = (o: Record<string, unknown> = {}) => ({
   id: "cand-1", projectId: "proj-1", learnRunId: "run-1", firstSeenAt: "2026-10-15T10:00:00Z", lastSeenAt: "2026-10-15T11:00:00Z", seenCount: 2,
   origin: "https://permits.example.test", path: "/permits/sfjsp", queryKeys: [], identityVersion: 1, identitySha256: "a".repeat(64),
-  controlLabel: "Next", controlName: "t_n1", request: { method: "POST", where: "https://permits.example.test/permits/sfjsp", media: "multipart/form-data", fieldNames: ["t_n1"] },
+  controlLabel: "Next", controlName: "t_n1", steps: ["go to https://permits.example.test/permits/sfjsp?interviewID", "application entry: Apply For A Permit", "permit type: Solar Permit Request"], request: { method: "POST", where: "https://permits.example.test/permits/sfjsp", media: "multipart/form-data", fieldNames: ["t_n1"] },
   evidence: { title: "Development Hub", headings: [["1", "Development Hub"]], forms: [{ method: "post", enctype: "multipart/form-data", actionWhere: "https://permits.example.test/permits/sfjsp", fields: [["button", "submit", "t_n1"]] }], frames: [], controlLabels: ["Next"], text: "A Permit Tech will review your submission." },
   hasScreenshot: true, status: "open", decidedBy: "", decidedAt: "", passId: "", passLive: false, refusals: [], warnings: ["The text uses review wording."], ...o,
 });
@@ -53,13 +53,14 @@ const candidate = (o: Record<string, unknown> = {}) => ({
 const ok = cards([candidate()], "proj-1");
 check("(a) the card names the page, its control and the held request", ok.includes("https://permits.example.test/permits/sfjsp") && ok.includes("<strong>Next</strong>") && ok.includes("POST https://permits.example.test/permits/sfjsp · multipart/form-data · fields: t_n1"), ok);
 check("(a) …shows the page's text and the screenshot route", ok.includes("A Permit Tech will review your submission.") && ok.includes(`src="/api/projects/proj-1/info-page-candidates/cand-1/screenshot"`), ok);
+check("(a) …the exact steps that led to the page (a pass never applies after other ones)", ok.includes("Reached by exactly these steps") && ok.includes("application entry: Apply For A Permit → permit type: Solar Permit Request"), ok);
 check("(a) …and the two decisions", ok.includes("This is an information page — OK to advance") && ok.includes("Not an information page") && ok.includes(`data-identity="${"a".repeat(64)}"`), ok);
 check("(b) with no refusal the OK button is enabled", !/data-info-verify="cand-1"[^>]*disabled/.test(ok), ok);
 const refused = cards([candidate({ refusals: ["the page shows a summary (<dl> / <th> table)"] })], "proj-1");
 check("(b) a refusal disables OK and is listed (escaped)", /data-info-verify="cand-1"[^>]*disabled/.test(refused) && refused.includes("Cannot be marked") && refused.includes("&lt;dl&gt;"), refused);
 check("(b2) no screenshot: says to re-run the learn", cards([candidate({ hasScreenshot: false })], "p").includes("No screenshot"));
 const hostile = cards([candidate({
-  origin: H, path: H, controlLabel: H, queryKeys: [H],
+  origin: H, path: H, controlLabel: H, queryKeys: [H], steps: [H],
   request: { method: H, where: H, media: H, fieldNames: [H] },
   evidence: { title: H, headings: [["1", H]], forms: [{ method: H, enctype: H, actionWhere: H, fields: [["input", "hidden", H]] }], frames: [[H, H]], controlLabels: [H], text: H },
   warnings: [H], refusals: [H], decidedBy: H,

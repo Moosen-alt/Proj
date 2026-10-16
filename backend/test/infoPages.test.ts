@@ -168,6 +168,7 @@ await check("the card lists it with no refusal (DevHub's shape) and the fee / re
   assert.ok(list[0].warnings.some((w) => /review wording/.test(w)), JSON.stringify(list[0].warnings));
   assert.equal(list[0].hasScreenshot, true);
   assert.ok(!("screenshot_png" in (list[0] as unknown as Record<string, unknown>)));
+  assert.deepEqual(list[0].steps, [`go to ${ORIGIN}/permits/sfjsp?interviewID`, "application entry: Apply For A Permit", "permit type: Solar Permit Request"]);
 });
 
 // ── VERIFY: every refusal is a 409 that writes nothing ────────────────────────────────────────

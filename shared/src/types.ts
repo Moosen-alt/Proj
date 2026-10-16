@@ -4014,6 +4014,9 @@ export interface InfoPageCandidateRecord {
   controlLabel: string;
   controlName: string;
   request: { method: string; where: string; media: string; fieldNames: string[] };
+  /** The steps that led to the page, exactly as a pass binds them (a goto by its origin + path +
+   *  query KEYS, a click by its recorded note) — what the person verifies along with the page. */
+  steps: string[];
   evidence: { title: string; headings: Array<[string, string]>; forms: Array<{ method: string; enctype: string; actionWhere: string; fields: Array<[string, string, string]> }>; frames: Array<[string, string]>; controlLabels: string[]; text: string };
   hasScreenshot: boolean;
   status: "open" | "dismissed" | "verified";

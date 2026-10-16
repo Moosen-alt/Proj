@@ -263,6 +263,7 @@ const candidateRowToRecord = (db: AppDb, r: Row): InfoPageCandidateRecord => {
     controlLabel: digest ? digest.control.label : "",
     controlName: digest ? digest.control.name : "",
     request: digest ? { method: digest.expected.method, where: digest.expected.where, media: digest.expected.media, fieldNames: digest.expected.body.map(([n]) => n) } : { method: "", where: "", media: "", fieldNames: [] },
+    steps: parse<InfoPagePrefixStep[]>(r.prefix_json, []).map(([action, note, place]) => (s(action) === "goto" ? `go to ${s(place) || "the entry page"}` : s(note) || s(action))),
     evidence,
     hasScreenshot: !!r.screenshot_png,
     status: (s(r.status) as InfoPageCandidateRecord["status"]) || "open",
