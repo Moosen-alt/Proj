@@ -9,7 +9,7 @@
 import assert from "node:assert/strict";
 import { answerForUnrecordedControl, disconnectPartKeyFor, missingRequiredStopMessage, readDisconnectPart, UNPINNED_CONTROL_WHY } from "./unrecordedControls";
 import { policyDefaultAnswerFor, policyProfileFor, policyScopeFor } from "./adapters/autoLearnAdapter";
-import { operatorPolicyAnswer } from "../../shared/src/perJobQuestions";
+import { operatorPolicyAnswer, perJobAnswerKeyFor } from "../../shared/src/perJobQuestions";
 
 let failures = 0;
 const check = (label: string, fn: () => void): void => {
@@ -202,6 +202,54 @@ check("policy answers off (PORTAL_POLICY_DEFAULTS=off): the knife-blade question
 
 check("a policy answer is never typed into a dropdown that does not offer it", () => {
   assert.equal(answerForUnrecordedControl({ label: KNIFE, fieldType: "select", options: ["Select...", "Compliant", "Not compliant"] }, STD, "nem"), null);
+});
+
+// PR #353 round 4 (Helm's should-fix): the export-capacity question is in the learner's policy table
+// ("No"), and the round-3 pass filed that "No" on a job whose replay map says exportLimiting "Yes".
+// The job's own answer, bound to its key, comes first; the standing "No" only when the key is absent.
+const EXPORT_Q = "Do you propose to limit the export capacity of this system?";
+check("preconditions: the export-capacity question is a policy question with a standing No, and NOT a per-job one", () => {
+  assert.equal(policyDefaultAnswerFor(EXPORT_Q, "nem"), "No", "the learner's table still answers it (else this map is consulted for nothing)");
+  assert.equal(perJobAnswerKeyFor(EXPORT_Q, { control: "select", answer: "", options: YES_NO }), null, "the per-job route does not take it (else the policy branch never sees it)");
+});
+check("the export-capacity question: the job's exportLimiting \"Yes\" is bound and selected, never the standing No", () => {
+  assert.deepEqual(answerForUnrecordedControl({ label: EXPORT_Q, fieldType: "select", options: YES_NO }, { ...STD, exportLimiting: "Yes" }, "nem"),
+    { kind: "bound", key: "exportLimiting", value: "Yes" });
+});
+check("the export-capacity question: the job's exportLimiting \"No\" is bound too (the job's answer, not the policy's)", () => {
+  assert.deepEqual(answerForUnrecordedControl({ label: EXPORT_Q, fieldType: "select", options: YES_NO }, { ...STD, exportLimiting: "No" }, "nem"),
+    { kind: "bound", key: "exportLimiting", value: "No" });
+});
+check("the export-capacity question: exportLimiting absent or empty → the standing No (policy)", () => {
+  for (const fv of [STD, { ...STD, exportLimiting: "" }, { ...STD, exportLimiting: "   " }] as Array<Record<string, string>>) {
+    assert.deepEqual(answerForUnrecordedControl({ label: EXPORT_Q, fieldType: "select", options: YES_NO }, fv, "nem"),
+      { kind: "policy", value: "No", why: "the operator's standing policy answer" }, JSON.stringify(fv));
+  }
+});
+check("the export-capacity question: a job value the dropdown does not offer is missing (bound, no value — a stop by name), never the standing No", () => {
+  const ans = answerForUnrecordedControl({ label: EXPORT_Q, fieldType: "select", options: YES_NO }, { ...STD, exportLimiting: "Partial" }, "nem");
+  assert.deepEqual(ans, { kind: "bound", key: "exportLimiting", value: "" });
+  const msg = missingRequiredStopMessage('"advance: Next"', [{ label: EXPORT_Q, key: "exportLimiting" }]);
+  assert.ok(msg.slice(0, 300).includes(EXPORT_Q) && /no value was supplied for this project/.test(msg), msg);
+  assert.ok(/exportLimiting\) is not one this control offers/.test(msg), msg);
+});
+check("the export-capacity question: the job's answer does not widen the scope — policy off or a permit portal leaves it as before (null)", () => {
+  for (const scope of ["none", "permit"] as const) {
+    assert.equal(answerForUnrecordedControl({ label: EXPORT_Q, fieldType: "select", options: YES_NO }, { ...STD, exportLimiting: "Yes" }, scope), null, scope);
+  }
+});
+check("the job-key map answers only the export-capacity question: the other policy questions keep the standing answer", () => {
+  // A job carrying exportLimiting (every replay map does) changes no other policy question's answer.
+  const withExport = { ...STD, exportLimiting: "Yes" };
+  for (const [label, want] of [
+    [KNIFE, "Yes"],
+    ["Is the inverter lab-certified as that term is defined in the Illinois Distributed Generation Interconnection Standard?", "Yes"],
+    ["Is this a public school project?", "No"],
+    ["Will a meter collar adapter be used?", "No"],
+  ] as Array<[string, string]>) {
+    assert.deepEqual(answerForUnrecordedControl({ label, fieldType: "select", options: YES_NO }, withExport, "nem"),
+      { kind: "policy", value: want, why: "the operator's standing policy answer" }, label);
+  }
 });
 
 check("MUST-EXCLUDE: ordinary required controls are not this module's (gap-fill and the sweep keep them)", () => {

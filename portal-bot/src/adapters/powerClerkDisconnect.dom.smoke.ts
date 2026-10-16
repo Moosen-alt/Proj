@@ -30,6 +30,10 @@
 //       Switch Model Notes" textarea, then the empty one — Notes is never written, the empty one gets
 //       DG221URB (the pass writes only the element the sweep found empty);
 //   [M] (round 3) two EMPTY same-name boxes with no ids — neither is typed; the run stops by name;
+//   [X] (round 4, Helm's should-fix) the section also asks "Do you propose to limit the export capacity
+//       of this system?" (a required Yes/No select, a policy question whose standing answer is "No"):
+//       the job's exportLimiting "Yes" commits "Yes", "No" commits "No", and only a job with no
+//       exportLimiting gets the standing "No";
 //   [L] the LEARNER's Calculate (clickComputeButton) returns only once the result is on the page,
 //       so its rescan sees the four controls and its policy pass records the two Yes/No answers.
 //
@@ -125,6 +129,13 @@ ${req("DTYPEInput", LABEL.knife, yesNo("DTYPEInput", "discKnife"))}
 ${req("DDISTInput", LABEL.dist, yesNo("DDISTInput", "discDist"))}
 `;
 
+// [X] (PR #353 round 4 — Helm's probe): the section with a required export-capacity question added. The
+// learner's policy table answers it "No"; the replay map carries the job's own exportLimiting.
+const EXPORT_Q = "Do you propose to limit the export capacity of this system?";
+const SECTION_X = `${SECTION}
+${req("DEXPInput", EXPORT_Q, yesNo("DEXPInput", "discExport"))}
+`;
+
 const SPEC_PAGE = `<!doctype html><html><head><meta charset="utf-8"><style>
   body{font:14px sans-serif;padding:12px} .loader{display:flex;justify-content:center}
   .spinner-border{width:24px;height:24px;border:3px solid #888;border-right-color:transparent;border-radius:50%;animation:s .8s linear infinite}
@@ -140,7 +151,7 @@ const SPEC_PAGE = `<!doctype html><html><head><meta charset="utf-8"><style>
   ${req("MACCInput", LABEL.meterAccess, '<select class="form-select" id="MACCInput" data-test-role="dropdownlist-element" required data-k="meterAccess"><option value="">Select...</option><option value="13">None</option><option value="14">Dog at residence</option><option value="15">Locked gate</option><option value="17">Other</option></select>')}
   <button id="next" type="button">Next</button>
   <script>
-    var server = { exportKw: "", discMake: "", discMake2: "", hiddenMake: "", dcMake: "", discModel: "", discModel2: "", discNotes: "", discKnife: "", discDist: "", meterLoc: "", meterAccess: "", calculated: false };
+    var server = { exportKw: "", discMake: "", discMake2: "", hiddenMake: "", dcMake: "", discModel: "", discModel2: "", discNotes: "", discKnife: "", discDist: "", discExport: "", meterLoc: "", meterAccess: "", calculated: false };
     window.__server = server;
     // PER-FIELD AUTOSAVE on blur / change (a select saves its visible option text). A box the
     // portal rendered already holding a value starts the server with it.
@@ -154,7 +165,7 @@ const SPEC_PAGE = `<!doctype html><html><head><meta charset="utf-8"><style>
     }
     wire(document);
     var V = new URLSearchParams(location.search).get("v") || "";
-    var SECTION = V === "e" ? ${JSON.stringify(SECTION_E)} : V === "f" ? ${JSON.stringify(SECTION_F)} : V === "n" ? ${JSON.stringify(SECTION_N)} : V === "m" ? ${JSON.stringify(SECTION_M)} : ${JSON.stringify(SECTION)};
+    var SECTION = V === "e" ? ${JSON.stringify(SECTION_E)} : V === "f" ? ${JSON.stringify(SECTION_F)} : V === "n" ? ${JSON.stringify(SECTION_N)} : V === "m" ? ${JSON.stringify(SECTION_M)} : V === "x" ? ${JSON.stringify(SECTION_X)} : ${JSON.stringify(SECTION)};
     // CALCULATE: spinner in the loader, the stale marker stays, the server answers later; the
     // disconnect section renders only when the computed rating requires it (over 10 kW here).
     document.getElementById("calc").addEventListener("click", function () {
@@ -339,6 +350,35 @@ check("[M] the run stops before review, naming the control within the first 300 
 check("[M] the stop says the value is on file but the control could not be told apart (not \"no part on file\")",
   /could not be told apart/.test(mMsg) && !/no AC disconnect part is on file/.test(mMsg), mMsg.slice(0, 600));
 check("[M] nothing was filed", M.filed === false, outline(M));
+
+// [X] (PR #353 round 4 — Helm's should-fix): the export-capacity question renders with the section. Its
+// policy answer is "No"; the round-3 pass committed that "No" on a job whose replay map says
+// exportLimiting "Yes", and the run reached review with nothing flagged.
+const X_FIELDS = { totalExportKw: "16.128", disconnectMake: "Eaton", disconnectModel: "DG221URB", disconnectWithin10ft: "" };
+const xBlanks = (w: Awaited<ReturnType<typeof run>>): string[] => (w.data.requiredStillEmpty as string[] | undefined) ?? [];
+console.log("\n[X1] the section also asks the export-capacity question; the job's exportLimiting is \"Yes\"");
+const X1 = await run({ ...X_FIELDS, exportLimiting: "Yes" }, "/?v=x");
+console.log(`   ${outline(X1)}`);
+check("[X1] the export-capacity question = Yes (the job's exportLimiting, never the standing No)", X1.committed.discExport === "Yes", outline(X1));
+check("[X1] the rest of the section is answered as in [A] and the run reaches review with nothing required left blank",
+  X1.committed.discMake === "Eaton" && X1.committed.discModel === "DG221URB" && X1.committed.discKnife === "Yes" && X1.committed.discDist === "Yes"
+    && atReview(X1) && xBlanks(X1).length === 0, `${outline(X1)} blanks=${JSON.stringify(xBlanks(X1))}`);
+check("[X1] the answer is reported as the job's own (bound to exportLimiting)",
+  ((X1.data.agingNotes as string[] | undefined) ?? []).some((n) => n.includes(EXPORT_Q.slice(0, 40)) && n.includes("from exportLimiting")),
+  JSON.stringify(X1.data.agingNotes ?? []).slice(0, 600));
+check("[X1] nothing was filed", X1.filed === false, outline(X1));
+
+console.log("\n[X2] the job's exportLimiting is \"No\"");
+const X2 = await run({ ...X_FIELDS, exportLimiting: "No" }, "/?v=x");
+console.log(`   ${outline(X2)}`);
+check("[X2] the export-capacity question = No (the job's own answer) and the run reaches review",
+  X2.committed.discExport === "No" && atReview(X2) && xBlanks(X2).length === 0, `${outline(X2)} blanks=${JSON.stringify(xBlanks(X2))}`);
+
+console.log("\n[X3] the job carries no exportLimiting");
+const X3 = await run({ ...X_FIELDS }, "/?v=x");
+console.log(`   ${outline(X3)}`);
+check("[X3] the export-capacity question = No (the standing policy answer, only because the job has none) and the run reaches review",
+  X3.committed.discExport === "No" && atReview(X3) && xBlanks(X3).length === 0, `${outline(X3)} blanks=${JSON.stringify(xBlanks(X3))}`);
 
 // ---------------------------------------------------------------------------
 // [L] THE LEARNER'S Calculate: a fresh learn must SEE the section to record it. The learner clicks

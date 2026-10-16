@@ -16,7 +16,9 @@
 //      the question bank, the binders and the stage gate): the job's own recorded answer; when the job
 //      has none, the operator's standing answer for THAT KEY if there is one (below); else nothing.
 //   3. A POLICY QUESTION — the learner's own table (autoLearnAdapter policyDefaultAnswerFor), so a
-//      learn and a replay give one question one answer.
+//      learn and a replay give one question one answer. When the job itself carries the answer
+//      (POLICY_QUESTION_JOB_KEYS: the export-capacity question ↔ exportLimiting), the job's value,
+//      bound to that key; the standing answer only when the key is absent or empty.
 // A control none of these knows is not this module's: the LLM gap-fill and the required sweep keep it.
 //
 // THE STANDING ANSWER FOR AN UNRECORDED PER-JOB CONTROL IS READ BY ITS KEY. The distance question
@@ -148,6 +150,35 @@ const OTHER_DISCONNECT_WHY = "it asks for another piece of equipment's disconnec
  *  a namesake ("Disconnect Switch Model Notes") instead — so nothing is typed. */
 export const UNPINNED_CONTROL_WHY = "a value is on file, but the empty control by that name could not be told apart from another on this page (several share the name, or the one named could not be found again), so it was not typed into a box that might be the wrong one";
 
+/**
+ * A POLICY QUESTION WHOSE ANSWER THE JOB ALSO CARRIES (PR #353 round 4) — the replay-map key that
+ * answers it ahead of the learner's standing answer. DATA, consulted only where the learner's policy
+ * table (policyDefaultAnswerFor) already answers the question in this scope, so it never widens or
+ * narrows which controls or which recipes get an answer; it only says WHOSE answer that is.
+ *
+ * The one entry: "Do you propose to limit the export capacity of this system?". The policy table's
+ * standing answer is "No", but the replay map carries the job's own `exportLimiting` (backend
+ * resolveRecipeFieldValues: "Yes" when the design shows a PCS / export limit / non-export / NGOM),
+ * and the round-3 pass filed the standing "No" on an export-limited job. The per-job rule does not
+ * catch this wording (per-job:export-limit reads "export limit", not "limit the export capacity").
+ * The pattern is the learner's own rule for the question, copied verbatim (autoLearnAdapter
+ * POLICY_RADIO_DEFAULTS); unrecordedControls.test pins that the two still read the same question.
+ *
+ * No other policy question has a replay-map key: lab-certified / UL 1741, the distance question
+ * (a per-job key, answered above by perJobAnswerKeyFor), public school, kWh netting, monetize,
+ * knife-blade, meter collar and drone consent match nothing resolveRecipeFieldValues emits (its own
+ * keys or the parser snapshot's).
+ */
+const POLICY_QUESTION_JOB_KEYS: ReadonlyArray<{ question: RegExp; key: string }> = Object.freeze([
+  { question: /do you propose to limit the export capacity/i, key: "exportLimiting" },
+]);
+
+/** The replay-map key that carries this job's own answer to a policy question, or null. */
+function policyQuestionJobKeyFor(question: string): string | null {
+  const text = String(question ?? "");
+  return POLICY_QUESTION_JOB_KEYS.find((p) => p.question.test(text))?.key ?? null;
+}
+
 const optNorm = (s: string): string => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 /** The control's own option for an answer ("Yes" → "Yes"), or "" when it offers none — a policy
  *  answer is never typed into a dropdown that does not offer it. */
@@ -201,8 +232,18 @@ export function answerForUnrecordedControl(
       if (standing) return { kind: "policy", value: standing, why: "the operator's standing answer (this job recorded none)" };
       return { kind: "bound", key: perJob, value: "" };
     }
-    const policy = offered(options, policyDefaultAnswerFor(label, scope));
-    if (policy) return { kind: "policy", value: policy, why: "the operator's standing policy answer" };
+    const standing = policyDefaultAnswerFor(label, scope);
+    if (standing) {
+      // THE JOB'S OWN ANSWER FIRST, when the job carries one (POLICY_QUESTION_JOB_KEYS): bound to its
+      // key, so the step selects the job's value. `value` is the control's own option for it, the gate
+      // for typing at all: a job value the dropdown does not offer is "" — never the standing answer
+      // in its place — and the run stops by name.
+      const jobKey = policyQuestionJobKeyFor(label);
+      const own = jobKey ? String(fieldValues?.[jobKey] ?? "").trim() : "";
+      if (jobKey && own) return { kind: "bound", key: jobKey, value: offered(options, own) };
+      const policy = offered(options, standing);
+      if (policy) return { kind: "policy", value: policy, why: "the operator's standing policy answer" };
+    }
   }
   return null;
 }
@@ -216,6 +257,9 @@ export function missingValueHint(key: string | null): string {
   }
   if (key === "disconnectWithin10ft" || key === "ownershipModel" || key === "systemConfiguration") {
     return "it is a per-job question only a person answers (the project's portal questions, or the intake link)";
+  }
+  if (key === "exportLimiting") {
+    return "the project's export-limiting answer (exportLimiting) is not one this control offers, so it was not replaced with the standing answer";
   }
   return `the project has no value for ${key}`;
 }
