@@ -29,7 +29,7 @@ import http from "node:http";
 import { chromium, type Page } from "playwright";
 import { backstopFor, installFilingBackstop, isStoppingAbort, type FilingBackstop, type InfoPagePassOpen } from "./filingBackstop";
 import {
-  INFO_PAGE_IDENTITY_VERSION, infoPagePrefixOf, infoPageRequestRefusals, sha256Hex, verifiedInfoPageFromCandidate, type InfoPageRunState,
+  INFO_PAGE_IDENTITY_VERSION, infoPagePrefixOf, infoPageRequestRefusals, sha256Hex, verifiedInfoPageFromCandidate, type InfoPageRunState, type InfoPageRunStep,
 } from "../../shared/src/infoPagePass";
 import type { VerifiedInfoPage } from "../../shared/src/types";
 import {
@@ -192,15 +192,18 @@ const DEVHUB: VerifiedInfoPage | null = A.candidate
   : null;
 // Every later scenario serves its page under its OWN prefix, so the verified entry for "the same
 // page at the same origin + path" is read live from that scenario's replica with DevHub's prefix.
-const devhubEntryAt = async (p: string): Promise<VerifiedInfoPage | null> => {
+const devhubEntryAt = async (p: string, prefix?: InfoPageRunStep[]): Promise<VerifiedInfoPage | null> => {
   VARIANTS[p] = { html: (pp) => devhubReplica({ p: pp }) };
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
   await page.goto(`${base}${p}/permits/sfjsp`);
-  const e = await entryFromLivePage(page, NEXT, devhubPrefix(startUrlOf(p)), `pass${p.replace(/\//g, "-")}`);
+  const e = await entryFromLivePage(page, NEXT, prefix ?? devhubPrefix(startUrlOf(p)), `pass${p.replace(/\//g, "-")}`);
   await ctx.close();
   return e;
 };
+// INFO_PAGE_SMOKE_ONLY=A,B,D runs only those sections (a kill check's quick pass); default: all.
+const ONLY = String(process.env.INFO_PAGE_SMOKE_ONLY || "").split(",").map((x) => x.trim()).filter(Boolean);
+const want = (section: string): boolean => !ONLY.length || ONLY.includes(section);
 
 // ===========================================================================================
 // [B] verified: exactly one request passes.
@@ -230,7 +233,7 @@ setTimeout(function () { fetch('autosave', { method: 'POST', body: 'x=1' }).catc
 // [E] slot lifetime.
 // ===========================================================================================
 console.log("\n[E] SLOT LIFETIME");
-{
+if (want("E")) {
   const e = await devhubEntryAt("/E1");
   const late = await go({ p: "/E1", html: (p) => devhubReplica({ p }), entries: e ? [e] : [], between: async () => { await sleep(20_600); } });
   check("[E] opened, unused for 20 s, then clicked: HELD (the slot is gone)", !!late.open?.opened && held(late), brief(late));
@@ -314,7 +317,7 @@ const NEAR: Array<{ id: string; what: string; opts?: Partial<ReplicaOpts>; query
 // is what (i) let through. Every variant but c14 is held in both (c14's form posts into a new tab,
 // which has no reading of its own: main's 4(b) does not hold it either — a named residual of main).
 const MAIN_LETS_THROUGH = new Set(["c14"]);
-for (const n of NEAR) {
+for (const n of want("N") ? NEAR : []) {
   const p = `/${n.id}`;
   const html = (pp: string): string => devhubReplica({ p: pp, ...(n.opts ?? {}), script: n.script });
   const common = { p, html, query: n.query, host: n.host, selector: n.selector, between: n.between, waitBeforeOpenMs: n.waitBeforeOpenMs };
@@ -332,7 +335,7 @@ for (const n of NEAR) {
   else if (o.open?.opened) console.log(`         ${n.id} opened (the request binding held it): ${JSON.stringify(o.aborts.map((a) => a.why)).slice(0, 200)}`);
 }
 // The ONE mask: the toggle inside a <header> landmark — one verification serves another tenant.
-{
+if (want("N")) {
   const p = "/c21h";
   VARIANTS[p] = { html: (pp) => devhubReplica({ p: pp, toggleInHeader: true }) };
   const ctx = await browser.newContext();
@@ -349,9 +352,15 @@ for (const n of NEAR) {
 // [D] run / backstop state with the exact verified page.
 // ===========================================================================================
 console.log("\n[D] RUN AND BACKSTOP STATE: the exact verified page, every one HELD");
-const DCASES: Array<{ id: string; what: string; run?: (s: string) => InfoPageRunState; before?: Run["before"]; entry?: (e: VerifiedInfoPage) => VerifiedInfoPage }> = [
-  { id: "d1", what: "a fill recorded earlier", run: (s) => cleanRun([...devhubPrefix(s), { action: "fill", note: "Site Address" }]) },
-  { id: "d2", what: "'advance: Yes' recorded (tw)", run: (s) => cleanRun([...devhubPrefix(s), { action: "click", note: "advance: Yes" }]) },
+const TW_PREFIX = (s: string): InfoPageRunStep[] => [...devhubPrefix(s), { action: "click", note: "advance: Yes" }];
+const FILL_PREFIX = (s: string): InfoPageRunStep[] => [...devhubPrefix(s), { action: "fill", note: "Site Address" }];
+const DCASES: Array<{ id: string; what: string; run?: (s: string) => InfoPageRunState; before?: Run["before"]; entry?: (e: VerifiedInfoPage) => VerifiedInfoPage; entryPrefix?: (s: string) => InfoPageRunStep[] }> = [
+  { id: "d1", what: "a fill recorded earlier", run: (s) => cleanRun(FILL_PREFIX(s)) },
+  { id: "d2", what: "'advance: Yes' recorded (tw)", run: (s) => cleanRun(TW_PREFIX(s)) },
+  // The same two with the page VERIFIED ON THAT VERY PREFIX (an entry the product cannot build —
+  // its watch never opens after an answer — so only the run-state whitelist stands in the way).
+  { id: "d1x", what: "a fill recorded earlier, the entry verified on that same prefix", run: (s) => cleanRun(FILL_PREFIX(s)), entryPrefix: FILL_PREFIX },
+  { id: "d2x", what: "'advance: Yes' recorded (tw), the entry verified on that same prefix", run: (s) => cleanRun(TW_PREFIX(s)), entryPrefix: TW_PREFIX },
   { id: "d3", what: "withOwnWriteWindow used earlier (everWrote)", before: async (_p, bs) => { const close = bs.openOwnWrite(_p, "a fill"); close(); } },
   { id: "d4", what: "lockReview armed (4a aborts before any exemption)", before: async (_p, bs) => { bs.lockReview("smoke"); } },
   { id: "d5", what: "a continued draft", run: (s) => cleanRun(devhubPrefix(s), { continuedDraft: true }) },
@@ -364,9 +373,9 @@ const DCASES: Array<{ id: string; what: string; run?: (s: string) => InfoPageRun
   { id: "d15", what: "a near-miss entry (the request hash one off)", entry: (e) => nearMissEntry(e, "requestSha") },
   { id: "d16", what: "an entry of an older identity version", entry: (e) => ({ ...e, identityVersion: INFO_PAGE_IDENTITY_VERSION - 1 }) },
 ];
-for (const c of DCASES) {
+for (const c of want("D") ? DCASES : []) {
   const p = `/${c.id}`;
-  const e = await devhubEntryAt(p);
+  const e = await devhubEntryAt(p, c.entryPrefix ? c.entryPrefix(startUrlOf(p)) : undefined);
   const o = await go({ p, html: (pp) => devhubReplica({ p: pp }), entries: e ? [c.entry ? c.entry(e) : e] : [], run: c.run, before: c.before });
   check(`[D] ${c.id} ${c.what}: HELD — nothing sent, no admission`, held(o), brief(o));
   if (o.open && !o.open.opened) console.log(`         ${c.id} refused: ${o.open.refusals.join("; ").slice(0, 200)}`);
