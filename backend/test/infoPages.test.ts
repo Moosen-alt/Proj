@@ -865,6 +865,20 @@ await check("round 4 (rule 6, X1_xorg): an incident on ANOTHER ORG's project put
   assert.deepEqual(IP.listInfoPagePassFilingWarnings(db, null).find((x) => x.passId === passId)?.projects.map((p) => p.id).sort(), [A, B].sort());
   x1 = { A, B, A2, B2, passId, passId2 };
 });
+await check("round 4 (rule 6, defense in depth): a may-have-filed row that carries incident text but no stamp of THIS project's org (a round-3 row, or one stamped for another org) is read back GENERIC — on the card and in the KB entry's time and label", async () => {
+  const P = fx.newProject();
+  for (const [i, org] of [[1, ""], [2, "org-b"]] as const) {
+    db.run("INSERT INTO audit_logs (id, project_id, actor_type, actor_name, action, details, created_at) VALUES (?, ?, 'portal_bot', 'network backstop', 'portal.info_page_may_have_filed', ?, '2026-10-16T12:00:00.000Z')",
+      [`dd-${i}-${P}`, P, JSON.stringify({ passId: `pass-dd-${i}`, where: sfjsp, controlLabel: "Pay for Jordan Rivera", why: ["Confirmation: KXQ-PLM-ZRT for Jordan Rivera"], ...(org ? { org } : {}) })]);
+  }
+  const w = IP.listInfoPageFilingWarnings(db, P);
+  assert.equal(w.length, 2);
+  assert.ok(w.every((x) => x.generic === true && x.why.length === 0 && x.at === "" && x.controlLabel === ""), JSON.stringify(w));
+  assert.ok(!JSON.stringify(w).includes("Jordan Rivera") && !JSON.stringify(w).includes("KXQ-PLM-ZRT"));
+  const kb = IP.listInfoPagePassFilingWarnings(db, "org-default").filter((x) => /^pass-dd-/.test(x.passId));
+  assert.equal(kb.length, 2);
+  assert.ok(kb.every((x) => x.at === "" && x.controlLabel === "" && x.projects.some((p) => p.id === P)), JSON.stringify(kb));
+});
 
 await check("round 4 (expiry, projects): a verification admits at most 10 DISTINCT projects — the 11th is HELD (handed no pass), its card says 'verification expired — a person re-verifies', a deleted project's use still counts, and re-verifying restores it", async () => {
   const { P: verifiedOn, passId, c } = await verifiedPage("Expiry Count Page");
