@@ -22,7 +22,7 @@ import {
   INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, digestInfoPageIdentity, infoPageBackstopRefusals, infoPageEvidence, infoPageMatchRefusals,
   infoPageObservedRequest, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageRunStateRefusals,
   infoPageShapeRefusals, infoPageVerifyWarnings, isMatchClassRefusal, mayPassInfoPage, parseFormBodyFields, verifiedInfoPageFromCandidate,
-  type InfoPageBackstopState, type InfoPageIdentityMaterial, type InfoPagePassContext, type InfoPageRunState,
+  type InfoPageBackstopState, type InfoPageIdentityMaterial, type InfoPagePassContext, type InfoPageRunState, type InfoPageRunStep,
 } from "../../shared/src/infoPagePass";
 import { isInterstitialForwardLabel, portalSafetyFactory } from "../../shared/src/portalSafety";
 import type { VerifiedInfoPage } from "../../shared/src/types";
@@ -153,7 +153,7 @@ console.log("\nSHAPE");
 
 // ---------------------------------------------------------------------------------------------
 console.log("\nRUN STATE, BACKSTOP STATE, MATCH");
-const PREFIX_STEPS = [
+const PREFIX_STEPS: InfoPageRunStep[] = [
   { action: "goto", note: "entry url", value: `${ORIGIN}/permits/sfjsp?interviewID=Home` },
   { action: "click", note: "application entry: Apply For A Permit" },
   { action: "click", note: "permit type: Solar Permit Request" },

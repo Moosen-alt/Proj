@@ -1884,7 +1884,6 @@ export function portalSafetyFactory() {
       const summaries = qsa(d, "dl, dd, th");
       const summaryOutsideChrome = summaries.filter((el) => !closest(el, CHROME)).length;
       const summaryInForm = summaries.filter((el) => contains(form, el)).length;
-      const controlLabels = qsa(d, "button, input[type=submit], input[type=button], input[type=image], [role=button]").map((el) => collapse(controlLabelInPage(el)));
       const customFormElements = 0;
       // The one tenant mask.
       const maskable = qsa(d, "button").filter((el) => String(attr(el, "type") ?? "").trim().toLowerCase() === "button"
@@ -1894,6 +1893,9 @@ export function portalSafetyFactory() {
         && collapse(textOf(el)).length <= 60);
       if (maskable.length > 1) return fail("more than one control qualifies for the tenant mask");
       const masked = maskable[0] ?? null;
+      // Every control's label — the masked toggle's as the same one token as in the text.
+      const controlLabels = qsa(d, "button, input[type=submit], input[type=button], input[type=image], [role=button]")
+        .map((el) => (masked && el === masked ? "‹toggle›" : collapse(controlLabelInPage(el))));
       // The text: the LIVE body walked (script / style / noscript / template skipped), the masked
       // toggle's whole text replaced by one token.
       const parts: string[] = [];

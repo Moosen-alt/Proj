@@ -37,6 +37,18 @@
 //      (b) exempts the RUN'S OWN recorded write on that page while it is in flight
 //      (withOwnWriteWindow: a fill / select / check whose per-field autosave posts — PowerClerk's
 //      Terms checkbox at review); (a), the filing-URL rule and payment never exempt anything.
+//      (b) ALSO exempts ONE request off a HUMAN-VERIFIED INFORMATION PAGE (#344, owner ruling
+//      2026-10-15, option B): openInfoPagePass takes the backstop's own fresh identity read of the
+//      page and its forward control, and the one predicate (shared/src/infoPagePass.ts
+//      infoPagePassRefusals) must find that exact page verified by a named person, reached by the
+//      exact verified steps with NOTHING entered on the run. Then one slot opens for 20 s: the
+//      page's own main-frame document POST whose URL, media type and ordered [name, sha256(value)]
+//      body equal the verified control's passes 4(b) — after payment, the filing-URL rule, the
+//      windows and the sticky lock (4a) have all been applied, unchanged. The first request that
+//      could take the slot consumes it, matched or not. With no verified page (every benchmark,
+//      every test that does not opt in) no slot can open and every request meets main's rules.
+//      An unverified page is held exactly as before; the held request is OBSERVED (method, URL
+//      hash, media, body hashes) so the learner can record the page as a candidate for a person.
 //
 // Every abort is recorded (origin + path only — never a query string, which can carry a
 // customer's data) so the run reports it; a filing, payment or lockdown abort also stops the run,
@@ -48,8 +60,36 @@
 //
 // Known cost: Playwright disables the browser's HTTP cache while any route is installed.
 import { isFilingOrPaymentRequest, isPayRequestUrl, paymentDialogVerdict, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE } from "../../shared/src/portalSafety";
+import {
+  digestInfoPageIdentity, infoPageObservedRequest, infoPagePassEntry, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals,
+  infoPageRequestRefusals, isMatchClassRefusal,
+  type InfoPageDigest, type InfoPageExpectedRequest, type InfoPageIdentityMaterial, type InfoPageIdentityReading, type InfoPageObservedRequest,
+  type InfoPagePrefixStep, type InfoPageRunState,
+} from "../../shared/src/infoPagePass";
+import type { VerifiedInfoPage } from "../../shared/src/types";
 
 export type BackstopRule = "filing-url" | "dismisser-window" | "enter-window" | "review-lockdown";
+
+/** What openInfoPagePass answered (#344). `candidateWatch`: no verified page matched, and ONLY
+ *  that refused — the backstop watches this page's held forward request so the run can record it
+ *  for a person to verify. */
+export interface InfoPagePassOpen {
+  opened: boolean;
+  entryId?: string;
+  refusals: string[];
+  candidateWatch: boolean;
+}
+
+/** An unverified information page, captured when the watch opened — BEFORE the click (#344,
+ *  amendment pin 2) — and, once the backstop held its forward request, what that request carried
+ *  (`observed`; null when nothing was held: the person cannot verify such a candidate). The
+ *  material is in memory only: the caller builds its scrubbed evidence and drops it. */
+export interface InfoPageCandidateTake {
+  digest: InfoPageDigest;
+  prefix: InfoPagePrefixStep[];
+  observed: InfoPageObservedRequest | null;
+  material: InfoPageIdentityMaterial;
+}
 
 export interface BackstopAbort {
   rule: BackstopRule;
@@ -121,8 +161,29 @@ export interface FilingBackstop {
   lockReview(why: string): void;
   /** Aborts that stop the run: filing, payment, review lockdown. */
   stoppingAborts(): BackstopAbort[];
+  /** A HUMAN-VERIFIED INFORMATION PAGE (#344): read `page`'s identity fresh on `control` (a
+   *  Playwright locator resolving to ONE element in the main frame) and ask infoPagePassRefusals.
+   *  Passing, ONE slot opens: that page's main-frame document POST equal to the verified control's
+   *  request passes rule 4(b) only, once, within 20 s. Refused only because no verified page
+   *  matches, a WATCH opens instead: the held request is observed for takeInfoPageCandidate. Any
+   *  other refusal opens nothing. Opening closes any earlier slot or watch. */
+  openInfoPagePass(page: unknown, control: unknown, opts: { entries: ReadonlyArray<VerifiedInfoPage>; run: InfoPageRunState }): Promise<InfoPagePassOpen>;
+  /** Close the info-page slot and watch now (the caller's click is over). */
+  closeInfoPagePass(): void;
+  /** The unverified page whose forward request was held, once (then forgotten), or null. */
+  takeInfoPageCandidate(): InfoPageCandidateTake | null;
+  /** Each request the info-page slot admitted: exempted = it passed 4(b) only because of the
+   *  pass (false: 4(b) would not have held it anyway). */
+  readonly infoPageAdmissions: Array<{ entryId: string; where: string; exempted: boolean }>;
+  /** Each request that took the info-page slot and did NOT match (origin + path, why). */
+  readonly infoPageRefusedRequests: Array<{ where: string; refusals: string[] }>;
   dispose(): Promise<void>;
 }
+
+/** How long an opened information-page slot stays open, at most (#344). */
+const INFO_PAGE_SLOT_MS = 20_000;
+/** The fresh identity read must answer within this, or the pass is refused. */
+const INFO_PAGE_IDENTITY_TIMEOUT_MS = 3_000;
 
 /** The rules whose abort stops the run by name (a window abort is reported, and the run goes on:
  *  nothing was sent, and the dismissal / Enter was not a step of the recipe). */
@@ -345,6 +406,46 @@ async function mainFrameIsTerminal(main: any): Promise<boolean | null> {
   try { return await Promise.race([read, timeout]); } finally { if (timer) clearTimeout(timer); }
 }
 
+/** THE BACKSTOP'S OWN FRESH IDENTITY READ (#344): the page's identity on exactly one control, in
+ *  the main frame, within 3 s — never a caller's or a load-time reading. Any doubt refuses. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function readInfoPageIdentity(page: any, control: any): Promise<InfoPageIdentityReading> {
+  const notOne: InfoPageIdentityReading = { ok: false, why: "the control is not one element in the main frame" };
+  const read = (async (): Promise<InfoPageIdentityReading> => {
+    if (!page || typeof page.mainFrame !== "function") return { ok: false, why: "the page cannot be read" };
+    if (!control || typeof control.count !== "function" || typeof control.elementHandle !== "function") return notOne;
+    const n = await control.count().catch(() => -1);
+    if (n !== 1) return notOne;
+    const handle = await control.elementHandle({ timeout: INFO_PAGE_IDENTITY_TIMEOUT_MS }).catch(() => null);
+    if (!handle) return notOne;
+    try {
+      const frame = await handle.ownerFrame().catch(() => null);
+      if (!frame || frame !== page.mainFrame()) return notOne;
+      await frame.evaluate(PORTAL_SAFETY_IN_PAGE_SOURCE).catch(() => null);
+      const r = await handle.evaluate((el: unknown, g: string) => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const ps = (globalThis as any)[g];
+        return ps && typeof ps.infoPageIdentityInPage === "function" ? ps.infoPageIdentityInPage(el) : { ok: false, why: "the page has no identity reader" };
+      }, PORTAL_SAFETY_GLOBAL).catch((e: unknown) => ({ ok: false, why: `the identity read failed (${String((e as { message?: string })?.message ?? e).slice(0, 80)})` }));
+      return r && typeof r === "object" && typeof (r as { ok?: unknown }).ok === "boolean" ? r as InfoPageIdentityReading : { ok: false, why: "the identity read returned nothing" };
+    } finally {
+      await handle.dispose().catch(() => null);
+    }
+  })();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<InfoPageIdentityReading>((r) => { timer = setTimeout(() => r({ ok: false, why: "the identity read timed out" }), INFO_PAGE_IDENTITY_TIMEOUT_MS); });
+  try { return await Promise.race([read, timeout]); } finally { if (timer) clearTimeout(timer); }
+}
+
+/** origin + path + every query [key, value] sorted: the page's exact address, for R5. */
+const pageKeyOf = (url: string): string => {
+  try {
+    const u = new URL(url);
+    const q = Array.from(u.searchParams.entries()).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0));
+    return JSON.stringify([u.origin, u.pathname, q]);
+  } catch { return ""; }
+};
+
 /** The page a request came from (its frame's page), or null (a service-worker request). */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function pageOfRequest(request: any): any {
@@ -449,6 +550,53 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   const drainRequests: string[] = [];
   let locked = "";
   let disposed = false;
+  // #344 — THE INFORMATION-PAGE PASS. Run-wide facts its predicate asks (the run wrote through an
+  // own-write window; an approved final-submit slot was ever opened), its ONE slot, its candidate
+  // watch, and what each admitted. Every closer below also closes these.
+  let everWrote = false;
+  let approvedEverOpened = false;
+  type InfoSlot = { page: unknown; entryId: string; expected: InfoPageExpectedRequest; pageKey: string; until: number; open: boolean; timer: ReturnType<typeof setTimeout> | null; detach: () => void };
+  let infoSlot: InfoSlot | null = null;
+  type InfoWatch = { page: unknown; capture: InfoPageCandidateTake; until: number; open: boolean; timer: ReturnType<typeof setTimeout> | null; detach: () => void };
+  let infoWatch: InfoWatch | null = null;
+  let infoCandidate: InfoPageCandidateTake | null = null;
+  const infoPageAdmissions: Array<{ entryId: string; where: string; exempted: boolean }> = [];
+  const infoPageRefusedRequests: Array<{ where: string; refusals: string[] }> = [];
+  const admittedEntryIds: string[] = [];
+  const infoSlotLive = (): boolean => !!infoSlot && infoSlot.open && Date.now() < infoSlot.until;
+  const infoWatchLive = (): boolean => !!infoWatch && infoWatch.open && Date.now() < infoWatch.until;
+  const closeInfoSlot = (): void => {
+    const s = infoSlot;
+    if (!s) return;
+    s.open = false;
+    if (s.timer) clearTimeout(s.timer);
+    s.timer = null;
+    s.detach();
+    infoSlot = null;
+  };
+  const closeInfoWatch = (): void => {
+    const w = infoWatch;
+    if (!w) return;
+    w.open = false;
+    if (w.timer) clearTimeout(w.timer);
+    w.timer = null;
+    w.detach();
+    infoWatch = null;
+  };
+  const closeInfo = (): void => { closeInfoSlot(); closeInfoWatch(); };
+  /** Close on the page's next document, and on a timer. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const bindInfoClosers = (pg: any, onClose: () => void): { detach: () => void; timer: ReturnType<typeof setTimeout> } => {
+    const detachers: Array<() => void> = [];
+    if (pg && typeof pg.on === "function" && typeof pg.off === "function") {
+      const onLoad = (): void => onClose();
+      pg.on("domcontentloaded", onLoad);
+      detachers.push(() => { try { pg.off("domcontentloaded", onLoad); } catch { /* page gone */ } });
+    }
+    const timer = setTimeout(onClose, INFO_PAGE_SLOT_MS);
+    (timer as { unref?: () => void }).unref?.();
+    return { detach: () => { for (const d of detachers.splice(0)) d(); }, timer };
+  };
   // A NAVIGATION REQUEST (a form POST) CANNOT BE ASKED LIVE: evaluating the page it is navigating
   // waits for that navigation, which waits for this handler — every Accela postback stalled the
   // full read timeout (measured: 9 postbacks x 1.5 s on the Accela replica). So each page's
@@ -503,6 +651,17 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
           }
         } catch { /* unreadable: the slot keeps its other closers */ }
       }
+      // ...and the information-page slot / watch (#344): the page is leaving by GET, so its one
+      // state-changing request can no longer be the verified control's.
+      if (method === "GET" && (infoSlot || infoWatch)) {
+        try {
+          const pg = pageOfRequest(request);
+          if (request.isNavigationRequest() && pg && request.frame() === pg.mainFrame()) {
+            if (infoSlot && pg === infoSlot.page) closeInfoSlot();
+            if (infoWatch && pg === infoWatch.page) closeInfoWatch();
+          }
+        } catch { /* unreadable: the slot keeps its other closers */ }
+      }
       await route.fallback().catch(() => null);
       return;
     }
@@ -512,6 +671,37 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       aborts.push({ rule, method: method || "?", where: whereOf(url), why, resourceType });
       await route.abort("blockedbyclient").catch(() => null);
     };
+    // R0 — THE INFORMATION-PAGE SLOT IS CONSUMED by the FIRST request that could be the verified
+    // control's (#344): the bound page's own main-frame document navigation. Matched or not, the
+    // slot is gone, and consuming it changes no rule's outcome: the request meets payment, the
+    // filing-URL rule, the windows and the sticky lock (4a) below exactly as on main, and only 4(b)
+    // can be lifted — only when R2-R5 all hold (URL, media, ordered body, the page's address).
+    let infoAdmit: { entryId: string; refusals: string[] } | null = null;
+    if (infoSlotLive()) {
+      const s = infoSlot!;
+      const pg = pageOfRequest(request);
+      let navigation = false;
+      let mainFrame = false;
+      try { navigation = !!request.isNavigationRequest(); } catch { navigation = false; }
+      try { mainFrame = !!pg && typeof pg.mainFrame === "function" && request.frame() === pg.mainFrame(); } catch { mainFrame = false; }
+      if (pg && pg === s.page && navigation && mainFrame && /^document$/i.test(resourceType)) {
+        closeInfoSlot();
+        let contentType = "";
+        try {
+          const h = typeof request.allHeaders === "function" ? await request.allHeaders() : request.headers();
+          contentType = String((h && (h["content-type"] ?? h["Content-Type"])) || "");
+        } catch { contentType = ""; }
+        let buf: Buffer | null = null;
+        try { buf = request.postDataBuffer(); } catch { buf = null; }
+        const observed = infoPageObservedRequest(method || "?", url, contentType, buf);
+        const refusals = infoPageRequestRefusals(s.expected, observed);
+        let pageUrl = "";
+        try { pageUrl = String(pg.url() || ""); } catch { pageUrl = ""; }
+        if (!pageUrl || pageKeyOf(pageUrl) !== s.pageKey) refusals.push("the page's address is not the one whose identity was read");
+        infoAdmit = { entryId: s.entryId, refusals };
+        if (refusals.length) infoPageRefusedRequests.push({ where: whereOf(url), refusals });
+      }
+    }
     // 1. PAYMENT: never, in any frame, any type, whatever was approved.
     if (isPayRequestUrl(url)) { await abort("filing-url", "a fee-payment endpoint — automation never pays"); return; }
     // The approved click's ONE request takes the slot (checked after the payment rule: a payment
@@ -588,10 +778,41 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
             return;
           }
         }
-        await abort("review-lockdown", `the page this request came from is the review/terminal page (${label})`);
+        // A HUMAN-VERIFIED INFORMATION PAGE'S ONE REQUEST (#344): the slot openInfoPagePass opened
+        // (identity, prefix, run state and shape all held at the click) took this request and it
+        // is exactly the verified control's. 4(b) only: everything above already applied.
+        if (infoAdmit && infoAdmit.refusals.length === 0) {
+          infoPageAdmissions.push({ entryId: infoAdmit.entryId, where: whereOf(url), exempted: true });
+          admittedEntryIds.push(infoAdmit.entryId);
+          await route.fallback().catch(() => null);
+          return;
+        }
+        // AN UNVERIFIED INFORMATION PAGE'S HELD REQUEST, OBSERVED (#344): the watch the click opened
+        // records what the page's forward control sent — method, URL hash, media, body hashes — so
+        // the run can offer the page to a person. The abort below is unchanged.
+        if (infoWatchLive() && pg && pg === infoWatch!.page && navigation && /^document$/i.test(resourceType)) {
+          let mainFrame = false;
+          try { mainFrame = typeof pg.mainFrame === "function" && request.frame() === pg.mainFrame(); } catch { mainFrame = false; }
+          if (mainFrame) {
+            const w = infoWatch!;
+            let contentType = "";
+            try {
+              const h = typeof request.allHeaders === "function" ? await request.allHeaders() : request.headers();
+              contentType = String((h && (h["content-type"] ?? h["Content-Type"])) || "");
+            } catch { contentType = ""; }
+            let buf: Buffer | null = null;
+            try { buf = request.postDataBuffer(); } catch { buf = null; }
+            if (!w.capture.observed) w.capture.observed = infoPageObservedRequest(method || "?", url, contentType, buf);
+            closeInfoWatch();
+          }
+        }
+        const passWhy = infoAdmit ? ` — the information-page pass did not cover it: ${infoAdmit.refusals.join("; ").slice(0, 200)}` : "";
+        await abort("review-lockdown", `the page this request came from is the review/terminal page (${label})${passWhy}`);
         return;
       }
     }
+    // The slot's request was not one 4(b) would have held: it passes as on main (recorded).
+    if (infoAdmit && infoAdmit.refusals.length === 0) infoPageAdmissions.push({ entryId: infoAdmit.entryId, where: whereOf(url), exempted: false });
     await route.fallback().catch(() => null);
   };
 
@@ -599,6 +820,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   const bs: FilingBackstop = {
     aborts,
     openWindow(rule, why) {
+      closeInfo();
       const id = nextWindow++;
       windows.set(id, { rule, why: String(why || "").slice(0, 120) });
       return () => { windows.delete(id); };
@@ -610,6 +832,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     allowApprovedFiling(ms: number, opts?: { page?: unknown }) {
       // Reset, never added: each approved click (the submit, a confirm dialog's OK) covers one.
       closeSlot();
+      // A run that ever opened the approved final-submit door never passes an information page.
+      approvedEverOpened = true;
+      closeInfo();
       if (disposed) return;
       // Bound to the page the caller clicked on — by default the page this backstop was installed
       // for, never "any page" (an unbound slot is how a completion page's POST took it).
@@ -666,6 +891,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       s.timer = setTimeout(() => { if (slot === s) closeSlot(); }, span);
     },
     openOwnWrite(pg: unknown, why: string) {
+      // The run wrote a value: no information page passes on this run any more (#344).
+      everWrote = true;
+      closeInfo();
       const id = nextOwnWrite++;
       // Bound to the page written on — by default the backstop's own page, never "any page".
       const bound = pg && typeof pg === "object" ? pg : page;
@@ -688,12 +916,85 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     approvedSlotOpen() { return slotLive(); },
     closeApprovedSlot() { closeSlot(); },
     lockReview(why: string) {
+      closeInfo();
       if (!locked) locked = `the run is at review (${String(why || label).slice(0, 100)}) — nothing legitimate posts from here until a person takes the page`;
     },
     stoppingAborts() { return aborts.filter(isStoppingAbort); },
+    async openInfoPagePass(pg: unknown, control: unknown, opts: { entries: ReadonlyArray<VerifiedInfoPage>; run: InfoPageRunState }): Promise<InfoPagePassOpen> {
+      // A new open closes any earlier slot or watch (a candidate already observed is kept).
+      closeInfo();
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const p: any = pg && typeof pg === "object" ? pg : page;
+      const reading = await readInfoPageIdentity(p, control);
+      const run = opts && opts.run ? opts.run : undefined;
+      const entries = opts && Array.isArray(opts.entries) ? opts.entries : [];
+      // The reading 4(b) consults for this page's NAVIGATION: its last load's (a navigation request
+      // cannot be asked live). Only a page whose click 4(b) would hold asks for a pass or a candidate.
+      let wideTerminal: boolean | null = lastReading.has(p) ? lastReading.get(p) ?? null : null;
+      if (wideTerminal === null && p && typeof p.mainFrame === "function") wideTerminal = await mainFrameIsTerminal(p.mainFrame()).catch(() => null);
+      // The backstop's own state, read AFTER the identity read (a page script may have tripped a
+      // stopping abort, or the run locked, while it ran).
+      const state = {
+        installed: true,
+        disposed,
+        locked: !!locked,
+        windowsOpen: windows.size > 0,
+        approvedSlotOpen: slotLive(),
+        approvedEverOpened,
+        stoppingAbort: aborts.some(isStoppingAbort),
+        everWrote,
+        admissions: infoPageAdmissions.filter((a) => a.exempted).length,
+        admittedEntryIds: [...admittedEntryIds],
+        wideTerminal,
+      };
+      const digest = reading.ok ? digestInfoPageIdentity(reading.material) : null;
+      const identity = reading.ok && digest
+        ? { ok: true, digest, projectValueHits: run && Array.isArray(run.projectValues) ? infoPageProjectValueRefusals(reading.material.text, run.projectValues) : undefined }
+        : { ok: false, why: reading.ok ? "the page could not be digested" : reading.why };
+      const ctx = { backstop: state, run, identity, entries };
+      const refusals = infoPagePassRefusals(ctx);
+      if (!refusals.length && reading.ok && digest) {
+        const entry = infoPagePassEntry(ctx);
+        if (!entry) return { opened: false, refusals: ["no verified information page matches"], candidateWatch: false };
+        const m = reading.material;
+        const q = m.page.query.map(([k, v]) => [k, v]);
+        const s: InfoSlot = {
+          page: p, entryId: entry.id, expected: digest.expected,
+          pageKey: JSON.stringify([m.page.origin, m.page.path, q]), until: Date.now() + INFO_PAGE_SLOT_MS, open: true, timer: null, detach: () => undefined,
+        };
+        const c = bindInfoClosers(p, () => { if (infoSlot === s) closeInfoSlot(); });
+        s.timer = c.timer;
+        s.detach = c.detach;
+        infoSlot = s;
+        return { opened: true, entryId: entry.id, refusals: [], candidateWatch: false };
+      }
+      if (reading.ok && digest && refusals.length > 0 && refusals.every(isMatchClassRefusal)) {
+        // CAPTURED NOW, before the click (amendment pin 2): a BackstopAbort carries no page identity.
+        const capture: InfoPageCandidateTake = {
+          digest, prefix: infoPagePrefixOf(run && Array.isArray(run.priorSteps) ? run.priorSteps : []), material: reading.material, observed: null,
+        };
+        infoCandidate = capture;
+        const w: InfoWatch = { page: p, capture, until: Date.now() + INFO_PAGE_SLOT_MS, open: true, timer: null, detach: () => undefined };
+        const c = bindInfoClosers(p, () => { if (infoWatch === w) closeInfoWatch(); });
+        w.timer = c.timer;
+        w.detach = c.detach;
+        infoWatch = w;
+        return { opened: false, refusals, candidateWatch: true };
+      }
+      return { opened: false, refusals, candidateWatch: false };
+    },
+    closeInfoPagePass() { closeInfo(); },
+    takeInfoPageCandidate() {
+      const c = infoCandidate;
+      infoCandidate = null;
+      return c;
+    },
+    infoPageAdmissions,
+    infoPageRefusedRequests,
     async dispose() {
       disposed = true;
       closeSlot();
+      closeInfo();
       if (REGISTRY.get(page) === bs) REGISTRY.delete(page);
       if (target !== page && REGISTRY.get(target) === bs) REGISTRY.delete(target);
       windows.clear();

@@ -7,7 +7,7 @@ import type { ProjectRecord, RecipeSelector, RecipeStep, StepFingerprint } from 
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, type PortalContext, type PortalStepResult } from "../adapter";
 import { openPortal } from "../browser";
 import { selectWithFallback, readClosedComboboxOptions } from "../comboboxFill";
-import { detectChallengeFrame, frameSelectorFor, maskId, readbackMatches, redactStatusText, safeAction, sleep, smartWait, waitForElement, waitForInteractiveControls } from "../safeAction";
+import { detectChallengeFrame, frameSelectorFor, maskId, readbackMatches, redactCaptureText, redactStatusText, safeAction, sleep, smartWait, waitForElement, waitForInteractiveControls } from "../safeAction";
 import { applyFormatHint } from "../formatHint";
 import { scrapeReviewScreen as scrapeReviewScreenShared } from "../reviewScreenScraper";
 import { performLogin, lastRevealTrail, loginFormPresent, holdForPerson } from "./loginFlow";
@@ -52,6 +52,10 @@ export interface ContinueDraft {
 import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isInterstitialForwardLabel as sharedIsInterstitialForwardLabel, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
 import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
+// Types only (erased): the information-page door is reached duck-typed on the installed backstop.
+import type { FilingBackstop, InfoPageCandidateTake, InfoPagePassOpen } from "../filingBackstop";
+import { infoPageEvidence, type InfoPageRunState, type InfoPageRunStep } from "../../../shared/src/infoPagePass";
+import type { InfoPageCandidateCapture, VerifiedInfoPage } from "../../../shared/src/types";
 import { hostOfUrl, sameCredentialScope } from "../siteOf";
 import { attachmentTypeFor, isDocumentTypeList, isPlanSetDocType } from "./attachmentTypes";
 import {
@@ -264,6 +268,11 @@ export interface LearnResult {
    *  Submit), never requested (the signature step was staged again), or still awaited / unreadable
    *  (the walk stopped and says why). */
   signatureCheck?: SignatureCheck;
+  /** AN INFORMATION PAGE NO PERSON HAS VERIFIED (#344): the backstop would hold (and held) its
+   *  forward request; captured at the click for a person to verify (project -> Portal runs). */
+  infoPageCandidate?: InfoPageCandidateCapture;
+  /** Each human-verified information page this walk passed (one request each, rule 4(b) only). */
+  infoPagePassed?: Array<{ passId: string; where: string }>;
 }
 
 // Live progress signal emitted while learning a portal, so the UI can show a real
@@ -2111,6 +2120,20 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   /** What the signature-request step staged, once the walk reached it (#308). */
   private signatureStep: SignatureStepOutcome | undefined;
   private signatureCheck: SignatureCheck | undefined;
+  /** #344 — see the infoPagePasses option: the human-verified information pages, frozen at
+   *  construction (a withdrawal applies from the next run). */
+  private infoPagePasses: ReadonlyArray<VerifiedInfoPage>;
+  /** #344 — the backend's answer: has this project already made progress on this portal origin?
+   *  Unknown (not given) is TRUE: an unknown never reassures. */
+  private infoPagePriorProgress: boolean;
+  /** The "advance:" steps an information-page pass of THIS run admitted (critique [9]: the step
+   *  objects, never their indexes, which a rolled-back walk reuses). */
+  private infoPassAdmittedSteps = new WeakSet<RecipeStep>();
+  private infoPageCandidate: InfoPageCandidateCapture | null = null;
+  private infoPagePassed: Array<{ passId: string; where: string }> = [];
+  /** The project's own values (street, name, parcel, system size): a page that shows them before
+   *  anything was entered is a summary, never an information page. */
+  private infoPageProjectValues: string[] = [];
   /** Lines for the person at review that come from the PAGE, not the run (#302: PSE's red
    *  "file as a modification on the original record" notice). */
   private pageReviewNotes: string[] = [];
@@ -2313,6 +2336,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
        *  still decides at the click. Never PORTAL_ALLOW_FINAL_SUBMIT: it files nothing. */
       signatureRequestApproval?: SignatureRequestApproval | null;
       runId?: string;
+      /** HUMAN-VERIFIED INFORMATION PAGES (#344): the backend's live passes (infoPages.ts
+       *  liveInfoPagePasses). Only the network backstop reads them, at the interstitial's forward
+       *  click (openInfoPagePass). None = every information page is held exactly as before. */
+      infoPagePasses?: ReadonlyArray<VerifiedInfoPage>;
+      /** #344: the backend's answer to "has this project already reached review, recorded an
+       *  application number or found a draft on this portal origin?". Not given = true (refuses). */
+      infoPagePriorProgress?: boolean;
     } = {},
   ) {
     super();
@@ -2323,6 +2353,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     this.siteIdentity = options.siteIdentity;
     this.continueDraft = options.continueDraft;
     this.signatureRequestApproval = options.signatureRequestApproval ?? null;
+    this.infoPagePasses = Object.freeze((options.infoPagePasses ?? []).map((e) => Object.freeze(JSON.parse(JSON.stringify(e)) as VerifiedInfoPage)));
+    this.infoPagePriorProgress = options.infoPagePriorProgress !== false;
     this.runId = String(options.runId ?? "");
     this.allowFinalSubmit = options.allowFinalSubmit === true;
     this.hasBattery = options.hasBattery;
@@ -3574,9 +3606,21 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         meterNumber: String(project.meterNumber ?? "").trim(),
       };
       this.debug?.setScrubber((text) => this.scrubSecrets(text));
+      // #344: the project's own values — a page that shows them before anything was entered is a
+      // summary, never an information page (the backstop refuses a pass and a candidate there).
+      {
+        const street = String(project.projectAddress ?? "").split(",")[0].trim();
+        const kw = typeof project.systemSizeDcKw === "number" && project.systemSizeDcKw > 0 ? `${project.systemSizeDcKw} kW` : "";
+        const apn = String(((project as { parserSnapshot?: Record<string, unknown> }).parserSnapshot ?? {}).apn ?? "").trim();
+        this.infoPageProjectValues = [street, String(project.homeownerName ?? "").trim(), apn, kw].filter((v) => v.length >= 4);
+      }
       result = await this.learnImpl(context, project);
       // The message quotes the portal (validation errors, notices) — a portal can echo an account.
       result = { ...result, message: this.scrubSecrets(result.message) };
+      // #344: the unverified information page this walk held (for a person to verify), and every
+      // verified one it passed (each use of the relaxation is on record).
+      if (this.infoPageCandidate) result = { ...result, infoPageCandidate: this.infoPageCandidate };
+      if (this.infoPagePassed.length) result = { ...result, infoPagePassed: [...this.infoPagePassed] };
       // Hand-off first (the route comes off), then every abort up to that moment is counted.
       await backstop?.dispose().catch(() => null);
       // WHAT THE PERSON TAKING THE REVIEW PAGE MUST KNOW (dryrun-0928 B3 + B14), in the hand-off itself:
@@ -5356,6 +5400,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         const stopping = backstopFor(this.page)?.stoppingAborts() ?? [];
         if (stopping.length) {
           this.debug?.event({ type: "backstop_stop", page: pageCount, message: describeBackstopAbort(stopping[0]) });
+          // AN INFORMATION PAGE NO PERSON HAS VERIFIED (#344): the hold is the same; the message says
+          // what a person can do about it. stopReason stays "backstop_abort".
+          const cand = this.infoPageCandidate;
+          if (cand && cand.observed) {
+            const req = cand.observed as { method?: string; where?: string };
+            return { ...fail(steps, this.portalName, `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: the network backstop held "${String(cand.controlLabel).slice(0, 40)}" (${String(req.method ?? "POST")} ${String(req.where ?? `${cand.origin}${cand.path}`)}). Nothing was sent. A person can mark this exact page once (project → Portal runs → Information page to verify); after that, runs pass it — only this page, and only before anything is entered on the run.`, null, pageCount, portalNotices), stopReason: "backstop_abort" };
+          }
           return { ...fail(steps, this.portalName, `Stopped by the network backstop: ${describeBackstopAbort(stopping[0])}. Nothing was sent; the step (or page script) that fired it must be reviewed.`, null, pageCount, portalNotices), stopReason: "backstop_abort" };
         }
       }
@@ -7583,6 +7634,18 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           selector: advanceField.selector,
           note: `advance: ${advanceField.label || "next"}`,
         });
+        // #344 — A HUMAN-VERIFIED INFORMATION PAGE: on the interstitial's forward click only (c2i'),
+        // the network backstop is asked ONCE, immediately before the click, whether a person
+        // verified this exact page (openInfoPagePass, reached duck-typed on the installed backstop —
+        // a backstop without the door holds the click exactly as before). The run state it judges
+        // is the steps BEFORE this one. The flag lives here, outside the retry closure: a retried
+        // click closes whatever the first attempt opened and meets 4(b) exactly as on main.
+        const advStep = steps[steps.length - 1];
+        const advPrior = steps.slice(0, steps.length - 1);
+        const infoDoor = backstopFor(this.page) as (Partial<FilingBackstop> & { infoPageAdmissions?: FilingBackstop["infoPageAdmissions"] }) | null;
+        const infoAdmissionsBefore = infoDoor && Array.isArray(infoDoor.infoPageAdmissions) ? infoDoor.infoPageAdmissions.length : 0;
+        let infoPassTried = false;
+        let infoShot: string | undefined;
         const advBeforeUrl = typeof this.page.url === "function" ? String(this.page.url() ?? "") : "";
         const advBeforeFp = await this.pageFingerprint();
         const advBeforeSig = await advanceSignatureOf(this.page);
@@ -7613,21 +7676,32 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           );
           (advTimer as { unref?: () => void }).unref?.();
         });
-        const res = await Promise.race([
-          safeAction(
-            "advance",
-            async () => {
-              const loc = await this.locator(advanceField.selector);
-              if (!loc) throw new Error("advance selector unresolved");
-              const gen = this.clickGeneration;
-              await this.clickResilient(loc);
-              if (this.clickGeneration !== gen) return; // retired mid-click; the walk owns the page
-              await this.waitAfterClick(advBeforeUrl, advBeforeFp, advTabsBefore);
-            },
-            { required: true },
-          ),
-          advBudget,
-        ]);
+        let res: { ok: boolean; field?: string; message?: string; timedOut?: boolean };
+        try {
+          res = await Promise.race([
+            safeAction(
+              "advance",
+              async () => {
+                const loc = await this.locator(advanceField.selector);
+                if (!loc) throw new Error("advance selector unresolved");
+                if (infoPassTried) {
+                  if (infoDoor && typeof infoDoor.closeInfoPagePass === "function") infoDoor.closeInfoPagePass();
+                } else if (interstitialAdvanceKey && infoDoor && typeof infoDoor.openInfoPagePass === "function") {
+                  infoPassTried = true;
+                  infoShot = await this.askInfoPagePass(infoDoor as FilingBackstop, loc, advPrior, pageCount, signatureDone);
+                }
+                const gen = this.clickGeneration;
+                await this.clickResilient(loc);
+                if (this.clickGeneration !== gen) return; // retired mid-click; the walk owns the page
+                await this.waitAfterClick(advBeforeUrl, advBeforeFp, advTabsBefore);
+              },
+              { required: true },
+            ),
+            advBudget,
+          ]);
+        } finally {
+          if (infoPassTried && infoDoor) this.settleInfoPagePass(infoDoor as FilingBackstop, advStep, infoAdmissionsBefore, infoShot, pageCount);
+        }
         if (advTimer) clearTimeout(advTimer);
         if ((res as { timedOut?: boolean }).timedOut) {
           this.clickGeneration++; // retire the click still in flight before anything else
@@ -8661,6 +8735,83 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     };
     const { screenshotBase64, ...text } = req;
     return { ...(walk(text) as Omit<LearnPlanRequest, "screenshotBase64">), screenshotBase64 };
+  }
+
+  /**
+   * #344 — ASK THE NETWORK BACKSTOP whether a person verified this information page, immediately
+   * before its forward click (the learner's ONE call). The run state is the steps before this click
+   * and the walk's own flags; only the backstop decides (infoPagePassRefusals). When no verified
+   * page matches and only that refused, the backstop captured the page (identity, prefix, text) and
+   * watches the click's request; the masked screenshot is taken HERE, still before the click.
+   * Returns that screenshot (base64), or undefined.
+   */
+  private async askInfoPagePass(door: FilingBackstop, loc: Locator, prior: RecipeStep[], pageCount: number, signatureDone: boolean): Promise<string | undefined> {
+    const priorSteps: InfoPageRunStep[] = prior.map((s) => ({
+      action: String(s.action ?? ""), note: s.note, value: s.action === "goto" ? s.value : undefined, admitted: this.infoPassAdmittedSteps.has(s),
+    }));
+    const cd = this.continueDraft;
+    const run: InfoPageRunState = {
+      priorSteps,
+      formPageSeen: this.formPageSeen,
+      continuedDraft: !!this.continuedDraft,
+      draftResume: !!(cd && (cd.applicationNumber || cd.required || cd.awaitingSignature)),
+      signatureCheck: !!this.signatureCheck,
+      signatureStep: !!this.signatureStep,
+      signatureDone,
+      // The learner's recorded writes are steps (the whitelist refuses them); its unrecorded writes
+      // go through withOwnWriteWindow (the backstop's run-wide everWrote).
+      writes: 0,
+      gapFills: 0,
+      priorProgress: this.infoPagePriorProgress,
+      projectValues: [...this.infoPageProjectValues],
+    };
+    let r: InfoPagePassOpen;
+    try {
+      r = await door.openInfoPagePass(this.page, loc, { entries: this.infoPagePasses, run });
+    } catch (e) {
+      r = { opened: false, refusals: [`the pass could not be asked (${String((e as { message?: string })?.message ?? e).slice(0, 80)})`], candidateWatch: false };
+    }
+    this.debug?.event({
+      type: r.opened ? "info_page_pass_open" : "info_page_refused", page: pageCount, entryId: r.entryId, candidateWatch: r.candidateWatch,
+      refusals: r.refusals.slice(0, 8).map((x) => this.scrubSecrets(String(x)).slice(0, 160)),
+    });
+    const pg = this.page;
+    if (!r.candidateWatch || !pg) return undefined;
+    const shot = await this.withSecretMask("info page screenshot", (mask) => pg.screenshot({ fullPage: true, mask })).catch(() => undefined);
+    return shot ? Buffer.from(shot).toString("base64") : undefined;
+  }
+
+  /** #344 — after the forward click: close the backstop's info-page slot / watch, keep the captured
+   *  candidate (its evidence scrubbed: no field value, secrets and long digit runs masked), and
+   *  record each verified page the click passed (the step object, so a rolled-back walk can never
+   *  pass an unadmitted step off as admitted). */
+  private settleInfoPagePass(door: FilingBackstop, advStep: RecipeStep, admissionsBefore: number, shot: string | undefined, pageCount: number): void {
+    try { if (typeof door.closeInfoPagePass === "function") door.closeInfoPagePass(); } catch { /* the slot has its own closers */ }
+    let take: InfoPageCandidateTake | null = null;
+    try { take = typeof door.takeInfoPageCandidate === "function" ? door.takeInfoPageCandidate() : null; } catch { take = null; }
+    if (take) {
+      const scrub = (s: string): string => redactCaptureText(this.scrubSecrets(s), 20_000);
+      const capture: InfoPageCandidateCapture = {
+        identityVersion: take.digest.version,
+        identitySha256: take.digest.identitySha256,
+        origin: take.digest.origin,
+        path: take.digest.path,
+        controlLabel: scrub(take.digest.control.label).slice(0, 80),
+        digest: take.digest,
+        prefix: take.prefix.map((s) => [s[0], s[1], s[2]] as [string, string, string]),
+        observed: take.observed,
+        evidence: infoPageEvidence(take.material, scrub),
+        ...(shot ? { screenshotBase64: shot } : {}),
+      };
+      if (!this.infoPageCandidate || (!this.infoPageCandidate.observed && capture.observed)) this.infoPageCandidate = capture;
+      this.debug?.event({ type: "info_page_candidate", page: pageCount, identity: take.digest.identitySha256.slice(0, 12), held: !!take.observed, screenshot: !!shot });
+    }
+    const admitted = Array.isArray(door.infoPageAdmissions) ? door.infoPageAdmissions.slice(admissionsBefore).filter((a) => a.exempted) : [];
+    if (admitted.length) {
+      this.infoPassAdmittedSteps.add(advStep);
+      for (const a of admitted) this.infoPagePassed.push({ passId: a.entryId, where: a.where });
+      this.debug?.event({ type: "info_page_pass", page: pageCount, passes: admitted.map((a) => ({ passId: a.entryId, where: a.where })) });
+    }
   }
 
   /** A screenshot that may leave the process (vision planner, review verifier, bundle PNG) with
