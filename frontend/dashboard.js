@@ -7821,9 +7821,12 @@ function infoPageCandidateCardsHtml(candidates, projectId) {
     const forms = (Array.isArray(ev.forms) ? ev.forms : []).map((f) => `${esc(String(f.method || "").toUpperCase())} ${esc(f.actionWhere)} · ${esc(f.enctype)} · fields: ${esc((Array.isArray(f.fields) ? f.fields : []).map((x) => x[2] || `(${x[0]})`).join(", ") || "none")}`);
     const headings = (Array.isArray(ev.headings) ? ev.headings : []).map((h) => `h${esc(h[0])}: ${esc(h[1])}`);
     const frames = (Array.isArray(ev.frames) ? ev.frames : []).map((f) => `${esc(f[0])} ${esc(f[1])}`);
+    // Round 4: this exact page was verified before, and that verification EXPIRED (30 days / 10 projects).
+    const expired = c.expiredPass && typeof c.expiredPass === "object" ? c.expiredPass : null;
     return `
     <article class="item warning" data-info-candidate="${esc(c.id)}">
-      <div class="item-title"><span>Information page to verify</span><span class="badge warning">held by the network backstop</span></div>
+      <div class="item-title"><span>Information page to verify</span><span class="badge warning">${expired ? "verification expired — a person re-verifies" : "held by the network backstop"}</span></div>
+      ${expired ? `<p style="font-size:12px" data-info-expired="${esc(expired.passId)}"><strong>Verification expired — a person re-verifies.</strong> This exact page was verified on ${esc(String(expired.verifiedAt || "").slice(0, 10))}; ${esc((Array.isArray(expired.why) ? expired.why : []).join("; "))}. Until a person verifies it again, runs stop here exactly as before it was verified.</p>` : ""}
       <p>The run stopped at <strong>${esc(c.origin)}${esc(c.path)}</strong>${(c.queryKeys || []).length ? ` (query keys: ${esc(c.queryKeys.join(", "))})` : ""}: its <strong>${esc(c.controlLabel)}</strong> was held because the page's own words read as review. Nothing was sent.</p>
       <p class="muted" style="font-size:12px">Held request: ${esc(req.method)} ${esc(req.where)} · ${esc(req.media)} · fields: ${esc((req.fieldNames || []).join(", ") || "none")} · seen ${esc(String(c.seenCount || 1))} time(s), first ${esc(String(c.firstSeenAt || "").slice(0, 10))}, last ${esc(String(c.lastSeenAt || "").slice(0, 10))}</p>
       <p class="muted" style="font-size:12px">Reached by exactly these steps (a pass never applies after other ones): ${esc((Array.isArray(c.steps) ? c.steps : []).join(" → ") || "none recorded")}</p>
@@ -7876,9 +7879,15 @@ function infoPageProjectStateHtml(states) {
 // #344 round 3 — THE VERIFIED PAGE MAY HAVE FILED: a pass this project used was withdrawn by an
 // after-click incident (the page it led to read like a receipt, or the run entered none of this job's
 // data there). Plain, first on the card, every value escaped.
+// Round 4 (rule 6): a GENERIC row (the incident was on another organisation's project) carries no
+// text, label or date — only that a verified page this project used may have filed.
 function infoPageFilingWarningsHtml(warnings) {
   const list = Array.isArray(warnings) ? warnings : [];
-  return list.slice(0, 5).map((w) => `
+  return list.slice(0, 5).map((w) => w.generic === true ? `
+    <article class="item blocker" data-info-may-have-filed="${esc(w.passId)}">
+      <div class="item-title"><span>A verified information page this project used may have filed — check the portal</span><span class="badge">check the portal</span></div>
+      <p style="font-size:12px">Automation passed the verified information page ${esc(w.where)} on a run of this project, and that verification has since been withdrawn after an incident. Look this project up on the portal before anything is filed again: an application may already be on file.</p>
+    </article>` : `
     <article class="item blocker" data-info-may-have-filed="${esc(w.passId)}">
       <div class="item-title"><span>The verified page may have filed — check the portal for this project</span><span class="badge">check the portal</span></div>
       <p style="font-size:12px">Automation passed the verified information page ${esc(w.where)}${w.controlLabel ? ` ("${esc(w.controlLabel)}")` : ""} on a run of this project. On ${esc(String(w.at || "").slice(0, 10))} a run that passed it met a page that did not prove to be an unfiled application, so the verification was withdrawn. Look this project up on the portal before anything is filed again: an application may already be on file.</p>
@@ -7961,9 +7970,12 @@ function infoPagePassRowsHtml(passes) {
   return list.map((p) => {
     const req = p.request || {};
     const live = p.live === true;
+    // Round 4: a verification is authority for 30 days and at most 10 projects; after that it EXPIRES.
+    const expired = Array.isArray(p.expired) ? p.expired : [];
     return `
     <article class="item ${live ? "info" : "warning"}">
-      <div class="item-title"><span>${esc(p.origin)}${esc(p.path)}</span><span class="badge">${live ? "live" : "no verification on record — never used"}</span></div>
+      <div class="item-title"><span>${esc(p.origin)}${esc(p.path)}</span><span class="badge">${live ? "live" : expired.length ? "verification expired — a person re-verifies" : "no verification on record — never used"}</span></div>
+      ${!live && expired.length ? `<p class="muted" style="font-size:12px">${esc(expired.join("; "))}. A run that reaches the page stops there and offers it on the project's card for a person to verify again.</p>` : ""}
       <p class="muted" style="font-size:12px">Control: <strong>${esc(p.controlLabel)}</strong> (${esc(p.controlName)}) · request ${esc(req.method)} ${esc(req.where)} · ${esc(req.media)} · fields: ${esc((req.fieldNames || []).join(", ") || "none")} · identity ${esc(p.identityPrefix)}…</p>
       <p class="muted" style="font-size:12px">Verified ${esc(String(p.verifiedAt || "").slice(0, 10))}</p>
       <button class="secondary" data-info-withdraw="${esc(p.id)}" style="font-size:12px">Withdraw</button>
@@ -7981,7 +7993,7 @@ function infoPagePassFilingWarningsHtml(list) {
     <article class="item blocker" data-info-pass-may-have-filed="${esc(w.passId)}">
       <div class="item-title"><span>${esc(w.where)} — withdrawn after an incident</span><span class="badge">may have filed</span></div>
       <p style="font-size:12px"><strong>The verified page may have filed — check the portal for this project</strong>${projects.length ? ":" : "."} ${projects.length ? projects.map((p) => `<strong>${esc(p.name || p.id)}</strong>${p.address ? ` (${esc(p.address)})` : ""}`).join(", ") : "No project of yours used it."}</p>
-      <p class="muted" style="font-size:11px">Control "${esc(w.controlLabel)}" · incident ${esc(String(w.at || "").slice(0, 10))}. The pass is deleted; a run that reaches the page again stops there and offers it to a person.</p>
+      <p class="muted" style="font-size:11px">${w.controlLabel ? `Control "${esc(w.controlLabel)}" · ` : ""}${w.at ? `incident ${esc(String(w.at).slice(0, 10))}. ` : ""}The pass is deleted; a run that reaches the page again stops there and offers it to a person.</p>
     </article>`;
   }).join("");
 }

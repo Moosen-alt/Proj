@@ -148,6 +148,26 @@ check("(e) verify goes through authForDecision + namedPersonConsent and sends th
     cut("loadInfoPageCandidates").includes("infoPageFilingWarningsHtml(data.filingWarnings) + infoPageCandidateCardsHtml(") && cut("loadInfoPagePasses").includes("infoPagePassFilingWarningsHtml(data.filingWarnings) + infoPagePassRowsHtml("));
 }
 
+// (i)–(k) ROUND 4 — rule 6's GENERIC warning row, and the EXPIRED verification on the card and the list.
+{
+  const warnHtml = new Function(`${cut("esc")}\n${cut("infoPageFilingWarningsHtml")}\nreturn infoPageFilingWarningsHtml;`)() as (w: unknown[]) => string;
+  const generic = warnHtml([{ passId: "pass-9", where: "https://permits.example.test/permits/sfjsp", controlLabel: "", at: "", why: [], generic: true }]);
+  check("(i) round 4 (rule 6): a GENERIC row says only 'A verified information page this project used may have filed — check the portal' — no 'Why', no date, no label",
+    generic.includes("A verified information page this project used may have filed — check the portal") && !generic.includes("Why:") && !/On \d{4}-/.test(generic) && generic.includes("item blocker"), generic);
+  const genericHostile = warnHtml([{ passId: H, where: H, controlLabel: H, at: H, why: [H], generic: true }]);
+  check("(i) …even a generic row handed text renders none of it (no why, no label, no date) and escapes the rest", !genericHostile.includes("<img src=x") && genericHostile.split("&lt;img src=x").length - 1 === 2, genericHostile);
+  const exp = cards([candidate({ expiredPass: { passId: "pass-old", verifiedAt: "2026-09-10T12:00:00Z", why: ["verification expired — a person re-verifies (a verification admits at most 10 projects; this one reached that limit)"] } })], "proj-1");
+  check("(j) round 4: an open card for a page whose verification EXPIRED says 'verification expired — a person re-verifies', when it was verified and why — and OK stays enabled (the re-verification)",
+    exp.includes("verification expired — a person re-verifies") && exp.includes("2026-09-10") && exp.includes("at most 10 projects") && !/data-info-verify="cand-1"[^>]*disabled/.test(exp), exp);
+  const expHostile = cards([candidate({ expiredPass: { passId: H, verifiedAt: H, why: [H] } })], "proj-1");
+  check("(j) …every value on it escaped", !expHostile.includes("<img src=x"), expHostile);
+  check("(j) …and a card with no expired pass says nothing of it", !cards([candidate({ expiredPass: null })], "p").includes("verification expired"));
+  const expRow = rows([pass({ live: false, expired: ["verification expired — a person re-verifies (a verification is authority for 30 days; this one is older)"] })]);
+  check("(k) round 4: the shared list marks an EXPIRED pass 'verification expired — a person re-verifies' with the limit reached (never a count)",
+    expRow.includes("verification expired — a person re-verifies") && expRow.includes("30 days") && !expRow.includes("no verification on record"), expRow);
+  check("(k) …a live pass shows no expiry", !rows([pass({ expired: [] })]).includes("verification expired"));
+}
+
 if (failures) { console.error(`\n${failures}/${total} infoPageCardRender check(s) FAILED.`); process.exit(1); }
 console.log(`\nAll ${total}/${total} infoPageCardRender checks passed.`);
 process.exit(0);

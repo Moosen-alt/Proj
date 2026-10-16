@@ -4030,6 +4030,10 @@ export interface InfoPageCandidateRecord {
   refusals: string[];
   /** What to look at twice (never blocks). */
   warnings: string[];
+  /** #344 round 4: this exact page's verification EXPIRED (INFO_PAGE_PASS_MAX_AGE_DAYS /
+   *  INFO_PAGE_PASS_MAX_PROJECTS) — the run was held as on main; a person re-verifies on this card
+   *  (the verify replaces the expired pass). null = none. */
+  expiredPass: { passId: string; verifiedAt: string; why: string[] } | null;
 }
 
 /** A shared pass as GET /api/info-page-passes lists it (critique [5]: no component or value hashes,
@@ -4060,9 +4064,13 @@ export interface InfoPagePassRecord {
   request: { method: string; where: string; media: string; fieldNames: string[] };
   identityPrefix: string;
   verifiedAt: string;
-  /** A person's verification is on record for this row (infoPages.liveInfoPagePasses): only such a
-   *  row is ever handed to a run. A withdrawn pass is deleted, so it is not listed at all. */
+  /** A person's verification is on record for this row and has not expired
+   *  (infoPages.liveInfoPagePasses): only such a row is ever handed to a run. A withdrawn pass is
+   *  deleted, so it is not listed at all. */
   live: boolean;
+  /** #344 round 4: why the verification expired (30 days / 10 projects — the limit reached, never a
+   *  count); empty = within both limits. */
+  expired: string[];
 }
 
 /**
@@ -4092,6 +4100,10 @@ export interface InfoPageFilingWarning {
   controlLabel: string;
   at: string;
   why: string[];
+  /** #344 round 4 (rule 6): the incident happened on another org's project — this row carries no
+   *  text, no label, no time ("A verified information page this project used may have filed — check
+   *  the portal"). */
+  generic: boolean;
 }
 
 /** #344 round 3 — on the pass's KNOWLEDGE-BASE entry: the same warning, with every project that used

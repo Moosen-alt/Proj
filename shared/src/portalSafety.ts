@@ -1947,6 +1947,80 @@ export function portalSafetyFactory() {
     }
   };
 
+  // #344 — ONE CONTAINER RULE for "is this control the page's CHROME?" (round 4: one question, one
+  // predicate). The after-click reading (infoPageAfterClickInPage) never counts such a field as form
+  // evidence, and the proof of progress (infoPageProofControlInPage) never takes a fill there as the
+  // proof (round 3's verifier: the proof accepted the street typed into n14's HEADER lookup box, which
+  // the form-evidence rule already excluded).
+  const INFO_CHROME = "header, nav, footer, aside, dialog, [role=banner], [role=search], [role=navigation], [role=contentinfo], [role=complementary], [role=dialog]";
+  // ROUND 3: CHROME BY NAME, NOT ONLY BY ELEMENT. An ASP.NET WebForms page wraps the whole page in
+  // one POST form, and its header is a <div id="header"> with a permit LOOKUP (round 2's n14: two
+  // empty boxes there counted as the application form). A field inside any element — itself, its
+  // form, or any ancestor — whose id, class or role NAMES a header, masthead, banner, nav, footer,
+  // menu, toolbar, top / side bar, search or lookup is never form evidence. Words, split at
+  // separators and camelCase ("pageHeader", "site-search", "ctl00_header"); a false exclusion is a
+  // false stop, the safe direction.
+  const INFO_CHROME_NAME = /(^|[^a-z0-9])(header|masthead|banner|nav|navbar|navigation|footer|menu|menubar|toolbar|topbar|sidebar|search\w*|lookup\w*)(?![a-z0-9])/;
+  const INFO_WIDGET = /\b(search\w*|query|keywords?|feedback|survey|comments?|rating|rate\s+(us|this|your)|subscribe|newsletter|log\s*in|login|sign\s*in|signin|username|password)\b/i;
+  const infoAttrWords = (el: Element): string => ["name", "id", "placeholder", "aria-label", "title", "class", "action"]
+    .map((a) => String(el.getAttribute(a) || "")).join(" ").replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ");
+  const infoLabelWords = (el: Element): string => {
+    const labels = (el as HTMLInputElement).labels;
+    return labels ? Array.from(labels).map((l) => String(l.textContent || "")).join(" ") : "";
+  };
+  const infoChromeNamed = (el: Element): boolean => {
+    const d = el.ownerDocument;
+    for (let n: Element | null = el; n && n !== d.body && n !== d.documentElement; n = n.parentElement) {
+      const words = ["id", "class", "role"].map((a) => String(n!.getAttribute(a) || "")).join(" ")
+        .replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_\-$:.]+/g, " ").toLowerCase();
+      if (INFO_CHROME_NAME.test(words)) return true;
+    }
+    return false;
+  };
+  /**
+   * Runs IN THE PAGE: IS THIS FIELD THE PAGE'S CHROME — never form evidence, never the proof? True
+   * when it, or its form, sits inside a header / nav / footer / aside / dialog / banner / search /
+   * navigation / contentinfo / complementary landmark; when it, its form or any ancestor is NAMED a
+   * header, masthead, banner, nav, footer, menu, toolbar, top / side bar, search or lookup (round 3);
+   * when its form is a search / feedback / sign-in widget or carries a password field; or when the
+   * field itself is a search, feedback, comment, rating, newsletter or sign-in box (by name, id,
+   * placeholder, label, aria-label or title).
+   */
+  const infoPageFieldChromeInPage = (el: Element): boolean => {
+    if (el.closest(INFO_CHROME)) return true;
+    if (infoChromeNamed(el)) return true;
+    const f = (el as HTMLInputElement).form;
+    if (f && (f.closest(INFO_CHROME) || INFO_WIDGET.test(infoAttrWords(f)) || f.querySelector("input[type=password]"))) return true;
+    if (/^q$/i.test(String(el.getAttribute("name") || "")) || INFO_WIDGET.test(`${infoAttrWords(el)} ${infoLabelWords(el)}`)) return true;
+    return false;
+  };
+  /**
+   * Runs IN THE PAGE (round 4): WHAT ONE CONTROL HOLDS NOW, for the proof of progress — read after the
+   * fill, its blur and the page's settle (a control that cleared or rewrote what was typed holds that,
+   * not the typed text) — and whether it is the page's chrome (infoPageFieldChromeInPage). `held` is
+   * every rendering of the value: an input's / textarea's value; a select's chosen option's text and
+   * value; a checked checkbox / radio's value and label (unchecked: nothing); an editable element's
+   * text. null = not a control.
+   */
+  const infoPageProofControlInPage = (el: Element | null): { chrome: boolean; held: string[] } | null => {
+    if (!el || typeof el.tagName !== "string") return null;
+    const tag = el.tagName.toLowerCase();
+    const held: string[] = [];
+    if (tag === "select") {
+      const s = el as HTMLSelectElement;
+      const o = s.selectedIndex >= 0 ? s.options[s.selectedIndex] : null;
+      if (o) held.push(String(o.text || ""), String(o.value || ""));
+    } else if (tag === "input") {
+      const i = el as HTMLInputElement;
+      const ty = String(i.type || "text").toLowerCase();
+      if (ty === "checkbox" || ty === "radio") { if (i.checked) held.push(String(i.value || ""), infoLabelWords(i)); }
+      else held.push(String(i.value || ""));
+    } else if (tag === "textarea") held.push(String((el as HTMLTextAreaElement).value || ""));
+    else if ((el as HTMLElement).isContentEditable) held.push(String(el.textContent || ""));
+    else return null;
+    return { chrome: infoPageFieldChromeInPage(el), held };
+  };
+
   /**
    * Runs IN THE PAGE: THE PAGE A VERIFIED INFORMATION PAGE'S CLICK LED TO (#344, proposal §4) —
    * what the network backstop judges before the run may go on. It must read as an UNFILED
@@ -1990,46 +2064,23 @@ export function portalSafetyFactory() {
       const r = (el as HTMLElement).getBoundingClientRect();
       return r.width > 2 && r.height > 2;
     }).length;
-    const CHROME = "header, nav, footer, aside, dialog, [role=banner], [role=search], [role=navigation], [role=contentinfo], [role=complementary], [role=dialog]";
-    // ROUND 3: CHROME BY NAME, NOT ONLY BY ELEMENT. An ASP.NET WebForms page wraps the whole page in
-    // one POST form, and its header is a <div id="header"> with a permit LOOKUP (round 2's n14: two
-    // empty boxes there counted as the application form). A field inside any element — itself, its
-    // form, or any ancestor — whose id, class or role NAMES a header, masthead, banner, nav, footer,
-    // menu, toolbar, top / side bar, search or lookup is never form evidence. Words, split at
-    // separators and camelCase ("pageHeader", "site-search", "ctl00_header"); a false exclusion is a
-    // false stop, the safe direction.
-    const CHROME_NAME = /(^|[^a-z0-9])(header|masthead|banner|nav|navbar|navigation|footer|menu|menubar|toolbar|topbar|sidebar|search\w*|lookup\w*)(?![a-z0-9])/;
-    const chromeNamed = (el: Element): boolean => {
-      for (let n: Element | null = el; n && n !== d.body && n !== d.documentElement; n = n.parentElement) {
-        const words = ["id", "class", "role"].map((a) => String(n!.getAttribute(a) || "")).join(" ")
-          .replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_\-$:.]+/g, " ").toLowerCase();
-        if (CHROME_NAME.test(words)) return true;
-      }
-      return false;
-    };
-    const WIDGET = /\b(search\w*|query|keywords?|feedback|survey|comments?|rating|rate\s+(us|this|your)|subscribe|newsletter|log\s*in|login|sign\s*in|signin|username|password)\b/i;
+    // The container rule (landmarks, chrome BY NAME, widget forms and boxes) is the shared
+    // infoPageFieldChromeInPage above — the same one the proof of progress asks (round 4).
     const PLAIN_INPUT = /^(text|email|tel|number|date|url|month|week|time|datetime-local)$/;
-    const attrWords = (el: Element): string => ["name", "id", "placeholder", "aria-label", "title", "class", "action"]
-      .map((a) => String(el.getAttribute(a) || "")).join(" ").replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ");
-    const labelWords = (el: Element): string => {
-      const labels = (el as HTMLInputElement).labels;
-      return labels ? Array.from(labels).map((l) => String(l.textContent || "")).join(" ") : "";
-    };
     let pageOrigin = "";
     try { pageOrigin = new URL(String(d.URL || "")).origin; } catch { pageOrigin = ""; }
     let formFields = 0;
     for (const f of Array.from(d.querySelectorAll("form")) as HTMLFormElement[]) {
-      if (f.closest(CHROME)) continue;
+      if (f.closest(INFO_CHROME)) continue;
       if (String(f.getAttribute("method") || "").trim().toLowerCase() !== "post") continue;
       let actionOrigin = "";
       try { actionOrigin = new URL(String(f.getAttribute("action") || "").trim() || String(d.URL || ""), String(d.baseURI || d.URL || "")).origin; } catch { actionOrigin = ""; }
       if (!actionOrigin || actionOrigin !== pageOrigin) continue;
-      if (WIDGET.test(attrWords(f))) continue;
+      if (INFO_WIDGET.test(infoAttrWords(f))) continue;
       if (f.querySelector("input[type=password]")) continue;
       const plain = Array.from(f.elements).filter((el) => {
         const tag = el.tagName.toLowerCase();
-        if (el.closest(CHROME)) return false;
-        if (chromeNamed(el)) return false;
+        if (infoPageFieldChromeInPage(el)) return false;
         const ctl = el as HTMLInputElement;
         if (ctl.disabled === true || ctl.readOnly === true) return false;
         if (tag === "input") {
@@ -2042,7 +2093,6 @@ export function portalSafetyFactory() {
           if (String((el as HTMLSelectElement).value || "") !== "") return false;
         } else return false;
         if (!shown(el)) return false;
-        if (/^q$/i.test(String(el.getAttribute("name") || "")) || WIDGET.test(`${attrWords(el)} ${labelWords(el)}`)) return false;
         return true;
       }).length;
       if (plain > formFields) formFields = plain;
@@ -2058,6 +2108,8 @@ export function portalSafetyFactory() {
     isInterstitialForwardLabel,
     infoPageIdentityInPage,
     infoPageAfterClickInPage,
+    infoPageFieldChromeInPage,
+    infoPageProofControlInPage,
     dismissalRefusalInPage,
     implicitSubmitInPage,
     implicitSubmitRefusalInPage,

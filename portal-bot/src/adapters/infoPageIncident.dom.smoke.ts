@@ -39,6 +39,14 @@
 //   HELD by the backstop (nothing reaches the server). RESIDUAL (stated in the PR, passes on
 //   purpose): pq_list_bound — the account's list whose address filter the planner binds to the
 //   job's street satisfies the proof.
+//   ROUND 4 — THE PROOF IS WHAT THE PAGE HOLDS: a bound job key counts only when its control, read
+//   back just before the run leaves the page, HOLDS the job's own value (case, spaces and
+//   punctuation aside) outside the page's chrome: n4_wrongval (other text typed under projectName /
+//   workDescription), n5_clear (inputs that clear what is typed), g_pqaspx (the street typed into the
+//   header lookup) and clientid (the company's id: never one of this job's own values) are incidents,
+//   and so is pq_list_ended (the job's street held, but the walk never leaves through its advance:
+//   the read-back happens only as the run leaves). pq_list_bound (the residual) now leaves through
+//   the filter's own button with the street held: the proof is met, on purpose.
 //   ROUND 2, AT MOST ONCE PER PROJECT — progress: the backend says this project already made progress
 //   on this portal; the exact verified page is held as on main and the run names it (infoPageHeldVerified).
 //   Every admitted walk reports its use AT ONCE through onInfoPagePassed.
@@ -58,7 +66,7 @@ import http from "node:http";
 import { chromium } from "playwright";
 import { AutoLearnAdapter, type LearnPlanner, type LearnPlanRequest, type LearnPlanResponse } from "./autoLearnAdapter";
 import { backstopFor } from "../filingBackstop";
-import { verifiedInfoPageFromCandidate, type InfoPageDigest } from "../../../shared/src/infoPagePass";
+import { infoPageJobValues, verifiedInfoPageFromCandidate, type InfoPageDigest } from "../../../shared/src/infoPagePass";
 import type { InfoPageCandidateCapture, InfoPageIncident, VerifiedInfoPage } from "../../../shared/src/types";
 import { bodyNamesOf } from "./infoPageFixture";
 
@@ -238,6 +246,7 @@ const AFTER: Record<string, () => string> = {
   pq_prefs: () => plain("In the queue", `<main><h1>In the queue</h1><p>Your request is now in the queue for intake.</p>${PREFS_FORM}</main>`),
   pq_list: () => LIST_PAGE(),
   pq_list_bound: () => LIST_PAGE(),
+  pq_list_ended: () => LIST_PAGE(),
   // The GENUINE form, but the run proves nothing on it: no fill (form_nofill), literals only
   // (form_literal), the company's own phone, not the job's (form_company). The fail-closed cost:
   // each is an incident.
@@ -248,6 +257,22 @@ const AFTER: Record<string, () => string> = {
   // planner takes 10 s; the proof is armed about 1.5 s after load): the proof hold holds it, nothing reaches the server.
   autopost: () => shell({ title: "Project Information", action: `${P}/sg2`, content: TWO_FIELDS, nav: NEXT_SG2,
     script: `<script>setTimeout(function () { document.getElementById('smartguide_ApplyForAPermit').submit(); }, 6000);</script>` }),
+  // ROUND 4 — round 3's verifier's B1 shapes and the G_pqaspx asymmetry: every content rule passes
+  // each; the planner BINDS a job key in every one — only the value check / the chrome rule catch them.
+  //   n4_wrongval — the note form; the planner binds projectName / workDescription but TYPES other
+  //                 text ("Question about my request"): the controls never hold the job's values;
+  //   n5_clear    — a "start another" form whose inputs CLEAR whatever is typed (client-side
+  //                 validation): the planner binds the job's street, the control holds nothing;
+  //   g_pqaspx    — pq_aspx_copy, the job's street typed into the HEADER lookup's Address box (the
+  //                 container rule the after-click reading already applies): chrome, never the proof;
+  //   clientid    — the note form, the company's id bound as clientId (a UUID the parser snapshot
+  //                 carries): never one of this job's own values (infoPageJobValues).
+  n4_wrongval: () => plain("All done", `<main><h1>All done!</h1><p>A Permit Tech will email you within 5 business days.</p>${NOTE_FORM}</main>`),
+  n5_clear: () => plain("All set", `<main><h1>You're all set</h1><p>A Permit Tech will email you within 5 business days.</p>
+<h2>Start another solar request</h2><form method="post" action="${P}/another-dead"><label for="aa">Site Address</label> <input id="aa" name="addr" type="text"><br><label for="ap">Parcel Number</label> <input id="ap" name="apn" type="text"><br><button type="submit" name="go">Next</button></form></main>
+<script>['aa','ap'].forEach(function (id) { var el = document.getElementById(id); ['input','change','blur','keyup'].forEach(function (ev) { el.addEventListener(ev, function () { setTimeout(function () { el.value = ''; }, 0); }); }); });</script>`),
+  g_pqaspx: () => aspx("Thank you", `<h1>Thank you</h1><p>A Permit Tech will email you within 5 business days.</p>${EMAIL_COPY}<p><label for="sms">Text me updates</label> <input id="sms" name="ctl00$Main$txtSms" type="tel"></p>`),
+  clientid: () => plain("All done", `<main><h1>All done!</h1><p>A Permit Tech will email you within 5 business days.</p>${NOTE_FORM}</main>`),
 };
 
 const hits: Array<{ method: string; url: string; names: string[]; mode: string }> = [];
@@ -290,9 +315,17 @@ interface Walk {
   reported: Array<{ passId: string; where: string }>; heldVerified?: Array<{ passId: string; where: string; why: string[] }>;
   secs: number;
 }
-// ROUND 3: THIS JOB'S OWN VALUES (what the backend's infoPageJobValueKeys hands the learner) and what
-// the planner does on the page the verified click led to, per walk. Every other page: nothing.
-const JOB_KEYS = ["street", "city", "zip", "homeownerName"];
+// ROUND 3/4: THIS JOB'S OWN VALUES — what the backend hands the learner, computed by the SAME shared
+// function (infoPageJobValues) from what the backend resolves for this project and for a blank one
+// of the same company: the company's id (clientId — read from the parser snapshot, so a blank
+// resolves it to "") and its phone are never among them (round 4) — and what the planner does on the
+// page the verified click led to, per walk. Every other page: nothing.
+const CLIENT_ID = "bb153551-be5a-4658-8c03-4ee5a71861e8";
+const RESOLVED = { street: "1 Test St", city: "Springfield", zip: "62701", homeownerName: "T", projectName: "Test Owner Solar", workDescription: "Residential solar PV system, 8.6 kW DC", clientId: CLIENT_ID, installerPhone: "(555) 010-0000" };
+const BLANK = { street: "", city: "", zip: "", homeownerName: "", projectName: "", workDescription: "", clientId: "", installerPhone: "(555) 010-0000" };
+const JOB_VALUES = infoPageJobValues(RESOLVED, BLANK, () => false, [CLIENT_ID]);
+check("premise (round 4): this job's own values are the street, city, zip, project name and work description — never the company's id or phone, never a one-letter name",
+  JSON.stringify(Object.keys(JOB_VALUES)) === JSON.stringify(["city", "projectName", "street", "workDescription", "zip"]), JSON.stringify(JOB_VALUES));
 const fieldIdx = (req: LearnPlanRequest, label: string): number => req.fields.findIndex((f) => String(f.label ?? "").trim() === label);
 const PLANS: Record<string, (req: LearnPlanRequest) => Promise<LearnPlanResponse> | LearnPlanResponse> = {
   // The positive control: the job's street, BOUND (the proof), then Next.
@@ -301,7 +334,19 @@ const PLANS: Record<string, (req: LearnPlanRequest) => Promise<LearnPlanResponse
   form_literal: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
   form_company: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "(555) 010-0000", field: "installerPhone" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
   autopost: async () => { await new Promise((r) => setTimeout(r, 10000)); return { fills: [], atReview: false }; },
-  pq_list_bound: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Address"), value: "1 Test St", field: "street" }], atReview: false }),
+  // The residual (round 4): the filter KEEPS the job's street and the run leaves through the filter's own button.
+  pq_list_bound: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Address"), value: "1 Test St", field: "street" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Filter") }),
+  // Round 4: the same fill, but the walk ENDS on that page (no advance): the proof is read back only as
+  // the run leaves through its advance, so a walk that never leaves is an incident (fail closed).
+  pq_list_ended: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Address"), value: "1 Test St", field: "street" }], atReview: false }),
+  // ROUND 4: a job key bound, other text typed (round 3's N4_wrongval).
+  n4_wrongval: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Subject"), value: "Question about my request", field: "projectName" }, { selectorIndex: fieldIdx(req, "Message"), value: "Please call me back when you can.", field: "workDescription" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Add note") }),
+  // ROUND 4: the job's street, bound and typed — into inputs that clear it (round 3's N5_clear).
+  n5_clear: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St", field: "street" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
+  // ROUND 4: the job's street, bound and typed — into the HEADER lookup's Address box (G_pqaspx).
+  g_pqaspx: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Address"), value: "1 Test St", field: "street" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Find") }),
+  // ROUND 4: the company's id bound as clientId (a company constant, never this job's own value).
+  clientid: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Subject"), value: CLIENT_ID, field: "clientId" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Add note") }),
 };
 const walk = async (mode: string, entries: VerifiedInfoPage[], permitType = "structural", priorProgress = false): Promise<Walk> => {
   const ctx = await browser.newContext();
@@ -315,7 +360,7 @@ const walk = async (mode: string, entries: VerifiedInfoPage[], permitType = "str
     return at === `${P}/after` && PLANS[mode] ? PLANS[mode](req) : { fills: [], atReview: false };
   };
   const reported: Array<{ passId: string; where: string }> = [];
-  const a = new AutoLearnAdapter("Incident Walk", plan, { maxPages: 6, budgetMs: 180_000, infoPagePasses: entries, infoPagePriorProgress: priorProgress, onInfoPagePassed: (p) => { reported.push(p); }, infoPageProofKeys: JOB_KEYS });
+  const a = new AutoLearnAdapter("Incident Walk", plan, { maxPages: 6, budgetMs: 180_000, infoPagePasses: entries, infoPagePriorProgress: priorProgress, onInfoPagePassed: (p) => { reported.push(p); }, infoPageProofValues: JOB_VALUES });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (a as any).page = pw;
   const locks: string[] = [];
@@ -381,7 +426,12 @@ const ROUND3: Record<string, RegExp> = {
   form_nofill: NO_PROGRESS, form_literal: NO_PROGRESS, form_company: NO_PROGRESS, autopost: NO_PROGRESS,
 };
 const PROOF_ONLY = Object.keys(ROUND3).filter((m) => ROUND3[m] === NO_PROGRESS);
-const AFTER_MODES = ["receipt", "filed", "review", "error", "same", "blank", ...Object.keys(ROUND2), ...Object.keys(ROUND3)];
+// Round 4: round 3's verifier's B1 shapes (N4_wrongval, N5_clear), the G_pqaspx asymmetry and the
+// clientId case — the planner BINDS a job key in each, every content rule passes them; only the value
+// the control holds, the chrome rule or the job's own values catch them. Each is an incident after ONE
+// project (the backend withdraws the pass on it: infoPages.test).
+const ROUND4: Record<string, RegExp> = { n4_wrongval: NO_PROGRESS, n5_clear: NO_PROGRESS, g_pqaspx: NO_PROGRESS, clientid: NO_PROGRESS, pq_list_ended: NO_PROGRESS };
+const AFTER_MODES = ["receipt", "filed", "review", "error", "same", "blank", ...Object.keys(ROUND2), ...Object.keys(ROUND3), ...Object.keys(ROUND4)];
 const results: Record<string, Walk> = {};
 const queue: Array<[string, string]> = [...AFTER_MODES.map((m) => [m, "structural"] as [string, string]), ["form", "structural"], ["pq_list_bound", "structural"], ["progress", "structural"], ["drift", "structural"], ["tileb", "structural"]];
 await Promise.all(Array.from({ length: 4 }, async () => {
@@ -408,6 +458,10 @@ for (const mode of AFTER_MODES) {
   if (ROUND3[mode]) {
     check(`after [${mode}] (round 3${PROOF_ONLY.includes(mode) ? ", PROOF ONLY: every content rule passed it" : ""}): the incident names the rule that caught it`,
       (w.incidents?.[0]?.why ?? []).some((x) => ROUND3[mode].test(x)), JSON.stringify(w.incidents?.[0]?.why ?? []));
+  }
+  if (ROUND4[mode]) {
+    check(`after [${mode}] (round 4, the planner BOUND a job key; every content rule passed it): no proof — the incident names it`,
+      (w.incidents?.[0]?.why ?? []).some((x) => ROUND4[mode].test(x)), JSON.stringify(w.incidents?.[0]?.why ?? []));
   }
   lines.push(`  note - [${mode}] ${w.secs}s: ${(w.incidents?.[0]?.why ?? []).join("; ").slice(0, 200)}`);
 }
@@ -440,9 +494,11 @@ for (const mode of AFTER_MODES) {
 {
   // RESIDUAL (stated in the PR under "What remains"; passes ON PURPOSE): the account's list after the
   // verified Next filed — but it offers an address filter, and the planner binds the job's street
-  // into it. That IS a fill bound to the job's own data on that page: the proof is satisfied, no
-  // content rule catches the page, so no incident. Once per project caps it at this project; nothing
-  // here caps the next project. If this check ever fails because the gap was closed, update the PR.
+  // into it and the filter KEEPS it. That IS this job's own data held on that page: the proof is
+  // satisfied, no content rule catches the page, so no incident — to every reader the bot has it is
+  // the normal flow. Nothing detects it; what bounds it is once per project plus the verification's
+  // EXPIRY (round 4: INFO_PAGE_PASS_MAX_AGE_DAYS / INFO_PAGE_PASS_MAX_PROJECTS), not one project. If
+  // this check ever fails because the gap was closed, update the PR's "What remains".
   const w = results.pq_list_bound;
   check("RESIDUAL [pq_list_bound] (passes on purpose, stated in the PR): a filed page offering a field the planner binds to the job's own data satisfies the proof — no incident",
     w.stopReason !== "info_page_incident" && !(w.incidents ?? []).length && (w.passed ?? []).length === 1, JSON.stringify({ stop: w.stopReason, incidents: w.incidents, message: w.message.slice(0, 200) }));

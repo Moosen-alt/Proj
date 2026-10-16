@@ -44,6 +44,14 @@
 //               after ONE project and warns EVERY project in its use ledger "may have filed" (the
 //               card; the KB entry names them only inside the caller's org); a before-click incident
 //               warns nobody; a learn that threw after a use warns its project.
+//   ROUND 4   — the learn is handed key → VALUE, never the company's id (clientId) or any value of the
+//               client record; RULE 6 (X1_xorg): an incident on another org's project leaves only a
+//               GENERIC row on ours (no text, names, codes, counts or time — in the card, the raw audit
+//               rows and the KB entry, both directions, and through the real routes with auth on), and
+//               the run message counts only its own org; EXPIRY: a verification admits at most 10
+//               distinct projects (the 11th is held; a deleted project's use still counts) and lasts 30
+//               days (31 is held), the card says "verification expired — a person re-verifies", and the
+//               existing verify on the fresh candidate restores it.
 //   ROUTES    — auth OFF: JSON only (415); cross-origin and a rebinding Host are 403 and write
 //               nothing; no name / "operator" is 400; a typed name verifies. Auth ON: 401 signed
 //               out; an org ADMIN is 403 on verify (superadmin only) and the superadmin's verify
@@ -144,7 +152,7 @@ const stubLearn = () => ({
 });
 // Round 2: every attempt's input is kept (the headed retry is a second call), and a test may script
 // the attempts itself (report a use through the learner's own callback, throw, look bot-blocked…).
-type LearnInput = { infoPagePasses?: Array<{ id: string }>; infoPagePriorProgress?: boolean; onInfoPagePassed?: (p: { passId: string; where: string }) => void; infoPageProofKeys?: string[] };
+type LearnInput = { infoPagePasses?: Array<{ id: string }>; infoPagePriorProgress?: boolean; onInfoPagePassed?: (p: { passId: string; where: string }) => void; infoPageProofValues?: Record<string, string> };
 let handedAll: LearnInput[] = [];
 let scripted: Array<(input: LearnInput) => unknown> = [];
 autoLearn.setAutoLearnSeamsForTests({ learnPortal: (async (input: LearnInput) => {
@@ -673,15 +681,29 @@ await check("prior progress: a staged submission on the same side refuses; one o
 });
 
 // ── ROUND 3: PROOF OF PROGRESS, MAY HAVE FILED, V9 ──────────────────────────────────────────────
-await check("round 3: the learn is handed THIS JOB'S OWN VALUES — per-job keys (the homeowner, the street), never a secret, a company constant or a policy default", async () => {
+await check("round 3/4: the learn is handed THIS JOB'S OWN VALUES (key → value) — the homeowner, the street — never a secret, a company constant, a policy default or the company's id (clientId)", async () => {
   const P = fx.newProject();
   await runLearn(P);
-  const keys = (handed as LearnInput).infoPageProofKeys;
-  assert.ok(Array.isArray(keys) && keys.length > 0, JSON.stringify(keys));
-  assert.ok(keys!.includes("homeownerName"), JSON.stringify(keys));
-  assert.ok(keys!.some((k) => /street/i.test(k)), JSON.stringify(keys));
-  for (const banned of ["accountNumber", "meterNumber", "numberOfStories", "existingBuildingArea", "systemConfiguration"]) assert.ok(!keys!.includes(banned), `${banned} is not this job's own value: ${JSON.stringify(keys)}`);
-  assert.ok(!keys!.some((k) => /^(installer|company|contractor|license|licence)/i.test(k)), `a company constant: ${JSON.stringify(keys)}`);
+  const vals = (handed as LearnInput).infoPageProofValues;
+  assert.ok(vals && typeof vals === "object" && !Array.isArray(vals), JSON.stringify(vals));
+  const keys = Object.keys(vals!);
+  assert.ok(keys.length > 0, JSON.stringify(keys));
+  assert.ok(keys.includes("homeownerName"), JSON.stringify(keys));
+  assert.ok(keys.some((k) => /street/i.test(k)), JSON.stringify(keys));
+  const row = db.get<{ homeowner_name: string; project_address: string; client_id: string }>("SELECT homeowner_name, project_address, client_id FROM projects WHERE id = ?", [P])!;
+  assert.equal(vals!.homeownerName, row.homeowner_name, "the value is THIS project's own");
+  assert.equal(vals!.street, row.project_address.split(",")[0].trim(), "the street is THIS project's own");
+  for (const banned of ["accountNumber", "meterNumber", "numberOfStories", "existingBuildingArea", "systemConfiguration"]) assert.ok(!keys.includes(banned), `${banned} is not this job's own value: ${JSON.stringify(keys)}`);
+  assert.ok(!keys.some((k) => /^(installer|company|contractor|license|licence|client)/i.test(k)), `a company constant: ${JSON.stringify(keys)}`);
+  // ROUND 4 — THE clientId CASE: the company's id rides in the parser snapshot (a blank project
+  // resolves it to ""), so round 3 counted it as one of this job's own values. Nothing the company
+  // supplies is: no value handed equals the client's id or any field of its record.
+  assert.ok(!keys.includes("clientId"), `clientId is a company constant: ${JSON.stringify(keys)}`);
+  const client = db.get<Record<string, unknown>>("SELECT * FROM clients WHERE id = ?", [row.client_id])!;
+  const companyValues = new Set(Object.values(client).filter((v) => typeof v === "string" && v.replace(/[^A-Za-z0-9]/g, "").length >= 2).map((v) => String(v).toLowerCase().replace(/[^a-z0-9]/g, "")));
+  const leaked = Object.entries(vals!).filter(([, v]) => companyValues.has(v.toLowerCase().replace(/[^a-z0-9]/g, "")));
+  assert.deepEqual(leaked, [], `a value of the client record is handed as this job's own: ${JSON.stringify(leaked)}`);
+  assert.ok(!Object.values(vals!).some((v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(v)), "an id is never this job's own value");
 });
 await check("round 3 (V9): a held result that RECORDED a fill is never a clean hold; neither is one whose steps are unknown — the next learn is handed priorProgress TRUE", async () => {
   const clean = { stopReason: "backstop_abort", infoPageCandidate: { observed: { method: "POST" } }, steps: [{ action: "goto" }, { action: "click", note: "application entry: Apply" }, { action: "click", note: "advance: Next" }] };
@@ -730,9 +752,10 @@ await check("round 3: an AFTER-CLICK incident (the run entered none of the job's
   const all = IP.listInfoPagePassFilingWarnings(db, null).find((x) => x.passId === passId);
   assert.deepEqual(all?.projects.map((p) => p.id).sort(), [A, B].sort());
   assert.deepEqual(IP.listInfoPagePassFilingWarnings(db, "org-default").find((x) => x.passId === passId)?.projects.map((p) => p.id).sort(), [A, B].sort());
+  // Round 4 (rule 6): another org sees ONLY ITS OWN ROWS — it has none here, so no entry at all.
   const elsewhere = IP.listInfoPagePassFilingWarnings(db, "org-elsewhere").find((x) => x.passId === passId);
-  assert.ok(elsewhere && elsewhere.projects.length === 0, "another org sees the shared warning but no project of ours");
-  assert.ok(!JSON.stringify(elsewhere).includes(A) && !JSON.stringify(elsewhere).includes(B));
+  assert.equal(elsewhere, undefined, "another org sees no entry built from our rows");
+  assert.ok(!JSON.stringify(IP.listInfoPagePassFilingWarnings(db, "org-elsewhere")).includes(A) && !JSON.stringify(IP.listInfoPagePassFilingWarnings(db, "org-elsewhere")).includes(B));
 });
 await check("round 3: a BEFORE-click incident (nothing was sent) warns no project", async () => {
   const { P, passId } = await verifiedPage("Before Only Page");
@@ -766,6 +789,140 @@ await check("round 3: a learn that THREW after using the pass warns the project 
   assert.equal(IP.listInfoPageFilingWarnings(db, T).length, 1);
 });
 
+// ── ROUND 4: RULE 6 (X1_xorg) AND THE EXPIRY CAP ─────────────────────────────────────────────────
+db.run("INSERT OR IGNORE INTO orgs (id, name, edition, created_at) VALUES ('org-b', 'Org B', 'full', '2026-10-15')");
+// An org-b project through the real write path (repository.createProject with its org), from the same
+// intake payload the fixture's projects carry (read back from one of them), with its own owner/street.
+const orgBProject = (owner: string, street: string): string => {
+  const template = fx.newProject();
+  const payload = JSON.parse(String(db.get<{ parser_json: string }>("SELECT parser_json FROM projects WHERE id = ?", [template])!.parser_json));
+  fx.repo.deleteProject(db, template);
+  const id = fx.repo.createProject(db, { ...payload, owner, street } as never, "org-b").project.id;
+  assert.equal(db.get<{ org_id: string }>("SELECT org_id FROM projects WHERE id = ?", [id])?.org_id, "org-b");
+  return id;
+};
+const usesThePass = (passId: string) => (input: LearnInput) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); return passedResult({ infoPagePassed: [{ passId, where: sfjsp }] }); };
+const incidentOn = (passId: string, why: string[]) => (input: LearnInput) => {
+  input.onInfoPagePassed?.({ passId, where: sfjsp });
+  return passedResult({ stopReason: "info_page_incident", message: "STOPPED AFTER A VERIFIED INFORMATION PAGE: …", infoPagePassed: [{ passId, where: sfjsp }], infoPageIncidents: [{ passId, phase: "after", why, where: sfjsp }] });
+};
+// Kept for the auth-on route checks below.
+let x1 = { A: "", B: "", A2: "", B2: "", passId: "", passId2: "" };
+await check("round 4 (rule 6, X1_xorg): an incident on ANOTHER ORG's project puts only a GENERIC row on ours — no text, no names, no codes, no counts, no time — and each org's KB entry is built from its own rows only (both directions)", async () => {
+  // A (org-default) passes the verified page genuinely; B (org-b, homeowner "Jordan Rivera") then
+  // meets a receipt quoting B's own data: the incident, whose text names B's homeowner and code.
+  const { passId } = await verifiedPage("X1 Xorg Page");
+  const A = fx.newProject();
+  scripted = [usesThePass(passId)];
+  await runLearn(A);
+  const B = orgBProject("Jordan Rivera", "777 Orgb Lane");
+  const whyB = ["the page after the click says something was sent or received (\"Confirmation: KXQ-PLM-ZRT\")", "the page after the click offers \"Pay intake fee for Jordan Rivera\", a submit-, filing- or pay-worded control"];
+  scripted = [incidentOn(passId, whyB)];
+  const rB = await runLearn(B);
+  assert.equal(db.query("SELECT id FROM portal_info_page_passes WHERE id = ?", [passId]).length, 0, "the pass is withdrawn");
+  // A's card: ONE GENERIC row — and nothing of org-b's in A's card or in A's raw audit rows (the
+  // project detail returns them).
+  const wa = IP.listInfoPageFilingWarnings(db, A);
+  assert.equal(wa.length, 1);
+  assert.deepEqual({ generic: wa[0].generic, why: wa[0].why, at: wa[0].at, controlLabel: wa[0].controlLabel, passId: wa[0].passId }, { generic: true, why: [], at: "", controlLabel: "", passId });
+  const aRaw = JSON.stringify(db.query("SELECT details FROM audit_logs WHERE project_id = ?", [A]));
+  for (const leak of ["Jordan Rivera", "KXQ-PLM-ZRT", "777 Orgb", B]) {
+    assert.ok(!JSON.stringify(wa).includes(leak), `A's card carries org-b's ${leak}`);
+    assert.ok(!aRaw.includes(leak), `A's audit rows carry org-b's ${leak}`);
+  }
+  // B's own card carries its own incident text; B's run message counts no other org's project.
+  const wb = IP.listInfoPageFilingWarnings(db, B);
+  assert.equal(wb[0].generic, false);
+  assert.ok(wb[0].why.some((w) => /KXQ-PLM-ZRT/.test(w)), JSON.stringify(wb));
+  assert.match(String(rB.message), /The verified page may have filed — check the portal for this project\./);
+  assert.ok(!/other project/.test(String(rB.message)), `B's message counts another org's project: ${rB.message}`);
+  // The KB entry: org-default sees A only, with no time / label from org-b's rows; org-b sees B only.
+  const kd = IP.listInfoPagePassFilingWarnings(db, "org-default").find((x) => x.passId === passId);
+  assert.deepEqual(kd?.projects.map((p) => p.id), [A]);
+  assert.deepEqual({ at: kd?.at, controlLabel: kd?.controlLabel }, { at: "", controlLabel: "" }, "org-default's entry took org-b's incident time / label");
+  assert.ok(!JSON.stringify(kd).includes("Jordan Rivera") && !JSON.stringify(kd).includes(B));
+  const kb = IP.listInfoPagePassFilingWarnings(db, "org-b").find((x) => x.passId === passId);
+  assert.deepEqual(kb?.projects.map((p) => p.id), [B]);
+  assert.ok(kb?.at, "org-b's own row dates its own entry");
+  assert.ok(!JSON.stringify(kb).includes(A));
+  // VICE VERSA: the incident on org-default's project (homeowner "Casey Default"), the use on org-b's.
+  const { passId: passId2 } = await verifiedPage("X1 Reverse Page");
+  const A2 = orgBProject("Robin Orgb", "888 Orgb Court");
+  scripted = [usesThePass(passId2)];
+  await runLearn(A2);
+  const B2 = fx.newProject();
+  scripted = [incidentOn(passId2, ["the page after the click says something was sent or received (\"Confirmation: QQQ-DEF-AAA\")", "the page after the click offers \"Pay intake fee for Casey Default\", a submit-, filing- or pay-worded control"])];
+  await runLearn(B2);
+  const wa2 = IP.listInfoPageFilingWarnings(db, A2);
+  assert.equal(wa2.length, 1);
+  assert.equal(wa2[0].generic, true);
+  const a2Raw = JSON.stringify(db.query("SELECT details FROM audit_logs WHERE project_id = ?", [A2]));
+  for (const leak of ["Casey Default", "QQQ-DEF-AAA", B2]) assert.ok(!JSON.stringify(wa2).includes(leak) && !a2Raw.includes(leak), `org-b's card or rows carry org-default's ${leak}`);
+  const kb2 = IP.listInfoPagePassFilingWarnings(db, "org-b").find((x) => x.passId === passId2);
+  assert.deepEqual(kb2?.projects.map((p) => p.id), [A2]);
+  assert.ok(!JSON.stringify(IP.listInfoPagePassFilingWarnings(db, "org-b")).includes(B2));
+  // The superadmin sees every project of both.
+  assert.deepEqual(IP.listInfoPagePassFilingWarnings(db, null).find((x) => x.passId === passId)?.projects.map((p) => p.id).sort(), [A, B].sort());
+  x1 = { A, B, A2, B2, passId, passId2 };
+});
+
+await check("round 4 (expiry, projects): a verification admits at most 10 DISTINCT projects — the 11th is HELD (handed no pass), its card says 'verification expired — a person re-verifies', a deleted project's use still counts, and re-verifying restores it", async () => {
+  const { P: verifiedOn, passId, c } = await verifiedPage("Expiry Count Page");
+  const users: string[] = [];
+  for (let i = 0; i < 10; i++) {
+    const X = i === 0 ? verifiedOn : fx.newProject();
+    scripted = [usesThePass(passId)];
+    await runLearn(X);
+    assert.ok(((handedAll[0]?.infoPagePasses ?? []) as Array<{ id: string }>).some((e) => e.id === passId), `project ${i + 1} was handed the pass`);
+    users.push(X);
+  }
+  assert.ok(!IP.liveInfoPagePasses(db).some((p) => p.id === passId), "after 10 projects the pass is no longer live");
+  // Deleting one of them never hands the pass a use back (the use is kept project-less).
+  fx.repo.deleteProject(db, users[5]);
+  assert.ok(!IP.liveInfoPagePasses(db).some((p) => p.id === passId), "a deleted project's use was dropped from the count");
+  // The 11th project: HELD — no pass handed; the page is a fresh candidate; the card and the run say why.
+  const P11 = fx.newProject();
+  const r11 = await runLearn(P11, c);
+  assert.ok(!((handed as LearnInput).infoPagePasses ?? []).some((e) => e.id === passId), "the 11th project was handed the expired pass");
+  const card = IP.listInfoPageCandidates(db, P11)[0];
+  assert.ok(card && card.status === "open", "the page is offered to a person again");
+  assert.ok(card.expiredPass && card.expiredPass.passId === passId && card.expiredPass.why.some((w) => /^verification expired — a person re-verifies/.test(w) && /at most 10 projects/.test(w)), JSON.stringify(card.expiredPass));
+  assert.deepEqual(card.refusals, [], "an expired pass never blocks its re-verification");
+  assert.match(String(r11.message), /verification expired — a person re-verifies/);
+  const listed = IP.listInfoPagePasses(db).find((p) => p.id === passId);
+  assert.ok(listed && listed.live === false && listed.expired.length > 0 && !listed.expired.some((x) => /\b1[0-9]\b projects have/.test(x)), JSON.stringify(listed));
+  // RE-VERIFY (the existing verify action, its one INSERT): the expired row is withdrawn through the
+  // one delete and replaced; the next project is handed the NEW pass.
+  const out = verifyFn(P11, card.id, c.identitySha256);
+  assert.equal(db.query("SELECT id FROM portal_info_page_passes WHERE id = ?", [passId]).length, 0, "the expired row is gone");
+  assert.ok(IP.liveInfoPagePasses(db).some((p) => p.id === out.passId), "the re-verified pass is live");
+  const P12 = fx.newProject();
+  await runLearn(P12);
+  assert.ok(((handed as LearnInput).infoPagePasses ?? []).some((e) => e.id === out.passId), "re-verify restores: the next project is handed it");
+});
+
+await check("round 4 (expiry, age): a verification is authority for 30 days — at 30 days it is live, at 31 days a run is HELD and the card says 'verification expired — a person re-verifies'; re-verifying restores it", async () => {
+  const { passId, c } = await verifiedPage("Expiry Age Page");
+  const realNow = Date.now;
+  let reverified = "";
+  try {
+    Date.now = () => realNow() + 30 * 86_400_000 - 60_000;
+    assert.ok(IP.liveInfoPagePasses(db).some((p) => p.id === passId), "30 days old: still live");
+    Date.now = () => realNow() + 31 * 86_400_000;
+    assert.ok(!IP.liveInfoPagePasses(db).some((p) => p.id === passId), "31 days old: not live");
+    const Q = fx.newProject();
+    const r = await runLearn(Q, c);
+    assert.ok(!((handed as LearnInput).infoPagePasses ?? []).some((e) => e.id === passId), "a run 31 days later was handed the expired pass");
+    const card = IP.listInfoPageCandidates(db, Q)[0];
+    assert.ok(card.expiredPass && card.expiredPass.why.some((w) => /30 days/.test(w)), JSON.stringify(card.expiredPass));
+    assert.deepEqual(card.refusals, []);
+    assert.match(String(r.message), /verification expired — a person re-verifies/);
+    reverified = verifyFn(Q, card.id, c.identitySha256).passId;
+  } finally { Date.now = realNow; }
+  assert.ok(IP.liveInfoPagePasses(db).some((p) => p.id === reverified), "the re-verified pass is live");
+  assert.equal(db.query("SELECT id FROM portal_info_page_passes WHERE id = ?", [passId]).length, 0);
+});
+
 // ── ROUTES ───────────────────────────────────────────────────────────────────────────────────────
 // Everything the routes need is written now; the in-process handle closes before a server opens it.
 const routeP = fx.newProject();
@@ -792,7 +949,7 @@ const warnedP = String(warnedRow?.project_id ?? "");
 const warnedPass = String(warnedRow ? JSON.parse(warnedRow.details).passId : "");
 const { setUserPassword } = await import("../src/auth");
 const { grantProduct } = await import("../src/entitlements");
-db.run("INSERT INTO orgs (id, name, edition, created_at) VALUES ('org-b', 'Org B', 'full', '2026-10-15')");
+db.run("INSERT OR IGNORE INTO orgs (id, name, edition, created_at) VALUES ('org-b', 'Org B', 'full', '2026-10-15')");
 grantProduct(db, "org-b", "autopilot");
 db.run("INSERT INTO users (id, name, email, role, color, active, created_at, org_id) VALUES ('u-super', 'Sam Superadmin', 'super@info.test', 'superadmin', '#000', 1, '2026-10-15', 'org-default')");
 setUserPassword(db, "u-super", "info-test-password-1");
@@ -978,18 +1135,42 @@ const readDb = async <T>(fn: (d: typeof db) => T): Promise<T> => {
       assert.equal(r.status, 403, r.text);
       assert.equal(await readDb((d) => d.query("SELECT id FROM portal_info_page_passes WHERE identity_sha256 = ?", [authIdentity]).length), 0);
     });
-    await check("auth on (round 3, rule 6): ANOTHER ORG's admin sees the shared may-have-filed entry on the KB list but NO project of ours; the superadmin sees them named", async () => {
+    await check("auth on (round 3/4, rule 6): ANOTHER ORG's admin sees NO may-have-filed entry built from our rows (round 4: own rows only) and no project of ours; the superadmin sees them named", async () => {
       const other = await login("other@info.test");
       const o = await call(PORT, "GET", "/api/info-page-passes", { headers: { cookie: other } });
       assert.equal(o.status, 200, o.text.slice(0, 200));
       const oe = JSON.parse(o.text).filingWarnings.find((w: { passId: string }) => w.passId === warnedPass);
-      assert.ok(oe && oe.projects.length === 0, o.text.slice(0, 600));
+      assert.equal(oe, undefined, o.text.slice(0, 600));
       assert.ok(!o.text.includes(warnedP), "another org's caller saw our project id");
       const sup = await login("super@info.test");
       const s = await call(PORT, "GET", "/api/info-page-passes", { headers: { cookie: sup } });
       assert.ok(JSON.parse(s.text).filingWarnings.find((w: { passId: string }) => w.passId === warnedPass)?.projects.some((p: { id: string }) => p.id === warnedP), s.text.slice(0, 600));
       const g = await call(PORT, "GET", `/api/projects/${warnedP}/info-page-candidates`, { headers: { cookie: other } });
       assert.equal(g.status, 404, "another org reads our project's card");
+    });
+    await check("auth on (round 4, rule 6, X1_xorg): org-b's data never reaches an org-default card or KB response, and org-default's never reaches org-b's — through the real routes", async () => {
+      assert.ok(x1.A && x1.B && x1.A2 && x1.B2, "premise: the X1 projects were written above");
+      const admin = await login("admin@info.test");
+      const other = await login("other@info.test");
+      const cardA = await call(PORT, "GET", `/api/projects/${x1.A}/info-page-candidates`, { headers: { cookie: admin } });
+      assert.equal(cardA.status, 200, cardA.text.slice(0, 200));
+      const wA = JSON.parse(cardA.text).filingWarnings;
+      assert.ok(wA.length === 1 && wA[0].generic === true, cardA.text.slice(0, 400));
+      const kbDefault = await call(PORT, "GET", "/api/info-page-passes", { headers: { cookie: admin } });
+      for (const [what, text] of [["org-default's card for A", cardA.text], ["org-default's KB list", kbDefault.text]] as const) {
+        for (const leak of ["Jordan Rivera", "KXQ-PLM-ZRT", "777 Orgb", "Robin Orgb", x1.B, x1.A2]) assert.ok(!text.includes(leak), `${what} carries org-b's ${leak}`);
+      }
+      const cardA2 = await call(PORT, "GET", `/api/projects/${x1.A2}/info-page-candidates`, { headers: { cookie: other } });
+      assert.equal(cardA2.status, 200, cardA2.text.slice(0, 200));
+      assert.ok(JSON.parse(cardA2.text).filingWarnings[0]?.generic === true, cardA2.text.slice(0, 400));
+      const kbB = await call(PORT, "GET", "/api/info-page-passes", { headers: { cookie: other } });
+      for (const [what, text] of [["org-b's card for A2", cardA2.text], ["org-b's KB list", kbB.text]] as const) {
+        for (const leak of ["Casey Default", "QQQ-DEF-AAA", x1.A, x1.B2]) assert.ok(!text.includes(leak), `${what} carries org-default's ${leak}`);
+      }
+      // Each org still sees its OWN incident in full on its own card.
+      const cardB = await call(PORT, "GET", `/api/projects/${x1.B}/info-page-candidates`, { headers: { cookie: other } });
+      assert.ok(cardB.status === 200 && cardB.text.includes("KXQ-PLM-ZRT"), cardB.text.slice(0, 300));
+      assert.equal((await call(PORT, "GET", `/api/projects/${x1.B}/info-page-candidates`, { headers: { cookie: admin } })).status, 404, "org-default read org-b's card");
     });
     await check("auth on: ANOTHER ORG's admin gets 404 for this project's candidates (rule 6), never 403", async () => {
       const cookie = await login("other@info.test");

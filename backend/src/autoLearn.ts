@@ -26,7 +26,7 @@ import fs from "node:fs";
 import type { AppDb } from "./db";
 import type { InfoPageIncident, PortalRecipe, ProjectRecord, RecipeStep } from "../../shared/src/types";
 import { FINAL_SUBMIT_GATE_SENTENCE, redactSecretValues } from "../../shared/src/portalSafety";
-import { infoPageJobValueKeys } from "../../shared/src/infoPagePass";
+import { INFO_PAGE_PASS_EXPIRED, infoPageJobValues } from "../../shared/src/infoPagePass";
 import { isPlannerSecretKey, projectSecretValues } from "./projectSecrets";
 import { perJobAnswerKeyFor, perJobControlOfField } from "../../shared/src/perJobQuestions";
 import { parseHasBattery } from "../../shared/src/batteryControls";
@@ -45,7 +45,7 @@ import { logger } from "./logger";
 import { ensurePlanSetSplit } from "./docSplitter";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
-import { infoPagePriorProgress, isCleanInfoPageHold, liveInfoPagePasses, recordInfoPageCandidate, recordInfoPageHeldVerified, recordInfoPageLearnClean, recordInfoPageLearnStart, recordInfoPagePassIncidents, recordInfoPagePassUses } from "./infoPages";
+import { expiredInfoPagePassFor, infoPagePriorProgress, isCleanInfoPageHold, liveInfoPagePasses, recordInfoPageCandidate, recordInfoPageHeldVerified, recordInfoPageLearnClean, recordInfoPageLearnStart, recordInfoPagePassIncidents, recordInfoPagePassUses } from "./infoPages";
 import { formPurposeMismatch } from "./formPurpose";
 import { looksBotBlocked } from "./runAbort";
 import { id } from "./ids";
@@ -1158,7 +1158,8 @@ async function autoLearnPortalInner(
     attempt: [] as Array<{ passId: string; where: string }>,
     attemptStartId: "",
     withdrawn: [] as string[],
-    /** Round 3: the projects an after-click incident warned (the verified page may have filed). */
+    /** Round 3: the projects an after-click incident warned (the verified page may have filed) — round 4
+     *  (rule 6): only those in THIS project's org; another org's are never counted or named here. */
     warned: [] as string[],
     warnError: "",
     afterIncident: false,
@@ -1209,7 +1210,7 @@ async function autoLearnPortalInner(
       try {
         const out = recordInfoPagePassIncidents(db, infoPageProjectRow ? projectId : null, runId, incidents);
         infoPageCall.withdrawn.push(...out.withdrawn);
-        for (const w of out.warned) if (!infoPageCall.warned.includes(w)) infoPageCall.warned.push(w);
+        for (const w of out.warnedInOrg) if (!infoPageCall.warned.includes(w)) infoPageCall.warned.push(w);
         if (out.warnError) infoPageCall.warnError = out.warnError;
         infoPageCall.incidentRecorded = true;
         if (incidents.some((i) => i.phase === "after")) infoPageCall.afterIncident = true;
@@ -1230,16 +1231,31 @@ async function autoLearnPortalInner(
   // company, portal and track resolves to (per-job fields emptied, the id, client, state, AHJ,
   // utility and account kept) — so a policy default ("0" stories, behind-the-meter), a company
   // constant (licence, phone) or a per-job answer column never counts, and secrets never do
-  // (shared infoPageJobValueKeys). Unreadable = none: every admitted pass then ends as an incident.
-  const infoPageProofKeys = ((): string[] => {
+  // (shared infoPageJobValues). Unreadable = none: every admitted pass then ends as an incident.
+  // ROUND 4: key → VALUE (the proof compares what the control HOLDS with it), and nothing the company
+  // or the defaults supply: a value the blank project resolves under ANY key, any field of the client
+  // record (its id included — clientId is read from the parser snapshot, so a blank resolves it to
+  // ""), the org's id, an id-shaped value or a key naming the company is never this job's own.
+  const infoPageProofValues = ((): Record<string, string> => {
     try {
       const values = resolveRecipeFieldValues(db, project, portalType, learnTrack, issuerTrack);
       const blank: ProjectRecord = {
         ...project, homeownerName: "", projectAddress: "", city: "", zip: "",
         systemSizeDcKw: null, systemSizeAcKw: null, totalExportKw: null, parserSnapshot: {}, existingSystem: undefined,
       };
-      return infoPageJobValueKeys(values, resolveRecipeFieldValues(db, blank, portalType, learnTrack, issuerTrack), isPlannerSecretKey);
-    } catch { return []; }
+      const company: unknown[] = [project.clientId];
+      const collect = (v: unknown, depth: number): void => {
+        if (v === null || v === undefined) return;
+        if (typeof v === "string") {
+          company.push(v);
+          if (depth < 3 && /^\s*[[{]/.test(v)) { try { collect(JSON.parse(v), depth + 1); } catch { /* plain text */ } }
+        } else if (typeof v === "number") company.push(String(v));
+        else if (typeof v === "object" && depth < 3) for (const x of Object.values(v as Record<string, unknown>)) collect(x, depth + 1);
+      };
+      if (project.clientId) collect(db.get<Record<string, unknown>>("SELECT * FROM clients WHERE id = ?", [project.clientId]) ?? {}, 0);
+      collect(db.get<Record<string, unknown>>("SELECT org_id FROM projects WHERE id = ?", [projectId]) ?? {}, 0);
+      return infoPageJobValues(values, resolveRecipeFieldValues(db, blank, portalType, learnTrack, issuerTrack), isPlannerSecretKey, company);
+    } catch { return {}; }
   })();
   let learn;
   // THE BUDGET IS FOR THE PORTAL, NOT FOR EACH ATTEMPT.
@@ -1435,7 +1451,7 @@ async function autoLearnPortalInner(
       infoPagePriorProgress: infoPageInput.priorProgress,
       onInfoPagePassed,
       // #344 round 3: the page after a verified one must take one of these before the run leaves it.
-      infoPageProofKeys,
+      infoPageProofValues,
     });
   // WRITE IT DOWN BEFORE WE TOUCH THE PORTAL, NOT AFTER. This run is about to log into a
   // REAL account and start a REAL application; a run that dies mid-way has still created
@@ -1601,6 +1617,11 @@ async function autoLearnPortalInner(
           infoPageLine += rec.status === "dismissed"
             ? ` A person marked this page "not an information page" (${rec.decidedBy || "a person"}, ${rec.decidedAt.slice(0, 10)}); it stays held.`
             : " Recorded for a person to verify (project → Portal runs).";
+          // ROUND 4: held because this exact page's verification EXPIRED (30 days / 10 projects).
+          if (rec.status !== "dismissed") {
+            const expired = expiredInfoPagePassFor(db, cand.identitySha256);
+            if (expired) infoPageLine += ` This page's ${INFO_PAGE_PASS_EXPIRED} on the card (${expired.why[0].replace(/^verification expired — a person re-verifies \(?/, "").replace(/\)$/, "")}).`;
+          }
         }
       } catch (err) {
         infoPageLine += ` The held information page could not be recorded for verification (${err instanceof Error ? err.message.slice(0, 120) : String(err)}).`;

@@ -43,7 +43,7 @@ import { HttpError } from "./httpError";
 import { id as newId } from "./ids";
 import { nowIso } from "./time";
 import {
-  INFO_PAGE_IDENTITY_VERSION, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageShapeRefusals, infoPageVerifyWarnings,
+  INFO_PAGE_IDENTITY_VERSION, infoPagePassExpiryRefusals, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageShapeRefusals, infoPageVerifyWarnings,
   verifiedInfoPageFromCandidate,
   type InfoPageDigest, type InfoPageEvidence, type InfoPageObservedRequest, type InfoPagePrefixStep,
 } from "../../shared/src/infoPagePass";
@@ -111,13 +111,57 @@ function passIsOnRecord(db: AppDb, r: Row): boolean {
 }
 
 /** THE effective-row predicate: a person's verification on record, at the current identity
- *  version. The bot input (autoLearn) and the KB list both read it. Reads only. */
-export function liveInfoPagePasses(db: AppDb): VerifiedInfoPage[] {
+ *  version, and (round 4) NOT EXPIRED — within INFO_PAGE_PASS_MAX_AGE_DAYS of the verification and
+ *  under INFO_PAGE_PASS_MAX_PROJECTS distinct projects in the use ledger (shared
+ *  infoPagePassExpiryRefusals; an unreadable ledger is expired). The bot input (autoLearn) and the KB
+ *  list both read it. Reads only. */
+export function liveInfoPagePasses(db: AppDb, nowMs: number = Date.now()): VerifiedInfoPage[] {
   const rows = db.query<Row>(
     `SELECT * FROM portal_info_page_passes
       WHERE verified_at <> '' AND verified_by <> '' AND identity_version = ?
       ORDER BY verified_at`, [INFO_PAGE_IDENTITY_VERSION]);
-  return rows.filter((r) => passIsOnRecord(db, r)).map(passRowToVerified);
+  const uses = infoPagePassUseCounts(db);
+  return rows.filter((r) => passIsOnRecord(db, r))
+    .filter((r) => infoPagePassExpiryRefusals(s(r.verified_at), uses ? uses.get(s(r.id)) ?? 0 : null, nowMs).length === 0)
+    .map(passRowToVerified);
+}
+
+/** ROUND 4 — HOW MANY DISTINCT PROJECTS EACH PASS ADMITTED: the use ledger (ACT_PASSED, one row per
+ *  admission, written the moment the learner reports it), plus the uses a deleted project left behind
+ *  (ACT_USE_RETAINED — deleting a project deletes its audit rows, and must never hand a pass a use
+ *  back). Read in JS (a malformed row names no pass). null = unreadable (the caller fails closed).
+ *  Reads only. */
+function infoPagePassUseCounts(db: AppDb): Map<string, number> | null {
+  try {
+    const by = new Map<string, Set<string>>();
+    for (const u of db.query<{ project_id: string | null; action: string; details: string }>(
+      "SELECT project_id, action, details FROM audit_logs WHERE action IN (?, ?)", [ACT_PASSED, ACT_USE_RETAINED])) {
+      const d = parse<Row>(u.details, {});
+      const passId = s(d.passId);
+      const pid = u.action === ACT_PASSED ? s(u.project_id) : s(d.projectId);
+      if (!passId || !pid) continue;
+      if (!by.has(passId)) by.set(passId, new Set());
+      by.get(passId)!.add(pid);
+    }
+    return new Map(Array.from(by.entries()).map(([k, v]) => [k, v.size]));
+  } catch { return null; }
+}
+
+/** ROUND 4 — why this pass row's verification is no longer authority (empty = within both limits).
+ *  Reads only. */
+function passExpiry(db: AppDb, r: Row, nowMs: number = Date.now()): string[] {
+  const uses = infoPagePassUseCounts(db);
+  return infoPagePassExpiryRefusals(s(r.verified_at), uses ? uses.get(s(r.id)) ?? 0 : null, nowMs);
+}
+
+/** ROUND 4 — the EXPIRED pass for this exact page, if one is on file: why it expired (the card and
+ *  the run message say "verification expired — a person re-verifies"). Empty = none, or it is live.
+ *  Reads only. */
+export function expiredInfoPagePassFor(db: AppDb, identitySha256: string, nowMs: number = Date.now()): { passId: string; verifiedAt: string; why: string[] } | null {
+  const r = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE identity_sha256 = ?", [s(identitySha256)]);
+  if (!r) return null;
+  const why = passExpiry(db, r, nowMs);
+  return why.length ? { passId: s(r.id), verifiedAt: s(r.verified_at), why } : null;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -140,8 +184,13 @@ const ACT_HELD_VERIFIED = "portal.info_page_held_verified";
 /** A named person allowed the pass ONCE MORE for this project and side. */
 const ACT_ALLOWED_AGAIN = "portal.info_page_pass_allowed_again";
 /** ROUND 3: an after-click incident on a pass this project USED — the verified page may have filed
- *  for this project (the warning on its card and on the pass's knowledge-base entry). Evidence only. */
+ *  for this project (the warning on its card and on the pass's knowledge-base entry). Evidence only.
+ *  ROUND 4 (rule 6): the incident's text rides only on rows of projects in the incident project's
+ *  org; any other org's project gets a GENERIC row (no text, no names, no counts). */
 const ACT_MAY_HAVE_FILED = "portal.info_page_may_have_filed";
+/** ROUND 4: a deleted project's uses of a pass, kept project-less so the expiry count never drops
+ *  (deleting a project deletes its audit rows). Authority for the count: one writer. */
+const ACT_USE_RETAINED = "portal.info_page_pass_use_retained";
 
 type Side = "ahj" | "utility";
 const sideOf = (scope: unknown): Side | "" => (scope === "ahj" || scope === "utility" ? scope : "");
@@ -440,8 +489,10 @@ function candidateRefusals(db: AppDb, r: Row): string[] {
   }
   out.push(...prefixShapeRefusals(prefix));
   out.push(...infoPageProjectValueRefusals(s(evidence?.text), projectValues(db, s(r.project_id))));
-  const existing = db.get<Row>("SELECT id FROM portal_info_page_passes WHERE identity_sha256 = ?", [s(r.identity_sha256)]);
-  if (existing) out.push("a pass for this exact page already exists (withdraw it first to verify again)");
+  // A pass for this exact page refuses a second one — unless its verification EXPIRED (round 4): then
+  // this verify is the re-verification, and it replaces the expired row (verifyInfoPageCandidate).
+  const existing = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE identity_sha256 = ?", [s(r.identity_sha256)]);
+  if (existing && !passExpiry(db, existing).length) out.push("a pass for this exact page already exists (withdraw it first to verify again)");
   return Array.from(new Set(out));
 }
 
@@ -470,9 +521,15 @@ const candidateRowToRecord = (db: AppDb, r: Row): InfoPageCandidateRecord => {
     decidedBy: s(r.decided_by),
     decidedAt: s(r.decided_at),
     passId: s(r.pass_id),
-    passLive: s(r.status) === "verified" && !!s(r.pass_id) && !!db.get<Row>("SELECT id FROM portal_info_page_passes WHERE id = ?", [s(r.pass_id)]),
+    passLive: s(r.status) === "verified" && !!s(r.pass_id) && ((): boolean => {
+      const p = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE id = ?", [s(r.pass_id)]);
+      return !!p && passExpiry(db, p).length === 0;
+    })(),
     refusals: s(r.status) === "open" ? candidateRefusals(db, r) : [],
     warnings: infoPageVerifyWarnings(digest ? digest.shape : null, evidence.text),
+    // ROUND 4: this exact page's verification EXPIRED (30 days / 10 projects): the run was held as on
+    // main, and a person re-verifies on this card.
+    expiredPass: s(r.status) === "open" ? expiredInfoPagePassFor(db, s(r.identity_sha256)) : null,
   };
 };
 
@@ -515,6 +572,13 @@ export function verifyInfoPageCandidate(
     const digest = parse<InfoPageDigest>(r.digest_json, null as unknown as InfoPageDigest);
     const prefix = parse<InfoPagePrefixStep[]>(r.prefix_json, []);
     const pass = verifiedInfoPageFromCandidate({ identityVersion: Number(r.identity_version), identitySha256: s(r.identity_sha256), digest, prefix });
+    // ROUND 4 — RE-VERIFICATION: a pass for this exact page whose verification EXPIRED (candidateRefusals
+    // refused a live one) is withdrawn first, through the one delete, and the new verification replaces it.
+    const expired = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE identity_sha256 = ?", [s(r.identity_sha256)]);
+    if (expired) {
+      removeInfoPagePass(db, expired, { projectId, actorType: "human", actor: input.verifiedBy, action: "portal.info_page_pass_withdrawn",
+        details: { reason: "verification expired — re-verified by a person", expired: passExpiry(db, expired).slice(0, 2), byUserId: input.userId } });
+    }
     const passId = newId();
     const at = nowIso();
     const summary = { forms: digest.summary.forms, fillable: digest.summary.fillable, frames: digest.summary.frames, hiddenNames: digest.summary.hiddenNames, headings: digest.summary.headings };
@@ -595,10 +659,17 @@ export function withdrawInfoPagePass(db: AppDb, passId: string, input: { by: str
  * and the incident's own — gets a may-have-filed row: the warning on its card ("The verified page may
  * have filed — check the portal for this project") and, named within the viewer's own org, on the
  * pass's knowledge-base entry. Before-click incidents sent nothing: no warning.
+ *
+ * ROUND 4 — RULE 6: the incident's text (its `why` quotes the incident project's page: a homeowner's
+ * name, a confirmation code), the control label and the run id stay inside the INCIDENT PROJECT'S
+ * ORG. A project of any other org in the use ledger gets only a GENERIC row — the pass and its place
+ * (shared knowledge), `generic: true`, nothing else — and the run message counts only the incident
+ * org's projects (`warnedInOrg`). An org that cannot be read is another org (generic).
  */
-export function recordInfoPagePassIncidents(db: AppDb, projectId: string | null, runId: string, incidents: ReadonlyArray<InfoPageIncident> | null | undefined): { withdrawn: string[]; warned: string[]; warnError: string } {
+export function recordInfoPagePassIncidents(db: AppDb, projectId: string | null, runId: string, incidents: ReadonlyArray<InfoPageIncident> | null | undefined): { withdrawn: string[]; warned: string[]; warnedInOrg: string[]; warnError: string } {
   const withdrawn: string[] = [];
   const warned: string[] = [];
+  const warnedInOrg: string[] = [];
   let warnError = "";
   for (const inc of Array.isArray(incidents) ? incidents : []) {
     const passId = s(inc?.passId).slice(0, 80);
@@ -627,29 +698,56 @@ export function recordInfoPagePassIncidents(db: AppDb, projectId: string | null,
     // incident's own. Only the incident's own row carries the run id.
     try {
       const users = new Set<string>();
+      const inOrg: string[] = [];
       db.transaction(() => {
         for (const u of db.query<{ project_id: string; details: string }>("SELECT project_id, details FROM audit_logs WHERE action = ? AND project_id IS NOT NULL", [ACT_PASSED])) {
           if (s(parse<Row>(u.details, {}).passId) === passId && s(u.project_id)) users.add(s(u.project_id));
         }
         if (projectId) users.add(projectId);
-        for (const pid of users) addAuditLog(db, pid, "portal_bot", "network backstop", ACT_MAY_HAVE_FILED, { passId, where, controlLabel, why, ...(pid === projectId ? { runId: s(runId).slice(0, 120) } : {}) });
+        // RULE 6 (round 4): the incident's org; a project of any other org — or of an org that
+        // cannot be read — gets the generic row only.
+        const incidentOrg = projectId ? projectOrgOf(db, projectId) : null;
+        for (const pid of users) {
+          const same = incidentOrg !== null && projectOrgOf(db, pid) === incidentOrg;
+          if (same) inOrg.push(pid);
+          addAuditLog(db, pid, "portal_bot", "network backstop", ACT_MAY_HAVE_FILED, same
+            ? { passId, where, controlLabel, why, org: incidentOrg, ...(pid === projectId ? { runId: s(runId).slice(0, 120) } : {}) }
+            : { passId, where, generic: true });
+        }
       });
       warned.push(...users);
+      warnedInOrg.push(...inOrg);
     } catch (err) {
       warnError = `the may-have-filed warning could not be written (${err instanceof Error ? err.message.slice(0, 100) : String(err).slice(0, 100)})`;
     }
   }
-  return { withdrawn, warned: Array.from(new Set(warned)), warnError };
+  return { withdrawn, warned: Array.from(new Set(warned)), warnedInOrg: Array.from(new Set(warnedInOrg)), warnError };
+}
+
+/** A project's org (a project with no org row belongs to the default tenant, scope.assertInScope's
+ *  rule); null = no such project, or unreadable. Reads only. */
+function projectOrgOf(db: AppDb, projectId: string): string | null {
+  try {
+    const r = db.get<{ org_id: string | null }>("SELECT org_id FROM projects WHERE id = ?", [projectId]);
+    return r ? (s(r.org_id) || DEFAULT_ORG_ID) : null;
+  } catch { return null; }
 }
 
 /** THE WARNING ON A PROJECT'S CARD (round 3): every after-click incident on a pass this project used
- *  — the verified page may have filed for it. Newest first. Reads only. */
+ *  — the verified page may have filed for it. Newest first. Reads only.
+ *  ROUND 4 (rule 6): a row carries the incident's text only when it was written for THIS project's
+ *  org (its `org` stamp equals the project's org); any other row — a generic one, an older one, one
+ *  whose org cannot be read — is returned GENERIC: the pass and its place, no text, no label, no time. */
 export function listInfoPageFilingWarnings(db: AppDb, projectId: string): InfoPageFilingWarning[] {
+  const own = projectOrgOf(db, projectId);
   return db.query<{ details: string; created_at: string }>(
     "SELECT details, created_at FROM audit_logs WHERE project_id = ? AND action = ? ORDER BY rowid DESC LIMIT 20", [projectId, ACT_MAY_HAVE_FILED])
     .map((r) => {
       const d = parse<Row>(r.details, {});
-      return { passId: s(d.passId), where: s(d.where), controlLabel: s(d.controlLabel), at: s(r.created_at), why: (Array.isArray(d.why) ? d.why as unknown[] : []).map((w) => s(w)).slice(0, 4) };
+      const full = d.generic !== true && own !== null && s(d.org) === own;
+      return full
+        ? { passId: s(d.passId), where: s(d.where), controlLabel: s(d.controlLabel), at: s(r.created_at), why: (Array.isArray(d.why) ? d.why as unknown[] : []).map((w) => s(w)).slice(0, 4), generic: false }
+        : { passId: s(d.passId), where: s(d.where), controlLabel: "", at: "", why: [], generic: true };
     });
 }
 
@@ -658,6 +756,9 @@ export function listInfoPageFilingWarnings(db: AppDb, projectId: string): InfoPa
  * withdrew, with every project that used it NAMED — only the projects inside `orgId` (null = every
  * org: the superadmin). The pass itself is shared knowledge; which projects used it is tenant data,
  * so another org's project is never named or counted here (rule 6). Newest first. Reads only.
+ * ROUND 4 (rule 6): each org sees ONLY ITS OWN ROWS — an entry exists for a caller's org only when
+ * one of its own projects carries the warning, and its time and label come from those rows (a
+ * generic row lends neither); another org's rows, times and projects never shape the entry.
  */
 export function listInfoPagePassFilingWarnings(db: AppDb, orgId: string | null): InfoPagePassFilingWarning[] {
   const rows = db.query<{ project_id: string; details: string; created_at: string; pid: string | null; homeowner_name: string | null; project_address: string | null; org_id: string | null }>(
@@ -669,12 +770,15 @@ export function listInfoPagePassFilingWarnings(db: AppDb, orgId: string | null):
     const d = parse<Row>(r.details, {});
     const passId = s(d.passId);
     if (!passId) continue;
+    // A deleted project belongs to no org: only the superadmin sees its row (unnamed). A project with
+    // no org row belongs to the default tenant (scope.assertInScope's rule).
+    const rowOrg = r.project_id && r.pid ? (s(r.org_id) || DEFAULT_ORG_ID) : null;
+    if (orgId !== null && rowOrg !== orgId) continue;
+    const full = d.generic !== true && (orgId === null || s(d.org) === orgId);
     let w = byPass.get(passId);
-    if (!w) { w = { passId, where: s(d.where), controlLabel: s(d.controlLabel), at: s(r.created_at), projects: [] }; byPass.set(passId, w); }
-    // A deleted project is named nowhere; a project with no org row belongs to the default tenant
-    // (scope.assertInScope's rule).
+    if (!w) { w = { passId, where: s(d.where), controlLabel: full ? s(d.controlLabel) : "", at: full ? s(r.created_at) : "", projects: [] }; byPass.set(passId, w); }
+    else if (full && !w.at) { w.at = s(r.created_at); w.controlLabel = s(d.controlLabel); }
     if (!r.project_id || !r.pid) continue;
-    if (orgId !== null && (s(r.org_id) || DEFAULT_ORG_ID) !== orgId) continue;
     if (w.projects.some((p) => p.id === s(r.project_id))) continue;
     w.projects.push({ id: s(r.project_id), name: s(r.homeowner_name), address: s(r.project_address).split(",")[0].trim() });
   }
@@ -685,6 +789,14 @@ export function listInfoPagePassFilingWarnings(db: AppDb, orgId: string | null):
  *  go with it (tenant evidence), and every pass a person verified on one of them is withdrawn — a
  *  pass is authority only while the verification it came from is on record. */
 export function deleteProjectInfoPages(db: AppDb, projectId: string): void {
+  // ROUND 4 — THE EXPIRY COUNT NEVER DROPS: deleteProject deletes this project's audit rows after
+  // this, so each pass it USED is first kept as a project-less row (infoPagePassUseCounts reads both).
+  const used = new Set<string>();
+  for (const u of db.query<{ details: string }>("SELECT details FROM audit_logs WHERE project_id = ? AND action = ?", [projectId, ACT_PASSED])) {
+    const passId = s(parse<Row>(u.details, {}).passId);
+    if (passId) used.add(passId);
+  }
+  for (const passId of used) addAuditLog(db, null, "system", "project deletion", ACT_USE_RETAINED, { passId, projectId });
   const verified = db.query<Row>("SELECT id, pass_id FROM portal_info_page_candidates WHERE project_id = ? AND status = 'verified' AND pass_id <> ''", [projectId]);
   for (const c of verified) {
     const r = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE id = ? AND source_candidate_id = ?", [s(c.pass_id), s(c.id)]);
@@ -694,20 +806,26 @@ export function deleteProjectInfoPages(db: AppDb, projectId: string): void {
 }
 
 /** The shared list (critique [5]): places, names and dates only — no component or value hash, no
- *  verifier, no project. `live` = a person's verification on record (what a run receives). */
-export function listInfoPagePasses(db: AppDb): InfoPagePassRecord[] {
-  return db.query<Row>("SELECT * FROM portal_info_page_passes ORDER BY verified_at DESC LIMIT 200").map((r) => ({
-    id: s(r.id),
-    origin: s(r.origin),
-    path: s(r.path),
-    queryKeys: parse<string[]>(r.query_keys_json, []),
-    controlLabel: s(r.control_label),
-    controlName: s(r.control_name),
-    request: { method: s(r.request_method), where: s(r.request_where), media: s(r.request_media), fieldNames: parse<Array<[string, string]>>(r.request_body_json, []).map(([n]) => n) },
-    identityPrefix: s(r.identity_sha256).slice(0, 12),
-    verifiedAt: s(r.verified_at),
-    live: Number(r.identity_version) === INFO_PAGE_IDENTITY_VERSION && passIsOnRecord(db, r),
-  }));
+ *  verifier, no project. `live` = a person's verification on record and not expired (what a run
+ *  receives); `expired` = why it expired (round 4: the limit reached, never a count — the count spans
+ *  tenants). */
+export function listInfoPagePasses(db: AppDb, nowMs: number = Date.now()): InfoPagePassRecord[] {
+  return db.query<Row>("SELECT * FROM portal_info_page_passes ORDER BY verified_at DESC LIMIT 200").map((r) => {
+    const expired = passExpiry(db, r, nowMs);
+    return {
+      id: s(r.id),
+      origin: s(r.origin),
+      path: s(r.path),
+      queryKeys: parse<string[]>(r.query_keys_json, []),
+      controlLabel: s(r.control_label),
+      controlName: s(r.control_name),
+      request: { method: s(r.request_method), where: s(r.request_where), media: s(r.request_media), fieldNames: parse<Array<[string, string]>>(r.request_body_json, []).map(([n]) => n) },
+      identityPrefix: s(r.identity_sha256).slice(0, 12),
+      verifiedAt: s(r.verified_at),
+      live: Number(r.identity_version) === INFO_PAGE_IDENTITY_VERSION && passIsOnRecord(db, r) && expired.length === 0,
+      expired,
+    };
+  });
 }
 
 /** Every use of the relaxation is on record: one audit row per admission, written the moment the

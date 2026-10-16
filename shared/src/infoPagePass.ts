@@ -44,6 +44,15 @@
 // and every project that used it is told the verified page may have filed. The content readings
 // above stay as an extra layer.
 //
+// ROUND 4: the proof is WHAT THE PAGE HOLDS — a bound job key counts only when its control, read back
+// just before the run leaves the page, holds the job's own value for that key (infoPageProofNorm)
+// outside the page's chrome (the after-click reading's own container rule); this job's own values
+// exclude everything the company or the defaults supply (infoPageJobValues). And a verification
+// EXPIRES (INFO_PAGE_PASS_MAX_AGE_DAYS / INFO_PAGE_PASS_MAX_PROJECTS, below): a page whose Next starts
+// filing server-side while still leading to a fresh application form is indistinguishable from the
+// normal flow to every reader the bot has, so nothing detects it — the expiry and once per project
+// are what bound it.
+//
 // The contract follows signatureRequestGate.ts / portalSafety.finalSubmitRefusals: PURE (node:crypto
 // only — no DOM, network or database), a plain boolean (mayPassInfoPage) and its reasons from a
 // separately named function (infoPagePassRefusals). ONE predicate: the backstop's openInfoPagePass
@@ -909,7 +918,12 @@ export function infoPageAfterClickRefusals(r: InfoPageAfterClickReading | null |
 // ---------------------------------------------------------------------------------------------
 
 /** A step the run recorded on the page a verified click led to, as the proof reads it. `value` is
- *  what was entered (kept in the learner's memory only, never on the step). */
+ *  what was entered (kept in the learner's memory only, never on the step). Round 4: `held` is what
+ *  the control HOLDS when it is read back after the fill, its blur and the page's settle (portalSafety
+ *  infoPageProofControlInPage, read again just before the run leaves the page); `chrome` whether
+ *  that control sits in the page's header / nav / footer / menu / toolbar / search / lookup (the
+ *  after-click reading's own container rule, infoPageFieldChromeInPage). Unread = undefined =
+ *  refused. */
 export interface InfoPageProofStep {
   action: string;
   field?: string;
@@ -917,6 +931,17 @@ export interface InfoPageProofStep {
   value?: string;
   sensitive?: boolean;
   gapFill?: boolean;
+  /** Every rendering of what the control holds (a select: its chosen option's text and value). */
+  held?: string | ReadonlyArray<string>;
+  chrome?: boolean;
+}
+
+/** THE ONE NORMALIZER of a proof value (round 4): case, whitespace and punctuation dropped
+ *  ("(503) 555-0199" = "5035550199"; "101 Solar Way" = "101 SOLAR WAY."), accents folded. Used for
+ *  the job's own values (infoPageJobValues) and the value a control holds (infoPageProofStepRefusals)
+ *  alike — one question, one predicate. */
+export function infoPageProofNorm(v: unknown): string {
+  return String(v ?? "").normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
 }
 
 /** The incident's reason when no such step was recorded before the run left the page or ended. */
@@ -928,57 +953,139 @@ const NOT_JOB_DATA_NOTE = /^(policy default|[a-z][a-z ]{0,30} default|e-signatur
 // An answer any page could take: empty, zero, a yes / no / on / off token.
 const TRIVIAL_VALUE = /^(?:|0+(?:\.0+)?|yes|no|y|n|true|false|on|off|none|n\/?a|null|undefined|-+|checked|unchecked)$/i;
 
+/** This job's own values: key → the value the backend resolved for THIS project (infoPageJobValues). */
+export type InfoPageJobValues = Readonly<Record<string, string>>;
+
 /**
  * EVERY REASON ONE RECORDED STEP IS NOT PROOF OF PROGRESS. Empty only for a fill / select / check
- * BOUND to one of this job's own values (`jobKeys`: the keys whose value is this project's own —
- * backend autoLearn's infoPageJobValueKeys: not a policy default, not the company's constant, never
- * a secret), not a policy / deterministic / signature step, not a gap fill, whose entered value is
- * not empty or trivial. A literal (no binding) is never proof: any page takes a literal.
+ * BOUND to one of this job's own values (`jobValues`: key → this project's own value — backend
+ * autoLearn's infoPageJobValues: not a policy default, not the company's constant, never a secret),
+ * not a policy / deterministic / signature step, not a gap fill, whose entered value is not empty or
+ * trivial — and (round 4) whose control, READ BACK after the fill, its blur and the page's settle,
+ * HOLDS exactly the job's own value for that key (infoPageProofNorm: case, whitespace and
+ * punctuation aside) and does not sit in the page's chrome (a header / nav / footer / menu / toolbar /
+ * search / lookup: the after-click reading's own container rule). A literal (no binding) is never
+ * proof: any page takes a literal. A planner that binds a job key but types other text, a control
+ * that clears or rewrites what was typed, and an unread control are never proof.
  */
-export function infoPageProofStepRefusals(step: InfoPageProofStep | null | undefined, jobKeys: ReadonlyArray<string> | null | undefined): string[] {
+export function infoPageProofStepRefusals(step: InfoPageProofStep | null | undefined, jobValues: InfoPageJobValues | null | undefined): string[] {
   if (!step || typeof step !== "object") return ["no step"];
   const out: string[] = [];
   const action = String(step.action ?? "");
   if (!/^(fill|select|check)$/.test(action)) out.push(`a "${action}" step is not a fill, select or check`);
   const field = String(step.field ?? "").trim();
+  const known = !!jobValues && typeof jobValues === "object" && !Array.isArray(jobValues);
+  const own = known && field && Object.prototype.hasOwnProperty.call(jobValues, field) ? infoPageProofNorm(jobValues![field]) : "";
   if (!field) out.push("the value is a literal, not bound to a project value");
-  else if (!Array.isArray(jobKeys)) out.push("this job's own values were not given");
-  else if (!jobKeys.includes(field)) out.push(`"${field.slice(0, 40)}" is not one of this job's own values (a policy default, a company constant or an unknown key)`);
+  else if (!known) out.push("this job's own values were not given");
+  else if (!own) out.push(`"${field.slice(0, 40)}" is not one of this job's own values (a policy default, a company constant or an unknown key)`);
   if (step.sensitive === true) out.push("a secret is never the proof");
   if (step.gapFill === true) out.push("a gap fill is a guess, never the proof");
   const note = collapse(step.note);
   if (NOT_JOB_DATA_NOTE.test(note)) out.push(`a "${note.slice(0, 30)}" step is the run's own policy, never the job's data`);
   const value = collapse(step.value);
   if (TRIVIAL_VALUE.test(value) || (value.match(/[A-Za-z0-9]/g) ?? []).length < 2) out.push("the value entered is empty or trivial");
+  // ROUND 4 — THE VALUE THE CONTROL HOLDS, not the binding the planner claimed.
+  const held = typeof step.held === "string" ? [step.held] : Array.isArray(step.held) ? (step.held as ReadonlyArray<unknown>).map((h) => String(h ?? "")) : null;
+  if (!held) out.push("what the control holds after the fill was not read");
+  else if (own && !held.some((h) => infoPageProofNorm(h) === own)) out.push(`the control does not hold this job's own value for "${field.slice(0, 40)}" (it holds ${held.some((h) => h.trim()) ? "other text" : "nothing"}: the planner typed something else, or the page cleared or rewrote it)`);
+  if (step.chrome !== false) out.push(step.chrome === true
+    ? "the control sits in the page's header, navigation, footer, menu, toolbar, search or lookup — never form evidence, never the proof"
+    : "whether the control sits in the page's chrome was not read");
   return out;
 }
 
 /** THE PROOF: one step recorded on the page the verified click led to passes infoPageProofStepRefusals.
  *  Empty = proved; anything unread refuses. */
-export function infoPageProofOfProgressRefusals(steps: ReadonlyArray<InfoPageProofStep> | null | undefined, jobKeys: ReadonlyArray<string> | null | undefined): string[] {
-  if (!Array.isArray(jobKeys)) return [`${INFO_PAGE_NO_PROGRESS} (this job's own values were not given)`];
+export function infoPageProofOfProgressRefusals(steps: ReadonlyArray<InfoPageProofStep> | null | undefined, jobValues: InfoPageJobValues | null | undefined): string[] {
+  if (!jobValues || typeof jobValues !== "object" || Array.isArray(jobValues)) return [`${INFO_PAGE_NO_PROGRESS} (this job's own values were not given)`];
   if (!Array.isArray(steps)) return [`${INFO_PAGE_NO_PROGRESS} (the run's steps were not given)`];
-  if (steps.some((s) => infoPageProofStepRefusals(s, jobKeys).length === 0)) return [];
-  return [`${INFO_PAGE_NO_PROGRESS} (no fill, select or check bound to a project value)`];
+  if (steps.some((s) => infoPageProofStepRefusals(s, jobValues).length === 0)) return [];
+  return [`${INFO_PAGE_NO_PROGRESS} (no fill, select or check bound to a project value that the page kept)`];
 }
 
+// A key that NAMES the company, the tenant or an internal id is never this job's data, whatever it
+// resolves to (round 4: clientId — read from the parser snapshot, so a blank project resolves it to
+// "" — was counted as one of this job's own values).
+const COMPANY_KEY = /^(?:id|uuid)$|^(?:client|company|org|organi[sz]ation|tenant|installer|contractor|business|licen[cs]e|insurance|bond|ccb)(?=$|[A-Z_:\-\d])/;
+const UUID_SHAPED = /^[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}$/i;
+
 /**
- * THIS JOB'S OWN VALUES: the keys whose value for this project is non-empty and DIFFERS from what a
- * blank project of the same company, portal and track resolves to (the backend resolves both through
- * portalRecipes.resolveRecipeFieldValues). A policy default ("0" stories, behind-the-meter) and the
- * company's own constants (licence, phone, address) resolve the same for a blank project, so they
- * never prove that a page asked for THIS job. Secret keys are dropped (`isSecret`).
+ * THIS JOB'S OWN VALUES (round 4: key → value): the keys whose value for this project is non-empty,
+ * not trivial, and NOT anything the company or the defaults supply. A key is OUT when:
+ *   - it is a secret (`isSecret`), or its name names the company / tenant / an internal id
+ *     (clientId, installer*, contractor*, licence…);
+ *   - its value equals what a blank project of the same company, portal and track resolves for the
+ *     same key (the backend resolves both through portalRecipes.resolveRecipeFieldValues) — a policy
+ *     default ("0" stories, behind-the-meter), a company constant;
+ *   - its value (infoPageProofNorm) equals ANY value the blank project resolves under ANY key — a
+ *     company constant or default copied into the parser snapshot under another name ("503", the
+ *     installer's area code, as the homeowner's; the AHJ's name as the city);
+ *   - its value equals any of `companyValues` (the client record's own fields, its id, the org's id);
+ *   - its value is UUID-shaped (an internal id is never what an application asks for), empty or
+ *     trivial (fewer than 2 letters / digits, 0, yes / no…).
+ * Unknown (no values or no blank resolution) = none: every admitted pass then ends as an incident.
  */
-export function infoPageJobValueKeys(values: Record<string, unknown> | null | undefined, blankValues: Record<string, unknown> | null | undefined, isSecret: (k: string) => boolean = () => false): string[] {
-  if (!values || typeof values !== "object" || !blankValues || typeof blankValues !== "object") return [];
-  const out: string[] = [];
-  for (const [k, v] of Object.entries(values)) {
-    const val = collapse(v === null || v === undefined ? "" : String(v));
-    if (!val || isSecret(k)) continue;
-    const blank = collapse(blankValues[k] === null || blankValues[k] === undefined ? "" : String(blankValues[k]));
-    if (val !== blank) out.push(k);
+export function infoPageJobValues(
+  values: Record<string, unknown> | null | undefined,
+  blankValues: Record<string, unknown> | null | undefined,
+  isSecret: (k: string) => boolean = () => false,
+  companyValues: ReadonlyArray<unknown> = [],
+): Record<string, string> {
+  if (!values || typeof values !== "object" || !blankValues || typeof blankValues !== "object") return {};
+  const str = (v: unknown): string => collapse(v === null || v === undefined || typeof v === "object" ? "" : String(v));
+  const supplied = new Set<string>();
+  for (const v of Object.values(blankValues)) { const n = infoPageProofNorm(str(v)); if (n) supplied.add(n); }
+  for (const v of Array.isArray(companyValues) ? companyValues : []) { const n = infoPageProofNorm(str(v)); if (n) supplied.add(n); }
+  const out: Record<string, string> = {};
+  for (const k of Object.keys(values).sort()) {
+    const val = str(values[k]);
+    if (!val || isSecret(k) || COMPANY_KEY.test(k)) continue;
+    if (val === str(blankValues[k])) continue;
+    const n = infoPageProofNorm(val);
+    if (n.length < 2 || TRIVIAL_VALUE.test(val) || UUID_SHAPED.test(val.trim()) || supplied.has(n)) continue;
+    out[k] = val;
   }
-  return out.sort();
+  return out;
+}
+
+/** The keys of infoPageJobValues (sorted). */
+export function infoPageJobValueKeys(values: Record<string, unknown> | null | undefined, blankValues: Record<string, unknown> | null | undefined, isSecret: (k: string) => boolean = () => false, companyValues: ReadonlyArray<unknown> = []): string[] {
+  return Object.keys(infoPageJobValues(values, blankValues, isSecret, companyValues)).sort();
+}
+
+// ---------------------------------------------------------------------------------------------
+// ROUND 4 — THE EXPIRY OF A VERIFICATION (owner-adjustable defaults, in this ONE place)
+// ---------------------------------------------------------------------------------------------
+// A verified page whose Next starts filing server-side while still leading to a fresh application
+// form is indistinguishable from the normal flow to every reader the bot has (the after-click
+// readings, the proof of progress): nothing detects it. So a verification is AUTHORITY ONLY FOR A
+// WHILE: for INFO_PAGE_PASS_MAX_AGE_DAYS after a person verified it, and for at most
+// INFO_PAGE_PASS_MAX_PROJECTS distinct projects (counted from the use ledger). After either, the pass
+// is no longer live: the next run is held at the page exactly as on main, and the card says
+// "verification expired — a person re-verifies" (the existing verify action on the fresh candidate).
+/** Days a person's verification stays authority (owner-adjustable default). */
+export const INFO_PAGE_PASS_MAX_AGE_DAYS = 30;
+/** Distinct projects one verification may admit (owner-adjustable default). */
+export const INFO_PAGE_PASS_MAX_PROJECTS = 10;
+/** The phrase the card and the run message carry. */
+export const INFO_PAGE_PASS_EXPIRED = "verification expired — a person re-verifies";
+
+/**
+ * WHY THIS VERIFICATION IS NO LONGER AUTHORITY (empty = within both limits). `projectsUsed` is the
+ * number of distinct projects the use ledger shows it admitted; `nowMs` the clock. An unreadable
+ * verification time or count is expired: an unknown never reassures. The wording names the limit
+ * reached, never the count (the count spans tenants).
+ */
+export function infoPagePassExpiryRefusals(verifiedAt: string | null | undefined, projectsUsed: number | null | undefined, nowMs: number = Date.now()): string[] {
+  const out: string[] = [];
+  const at = Date.parse(String(verifiedAt ?? ""));
+  if (!Number.isFinite(at)) out.push(`${INFO_PAGE_PASS_EXPIRED} (when it was verified could not be read)`);
+  else if (nowMs - at > INFO_PAGE_PASS_MAX_AGE_DAYS * 86_400_000) out.push(`${INFO_PAGE_PASS_EXPIRED} (a verification is authority for ${INFO_PAGE_PASS_MAX_AGE_DAYS} days; this one is older)`);
+  const n = Number(projectsUsed);
+  if (projectsUsed === null || projectsUsed === undefined || !Number.isFinite(n) || n < 0) out.push(`${INFO_PAGE_PASS_EXPIRED} (how many projects used it could not be read)`);
+  else if (n >= INFO_PAGE_PASS_MAX_PROJECTS) out.push(`${INFO_PAGE_PASS_EXPIRED} (a verification admits at most ${INFO_PAGE_PASS_MAX_PROJECTS} projects; this one reached that limit)`);
+  return out;
 }
 
 // ---------------------------------------------------------------------------------------------

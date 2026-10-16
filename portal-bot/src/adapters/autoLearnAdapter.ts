@@ -2147,18 +2147,24 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   /** The project's own values (street, name, parcel, system size): a page that shows them before
    *  anything was entered is a summary, never an information page. */
   private infoPageProjectValues: string[] = [];
-  /** #344 round 3 — the keys whose value is THIS JOB'S own (the backend's infoPageJobValueKeys): only
-   *  a fill / select / check bound to one of them proves the page after a verified click took the
-   *  job's data. Not given = none (every such page is an incident: fail closed). */
-  private infoPageProofKeys: ReadonlyArray<string>;
+  /** #344 round 3/4 — THIS JOB'S OWN VALUES, key → value (the backend's infoPageJobValues): only a
+   *  fill / select / check bound to one of these keys, whose control HOLDS that value after the fill,
+   *  proves the page after a verified click took the job's data. Not given = none (every such page
+   *  is an incident: fail closed). Memory only: never logged, never on a step. */
+  private infoPageProofValues: Readonly<Record<string, string>>;
   /** #344 round 3 — PROOF OF PROGRESS pending: armed when the page a verified click led to read as an
-   *  unfiled form; settled when a step bound to the job's own data is recorded there (`step`, the
+   *  unfiled form; settled when a step bound to the job's own data is PROVED there (`step`, the
    *  object — a rolled-back walk can never pass another step off as it), or at the walk's end as an
-   *  incident. */
-  private infoProof: { passes: Array<{ passId: string; where: string }>; page: number; step: RecipeStep | null; left: boolean } | null = null;
+   *  incident. Round 4: `candidates` are the fills / selects / checks applied on that page; each is
+   *  read back (what its control holds, whether it is chrome) just before the run leaves the page,
+   *  and only one that passes the shared predicate then lifts the hold. */
+  private infoProof: { passes: Array<{ passId: string; where: string }>; page: number; step: RecipeStep | null; left: boolean; candidates: RecipeStep[] } | null = null;
   /** What each fill / select / check entered (memory only, never on the step): the proof needs to
    *  know the value was not empty or trivial. Secrets are never kept here. */
   private infoProofValues = new WeakMap<RecipeStep, string>();
+  /** Round 4 — what the proved step's control HELD when it was read back, and whether it was chrome
+   *  (memory only): the walk's end re-judges the proof with the same facts. */
+  private infoProofReads = new WeakMap<RecipeStep, { held: string[]; chrome: boolean }>();
   /** Lines for the person at review that come from the PAGE, not the run (#302: PSE's red
    *  "file as a modification on the original record" notice). */
   private pageReviewNotes: string[] = [];
@@ -2373,11 +2379,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       /** #344 round 2: called synchronously for every information page the backstop admitted, the
        *  moment the click is settled (the backend records the use before the walk goes on). */
       onInfoPagePassed?: (p: { passId: string; where: string }) => void;
-      /** #344 round 3: the keys whose value is THIS JOB'S own (backend autoLearn: values that differ
-       *  from a blank project's — never a policy default, a company constant or a secret). After a
-       *  verified information page, the page it led to must take one of them before the run leaves
-       *  it. Not given = none: every admitted pass then ends as an incident (fail closed). */
-      infoPageProofKeys?: ReadonlyArray<string>;
+      /** #344 round 3/4: THIS JOB'S OWN VALUES, key → value (backend autoLearn infoPageJobValues:
+       *  values a blank project of the same company does not resolve under any key — never a policy
+       *  default, a company constant, an internal id or a secret). After a verified information
+       *  page, the page it led to must HOLD one of them, in a control bound to its key, before the
+       *  run leaves it. Not given = none: every admitted pass then ends as an incident (fail closed). */
+      infoPageProofValues?: Readonly<Record<string, string>>;
     } = {},
   ) {
     super();
@@ -2391,7 +2398,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     this.infoPagePasses = Object.freeze((options.infoPagePasses ?? []).map((e) => Object.freeze(JSON.parse(JSON.stringify(e)) as VerifiedInfoPage)));
     this.infoPagePriorProgress = options.infoPagePriorProgress !== false;
     this.onInfoPagePassed = typeof options.onInfoPagePassed === "function" ? options.onInfoPagePassed : undefined;
-    this.infoPageProofKeys = Object.freeze(Array.isArray(options.infoPageProofKeys) ? options.infoPageProofKeys.map((k) => String(k)) : []);
+    this.infoPageProofValues = Object.freeze(((): Record<string, string> => {
+      const v = options.infoPageProofValues;
+      const out: Record<string, string> = {};
+      if (!v || typeof v !== "object" || Array.isArray(v)) return out;
+      for (const [k, x] of Object.entries(v)) if (typeof x === "string" || typeof x === "number") out[String(k)] = String(x);
+      return out;
+    })());
     this.runId = String(options.runId ?? "");
     this.allowFinalSubmit = options.allowFinalSubmit === true;
     this.hasBattery = options.hasBattery;
@@ -7689,6 +7702,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // #344 round 3 — PROOF OF PROGRESS, BEFORE THE RUN LEAVES THE PAGE a verified click led to:
         // no step bound to this job's own data recorded there = the incident, here, before the
         // advance is pressed (the backstop would hold its request anyway). learn() reports it.
+        // ROUND 4: decided HERE, after the fills, their blurs, the re-assert pass and the settle
+        // above — each candidate's control is read back now, and only one that HOLDS the job's own
+        // value for its key (outside the page's chrome) lifts the hold (noteInfoPageProof).
+        if (this.infoProof && !this.infoProof.step) await this.proveInfoPage(steps);
         if (this.infoProof && !(this.infoProof.step && steps.includes(this.infoProof.step))) {
           this.debug?.event({ type: "info_page_proof_missing", page: pageCount, advance: String(advanceField.label ?? "").slice(0, 40) });
           return {
@@ -7816,7 +7833,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // until a fill / select / check bound to one of the job's values is recorded there
           // (applyFill reports it); leaving, ending or stopping first is the incident (learn()'s
           // settleInfoPageProof).
-          this.infoProof = { passes: [...infoAdmitted], page: pageCount, step: null, left: false };
+          this.infoProof = { passes: [...infoAdmitted], page: pageCount, step: null, left: false, candidates: [] };
           this.debug?.event({ type: "info_page_proof_pending", page: pageCount });
         }
         if (!res.ok) {
@@ -9044,30 +9061,68 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     sensitive: boolean,
   ): Promise<RecipeStep | null> {
     const step = await withOwnWriteWindow(this.page, `learner ${field.fieldType || "field"} write (${String(field.label ?? "").slice(0, 40)})`, () => this.applyFillInner(field, fillReq, sensitive));
-    // #344 round 3: what was entered (memory only; never a secret), and whether this step is the
-    // PROOF that the page after a verified information page took this job's own data.
+    // #344 round 3: what was entered (memory only; never a secret), and — round 4 — a CANDIDATE for
+    // the proof that the page after a verified information page took this job's own data. Nothing is
+    // decided here: what the control HOLDS is read just before the run leaves the page.
     if (step && !sensitive && step.sensitive !== true) this.infoProofValues.set(step, String(fillReq.value ?? ""));
-    if (step && this.infoProof && !this.infoProof.step && !this.infoProof.left) this.noteInfoPageProof(step);
+    if (step && this.infoProof && !this.infoProof.step && !this.infoProof.left && this.infoProof.candidates.length < 24) this.infoProof.candidates.push(step);
     return step;
   }
 
-  /** #344 round 3 — a recorded fill / select / check on the page a verified click led to: if it is
-   *  bound to one of this job's own values (infoPageProofStepRefusals), tell the backstop, which lifts
-   *  its hold only while the run is still on that page's document. */
-  private noteInfoPageProof(step: RecipeStep): void {
+  /** #344 round 4 — READ BACK each candidate step's control on the page a verified click led to, just
+   *  before the run leaves it (after the fills, their blurs, the re-assert pass and the settle): what
+   *  it HOLDS now and whether it is the page's chrome (portalSafety infoPageProofControlInPage, the
+   *  after-click reading's own container rule). The first that passes the shared predicate is the
+   *  proof (noteInfoPageProof). Unreadable = not proof. */
+  private async proveInfoPage(steps: RecipeStep[]): Promise<void> {
     const p = this.infoProof;
-    if (!p) return;
-    const refusals = infoPageProofStepRefusals(this.infoProofStepOf(step), this.infoPageProofKeys);
-    if (refusals.length) return;
+    if (!p || p.step || p.left || !this.page || typeof this.page.evaluate !== "function") return;
+    const own = this.infoPageProofValues;
+    const candidates = p.candidates.filter((s) => steps.includes(s) && typeof s.field === "string" && Object.prototype.hasOwnProperty.call(own, s.field));
+    if (!candidates.length) return;
+    await this.page.evaluate(PORTAL_SAFETY_IN_PAGE_SOURCE).catch(() => null);
+    for (const s of candidates) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const loc = (await this.locator(s.selector).catch(() => null)) as any;
+      let read: { held: string[]; chrome: boolean } | null = null;
+      if (loc && typeof loc.evaluate === "function") {
+        const r = await loc.evaluate((el: Element, g: string) => {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const ps = (globalThis as any)[g];
+          return ps && typeof ps.infoPageProofControlInPage === "function" ? ps.infoPageProofControlInPage(el) : null;
+        }, PORTAL_SAFETY_GLOBAL).catch(() => null) as { held?: unknown; chrome?: unknown } | null;
+        if (r && Array.isArray(r.held) && typeof r.chrome === "boolean") read = { held: r.held.map((x) => String(x ?? "")), chrome: r.chrome };
+      }
+      if (read) this.infoProofReads.set(s, read);
+      if (this.noteInfoPageProof(s)) return;
+      if (this.infoProof?.left) return;
+    }
+  }
+
+  /** #344 round 3/4 — THE ONE LIFT: a candidate step on the page a verified click led to whose
+   *  control, read back, HOLDS this job's own value for its key outside the page's chrome
+   *  (infoPageProofStepRefusals over what was read): tell the backstop, which lifts its hold only
+   *  while the run is still on that page's document. True = proved. */
+  private noteInfoPageProof(step: RecipeStep): boolean {
+    const p = this.infoProof;
+    if (!p) return false;
+    const refusals = infoPageProofStepRefusals(this.infoProofStepOf(step), this.infoPageProofValues);
+    this.debug?.event({ type: "info_page_proof_read", page: p.page, field: String(step.field ?? "").slice(0, 40), refusals: refusals.slice(0, 4).map((x) => x.slice(0, 160)) });
+    if (refusals.length) return false;
     const door = backstopFor(this.page) as Partial<FilingBackstop> | null;
     const given = !!door && typeof door.infoPageProofGiven === "function" && door.infoPageProofGiven();
     if (given) p.step = step;
     else p.left = true;
     this.debug?.event({ type: given ? "info_page_proof" : "info_page_proof_too_late", page: p.page, field: String(step.field ?? "").slice(0, 40) });
+    return given;
   }
 
   private infoProofStepOf(step: RecipeStep): InfoPageProofStep {
-    return { action: String(step.action ?? ""), field: step.field, note: step.note, value: this.infoProofValues.get(step) ?? "", sensitive: step.sensitive === true };
+    const read = this.infoProofReads.get(step);
+    return {
+      action: String(step.action ?? ""), field: step.field, note: step.note, value: this.infoProofValues.get(step) ?? "", sensitive: step.sensitive === true,
+      ...(read ? { held: read.held, chrome: read.chrome } : {}),
+    };
   }
 
   /**
@@ -9085,14 +9140,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     if (!p) return result;
     const steps = Array.isArray(result.steps) ? result.steps : [];
     const recorded = !!p.step && steps.includes(p.step)
-      && infoPageProofOfProgressRefusals([this.infoProofStepOf(p.step)], this.infoPageProofKeys).length === 0;
+      && infoPageProofOfProgressRefusals([this.infoProofStepOf(p.step)], this.infoPageProofValues).length === 0;
     if (recorded) return result;
     this.infoProof = null;
     const state = backstop && typeof backstop.infoPageProofState === "function" ? backstop.infoPageProofState() : "none";
     const left = p.left || state === "left";
     if (backstop && !left) { try { backstop.lockReview("a verified information page led to a page that took none of this job's data"); } catch { /* disposed */ } }
     const why = [
-      `${infoPageProofOfProgressRefusals([], this.infoPageProofKeys)[0]} — the run ${left ? "left that page" : result.stopReason === "info_page_incident" ? "was about to leave that page" : "ended"} first`,
+      `${infoPageProofOfProgressRefusals([], this.infoPageProofValues)[0]} — the run ${left ? "left that page" : result.stopReason === "info_page_incident" ? "was about to leave that page" : "ended"} first`,
     ];
     for (const a of p.passes) this.infoPageIncidents.push({ passId: a.passId, phase: "after", why, where: a.where });
     this.debug?.event({ type: "info_page_incident", page: p.page, phase: "after", kind: "no_progress", left, why });
@@ -9105,7 +9160,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       reachedReview: false,
       pauseReason: null,
       stopReason: "info_page_incident",
-      message: `STOPPED AFTER A VERIFIED INFORMATION PAGE: the network backstop let one request through on the page a person verified; the page it led to read as a form, but the run ${left ? "left it" : "did not continue past it"} without entering any of this job's own data there (no fill, select or check bound to a project value) — so nothing showed it was this job's application. It may have been a receipt: the verified page may have filed — check the portal for this project. Nothing is recorded as filed, and that verification is withdrawn. (The walk said: ${prior})`,
+      message: `STOPPED AFTER A VERIFIED INFORMATION PAGE: the network backstop let one request through on the page a person verified; the page it led to read as a form, but the run ${left ? "left it" : "did not continue past it"} without entering any of this job's own data there (no fill, select or check bound to a project value whose control kept that value) — so nothing showed it was this job's application. It may have been a receipt: the verified page may have filed — check the portal for this project. Nothing is recorded as filed, and that verification is withdrawn. (The walk said: ${prior})`,
     };
   }
 

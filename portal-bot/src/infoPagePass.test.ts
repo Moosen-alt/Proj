@@ -29,7 +29,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, INFO_PAGE_NO_PROGRESS, digestInfoPageIdentity, infoPageAfterClickSentWording, infoPageJobValueKeys, infoPageLabeledCodes, infoPageProofOfProgressRefusals, infoPageProofStepRefusals, infoPageAfterClickRefusals, infoPageBackstopRefusals, infoPageDriftedEntries, infoPageEvidence, infoPageMatchRefusals,
+  INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, INFO_PAGE_NO_PROGRESS, INFO_PAGE_PASS_EXPIRED, INFO_PAGE_PASS_MAX_AGE_DAYS, INFO_PAGE_PASS_MAX_PROJECTS, digestInfoPageIdentity, infoPageAfterClickSentWording, infoPageJobValueKeys, infoPageJobValues, infoPagePassExpiryRefusals, infoPageProofNorm, infoPageLabeledCodes, infoPageProofOfProgressRefusals, infoPageProofStepRefusals, infoPageAfterClickRefusals, infoPageBackstopRefusals, infoPageDriftedEntries, infoPageEvidence, infoPageMatchRefusals,
   infoPageNumberTokens, infoPageObservedRequest, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageRunStateRefusals,
   infoPageShapeRefusals, infoPageVerifyWarnings, isMatchClassRefusal, mayPassInfoPage, parseFormBodyFields, verifiedInfoPageFromCandidate,
   type InfoPageBackstopState, type InfoPageIdentityMaterial, type InfoPagePassContext, type InfoPageProofStep, type InfoPageRunState, type InfoPageRunStep,
@@ -419,11 +419,24 @@ console.log("\nAFTER THE CLICK (proposal §4; round 2): only POSITIVE evidence o
 // ---------------------------------------------------------------------------------------------
 console.log("\nPROOF OF PROGRESS (round 3): the page after the click must take THIS JOB'S OWN DATA");
 {
-  const KEYS = ["street", "projectAddress", "parcelNumber", "systemSizeDcKw", "homeownerName"];
-  const ok: InfoPageProofStep = { action: "fill", field: "street", note: "Site Address", value: "1 Test St" };
-  check("a fill bound to one of this job's own values, with a real value, is the proof", infoPageProofStepRefusals(ok, KEYS).length === 0, JSON.stringify(infoPageProofStepRefusals(ok, KEYS)));
-  check("…a select bound to one (the parcel) too", infoPageProofStepRefusals({ action: "select", field: "parcelNumber", note: "Parcel", value: "R123456" }, KEYS).length === 0);
+  // Round 4: this job's own values are key → VALUE, and the step carries what its control HOLDS
+  // (read back after the fill) and whether it is the page's chrome.
+  const KEYS: Record<string, string> = { street: "1 Test St", projectAddress: "1 Test St, Springfield, IL", parcelNumber: "R123456", systemSizeDcKw: "8.6", homeownerName: "Pat Q", homeownerPhone: "(503) 555-0199", projectName: "Pat Q Solar" };
+  const ok: InfoPageProofStep = { action: "fill", field: "street", note: "Site Address", value: "1 Test St", held: "1 Test St", chrome: false };
+  check("a fill bound to one of this job's own values, whose control HOLDS that value outside the chrome, is the proof", infoPageProofStepRefusals(ok, KEYS).length === 0, JSON.stringify(infoPageProofStepRefusals(ok, KEYS)));
+  check("…a select bound to one (the parcel) too — its chosen option's text or value may carry it", infoPageProofStepRefusals({ action: "select", field: "parcelNumber", note: "Parcel", value: "R123456", held: ["Parcel R-123456", "R123456"], chrome: false }, KEYS).length === 0);
+  check("round 4: the comparison ignores case, spaces and punctuation ('(503) 555-0199' held as '5035550199'; '1 TEST ST.')",
+    infoPageProofStepRefusals({ ...ok, field: "homeownerPhone", value: "(503) 555-0199", held: "5035550199" }, KEYS).length === 0 && infoPageProofStepRefusals({ ...ok, held: " 1 TEST ST. " }, KEYS).length === 0);
+  check("round 4: one normalizer — infoPageProofNorm folds case, accents, spaces and punctuation", infoPageProofNorm(" José  O'Neil-Smith, Jr. ") === "joseoneilsmithjr" && infoPageProofNorm(null) === "");
   const notProof: Array<[string, InfoPageProofStep, RegExp]> = [
+    ["round 4 (N4_wrongval): a job key BOUND but other text typed — the control holds 'Question about my request', not the project name", { ...ok, field: "projectName", value: "Question about my request", held: "Question about my request" }, /does not hold this job's own value/],
+    ["round 4 (N5_clear): the job's street typed, but the control CLEARED it", { ...ok, held: "" }, /does not hold this job's own value .*holds nothing/],
+    ["round 4: the control REWROTE it (another address)", { ...ok, held: "2 Other Ave" }, /does not hold this job's own value .*other text/],
+    ["round 4: a prefix of the value is not the value", { ...ok, held: "1 Test" }, /does not hold this job's own value/],
+    ["round 4: what the control holds was not read (unknown refuses)", { ...ok, held: undefined }, /was not read/],
+    ["round 4 (G_pqaspx): the street typed into the page's HEADER lookup — chrome", { ...ok, chrome: true }, /header, navigation, footer, menu, toolbar, search or lookup/],
+    ["round 4: whether the control is chrome was not read (unknown refuses)", { ...ok, chrome: undefined }, /chrome was not read/],
+    ["round 4: the company's id bound as clientId — never one of this job's own values", { ...ok, field: "clientId", value: "bb153551-be5a-4658-8c03-4ee5a71861e8", held: "bb153551-be5a-4658-8c03-4ee5a71861e8" }, /not one of this job's own values/],
     ["a LITERAL (no binding) — any page takes one", { ...ok, field: undefined }, /literal/],
     ["a key that is not this job's own (a company constant / policy default)", { ...ok, field: "installerPhone" }, /not one of this job's own values/],
     ["a secret", { ...ok, sensitive: true }, /secret/],
@@ -443,7 +456,8 @@ console.log("\nPROOF OF PROGRESS (round 3): the page after the click must take T
   check("…none qualifying is the incident's reason (\"the run entered none of this job's own data…\")",
     infoPageProofOfProgressRefusals([{ action: "select", note: "Existing contact", value: "New Contact" }, { ...ok, field: "installerPhone" }], KEYS).some((x) => x.startsWith(INFO_PAGE_NO_PROGRESS)));
   check("…no step at all is the incident's reason", infoPageProofOfProgressRefusals([], KEYS).some((x) => x.startsWith(INFO_PAGE_NO_PROGRESS)));
-  check("…unknown steps or keys refuse", infoPageProofOfProgressRefusals(null, KEYS).length > 0 && infoPageProofOfProgressRefusals([ok], null).length > 0);
+  check("…unknown steps or values refuse (a bare key list is not this job's values)", infoPageProofOfProgressRefusals(null, KEYS).length > 0 && infoPageProofOfProgressRefusals([ok], null).length > 0
+    && infoPageProofOfProgressRefusals([ok], ["street"] as never).length > 0);
   // THIS JOB'S OWN VALUES: what differs from a blank project of the same company / portal / track.
   const values = { street: "1 Test St", city: "Springfield", numberOfStories: "0", systemConfiguration: "behind-the-meter", installerPhone: "(555) 010-0000", accountNumber: "12345678", homeownerName: "Pat Q", emptyKey: "" };
   const blank = { street: "", city: "", numberOfStories: "0", systemConfiguration: "behind-the-meter", installerPhone: "(555) 010-0000", accountNumber: "12345678", homeownerName: "" };
@@ -451,6 +465,40 @@ console.log("\nPROOF OF PROGRESS (round 3): the page after the click must take T
   check("this job's own values: the per-job values (street, city, homeowner) count; a policy default, a company constant, a secret and an empty value do not",
     JSON.stringify(jk) === JSON.stringify(["city", "homeownerName", "street"]), JSON.stringify(jk));
   check("this job's own values: unknown (no blank resolution) is none", infoPageJobValueKeys(values, null).length === 0 && infoPageJobValueKeys(null, blank).length === 0);
+  check("round 4: infoPageJobValues carries each key's VALUE (what the proof compares the control's held value with)",
+    JSON.stringify(infoPageJobValues(values, blank, (k) => k === "accountNumber")) === JSON.stringify({ city: "Springfield", homeownerName: "Pat Q", street: "1 Test St" }));
+  // ROUND 4 — THE clientId CASE and its family: nothing the company or the defaults supply is this
+  // job's own value, whatever key the snapshot carries it under.
+  const CID = "bb153551-be5a-4658-8c03-4ee5a71861e8";
+  const v4 = { ...values, clientId: CID, homeownerPhoneArea: "503", installerPhoneArea: "503", ahj: "Portland", city2: "Portland", contractorLicenseNumber: "240136", snapshotLicence: "240136", orgRef: "org-default", feeLineQuantity: "0", hasBattery: "No", wind: "B", projectUuid: "0f8fad5b-d9cb-469f-a165-70867728950e" };
+  const b4 = { ...blank, clientId: "", homeownerPhoneArea: "000", installerPhoneArea: "503", ahj: "Portland", city2: "", contractorLicenseNumber: "240136", snapshotLicence: "", orgRef: "", feeLineQuantity: "", hasBattery: "", wind: "", projectUuid: "" };
+  const j4 = infoPageJobValueKeys(v4, b4, (k) => k === "accountNumber", [CID, "org-default", "Replay Trust Solar LLC"]);
+  check("round 4 (the clientId case): clientId — the company's UUID, read from the parser snapshot so a blank project resolves it to '' — is NOT this job's own value",
+    !j4.includes("clientId"), JSON.stringify(j4));
+  check("round 4: a value a blank project resolves under ANY key is out ('503' = the installer's area code; 'Portland' = the AHJ; the licence copied into the snapshot)",
+    !j4.includes("homeownerPhoneArea") && !j4.includes("city2") && !j4.includes("snapshotLicence"), JSON.stringify(j4));
+  check("round 4: a value from the client record / org (the company values) is out, and so is any UUID-shaped value, a trivial value and a key naming the company",
+    !j4.includes("orgRef") && !j4.includes("projectUuid") && !j4.includes("feeLineQuantity") && !j4.includes("hasBattery") && !j4.includes("wind") && !j4.includes("contractorLicenseNumber"), JSON.stringify(j4));
+  check("round 4: …while the job's own values stay (the positive control)", JSON.stringify(j4) === JSON.stringify(["city", "homeownerName", "street"]), JSON.stringify(j4));
+  check("round 4: a key that NAMES the company is out even with a per-job-looking value", !infoPageJobValueKeys({ clientName: "Pat Q Solar Co" }, { clientName: "" }).length && !infoPageJobValueKeys({ installerContactName: "Sam Lee" }, { installerContactName: "" }).length);
+}
+
+// ---------------------------------------------------------------------------------------------
+console.log("\nEXPIRY (round 4): a verification is authority for 30 days and at most 10 projects");
+{
+  const now = Date.parse("2026-10-16T12:00:00.000Z");
+  const day = 86_400_000;
+  check("round 4: the limits are the owner-adjustable defaults, in ONE place (30 days, 10 projects)", INFO_PAGE_PASS_MAX_AGE_DAYS === 30 && INFO_PAGE_PASS_MAX_PROJECTS === 10);
+  check("round 4: a fresh verification used by 0..9 projects is live (the positive control)",
+    [0, 1, 9].every((n) => infoPagePassExpiryRefusals(new Date(now - day).toISOString(), n, now).length === 0));
+  check("round 4: 30 days old is still live; 31 days old is EXPIRED, and says so", infoPagePassExpiryRefusals(new Date(now - 30 * day).toISOString(), 0, now).length === 0
+    && infoPagePassExpiryRefusals(new Date(now - 31 * day).toISOString(), 0, now).some((x) => x.startsWith(INFO_PAGE_PASS_EXPIRED) && /30 days/.test(x)));
+  check("round 4: the 10th project's use EXPIRES it (the 11th is held), and the wording names the limit, never a count",
+    infoPagePassExpiryRefusals(new Date(now).toISOString(), 10, now).some((x) => x.startsWith(INFO_PAGE_PASS_EXPIRED) && /at most 10 projects/.test(x))
+    && !infoPagePassExpiryRefusals(new Date(now).toISOString(), 14, now).some((x) => /14/.test(x)));
+  check("round 4: an unreadable time or count is expired (an unknown never reassures)",
+    infoPagePassExpiryRefusals("not a date", 0, now).length > 0 && infoPagePassExpiryRefusals(new Date(now).toISOString(), null, now).length > 0 && infoPagePassExpiryRefusals(new Date(now).toISOString(), Number.NaN, now).length > 0);
+  check("round 4: the card's phrase", INFO_PAGE_PASS_EXPIRED === "verification expired — a person re-verifies");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -573,6 +621,8 @@ console.log("\nGREP PINS");
     ["portal.info_page_pass_allowed_again", "ACT_ALLOWED_AGAIN", "allowInfoPagePassOnceMore"],
     // Round 3: the may-have-filed warning (evidence) — one writer: the after-click incident.
     ["portal.info_page_may_have_filed", "ACT_MAY_HAVE_FILED", "recordInfoPagePassIncidents"],
+    // Round 4: a deleted project's uses, kept for the expiry count — one writer: the project deletion.
+    ["portal.info_page_pass_use_retained", "ACT_USE_RETAINED", "deleteProjectInfoPages"],
   ];
   for (const [literal, constant, writer] of ledger) {
     const namers = everything.filter((f) => fs.readFileSync(f, "utf8").includes(literal)).map(rel).sort();
