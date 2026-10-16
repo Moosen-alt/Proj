@@ -2582,6 +2582,33 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       `);
     },
   },
+  {
+    version: 49,
+    name: "portal_recipe_draft_submits",
+    up: (db) => {
+      // A KNOWN DRAFT-CREATING SUBMIT (#330; owner ruling 2026-10-16 "Yes to PSE"). The record that
+      // lets a replay click a recipe's healed Part 1 Submit itself. SERVER-OWNED, never in steps_json:
+      // a recipe save (PUT /api/portal-recipes/:id/steps), a re-record restore or a self-heal can
+      // never write, move or revive it. Only portalDraft.ts writes a row (the heal, and the arm on a
+      // person's click seen to make a draft) and only disarmDraftCreatingSubmit deletes one.
+      // steps_sig is recipeStepsSignature of the WHOLE recipe the draft was seen with: a replay gets
+      // the stamp only when the steps it replays are exactly those (any edit turns it off). An empty
+      // tenant_key is "healed, not yet stamped" (the heal's page had no readable tenant). One row per
+      // recipe; portal_recipes is shared knowledge, so no org_id (CLAUDE.md). No foreign key: a deleted
+      // recipe's id is never reused, so its orphan row is never read, and a key would block the delete.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS portal_recipe_draft_submits (
+          recipe_id TEXT PRIMARY KEY,
+          step_index INTEGER NOT NULL,
+          steps_sig TEXT NOT NULL,
+          tenant_key TEXT NOT NULL DEFAULT '',
+          label TEXT NOT NULL,
+          healed_at TEXT NOT NULL,
+          armed_at TEXT NOT NULL DEFAULT ''
+        );
+      `);
+    },
+  },
 ];
 
 /** v47 was edited in place while #218 was open (Helm's review at 0116f98a): a DB that ran an earlier

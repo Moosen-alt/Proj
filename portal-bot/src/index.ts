@@ -303,9 +303,10 @@ interface StageOptions {
   /** The project's site, for the replay's existing-draft check (#302, RecipeAdapter siteDraft). */
   siteDraft?: { street?: string; city?: string; zip?: string; siblingAtSameStreet?: boolean };
   /** The replay may click a recipe step healed as a KNOWN draft-creating submit itself (#330,
-   *  RecipeAdapter draftSubmitClick; draftSubmitGate decides). The backend sets it for the NEM
-   *  track's own recipe only. Never an approval to file, and never read by the final-submit gate. */
-  draftSubmitClick?: boolean;
+   *  RecipeAdapter draftSubmitStamp; draftSubmitGate decides). The backend's server-owned stamp,
+   *  passed for the NEM track's own recipe only and only when the replayed steps are exactly the
+   *  ones it was signed over. Never an approval to file, and never read by the final-submit gate. */
+  draftSubmitStamp?: import("./draftSubmitGate").DraftCreatingStamp | null;
 }
 
 // Headed, guided-manual staging leaves the browser OPEN at the review screen so the human
@@ -703,7 +704,7 @@ export async function stageWithRecipe(
     onProgress: options.onProgress,
     owedAttachments: options.owedAttachments,
     siteDraft: options.siteDraft,
-    draftSubmitClick: options.draftSubmitClick === true,
+    draftSubmitStamp: options.draftSubmitStamp ?? null,
   }), project, files, options));
 }
 

@@ -5,9 +5,11 @@
 // PSE's PowerClerk tenant answers Part 1's Submit with "Your draft application NEM-… has been
 // created. Please continue to Interconnection Application - Part 2 …" (draftCreated.ts). Once that
 // page has been SEEN after a click of a recipe's recorded final submit, the backend heals that step
-// (backend/src/portalDraft.ts): the isFinalSubmit flag comes off, and the step is STAMPED with the
-// tenant it was seen on and the label that was clicked. Until #330 a person still clicked it, so a
-// PSE job took two runs with a human click between them.
+// (backend/src/portalDraft.ts): the isFinalSubmit flag comes off, and the backend STAMPS it in a
+// server-owned record (portal_recipe_draft_submits — never in the recipe's steps, which any recipe
+// save can write) with the step index, the tenant it was seen on, the label that was clicked, and
+// the signature of the whole recipe. Until #330 a person still clicked it, so a PSE job took two
+// runs with a human click between them.
 //
 // This module is the ONE answer to "may the replay click this step itself?". It is NOT the
 // final-submit gate and never stands in for it:
@@ -15,10 +17,17 @@
 //     automaticSubmitRefusals, CLAUDE.md rule 1, unchanged);
 //   - PORTAL_ALLOW_FINAL_SUBMIT and a named run approval are never read: they neither allow nor
 //     refuse this click (draftSubmitGate.test pins both ways);
-//   - a step that was never healed (no stamp) is never clicked;
+//   - a step that was never healed (no stamp) is never clicked. The stamp reaches this module only
+//     as a run option the backend passes (draftSubmitStampForReplay): for the NEM track's own recipe
+//     (the track whose next stage continues a draft instead of starting the application again), and
+//     only when the steps being replayed are EXACTLY the steps the draft was seen with (any edit,
+//     relabel, re-aimed step, self-heal or restored snapshot turns it off). A field on a recipe step
+//     is never read as one;
 //   - the stamp only counts on the tenant it was seen on, for the label that was clicked, on the
-//     recipe's LAST step, once per run, and only where the backend enabled it (the NEM track's own
-//     recipe: the track whose next stage continues a draft instead of starting the application again).
+//     step it names, which must be the recipe's LAST step, once per run.
+// THE LIVE CHECK IS THE LABEL. A generic "Submit" on the page is not by itself proof it is Part 1's:
+// what makes it so is that every step before it — the whole of Part 1 as the draft was seen with it —
+// replayed unchanged (the signature), and that the page after the click must read as draft-created.
 // And the click is only half of it: the page it produces must read as draft-created
 // (readDraftAfterClick). Anything else — a receipt, a filed status, a page that cannot be read —
 // stops the run, is recorded as an incident, and the track never reads as filed (recipeAdapter
@@ -29,8 +38,10 @@ import { classifySubmissionText, isPayFee } from "../../shared/src/portalSafety"
 import type { RecipeStep } from "../../shared/src/types";
 import { readDraftCreated, type DraftCreatedRead } from "./draftCreated";
 
-/** What the heal writes on the step it healed (RecipeStep.draftCreatingSubmit). */
+/** The backend's stamp for this run (portalDraft.draftSubmitStampForReplay), never a step field. */
 export interface DraftCreatingStamp {
+  /** The step it names, in the steps the replay runs (the backend maps it through the replay binding). */
+  stepIndex: number;
   /** draftTenantKey of the page that said the draft was created. */
   tenantKey: string;
   /** The recorded label of the step that was clicked (the heal's matching key). */
@@ -59,43 +70,43 @@ export function draftStepLabel(step: RecipeStep | null | undefined): string {
 
 export const draftLabelKey = (v: unknown): string => String(v ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 
-/** The step's stamp, when it carries a complete one. */
-export function draftStampOf(step: RecipeStep | null | undefined): DraftCreatingStamp | null {
-  const raw = (step as { draftCreatingSubmit?: unknown } | null | undefined)?.draftCreatingSubmit;
-  if (!raw || typeof raw !== "object") return null;
-  const r = raw as Record<string, unknown>;
-  const tenantKey = String(r.tenantKey ?? "").trim();
-  const label = String(r.label ?? "").trim();
-  if (!tenantKey || !label) return null;
-  return { tenantKey, label, healedAt: String(r.healedAt ?? "") };
+/** The run's stamp, when it is a complete one (a tenant, a label and a step index). */
+export function completeStamp(stamp: DraftCreatingStamp | null | undefined): DraftCreatingStamp | null {
+  if (!stamp || typeof stamp !== "object") return null;
+  const tenantKey = String(stamp.tenantKey ?? "").trim();
+  const label = String(stamp.label ?? "").trim();
+  const stepIndex = Number(stamp.stepIndex);
+  if (!tenantKey || !label || !Number.isInteger(stepIndex) || stepIndex < 0) return null;
+  return { stepIndex, tenantKey, label, healedAt: String(stamp.healedAt ?? "") };
 }
 
 export interface DraftClickContext {
   /** The URL of the page the click would happen on. */
   pageUrl: string;
-  /** The backend enabled it for this run (RecipeAdapter options.draftSubmitClick). */
-  enabled: boolean;
+  /** The backend's stamp for this run (RecipeAdapter options.draftSubmitStamp), or null: none. */
+  stamp: DraftCreatingStamp | null;
   /** A draft-creating click was already made (or attempted) in this run. */
   alreadyClicked: boolean;
 }
 
 /**
  * Why the replay may NOT click steps[idx] as a known draft-creating submit. [] = it may.
- * Reads the recipe and the page URL only: no environment variable, no approval, no auto-submit arm.
+ * Reads the recipe, the backend's stamp for this run and the page URL only: no environment variable,
+ * no approval, no auto-submit arm, and never a stamp-like field on a step.
  */
 export function draftCreatingClickRefusals(steps: RecipeStep[], idx: number, ctx: DraftClickContext): string[] {
   const out: string[] = [];
   const list = Array.isArray(steps) ? steps : [];
   const step = list[idx];
-  if (!ctx.enabled) out.push("this run may not click a draft-creating submit (only the NEM track's own recipe may)");
   if (!step) return [...out, "there is no such step"];
   if (step.action !== "click") out.push(`the step is a ${String(step.action)}, not a click`);
   if (step.isFinalSubmit === true) out.push("the step is flagged as the final submit — that click goes only through the final-submit gate");
-  const stamp = draftStampOf(step);
+  const stamp = completeStamp(ctx.stamp);
   if (!stamp) {
-    out.push("the step was never healed from a draft-created page on this portal");
+    out.push("the step was never healed from a draft-created page on this portal (no stamp for these exact steps on this run)");
     return out;
   }
+  if (stamp.stepIndex !== idx) out.push(`the stamp names step ${stamp.stepIndex + 1}, not this one`);
   if (idx !== list.length - 1) out.push("the step is not the recipe's last step");
   const recorded = draftStepLabel(step);
   if (!recorded || draftLabelKey(recorded) !== draftLabelKey(stamp.label)) {

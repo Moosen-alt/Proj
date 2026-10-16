@@ -97,7 +97,7 @@ import { readAndRecordPortalFees } from "./portalFeeReadings";
 import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential } from "./portalCredentials";
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
 import { logger } from "./logger";
-import { disarmDraftCreatingSubmit, draftContinuationGaps, openPortalDraftFor, recordPortalDraft, DRAFT_SUBMIT_UNEXPECTED_ACTION, type ObservedDraft } from "./portalDraft";
+import { disarmDraftCreatingSubmit, draftContinuationGaps, draftSubmitStampForReplay, openPortalDraftFor, recordPortalDraft, DRAFT_SUBMIT_UNEXPECTED_ACTION, type ObservedDraft } from "./portalDraft";
 import { claimSignatureRequestApproval, runningJobSignatureRequestApprovalId } from "./signatureRequestApproval";
 import { nemSignatureState, nemStageIsResume } from "./signatureTrack";
 import { siteKey } from "../../portal-bot/src/draftCreated";
@@ -9042,12 +9042,6 @@ export async function prepareSubmission(
     loginUrl: credentialUrl || undefined,
     // The replay's existing-draft check (#302): NEM only — the two-part utility portals.
     siteDraft: siteDraftParts,
-    // A KNOWN DRAFT-CREATING SUBMIT MAY BE CLICKED BY THE REPLAY ITSELF (#330, owner ruling 2026-10-16):
-    // NEM only, because only the NEM track's next stage continues a draft (openPortalDraftFor) — on any
-    // other track the next stage would replay the start again and make a second application. And only
-    // on this entity's OWN recipe: a borrowed recipe's stamp is another entity's evidence.
-    // portal-bot's draftSubmitGate decides each click; this is never an approval to file.
-    draftSubmitClick: track === "nem" && !borrowed,
   };
 
   // UNIVERSAL-FIRST dispatch with SELF-SEED (see selectStagingActor):
@@ -9337,8 +9331,23 @@ export async function prepareSubmission(
       }
       const boundRecipe = { ...recipe, steps: replayBinding.steps };
       const boundValues = { ...replayFieldValues, ...replayBinding.fieldValues };
+      // A KNOWN DRAFT-CREATING SUBMIT MAY BE CLICKED BY THE REPLAY ITSELF (#330, owner ruling 2026-10-16).
+      // The stamp is SERVER-OWNED (portal_recipe_draft_submits; no recipe save can write it) and is
+      // passed only when the steps this replay READ are exactly the steps the draft was seen with
+      // (draftSubmitStampForReplay compares the whole recipe's signature) — any edit since turns it
+      // off. NEM only, because only the NEM track's next stage continues a draft (openPortalDraftFor):
+      // on any other track the next stage would replay the start again and make a second application.
+      // And only on this entity's OWN recipe: a borrowed recipe's stamp is another entity's evidence.
+      // The stamped step must also be the LAST step the binding kept. portal-bot's draftSubmitGate
+      // decides each click; this is never an approval to file.
+      const ownStamp = track === "nem" && !borrowed ? draftSubmitStampForReplay(db, recipe.id, recipe.steps ?? []) : null;
+      const boundStampIdx = ownStamp ? replayBinding.originalIndex.indexOf(ownStamp.stepIndex) : -1;
+      const draftSubmitStamp = ownStamp && boundStampIdx >= 0 && boundStampIdx === replayBinding.steps.length - 1
+        ? { ...ownStamp, stepIndex: boundStampIdx }
+        : null;
+      const replayOptions = { ...stageOptions, draftSubmitStamp };
       ledgerStagingLaunch(`staging replay (${track ?? "permit"} track, run ${runId})`, String(recipe.portalUrl || credentialUrl || ""));
-      result = await recipeStageRunner(boundRecipe, stagedProject, boundValues, docsByType, files, stageOptions);
+      result = await recipeStageRunner(boundRecipe, stagedProject, boundValues, docsByType, files, replayOptions);
 
       // A BOT WALL MUST NOT BLOCK A FILING — RETRY WITH A REAL WINDOW.
       //
@@ -9363,7 +9372,8 @@ export async function prepareSubmission(
           ledgerStagingLaunch(`staging replay (${track ?? "permit"} track, run ${runId}) — headed retry, a second browser; may leave a second draft`, String(recipe.portalUrl || credentialUrl || ""));
           const headedResult = await recipeStageRunner(
             boundRecipe, stagedProject, boundValues, docsByType, files,
-            { ...stageOptions, headless: false },
+            // Never a second draft-creating click after one already reached the portal (#330).
+            { ...replayOptions, headless: false, draftSubmitStamp: (result as { draftSubmitUnexpected?: unknown }).draftSubmitUnexpected ? null : draftSubmitStamp },
           );
           const before = Array.isArray((result as { steps?: unknown[] }).steps) ? (result as { steps: unknown[] }).steps.length : 0;
           const after = Array.isArray((headedResult as { steps?: unknown[] }).steps) ? (headedResult as { steps: unknown[] }).steps.length : 0;

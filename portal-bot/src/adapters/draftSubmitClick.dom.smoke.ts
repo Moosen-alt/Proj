@@ -3,7 +3,8 @@
 // Owner ruling 2026-10-16 ("Yes to PSE"): PSE's PowerClerk Part 1 Submit only creates a draft
 // ("Your draft application NEM-… has been created. Please continue to Interconnection Application -
 // Part 2 …"). Once that page has been seen after a click of the recipe's last step, the backend
-// heals and stamps it (portalDraft.ts); the replay may then click it itself (draftSubmitGate.ts).
+// heals it and stamps it in a server-owned record (portalDraft.ts); a replay of exactly those steps
+// is passed that stamp (draftSubmitStamp) and may then click the step itself (draftSubmitGate.ts).
 //
 // Real Chromium through the real stage path (stageWithRecipe → runAdapter → RecipeAdapter with the
 // network backstop installed) against a synthetic Part 1 page on 127.0.0.1 (never a real portal).
@@ -14,10 +15,11 @@
 //                 no record number captured. With PORTAL_ALLOW_FINAL_SUBMIT unset and no approval.
 //   MUST-PASS     draftApproved: the switch on, autoSubmit on and a named approval for the run change
 //                 nothing — still one POST, still a draft, still finalSubmitClicked false.
-//   MUST-EXCLUDE  (0 POSTs each) neverHealed: the same Submit unstamped, with the switch on, autoSubmit
-//                 and an approval; otherTenant: stamped for another host; notEnabled: the run not
-//                 enabled (another track / a borrowed recipe); flagged: stamped AND isFinalSubmit with
-//                 no approval (the final-submit gate refuses; this path never takes it).
+//   MUST-EXCLUDE  (0 POSTs each) neverHealed: no stamp for the run — with the switch on, autoSubmit,
+//                 an approval AND the old stamp field forged onto the step itself (what a recipe save
+//                 could write); otherTenant: stamped for another host; stampMoved: the run's stamp
+//                 names another step; flagged: stamped AND isFinalSubmit with no approval (the
+//                 final-submit gate refuses; this path never takes it).
 //   MUST-STOP     receipt: the page after the click reads as a FILING → one POST, paused
 //                 draft_submit_unexpected, draftSubmitUnexpected.verdict "filed", finalSubmitClicked
 //                 false, NO record number captured, no draft reported.
@@ -28,6 +30,7 @@ import "../smokeArtifactDirs";
 import http from "node:http";
 import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../../shared/src/types";
 import { stageWithRecipe } from "../index";
+import type { DraftCreatingStamp } from "../draftSubmitGate";
 import { draftTenantKey } from "../draftSubmitGate";
 
 delete process.env.PORTAL_ALLOW_FINAL_SUBMIT;
@@ -73,7 +76,8 @@ await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
 const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 const TENANT = draftTenantKey(base);
 
-const stamp = (tenantKey = TENANT) => ({ tenantKey, label: "Submit", healedAt: "2026-10-16T00:00:00.000Z" });
+// The backend's stamp for the run: the Submit is step index 4 of recipeFor(...).
+const stamp = (tenantKey = TENANT, stepIndex = 4): DraftCreatingStamp => ({ stepIndex, tenantKey, label: "Submit", healedAt: "2026-10-16T00:00:00.000Z" });
 const submitStep = (over: Partial<RecipeStep> = {}): RecipeStep => ({
   action: "click", selector: { css: "#btnSubmit", text: "Submit" }, note: "final submit | creates a draft, not the filing (#302)", ...over,
 } as RecipeStep);
@@ -91,14 +95,14 @@ const recipeFor = (mode: string, last: RecipeStep): PortalRecipe => ({
 
 let seq = 0;
 interface Outcome { r: Record<string, unknown>; posts: string[] }
-async function stage(mode: string, last: RecipeStep, opts: { env?: string; draftSubmitClick?: boolean; autoSubmit?: boolean; approve?: boolean } = {}): Promise<Outcome> {
+async function stage(mode: string, last: RecipeStep, opts: { env?: string; stamp?: DraftCreatingStamp | null; autoSubmit?: boolean; approve?: boolean } = {}): Promise<Outcome> {
   const prev = process.env.PORTAL_ALLOW_FINAL_SUBMIT;
   if (opts.env === undefined) delete process.env.PORTAL_ALLOW_FINAL_SUBMIT; else process.env.PORTAL_ALLOW_FINAL_SUBMIT = opts.env;
   const before = posts.length;
   try {
     const runId = `run-${mode}-${++seq}`;
     const r = await stageWithRecipe(recipeFor(mode, last), { id: `p-${mode}` } as ProjectRecord, {}, {}, [], {
-      headless: true, runId, draftSubmitClick: opts.draftSubmitClick !== false,
+      headless: true, runId, draftSubmitStamp: opts.stamp === undefined ? stamp() : opts.stamp,
       autoSubmit: opts.autoSubmit === true, runApproval: opts.approve ? { approver: "A. Operator", runId } : null,
     });
     await new Promise((res) => setTimeout(res, 300));
@@ -118,40 +122,41 @@ const incidentOf = (o: Outcome) => (o.r.draftSubmitUnexpected ?? null) as { verd
 
 try {
   {
-    const o = await stage("draft", submitStep({ draftCreatingSubmit: stamp() } as Partial<RecipeStep>));
+    const o = await stage("draft", submitStep());
     const d = draftOf(o);
     check("draft: the stamped Submit is clicked ONCE and the page reads as the draft it made", submits(o) === 1 && d?.applicationNumber === "NEM-90017" && d?.nextForm === "Interconnection Application - Part 2", brief(o));
     check("draft: nothing reads as filed — finalSubmitClicked false, no record number, the run staged ok", o.r.finalSubmitClicked === false && !o.r.capturedPermitNumber && !o.r.capturedConfirmationNumber && o.r.ok === true && !o.r.pauseReason, brief(o));
     check("draft: the draft carries the tenant it was made on and the label clicked", d?.tenantKey === TENANT && d?.clickedLabel === "Submit", brief(o));
   }
   {
-    const o = await stage("draftApproved", submitStep({ draftCreatingSubmit: stamp() } as Partial<RecipeStep>), { env: "1", autoSubmit: true, approve: true });
+    const o = await stage("draftApproved", submitStep(), { env: "1", autoSubmit: true, approve: true });
     check("draftApproved: the switch, autoSubmit and an approval change nothing — one click, a draft, never a filing", submits(o) === 1 && draftOf(o)?.applicationNumber === "NEM-90017" && o.r.finalSubmitClicked === false, brief(o));
   }
   {
-    const o = await stage("neverHealed", submitStep(), { env: "1", autoSubmit: true, approve: true });
-    check("neverHealed: a Submit never healed is never clicked (switch on, autoSubmit, approval: 0 POSTs)", submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
+    const forged = submitStep({ draftCreatingSubmit: { tenantKey: TENANT, label: "Submit", healedAt: "2026-10-16T00:00:00.000Z" } } as unknown as Partial<RecipeStep>);
+    const o = await stage("neverHealed", forged, { env: "1", autoSubmit: true, approve: true, stamp: null });
+    check("neverHealed: no stamp for the run, never clicked — switch on, autoSubmit, approval and a stamp field forged on the step (0 POSTs)", submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
   }
   {
-    const o = await stage("otherTenant", submitStep({ draftCreatingSubmit: stamp("another-utility.powerclerk.example") } as Partial<RecipeStep>));
+    const o = await stage("otherTenant", submitStep(), { stamp: stamp("another-utility.powerclerk.example") });
     check("otherTenant: a stamp seen on another tenant is never clicked here (0 POSTs)", submits(o) === 0 && !draftOf(o), brief(o));
   }
   {
-    const o = await stage("notEnabled", submitStep({ draftCreatingSubmit: stamp() } as Partial<RecipeStep>), { draftSubmitClick: false });
-    check("notEnabled: a run the backend did not enable never clicks it (0 POSTs) and stops for a person", submits(o) === 0 && !draftOf(o) && /left for a person/.test(JSON.stringify(o.r.steps ?? "")), brief(o));
+    const o = await stage("stampMoved", submitStep(), { stamp: stamp(TENANT, 2) });
+    check("stampMoved: a stamp naming another step never clicks the Submit (0 POSTs)", submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
   }
   {
-    const o = await stage("flagged", submitStep({ isFinalSubmit: true, draftCreatingSubmit: stamp() } as Partial<RecipeStep>));
+    const o = await stage("flagged", submitStep({ isFinalSubmit: true }));
     check("flagged: a stamped step still flagged isFinalSubmit goes only to the final-submit gate, which refuses (0 POSTs)", submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
   }
   {
-    const o = await stage("receipt", submitStep({ draftCreatingSubmit: stamp() } as Partial<RecipeStep>));
+    const o = await stage("receipt", submitStep());
     check("receipt: a filing page after the click stops the run as the incident", submits(o) === 1 && o.r.pauseReason === "draft_submit_unexpected" && incidentOf(o)?.verdict === "filed", brief(o));
     check("receipt: the track does not read as filed — finalSubmitClicked false, no record number, no draft", o.r.finalSubmitClicked === false && !o.r.capturedPermitNumber && !o.r.capturedConfirmationNumber && !draftOf(o) && o.r.ok === false, brief(o));
     check("receipt: the run says the portal may have filed and a person must check", /MAY HAVE FILED/.test(msgOf(o.r)), brief(o));
   }
   {
-    const o = await stage("error", submitStep({ draftCreatingSubmit: stamp() } as Partial<RecipeStep>));
+    const o = await stage("error", submitStep());
     check("error: an error page after the click stops the run as the incident (not a draft)", submits(o) === 1 && o.r.pauseReason === "draft_submit_unexpected" && incidentOf(o)?.verdict === "not_a_draft" && o.r.finalSubmitClicked === false && !draftOf(o), brief(o));
   }
 } finally {

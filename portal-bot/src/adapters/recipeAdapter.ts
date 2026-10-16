@@ -5,7 +5,7 @@ import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, ok, fail, type PortalContext, 
 import { applyFormatHint } from "../formatHint";
 import { extractRecordNumber, pageConfirmsSubmission } from "../recordNumber";
 import { findSiteDraft, readDraftCreated } from "../draftCreated";
-import { draftCreatingClickRefusals, draftLabelKey, draftStampOf, draftStepLabel, draftTenantKey, readDraftAfterClick } from "../draftSubmitGate";
+import { completeStamp, draftCreatingClickRefusals, draftLabelKey, draftStepLabel, draftTenantKey, readDraftAfterClick, type DraftCreatingStamp } from "../draftSubmitGate";
 import { armHumanCaptureOnPage, HUMAN_SUBMIT_OBSERVED_NOTE } from "../humanCapture";
 import { feeBracketCoverage, feeBracketCoverageMessage, decideFeeTier, FEE_TIER_DC_FIELD, FEE_TIER_RATING_FIELD, kvaText, parseFeeBracketFieldKey, readTierLabel, sameFeeTier, TIER_UNIT_RE, type TierBoxOnPage } from "../feeBracketQuantity";
 
@@ -697,11 +697,13 @@ export class RecipeAdapter extends BasePortalAdapter {
        *  application, an unsubmitted draft already listed for this street stops the replay, named
        *  — a two-part portal made that draft at its Part 1 Submit, and a second one is a failure. */
       siteDraft?: { street?: string; city?: string; zip?: string; siblingAtSameStreet?: boolean };
-      /** THE REPLAY MAY CLICK A KNOWN DRAFT-CREATING SUBMIT ITSELF (#330). Set by the backend for the
-       *  NEM track's own recipe only; draftSubmitGate.draftCreatingClickRefusals decides each click,
-       *  and the page after it must read as draft-created. Not an approval to file: the final-submit
-       *  gate never reads it. */
-      draftSubmitClick?: boolean;
+      /** THE REPLAY MAY CLICK A KNOWN DRAFT-CREATING SUBMIT ITSELF (#330). The backend's server-owned
+       *  stamp (portalDraft.draftSubmitStampForReplay), passed only for the NEM track's own recipe and
+       *  only when these exact steps are the ones the draft was seen with; stepIndex is in these
+       *  (bound) steps. draftSubmitGate.draftCreatingClickRefusals decides each click, and the page
+       *  after it must read as draft-created. Not an approval to file: the final-submit gate never
+       *  reads it. */
+      draftSubmitStamp?: DraftCreatingStamp | null;
     } = {},
   ) {
     super();
@@ -1590,7 +1592,8 @@ export class RecipeAdapter extends BasePortalAdapter {
       }
 
       // A KNOWN DRAFT-CREATING SUBMIT (#330: PSE's Part 1). The recipe's last step was healed from a
-      // draft-created page (portalDraft.ts) and stamped with that tenant and label. Reached here — on
+      // draft-created page (portalDraft.ts) and the backend passed its server-owned stamp (tenant,
+      // label, step) for these exact steps. Reached here — on
       // that step, or on the stopForReview right in front of it — the replay clicks it ITSELF when
       // draftSubmitGate allows, then reads the page: a draft ends the run as staged-to-draft, anything
       // else stops it as an incident. Refused, it is today's stop: a person clicks it. No stamp, no
@@ -5584,13 +5587,14 @@ export class RecipeAdapter extends BasePortalAdapter {
   }
 
   /** THE STAMPED DRAFT-CREATING STEP this loop position reaches (#330), or -1: the recipe's last step
-   *  when it carries a draft-creating stamp — reached on itself, or on the plain stopForReview right
-   *  in front of it (the learner records the filing click behind one). Anything else: -1, and the
-   *  loop runs exactly as before. */
+   *  when the run's stamp names it — reached on itself, or on the plain stopForReview right in front
+   *  of it (the learner records the filing click behind one). Anything else: -1, and the loop runs
+   *  exactly as before. */
   private draftCreatingStepAt(i: number): number {
     const steps = this.recipe.steps;
     const last = steps.length - 1;
-    if (last < 0 || !draftStampOf(steps[last])) return -1;
+    const stamp = completeStamp(this.options.draftSubmitStamp);
+    if (last < 0 || !stamp || stamp.stepIndex !== last) return -1;
     if (i === last) return last;
     if (i === last - 1 && steps[i]?.action === "stopForReview" && !steps[i]?.outwardAction) return last;
     return -1;
@@ -5619,10 +5623,10 @@ export class RecipeAdapter extends BasePortalAdapter {
     const step = this.recipe.steps[idx];
     const urlNow = (): string => (this.page && typeof this.page.url === "function" ? String(this.page.url() ?? "") : "");
     const refusals = draftCreatingClickRefusals(this.recipe.steps, idx, {
-      pageUrl: urlNow(), enabled: this.options.draftSubmitClick === true, alreadyClicked: this.draftSubmitAttempted,
+      pageUrl: urlNow(), stamp: this.options.draftSubmitStamp ?? null, alreadyClicked: this.draftSubmitAttempted,
     });
     if (refusals.length) return { kind: "refused", refusals };
-    const stamp = draftStampOf(step)!;
+    const stamp = completeStamp(this.options.draftSubmitStamp)!;
     // READY, AS A PERSON WOULD CHECK BEFORE CLICKING: the page re-asserted and gap-filled, nothing
     // required left empty, no challenge on it, and the run's own pending save drained.
     await this.reassertBlanksOnce(false).catch(() => [] as string[]);

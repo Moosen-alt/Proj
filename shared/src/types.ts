@@ -3929,12 +3929,6 @@ export interface RecipeStep {
    *  flagged; they are always blocked regardless. Without this flag, autoSubmit
    *  safely stops at the review screen and never clicks final submit. */
   isFinalSubmit?: boolean;
-  /** A click SEEN to create only a draft (#302) on this tenant, stamped by the heal
-   *  (backend/src/portalDraft.ts) and never set with isFinalSubmit. The replay clicks it itself
-   *  only through portal-bot/src/draftSubmitGate.ts (#330): the stamp's tenant and label, the
-   *  recipe's last step, the NEM track's own recipe, and the page after the click must read as
-   *  draft-created. Never read by the final-submit gate. */
-  draftCreatingSubmit?: { tenantKey: string; label: string; healedAt: string };
   /** An OUTWARD action the step stands in front of, never replayed (#308): "request_signatures" is
    *  PowerClerk's Request Signatures, which emails the homeowner a DocuSign request. Recorded on a
    *  stopForReview marker, never on a click, and never isFinalSubmit (it files nothing). Only the
