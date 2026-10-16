@@ -614,18 +614,48 @@ export function verifyInfoPageCandidate(
 }
 
 /** What the audit keeps of a withdrawn pass (the row is gone): places, names and dates — never a
- *  hash of a value or the verifier (the withdrawal row may carry no project). */
-const passHistory = (r: Row): Record<string, unknown> => ({
-  origin: s(r.origin), path: s(r.path), controlLabel: s(r.control_label), controlName: s(r.control_name),
-  request: { method: s(r.request_method), where: s(r.request_where), media: s(r.request_media), fieldNames: parse<Array<[string, string]>>(r.request_body_json, []).map(([n]) => n) },
-  identitySha256Prefix: s(r.identity_sha256).slice(0, 12), verifiedAt: s(r.verified_at), sourceCandidateId: s(r.source_candidate_id),
-});
+ *  hash of a value or the verifier (the withdrawal row may carry no project).
+ *  RULE 6 (Helm's review of #349): WHICH candidate the pass came from and WHEN a person verified it
+ *  belong to the org of the project it was verified on. They ride only on an audit row written on a
+ *  project of THAT org; a row on another org's project, on no project, or where either org cannot be
+ *  read carries neither (the pass id still links it to the verification's own audit row). */
+const passHistory = (db: AppDb, r: Row, auditProjectId: string | null): Record<string, unknown> => {
+  let sameOrg = false;
+  try {
+    const src = db.get<{ project_id: string }>("SELECT project_id FROM portal_info_page_candidates WHERE id = ?", [s(r.source_candidate_id)]);
+    const srcOrg = src && s(src.project_id) ? projectOrgOf(db, s(src.project_id)) : null;
+    const auditOrg = auditProjectId ? projectOrgOf(db, auditProjectId) : null;
+    sameOrg = srcOrg !== null && auditOrg !== null && srcOrg === auditOrg;
+  } catch { sameOrg = false; }
+  return {
+    origin: s(r.origin), path: s(r.path), controlLabel: s(r.control_label), controlName: s(r.control_name),
+    request: { method: s(r.request_method), where: s(r.request_where), media: s(r.request_media), fieldNames: parse<Array<[string, string]>>(r.request_body_json, []).map(([n]) => n) },
+    identitySha256Prefix: s(r.identity_sha256).slice(0, 12),
+    ...(sameOrg ? { verifiedAt: s(r.verified_at), sourceCandidateId: s(r.source_candidate_id) } : {}),
+  };
+};
 
 /** THE ONE DELETE of a pass (every withdrawal goes through here), with its audit row. A run already
  *  in flight keeps the entries it started with (they are frozen per run). */
 function removeInfoPagePass(db: AppDb, r: Row, audit: { projectId: string | null; actorType: "human" | "system" | "portal_bot"; actor: string; action: string; details: Record<string, unknown> }): void {
+  // The history is read BEFORE the delete (it looks up the source candidate's project).
+  const history = passHistory(db, r, audit.projectId);
   db.run("DELETE FROM portal_info_page_passes WHERE id = ?", [s(r.id)]);
-  addAuditLog(db, audit.projectId, audit.actorType, audit.actor, audit.action, { passId: s(r.id), ...audit.details, pass: passHistory(r) });
+  addAuditLog(db, audit.projectId, audit.actorType, audit.actor, audit.action, { passId: s(r.id), ...audit.details, pass: history });
+}
+
+/** HELM'S REVIEW OF #349 — A NAMED PERSON, NOT AN AGENT: the extra test an information-page decision's
+ *  name must pass on top of feeConfirm.isConfirmingPerson (server.ts infoPagePerson asks both). At
+ *  least three letters, and never an agent's or the product's own name ("Claude", "auto-learn",
+ *  "bot", "system", "operator", "assistant", …): one verification relaxes rule 1's lockdown for every
+ *  tenant, so a name a script or an agent would type is refused (fail closed: a real person whose
+ *  whole name is one of these types their full name). */
+const AGENT_NAME = /^(?:claude(?:[\s_-]*(?:code|ai|agent|bot|opus|sonnet|haiku))?|anthropic|auto[\s_-]*(?:learn(?:er|ing)?|pilot|mation|matic)?|autopilot|portal[\s_-]*bot|bot|robot|system|operator|assistant|agent|ai|llm|gpt|chat[\s_-]*gpt|copilot|helm|worker(?:[\s_-]*[\p{L}\p{N}]+)?|network[\s_-]*backstop|backstop|script|admin|dashboard)$/iu;
+export function isInfoPageDeciderName(name: string): boolean {
+  const n = String(name ?? "").replace(/\s+/g, " ").trim();
+  if ((n.match(/\p{L}/gu) ?? []).length < 3) return false;
+  const bare = n.replace(/[^\p{L}\p{N}\s_-]/gu, " ").replace(/\s+/g, " ").trim();
+  return !AGENT_NAME.test(bare);
 }
 
 /** "Not an information page": the card leaves the open list and a re-capture never re-nags. */

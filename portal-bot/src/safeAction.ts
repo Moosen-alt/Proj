@@ -49,17 +49,20 @@ export function redactStatusText(text: string | null | undefined): string | null
   return masked.slice(0, MAX_STATUS_SNIPPET);
 }
 
-// Redact page text kept in a DIAGNOSTIC CAPTURE (a replay failure / review-miss file): every run
-// of 6+ digits (account, meter, phone, parcel) masked to its last 4, every email address masked.
-// Unlike redactStatusText it keeps the text's length budget large (a capture is read by a person
-// debugging a page), and it never returns null. Idempotent.
+// Redact page text kept in a DIAGNOSTIC CAPTURE (a replay failure / review-miss file, an information
+// page's candidate evidence): every run of 6+ digits (account, meter, phone, parcel) masked to its
+// last 4, every 5-digit run masked WHOLE (Helm's review of #349: a 5-digit account number was left
+// in clear — and its last 4 would be 80% of it), every email address masked. A run of 4 or fewer
+// digits (a year, a house number) is kept. Unlike redactStatusText it keeps the text's length budget
+// large (a capture is read by a person debugging a page), and it never returns null. Idempotent.
 export function redactCaptureText(text: string | null | undefined, max = 6000): string {
   const t = String(text ?? "");
   return t
     .replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g, "[email]")
-    .replace(/\d[\d\s().-]{4,}\d/g, (m) => {
+    .replace(/\d[\d\s().-]{3,}\d/g, (m) => {
       const digits = m.replace(/\D/g, "");
-      return digits.length >= 6 ? maskId(digits) : m;
+      if (digits.length >= 6) return maskId(digits);
+      return digits.length === 5 ? "*****" : m;
     })
     .slice(0, max);
 }

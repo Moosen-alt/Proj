@@ -67,6 +67,38 @@ createCustomer(seed, { name: "Demo Lead", clientId: demo.id } as never);
 const statusCheckId = String(seed.get<{ id: string }>("SELECT id FROM permit_status_checks WHERE project_id = ?", [demoProject.id])?.id ?? "");
 check("setup: the demo project has a status check that references its tracking target (the FK the old reset tripped)",
   Boolean(targetId && statusCheckId) && Boolean(seed.get("SELECT 1 FROM permit_status_checks WHERE id = ? AND target_id = ?", [statusCheckId, targetId])));
+// #344 (Helm's review of #349): a VERIFIED INFORMATION PAGE on the demo project — a candidate a learn
+// recorded and a person's verification of it (the real write paths). The pass row carries no
+// project_id, so the schema-derived sweep alone deleted the candidate and left the pass dangling.
+const { recordInfoPageCandidate, verifyInfoPageCandidate } = await import("../src/infoPages");
+const { INFO_PAGE_IDENTITY_VERSION, digestInfoPageIdentity, infoPageEvidence, infoPagePrefixOf } = await import("../../shared/src/infoPagePass");
+const IP_ORIGIN = "https://permits.example.test";
+const ipMaterial = {
+  version: INFO_PAGE_IDENTITY_VERSION,
+  page: { origin: IP_ORIGIN, path: "/permits/sfjsp", query: [] },
+  title: "Demo Reset Info Page",
+  structure: {
+    headings: [["1", "Demo Reset Info Page"]],
+    forms: [{ id: "smartguide_ApplyForAPermit", name: "", method: "post", enctype: "multipart/form-data", action: `${IP_ORIGIN}/permits/sfjsp`, target: "", elements: [["button", "submit", "t_p1", null], ["button", "submit", "t_n1", null]] }],
+    fillable: [], clickables: [["button", "submit", "t_p1", 0, ""], ["button", "submit", "t_n1", 0, ""]], frames: [],
+  },
+  facts: { fileInputsInForm: 0, customFormElements: 0, summaryOutsideChrome: 0, summaryInForm: 0, controlLabels: ["Previous", "Next"], hiddenNames: [], masked: 0, baseTarget: "" },
+  text: "Demo Reset Info Page Permitting Information This is a permit request only. A Permit Tech will review your submission. Previous Next",
+  control: { tag: "button", type: "submit", name: "t_n1", value: "", label: "Next", formIndex: 0, submitterIndex: 1, method: "post", action: `${IP_ORIGIN}/permits/sfjsp`, enctype: "multipart/form-data", target: "" },
+  request: { method: "POST", url: `${IP_ORIGIN}/permits/sfjsp`, media: "multipart/form-data", body: [["t_n1", ""]] },
+} as Parameters<typeof digestInfoPageIdentity>[0];
+const ipDigest = digestInfoPageIdentity(ipMaterial);
+const ipCand = recordInfoPageCandidate(seed, demoProject.id, "demo-reset-learn", {
+  identityVersion: ipDigest.version, identitySha256: ipDigest.identitySha256, origin: ipDigest.origin, path: ipDigest.path, controlLabel: ipDigest.control.label,
+  digest: ipDigest,
+  prefix: infoPagePrefixOf([{ action: "goto", note: "entry url", value: `${IP_ORIGIN}/permits/sfjsp?interviewID=Home` }, { action: "click", note: "application entry: Apply For A Permit" }, { action: "click", note: "permit type: Solar Permit Request" }]),
+  observed: { method: "POST", where: ipDigest.expected.where, actionUrlSha: ipDigest.expected.actionUrlSha, media: ipDigest.expected.media, body: ipDigest.expected.body, hasFilenamePart: false },
+  evidence: infoPageEvidence(ipMaterial),
+  screenshotBase64: Buffer.from("89504e470d0a1a0a0000000d4948445200000001000000010806000000", "hex").toString("base64"),
+});
+const demoPassId = ipCand ? verifyInfoPageCandidate(seed, demoProject.id, ipCand.id, { identitySha256: ipDigest.identitySha256, verifiedBy: "Pat Verifier", userId: "" }).passId : "";
+check("setup (#344): the demo project carries a verified information page — its candidate and the pass a person's verify wrote",
+  !!demoPassId && Boolean(seed.get("SELECT 1 FROM portal_info_page_passes WHERE id = ? AND source_candidate_id = ?", [demoPassId, ipCand?.id ?? ""])));
 seed.backupTo(path.join(root, "seeded.sqlite"));
 seed.close();
 
@@ -81,6 +113,8 @@ const counts = async (dbPath: string): Promise<Record<string, number>> => {
     demoChecks: n("SELECT COUNT(*) AS n FROM permit_status_checks WHERE project_id = ?", demoProject.id),
     demoQc: n("SELECT COUNT(*) AS n FROM qc_results WHERE project_id = ?", demoProject.id),
     demoCustomers: n("SELECT COUNT(*) AS n FROM customers WHERE client_id = ?", demo.id),
+    demoInfoCandidates: n("SELECT COUNT(*) AS n FROM portal_info_page_candidates WHERE project_id = ?", demoProject.id),
+    demoInfoPass: n("SELECT COUNT(*) AS n FROM portal_info_page_passes WHERE id = ?", demoPassId),
     otherClient: n("SELECT COUNT(*) AS n FROM clients WHERE id = ?", other.id),
     otherProjects: n("SELECT COUNT(*) AS n FROM projects WHERE id = ?", otherProject.id),
     otherQc: n("SELECT COUNT(*) AS n FROM qc_results WHERE project_id = ?", otherProject.id),
@@ -108,6 +142,9 @@ const runReset = (dbPath: string) => spawnSync(process.execPath, [TSX_CLI, SCRIP
     JSON.stringify(after));
   check("1c. MUST EXCLUDE: the other company's client, project and QC rows are untouched",
     after.otherClient === 1 && after.otherProjects === 1 && after.otherQc === before.otherQc, JSON.stringify(after));
+  check("1d. (#344) the verified information page goes with the demo: its candidate AND the pass verified on it (no dangling pass)",
+    before.demoInfoCandidates === 1 && before.demoInfoPass === 1 && after.demoInfoCandidates === 0 && after.demoInfoPass === 0,
+    `before=${JSON.stringify(before)} after=${JSON.stringify(after)}`);
 }
 
 // ---- 2. a reference it cannot clear rolls the WHOLE reset back -----------------------------

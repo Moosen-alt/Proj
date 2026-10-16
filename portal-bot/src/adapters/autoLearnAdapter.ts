@@ -8946,13 +8946,26 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     try { take = typeof door.takeInfoPageCandidate === "function" ? door.takeInfoPageCandidate() : null; } catch { take = null; }
     if (take) {
       const scrub = (s: string): string => redactCaptureText(this.scrubSecrets(s), 20_000);
+      // Helm's review of #349: the digest's LABELS are page text too — every button's label
+      // (shape.controlLabels) and the forward control's (shape.controlLabel, control.label) — and are
+      // kept in the candidate's digest_json: scrubbed exactly as the evidence text is. (A label that
+      // scrubbing changed then never matches the live page: fail closed. "Next" is unchanged.)
+      const digest = {
+        ...take.digest,
+        control: { ...take.digest.control, label: scrub(String(take.digest.control.label ?? "")) },
+        shape: {
+          ...take.digest.shape,
+          controlLabel: scrub(String(take.digest.shape.controlLabel ?? "")),
+          controlLabels: (Array.isArray(take.digest.shape.controlLabels) ? take.digest.shape.controlLabels : []).map((l) => scrub(String(l ?? ""))),
+        },
+      };
       const capture: InfoPageCandidateCapture = {
         identityVersion: take.digest.version,
         identitySha256: take.digest.identitySha256,
         origin: take.digest.origin,
         path: take.digest.path,
         controlLabel: scrub(take.digest.control.label).slice(0, 80),
-        digest: take.digest,
+        digest,
         prefix: take.prefix.map((s) => [s[0], s[1], s[2]] as [string, string, string]),
         observed: take.observed,
         evidence: infoPageEvidence(take.material, scrub),

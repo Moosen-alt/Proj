@@ -3033,7 +3033,9 @@ app.post("/api/projects/:id/structural-letter/withdraw", asyncHandler(async (req
 //     127.0.0.1 / localhost:<port> — a DNS-rebinding page cannot pose as the dashboard.
 //   - A NAMED PERSON: the session user when auth is on (a body name is ignored), else the typed
 //     name; either must pass feeConfirm.isConfirmingPerson ("operator" / "admin" / "bot" are not
-//     people). A sibling of structuralLetterPerson (whose texts stay untouched).
+//     people) AND infoPages.isInfoPageDeciderName (Helm's review of #349: at least three letters,
+//     never an agent's name — "Claude", "auto-learn", "system" …). A sibling of
+//     structuralLetterPerson (whose texts stay untouched).
 //   - WHO MAY (critique [7]): with auth on, verify and withdraw need ROLE_SUPERADMIN (the platform
 //     operator); an org admin may dismiss its own project's candidate (requireAdmin + the scope guard).
 // The project routes sit under /api/projects/:id (the scope guard answers 404 for another org's
@@ -3051,13 +3053,16 @@ function requireSameOriginMutation(req: Request): void {
     throw new HttpError(403, "With no login, this decision is taken only on this machine's own address (127.0.0.1 / localhost).");
   }
 }
-function infoPagePerson(req: Request, typed: unknown, isConfirmingPerson: (n: string) => boolean, what: string): { name: string; userId: string } {
+async function infoPagePerson(req: Request, typed: unknown, what: string): Promise<{ name: string; userId: string }> {
+  const { isConfirmingPerson } = await import("./feeConfirm");
+  const { isInfoPageDeciderName } = await import("./infoPages");
+  const isPerson = (n: string): boolean => isConfirmingPerson(n) && isInfoPageDeciderName(n);
   const user = currentUser(db, req);
   if (AUTH_ENABLED && !user) throw new HttpError(401, `Sign in to ${what}.`);
   const name = AUTH_ENABLED
-    ? String((user?.name && isConfirmingPerson(user.name) ? user.name : user?.email) || "").trim()
+    ? String((user?.name && isPerson(user.name) ? user.name : user?.email) || "").trim()
     : String(typed || "").trim().slice(0, 120);
-  if (!isConfirmingPerson(name)) throw new HttpError(400, `A named person must ${what} — type your name.`);
+  if (!isPerson(name)) throw new HttpError(400, `A named person must ${what} — type your full name (at least three letters; an agent's or the product's own name is not a person).`);
   return { name, userId: user?.id ?? "" };
 }
 function requireSuperadminWhenSignedIn(req: Request, what: string): void {
@@ -3091,11 +3096,10 @@ app.get("/api/projects/:id/info-page-candidates", asyncHandler(async (req, res) 
 app.post("/api/projects/:id/info-page-allow-once-more", asyncHandler(async (req, res) => {
   requireSameOriginMutation(req);
   requireSuperadminWhenSignedIn(req, "allow a verified information page once more");
-  const { isConfirmingPerson } = await import("./feeConfirm");
   const { allowInfoPagePassOnceMore, listInfoPageCandidates, listInfoPageProjectState, listInfoPageFilingWarnings } = await import("./infoPages");
   const pid = infoPageProjectId(req);
   const scope = String(req.body?.scope || "");
-  const who = infoPagePerson(req, req.body?.allowedBy, isConfirmingPerson, "allow a verified information page once more");
+  const who = await infoPagePerson(req, req.body?.allowedBy, "allow a verified information page once more");
   allowInfoPagePassOnceMore(db, pid, scope, { by: who.name, userId: who.userId });
   res.json({ candidates: listInfoPageCandidates(db, pid), projectState: listInfoPageProjectState(db, pid), filingWarnings: listInfoPageFilingWarnings(db, pid) });
 }));
@@ -3110,24 +3114,22 @@ app.get("/api/projects/:id/info-page-candidates/:cid/screenshot", asyncHandler(a
 app.post("/api/projects/:id/info-page-candidates/:cid/verify", asyncHandler(async (req, res) => {
   requireSameOriginMutation(req);
   requireSuperadminWhenSignedIn(req, "verify an information page");
-  const { isConfirmingPerson } = await import("./feeConfirm");
   const { verifyInfoPageCandidate, listInfoPageCandidates } = await import("./infoPages");
   const pid = infoPageProjectId(req);
   const cid = infoPageCandidateId(req);
   const identitySha256 = String(req.body?.identitySha256 || "").trim().toLowerCase();
   if (!/^[0-9a-f]{64}$/.test(identitySha256)) throw new HttpError(400, "identitySha256 (the card's page identity) is required.");
-  const who = infoPagePerson(req, req.body?.verifiedBy, isConfirmingPerson, "verify an information page");
+  const who = await infoPagePerson(req, req.body?.verifiedBy, "verify an information page");
   const out = verifyInfoPageCandidate(db, pid, cid, { identitySha256, verifiedBy: who.name, userId: who.userId });
   res.json({ passId: out.passId, candidates: listInfoPageCandidates(db, pid) });
 }));
 app.post("/api/projects/:id/info-page-candidates/:cid/dismiss", asyncHandler(async (req, res) => {
   requireSameOriginMutation(req);
   requireAdmin(req);
-  const { isConfirmingPerson } = await import("./feeConfirm");
   const { dismissInfoPageCandidate, listInfoPageCandidates } = await import("./infoPages");
   const pid = infoPageProjectId(req);
   const cid = infoPageCandidateId(req);
-  const who = infoPagePerson(req, req.body?.dismissedBy, isConfirmingPerson, "dismiss an information page candidate");
+  const who = await infoPagePerson(req, req.body?.dismissedBy, "dismiss an information page candidate");
   dismissInfoPageCandidate(db, pid, cid, { dismissedBy: who.name, userId: who.userId });
   res.json({ candidates: listInfoPageCandidates(db, pid) });
 }));
@@ -3140,13 +3142,12 @@ app.get("/api/info-page-passes", asyncHandler(async (req, res) => {
 app.post("/api/info-page-passes/:passId/withdraw", asyncHandler(async (req, res) => {
   requireSameOriginMutation(req);
   requireSuperadminWhenSignedIn(req, "withdraw a verified information page");
-  const { isConfirmingPerson } = await import("./feeConfirm");
   const { withdrawInfoPagePass, listInfoPagePasses } = await import("./infoPages");
   const passId = String(req.params.passId || "");
   if (!UUIDISH.test(passId)) throw new HttpError(404, "Verified information page not found.");
   const reason = String(req.body?.reason || "").trim();
   if (!reason || reason.length > 200) throw new HttpError(400, "A reason (up to 200 characters) is required to withdraw a verified page.");
-  const who = infoPagePerson(req, req.body?.withdrawnBy, isConfirmingPerson, "withdraw a verified information page");
+  const who = await infoPagePerson(req, req.body?.withdrawnBy, "withdraw a verified information page");
   withdrawInfoPagePass(db, passId, { by: who.name, userId: who.userId, reason });
   res.json({ passes: listInfoPagePasses(db) });
 }));

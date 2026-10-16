@@ -868,6 +868,35 @@ await check("round 4 (rule 6, X1_xorg): an incident on ANOTHER ORG's project put
   assert.deepEqual(IP.listInfoPagePassFilingWarnings(db, null).find((x) => x.passId === passId)?.projects.map((p) => p.id).sort(), [A, B].sort());
   x1 = { A, B, A2, B2, passId, passId2 };
 });
+await check("Helm's review of #349 (rule 6): a withdrawal's audit row keeps WHICH candidate and WHEN a person verified only on a project of the verifying project's org — never on another org's project, never on a project-less row", async () => {
+  // Verified on org-default; the incident is reported on org-b's project.
+  const { passId } = await verifiedPage("Xorg History Page");
+  const B = orgBProject("Sam Orgb", "999 Orgb Way");
+  scripted = [incidentOn(passId, ["the page after the click shows no application form"])];
+  await runLearn(B);
+  const row = fx.audits("portal.info_page_pass_incident").find((x) => JSON.parse(x.details).passId === passId);
+  assert.ok(row, "the incident row");
+  assert.equal(row!.project_id, B);
+  const pass = JSON.parse(row!.details).pass;
+  assert.equal(pass.origin, ORIGIN, "the shared place is kept");
+  assert.ok(!("sourceCandidateId" in pass) && !("verifiedAt" in pass), `org-b's row carries org-default's candidate / verification time: ${JSON.stringify(pass)}`);
+  // The positive control: the same incident on another project of the verifying org keeps both.
+  const { P: P2, passId: passId2 } = await verifiedPage("Same Org History Page");
+  const C = fx.newProject();
+  scripted = [incidentOn(passId2, ["the page after the click shows no application form"])];
+  await runLearn(C);
+  const row2 = fx.audits("portal.info_page_pass_incident").find((x) => JSON.parse(x.details).passId === passId2);
+  const pass2 = JSON.parse(row2!.details).pass;
+  assert.equal(pass2.sourceCandidateId, String(cand(P2)[0].id), JSON.stringify(pass2));
+  assert.ok(String(pass2.verifiedAt).length > 0, JSON.stringify(pass2));
+  // A person's withdrawal (no project): neither.
+  const { passId: passId3 } = await verifiedPage("Projectless History Page");
+  IP.withdrawInfoPagePass(db, passId3, { by: "Wren Withdrawer", userId: "", reason: "the page changed" });
+  const row3 = fx.audits("portal.info_page_pass_withdrawn").find((x) => JSON.parse(x.details).passId === passId3);
+  assert.equal(row3!.project_id, null);
+  const pass3 = JSON.parse(row3!.details).pass;
+  assert.ok(!("sourceCandidateId" in pass3) && !("verifiedAt" in pass3), JSON.stringify(pass3));
+});
 await check("round 4 (rule 6, defense in depth): a may-have-filed row that carries incident text but no stamp of THIS project's org (a round-3 row, or one stamped for another org) is read back GENERIC — on the card and in the KB entry's time and label", async () => {
   const P = fx.newProject();
   for (const [i, org] of [[1, ""], [2, "org-b"]] as const) {
@@ -1062,6 +1091,12 @@ await check("Helm's review of #349: the reservation enforces AT MOST ONCE PER PR
   assert.deepEqual(IP.reserveInfoPagePassUse(db, Q, "", "ahj", { passId, where: sfjsp }), [], "allowed once more: reserves");
   assert.deepEqual(IP.reserveInfoPagePassUse(db, Q, "", "ahj", { passId, where: sfjsp }), [IP.INFO_PAGE_ALREADY_USED_REFUSAL], "and only once");
 });
+await check("Helm's review of #349: a decision's name is a PERSON's — three letters or more, never an agent's or the product's own name; a real name that merely contains one passes", () => {
+  for (const n of ["Pat Synthetic", "Joe", "Claude Dupont", "Al Smith", "María José", "jo@solar.example", "Botha Nkosi"]) assert.ok(IP.isInfoPageDeciderName(n), `refused a person: ${n}`);
+  for (const n of ["ab", "Al", "J. K.", "Claude", "claude-code", "Claude Opus", "auto-learn", "AutoLearn", "auto learner", "bot", "Robot", "SYSTEM", "operator", "assistant", "agent", "AI", "LLM", "helm", "worker-local", "network backstop", "admin"]) {
+    assert.ok(!IP.isInfoPageDeciderName(n), `accepted an agent / too short a name: ${n}`);
+  }
+});
 
 // ── ROUTES ───────────────────────────────────────────────────────────────────────────────────────
 // Everything the routes need is written now; the in-process handle closes before a server opens it.
@@ -1193,8 +1228,8 @@ const readDb = async <T>(fn: (d: typeof db) => T): Promise<T> => {
       const r = await call(PORT, "POST", verifyUrl, { body: { identitySha256: routeIdentity, verifiedBy: "Pat Synthetic" }, headers: { host: `rebind.example:${PORT}`, origin: `http://rebind.example:${PORT}`, "sec-fetch-site": "same-origin" } });
       assert.equal(r.status, 403, r.text);
     });
-    await check("auth off: no name, a blank one, 'operator', 'admin' or 'bot' is a 400", async () => {
-      for (const n of [undefined, "  ", "operator", "admin", "bot"]) {
+    await check("auth off: no name, a blank one, 'operator', 'admin' or 'bot' is a 400 — and (Helm's review of #349) a name under three letters or an agent's name", async () => {
+      for (const n of [undefined, "  ", "operator", "admin", "bot", "ab", "J.", "Claude", "claude code", "CLAUDE (AI)", "auto-learn", "Auto Learn", "autolearn", "System", "assistant", "worker-local", "helm"]) {
         const r = await call(PORT, "POST", verifyUrl, { body: { identitySha256: routeIdentity, verifiedBy: n }, headers: same });
         assert.equal(r.status, 400, `${n}: ${r.text}`);
       }
