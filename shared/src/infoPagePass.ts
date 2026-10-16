@@ -939,9 +939,31 @@ export interface InfoPageProofStep {
 /** THE ONE NORMALIZER of a proof value (round 4): case, whitespace and punctuation dropped
  *  ("(503) 555-0199" = "5035550199"; "101 Solar Way" = "101 SOLAR WAY."), accents folded. Used for
  *  the job's own values (infoPageJobValues) and the value a control holds (infoPageProofStepRefusals)
- *  alike — one question, one predicate. */
+ *  alike — one question, one predicate.
+ *  ROUND 5 — DIGIT GROUPS NEVER MERGE ACROSS A DECIMAL POINT OR A COMMA (infoPageProofNumber): a
+ *  digits-only mask that turns the job's 6.5 into 65 holds another number, never the job's value.
+ *  A number compares AS A NUMBER: "6.5" = "6.50", "6.0" = "6", "6.5" ≠ "65", "3.2" ≠ "32",
+ *  "1.0" ≠ "10". US thousands grouping (a comma followed by exactly three digits, repeated, before
+ *  any decimal point) is one number: "1,200" = "1200", "12,500.75" = "12500.75". Any other comma
+ *  between digits is KEPT ("1,20" ≠ "120", "3,2" ≠ "32", "3,2" ≠ "3.2": a European decimal is never
+ *  guessed — at worst a false stop). Spaces, hyphens, slashes and parentheses between digits still
+ *  merge (a phone's formatting, a mask's grouping). */
 export function infoPageProofNorm(v: unknown): string {
-  return String(v ?? "").normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  return String(v ?? "").normalize("NFKD").replace(/[̀-ͯ]/g, "").toLowerCase()
+    .replace(/(\d+(?:[.,]\d+)+)|[^a-z0-9]/g, (_m, num?: string) => (num ? infoPageProofNumber(num) : ""));
+}
+
+/** ROUND 5: one run of digits joined by decimal points / commas, as the proof compares it (see
+ *  infoPageProofNorm): US thousands grouping collapses; a plain decimal loses its fraction's trailing
+ *  zeros and its integer part's leading zeros (6.50 → 6.5, 06.5 → 6.5, 6.0 → 6); anything else keeps
+ *  its separators, so its digit groups never merge. */
+function infoPageProofNumber(t: string): string {
+  const n = /^\d{1,3}(?:,\d{3})+(?:\.\d+)?$/.test(t) ? t.replace(/,/g, "") : t;
+  const m = /^(\d+)\.(\d+)$/.exec(n);
+  if (!m) return n;
+  const int = m[1].replace(/^0+(?=\d)/, "");
+  const frac = m[2].replace(/0+$/, "");
+  return frac ? `${int}.${frac}` : int;
 }
 
 /** The incident's reason when no such step was recorded before the run left the page or ended. */
@@ -1070,17 +1092,22 @@ export const INFO_PAGE_PASS_MAX_AGE_DAYS = 30;
 export const INFO_PAGE_PASS_MAX_PROJECTS = 10;
 /** The phrase the card and the run message carry. */
 export const INFO_PAGE_PASS_EXPIRED = "verification expired — a person re-verifies";
+/** ROUND 5 — CLOCK SKEW: a verification time further in the future than this is unreadable (expired). */
+export const INFO_PAGE_PASS_CLOCK_SKEW_MS = 5 * 60_000;
 
 /**
  * WHY THIS VERIFICATION IS NO LONGER AUTHORITY (empty = within both limits). `projectsUsed` is the
  * number of distinct projects the use ledger shows it admitted; `nowMs` the clock. An unreadable
- * verification time or count is expired: an unknown never reassures. The wording names the limit
- * reached, never the count (the count spans tenants).
+ * verification time or count is expired: an unknown never reassures — and (round 5) so is a
+ * verification time more than INFO_PAGE_PASS_CLOCK_SKEW_MS in the FUTURE (a skewed clock or a forged
+ * time would otherwise never age). The wording names the limit reached, never the count (the count
+ * spans tenants).
  */
 export function infoPagePassExpiryRefusals(verifiedAt: string | null | undefined, projectsUsed: number | null | undefined, nowMs: number = Date.now()): string[] {
   const out: string[] = [];
   const at = Date.parse(String(verifiedAt ?? ""));
   if (!Number.isFinite(at)) out.push(`${INFO_PAGE_PASS_EXPIRED} (when it was verified could not be read)`);
+  else if (at - nowMs > INFO_PAGE_PASS_CLOCK_SKEW_MS) out.push(`${INFO_PAGE_PASS_EXPIRED} (it reads as verified in the future: the clock cannot be trusted)`);
   else if (nowMs - at > INFO_PAGE_PASS_MAX_AGE_DAYS * 86_400_000) out.push(`${INFO_PAGE_PASS_EXPIRED} (a verification is authority for ${INFO_PAGE_PASS_MAX_AGE_DAYS} days; this one is older)`);
   const n = Number(projectsUsed);
   if (projectsUsed === null || projectsUsed === undefined || !Number.isFinite(n) || n < 0) out.push(`${INFO_PAGE_PASS_EXPIRED} (how many projects used it could not be read)`);

@@ -29,7 +29,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, INFO_PAGE_NO_PROGRESS, INFO_PAGE_PASS_EXPIRED, INFO_PAGE_PASS_MAX_AGE_DAYS, INFO_PAGE_PASS_MAX_PROJECTS, digestInfoPageIdentity, infoPageAfterClickSentWording, infoPageJobValueKeys, infoPageJobValues, infoPagePassExpiryRefusals, infoPageProofNorm, infoPageLabeledCodes, infoPageProofOfProgressRefusals, infoPageProofStepRefusals, infoPageAfterClickRefusals, infoPageBackstopRefusals, infoPageDriftedEntries, infoPageEvidence, infoPageMatchRefusals,
+  INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, INFO_PAGE_NO_PROGRESS, INFO_PAGE_PASS_CLOCK_SKEW_MS, INFO_PAGE_PASS_EXPIRED, INFO_PAGE_PASS_MAX_AGE_DAYS, INFO_PAGE_PASS_MAX_PROJECTS, digestInfoPageIdentity, infoPageAfterClickSentWording, infoPageJobValueKeys, infoPageJobValues, infoPagePassExpiryRefusals, infoPageProofNorm, infoPageLabeledCodes, infoPageProofOfProgressRefusals, infoPageProofStepRefusals, infoPageAfterClickRefusals, infoPageBackstopRefusals, infoPageDriftedEntries, infoPageEvidence, infoPageMatchRefusals,
   infoPageNumberTokens, infoPageObservedRequest, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageRunStateRefusals,
   infoPageShapeRefusals, infoPageVerifyWarnings, isMatchClassRefusal, mayPassInfoPage, parseFormBodyFields, verifiedInfoPageFromCandidate,
   type InfoPageBackstopState, type InfoPageIdentityMaterial, type InfoPagePassContext, type InfoPageProofStep, type InfoPageRunState, type InfoPageRunStep,
@@ -428,6 +428,26 @@ console.log("\nPROOF OF PROGRESS (round 3): the page after the click must take T
   check("round 4: the comparison ignores case, spaces and punctuation ('(503) 555-0199' held as '5035550199'; '1 TEST ST.')",
     infoPageProofStepRefusals({ ...ok, field: "homeownerPhone", value: "(503) 555-0199", held: "5035550199" }, KEYS).length === 0 && infoPageProofStepRefusals({ ...ok, held: " 1 TEST ST. " }, KEYS).length === 0);
   check("round 4: one normalizer — infoPageProofNorm folds case, accents, spaces and punctuation", infoPageProofNorm(" José  O'Neil-Smith, Jr. ") === "joseoneilsmithjr" && infoPageProofNorm(null) === "");
+  // ROUND 5 (R1_decimal) — DIGIT GROUPS NEVER MERGE across a decimal point or a comma; a number
+  // compares as a number. Pairs: [a, b, equal?].
+  const numberPairs: Array<[string, string, boolean]> = [
+    ["6.5", "65", false], ["3.2", "32", false], ["8.6", "86", false], ["1.0", "10", false],
+    ["6.5", "6.50", true], ["6.0", "6", true], ["06.5", "6.5", true], ["6.5 kW", "6.50kw", true],
+    ["1,200", "1200", true], ["12,500.75", "12500.75", true], ["1,200.50", "1200.5", true],
+    ["1,20", "120", false], ["3,2", "32", false], ["3,2", "3.2", false], ["1,2000", "12000", false],
+    ["(503) 555-0199", "5035550199", true], ["101 Solar Way.", "101 SOLAR WAY", true], ["0199", "199", false],
+  ];
+  for (const [a, b, eq] of numberPairs) {
+    check(`round 5: infoPageProofNorm("${a}") ${eq ? "=" : "≠"} infoPageProofNorm("${b}")`, (infoPageProofNorm(a) === infoPageProofNorm(b)) === eq, `${infoPageProofNorm(a)} vs ${infoPageProofNorm(b)}`);
+  }
+  check("round 5 (R1_decimal): a digits-only mask turned the job's 8.6 kW into 86 — the control holds ANOTHER number, never the proof",
+    infoPageProofStepRefusals({ ...ok, field: "systemSizeDcKw", value: "8.6", held: "86" }, KEYS).some((x) => /does not hold this job's own value/.test(x)), JSON.stringify(infoPageProofStepRefusals({ ...ok, field: "systemSizeDcKw", value: "8.6", held: "86" }, KEYS)));
+  check("round 5: …a planner that typed 32 for a job value of 3.2 is no proof either",
+    infoPageProofStepRefusals({ ...ok, field: "deadLoad", value: "32", held: "32" }, { ...KEYS, deadLoad: "3.2" }).some((x) => /does not hold this job's own value/.test(x)));
+  check("round 5 (positive control): the same number written another way IS the job's value (8.60 held for 8.6; 1,200 held for 1200)",
+    infoPageProofStepRefusals({ ...ok, field: "systemSizeDcKw", value: "8.6", held: "8.60" }, KEYS).length === 0
+    && infoPageProofStepRefusals({ ...ok, field: "roofArea", value: "1200", held: "1,200" }, { ...KEYS, roofArea: "1200" }).length === 0,
+    JSON.stringify(infoPageProofStepRefusals({ ...ok, field: "systemSizeDcKw", value: "8.6", held: "8.60" }, KEYS)));
   const notProof: Array<[string, InfoPageProofStep, RegExp]> = [
     ["round 4 (N4_wrongval): a job key BOUND but other text typed — the control holds 'Question about my request', not the project name", { ...ok, field: "projectName", value: "Question about my request", held: "Question about my request" }, /does not hold this job's own value/],
     ["round 4 (N5_clear): the job's street typed, but the control CLEARED it", { ...ok, held: "" }, /does not hold this job's own value .*holds nothing/],
@@ -499,6 +519,13 @@ console.log("\nEXPIRY (round 4): a verification is authority for 30 days and at 
   check("round 4: an unreadable time or count is expired (an unknown never reassures)",
     infoPagePassExpiryRefusals("not a date", 0, now).length > 0 && infoPagePassExpiryRefusals(new Date(now).toISOString(), null, now).length > 0 && infoPagePassExpiryRefusals(new Date(now).toISOString(), Number.NaN, now).length > 0);
   check("round 4: the card's phrase", INFO_PAGE_PASS_EXPIRED === "verification expired — a person re-verifies");
+  // ROUND 5 — CLOCK SKEW: a verification time in the FUTURE never ages, so beyond a small tolerance
+  // (INFO_PAGE_PASS_CLOCK_SKEW_MS, 5 minutes) it is expired.
+  check("round 5: the clock-skew tolerance is 5 minutes, in ONE place", INFO_PAGE_PASS_CLOCK_SKEW_MS === 5 * 60_000);
+  check("round 5 (clock skew): verified 4 minutes in the future is live (within the tolerance)", infoPagePassExpiryRefusals(new Date(now + 4 * 60_000).toISOString(), 0, now).length === 0);
+  check("round 5 (clock skew): verified 6 minutes, 3 days or 400 days in the FUTURE is EXPIRED, and says so",
+    [6 * 60_000, 3 * day, 400 * day].every((ahead) => infoPagePassExpiryRefusals(new Date(now + ahead).toISOString(), 0, now).some((x) => x.startsWith(INFO_PAGE_PASS_EXPIRED) && /future/.test(x))),
+    JSON.stringify(infoPagePassExpiryRefusals(new Date(now + 6 * 60_000).toISOString(), 0, now)));
 }
 
 // ---------------------------------------------------------------------------------------------
