@@ -50,6 +50,10 @@
 //   ROUND 5 — r1_decimal (verification round 4's R1_decimal): a digits-only Subject turns the job's
 //   bound 6.5 (acKw) into 65 — another number, never the proof: an incident. Every admitted walk's use
 //   is RESERVED at the admission (reserveInfoPagePass, asked by the backstop) before it is reported.
+//   ROUND 6 (Helm's review, blocker 1) — b1_autoproc / b1_newapp / b1_fetchapp: the page the verified
+//   click led to sends its own POST (an auto-submit at +422 ms, a hidden second form, a fetch) while
+//   the after-click reading is still running. The proof hold is armed AT THE ADMISSION, so each is
+//   held (nothing reaches the server) and the walk is the incident; the pass is reported for withdrawal.
 //   ROUND 2, AT MOST ONCE PER PROJECT — progress: the backend says this project already made progress
 //   on this portal; the exact verified page is held as on main and the run names it (infoPageHeldVerified).
 //   Every admitted walk reports its use AT ONCE through onInfoPagePassed.
@@ -261,6 +265,19 @@ const AFTER: Record<string, () => string> = {
   // planner takes 10 s; the proof is armed about 1.5 s after load): the proof hold holds it, nothing reaches the server.
   autopost: () => shell({ title: "Project Information", action: `${P}/sg2`, content: TWO_FIELDS, nav: NEXT_SG2,
     script: `<script>setTimeout(function () { document.getElementById('smartguide_ApplyForAPermit').submit(); }, 6000);</script>` }),
+  // ROUND 6 (Helm's review, blocker 1) — the page the verified click led to sends its OWN state-changing
+  // request BEFORE the after-click reading returns (the proof hold used to be armed only then: the
+  // next document ran unheld for 2.8-8.3 s). The hold is now armed AT THE ADMISSION, so each is held
+  // from the next document's first byte, and the walk is the incident:
+  //   b1_autoproc — the genuine-looking form auto-submits itself to /process 422 ms after load;
+  //   b1_newapp   — a hidden SECOND form (outside the SmartGuide form) posts /newapp 300 ms after load;
+  //   b1_fetchapp — a fetch POST /api/applications 400 ms after load.
+  b1_autoproc: () => shell({ title: "Project Information", action: `${P}/process`, content: TWO_FIELDS, nav: NEXT_SG2,
+    script: `<script>setTimeout(function () { document.getElementById('smartguide_ApplyForAPermit').submit(); }, 422);</script>` }),
+  b1_newapp: () => receipt("Project Information", TWO_FIELDS, "",
+    `<form id="newapp" method="post" action="${P}/newapp" style="display:none"><input type="hidden" name="kind" value="solar"></form><script>setTimeout(function () { document.getElementById('newapp').submit(); }, 300);</script>`, NEXT_SG2),
+  b1_fetchapp: () => receipt("Project Information", TWO_FIELDS, "", HEADER_SEARCH, NEXT_SG2).replace("</body>",
+    `<script>setTimeout(function () { fetch('${P}/api/applications', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ type: 'solar' }) }).catch(function () { return null; }); }, 400);</script></body>`),
   // ROUND 4 — round 3's verifier's B1 shapes and the G_pqaspx asymmetry: every content rule passes
   // each; the planner BINDS a job key in every one — only the value check / the chrome rule catch them.
   //   n4_wrongval — the note form; the planner binds projectName / workDescription but TYPES other
@@ -452,7 +469,10 @@ const ROUND4: Record<string, RegExp> = { n4_wrongval: NO_PROGRESS, n5_clear: NO_
 // Round 5: verification round 4's R1_decimal — the job's 6.5, held as 65 by a digits-only mask: the
 // control holds another number, so there is no proof — an incident after ONE project.
 const ROUND5: Record<string, RegExp> = { r1_decimal: NO_PROGRESS };
-const AFTER_MODES = ["receipt", "filed", "review", "error", "same", "blank", ...Object.keys(ROUND2), ...Object.keys(ROUND3), ...Object.keys(ROUND4), ...Object.keys(ROUND5)];
+// Round 6 (Helm's blocker 1): the next page's own request, fired before the after-click reading
+// returned — the URL it went to (held: it must never reach the server).
+const HELM_B1: Record<string, string> = { b1_autoproc: `${P}/process`, b1_newapp: `${P}/newapp`, b1_fetchapp: `${P}/api/applications` };
+const AFTER_MODES = ["receipt", "filed", "review", "error", "same", "blank", ...Object.keys(ROUND2), ...Object.keys(ROUND3), ...Object.keys(ROUND4), ...Object.keys(ROUND5), ...Object.keys(HELM_B1)];
 const results: Record<string, Walk> = {};
 const queue: Array<[string, string]> = [...AFTER_MODES.map((m) => [m, "structural"] as [string, string]), ["form", "structural"], ["pq_list_bound", "structural"], ["progress", "structural"], ["drift", "structural"], ["tileb", "structural"]];
 await Promise.all(Array.from({ length: 4 }, async () => {
@@ -500,6 +520,19 @@ for (const mode of AFTER_MODES) {
   const w = results.autopost;
   check("after [autopost] (round 3): the page's OWN form POST, fired while the run had entered none of the job's data, is HELD by the proof hold — nothing reached the server",
     !w.hits.some((h) => h.method !== "GET" && h.url.startsWith(`${P}/sg2`)) && /PROOF OF PROGRESS/.test(w.message), JSON.stringify({ posts: posts(w), message: w.message.slice(-400) }));
+}
+for (const [mode, sent] of Object.entries(HELM_B1)) {
+  // ROUND 6 (Helm's blocker 1): the hold is armed AT THE ADMISSION, so the next page's own request —
+  // fired while the after-click reading was still running — is held from the document's first byte.
+  // Kill check: with the hold armed only after checkInfoPageAfterClick returns (cc9eafeb), each of
+  // these reached the server.
+  const w = results[mode];
+  const held = `BACKSTOP ABORTED POST ${base}${sent} (`;
+  const at = w.message.indexOf(held);
+  const named = at >= 0 && /^BACKSTOP ABORTED POST \S+ \(\w+\): REVIEW-PAGE LOCKDOWN — PROOF OF PROGRESS/.test(w.message.slice(at, at + 240));
+  check(`after [${mode}] (round 6, Helm B1): the next page's own request, fired before the after-click reading returned, was HELD by the proof hold — it never reached the server`,
+    !w.hits.some((h) => h.method !== "GET" && h.url.split("?")[0] === sent) && named,
+    JSON.stringify({ posts: posts(w), message: w.message.slice(-500) }));
 }
 
 {

@@ -643,7 +643,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // PROOF OF PROGRESS (round 3): armed when the page a verified click led to passed the after-click
   // reading; until the learner proves it entered this job's own data there, nothing state-changing
   // but the run's own writes passes (the hold in the handler, rule 3b).
-  let infoProof: { page: unknown; entryId: string; state: "pending" | "proved" | "left" } | null = null;
+  let infoProof: { page: unknown; entryId: string; state: "pending" | "proved" | "left"; checked: boolean } | null = null;
   const ownWriteOn = (pg: unknown): boolean => !!pg && [...ownWrites.values()].some((w) => w.page === pg);
   const infoSlotLive = (): boolean => !!infoSlot && infoSlot.open && Date.now() < infoSlot.until;
   const infoWatchLive = (): boolean => !!infoWatch && infoWatch.open && Date.now() < infoWatch.until;
@@ -748,7 +748,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       // the run proved it entered this job's data there — the proof can no longer be given on that
       // page (state "left"; the hold stays). The run's own write in flight on it (a cascading select
       // that reloads) is not leaving.
-      if (method === "GET" && infoProof && infoProof.state === "pending") {
+      if (method === "GET" && infoProof && infoProof.state === "pending" && infoProof.checked) {
         try {
           const pg = pageOfRequest(request);
           if (request.isNavigationRequest() && pg && pg === infoProof.page && request.frame() === pg.mainFrame() && !ownWriteOn(pg)) infoProof.state = "left";
@@ -921,6 +921,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
           infoPageAdmissions.push({ entryId: infoAdmit.entryId, where: whereOf(url), exempted: true });
           admittedEntryIds.push(infoAdmit.entryId);
           infoAfterBaseline = { entryId: infoAdmit.entryId, tokens: [...infoAdmit.tokens] };
+          // F1 FIX: the proof hold (3b) is ARMED AT THE ADMISSION — the next document's own requests
+          // are held from its first byte, not only after checkInfoPageAfterClick returns.
+          infoProof = { page: pg, entryId: infoAdmit.entryId, state: "pending", checked: false };
           await route.fallback().catch(() => null);
           return;
         }
@@ -1161,7 +1164,8 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       if (refusals.length) bs.lockReview(`the page after a verified information page did not read as an unfiled form (${refusals[0].slice(0, 60)})`);
       // PROOF OF PROGRESS (round 3): a page that reads as an unfiled form must now TAKE this job's
       // data before anything leaves it — the hold (rule 3b) is armed on it until the learner proves it.
-      else infoProof = { page: p, entryId: baseline ? baseline.entryId : "", state: "pending" };
+      else if (infoProof && infoProof.page === p && !infoProof.checked) infoProof.checked = true;
+      else infoProof = { page: p, entryId: baseline ? baseline.entryId : "", state: "pending", checked: true };
       return { ok: refusals.length === 0, refusals };
     },
     infoPageProofGiven() {
