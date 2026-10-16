@@ -512,6 +512,7 @@ async function loadProjects() {
   await fetchProjectPage(false);
   await loadKnowledgeBase();
   await loadPortalRecipes();
+  await loadInfoPagePasses();
   await loadAhjForms();
   await loadSignatures();
   await loadEmailTracker();
@@ -7796,6 +7797,147 @@ function renderCorrections() {
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// HUMAN-VERIFIED INFORMATION PAGES (#344, owner ruling 2026-10-15: option B). A learn the network
+// backstop held at an information page (rule 4b: the page's own words read as review; nothing had
+// been entered) offers that EXACT page here. A named person who marks it "an information page — OK
+// to advance" lets later runs pass that one page's forward request — only that page, only before
+// anything is entered on the run. The server re-checks every refusal; the button is disabled while
+// any applies. Everything shown is portal text: esc() all of it.
+// ---------------------------------------------------------------------------------------------
+function infoPageCandidateCardsHtml(candidates, projectId) {
+  const list = Array.isArray(candidates) ? candidates : [];
+  const open = list.filter((c) => c && c.status === "open");
+  const decided = list.filter((c) => c && c.status !== "open").slice(0, 5);
+  const li = (items) => items.map((x) => `<li>${esc(x)}</li>`).join("");
+  const cards = open.map((c) => {
+    const req = c.request || {};
+    const ev = c.evidence || {};
+    const refusals = Array.isArray(c.refusals) ? c.refusals : [];
+    const warnings = Array.isArray(c.warnings) ? c.warnings : [];
+    const shot = c.hasScreenshot
+      ? `<img src="/api/projects/${esc(encodeURIComponent(projectId))}/info-page-candidates/${esc(encodeURIComponent(c.id))}/screenshot" alt="The page as the run saw it (masked)" style="max-width:100%;border:1px solid var(--line, #ddd);margin:6px 0" loading="lazy">`
+      : `<p class="muted">No screenshot: re-run the learn so the page can be seen before it is verified.</p>`;
+    const forms = (Array.isArray(ev.forms) ? ev.forms : []).map((f) => `${esc(String(f.method || "").toUpperCase())} ${esc(f.actionWhere)} · ${esc(f.enctype)} · fields: ${esc((Array.isArray(f.fields) ? f.fields : []).map((x) => x[2] || `(${x[0]})`).join(", ") || "none")}`);
+    const headings = (Array.isArray(ev.headings) ? ev.headings : []).map((h) => `h${esc(h[0])}: ${esc(h[1])}`);
+    const frames = (Array.isArray(ev.frames) ? ev.frames : []).map((f) => `${esc(f[0])} ${esc(f[1])}`);
+    return `
+    <article class="item warning" data-info-candidate="${esc(c.id)}">
+      <div class="item-title"><span>Information page to verify</span><span class="badge warning">held by the network backstop</span></div>
+      <p>The run stopped at <strong>${esc(c.origin)}${esc(c.path)}</strong>${(c.queryKeys || []).length ? ` (query keys: ${esc(c.queryKeys.join(", "))})` : ""}: its <strong>${esc(c.controlLabel)}</strong> was held because the page's own words read as review. Nothing was sent.</p>
+      <p class="muted" style="font-size:12px">Held request: ${esc(req.method)} ${esc(req.where)} · ${esc(req.media)} · fields: ${esc((req.fieldNames || []).join(", ") || "none")} · seen ${esc(String(c.seenCount || 1))} time(s), first ${esc(String(c.firstSeenAt || "").slice(0, 10))}, last ${esc(String(c.lastSeenAt || "").slice(0, 10))}</p>
+      ${shot}
+      <details class="fold"><summary>The page's text, headings and forms</summary>
+        <pre style="white-space:pre-wrap;max-height:240px;overflow:auto;font-size:12px">${esc(ev.text || "")}</pre>
+        ${headings.length ? `<p class="muted" style="font-size:12px">Headings: ${headings.join(" · ")}</p>` : ""}
+        ${forms.length ? `<p class="muted" style="font-size:12px">Forms: ${forms.join(" | ")}</p>` : ""}
+        ${frames.length ? `<p class="muted" style="font-size:12px">Frames: ${frames.join(" · ")}</p>` : ""}
+      </details>
+      ${warnings.length ? `<p style="font-size:12px;margin:6px 0 2px"><strong>Look twice:</strong></p><ul style="font-size:12px;margin:0">${li(warnings)}</ul>` : ""}
+      ${refusals.length ? `<p style="font-size:12px;margin:6px 0 2px"><strong>Cannot be marked:</strong></p><ul style="font-size:12px;margin:0">${li(refusals)}</ul>` : ""}
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button data-info-verify="${esc(c.id)}" data-identity="${esc(c.identitySha256)}" data-label="${esc(c.controlLabel)}"${refusals.length ? " disabled" : ""}>This is an information page — OK to advance</button>
+        <button class="secondary" data-info-dismiss="${esc(c.id)}">Not an information page</button>
+      </div>
+      <p class="muted" style="font-size:11px;margin-top:4px">Marking it lets automation press "${esc(c.controlLabel)}" on exactly this page, for every client, only on a run that has entered nothing. It never applies after a field is filled, on a resumed draft or signature, or if anything on the page changes.</p>
+    </article>`;
+  }).join("");
+  const done = decided.map((c) => `<p class="muted" style="font-size:12px">Information page ${esc(c.origin)}${esc(c.path)}: ${c.status === "verified" ? "verified" : "marked not an information page"} by ${esc(c.decidedBy || "a person")} ${esc(String(c.decidedAt || "").slice(0, 10))}.</p>`).join("");
+  return cards + done;
+}
+
+async function loadInfoPageCandidates(projectId) {
+  const wrap = $("infoPageCandidates");
+  if (!wrap || !projectId) return;
+  let data;
+  try { data = await api(`/api/projects/${encodeURIComponent(projectId)}/info-page-candidates`); } catch { return; }
+  if (state.selectedProjectId !== projectId || !$("infoPageCandidates")) return;
+  $("infoPageCandidates").innerHTML = infoPageCandidateCardsHtml(data.candidates, projectId);
+  bindInfoPageCandidateButtons(projectId);
+}
+
+function bindInfoPageCandidateButtons(projectId) {
+  document.querySelectorAll("#infoPageCandidates button[data-info-verify]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const auth = await authForDecision();
+      const lede = `Automation will press "${button.dataset.label}" on exactly this page, for every client, only on a run that has entered nothing. It never applies after a field is filled, on a resumed draft or signature, or if anything on the page changes.\n\nMark it an information page — OK to advance?`;
+      const name = namedPersonConsent(auth, lede, "verified this information page", "an information page is verified by a named person");
+      if (name === null) return;
+      button.disabled = true;
+      try {
+        await api(`/api/projects/${encodeURIComponent(projectId)}/info-page-candidates/${encodeURIComponent(button.dataset.infoVerify)}/verify`,
+          { method: "POST", body: JSON.stringify({ identitySha256: button.dataset.identity, verifiedBy: name }) });
+        showMessage("Verified. The next run passes this exact page — only this page, and only before anything is entered.");
+        loadInfoPageCandidates(projectId);
+      } catch (err) {
+        showMessage(err.message, "error");
+        button.disabled = false;
+      }
+    });
+  });
+  document.querySelectorAll("#infoPageCandidates button[data-info-dismiss]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const auth = await authForDecision();
+      const name = namedPersonConsent(auth, "Mark this page NOT an information page? Runs keep stopping there, and it is not offered again.", "dismissed this information page", "a candidate is dismissed by a named person");
+      if (name === null) return;
+      button.disabled = true;
+      try {
+        await api(`/api/projects/${encodeURIComponent(projectId)}/info-page-candidates/${encodeURIComponent(button.dataset.infoDismiss)}/dismiss`,
+          { method: "POST", body: JSON.stringify({ dismissedBy: name }) });
+        loadInfoPageCandidates(projectId);
+      } catch (err) {
+        showMessage(err.message, "error");
+        button.disabled = false;
+      }
+    });
+  });
+}
+
+// The shared list (Knowledge modal): where each verified page lives, its control, its request's
+// field NAMES, when it was verified, and whether it was withdrawn — never its text or a hash.
+function infoPagePassRowsHtml(passes) {
+  const list = Array.isArray(passes) ? passes : [];
+  if (!list.length) return `<p class="muted">No information page has been verified. A run held at one offers it on the project's Portal runs.</p>`;
+  return list.map((p) => {
+    const req = p.request || {};
+    const live = p.status === "live";
+    return `
+    <article class="item ${live ? "info" : ""}">
+      <div class="item-title"><span>${esc(p.origin)}${esc(p.path)}</span><span class="badge">${live ? "live" : "withdrawn"}</span></div>
+      <p class="muted" style="font-size:12px">Control: <strong>${esc(p.controlLabel)}</strong> (${esc(p.controlName)}) · request ${esc(req.method)} ${esc(req.where)} · ${esc(req.media)} · fields: ${esc((req.fieldNames || []).join(", ") || "none")} · identity ${esc(p.identityPrefix)}…</p>
+      <p class="muted" style="font-size:12px">Verified ${esc(String(p.verifiedAt || "").slice(0, 10))}${live ? "" : ` · withdrawn ${esc(String(p.withdrawnAt || "").slice(0, 10))}: ${esc(p.withdrawReason)}`}</p>
+      ${live ? `<button class="secondary" data-info-withdraw="${esc(p.id)}" style="font-size:12px">Withdraw</button>` : ""}
+    </article>`;
+  }).join("");
+}
+
+async function loadInfoPagePasses() {
+  const wrap = $("infoPagePasses");
+  if (!wrap) return;
+  let data;
+  try { data = await api("/api/info-page-passes"); } catch (err) { wrap.innerHTML = `<p class="muted">${esc(err.message)}</p>`; return; }
+  const passes = data.passes || [];
+  wrap.innerHTML = infoPagePassRowsHtml(passes);
+  if ($("infoPagePassesCount")) $("infoPagePassesCount").textContent = `${passes.filter((p) => p.status === "live").length} live`;
+  wrap.querySelectorAll("button[data-info-withdraw]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const auth = await authForDecision();
+      const name = namedPersonConsent(auth, "Withdraw this verified information page? Runs that START after this stop at the page again. A run already in progress keeps the pass it started with.", "withdrew this verified page", "a pass is withdrawn by a named person");
+      if (name === null) return;
+      const reason = String(window.prompt("Why is it withdrawn? (required, up to 200 characters)", "") || "").trim();
+      if (!reason) { showMessage("A reason is required to withdraw a verified page.", "warning"); return; }
+      button.disabled = true;
+      try {
+        await api(`/api/info-page-passes/${encodeURIComponent(button.dataset.infoWithdraw)}/withdraw`, { method: "POST", body: JSON.stringify({ withdrawnBy: name, reason: reason.slice(0, 200) }) });
+        loadInfoPagePasses();
+      } catch (err) {
+        showMessage(err.message, "error");
+        button.disabled = false;
+      }
+    });
+  });
+}
+
 function renderPortalRuns() {
   const runs = state.detail.portalRuns || [];
   const awaiting = runs.find((run) => run.status === "awaiting_human_submit");
@@ -7848,7 +7990,10 @@ function renderPortalRuns() {
   const prevFold = $("portalRuns").querySelector("details.runs-fold");
   const foldWasOpen = !!(prevFold && prevFold.open && $("portalRuns").dataset.projectId === (state.selectedProjectId || ""));
   if (pinnedWrap) {
-    pinnedWrap.innerHTML = pinned.map(runCard).join("");
+    // #344: the project's information pages waiting for a person go first (filled by
+    // loadInfoPageCandidates below; empty — and invisible — when there are none).
+    pinnedWrap.innerHTML = `<div id="infoPageCandidates" class="stack"></div>${pinned.map(runCard).join("")}`;
+    loadInfoPageCandidates(state.selectedProjectId);
     $("portalRuns").innerHTML = !runs.length
       ? `<p class="muted">No portal runs yet.</p>`
       : earlier.length
@@ -9394,6 +9539,7 @@ function openKnowledgeModal() {
   $("knowledgeModal").hidden = false;
   loadKnowledgeBase();
   loadPortalRecipes();
+  loadInfoPagePasses();
   if (window.lucide) window.lucide.createIcons();
 }
 function closeKnowledgeModal() { $("knowledgeModal").hidden = true; }
