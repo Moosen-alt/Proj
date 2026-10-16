@@ -61,6 +61,11 @@
 //   proof, the one way off the page is its own main-frame form back to the verified request's
 //   origin + path) holds their post elsewhere. pq_list_bound is caught by both. The positive control
 //   (form) now posts its Next back to the interview's own endpoint, as DevHub's SmartGuide does.
+//   ROUND 7 (worker-local's V6 on Helm's fixes) — AUTOPOSTBACK: V6_apb_else / V6_apb_change_else are
+//   q4_noack_other with its Site Address posting its own form (oninput +150 ms / onchange) while the
+//   run's fill is inside its own-write window. That window exempts the run's background writes only
+//   (fetch / XHR — the positive control's autosave still passes): the DOCUMENT POST is held by the
+//   proof hold, nothing reaches the server, the walk is the incident.
 //   ROUND 2, AT MOST ONCE PER PROJECT — progress: the backend says this project already made progress
 //   on this portal; the exact verified page is held as on main and the run names it (infoPageHeldVerified).
 //   Every admitted walk reports its use AT ONCE through onInfoPagePassed.
@@ -195,6 +200,8 @@ const receipt = (title: string, body: string, inForm = "", header = "", nav = ""
   const html = shell({ title, content: `${body}${inForm}`, nav });
   return header ? html.replace("<body class=\"\">", `<body class="">${header}`) : html;
 };
+// q4_noack_other's Site Address as it is; the V6 AutoPostBack shapes swap it for one that posts its form.
+const APB_PLAIN_ADDR = `<input id="aa" name="addr" type="text">`;
 const AFTER: Record<string, () => string> = {
   receipt: () => plain("Request Received", `<h1>Request received</h1><p>Your application has been submitted. Confirmation number: PR-2026-00042.</p>`),
   filed: () => plain("My Requests", `<h1>My Requests</h1><form action="${P}/search" method="get"><label for="q">Search</label><input id="q" name="q" type="text"></form><p>Your request was received and is with a Permit Tech.</p>`),
@@ -253,6 +260,13 @@ const AFTER: Record<string, () => string> = {
   zzc_inqueue: () => plain("Success", `<main><h1>Success</h1><p>Request accepted. Status: In queue.</p><form method="post" action="${P}/contact"><label for="c1">Site Address</label> <input id="c1" name="site" type="text"><br><label for="c2">ZIP</label> <input id="c2" name="zip" type="text"><br><button type="submit" name="go">Continue</button></form></main>`),
   q4_noack_other: () => plain("Next steps", `<main><h1>Next steps</h1><p>Your solar request is now with the city.</p><h2>Details for the inspector</h2><form method="post" action="${P}/another"><label for="aa">Site Address</label> <input id="aa" name="addr" type="text"><br><label for="ap">City</label> <input id="ap" name="city" type="text"><br><button type="submit" name="go">Next</button></form></main>`),
   q4_noack_more: () => receipt("Nice work", `<p>A Permit Tech has it. Optional details:</p>`, TWO_FIELDS, HEADER_SEARCH, `<button type="submit" name="t_more" formaction="${P}/more" class="btn btn-primary ms-auto">Next</button>`),
+  // ROUND 7 (worker-local's V6 on Helm's fixes) — AUTOPOSTBACK: q4_noack_other's plain-worded receipt
+  // (no acknowledgement wording: the after-click reading passes it), its Site Address an ASP.NET
+  // AutoPostBack — the input posts its OWN form (/another, the job's street in it) while the run's
+  // fill is still inside its own-write window: 150 ms after the input event (V6_apb_else), or on the
+  // change event (V6_apb_change_else). The own-write window used to exempt that DOCUMENT POST.
+  V6_apb_else: () => AFTER.q4_noack_other().replace(APB_PLAIN_ADDR, `<input id="aa" name="addr" type="text" oninput="var f = this.form; setTimeout(function () { f.submit(); }, 150);">`),
+  V6_apb_change_else: () => AFTER.q4_noack_other().replace(APB_PLAIN_ADDR, `<input id="aa" name="addr" type="text" onchange="this.form.submit();">`),
   // ROUND 3 — round 2's verifier's B0 / B1 shapes (each passed round 2's after-click check).
   n1_aspx_nonum: () => aspx("Request sent", `<h1>Request sent</h1><p>Your solar permit request was sent to the City on 10/16/2026. A Permit Tech will email you within 5 business days.</p>`, EMAIL_COPY),
   n2_aspx_shortnum: () => aspx("Request sent", `<h1>Thank you</h1><p>Your request number 4471 was sent to a Permit Tech for intake on 10/16/2026.</p>`, EMAIL_COPY),
@@ -382,6 +396,9 @@ const PLANS: Record<string, (req: LearnPlanRequest) => Promise<LearnPlanResponse
   zzc_inqueue: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St", field: "street" }, { selectorIndex: fieldIdx(req, "ZIP"), value: "62701", field: "zip" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Continue") }),
   q4_noack_other: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St", field: "street" }, { selectorIndex: fieldIdx(req, "City"), value: "Springfield", field: "city" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
   q4_noack_more: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St", field: "street" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
+  // Round 7 (V6): q4_noack_other's plan — the job's street and city, bound, then Next.
+  V6_apb_else: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St", field: "street" }, { selectorIndex: fieldIdx(req, "City"), value: "Springfield", field: "city" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
+  V6_apb_change_else: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St", field: "street" }, { selectorIndex: fieldIdx(req, "City"), value: "Springfield", field: "city" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
   form_nofill: (req) => ({ fills: [], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
   form_literal: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
   form_company: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "(555) 010-0000", field: "installerPhone" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
@@ -504,7 +521,11 @@ const HELM_B1: Record<string, string> = { b1_autoproc: `${P}/process`, b1_newapp
 // account's list (pq_list_bound, round 4's stated residual) is now SAME INTERVIEW's too.
 const STRAYED = /somewhere other than the interview's own form/;
 const ROUND6: Record<string, RegExp> = { zzc_another: /acknowledgement/, zzc_more: /acknowledgement/, zzc_inqueue: /acknowledgement/, q4_noack_other: STRAYED, q4_noack_more: STRAYED, pq_list_bound: /acknowledgement|somewhere other than the interview's own form/ };
-const AFTER_MODES = ["receipt", "filed", "review", "error", "same", "blank", ...Object.keys(ROUND2), ...Object.keys(ROUND3), ...Object.keys(ROUND4), ...Object.keys(ROUND5), ...Object.keys(HELM_B1), ...Object.keys(ROUND6)];
+// Round 7 (worker-local's V6 on Helm's fixes): an AutoPostBack — the receipt's own form, posted by its
+// input's oninput / onchange during the run's fill — the URL it went to (held: it must never reach the
+// server; the own-write window exempts the run's background writes only, never a document request).
+const HELM_V6: Record<string, string> = { V6_apb_else: `${P}/another`, V6_apb_change_else: `${P}/another` };
+const AFTER_MODES = ["receipt", "filed", "review", "error", "same", "blank", ...Object.keys(ROUND2), ...Object.keys(ROUND3), ...Object.keys(ROUND4), ...Object.keys(ROUND5), ...Object.keys(HELM_B1), ...Object.keys(ROUND6), ...Object.keys(HELM_V6)];
 const results: Record<string, Walk> = {};
 const queue: Array<[string, string]> = [...AFTER_MODES.map((m) => [m, "structural"] as [string, string]), ["form", "structural"], ["progress", "structural"], ["drift", "structural"], ["tileb", "structural"]];
 await Promise.all(Array.from({ length: 4 }, async () => {
@@ -570,6 +591,22 @@ for (const [mode, sent] of Object.entries(HELM_B1)) {
   check(`after [${mode}] (round 6, Helm B1): the next page's own request, fired before the after-click reading returned, was HELD by the proof hold — it never reached the server`,
     !w.hits.some((h) => h.method !== "GET" && h.url.split("?")[0] === sent) && named,
     JSON.stringify({ posts: posts(w), message: w.message.slice(-500) }));
+}
+check("premise (round 7, V6): each AutoPostBack shape is q4_noack_other with its Site Address posting the form (oninput after 150 ms / onchange)",
+  /oninput="var f = this\.form; setTimeout\(function \(\) \{ f\.submit\(\); \}, 150\);"/.test(AFTER.V6_apb_else()) && /onchange="this\.form\.submit\(\);"/.test(AFTER.V6_apb_change_else())
+  && AFTER.V6_apb_else().replace(/ oninput="[^"]*"/, "") === AFTER.q4_noack_other() && AFTER.V6_apb_change_else().replace(/ onchange="[^"]*"/, "") === AFTER.q4_noack_other());
+for (const [mode, sent] of Object.entries(HELM_V6)) {
+  // ROUND 7 (worker-local's V6_apb_else / V6_apb_change_else): the receipt's own form, posted by its
+  // input's AutoPostBack while the run's fill of the job's street is inside its own-write window, is a
+  // DOCUMENT request — the window exempts only the run's background writes (fetch / XHR), so it is
+  // held exactly as with no window open: nothing reaches the server, the walk is the incident, the pass
+  // is reported for withdrawal. Kill check: with the window exempting every request (96cb22fa), the
+  // POST reached the server with the job's street.
+  const w = results[mode];
+  const held = `BACKSTOP ABORTED POST ${base}${sent} (document): REVIEW-PAGE LOCKDOWN — PROOF OF PROGRESS`;
+  check(`after [${mode}] (round 7, V6 AutoPostBack): the receipt's own form, posted by its input during the run's fill, was HELD as a document request by the proof hold — it never reached the server`,
+    !w.hits.some((h) => h.method !== "GET" && h.url.split("?")[0] === sent) && w.message.includes(held),
+    JSON.stringify({ posts: posts(w), message: w.message.slice(-600) }));
 }
 
 {

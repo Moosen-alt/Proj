@@ -56,8 +56,9 @@
 //      run's incident — it stops, the pass is withdrawn.
 //      PROOF OF PROGRESS (round 3, structural: it reads no wording). A page that passed that
 //      reading is then HELD: no state-changing request from any page passes — but the run's own
-//      writes (an open own-write window or drain on the requesting page) — until the learner has
-//      recorded a fill / select / check bound to THIS JOB'S own data there and says so
+//      background writes (a non-document request such as a fetch / XHR in an open own-write window,
+//      or a drain's same-origin fetch / XHR, on the requesting page; a document request in that
+//      window — an AutoPostBack — is held like any other) — until the learner has recorded a fill / select / check bound to THIS JOB'S own data there and says so
 //      (infoPageProofGiven). Leaving that page's document by a GET navigation first makes the proof
 //      impossible (state "left": the hold stays). A held document request or filing URL stops the
 //      run (as 4b's do); the learner then reports the incident (the run never entered the job's data
@@ -846,17 +847,23 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     }
     // 3b. PROOF OF PROGRESS (#344 round 3): after a verified information page's click led to a page
     // that read as an unfiled form, NOTHING state-changing passes until the run has entered this
-    // job's own data on that page (infoPageProofGiven) — but the run's own writes there: an open
-    // own-write window on the requesting page (a fill's autosave), or a drain's same-origin fetch /
-    // XHR. A document request (a form submit: the run or the page leaving it) or a filing URL held
-    // here stops the run (isStoppingAbort, as 4b's do); a background call is held and reported.
+    // job's own data on that page (infoPageProofGiven) — but the run's own writes there: a background
+    // (non-document) request such as a fetch / XHR in an open own-write window on the requesting page
+    // (a fill's autosave), or a drain's same-origin fetch / XHR. A document request (a form submit: the
+    // run or the page leaving it) or a filing URL held here stops the run (isStoppingAbort, as 4b's do); a background call is held and reported.
     // Never lifted by anything but the proof; the approved final-submit slot is never open on such a
     // run (it never opens after an information-page pass, and vice versa).
+    // AUTOPOSTBACK (worker-local's V6_apb_else / V6_apb_change_else): the own-write window covers the
+    // run's own BACKGROUND writes only (fetch / XHR — a field's autosave). A DOCUMENT request (resource
+    // type document, or any navigation) in the window is the page posting a form — an ASP.NET
+    // AutoPostBack's oninput / onchange "this.form.submit()" sends the receipt's form with the job's
+    // street — never the write's own commit: it is judged exactly as with no window open (held here).
     if (!approved && infoProof && infoProof.state !== "proved" && infoProof.state !== "continued") {
       const pg = pageOfRequest(request);
       let navigation = true;
       try { navigation = !!request.isNavigationRequest(); } catch { /* unknown: a navigation */ }
-      let ownWrite = ownWriteOn(pg);
+      const documentRequest = navigation || /^document$/i.test(resourceType);
+      let ownWrite = !documentRequest && ownWriteOn(pg);
       if (!ownWrite && pg && !navigation && /^(xhr|fetch)$/i.test(resourceType) && [...drains.values()].some((d) => d.page === pg)) {
         let pageUrl = "";
         try { pageUrl = typeof pg.url === "function" ? String(pg.url() || "") : ""; } catch { pageUrl = ""; }
@@ -874,12 +881,15 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     // (origin + path): the interview continuing. A receipt's "start another request", "tell us more",
     // contact or list-filter form posts elsewhere — that is not the next step of THIS application, so
     // it stops the run (state "strayed": the learner reports the pass's incident). After the interview
-    // continued, main's rules apply unchanged.
+    // continued, main's rules apply unchanged. As in 3b, the own-write window exempts only the run's
+    // background writes: a document request in it is judged as with no window (only the main-frame
+    // submit back to the verified origin + path continues; anything else is the stray).
     if (!approved && infoProof && infoProof.state === "proved") {
       const pg = pageOfRequest(request);
       let navigation = true;
       try { navigation = !!request.isNavigationRequest(); } catch { /* unknown: a navigation */ }
-      let ownWrite = ownWriteOn(pg);
+      const documentRequest = navigation || /^document$/i.test(resourceType);
+      let ownWrite = !documentRequest && ownWriteOn(pg);
       if (!ownWrite && pg && !navigation && /^(xhr|fetch)$/i.test(resourceType) && [...drains.values()].some((d) => d.page === pg)) {
         let pageUrl = "";
         try { pageUrl = typeof pg.url === "function" ? String(pg.url() || "") : ""; } catch { pageUrl = ""; }
