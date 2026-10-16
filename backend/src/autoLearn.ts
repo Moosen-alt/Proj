@@ -1160,6 +1160,7 @@ async function autoLearnPortalInner(
     withdrawn: [] as string[],
     /** Round 3: the projects an after-click incident warned (the verified page may have filed). */
     warned: [] as string[],
+    warnError: "",
     afterIncident: false,
     incidentRecorded: false,
     incidentError: "",
@@ -1209,6 +1210,7 @@ async function autoLearnPortalInner(
         const out = recordInfoPagePassIncidents(db, infoPageProjectRow ? projectId : null, runId, incidents);
         infoPageCall.withdrawn.push(...out.withdrawn);
         for (const w of out.warned) if (!infoPageCall.warned.includes(w)) infoPageCall.warned.push(w);
+        if (out.warnError) infoPageCall.warnError = out.warnError;
         infoPageCall.incidentRecorded = true;
         if (incidents.some((i) => i.phase === "after")) infoPageCall.afterIncident = true;
       } catch (err) {
@@ -1579,6 +1581,7 @@ async function autoLearnPortalInner(
       if (infoPageCall.afterIncident) {
         const others = infoPageCall.warned.filter((p) => p !== projectId).length;
         infoPageLine += ` The verified page may have filed — check the portal for this project${others ? ` (and ${others} other project(s) that used this verified page: each is warned on its card)` : ""}.`;
+        if (infoPageCall.warnError) infoPageLine += ` (${infoPageCall.warnError}: check every project that used this verified page by hand.)`;
       }
     }
     if (Array.isArray(learn.infoPageHeldVerified) && learn.infoPageHeldVerified.length) {

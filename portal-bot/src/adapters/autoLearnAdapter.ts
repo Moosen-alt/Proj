@@ -7696,6 +7696,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             stopReason: "info_page_incident",
           };
         }
+        // …and with the proof RECORDED, the walk leaves that page now: the proof is settled here, so a
+        // later rollback of some other section's steps (an Accela contact bail) can never turn a
+        // proved page into a false incident at the walk's end.
+        if (this.infoProof) {
+          this.debug?.event({ type: "info_page_proof_settled", page: pageCount, field: String(this.infoProof.step?.field ?? "").slice(0, 40) });
+          this.infoProof = null;
+        }
         // An interstitial's forward control is clicked once per page (c2i'): remembered now, as
         // the click is made, so a return to the same page stops instead of clicking it again.
         if (interstitialAdvanceKey) this.navClicksByPath.add(interstitialAdvanceKey);

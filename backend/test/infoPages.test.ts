@@ -739,6 +739,25 @@ await check("round 3: a BEFORE-click incident (nothing was sent) warns no projec
   await runLearn(P, undefined, undefined, [{ passId, phase: "before", why: ["the page's text changed"], where: sfjsp }]);
   assert.equal(fx.audits("portal.info_page_may_have_filed").filter((x) => JSON.parse(x.details).passId === passId).length, 0);
 });
+await check("round 3: the WITHDRAWAL never depends on the warning — a malformed ledger row, or a warning write that fails, still leaves the pass withdrawn (the failure is named)", async () => {
+  // A malformed "passed" row (not JSON) in the ledger: the incident still withdraws, and still warns.
+  const one = await verifiedPage("Malformed Ledger Page");
+  db.run("INSERT INTO audit_logs (id, project_id, actor_type, actor_name, action, details, created_at) VALUES (?, ?, 'portal_bot', 'x', 'portal.info_page_passed', 'not json {', '2026-10-16')", [`bad-${one.passId}`, one.P]);
+  const M = fx.newProject();
+  await runLearn(M, undefined, [{ passId: one.passId, where: sfjsp }], [{ passId: one.passId, phase: "after", why: ["x"], where: sfjsp }]);
+  assert.equal(db.query("SELECT id FROM portal_info_page_passes WHERE id = ?", [one.passId]).length, 0, "a malformed ledger row kept the pass live");
+  assert.equal(IP.listInfoPageFilingWarnings(db, M).length, 1);
+  // The warning write itself fails: the pass is withdrawn all the same, and the run says why.
+  const two = await verifiedPage("Warn Fails Page");
+  db.run("CREATE TEMP TRIGGER r3_warn_fails BEFORE INSERT ON audit_logs WHEN NEW.action = 'portal.info_page_may_have_filed' BEGIN SELECT RAISE(ABORT, 'forced warning failure'); END");
+  try {
+    const W = fx.newProject();
+    const r = await runLearn(W, undefined, [{ passId: two.passId, where: sfjsp }], [{ passId: two.passId, phase: "after", why: ["x"], where: sfjsp }]);
+    assert.equal(db.query("SELECT id FROM portal_info_page_passes WHERE id = ?", [two.passId]).length, 0, "a failing warning kept the pass live");
+    assert.equal(fx.audits("portal.info_page_pass_incident").filter((x) => JSON.parse(x.details).passId === two.passId && JSON.parse(x.details).withdrawn === true).length, 1);
+    assert.match(String(r.message), /may-have-filed warning could not be written/);
+  } finally { db.run("DROP TRIGGER IF EXISTS r3_warn_fails"); }
+});
 await check("round 3: a learn that THREW after using the pass warns the project too (the page after it was never judged)", async () => {
   const { passId } = await verifiedPage("Threw Page");
   const T = fx.newProject();

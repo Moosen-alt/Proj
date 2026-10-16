@@ -596,34 +596,50 @@ export function withdrawInfoPagePass(db: AppDb, passId: string, input: { by: str
  * have filed — check the portal for this project") and, named within the viewer's own org, on the
  * pass's knowledge-base entry. Before-click incidents sent nothing: no warning.
  */
-export function recordInfoPagePassIncidents(db: AppDb, projectId: string | null, runId: string, incidents: ReadonlyArray<InfoPageIncident> | null | undefined): { withdrawn: string[]; warned: string[] } {
+export function recordInfoPagePassIncidents(db: AppDb, projectId: string | null, runId: string, incidents: ReadonlyArray<InfoPageIncident> | null | undefined): { withdrawn: string[]; warned: string[]; warnError: string } {
   const withdrawn: string[] = [];
   const warned: string[] = [];
+  let warnError = "";
   for (const inc of Array.isArray(incidents) ? incidents : []) {
     const passId = s(inc?.passId).slice(0, 80);
     const phase = inc?.phase === "after" ? "after" : "before";
     const why = (Array.isArray(inc?.why) ? inc.why as unknown[] : []).map((w: unknown) => s(w).slice(0, 240)).slice(0, 8);
     if (!passId) continue;
+    // THE WITHDRAWAL FIRST, in its own transaction: nothing the warning below reads or writes can
+    // keep a pass live after an incident (evidence never blocks the removal of authority).
+    let where = s(inc?.where).slice(0, 200);
+    let controlLabel = "";
     db.transaction(() => {
       const r = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE id = ?", [passId]);
-      const details = { phase, why, runId: s(runId).slice(0, 120), where: s(inc?.where).slice(0, 200) };
-      if (phase === "after") {
-        const users = new Set(db.query<{ project_id: string }>(
-          "SELECT DISTINCT project_id FROM audit_logs WHERE action = ? AND project_id IS NOT NULL AND json_extract(details, '$.passId') = ?",
-          [ACT_PASSED, passId]).map((u) => s(u.project_id)).filter(Boolean));
-        if (projectId) users.add(projectId);
-        const warning = { passId, where: details.where || (r ? `${s(r.origin)}${s(r.path)}` : ""), controlLabel: r ? s(r.control_label) : "", runId: details.runId, why };
-        for (const pid of users) { addAuditLog(db, pid, "portal_bot", "network backstop", ACT_MAY_HAVE_FILED, warning); warned.push(pid); }
-      }
+      const details = { phase, why, runId: s(runId).slice(0, 120), where };
       if (r) {
+        if (!where) where = `${s(r.origin)}${s(r.path)}`;
+        controlLabel = s(r.control_label);
         removeInfoPagePass(db, r, { projectId, actorType: "portal_bot", actor: "network backstop", action: "portal.info_page_pass_incident", details: { ...details, withdrawn: true } });
         withdrawn.push(passId);
       } else {
         addAuditLog(db, projectId, "portal_bot", "network backstop", "portal.info_page_pass_incident", { passId, ...details, withdrawn: false });
       }
     });
+    if (phase !== "after") continue;
+    // THEN THE WARNING (best effort, reported, never undoing the withdrawal): every project in the
+    // pass's use ledger — read in JS, so one malformed audit row cannot fail the query — and the
+    // incident's own. Only the incident's own row carries the run id.
+    try {
+      const users = new Set<string>();
+      db.transaction(() => {
+        for (const u of db.query<{ project_id: string; details: string }>("SELECT project_id, details FROM audit_logs WHERE action = ? AND project_id IS NOT NULL", [ACT_PASSED])) {
+          if (s(parse<Row>(u.details, {}).passId) === passId && s(u.project_id)) users.add(s(u.project_id));
+        }
+        if (projectId) users.add(projectId);
+        for (const pid of users) addAuditLog(db, pid, "portal_bot", "network backstop", ACT_MAY_HAVE_FILED, { passId, where, controlLabel, why, ...(pid === projectId ? { runId: s(runId).slice(0, 120) } : {}) });
+      });
+      warned.push(...users);
+    } catch (err) {
+      warnError = `the may-have-filed warning could not be written (${err instanceof Error ? err.message.slice(0, 100) : String(err).slice(0, 100)})`;
+    }
   }
-  return { withdrawn, warned: Array.from(new Set(warned)) };
+  return { withdrawn, warned: Array.from(new Set(warned)), warnError };
 }
 
 /** THE WARNING ON A PROJECT'S CARD (round 3): every after-click incident on a pass this project used
