@@ -2726,6 +2726,14 @@ export function latestSchemaVersion(): number {
   return VERSIONED_MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0);
 }
 
+/** Every versioned migration's version and name, in declaration order. Read-only: what the
+ *  contiguity guard (backend/test/migrationVersions.test.ts) checks — runVersionedMigrations applies
+ *  only versions above MAX(schema_meta.version), so a gap filled by a later merge is never applied
+ *  to a database that already ran the version above it. */
+export function versionedMigrationVersions(): Array<{ version: number; name: string }> {
+  return VERSIONED_MIGRATIONS.map((m) => ({ version: m.version, name: m.name }));
+}
+
 /** MAX(schema_meta.version) of an already-open handle, 0 when the table is missing. */
 export function currentSchemaVersion(db: AppDb): number {
   try {

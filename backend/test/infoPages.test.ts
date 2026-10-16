@@ -1043,6 +1043,25 @@ await check("round 5 (clock skew): a verification whose time reads 10 minutes in
     assert.ok(IP.liveInfoPagePasses(db).some((p) => p.id === passId), "4 minutes ahead: within the tolerance");
   } finally { Date.now = realNow; }
 });
+await check("Helm's review of #349: the reservation enforces AT MOST ONCE PER PROJECT — two runs of ONE project in flight, each handed the pass: the first reserves, the second is HELD; the other side and another project are not; a person's allowance lifts it once", async () => {
+  const { passId } = await verifiedPage("Once Per Project Page");
+  const Q = fx.newProject();
+  const first = IP.reserveInfoPagePassUse(db, Q, "", "ahj", { passId, where: sfjsp });
+  assert.deepEqual(first, [], "the first run of the project reserves");
+  const second = IP.reserveInfoPagePassUse(db, Q, "", "ahj", { passId, where: sfjsp });
+  assert.deepEqual(second, [IP.INFO_PAGE_ALREADY_USED_REFUSAL], JSON.stringify(second));
+  assert.equal(usesOf(passId).filter((a) => a.project_id === Q).length, 1, "the held run wrote no second use");
+  // The other side of the same project, and another project, are not this project's earlier use.
+  assert.deepEqual(IP.reserveInfoPagePassUse(db, Q, "", "utility", { passId, where: sfjsp }), [], "the utility side is its own");
+  assert.deepEqual(IP.reserveInfoPagePassUse(db, fx.newProject(), "", "ahj", { passId, where: sfjsp }), [], "another project reserves");
+  // A use the learner reported without a reservation (admitted: the request already went) is still written.
+  IP.recordInfoPagePassUses(db, Q, "", "ahj", [{ passId, where: sfjsp }]);
+  assert.equal(usesOf(passId).filter((a) => a.project_id === Q && JSON.parse(a.details).scope === "ahj").length, 2, "an admitted report is never dropped");
+  // A named person's "allow once more" lifts it for ONE more use.
+  IP.allowInfoPagePassOnceMore(db, Q, "ahj", { by: "Pat Allower", userId: "" });
+  assert.deepEqual(IP.reserveInfoPagePassUse(db, Q, "", "ahj", { passId, where: sfjsp }), [], "allowed once more: reserves");
+  assert.deepEqual(IP.reserveInfoPagePassUse(db, Q, "", "ahj", { passId, where: sfjsp }), [IP.INFO_PAGE_ALREADY_USED_REFUSAL], "and only once");
+});
 
 // ── ROUTES ───────────────────────────────────────────────────────────────────────────────────────
 // Everything the routes need is written now; the in-process handle closes before a server opens it.

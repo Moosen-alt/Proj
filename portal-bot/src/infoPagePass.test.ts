@@ -31,7 +31,7 @@ import { fileURLToPath } from "node:url";
 import {
   INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, INFO_PAGE_NO_PROGRESS, INFO_PAGE_PASS_CLOCK_SKEW_MS, INFO_PAGE_PASS_EXPIRED, INFO_PAGE_PASS_MAX_AGE_DAYS, INFO_PAGE_PASS_MAX_PROJECTS, digestInfoPageIdentity, infoPageAfterClickSentWording, infoPageJobValueKeys, infoPageJobValues, infoPagePassExpiryRefusals, infoPageProofNorm, infoPageLabeledCodes, infoPageProofOfProgressRefusals, infoPageProofStepRefusals, infoPageAfterClickRefusals, infoPageBackstopRefusals, infoPageDriftedEntries, infoPageEvidence, infoPageMatchRefusals,
   infoPageNumberTokens, infoPageAfterClickAckWording, infoPageObservedRequest, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageRunStateRefusals,
-  infoPageShapeRefusals, infoPageVerifyWarnings, isMatchClassRefusal, mayPassInfoPage, parseFormBodyFields, verifiedInfoPageFromCandidate,
+  infoPageShapeRefusals, infoPageVerifyWarnings, isDigitRunValue, isMatchClassRefusal, isSecretLikeFieldName, mayPassInfoPage, parseFormBodyFields, verifiedInfoPageFromCandidate,
   type InfoPageBackstopState, type InfoPageIdentityMaterial, type InfoPagePassContext, type InfoPageProofStep, type InfoPageRunState, type InfoPageRunStep,
 } from "../../shared/src/infoPagePass";
 import { classifySubmissionText, isInterstitialForwardLabel, portalSafetyFactory } from "../../shared/src/portalSafety";
@@ -151,6 +151,60 @@ console.log("\nSHAPE");
     const r = infoPageShapeRefusals(digestInfoPageIdentity(m).shape);
     check(`refused: ${what}`, r.some((x) => re.test(x)), JSON.stringify(r));
   }
+  // Helm's review of #349 — A HIDDEN VALUE A PLAIN HASH DOES NOT PROTECT is never bound: the request
+  // body's per-value sha256 sits in the shared table, and `acctNo=4821` is read back in moments.
+  // Refused (fail closed); names only are kept, never the value. A CSRF token, a view state, a step
+  // name or a one-digit flag is neither.
+  const hiddenIn = (name: string, value: string, inForm = true) => (m: InfoPageIdentityMaterial): void => {
+    if (inForm) {
+      m.structure.forms[0].elements.push(["input", "hidden", name, value]);
+      m.facts.hiddenNames.push(name);
+      m.request.body.push([name, value]);
+    } else {
+      m.structure.forms.push({ id: "lookup", name: "", method: "post", enctype: "application/x-www-form-urlencoded", action: `${ORIGIN}/lookup`, target: "", elements: [["input", "hidden", name, value]] });
+    }
+  };
+  const HIDDEN_SECRET = /hidden input\(s\) whose value looks like an account, meter or other number or a secret/;
+  for (const [what, mutate] of [
+    ["a hidden account number (acctNo=4821)", hiddenIn("acctNo", "4821")],
+    ["a hidden digit run under an innocuous name (ref=7734-009-155)", hiddenIn("ref", "7734-009-155")],
+    ["a hidden 5-digit value with a two-letter prefix (code=AC 48213)", hiddenIn("code", "AC 48213")],
+    ["a hidden meter number under an ASP.NET name, value not numeric (ctl00$Main$hdnMeterNumber=abc)", hiddenIn("ctl00$Main$hdnMeterNumber", "abc")],
+    ["a hidden ESIID (ESIID=x)", hiddenIn("ESIID", "x")],
+    ["a hidden SA id (sa_id=x)", hiddenIn("sa_id", "x")],
+    ["a hidden password (pwd=hunter2)", hiddenIn("pwd", "hunter2")],
+    ["a hidden digit run in ANOTHER form on the page (acct=4821, a lookup form)", hiddenIn("acct", "4821", false)],
+  ] as Array<[string, (m: InfoPageIdentityMaterial) => void]>) {
+    const m = devhub();
+    mutate(m);
+    const d = digestInfoPageIdentity(m);
+    const r = infoPageShapeRefusals(d.shape);
+    check(`refused (Helm #349): ${what} — the name is named, the value never kept`, r.some((x) => HIDDEN_SECRET.test(x)) && !JSON.stringify(d.shape).includes("4821") && !JSON.stringify(d.shape).includes("hunter2"), JSON.stringify({ r, hs: d.shape.hiddenSecretLike }));
+  }
+  for (const [what, mutate] of [
+    ["a CSRF token (__csrf=abc123)", hiddenIn("__csrf", "abc123")],
+    ["a view state (__VIEWSTATE=a long base64 token)", hiddenIn("__VIEWSTATE", "/wEPDwUKMTI3NjQ5MjU4Mg9kFgJmD2QWAgIDD2QWAgIBDxYCHgRUZXh0BQ5QZXJtaXQgUmVxdWVzdGRk")],
+    ["a step name (interviewID=ApplyForAPermit)", hiddenIn("interviewID", "ApplyForAPermit")],
+    ["a one-digit flag (step=2)", hiddenIn("step", "2")],
+  ] as Array<[string, (m: InfoPageIdentityMaterial) => void]>) {
+    const m = devhub();
+    mutate(m);
+    const r = infoPageShapeRefusals(digestInfoPageIdentity(m).shape);
+    check(`not refused (Helm #349 positive control): ${what}`, !r.some((x) => HIDDEN_SECRET.test(x)) && r.length === 0, JSON.stringify(r));
+  }
+  {
+    const d = digestInfoPageIdentity(devhub());
+    const old = { ...d.shape } as Partial<typeof d.shape>;
+    delete old.hiddenSecretLike;
+    const r = infoPageShapeRefusals(old as typeof d.shape);
+    check("refused (Helm #349): a digest read before the hidden-value check (no hiddenSecretLike) — unknown never reassures",
+      r.some((x) => /hidden inputs were not checked/.test(x)), JSON.stringify(r));
+  }
+  check("isSecretLikeFieldName reads names word by word; isDigitRunValue wants 4+ digits, at most 2 letters, at most 40 characters",
+    ["acctNo", "AccountNumber", "meter_number", "ctl00$txtMeterNo", "ESIID", "EsiId", "said", "SA_ID", "ssn", "txtPinCode", "dob"].every(isSecretLikeFieldName)
+    && !["__csrf", "__VIEWSTATE", "interviewID", "step", "spinner", "accordion", "t_n1685049573549", "kind"].some(isSecretLikeFieldName)
+    && ["4821", "7734-009-155", "(503) 000-0000", "AC 48213", "1685049573549"].every(isDigitRunValue)
+    && !["", "2", "123", "abc123", "ApplyForAPermit", "/wEPDwUKMTI3NjQ5MjU4Mg9kFgJmD2QWAgIDD2QWAgIBDxYCHgRUZXh0BQ5QZXJtaXQgUmVxdWVzdGRk"].some(isDigitRunValue));
   check("the project's own street on the page refuses", infoPageProjectValueRefusals(`${PROSE} Site: 1 Test St, Springfield`, ["1 Test St", "Jordan Testcase"]).length === 1);
   check("the project's system size on the page refuses", infoPageProjectValueRefusals("System size 7.6 kW DC", ["7.6 kW"]).length === 1);
   check("DevHub's own text names none of a synthetic project's values (phone 503-000-0000, TTY 711)",

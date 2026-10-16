@@ -14,7 +14,11 @@
 //   [R] ROUND 5 — RESERVED AT THE ADMISSION: the backstop awaits the use's reservation the moment it
 //       would let the request through (asked then, never at the open); a refusal (an expired
 //       verification), a throw, a malformed answer or no reservation at all HOLDS it exactly as on
-//       main; an asynchronous reservation is awaited and the request passes once.
+//       main; an asynchronous reservation is awaited and the request passes once. R6 (Helm's F3):
+//       a stopping abort AFTER the pass opened (a page script's filing-shaped POST) closes it — the
+//       Next is held at consumption, and no reservation is asked.
+//   [H] HIDDEN VALUES (Helm's review of #349): a hidden acctNo=4821 is refused by the shape — no
+//       watch, no candidate, nothing hashed into the shared table; a CSRF token still is a candidate.
 //   [E] SLOT LIFETIME: an opened slot that is not used within 20 s is gone; a GET reload closes it;
 //       a second matching POST after the admission is held (the same page served again: d8).
 //   [N] NEAR MISSES with DevHub's entry live, the variant served at the SAME origin + path: every
@@ -290,6 +294,38 @@ if (want("R")) {
   const r5 = await go({ p: "/R5", html: (p) => devhubReplica({ p }), entries: e5 ? [e5] : [], reserve: async () => { await sleep(600); answeredAt = Date.now(); return []; } });
   check("[R5] (positive control) an asynchronous reservation is AWAITED: the Next waits for it and passes ONCE, exempted",
     !!r5.open?.opened && answeredAt > 0 && r5.posts.length === 1 && r5.admissions.filter((a) => a.exempted).length === 1, brief(r5));
+  // R6 — F3 (Helm's review of #349): AFTER the pass opened, a page script sends a filing-shaped POST
+  // (held: a STOPPING abort — the run is stopping). The slot it opened must not then let Next through.
+  // Kill: without the consumption check, Next passes once, exempted.
+  const e6 = await devhubEntryAt("/R6");
+  const calls6: Array<[string, string]> = [];
+  const r6 = await go({
+    p: "/R6", html: (p) => devhubReplica({ p }), entries: e6 ? [e6] : [],
+    reserve: (id, where) => { calls6.push([id, where]); return []; },
+    between: async (page) => { await page.evaluate("fetch('submitApplication', { method: 'POST', body: 'x=1' }).catch(function () { return null; })"); await sleep(400); },
+  });
+  check("[R6] premise: the pass OPENED, then a page script's filing-shaped POST was held as a STOPPING abort (filing-url)",
+    !!r6.open?.opened && r6.aborts.some((a) => a.rule === "filing-url" && /\/R6\/permits\/submitApplication$/.test(a.where) && a.stopping), brief(r6));
+  check("[R6] F3: the slot does not let Next through after the run met a stopping abort — HELD as on main, no reservation asked, the abort names why",
+    stoppingHold(r6, /stopping abort/) && calls6.length === 0, `${brief(r6)} calls=${JSON.stringify(calls6)}`);
+}
+
+// ===========================================================================================
+// [H] Helm's review of #349 — A HIDDEN VALUE A PLAIN HASH DOES NOT PROTECT: the replica's form carries
+//     a hidden account number (acctNo=4821). With no verified page, main holds the Next; the door
+//     now refuses the SHAPE, so NO watch opens and no candidate is kept (its request-body hash of
+//     "4821" never reaches the shared table). The positive control: a CSRF token (__csrf=abc123)
+//     still yields a candidate. Kill: without the shape rule, H1 opens a watch and keeps a candidate.
+// ===========================================================================================
+console.log("\n[H] HIDDEN VALUES: a digit-run or secret-like hidden input is never captured for verification");
+if (want("H")) {
+  const h1 = await go({ p: "/H1", html: (p) => devhubReplica({ p, formExtra: `<input type="hidden" name="acctNo" value="4821">` }), entries: [] });
+  check("[H1] a hidden acctNo=4821: the door REFUSES the shape (named), opens NO watch, keeps no candidate — and the Next is held as on main",
+    !!h1.open && !h1.open.opened && !h1.open.candidateWatch && h1.open.refusals.some((r) => /hidden input\(s\) whose value looks like an account, meter or other number/.test(r) && /acctNo/.test(r))
+    && !h1.candidate && h1.posts.length === 0, brief(h1));
+  const h2 = await go({ p: "/H2", html: (p) => devhubReplica({ p, formExtra: `<input type="hidden" name="__csrf" value="abc123">` }), entries: [] });
+  check("[H2] (positive control) a hidden CSRF token (__csrf=abc123): no verified page matches, a WATCH opens and the held request is kept as a candidate",
+    !!h2.open && !h2.open.opened && h2.open.candidateWatch === true && !!h2.candidate?.observed && h2.posts.length === 0, brief(h2));
 }
 
 // ===========================================================================================

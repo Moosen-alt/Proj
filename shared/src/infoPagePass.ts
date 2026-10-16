@@ -183,6 +183,10 @@ export interface InfoPageShape {
   draftNotice: boolean;
   /** The text asks for an amount due / charged NOW (read in Node, raw). */
   amountDueNow: boolean;
+  /** Helm's review of #349: the NAMES of hidden inputs (any form) whose value a plain sha256 would
+   *  not protect — a secret-like name or a digit-run value (infoPageHiddenSecretNames). Never a value.
+   *  Missing (a digest from before this field) refuses. */
+  hiddenSecretLike: string[];
 }
 
 export interface InfoPageComponents {
@@ -260,6 +264,60 @@ export const infoPageTextAsksAmountNow = (text: string): boolean => String(text 
   /\$\s*\d/.test(s) && /\b(due|charged?|payable|owed|pay|paid)\b/i.test(s) && /\b(now|today|immediately)\b/i.test(s));
 
 /**
+ * HIDDEN VALUES A PLAIN HASH DOES NOT PROTECT (Helm's review of #349). The digest keeps each hidden
+ * input's value as an unkeyed sha256 (the request body, per value, in the shared pass table; the
+ * structure hash over every form). A short or low-entropy value — `acctNo=4821` — is brute-forced
+ * back from its hash in moments, so a page that carries one is NEVER verified (fail closed: refused
+ * by infoPageShapeRefusals, so no candidate is kept and nothing is stored):
+ *   - a SECRET-LIKE NAME, read word by word (camelCase, `_`, `$`, `-`, `.` split, adjacent words
+ *     joined: "acctNo", "ctl00$Main$txtMeterNumber", "ESIID", "sa_id"): account / acct, meter,
+ *     password / passcode / pwd / pin, SSN / social, tax id / EIN / TIN, routing / IBAN, card / CVV,
+ *     ESI / ESIID, SA id (SAID), date of birth;
+ *   - a DIGIT-RUN VALUE: four or more digits with at most two letters, whatever the separators
+ *     ("4821", "7734-009-155", "AC 48213"), up to 40 characters (a longer value is a token, not a
+ *     number a person types).
+ * A CSRF token, a view state or a step name is neither. Names only are returned, never a value.
+ */
+const SECRET_NAME_WORDS = new Set([
+  "acct", "account", "accountno", "accountnum", "accountnumber", "acctno", "acctnum",
+  "meter", "meterno", "meternum", "meternumber", "meterid",
+  "password", "passwd", "passcode", "passphrase", "pwd", "pin", "pincode",
+  "ssn", "social", "socialsecurity", "taxid", "ein", "tin", "routing", "routingnumber", "iban",
+  "card", "cardno", "cardnumber", "cvv", "cvc",
+  "esi", "esiid", "said", "dob", "birthdate", "dateofbirth",
+]);
+const nameWords = (name: string): string[] => String(name ?? "")
+  .replace(/([a-z])([A-Z])/g, "$1 $2").replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2").replace(/([A-Za-z])(\d)/g, "$1 $2").replace(/(\d)([A-Za-z])/g, "$1 $2")
+  .toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+/** The name reads as a customer secret, word by word (and each pair of adjacent words joined). */
+export const isSecretLikeFieldName = (name: string): boolean => {
+  const w = nameWords(name);
+  return w.some((x, i) => SECRET_NAME_WORDS.has(x) || (i + 1 < w.length && SECRET_NAME_WORDS.has(`${x}${w[i + 1]}`)) || (i + 2 < w.length && SECRET_NAME_WORDS.has(`${x}${w[i + 1]}${w[i + 2]}`)));
+};
+/** The value is a number a person would type (4+ digits, at most 2 letters, at most 40 characters). */
+export const isDigitRunValue = (value: string): boolean => {
+  const v = String(value ?? "").trim();
+  if (!v || v.length > 40) return false;
+  return (v.match(/\d/g) ?? []).length >= 4 && (v.match(/[A-Za-z]/g) ?? []).length <= 2;
+};
+/** The NAMES of hidden inputs (every form, and the control's own request body) whose value a plain
+ *  hash would not protect. */
+export function infoPageHiddenSecretNames(m: InfoPageIdentityMaterial): string[] {
+  const out = new Set<string>();
+  for (const f of Array.isArray(m?.structure?.forms) ? m.structure.forms : []) {
+    for (const [, , name, v] of Array.isArray(f.elements) ? f.elements : []) {
+      if (v === null || v === undefined) continue; // not a hidden input (only those carry a value here)
+      if (isSecretLikeFieldName(name) || isDigitRunValue(v)) out.add(String(name || "(unnamed)"));
+    }
+  }
+  const hidden = new Set(Array.isArray(m?.facts?.hiddenNames) ? m.facts.hiddenNames : []);
+  for (const [n, v] of Array.isArray(m?.request?.body) ? m.request.body : []) {
+    if (hidden.has(n) && (isSecretLikeFieldName(n) || isDigitRunValue(v))) out.add(n);
+  }
+  return Array.from(out);
+}
+
+/**
  * THE DIGEST: six component hashes and one identity hash over them, plus what is kept in clear
  * (origin, path, query KEYS, the control's tag/type/name/label, form field NAMES). Raw hidden
  * values, body values and the page text never leave this function.
@@ -306,6 +364,7 @@ export function digestInfoPageIdentity(m: InfoPageIdentityMaterial): InfoPageDig
     baseTarget: m.facts.baseTarget,
     draftNotice: infoPageTextHasDraftNotice(m.text),
     amountDueNow: infoPageTextAsksAmountNow(m.text),
+    hiddenSecretLike: infoPageHiddenSecretNames(m),
   };
   return {
     version: m.version,
@@ -368,6 +427,10 @@ export function infoPageShapeRefusals(shape: InfoPageShape | null | undefined): 
   if (s.draftNotice) out.push("the page names a draft, an application in progress or an application / record number");
   if (s.amountDueNow !== false) out.push("the page asks for an amount due or charged now — automation never pays");
   if (isFilingOrPaymentRequest("POST", s.actionWhere) || isPayRequestUrl(s.actionWhere)) out.push("the form's action reads as a filing or a payment");
+  // Helm's review of #349: a hidden value an unkeyed hash would not protect is never bound (and a
+  // digest read before this was checked says nothing — refused).
+  if (!Array.isArray(s.hiddenSecretLike)) out.push("the page's hidden inputs were not checked for secret-like or number values");
+  else if (s.hiddenSecretLike.length) out.push(`the page carries hidden input(s) whose value looks like an account, meter or other number or a secret (${s.hiddenSecretLike.slice(0, 4).join(", ")}) — its hash could be read back, so it is never verified`);
   return out;
 }
 

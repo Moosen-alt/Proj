@@ -228,6 +228,10 @@ export interface FilingBackstop {
   dispose(): Promise<void>;
 }
 
+/** F3 (Helm's review of #349): why a slot's request is held when the run met a stopping abort after
+ *  the slot opened. */
+export const INFO_PAGE_STOPPING_ABORT_REFUSAL = "the run met a stopping abort (a filing, payment or form post was held) after the pass opened";
+
 /** How long an opened information-page slot stays open, at most (#344). */
 const INFO_PAGE_SLOT_MS = 20_000;
 /** The fresh identity read must answer within this, or the pass is refused. */
@@ -793,7 +797,11 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         let pageUrl = "";
         try { pageUrl = String(pg.url() || ""); } catch { pageUrl = ""; }
         if (!pageUrl || pageKeyOf(pageUrl) !== s.pageKey) refusals.push("the page's address is not the one whose identity was read");
-        infoAdmit = { entryId: s.entryId, refusals, tokens: s.beforeTokens, ack: s.beforeAck, reserve: s.reserve };
+        // F3 (Helm's review of #349): a STOPPING abort since the slot opened — a page script tried to
+        // file, pay or post a form while the run was between the open and the click — means the run is
+        // stopping: the slot it opened is no longer good for anything (asked here, at consumption).
+        if (aborts.some(isStoppingAbort)) refusals.push(INFO_PAGE_STOPPING_ABORT_REFUSAL);
+        infoAdmit ={ entryId: s.entryId, refusals, tokens: s.beforeTokens, ack: s.beforeAck, reserve: s.reserve };
         if (refusals.length) infoPageRefusedRequests.push({ where: whereOf(url), refusals });
       }
     }
@@ -946,6 +954,8 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
           // The await is the one place this handler yields with a slot's request in hand: a run that
           // locked or was disposed meanwhile is never let through (the use stays counted).
           if (!reserved.length && (locked || disposed)) reserved = ["the run locked while the use was being reserved"];
+          // F3: …and one that met a stopping abort meanwhile (the use stays counted).
+          if (!reserved.length && aborts.some(isStoppingAbort)) reserved = [INFO_PAGE_STOPPING_ABORT_REFUSAL];
           if (reserved.length) {
             infoAdmit.refusals.push(...reserved);
             infoPageRefusedRequests.push({ where: whereOf(url), refusals: reserved });

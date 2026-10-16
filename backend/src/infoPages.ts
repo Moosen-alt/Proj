@@ -845,7 +845,9 @@ export function listInfoPagePasses(db: AppDb, nowMs: number = Date.now()): InfoP
  * current identity version — a pass withdrawn while the run was in flight refuses), re-read the use
  * ledger, refuse when the verification is expired NOW (shared infoPagePassExpiryRefusals: 30 days,
  * a clock-skewed time, or INFO_PAGE_PASS_MAX_PROJECTS distinct projects already — so a NEW project
- * that would make it 11 refuses), else write the use row. The pass is handed out earlier
+ * that would make it 11 refuses), refuse when THIS project already has an admitted use on this side
+ * since the latest allowance (at most once per project — Helm's review of #349: two runs of one
+ * project in flight were each handed the pass), else write the use row. The pass is handed out earlier
  * (liveInfoPagePasses, per attempt): runs in flight at the same time were each handed it, and only
  * this check decides. THE ONLY WRITER OF ACT_PASSED (the source scan pins it).
  *
@@ -872,10 +874,35 @@ export function reserveInfoPagePassUse(
       const uses = infoPagePassUseCounts(db);
       const why = infoPagePassExpiryRefusals(s(r.verified_at), uses ? uses.get(passId) ?? 0 : null, nowMs);
       if (why.length) return why;
+      // AT MOST ONCE PER PROJECT, DECIDED HERE TOO (Helm's review of #349). The hand-out asks it
+      // (infoPagePriorProgress), but runs of the SAME project in flight at once were each handed the
+      // pass: only this transaction decides. An earlier admitted use of this project on this side,
+      // after the latest "allow once more" on it, refuses. (Not infoPagePriorProgress itself: this
+      // run's own learn start is on record, and it is not progress here.)
+      const earlier = earlierInfoPageUseOnSide(db, projectId, scope === "utility" ? "utility" : "ahj");
+      if (earlier) return [earlier];
     }
     addAuditLog(db, projectId, "portal_bot", "network backstop", ACT_PASSED, { runId, scope, passId, where });
     return [];
   });
+}
+
+/** The refusal a reservation gives when this project already used a verified page on this side. */
+export const INFO_PAGE_ALREADY_USED_REFUSAL = "this project already passed a verified information page on this portal (an earlier or concurrent run of it) — a pass admits at most once per project; a person may allow it once more";
+
+/** An admitted use (ACT_PASSED) of this project on this side after the latest allowance on that side,
+ *  as a refusal; "" = none. A ledger that cannot be read is a refusal (an unknown never reassures).
+ *  Reads only. */
+function earlierInfoPageUseOnSide(db: AppDb, projectId: string, side: Side): string {
+  try {
+    const rows = db.query<{ rid: number; action: string; details: string }>(
+      "SELECT rowid AS rid, action, details FROM audit_logs WHERE project_id = ? AND action IN (?, ?) ORDER BY rowid", [projectId, ACT_PASSED, ACT_ALLOWED_AGAIN]);
+    const parsed = rows.map((r) => ({ rid: Number(r.rid), action: s(r.action), d: parse<Row>(r.details, {}) }));
+    const allowedAt = Math.max(0, ...parsed.filter((r) => r.action === ACT_ALLOWED_AGAIN && sideOf(r.d.scope) === side).map((r) => r.rid));
+    return parsed.some((r) => r.action === ACT_PASSED && r.rid > allowedAt && rowOnSide(r.d, side)) ? INFO_PAGE_ALREADY_USED_REFUSAL : "";
+  } catch {
+    return "the use could not be reserved (this project's earlier uses could not be read)";
+  }
 }
 
 /** Every use of the relaxation is on record: one audit row per admission — RESERVED at the admission
