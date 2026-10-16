@@ -88,6 +88,21 @@ check("(e) the card is wired into the pinned portal runs and the list beside the
 check("(e) verify goes through authForDecision + namedPersonConsent and sends the card's identity",
   cut("bindInfoPageCandidateButtons").includes("namedPersonConsent(auth") && cut("bindInfoPageCandidateButtons").includes("identitySha256: button.dataset.identity"));
 
+// The decision routes refuse anything but a same-origin JSON body (415 / 403): the dashboard's own
+// api() helper must send Content-Type: application/json, and the three decisions must go through it
+// with a JSON body and no header of their own — or the owner's "OK to advance" is a 415.
+{
+  // (Its default parameter `options = {}` opens a brace before the body, so it is cut to its first
+  // closing line rather than brace-balanced.)
+  const apiAt = dashboard.search(/^async function api\(/m);
+  const apiFn = apiAt < 0 ? "" : dashboard.slice(apiAt, dashboard.indexOf("\n}\n", apiAt) + 2);
+  const calls = [cut("bindInfoPageCandidateButtons"), cut("loadInfoPagePasses")].join("\n");
+  const decisionCalls = calls.match(/await api\([^;]*method: "POST"[^;]*\);/g) ?? [];
+  check("(f) the dashboard's api() sends Content-Type: application/json, and verify / dismiss / withdraw go through it with a JSON body and no header override",
+    /"Content-Type": "application\/json"/.test(apiFn) && decisionCalls.length === 3 && decisionCalls.every((c) => c.includes("JSON.stringify(") && !/headers\s*:/.test(c)),
+    JSON.stringify({ api: apiFn.slice(0, 200), decisionCalls }));
+}
+
 if (failures) { console.error(`\n${failures}/${total} infoPageCardRender check(s) FAILED.`); process.exit(1); }
 console.log(`\nAll ${total}/${total} infoPageCardRender checks passed.`);
 process.exit(0);
