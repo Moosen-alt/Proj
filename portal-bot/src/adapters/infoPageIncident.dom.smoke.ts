@@ -527,7 +527,12 @@ const ROUND6: Record<string, RegExp> = { zzc_another: /acknowledgement/, zzc_mor
 const HELM_V6: Record<string, string> = { V6_apb_else: `${P}/another`, V6_apb_change_else: `${P}/another` };
 const AFTER_MODES = ["receipt", "filed", "review", "error", "same", "blank", ...Object.keys(ROUND2), ...Object.keys(ROUND3), ...Object.keys(ROUND4), ...Object.keys(ROUND5), ...Object.keys(HELM_B1), ...Object.keys(ROUND6), ...Object.keys(HELM_V6)];
 const results: Record<string, Walk> = {};
-const queue: Array<[string, string]> = [...AFTER_MODES.map((m) => [m, "structural"] as [string, string]), ["form", "structural"], ["progress", "structural"], ["drift", "structural"], ["tileb", "structural"]];
+// The V6 walks are the slowest by far (150-220 s: the held AutoPostBack leaves the page on the
+// browser's error page, and the learner stops only at its page boundary), so they start first — the
+// other walks pack around them and the smoke stays well inside the runner's 600 s budget.
+const SLOW_FIRST = Object.keys(HELM_V6);
+const queue: Array<[string, string]> = [...SLOW_FIRST, ...AFTER_MODES.filter((m) => !SLOW_FIRST.includes(m))].map((m) => [m, "structural"] as [string, string])
+  .concat([["form", "structural"], ["progress", "structural"], ["drift", "structural"], ["tileb", "structural"]]);
 await Promise.all(Array.from({ length: 4 }, async () => {
   while (queue.length) {
     const [mode, permitType] = queue.shift()!;
