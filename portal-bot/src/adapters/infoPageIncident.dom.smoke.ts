@@ -244,10 +244,10 @@ const AFTER: Record<string, () => string> = {
   form_nofill: () => receipt("Project Information", TWO_FIELDS, "", HEADER_SEARCH, NEXT_SG2),
   form_literal: () => receipt("Project Information", TWO_FIELDS, "", HEADER_SEARCH, NEXT_SG2),
   form_company: () => receipt("Project Information", TWO_FIELDS, "", HEADER_SEARCH, NEXT_SG2),
-  // The genuine form posts ITSELF 3.5 s after load — while the run is still reading the page (the
-  // planner takes 6 s): the proof hold holds it, nothing reaches the server.
+  // The genuine form posts ITSELF 6 s after load — while the run is still reading the page (the
+  // planner takes 10 s; the proof is armed about 1.5 s after load): the proof hold holds it, nothing reaches the server.
   autopost: () => shell({ title: "Project Information", action: `${P}/sg2`, content: TWO_FIELDS, nav: NEXT_SG2,
-    script: `<script>setTimeout(function () { document.getElementById('smartguide_ApplyForAPermit').submit(); }, 3500);</script>` }),
+    script: `<script>setTimeout(function () { document.getElementById('smartguide_ApplyForAPermit').submit(); }, 6000);</script>` }),
 };
 
 const hits: Array<{ method: string; url: string; names: string[]; mode: string }> = [];
@@ -300,7 +300,7 @@ const PLANS: Record<string, (req: LearnPlanRequest) => Promise<LearnPlanResponse
   form_nofill: (req) => ({ fills: [], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
   form_literal: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
   form_company: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "(555) 010-0000", field: "installerPhone" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
-  autopost: async () => { await new Promise((r) => setTimeout(r, 6000)); return { fills: [], atReview: false }; },
+  autopost: async () => { await new Promise((r) => setTimeout(r, 10000)); return { fills: [], atReview: false }; },
   pq_list_bound: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Address"), value: "1 Test St", field: "street" }], atReview: false }),
 };
 const walk = async (mode: string, entries: VerifiedInfoPage[], permitType = "structural", priorProgress = false): Promise<Walk> => {
@@ -413,7 +413,7 @@ for (const mode of AFTER_MODES) {
 }
 {
   // ROUND 3 — THE HOLD ITSELF (structural, not the learner's own pre-check): the genuine form posts
-  // ITSELF 3.5 s after load while the run is still reading it. Nothing reaches the server; the
+  // ITSELF 6 s after load while the run is still reading it. Nothing reaches the server; the
   // backstop names the proof hold; the walk is the incident.
   const w = results.autopost;
   check("after [autopost] (round 3): the page's OWN form POST, fired while the run had entered none of the job's data, is HELD by the proof hold — nothing reached the server",
