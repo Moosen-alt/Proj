@@ -1,18 +1,29 @@
-// HUMAN-VERIFIED INFORMATION PAGES (#344, owner ruling 2026-10-15: option B) — the backend half.
+// HUMAN-VERIFIED INFORMATION PAGES (#344, owner ruling 2026-10-15: option B; proposal approved
+// 2026-10-16) — the backend half.
 //
 // The network backstop (portal-bot/src/filingBackstop.ts openInfoPagePass) may let ONE forward
 // request off an information page through hard rule 1's review lockdown (4b), only when a NAMED
 // PERSON verified that exact page and the run has entered nothing (shared/src/infoPagePass.ts).
-// This module is the ONLY writer of both tables (an infoPagePass.test grep pin):
+// This module is the ONLY writer of both tables (infoPagePass.test's source scan pins it):
 //
-//   portal_info_page_candidates — project-scoped evidence a learn recorded when the backstop held
+//   portal_info_page_candidates — project-scoped EVIDENCE a learn recorded when the backstop held
 //     an unverified information page (recordInfoPageCandidate, called by autoLearn's finalize).
-//   portal_info_page_passes — shared knowledge (hashes, names, structure), written ONLY by a
-//     person's verify (INSERT, built from the candidate ROW, never a request body) and withdraw
-//     (UPDATE of the withdrawn_* columns). Never by a learn, import, research, replay or migration;
-//     never overwritten (a changed page is a new candidate); never deleted (rule 3).
+//     Evidence, never authority.
+//   portal_info_page_passes — the SERVER-OWNED RECORD (shared knowledge: hashes, names, structure).
+//     ONE function creates a row: verifyInfoPageCandidate, a named person's verify, built from the
+//     candidate ROW (never a request body). No path ever UPDATEs a row. A row is WITHDRAWN by a
+//     DELETE (removeInfoPagePass, the one delete) — by a person, by an incident a run reports (§4 of
+//     the proposal: the page drifted before the click, or did not read as "not filed" after it),
+//     or with the project it was verified on. History stays in the audit log. Never written by a
+//     learn, an import, research, a replay, a recipe save, a correction or a migration (rule 3).
 //
-// liveInfoPagePasses is the ONE effective-row predicate: the bot input and the KB list both read it.
+// AUTHORITY IS THE PERSON'S VERIFICATION ON RECORD (liveInfoPagePasses, the ONE effective-row
+// predicate the bot input and the KB list both read): a pass row counts only while its source
+// candidate row says a person verified it — status 'verified', pass_id = this row, the same person
+// and time — and the row is exactly what verifyInfoPageCandidate builds from that candidate. A row
+// written any other way (a direct INSERT, a copy, a row "moved" to another host / path / control /
+// step sequence) is never handed to a run (the #354 lesson: data a generic path can write is never
+// authority for a click).
 import type { AppDb } from "./db";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
@@ -24,25 +35,24 @@ import {
   type InfoPageDigest, type InfoPageEvidence, type InfoPageObservedRequest, type InfoPagePrefixStep,
 } from "../../shared/src/infoPagePass";
 import { isFilingOrPaymentRequest, isPayRequestUrl } from "../../shared/src/portalSafety";
-import type { InfoPageCandidateCapture, InfoPageCandidateRecord, InfoPagePassRecord, VerifiedInfoPage } from "../../shared/src/types";
+import type { InfoPageCandidateCapture, InfoPageCandidateRecord, InfoPageIncident, InfoPagePassRecord, VerifiedInfoPage } from "../../shared/src/types";
 
 type Row = Record<string, unknown>;
 const s = (v: unknown): string => (v === null || v === undefined ? "" : String(v));
 const parse = <T>(text: unknown, fallback: T): T => { try { return JSON.parse(s(text)) as T; } catch { return fallback; } };
 const HEX64 = /^[0-9a-f]{64}$/;
 
+/** Canonical JSON (object keys sorted, arrays in order): the provenance comparison. */
+const canon = (v: unknown): string => {
+  if (v === null || typeof v !== "object") return JSON.stringify(v ?? null);
+  if (Array.isArray(v)) return `[${v.map(canon).join(",")}]`;
+  const o = v as Record<string, unknown>;
+  return `{${Object.keys(o).sort().map((k) => `${JSON.stringify(k)}:${canon(o[k])}`).join(",")}}`;
+};
+
 // ---------------------------------------------------------------------------------------------
 // The bot's input
 // ---------------------------------------------------------------------------------------------
-
-/** THE effective-row predicate: verified by a named person, not withdrawn, current identity version. */
-export function liveInfoPagePasses(db: AppDb): VerifiedInfoPage[] {
-  const rows = db.query<Row>(
-    `SELECT * FROM portal_info_page_passes
-      WHERE verified_at <> '' AND verified_by <> '' AND withdrawn_at = '' AND identity_version = ?
-      ORDER BY verified_at`, [INFO_PAGE_IDENTITY_VERSION]);
-  return rows.map(passRowToVerified);
-}
 
 const passRowToVerified = (r: Row): VerifiedInfoPage => ({
   id: s(r.id),
@@ -65,12 +75,46 @@ const passRowToVerified = (r: Row): VerifiedInfoPage => ({
 });
 
 /**
+ * IS THIS PASS ROW A PERSON'S VERIFICATION ON RECORD? Its source candidate says so (verified, this
+ * pass, the same person at the same time), and the row is EXACTLY what verifyInfoPageCandidate
+ * builds from that candidate. Anything else — a row inserted by another path, or one whose host,
+ * path, control, request or step sequence was changed after the fact — is not authority.
+ */
+function passIsOnRecord(db: AppDb, r: Row): boolean {
+  if (!s(r.verified_at) || !s(r.verified_by) || !s(r.source_candidate_id)) return false;
+  const c = db.get<Row>("SELECT * FROM portal_info_page_candidates WHERE id = ?", [s(r.source_candidate_id)]);
+  if (!c) return false;
+  if (s(c.status) !== "verified" || s(c.pass_id) !== s(r.id)) return false;
+  if (s(c.decided_by) !== s(r.verified_by) || s(c.decided_at) !== s(r.verified_at)) return false;
+  const digest = parse<InfoPageDigest | null>(c.digest_json, null);
+  if (!digest || digest.identitySha256 !== s(c.identity_sha256)) return false;
+  let built: Omit<VerifiedInfoPage, "id" | "verifiedAt">;
+  try {
+    built = verifiedInfoPageFromCandidate({ identityVersion: Number(c.identity_version), identitySha256: s(c.identity_sha256), digest, prefix: parse<InfoPagePrefixStep[]>(c.prefix_json, []) });
+  } catch { return false; }
+  const { id: _id, verifiedAt: _at, ...row } = passRowToVerified(r);
+  void _id; void _at;
+  return canon(row) === canon(built);
+}
+
+/** THE effective-row predicate: a person's verification on record, at the current identity
+ *  version. The bot input (autoLearn) and the KB list both read it. Reads only. */
+export function liveInfoPagePasses(db: AppDb): VerifiedInfoPage[] {
+  const rows = db.query<Row>(
+    `SELECT * FROM portal_info_page_passes
+      WHERE verified_at <> '' AND verified_by <> '' AND identity_version = ?
+      ORDER BY verified_at`, [INFO_PAGE_IDENTITY_VERSION]);
+  return rows.filter((r) => passIsOnRecord(db, r)).map(passRowToVerified);
+}
+
+/**
  * HAS THIS PROJECT ALREADY MADE PROGRESS ON THIS PORTAL? (critique [1]) The portal session and its
  * server-side interview survive between runs (a persistent per-client profile), so a page a person
  * verified at the START of the interview could be shown again at a later server position where its
  * Next files. Refused (true) when this project already has, on this portal:
  *   - a tracking target on the same origin with an application or permit number;
  *   - a submission on the same side (permit vs NEM) that reached review or was filed;
+ *   - a portal run on the same side that reached review, was submitted or recorded a number;
  *   - a draft recorded on the same side (portal.draft_created).
  * Unknown (an unparseable portal URL, a read error) is true: an unknown never reassures.
  */
@@ -88,6 +132,8 @@ export function infoPagePriorProgress(db: AppDb, projectId: string, portalUrl: s
     const nem = scopeType === "utility";
     const subs = db.query<Row>("SELECT permit_type, status FROM submissions WHERE project_id = ?", [projectId]);
     if (subs.some((x) => (s(x.permit_type) === "nem") === nem && ["awaiting_human_submit", "submitted", "submitted_unconfirmed", "staged", "approved", "issued"].includes(s(x.status)))) return true;
+    const runs = db.query<Row>("SELECT permit_type, status, confirmation_number FROM portal_runs WHERE project_id = ?", [projectId]);
+    if (runs.some((x) => (s(x.permit_type) === "nem") === nem && (s(x.confirmation_number).trim() !== "" || ["awaiting_human_submit", "submitted", "submitted_unconfirmed"].includes(s(x.status))))) return true;
     const drafts = db.query<Row>("SELECT details FROM audit_logs WHERE project_id = ? AND action = 'portal.draft_created'", [projectId]);
     if (drafts.some((d) => (s(parse<Row>(d.details, {}).track) === "nem") === nem)) return true;
     return false;
@@ -97,7 +143,7 @@ export function infoPagePriorProgress(db: AppDb, projectId: string, portalUrl: s
 }
 
 // ---------------------------------------------------------------------------------------------
-// Candidates (project-scoped)
+// Candidates (project-scoped evidence)
 // ---------------------------------------------------------------------------------------------
 
 /** A capture the bot handed back, checked before anything is written (the bot is trusted, its
@@ -194,8 +240,8 @@ function candidateRefusals(db: AppDb, r: Row): string[] {
   }
   out.push(...prefixShapeRefusals(prefix));
   out.push(...infoPageProjectValueRefusals(s(evidence?.text), projectValues(db, s(r.project_id))));
-  const live = db.get<Row>("SELECT id FROM portal_info_page_passes WHERE identity_sha256 = ? AND withdrawn_at = ''", [s(r.identity_sha256)]);
-  if (live) out.push("a live pass for this exact page already exists");
+  const existing = db.get<Row>("SELECT id FROM portal_info_page_passes WHERE identity_sha256 = ?", [s(r.identity_sha256)]);
+  if (existing) out.push("a pass for this exact page already exists (withdraw it first to verify again)");
   return Array.from(new Set(out));
 }
 
@@ -223,6 +269,7 @@ const candidateRowToRecord = (db: AppDb, r: Row): InfoPageCandidateRecord => {
     decidedBy: s(r.decided_by),
     decidedAt: s(r.decided_at),
     passId: s(r.pass_id),
+    passLive: s(r.status) === "verified" && !!s(r.pass_id) && !!db.get<Row>("SELECT id FROM portal_info_page_passes WHERE id = ?", [s(r.pass_id)]),
     refusals: s(r.status) === "open" ? candidateRefusals(db, r) : [],
     warnings: infoPageVerifyWarnings(digest ? digest.shape : null, evidence.text),
   };
@@ -242,10 +289,16 @@ export function infoPageCandidateScreenshot(db: AppDb, projectId: string, candid
   return r && r.screenshot_png && r.screenshot_png.length ? Buffer.from(r.screenshot_png) : null;
 }
 
+// ---------------------------------------------------------------------------------------------
+// The record: ONE create (a person's verify), ONE delete (every withdrawal), no update
+// ---------------------------------------------------------------------------------------------
+
 /**
  * A NAMED PERSON VERIFIES the candidate: "This is an information page — OK to advance". One
- * transaction. The pass row is built ONLY from the candidate ROW (verifiedInfoPageFromCandidate);
- * the body names only which card the person looked at (its identity), never what to write.
+ * transaction. THE ONLY WRITER THAT CREATES A PASS: the row is built ONLY from the candidate ROW
+ * (verifiedInfoPageFromCandidate); the body names only which card the person looked at (its
+ * identity), never what to write. The candidate is stamped verified with this pass's id, by the
+ * same person at the same time — the record liveInfoPagePasses requires before a run may use it.
  */
 export function verifyInfoPageCandidate(
   db: AppDb, projectId: string, candidateId: string,
@@ -280,10 +333,26 @@ export function verifyInfoPageCandidate(
     addAuditLog(db, projectId, "human", input.verifiedBy, "portal.info_page_verified", {
       passId, candidateId, origin: pass.origin, path: pass.path, controlLabel: pass.controlLabel, controlName: pass.controlName,
       request: { method: pass.request.method, where: pass.request.where, media: pass.request.media, fieldNames: pass.request.body.map(([n]) => n) },
+      prefix: pass.prefix.map(([a, n]) => `${a}${n ? ` ${n}` : ""}`),
       identitySha256Prefix: pass.identitySha256.slice(0, 12),
     });
     return { passId };
   });
+}
+
+/** What the audit keeps of a withdrawn pass (the row is gone): places, names and dates — never a
+ *  hash of a value or the verifier (the withdrawal row may carry no project). */
+const passHistory = (r: Row): Record<string, unknown> => ({
+  origin: s(r.origin), path: s(r.path), controlLabel: s(r.control_label), controlName: s(r.control_name),
+  request: { method: s(r.request_method), where: s(r.request_where), media: s(r.request_media), fieldNames: parse<Array<[string, string]>>(r.request_body_json, []).map(([n]) => n) },
+  identitySha256Prefix: s(r.identity_sha256).slice(0, 12), verifiedAt: s(r.verified_at), sourceCandidateId: s(r.source_candidate_id),
+});
+
+/** THE ONE DELETE of a pass (every withdrawal goes through here), with its audit row. A run already
+ *  in flight keeps the entries it started with (they are frozen per run). */
+function removeInfoPagePass(db: AppDb, r: Row, audit: { projectId: string | null; actorType: "human" | "system" | "portal_bot"; actor: string; action: string; details: Record<string, unknown> }): void {
+  db.run("DELETE FROM portal_info_page_passes WHERE id = ?", [s(r.id)]);
+  addAuditLog(db, audit.projectId, audit.actorType, audit.actor, audit.action, { passId: s(r.id), ...audit.details, pass: passHistory(r) });
 }
 
 /** "Not an information page": the card leaves the open list and a re-capture never re-nags. */
@@ -298,21 +367,62 @@ export function dismissInfoPageCandidate(db: AppDb, projectId: string, candidate
   });
 }
 
-/** WITHDRAW a pass (never delete it): runs that start after this no longer receive it; a run already
- *  in flight keeps the pass it started with (entries are frozen per run). */
+/** A PERSON WITHDRAWS a pass: the row is deleted (the audit keeps its history). Runs that start
+ *  after this no longer receive it; a run already in flight keeps the pass it started with. */
 export function withdrawInfoPagePass(db: AppDb, passId: string, input: { by: string; userId: string; reason: string }): void {
   db.transaction(() => {
-    const r = db.get<Row>("SELECT id, withdrawn_at FROM portal_info_page_passes WHERE id = ?", [passId]);
+    const r = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE id = ?", [passId]);
     if (!r) throw new HttpError(404, "Verified information page not found.");
-    if (s(r.withdrawn_at)) throw new HttpError(409, "This pass is already withdrawn.");
-    db.run("UPDATE portal_info_page_passes SET withdrawn_at = ?, withdrawn_by = ?, withdrawn_by_user_id = ?, withdraw_reason = ? WHERE id = ?",
-      [nowIso(), input.by, input.userId, input.reason, passId]);
-    addAuditLog(db, null, "human", input.by, "portal.info_page_pass_withdrawn", { passId, reason: input.reason });
+    removeInfoPagePass(db, r, { projectId: null, actorType: "human", actor: input.by, action: "portal.info_page_pass_withdrawn", details: { reason: input.reason, byUserId: input.userId } });
   });
 }
 
+/**
+ * AN INCIDENT A RUN REPORTED ON A PASS (proposal §4), audited on the run's project and the pass
+ * WITHDRAWN (deleted):
+ *   - before the click: the page at the pass's host + path read differently (signature, control,
+ *     the steps before it, or the request) — the backstop held the click exactly as on main and the
+ *     new page was recorded as a fresh candidate;
+ *   - after the click: the page the verified click led to did not read as "not filed" (a receipt,
+ *     a confirmation number, a filed status, the review page, an error, no form, unreadable) — the
+ *     run stopped and nothing is recorded as filed.
+ * A pass already gone is audited all the same (withdrawn: false).
+ */
+export function recordInfoPagePassIncidents(db: AppDb, projectId: string | null, runId: string, incidents: ReadonlyArray<InfoPageIncident> | null | undefined): { withdrawn: string[] } {
+  const withdrawn: string[] = [];
+  for (const inc of Array.isArray(incidents) ? incidents : []) {
+    const passId = s(inc?.passId).slice(0, 80);
+    const phase = inc?.phase === "after" ? "after" : "before";
+    const why = (Array.isArray(inc?.why) ? inc.why as unknown[] : []).map((w: unknown) => s(w).slice(0, 240)).slice(0, 8);
+    if (!passId) continue;
+    db.transaction(() => {
+      const r = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE id = ?", [passId]);
+      const details = { phase, why, runId: s(runId).slice(0, 120), where: s(inc?.where).slice(0, 200) };
+      if (r) {
+        removeInfoPagePass(db, r, { projectId, actorType: "portal_bot", actor: "network backstop", action: "portal.info_page_pass_incident", details: { ...details, withdrawn: true } });
+        withdrawn.push(passId);
+      } else {
+        addAuditLog(db, projectId, "portal_bot", "network backstop", "portal.info_page_pass_incident", { passId, ...details, withdrawn: false });
+      }
+    });
+  }
+  return { withdrawn };
+}
+
+/** THE PROJECT IS BEING DELETED (repository.deleteProject, inside its transaction): its candidates
+ *  go with it (tenant evidence), and every pass a person verified on one of them is withdrawn — a
+ *  pass is authority only while the verification it came from is on record. */
+export function deleteProjectInfoPages(db: AppDb, projectId: string): void {
+  const verified = db.query<Row>("SELECT id, pass_id FROM portal_info_page_candidates WHERE project_id = ? AND status = 'verified' AND pass_id <> ''", [projectId]);
+  for (const c of verified) {
+    const r = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE id = ? AND source_candidate_id = ?", [s(c.pass_id), s(c.id)]);
+    if (r) removeInfoPagePass(db, r, { projectId: null, actorType: "system", actor: "project deletion", action: "portal.info_page_pass_withdrawn", details: { reason: "the project it was verified on was deleted" } });
+  }
+  db.run("DELETE FROM portal_info_page_candidates WHERE project_id = ?", [projectId]);
+}
+
 /** The shared list (critique [5]): places, names and dates only — no component or value hash, no
- *  verifier, no project. Reads only. */
+ *  verifier, no project. `live` = a person's verification on record (what a run receives). */
 export function listInfoPagePasses(db: AppDb): InfoPagePassRecord[] {
   return db.query<Row>("SELECT * FROM portal_info_page_passes ORDER BY verified_at DESC LIMIT 200").map((r) => ({
     id: s(r.id),
@@ -324,9 +434,7 @@ export function listInfoPagePasses(db: AppDb): InfoPagePassRecord[] {
     request: { method: s(r.request_method), where: s(r.request_where), media: s(r.request_media), fieldNames: parse<Array<[string, string]>>(r.request_body_json, []).map(([n]) => n) },
     identityPrefix: s(r.identity_sha256).slice(0, 12),
     verifiedAt: s(r.verified_at),
-    status: s(r.withdrawn_at) ? "withdrawn" as const : "live" as const,
-    withdrawnAt: s(r.withdrawn_at),
-    withdrawReason: s(r.withdraw_reason),
+    live: Number(r.identity_version) === INFO_PAGE_IDENTITY_VERSION && passIsOnRecord(db, r),
   }));
 }
 

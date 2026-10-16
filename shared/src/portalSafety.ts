@@ -1947,10 +1947,36 @@ export function portalSafetyFactory() {
     }
   };
 
+  /**
+   * Runs IN THE PAGE: THE PAGE A VERIFIED INFORMATION PAGE'S CLICK LED TO (#344, proposal §4) —
+   * what the network backstop judges before the run may go on. It must read as an UNFILED FORM:
+   * text, at least one visible enabled fillable control, and the shared readings say no (the
+   * terminal reading here; the receipt / error reading, classifySubmissionText, in Node on `text`).
+   * No new wording: the same terminalPageInPage and navigator-cut text every door reads.
+   */
+  const infoPageAfterClickInPage = (): { readable: boolean; fillable: number; terminal: boolean | null; text: string } => {
+    const d = (globalThis as { document?: Document }).document;
+    if (!d || !d.body) return { readable: false, fillable: 0, terminal: null, text: "" };
+    const t = terminalPageInPage();
+    const text = String(pageTextWithoutNavigatorInPage(d) || "").replace(/\s+/g, " ").trim();
+    const fillable = Array.from(d.querySelectorAll("input, select, textarea, [contenteditable]")).filter((el) => {
+      const tag = el.tagName.toLowerCase();
+      if (tag === "input") {
+        const ty = String(el.getAttribute("type") || "text").trim().toLowerCase();
+        if (/^(hidden|submit|button|image|reset)$/.test(ty)) return false;
+      } else if (tag !== "select" && tag !== "textarea" && String(el.getAttribute("contenteditable") || "").trim().toLowerCase() === "false") return false;
+      if ((el as HTMLInputElement).disabled === true) return false;
+      const r = (el as HTMLElement).getBoundingClientRect();
+      return r.width > 2 && r.height > 2;
+    }).length;
+    return { readable: text.length > 0, fillable, terminal: typeof t.terminal === "boolean" ? t.terminal : null, text: text.slice(0, 20_000) };
+  };
+
   return {
     INFO_PAGE_IDENTITY_VERSION,
     isInterstitialForwardLabel,
     infoPageIdentityInPage,
+    infoPageAfterClickInPage,
     dismissalRefusalInPage,
     implicitSubmitInPage,
     implicitSubmitRefusalInPage,

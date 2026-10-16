@@ -2313,10 +2313,13 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       addColumnIfMissing(db, "portal_recipes", "flagged_at", "TEXT");
     },
   },
-  // v49 sits here, beside the portal-run trust tables (v35), rather than at the end of the list:
-  // parallel PRs appending at the end collide (see v43 / v46).
+  // v50 sits here, beside the portal-run trust tables (v35), rather than at the end of the list:
+  // parallel PRs appending at the end collide (see v43 / v46). ORDERING: v49 belongs to PR #354
+  // (portal_recipe_draft_submits). The runner applies only versions above MAX(schema_meta.version),
+  // so #354 must land first — a database that ran v50 would never run a v49 merged after it (the
+  // PR that lands second renumbers otherwise).
   {
-    version: 49,
+    version: 50,
     name: "portal_info_pages",
     up: (db) => {
       // HUMAN-VERIFIED INFORMATION PAGES (#344, owner ruling 2026-10-15: option B). Hard rule 1's
@@ -2330,11 +2333,14 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       // an unverified information page: the identity digest (hashes, names, structure), the exact
       // prefix, the held request (hashes), the scrubbed page text and the masked screenshot.
       //
-      // portal_info_page_passes — SHARED KNOWLEDGE, like portal_recipes (the owner: the page is the
-      // same for every tenant). Hashes, names and structure only: never page text, a screenshot, a
-      // hidden value or a project id. Written ONLY by a person's verify (INSERT) and withdraw
-      // (UPDATE of the withdrawn_* columns) in backend/src/infoPages.ts — never by a learn, an
-      // import, research, a replay or a migration (rule 3). Rows are never deleted.
+      // portal_info_page_passes — THE SERVER-OWNED RECORD, shared knowledge like portal_recipes (the
+      // owner: the page is the same for every tenant). Hashes, names and structure only: never page
+      // text, a screenshot, a hidden value or a project id. CREATED ONLY by a person's verify and
+      // never updated; WITHDRAWN BY DELETE (a person, an incident a run reports, or the deletion of
+      // the project it was verified on) — all in backend/src/infoPages.ts, history in audit_logs.
+      // Never written by a learn, an import, research, a replay, a recipe save or a migration
+      // (rule 3). A row counts only while its source candidate records the verification
+      // (infoPages.liveInfoPagePasses). One pass per page identity.
       //
       // Both tables and every index are created HERE, never lazily in a read path.
       db.exec(`
@@ -2390,13 +2396,9 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
           verified_at TEXT NOT NULL,
           verified_by TEXT NOT NULL,
           verified_by_user_id TEXT NOT NULL DEFAULT '',
-          source_candidate_id TEXT NOT NULL,
-          withdrawn_at TEXT NOT NULL DEFAULT '',
-          withdrawn_by TEXT NOT NULL DEFAULT '',
-          withdrawn_by_user_id TEXT NOT NULL DEFAULT '',
-          withdraw_reason TEXT NOT NULL DEFAULT ''
+          source_candidate_id TEXT NOT NULL
         );
-        CREATE UNIQUE INDEX IF NOT EXISTS ux_info_page_pass_live ON portal_info_page_passes(identity_sha256) WHERE withdrawn_at = '';
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_info_page_pass_identity ON portal_info_page_passes(identity_sha256);
         CREATE INDEX IF NOT EXISTS idx_info_page_pass_origin ON portal_info_page_passes(origin, path);
       `);
     },

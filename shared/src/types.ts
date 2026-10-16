@@ -4020,6 +4020,9 @@ export interface InfoPageCandidateRecord {
   decidedBy: string;
   decidedAt: string;
   passId: string;
+  /** A verified candidate whose pass still exists (false once it was withdrawn or an incident
+   *  removed it). */
+  passLive: boolean;
   /** Why "OK to advance" is refused (computed server-side; non-empty disables the button). */
   refusals: string[];
   /** What to look at twice (never blocks). */
@@ -4038,9 +4041,26 @@ export interface InfoPagePassRecord {
   request: { method: string; where: string; media: string; fieldNames: string[] };
   identityPrefix: string;
   verifiedAt: string;
-  status: "live" | "withdrawn";
-  withdrawnAt: string;
-  withdrawReason: string;
+  /** A person's verification is on record for this row (infoPages.liveInfoPagePasses): only such a
+   *  row is ever handed to a run. A withdrawn pass is deleted, so it is not listed at all. */
+  live: boolean;
+}
+
+/**
+ * AN INCIDENT ON A VERIFIED INFORMATION PAGE (#344, proposal §4), reported by a learn and acted on
+ * by the backend (infoPages.recordInfoPagePassIncidents: audited, the pass WITHDRAWN):
+ *   before — the page at the pass's host + path read differently (signature, control, the steps
+ *            before it, or the request); the backstop held the click exactly as on main;
+ *   after  — the page the verified click led to did not read as "not filed" (a receipt, a filed
+ *            status, the review page, an error, no form, unreadable); the run stopped and nothing is
+ *            recorded as filed.
+ */
+export interface InfoPageIncident {
+  passId: string;
+  phase: "before" | "after";
+  why: string[];
+  /** origin + path of the page (never a query). */
+  where: string;
 }
 
 export interface PortalRecipeLoginStep {

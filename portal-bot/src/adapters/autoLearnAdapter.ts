@@ -55,7 +55,7 @@ import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describe
 // Types only (erased): the information-page door is reached duck-typed on the installed backstop.
 import type { FilingBackstop, InfoPageCandidateTake, InfoPagePassOpen } from "../filingBackstop";
 import { infoPageEvidence, type InfoPageRunState, type InfoPageRunStep } from "../../../shared/src/infoPagePass";
-import type { InfoPageCandidateCapture, VerifiedInfoPage } from "../../../shared/src/types";
+import type { InfoPageCandidateCapture, InfoPageIncident, VerifiedInfoPage } from "../../../shared/src/types";
 import { hostOfUrl, sameCredentialScope } from "../siteOf";
 import { attachmentTypeFor, isDocumentTypeList, isPlanSetDocType } from "./attachmentTypes";
 import {
@@ -273,6 +273,10 @@ export interface LearnResult {
   infoPageCandidate?: InfoPageCandidateCapture;
   /** Each human-verified information page this walk passed (one request each, rule 4(b) only). */
   infoPagePassed?: Array<{ passId: string; where: string }>;
+  /** INCIDENTS on verified information pages (#344, proposal §4): the page drifted before the click
+   *  (held exactly as on main), or the page after the verified click did not read as an unfiled
+   *  form (the walk stopped, stopReason "info_page_incident"). The backend withdraws each pass. */
+  infoPageIncidents?: InfoPageIncident[];
 }
 
 // Live progress signal emitted while learning a portal, so the UI can show a real
@@ -2131,6 +2135,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   private infoPassAdmittedSteps = new WeakSet<RecipeStep>();
   private infoPageCandidate: InfoPageCandidateCapture | null = null;
   private infoPagePassed: Array<{ passId: string; where: string }> = [];
+  private infoPageIncidents: InfoPageIncident[] = [];
   /** The project's own values (street, name, parcel, system size): a page that shows them before
    *  anything was entered is a summary, never an information page. */
   private infoPageProjectValues: string[] = [];
@@ -3621,6 +3626,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // verified one it passed (each use of the relaxation is on record).
       if (this.infoPageCandidate) result = { ...result, infoPageCandidate: this.infoPageCandidate };
       if (this.infoPagePassed.length) result = { ...result, infoPagePassed: [...this.infoPagePassed] };
+      if (this.infoPageIncidents.length) result = { ...result, infoPageIncidents: this.infoPageIncidents.map((i) => ({ ...i, why: i.why.map((w) => this.scrubSecrets(w)) })) };
       // Hand-off first (the route comes off), then every abort up to that moment is counted.
       await backstop?.dispose().catch(() => null);
       // WHAT THE PERSON TAKING THE REVIEW PAGE MUST KNOW (dryrun-0928 B3 + B14), in the hand-off itself:
@@ -5405,7 +5411,16 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           const cand = this.infoPageCandidate;
           if (cand && cand.observed) {
             const req = cand.observed as { method?: string; where?: string };
-            return { ...fail(steps, this.portalName, `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: the network backstop held "${String(cand.controlLabel).slice(0, 40)}" (${String(req.method ?? "POST")} ${String(req.where ?? `${cand.origin}${cand.path}`)}). Nothing was sent. A person can mark this exact page once (project → Portal runs → Information page to verify); after that, runs pass it — only this page, and only before anything is entered on the run.`, null, pageCount, portalNotices), stopReason: "backstop_abort" };
+            const held = `the network backstop held "${String(cand.controlLabel).slice(0, 40)}" (${String(req.method ?? "POST")} ${String(req.where ?? `${cand.origin}${cand.path}`)}). Nothing was sent.`;
+            // A page a person HAD verified, now read differently (proposal §4): the incident withdraws
+            // that verification; the page as it is now is the fresh candidate.
+            const changed = this.infoPageIncidents.filter((i) => i.phase === "before");
+            return {
+              ...fail(steps, this.portalName, changed.length
+                ? `HELD AT AN INFORMATION PAGE THAT CHANGED SINCE A PERSON VERIFIED IT (${changed[0].why.slice(0, 3).join("; ")}): ${held} That verification is withdrawn. A person can mark the page as it is now (project → Portal runs → Information page to verify).`
+                : `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: ${held} A person can mark this exact page once (project → Portal runs → Information page to verify); after that, runs pass it — only this page, and only before anything is entered on the run.`, null, pageCount, portalNotices),
+              stopReason: "backstop_abort",
+            };
           }
           return { ...fail(steps, this.portalName, `Stopped by the network backstop: ${describeBackstopAbort(stopping[0])}. Nothing was sent; the step (or page script) that fired it must be reviewed.`, null, pageCount, portalNotices), stopReason: "backstop_abort" };
         }
@@ -7646,6 +7661,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         const infoAdmissionsBefore = infoDoor && Array.isArray(infoDoor.infoPageAdmissions) ? infoDoor.infoPageAdmissions.length : 0;
         let infoPassTried = false;
         let infoShot: string | undefined;
+        let infoAdmitted: Array<{ passId: string; where: string }> = [];
         const advBeforeUrl = typeof this.page.url === "function" ? String(this.page.url() ?? "") : "";
         const advBeforeFp = await this.pageFingerprint();
         const advBeforeSig = await advanceSignatureOf(this.page);
@@ -7700,7 +7716,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             advBudget,
           ]);
         } finally {
-          if (infoPassTried && infoDoor) this.settleInfoPagePass(infoDoor as FilingBackstop, advStep, infoAdmissionsBefore, infoShot, pageCount);
+          if (infoPassTried && infoDoor) infoAdmitted = this.settleInfoPagePass(infoDoor as FilingBackstop, advStep, infoAdmissionsBefore, infoShot, pageCount);
         }
         if (advTimer) clearTimeout(advTimer);
         if ((res as { timedOut?: boolean }).timedOut) {
@@ -7711,6 +7727,26 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             label: String(advanceField.label ?? "").slice(0, 60),
             ms: Date.now() - advStarted,
           });
+        }
+        // #344 §4 — AFTER A VERIFIED INFORMATION PAGE'S CLICK the page it led to must read as an
+        // UNFILED FORM (the backstop's checkInfoPageAfterClick: text, a fillable field, not the
+        // review / terminal page, neither filed nor an error). Otherwise this is an INCIDENT: the
+        // run stops here, the backend withdraws the pass, and nothing is recorded as filed (ok:false,
+        // no review reached, no final submit). Asked whatever the click's own outcome — a click
+        // that timed out after its request was admitted is judged the same way.
+        if (infoAdmitted.length) {
+          const door = infoDoor as Partial<FilingBackstop> | null;
+          const after = door && typeof door.checkInfoPageAfterClick === "function"
+            ? await door.checkInfoPageAfterClick(this.page).catch((e: unknown) => ({ ok: false, refusals: [`the page after the click could not be read (${String((e as { message?: string })?.message ?? e).slice(0, 80)})`] }))
+            : { ok: false, refusals: ["the network backstop cannot read the page after the click"] };
+          this.debug?.event({ type: after.ok ? "info_page_after_click_ok" : "info_page_incident", page: pageCount, phase: "after", refusals: after.refusals.slice(0, 6).map((x) => this.scrubSecrets(x).slice(0, 160)) });
+          if (!after.ok) {
+            for (const a of infoAdmitted) this.infoPageIncidents.push({ passId: a.passId, phase: "after", why: after.refusals.slice(0, 6), where: a.where });
+            return {
+              ...fail(steps, this.portalName, `STOPPED AFTER A VERIFIED INFORMATION PAGE: the network backstop let "${String(advanceField.label ?? "").slice(0, 40)}" through on the page a person verified, and the page it led to ${after.refusals.slice(0, 3).map((r) => r.replace(/^the page after the click /, "")).join("; ")}. Nothing more was sent, nothing is recorded as filed, and that verification is withdrawn. Check this application on the portal by hand before any run continues.`, null, pageCount, portalNotices),
+              stopReason: "info_page_incident",
+            };
+          }
         }
         if (!res.ok) {
           return fail(steps, this.portalName, `Failed to click the advance button on page ${pageCount}: ${res.message ?? "unknown"}`, null, pageCount, portalNotices);
@@ -8775,6 +8811,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       type: r.opened ? "info_page_pass_open" : "info_page_refused", page: pageCount, entryId: r.entryId, candidateWatch: r.candidateWatch,
       refusals: r.refusals.slice(0, 8).map((x) => this.scrubSecrets(String(x)).slice(0, 160)),
     });
+    // INVALIDATION BEFORE THE CLICK (proposal §4): a page a person verified at this host + path now
+    // reads differently. The click is held exactly as on main; each such pass is an incident the
+    // backend audits and withdraws, and the page as it is now becomes the fresh candidate.
+    for (const d of Array.isArray(r.drifted) ? r.drifted : []) {
+      this.infoPageIncidents.push({ passId: d.entryId, phase: "before", why: d.why.slice(0, 6), where: d.where });
+      this.debug?.event({ type: "info_page_incident", page: pageCount, phase: "before", passId: d.entryId, why: d.why.slice(0, 6) });
+    }
     const pg = this.page;
     if (!r.candidateWatch || !pg) return undefined;
     const shot = await this.withSecretMask("info page screenshot", (mask) => pg.screenshot({ fullPage: true, mask })).catch(() => undefined);
@@ -8784,8 +8827,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   /** #344 — after the forward click: close the backstop's info-page slot / watch, keep the captured
    *  candidate (its evidence scrubbed: no field value, secrets and long digit runs masked), and
    *  record each verified page the click passed (the step object, so a rolled-back walk can never
-   *  pass an unadmitted step off as admitted). */
-  private settleInfoPagePass(door: FilingBackstop, advStep: RecipeStep, admissionsBefore: number, shot: string | undefined, pageCount: number): void {
+   *  pass an unadmitted step off as admitted). Returns what this click passed (the caller then
+   *  judges the page it led to). */
+  private settleInfoPagePass(door: FilingBackstop, advStep: RecipeStep, admissionsBefore: number, shot: string | undefined, pageCount: number): Array<{ passId: string; where: string }> {
     try { if (typeof door.closeInfoPagePass === "function") door.closeInfoPagePass(); } catch { /* the slot has its own closers */ }
     let take: InfoPageCandidateTake | null = null;
     try { take = typeof door.takeInfoPageCandidate === "function" ? door.takeInfoPageCandidate() : null; } catch { take = null; }
@@ -8812,6 +8856,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       for (const a of admitted) this.infoPagePassed.push({ passId: a.entryId, where: a.where });
       this.debug?.event({ type: "info_page_pass", page: pageCount, passes: admitted.map((a) => ({ passId: a.entryId, where: a.where })) });
     }
+    return admitted.map((a) => ({ passId: a.entryId, where: a.where }));
   }
 
   /** A screenshot that may leave the process (vision planner, review verifier, bundle PNG) with

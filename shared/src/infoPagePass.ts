@@ -26,11 +26,20 @@
 //     within 20 s, and the backstop's other rules (payment, filing URL, windows, the sticky lock 4a)
 //     still apply before it.
 //
+// WHAT INVALIDATES IT (proposal §4, approved 2026-10-16): before the click, a page at a verified
+// page's origin + path that reads differently (signature, control, request, the steps before it) is
+// held exactly as on main and each such pass is an incident (infoPageDriftedEntries); after the
+// click, the page it led to must read as an unfiled form (infoPageAfterClickRefusals — text, a
+// fillable field, and the shared terminal and receipt / error readings say no), or the run stops.
+// Either incident withdraws the pass (the backend deletes it) and nothing is recorded as filed.
+//
 // The contract follows signatureRequestGate.ts / portalSafety.finalSubmitRefusals: PURE (node:crypto
 // only — no DOM, network or database), a plain boolean (mayPassInfoPage) and its reasons from a
 // separately named function (infoPagePassRefusals). ONE predicate: the backstop's openInfoPagePass
 // is its only caller; the backend's verify route runs the same shape half (infoPageShapeRefusals)
-// and request half (infoPageRequestRefusals) before a person's verification is written.
+// and request half (infoPageRequestRefusals) before a person's verification is written. The pass
+// itself is a server-owned record only a person's verify creates (backend/src/infoPages.ts); the
+// bot receives it only as input, never from recipe steps or any other data.
 //
 // THREAT MODEL: a benign portal that changes. A hostile page script that poisons the DOM prototypes
 // the identity read uses could lie to it (main's 4b reading has the same exposure); the request
@@ -41,6 +50,7 @@ import { createHash } from "node:crypto";
 import type { VerifiedInfoPage } from "./types";
 import {
   INFO_PAGE_IDENTITY_VERSION,
+  classifySubmissionText,
   isFilingOrPaymentRequest,
   isFinalSubmitControl,
   isInterstitialForwardLabel,
@@ -513,23 +523,56 @@ export function infoPageMatchRefusals(
   prefix: ReadonlyArray<InfoPagePrefixStep>,
 ): { entry: VerifiedInfoPage | null; refusals: string[] } {
   const same = entries.filter((e) => e && e.identityVersion === digest.version && e.identitySha256 === digest.identitySha256);
-  const exact = same.filter((e) => e.controlName === digest.control.name && collapse(e.controlLabel) === digest.control.label
+  const samePage = same.filter((e) => e.controlName === digest.control.name && collapse(e.controlLabel) === digest.control.label
     && e.request.method === digest.expected.method && e.request.where === digest.expected.where
     && e.request.actionSha256 === digest.expected.actionUrlSha && e.request.media === digest.expected.media
     && sameBody(e.request.body, digest.expected.body));
-  if (exact.length === 1) {
-    if (!Array.isArray(exact[0].prefix) || !samePrefix(exact[0].prefix, prefix)) {
-      return { entry: null, refusals: [`${INFO_PAGE_NO_MATCH}: the page matches a verified page (${String(exact[0].verifiedAt).slice(0, 10)}), but the run reached it by different steps`] };
-    }
-    return { entry: exact[0], refusals: [] };
-  }
+  // THE STEPS THAT LED HERE are part of what the person verified (critique [0]): a different tile to
+  // the same page is a different page.
+  const exact = samePage.filter((e) => Array.isArray(e.prefix) && samePrefix(e.prefix, prefix));
+  if (exact.length === 1) return { entry: exact[0], refusals: [] };
   if (exact.length > 1) return { entry: null, refusals: [`${INFO_PAGE_NO_MATCH}: more than one verified entry claims this page`] };
+  if (samePage.length) {
+    return { entry: null, refusals: [`${INFO_PAGE_NO_MATCH}: the page matches a verified page (${String(samePage[0].verifiedAt).slice(0, 10)}), but the run reached it by different steps`] };
+  }
   const near = entries.find((e) => e && e.origin === digest.origin && e.path === digest.path && e.controlName === digest.control.name);
   if (!near) return { entry: null, refusals: [`${INFO_PAGE_NO_MATCH}: no person has verified this page`] };
   const drifted = (Object.keys(COMPONENT_WORDS) as Array<keyof InfoPageComponents>)
     .filter((k) => !near.components || near.components[k] !== digest.components[k]).map((k) => COMPONENT_WORDS[k]);
   const version = near.identityVersion !== digest.version ? ` (identity version ${near.identityVersion} vs ${digest.version})` : "";
   return { entry: null, refusals: [`${INFO_PAGE_NO_MATCH}: the ${drifted.join(", ") || "identity"} differ(s) from a verified page (${String(near.verifiedAt).slice(0, 10)})${version}`] };
+}
+
+/**
+ * WHICH VERIFIED PAGES THIS READ INVALIDATES (proposal §4, before the click): every entry at the
+ * same origin + path (the portal tenant is in the path, or is the host) that this page did NOT
+ * match exactly — a changed signature, a different forward control or request, or different steps
+ * before it — and that was not already passed on this run. Asked by the backstop only when the page
+ * is held exactly as on main and recorded as a fresh candidate (a candidate watch opened); the run
+ * reports each as an incident and the backend withdraws it. Names what differs (never a person).
+ */
+export function infoPageDriftedEntries(
+  digest: InfoPageDigest,
+  entries: ReadonlyArray<VerifiedInfoPage>,
+  prefix: ReadonlyArray<InfoPagePrefixStep>,
+  admittedEntryIds: ReadonlyArray<string>,
+): Array<{ entryId: string; why: string[]; where: string }> {
+  const out: Array<{ entryId: string; why: string[]; where: string }> = [];
+  for (const e of Array.isArray(entries) ? entries : []) {
+    if (!e || e.origin !== digest.origin || e.path !== digest.path) continue;
+    if (admittedEntryIds.includes(e.id)) continue;
+    const why: string[] = [];
+    if (e.identityVersion !== digest.version) why.push(`the identity was read at version ${digest.version}, the page was verified at ${e.identityVersion}`);
+    const drifted = (Object.keys(COMPONENT_WORDS) as Array<keyof InfoPageComponents>)
+      .filter((k) => !e.components || e.components[k] !== digest.components[k]).map((k) => COMPONENT_WORDS[k]);
+    if (drifted.length || e.identitySha256 !== digest.identitySha256) why.push(`the page's ${drifted.join(", ") || "identity"} changed`);
+    if (e.controlName !== digest.control.name || collapse(e.controlLabel) !== digest.control.label) why.push("the forward control is a different one");
+    if (e.request.method !== digest.expected.method || e.request.where !== digest.expected.where || e.request.actionSha256 !== digest.expected.actionUrlSha
+      || e.request.media !== digest.expected.media || !sameBody(e.request.body, digest.expected.body)) why.push("the control would send a different request");
+    if (!Array.isArray(e.prefix) || !samePrefix(e.prefix, prefix)) why.push("the run reached the page by different steps");
+    if (why.length) out.push({ entryId: e.id, why, where: `${digest.origin}${digest.path}` });
+  }
+  return out;
 }
 
 /** EVERY reason the backstop may NOT admit this page's forward request. Empty only when all hold. */
@@ -658,6 +701,46 @@ export function infoPageRequestRefusals(expected: InfoPageExpectedRequest | null
   if (observed.body === null) out.push("the request body could not be read");
   else if (!sameBody(observed.body, expected.body)) out.push("the request body differs from what the verified control sends (a field added, removed, reordered or changed)");
   if (observed.hasFilenamePart) out.push("the request carries a file part");
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// After the click (proposal §4): the page the verified click led to must read as NOT FILED
+// ---------------------------------------------------------------------------------------------
+
+/** What portalSafety's infoPageAfterClickInPage read on the page the verified click led to. */
+export interface InfoPageAfterClickReading {
+  /** The page has a body with text. */
+  readable: boolean;
+  /** VISIBLE, enabled fillable controls (input / select / textarea / contenteditable). */
+  fillable: number;
+  /** The shared terminal reading (terminalPageInPage().terminal): null = unknown. */
+  terminal: boolean | null;
+  /** The page's text with the step navigator cut (what the shared readings judge). */
+  text: string;
+}
+
+/**
+ * EVERY REASON THE PAGE AFTER A VERIFIED INFORMATION PAGE'S CLICK IS NOT AN UNFILED FORM. Empty
+ * only when the page reads, carries a fillable field, and the shared readings all say no: not the
+ * review / terminal page (portalSafety terminalPageInPage, the reading 4(b) and replay's click gate
+ * use), and neither a receipt / confirmation number / filed status nor an error
+ * (portalSafety classifySubmissionText, the reading every submit outcome uses). A reading that goes
+ * both ways, or none at all, refuses. Any refusal is an incident: the run stops, the pass is
+ * withdrawn and nothing is recorded as filed. Digits in quoted evidence are masked.
+ */
+export function infoPageAfterClickRefusals(r: InfoPageAfterClickReading | null | undefined): string[] {
+  if (!r || typeof r !== "object") return ["the page after the click could not be read"];
+  const out: string[] = [];
+  const mask = (x: string | null): string => String(x ?? "").replace(/\d/g, "#").slice(0, 80);
+  if (r.readable !== true) out.push("the page after the click could not be read (no text)");
+  if (r.terminal === true) out.push("the page after the click reads as the review / terminal page");
+  else if (r.terminal !== false) out.push("the page after the click could not be judged review or not");
+  const outcome = classifySubmissionText(r.text);
+  if (outcome.verdict === "accepted") out.push(`the page after the click reads as filed ("${mask(outcome.evidence)}")`);
+  else if (outcome.verdict === "rejected") out.push(`the page after the click reads as an error ("${mask(outcome.evidence)}")`);
+  else if (outcome.evidence) out.push(`the page after the click reads both as filed and as an error (${mask(outcome.evidence)})`);
+  if (!(typeof r.fillable === "number" && Number.isFinite(r.fillable) && r.fillable > 0)) out.push("the page after the click has no fillable field — it is not the application form");
   return out;
 }
 

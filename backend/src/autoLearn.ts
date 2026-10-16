@@ -44,7 +44,7 @@ import { logger } from "./logger";
 import { ensurePlanSetSplit } from "./docSplitter";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
-import { infoPagePriorProgress, liveInfoPagePasses, recordInfoPageCandidate, recordInfoPagePassUses } from "./infoPages";
+import { infoPagePriorProgress, liveInfoPagePasses, recordInfoPageCandidate, recordInfoPagePassIncidents, recordInfoPagePassUses } from "./infoPages";
 import { formPurposeMismatch } from "./formPurpose";
 import { looksBotBlocked } from "./runAbort";
 import { id } from "./ids";
@@ -1451,14 +1451,31 @@ async function autoLearnPortalInner(
   // outcome's message, since the learn's own message is not what the operator reads.
   const handoffNotes = (learn.reviewHandoffNotes ?? []).filter(Boolean);
   // #344 — AN INFORMATION PAGE THE BACKSTOP HELD, FOR A PERSON TO VERIFY (and every verified one this
-  // walk passed, on record). Written once, here, before any outcome is chosen: the ONE writer of a
-  // candidate (infoPages.recordInfoPageCandidate). A database failure never fails the learn — it is
-  // named in the message. A learn with no project row (a benchmark) writes nothing.
+  // walk passed, on record, and every INCIDENT on a verified one acted on). Written once, here,
+  // before any outcome is chosen: the ONE writer of a candidate (infoPages.recordInfoPageCandidate).
+  // A database failure never fails the learn — it is named in the message. A learn with no project
+  // row (a benchmark) records no candidate.
   let infoPageLine = "";
   let infoPageSummary: { identitySha256: string; origin: string; path: string; controlLabel: string } | null = null;
   {
     const learnRunId = debugDir ? path.basename(debugDir) : "";
     const projectRow = (() => { try { return db.get<{ id: string }>("SELECT id FROM projects WHERE id = ?", [projectId]); } catch { return null; } })();
+    if (projectRow && Array.isArray(learn.infoPagePassed) && learn.infoPagePassed.length) recordInfoPagePassUses(db, projectId, learnRunId, learn.infoPagePassed);
+    // AN INCIDENT ON A VERIFIED PAGE (proposal §4): audited and the pass WITHDRAWN (deleted) — the
+    // page drifted before the click (held exactly as on main; the new page is the fresh candidate
+    // below), or the page after the click did not read as "not filed" (the learn stopped, ok:false:
+    // the failed outcome below, which records nothing as filed).
+    if (Array.isArray(learn.infoPageIncidents) && learn.infoPageIncidents.length) {
+      try {
+        const out = recordInfoPagePassIncidents(db, projectRow ? projectId : null, learnRunId, learn.infoPageIncidents);
+        const after = learn.infoPageIncidents.some((i) => i.phase === "after");
+        infoPageLine += out.withdrawn.length
+          ? ` ${after ? "The page after a verified information page did not read as an unfiled form" : "A verified information page changed"}; that verification was withdrawn (${out.withdrawn.length}) and a person must look again.`
+          : " An incident on a verified information page was recorded.";
+      } catch (err) {
+        infoPageLine += ` An incident on a verified information page could not be recorded (${err instanceof Error ? err.message.slice(0, 120) : String(err)}).`;
+      }
+    }
     const cand = learn.infoPageCandidate;
     if (cand && cand.observed && projectRow) {
       try {
@@ -1470,15 +1487,14 @@ async function autoLearnPortalInner(
               candidateId: rec.id, origin: cand.origin, path: cand.path, controlLabel: infoPageSummary.controlLabel, identitySha256Prefix: cand.identitySha256.slice(0, 12), learnRunId,
             });
           }
-          infoPageLine = rec.status === "dismissed"
+          infoPageLine += rec.status === "dismissed"
             ? ` A person marked this page "not an information page" (${rec.decidedBy || "a person"}, ${rec.decidedAt.slice(0, 10)}); it stays held.`
             : " Recorded for a person to verify (project → Portal runs).";
         }
       } catch (err) {
-        infoPageLine = ` The held information page could not be recorded for verification (${err instanceof Error ? err.message.slice(0, 120) : String(err)}).`;
+        infoPageLine += ` The held information page could not be recorded for verification (${err instanceof Error ? err.message.slice(0, 120) : String(err)}).`;
       }
     }
-    if (projectRow && Array.isArray(learn.infoPagePassed) && learn.infoPagePassed.length) recordInfoPagePassUses(db, projectId, learnRunId, learn.infoPagePassed);
   }
   const finalize = (r: Omit<AutoLearnResult, "debugDir">): AutoLearnResult => {
     const withInfoPage = infoPageLine && !String(r.message ?? "").includes(infoPageLine.trim()) ? { ...r, message: `${r.message}${infoPageLine}` } : r;

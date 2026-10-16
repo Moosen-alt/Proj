@@ -49,6 +49,10 @@
 //      every test that does not opt in) no slot can open and every request meets main's rules.
 //      An unverified page is held exactly as before; the held request is OBSERVED (method, URL
 //      hash, media, body hashes) so the learner can record the page as a candidate for a person.
+//      A page at a verified page's origin + path that reads differently is held the same way and
+//      names that pass as drifted (an incident: the backend withdraws it). After an admitted click,
+//      checkInfoPageAfterClick judges the page it led to: anything but an unfiled form arms the
+//      sticky lock (4a) and is the run's incident — it stops, the pass is withdrawn.
 //
 // Every abort is recorded (origin + path only — never a query string, which can carry a
 // customer's data) so the run reports it; a filing, payment or lockdown abort also stops the run,
@@ -61,10 +65,10 @@
 // Known cost: Playwright disables the browser's HTTP cache while any route is installed.
 import { isFilingOrPaymentRequest, isPayRequestUrl, paymentDialogVerdict, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE } from "../../shared/src/portalSafety";
 import {
-  digestInfoPageIdentity, infoPageObservedRequest, infoPagePassEntry, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals,
-  infoPageRequestRefusals, isMatchClassRefusal,
-  type InfoPageDigest, type InfoPageExpectedRequest, type InfoPageIdentityMaterial, type InfoPageIdentityReading, type InfoPageObservedRequest,
-  type InfoPagePrefixStep, type InfoPageRunState,
+  digestInfoPageIdentity, infoPageAfterClickRefusals, infoPageDriftedEntries, infoPageObservedRequest, infoPagePassEntry, infoPagePassRefusals,
+  infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, isMatchClassRefusal,
+  type InfoPageAfterClickReading, type InfoPageDigest, type InfoPageExpectedRequest, type InfoPageIdentityMaterial, type InfoPageIdentityReading,
+  type InfoPageObservedRequest, type InfoPagePrefixStep, type InfoPageRunState,
 } from "../../shared/src/infoPagePass";
 import type { VerifiedInfoPage } from "../../shared/src/types";
 
@@ -78,6 +82,10 @@ export interface InfoPagePassOpen {
   entryId?: string;
   refusals: string[];
   candidateWatch: boolean;
+  /** With a candidate watch only (the page is held exactly as on main): the verified pages at this
+   *  page's origin + path it did not match — each an INCIDENT (proposal §4, before the click) the
+   *  run reports and the backend acts on (audited, withdrawn). */
+  drifted?: Array<{ entryId: string; why: string[]; where: string }>;
 }
 
 /** An unverified information page, captured when the watch opened — BEFORE the click (#344,
@@ -170,6 +178,12 @@ export interface FilingBackstop {
   openInfoPagePass(page: unknown, control: unknown, opts: { entries: ReadonlyArray<VerifiedInfoPage>; run: InfoPageRunState }): Promise<InfoPagePassOpen>;
   /** Close the info-page slot and watch now (the caller's click is over). */
   closeInfoPagePass(): void;
+  /** AFTER A VERIFIED INFORMATION PAGE'S CLICK (proposal §4): read the page it led to (main frame)
+   *  and ask infoPageAfterClickRefusals — it must read as an unfiled form (text, a fillable field,
+   *  not the review / terminal page, neither filed nor an error). Any refusal arms the sticky
+   *  review lock (nothing more posts from here) and is the run's incident: it stops, the backend
+   *  withdraws the pass, nothing is recorded as filed. */
+  checkInfoPageAfterClick(page?: unknown): Promise<{ ok: boolean; refusals: string[] }>;
   /** The unverified page whose forward request was held, once (then forgotten), or null. */
   takeInfoPageCandidate(): InfoPageCandidateTake | null;
   /** Each request the info-page slot admitted: exempted = it passed 4(b) only because of the
@@ -434,6 +448,30 @@ async function readInfoPageIdentity(page: any, control: any): Promise<InfoPageId
   })();
   let timer: ReturnType<typeof setTimeout> | null = null;
   const timeout = new Promise<InfoPageIdentityReading>((r) => { timer = setTimeout(() => r({ ok: false, why: "the identity read timed out" }), INFO_PAGE_IDENTITY_TIMEOUT_MS); });
+  try { return await Promise.race([read, timeout]); } finally { if (timer) clearTimeout(timer); }
+}
+
+/** How long the page after a verified click may take to show its form (a SmartGuide step renders
+ *  server-side; a few hundred ms of script is normal). Only "no field yet" / "no text yet" waits:
+ *  a page that reads as filed, review or an error refuses at once. */
+const INFO_PAGE_AFTER_CLICK_MS = 6_000;
+
+/** One reading of the page a verified click led to, in its main frame, within 3 s (null = unread). */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function readAfterClick(page: any): Promise<InfoPageAfterClickReading | null> {
+  if (!page || typeof page.mainFrame !== "function") return null;
+  const read = (async (): Promise<InfoPageAfterClickReading | null> => {
+    const frame = page.mainFrame();
+    await frame.evaluate(PORTAL_SAFETY_IN_PAGE_SOURCE).catch(() => null);
+    const r = await frame.evaluate((g: string) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ps = (globalThis as any)[g];
+      return ps && typeof ps.infoPageAfterClickInPage === "function" ? ps.infoPageAfterClickInPage() : null;
+    }, PORTAL_SAFETY_GLOBAL).catch(() => null);
+    return r && typeof r === "object" ? r as InfoPageAfterClickReading : null;
+  })();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const timeout = new Promise<null>((r) => { timer = setTimeout(() => r(null), INFO_PAGE_IDENTITY_TIMEOUT_MS); });
   try { return await Promise.race([read, timeout]); } finally { if (timer) clearTimeout(timer); }
 }
 
@@ -970,20 +1008,39 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       }
       if (reading.ok && digest && refusals.length > 0 && refusals.every(isMatchClassRefusal)) {
         // CAPTURED NOW, before the click (amendment pin 2): a BackstopAbort carries no page identity.
-        const capture: InfoPageCandidateTake = {
-          digest, prefix: infoPagePrefixOf(run && Array.isArray(run.priorSteps) ? run.priorSteps : []), material: reading.material, observed: null,
-        };
+        const prefix = infoPagePrefixOf(run && Array.isArray(run.priorSteps) ? run.priorSteps : []);
+        const capture: InfoPageCandidateTake = { digest, prefix, material: reading.material, observed: null };
         infoCandidate = capture;
         const w: InfoWatch = { page: p, capture, until: Date.now() + INFO_PAGE_SLOT_MS, open: true, timer: null, detach: () => undefined };
         const c = bindInfoClosers(p, () => { if (infoWatch === w) closeInfoWatch(); });
         w.timer = c.timer;
         w.detach = c.detach;
         infoWatch = w;
-        return { opened: false, refusals, candidateWatch: true };
+        // INVALIDATION BEFORE THE CLICK (proposal §4): a verified page at this origin + path that
+        // this read did not match exactly (signature, control, request, the steps before it). The
+        // click is held exactly as on main; the run reports each as an incident.
+        const drifted = infoPageDriftedEntries(digest, entries, prefix, admittedEntryIds);
+        return { opened: false, refusals, candidateWatch: true, ...(drifted.length ? { drifted } : {}) };
       }
       return { opened: false, refusals, candidateWatch: false };
     },
     closeInfoPagePass() { closeInfo(); },
+    async checkInfoPageAfterClick(pg?: unknown) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const p: any = pg && typeof pg === "object" ? pg : page;
+      const deadline = Date.now() + INFO_PAGE_AFTER_CLICK_MS;
+      let refusals: string[] = ["the page after the click could not be read"];
+      for (;;) {
+        refusals = infoPageAfterClickRefusals(await readAfterClick(p).catch(() => null));
+        // Only an empty page (no text / no field YET) is waited for; anything that reads as filed,
+        // review or an error is final.
+        const waitable = refusals.length > 0 && refusals.every((r) => /could not be read|no fillable field/.test(r));
+        if (!waitable || Date.now() >= deadline) break;
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      if (refusals.length) bs.lockReview(`the page after a verified information page did not read as an unfiled form (${refusals[0].slice(0, 60)})`);
+      return { ok: refusals.length === 0, refusals };
+    },
     takeInfoPageCandidate() {
       const c = infoCandidate;
       infoCandidate = null;

@@ -10,16 +10,23 @@
 //   RUN     — only goto / entry clicks / admitted advances, every flag false, the exact prefix.
 //   BACKSTOP— locked, a window, an approved slot, a stopping abort, an own write, a 4th admission,
 //             a page the backstop would not hold.
+//   INVALID — before the click: a signature, control, request or step-sequence change at the pass's
+//             host + path is an incident on that pass (infoPageDriftedEntries); another path is not.
+//   AFTER   — after the click: only an unfiled form passes (infoPageAfterClickRefusals); a receipt,
+//             a confirmation number, a filed status, the review page, an error, no field, an
+//             unreadable or unjudged page each refuse.
 //   REQUEST — Chromium-shaped multipart and urlencoded bodies parse; every substitution refuses.
 //   GREP    — the predicate is called only from shared/src/infoPagePass.ts and filingBackstop.ts;
-//             the pass tables are written only by backend/src/infoPages.ts.
+//             THE SINGLE WRITER: the pass table is named only by its migration and infoPages.ts,
+//             created by one INSERT inside verifyInfoPageCandidate, never updated, deleted by one
+//             DELETE inside removeInfoPagePass; the bot gets passes only as its frozen input.
 //
 //   npx tsx portal-bot/src/infoPagePass.test.ts
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, digestInfoPageIdentity, infoPageBackstopRefusals, infoPageEvidence, infoPageMatchRefusals,
+  INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, digestInfoPageIdentity, infoPageAfterClickRefusals, infoPageBackstopRefusals, infoPageDriftedEntries, infoPageEvidence, infoPageMatchRefusals,
   infoPageObservedRequest, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageRunStateRefusals,
   infoPageShapeRefusals, infoPageVerifyWarnings, isMatchClassRefusal, mayPassInfoPage, parseFormBodyFields, verifiedInfoPageFromCandidate,
   type InfoPageBackstopState, type InfoPageIdentityMaterial, type InfoPagePassContext, type InfoPageRunState, type InfoPageRunStep,
@@ -254,6 +261,63 @@ const ctxWith = (o: Partial<{ run: InfoPageRunState; backstop: InfoPageBackstopS
   check("a near-miss names what drifted and the date, never a person",
     m.entry === null && m.refusals.length === 1 && m.refusals[0].startsWith(INFO_PAGE_NO_MATCH) && /text/.test(m.refusals[0]) && /2026-10-15/.test(m.refusals[0]), JSON.stringify(m.refusals));
   check("undefined context refuses", !mayPassInfoPage(undefined) && infoPagePassRefusals(undefined).length > 0);
+  // Two entries for the same page through different tiles: the run's own steps pick exactly one.
+  const viaA = entryFor(devhub(), PREFIX_STEPS, "pass-a");
+  const viaB = entryFor(devhub(), [...PREFIX_STEPS.slice(0, 2), { action: "click", note: "permit type: Trade Permits" }], "pass-b");
+  const pick = infoPageMatchRefusals(digestInfoPageIdentity(devhub()), [viaB, viaA], infoPagePrefixOf(PREFIX_STEPS));
+  check("the prefix is part of the match: of two entries for the same page, the one verified on THIS run's steps is the match", pick.entry?.id === "pass-a" && pick.refusals.length === 0, JSON.stringify(pick));
+}
+
+// ---------------------------------------------------------------------------------------------
+console.log("\nINVALIDATION BEFORE THE CLICK (proposal §4)");
+{
+  const prefix = infoPagePrefixOf(PREFIX_STEPS);
+  const e = entryFor(devhub());
+  const exact = infoPageDriftedEntries(digestInfoPageIdentity(devhub()), [e], prefix, []);
+  check("the exact verified page on the exact steps drifts nothing", exact.length === 0, JSON.stringify(exact));
+  const variants: Array<[string, (m: InfoPageIdentityMaterial) => void, InfoPageRunStep[] | null, RegExp]> = [
+    ["a signature change (one sentence)", (m) => { m.text += " New sentence."; }, null, /text/],
+    ["a different forward control", (m) => { m.control.name = "t_n9"; m.request.body = [["t_n9", ""]]; }, null, /forward control/],
+    ["a different request (a hidden field)", (m) => { m.structure.forms[0].elements.push(["input", "hidden", "__csrf", "abc"]); m.request.body = [["__csrf", "abc"], ["t_n1685049573549", ""]]; m.facts.hiddenNames = ["__csrf"]; }, null, /different request/],
+    ["different steps before it (another tile)", () => undefined, [...PREFIX_STEPS.slice(0, 2), { action: "click", note: "permit type: Trade Permits" }], /different steps/],
+  ];
+  for (const [what, mutate, steps, re] of variants) {
+    const m = devhub();
+    mutate(m);
+    const d = infoPageDriftedEntries(digestInfoPageIdentity(m), [e], infoPagePrefixOf(steps ?? PREFIX_STEPS), []);
+    check(`an incident on the pass at the same host + path: ${what}`, d.length === 1 && d[0].entryId === "pass-1" && d[0].why.some((w) => re.test(w)) && d[0].where === `${ORIGIN}/permits/sfjsp`, JSON.stringify(d));
+  }
+  const elsewhere = devhub();
+  elsewhere.page.path = "/permits/other";
+  check("a page at ANOTHER path never invalidates the pass", infoPageDriftedEntries(digestInfoPageIdentity(elsewhere), [e], prefix, []).length === 0);
+  const changed = devhub();
+  changed.text += " New sentence.";
+  check("a pass already passed on THIS run is not invalidated by a later page at the same path",
+    infoPageDriftedEntries(digestInfoPageIdentity(changed), [e], prefix, ["pass-1"]).length === 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+console.log("\nAFTER THE CLICK (proposal §4): the page must read as an unfiled form");
+{
+  const form = { readable: true, fillable: 3, terminal: false, text: "Project Information Site Address Owner Name Previous Next" };
+  check("the application form (fields, not terminal, neither filed nor an error) passes", infoPageAfterClickRefusals(form).length === 0, JSON.stringify(infoPageAfterClickRefusals(form)));
+  const bad: Array<[string, Record<string, unknown>, RegExp]> = [
+    ["a receipt ('Your application has been submitted')", { text: "Thank you. Your application has been submitted.", fillable: 0 }, /reads as filed/],
+    ["a confirmation number", { text: "Confirmation number: PR-2026-00042", fillable: 0 }, /reads as filed/],
+    ["a filed status beside a form", { text: "Request status: your request was received. Your submission was received.", fillable: 2 }, /reads as filed/],
+    ["the review page", { terminal: true, text: "Please review your application before submitting." }, /review \/ terminal/],
+    ["an error page", { text: "There was an error processing your request.", fillable: 1 }, /reads as an error/],
+    ["a page that reads both ways", { text: "Your application has been submitted. There was an error.", fillable: 1 }, /both as filed and as an error/],
+    ["the same information page again (no field)", { fillable: 0, text: "Permitting Information. A Permit Tech will review your submission." }, /no fillable field/],
+    ["an unreadable page", { readable: false, text: "", fillable: 0 }, /could not be read/],
+    ["an unknown terminal reading", { terminal: null }, /could not be judged/],
+  ];
+  for (const [what, patch, re] of bad) {
+    const r = infoPageAfterClickRefusals({ ...form, ...patch } as never);
+    check(`refused (an incident): ${what}`, r.some((x) => re.test(x)), JSON.stringify(r));
+  }
+  check("refused: no reading at all", infoPageAfterClickRefusals(null).length > 0);
+  check("quoted evidence never carries the number itself", !infoPageAfterClickRefusals({ ...form, text: "Confirmation number: PR-2026-00042" }).join(" ").includes("2026"));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -323,9 +387,56 @@ console.log("\nGREP PINS");
   const callers = files.filter((f) => /infoPagePassRefusals\(|mayPassInfoPage\(|infoPagePassEntry\(/.test(fs.readFileSync(f, "utf8"))).map(rel).sort();
   check("the pass predicate is called only from shared/src/infoPagePass.ts and portal-bot/src/filingBackstop.ts",
     JSON.stringify(callers) === JSON.stringify(["portal-bot/src/filingBackstop.ts", "shared/src/infoPagePass.ts"]), JSON.stringify(callers));
-  const writers = files.filter((f) => /(INSERT\s+INTO|UPDATE)\s+portal_info_page_(passes|candidates)\b/i.test(fs.readFileSync(f, "utf8"))).map(rel).sort();
+  const writers = files.filter((f) => /(INSERT\s+(OR\s+\w+\s+)?INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+portal_info_page_(passes|candidates)\b/i.test(fs.readFileSync(f, "utf8"))).map(rel).sort();
   check("portal_info_page_passes / _candidates are written only by backend/src/infoPages.ts",
     JSON.stringify(writers) === JSON.stringify(["backend/src/infoPages.ts"]), JSON.stringify(writers));
+  // THE SINGLE WRITER (proposal §2): every production file in the repo — backend, portal-bot, shared,
+  // scripts, tools, the frontend and the root scripts — is scanned for the pass table. It is named
+  // only by its migration and by infoPages.ts; there it is CREATED by exactly one statement inside
+  // verifyInfoPageCandidate (a person's verify), never updated or replaced, and deleted by exactly
+  // one statement inside removeInfoPagePass (every withdrawal). A recipe save, a KB import, research,
+  // a correction or a migration cannot create authority for this click.
+  const anyCode = (dir: string, out: string[] = []): string[] => {
+    if (!fs.existsSync(dir)) return out;
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.name === "node_modules" || e.name.startsWith(".") || e.name === "data") continue;
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) anyCode(p, out); else if (/\.(ts|mts|js|mjs|cjs)$/.test(e.name)) out.push(p);
+    }
+    return out;
+  };
+  const rootScripts = fs.readdirSync(root).filter((n) => /\.(ts|mts|js|mjs)$/.test(n)).map((n) => path.join(root, n));
+  const everything = [...["shared/src", "portal-bot/src", "backend/src", "scripts", "tools", "frontend"].flatMap((d) => anyCode(path.join(root, d))), ...rootScripts]
+    .filter((f) => !/\.test\.ts$|\.smoke\.ts$/.test(f));
+  const naming = everything.filter((f) => /portal_info_page_passes/.test(fs.readFileSync(f, "utf8"))).map(rel).sort();
+  check("the pass table is named only by its migration (db.ts) and by backend/src/infoPages.ts",
+    JSON.stringify(naming) === JSON.stringify(["backend/src/db.ts", "backend/src/infoPages.ts"]), JSON.stringify(naming));
+  const infoSrc = fs.readFileSync(path.join(root, "backend/src/infoPages.ts"), "utf8");
+  const fnBody = (name: string): string => {
+    const at = infoSrc.indexOf(`function ${name}(`);
+    if (at < 0) return "";
+    const next = infoSrc.slice(at + 10).search(/\n(export )?(async )?function /);
+    return next < 0 ? infoSrc.slice(at) : infoSrc.slice(at, at + 10 + next);
+  };
+  const inserts = infoSrc.match(/INSERT\s+(OR\s+\w+\s+)?INTO\s+portal_info_page_passes\b/gi) ?? [];
+  check("ONE create: exactly one INSERT INTO portal_info_page_passes, inside verifyInfoPageCandidate",
+    inserts.length === 1 && /INSERT\s+INTO\s+portal_info_page_passes\b/i.test(fnBody("verifyInfoPageCandidate")), `${inserts.length} insert(s)`);
+  check("NO update, NO replace of a pass, anywhere", !everything.some((f) => /(UPDATE|REPLACE\s+INTO)\s+portal_info_page_passes\b/i.test(fs.readFileSync(f, "utf8"))));
+  const deletes = infoSrc.match(/DELETE\s+FROM\s+portal_info_page_passes\b/gi) ?? [];
+  check("ONE delete: exactly one DELETE FROM portal_info_page_passes, inside removeInfoPagePass (every withdrawal)",
+    deletes.length === 1 && /DELETE\s+FROM\s+portal_info_page_passes\b/i.test(fnBody("removeInfoPagePass")), `${deletes.length} delete(s)`);
+  check("the db.ts migration only CREATEs the pass table (no row is written by a migration)",
+    !/(INSERT\s+(OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM|REPLACE\s+INTO)\s+portal_info_page_passes\b/i.test(fs.readFileSync(path.join(root, "backend/src/db.ts"), "utf8")));
+  // THE BOT RECEIVES PASSES ONLY AS INPUT, from the one effective-row predicate: liveInfoPagePasses
+  // is read only by autoLearn (the learn's input) and infoPages itself; the learner keeps only its
+  // frozen options copy, never anything from recipe steps.
+  const liveReaders = everything.filter((f) => /liveInfoPagePasses\(/.test(fs.readFileSync(f, "utf8"))).map(rel).sort();
+  check("liveInfoPagePasses is read only by backend/src/autoLearn.ts (the learn's input) and infoPages.ts",
+    JSON.stringify(liveReaders) === JSON.stringify(["backend/src/autoLearn.ts", "backend/src/infoPages.ts"]), JSON.stringify(liveReaders));
+  const learnerSrc = fs.readFileSync(path.join(root, "portal-bot/src/adapters/autoLearnAdapter.ts"), "utf8");
+  const assigns = learnerSrc.match(/this\.infoPagePasses\s*=[^=][^;]*;/g) ?? [];
+  check("the learner's verified pages come ONLY from its options (frozen at construction), never from a recipe step",
+    assigns.length === 1 && /options\.infoPagePasses/.test(assigns[0]) && !/step\w*\.(infoPage|verifiedInfoPage)/.test(learnerSrc), JSON.stringify(assigns));
   const learner = fs.readFileSync(path.join(root, "portal-bot/src/adapters/autoLearnAdapter.ts"), "utf8");
   check("the learner opens an information-page pass at exactly one place", (learner.match(/\.openInfoPagePass\(/g) ?? []).length === 1);
   const replay = fs.readFileSync(path.join(root, "portal-bot/src/adapters/recipeAdapter.ts"), "utf8");

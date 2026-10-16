@@ -1,7 +1,8 @@
 // HUMAN-VERIFIED INFORMATION PAGES, THE BACKEND (#344, option B): backend/src/infoPages.ts, migration
-// v49, autoLearn's finalize and the six routes — on a scratch DB, through the real write paths.
+// v50, autoLearn's finalize, repository.deleteProject and the six routes — on a scratch DB, through
+// the real write paths.
 //
-//   MIGRATION — v49 creates both tables and all four indexes, and replays after its schema_meta row is
+//   MIGRATION — v50 creates both tables and all four indexes, and replays after its schema_meta row is
 //               deleted; listing on a fresh DB writes nothing.
 //   CAPTURE   — a learn the backstop held at an unverified page (the learner stubbed through
 //               setAutoLearnSeamsForTests) records ONE open candidate with its screenshot through
@@ -14,8 +15,18 @@
 //               carrying / different held request, the project's own values on the page, a prefix
 //               that is not entry clicks, and a duplicate live identity. Success writes the shared
 //               row FROM THE ROW, audits it, stamps the candidate.
-//   RULE 3    — a re-capture with another identity leaves the pass byte-identical; withdraw stamps,
-//               audits and drops the row from liveInfoPagePasses; nothing deletes a pass.
+//   RULE 3    — a re-capture with another identity leaves the pass byte-identical; a person's
+//               withdraw DELETES the row (the audit keeps its history) and the bot stops receiving it.
+//   FORGED    — a pass row written by any path but the verify action (a direct insert, a copy of a
+//               real row) is never handed to a run; a pass "moved" to another host, path, control,
+//               request or step sequence, or whose candidate no longer records the verification,
+//               neither; pass-shaped fields saved onto recipe steps through the real save change
+//               nothing. (Kill: drop the provenance check in liveInfoPagePasses and these go red.)
+//   INCIDENTS — before the click (the page drifted) and after it (the page read as filed): audited
+//               on the project, the pass DELETED, the fresh candidate recorded, the learn "failed"
+//               with nothing recorded as filed; an unknown pass id is audited all the same.
+//   DELETE    — deleting the project a page was verified on deletes its candidates and withdraws
+//               that pass (audited with no project, so the history survives the project).
 //   SHARED    — GET /api/info-page-passes carries no text, no hash of a value, no verifier, no project.
 //   PROGRESS  — a tracking number on the same origin, a staged submission on the same side or a
 //               recorded draft refuses; another origin / the other side does not; unknown refuses.
@@ -36,7 +47,7 @@ import {
   INFO_PAGE_IDENTITY_VERSION, digestInfoPageIdentity, infoPageEvidence, infoPagePrefixOf, sha256Hex,
   type InfoPageIdentityMaterial,
 } from "../../shared/src/infoPagePass";
-import type { InfoPageCandidateCapture } from "../../shared/src/types";
+import type { InfoPageCandidateCapture, InfoPageIncident } from "../../shared/src/types";
 
 const fx = await setupStageFixture("info-pages");
 const { db } = fx;
@@ -92,9 +103,12 @@ const expect409 = (fn: () => unknown, re: RegExp): void => {
 };
 
 // ── MIGRATION ─────────────────────────────────────────────────────────────────────────────────
-await check("v49 creates both tables and all four indexes", () => {
+await check("v50 creates both tables and all four indexes (and the pass table has no update-only columns)", () => {
   const names = db.query<{ name: string }>("SELECT name FROM sqlite_master WHERE name LIKE '%info_page%' AND name NOT LIKE 'sqlite_%'").map((r) => r.name).sort();
-  assert.deepEqual(names, ["idx_info_page_cand_project", "idx_info_page_pass_origin", "portal_info_page_candidates", "portal_info_page_passes", "ux_info_page_cand_live", "ux_info_page_pass_live"]);
+  assert.deepEqual(names, ["idx_info_page_cand_project", "idx_info_page_pass_origin", "portal_info_page_candidates", "portal_info_page_passes", "ux_info_page_cand_live", "ux_info_page_pass_identity"]);
+  const cols = db.query<{ name: string }>("PRAGMA table_info(portal_info_page_passes)").map((r) => r.name);
+  assert.ok(!cols.some((c) => /withdrawn/.test(c)), JSON.stringify(cols));
+  assert.equal(Number(db.get<{ v: number }>("SELECT MAX(version) AS v FROM schema_meta")!.v), 50);
 });
 await check("listing on a fresh DB writes nothing (reads write nothing)", () => {
   const before = Number(db.get<{ n: number }>("SELECT total_changes() AS n")!.n);
@@ -106,14 +120,16 @@ await check("listing on a fresh DB writes nothing (reads write nothing)", () => 
 let handed: { infoPagePasses?: unknown[]; infoPagePriorProgress?: boolean } | null = null;
 let nextCapture: InfoPageCandidateCapture | undefined;
 let nextPassed: Array<{ passId: string; where: string }> | undefined;
+let nextIncidents: InfoPageIncident[] | undefined;
 const stubLearn = () => ({
   ok: false, portalName: "stub", steps: [], reviewScreen: { fields: [], bodyTextSnippet: "" }, finalSubmitRecorded: false, pageCount: 2, pauseReason: null,
-  message: "HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: the network backstop held \"Next\".", stopReason: "backstop_abort",
-  ...(nextCapture ? { infoPageCandidate: nextCapture } : {}), ...(nextPassed ? { infoPagePassed: nextPassed } : {}),
+  message: nextIncidents?.some((i) => i.phase === "after") ? "STOPPED AFTER A VERIFIED INFORMATION PAGE: the page it led to reads as filed." : "HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: the network backstop held \"Next\".",
+  stopReason: nextIncidents?.some((i) => i.phase === "after") ? "info_page_incident" : "backstop_abort",
+  ...(nextCapture ? { infoPageCandidate: nextCapture } : {}), ...(nextPassed ? { infoPagePassed: nextPassed } : {}), ...(nextIncidents ? { infoPageIncidents: nextIncidents } : {}),
 });
 autoLearn.setAutoLearnSeamsForTests({ learnPortal: (async (input: typeof handed) => { handed = input; return stubLearn(); }) as never });
-const runLearn = async (projectId: string, c?: InfoPageCandidateCapture, passed?: Array<{ passId: string; where: string }>) => {
-  nextCapture = c; nextPassed = passed; handed = null;
+const runLearn = async (projectId: string, c?: InfoPageCandidateCapture, passed?: Array<{ passId: string; where: string }>, incidents?: InfoPageIncident[]) => {
+  nextCapture = c; nextPassed = passed; nextIncidents = incidents; handed = null;
   return autoLearn.autoLearnPortal(db, projectId, { scope: "ahj", portalUrl: `${ORIGIN}/permits/sfjsp?interviewID=Home`, createdBy: "operator", permitType: "structural" });
 };
 
@@ -237,6 +253,67 @@ await check("a learn that PASSED a verified page records each use (portal.info_p
   await runLearn(fx.newProject(), undefined, [{ passId: pass1, where: `${ORIGIN}/permits/sfjsp` }]);
   assert.equal(fx.audits("portal.info_page_passed").length, before + 1);
 });
+// ── FORGED / MOVED: only a person's verification on record is authority ───────────────────────
+const liveIds = (): string[] => IP.liveInfoPagePasses(db).map((p) => p.id);
+await check("FORGED: a pass row INSERTED by any other path (no verification on record) is never handed to a run, and the KB list says so", async () => {
+  const forged = material((m) => { m.title = "Forged Page"; });
+  const d = digestInfoPageIdentity(forged);
+  db.run(`INSERT INTO portal_info_page_passes (id, origin, path, query_keys_json, identity_version, identity_sha256, page_sha256, title_sha256, structure_sha256, text_sha256,
+    control_sha256, request_sha256, control_label, control_name, control_tag, control_type, request_method, request_where, request_action_sha256, request_media,
+    request_body_json, prefix_json, summary_json, verified_at, verified_by, verified_by_user_id, source_candidate_id)
+    VALUES ('forged-1', ?, ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, 'Next', 't_n1', 'button', 'submit', 'POST', ?, ?, 'multipart/form-data', ?, ?, '{}', '2026-10-15T00:00:00.000Z', 'Mallory Forger', '', 'no-such-candidate')`,
+  [d.origin, d.path, d.version, d.identitySha256, d.components.pageSha, d.components.titleSha, d.components.structureSha, d.components.textSha, d.components.controlSha, d.components.requestSha,
+    d.expected.where, d.expected.actionUrlSha, JSON.stringify(d.expected.body), JSON.stringify(PREFIX)]);
+  assert.deepEqual(liveIds(), [pass1]);
+  const listed = IP.listInfoPagePasses(db).find((p) => p.id === "forged-1");
+  assert.equal(listed?.live, false);
+  await runLearn(fx.newProject());
+  assert.deepEqual((handed!.infoPagePasses as Array<{ id: string }>).map((p) => p.id), [pass1]);
+  db.run("DELETE FROM portal_info_page_passes WHERE id = 'forged-1'");
+});
+await check("FORGED: a COPY of a real pass row under another id (pointing at the real candidate) is never handed to a run", () => {
+  const forged = material((m) => { m.title = "Copied Page"; });
+  const d = digestInfoPageIdentity(forged);
+  db.run(`INSERT INTO portal_info_page_passes SELECT 'copied-1', origin, path, query_keys_json, identity_version, ?, page_sha256, title_sha256, structure_sha256, text_sha256,
+    control_sha256, request_sha256, control_label, control_name, control_tag, control_type, request_method, request_where, request_action_sha256, request_media,
+    request_body_json, prefix_json, summary_json, verified_at, verified_by, verified_by_user_id, source_candidate_id FROM portal_info_page_passes WHERE id = ?`, [d.identitySha256, pass1]);
+  assert.deepEqual(liveIds(), [pass1]);
+  db.run("DELETE FROM portal_info_page_passes WHERE id = 'copied-1'");
+});
+const moves: Array<[string, string, string]> = [
+  ["another host", "origin", "https://permits.other.test"],
+  ["another path (tenant)", "path", "/agency-b/permits/sfjsp"],
+  ["another control", "control_name", "t_n9"],
+  ["another request", "request_where", "https://permits.example.test/permits/file"],
+  ["another step sequence", "prefix_json", JSON.stringify([...PREFIX.slice(0, 2), ["click", "permit type: Trade Permits", ""]])],
+  ["another verifier", "verified_by", "Somebody Else"],
+];
+for (const [what, col, value] of moves) {
+  await check(`MOVED RECORD: the pass row moved to ${what} is not authority until it is exactly what the person verified`, () => {
+    const before = db.get<Record<string, unknown>>(`SELECT ${col} AS v FROM portal_info_page_passes WHERE id = ?`, [pass1])!.v;
+    db.run(`UPDATE portal_info_page_passes SET ${col} = ? WHERE id = ?`, [value, pass1]);
+    try { assert.deepEqual(liveIds(), []); } finally { db.run(`UPDATE portal_info_page_passes SET ${col} = ? WHERE id = ?`, [before, pass1]); }
+    assert.deepEqual(liveIds(), [pass1]);
+  });
+}
+await check("MOVED RECORD: a pass whose candidate no longer records the verification (status / pass id) is not authority", () => {
+  db.run("UPDATE portal_info_page_candidates SET status = 'open' WHERE id = ?", [cid1]);
+  try { assert.deepEqual(liveIds(), []); } finally { db.run("UPDATE portal_info_page_candidates SET status = 'verified' WHERE id = ?", [cid1]); }
+  db.run("UPDATE portal_info_page_candidates SET pass_id = 'other' WHERE id = ?", [cid1]);
+  try { assert.deepEqual(liveIds(), []); } finally { db.run("UPDATE portal_info_page_candidates SET pass_id = ? WHERE id = ?", [pass1, cid1]); }
+  assert.deepEqual(liveIds(), [pass1]);
+});
+await check("FORGED: pass-shaped fields saved onto RECIPE STEPS through the real save are ignored (the run is handed the record, nothing else)", async () => {
+  const forgedFields = { infoPagePass: { identitySha256: sha256Hex("x"), verifiedBy: "Mallory" }, verifiedInfoPage: { id: "forged", prefix: [] }, infoPagePasses: [{ id: "forged" }] };
+  // Its own AHJ, so no later learn here meets a complete recipe.
+  const r = fx.recipes.startPortalRecording(db, { scopeType: "ahj", state: "OR", ahj: "Forgedville", utility: "PGE", portalUrl: `${ORIGIN}/permits/sfjsp`, portalPlatform: "other", createdBy: "test" });
+  fx.recipes.savePortalRecipeSteps(db, r.id, [{ ...(fx.fills(1)[0]), ...forgedFields } as never, { action: "click", selector: { text: "Next" }, note: "advance: Next", ...forgedFields } as never, fx.REVIEW, fx.FINAL], { status: "complete" });
+  assert.deepEqual(liveIds(), [pass1]);
+  await runLearn(fx.newProject());
+  assert.deepEqual((handed!.infoPagePasses as Array<{ id: string }>).map((p) => p.id), [pass1]);
+  assert.equal(db.query("SELECT id FROM portal_info_page_passes").length, 1);
+});
+
 await check("RULE 3: a re-capture with ANOTHER identity is a new candidate; the pass row stays byte-identical", async () => {
   const before = JSON.stringify(passRows());
   await runLearn(P1, capture(material((m) => { m.text += " New paragraph."; })));
@@ -265,20 +342,31 @@ await check("a dismissed page stays dismissed on a re-capture, and the run says 
 });
 
 // ── WITHDRAW ─────────────────────────────────────────────────────────────────────────────────────
-await check("withdraw stamps the row (never deletes it), audits, and the bot no longer receives it", () => {
+await check("a person's withdraw DELETES the row, audits its history (no verifier, no project), and the bot no longer receives it", () => {
   IP.withdrawInfoPagePass(db, pass1, { by: "Wren Withdrawer", userId: "", reason: "the page changed" });
-  const p = passRows();
-  assert.equal(p.length, 1);
-  assert.ok(String(p[0].withdrawn_at));
-  assert.equal(p[0].withdrawn_by, "Wren Withdrawer");
+  assert.equal(passRows().length, 0);
   assert.equal(IP.liveInfoPagePasses(db).length, 0);
-  assert.equal(fx.audits("portal.info_page_pass_withdrawn").length, 1);
+  const a = fx.audits("portal.info_page_pass_withdrawn");
+  assert.equal(a.length, 1);
+  assert.equal(a[0].project_id, null);
+  assert.equal(a[0].actor_name, "Wren Withdrawer");
+  const d = JSON.parse(a[0].details);
+  assert.equal(d.passId, pass1);
+  assert.equal(d.reason, "the page changed");
+  assert.equal(d.pass.origin, ORIGIN);
+  assert.ok(!a[0].details.includes("Pat Verifier"), "the withdrawal row carries the verifier");
+  assert.throws(() => IP.withdrawInfoPagePass(db, pass1, { by: "Wren Withdrawer", userId: "", reason: "again" }), /not found/);
 });
-await check("after a withdrawal a re-capture of that page is a NEW open row (the verified one untouched)", async () => {
-  const P = fx.newProject();
-  await runLearn(P, capture());
-  assert.equal(cand(P).length, 1);
-  assert.equal(cand(P)[0].status, "open");
+let pass2 = "";
+await check("after a withdrawal a re-capture of that page is a NEW open row (the verified one untouched), and a person can verify it again", async () => {
+  await runLearn(P1, capture());
+  const open = cand(P1).filter((r) => r.status === "open" && r.identity_sha256 === capture().identitySha256);
+  assert.equal(open.length, 1);
+  assert.equal(cand(P1).filter((r) => r.status === "verified").length, 1);
+  pass2 = verifyFn(P1, String(open[0].id), capture().identitySha256).passId;
+  assert.deepEqual(IP.liveInfoPagePasses(db).map((p) => p.id), [pass2]);
+  const records = IP.listInfoPageCandidates(db, P1).filter((c) => c.status === "verified");
+  assert.deepEqual(records.map((c) => c.passLive).sort(), [false, true]);
 });
 await check("the shared list carries places, names and dates only — no text, no hash of a value, no verifier, no project", () => {
   const l = IP.listInfoPagePasses(db);
@@ -290,7 +378,78 @@ await check("the shared list carries places, names and dates only — no text, n
   assert.deepEqual(l[0].request.fieldNames, ["t_n1"]);
 });
 
+// ── INCIDENTS (proposal §4) ──────────────────────────────────────────────────────────────────────
+const verifiedPage = async (title: string): Promise<{ P: string; passId: string; c: InfoPageCandidateCapture }> => {
+  const P = fx.newProject();
+  const c = capture(material((m) => { m.title = title; }));
+  await runLearn(P, c);
+  const passId = verifyFn(P, String(cand(P)[0].id), c.identitySha256).passId;
+  assert.ok(IP.liveInfoPagePasses(db).some((p) => p.id === passId));
+  return { P, passId, c };
+};
+await check("INCIDENT BEFORE THE CLICK: the pass is DELETED and audited on the project; the page as it is now is the fresh candidate", async () => {
+  const { P, passId } = await verifiedPage("Incident Before Page");
+  const now = capture(material((m) => { m.title = "Incident Before Page"; m.text += " A new sentence."; }));
+  const r = await runLearn(P, now, undefined, [{ passId, phase: "before", why: ["the page's text changed"], where: `${ORIGIN}/permits/sfjsp` }]);
+  assert.equal(db.query("SELECT id FROM portal_info_page_passes WHERE id = ?", [passId]).length, 0);
+  assert.ok(!IP.liveInfoPagePasses(db).some((p) => p.id === passId));
+  const a = fx.audits("portal.info_page_pass_incident").filter((x) => JSON.parse(x.details).passId === passId);
+  assert.equal(a.length, 1);
+  assert.equal(a[0].project_id, P);
+  const d = JSON.parse(a[0].details);
+  assert.equal(d.phase, "before");
+  assert.equal(d.withdrawn, true);
+  assert.deepEqual(d.why, ["the page's text changed"]);
+  assert.equal(d.pass.origin, ORIGIN);
+  assert.ok(cand(P).some((x) => x.status === "open" && x.identity_sha256 === now.identitySha256), "the page as it is now was not recorded as a candidate");
+  assert.match(String(r.message), /verified information page changed; that verification was withdrawn/);
+});
+await check("INCIDENT AFTER THE CLICK: the pass is DELETED and audited; the learn is 'failed' and NOTHING is recorded as filed", async () => {
+  const { P, passId } = await verifiedPage("Incident After Page");
+  const r = await runLearn(P, undefined, [{ passId, where: `${ORIGIN}/permits/sfjsp` }],
+    [{ passId, phase: "after", why: ["the page after the click reads as filed (\"Confirmation number: PR-####-####\")"], where: `${ORIGIN}/permits/sfjsp` }]);
+  assert.equal(db.query("SELECT id FROM portal_info_page_passes WHERE id = ?", [passId]).length, 0);
+  const a = fx.audits("portal.info_page_pass_incident").filter((x) => JSON.parse(x.details).passId === passId);
+  assert.equal(a.length, 1);
+  assert.equal(JSON.parse(a[0].details).phase, "after");
+  assert.equal(fx.audits("portal.info_page_passed").filter((x) => JSON.parse(x.details).passId === passId).length, 1, "the use itself is on record too");
+  assert.equal(r.status, "failed");
+  assert.match(String(r.message), /did not read as an unfiled form; that verification was withdrawn/);
+  assert.equal(db.query("SELECT id FROM submissions WHERE project_id = ? AND status IN ('submitted', 'submitted_unconfirmed', 'awaiting_human_submit', 'staged')", [P]).length, 0);
+  assert.equal(db.query("SELECT id FROM portal_runs WHERE project_id = ? AND (confirmation_number <> '' OR status = 'submitted')", [P]).length, 0);
+  assert.equal(db.query("SELECT id FROM permit_check_targets WHERE project_id = ? AND (application_number <> '' OR permit_number <> '')", [P]).length, 0);
+});
+await check("an incident on a pass that is already gone is audited all the same (withdrawn: false)", async () => {
+  const P = fx.newProject();
+  await runLearn(P, undefined, undefined, [{ passId: "gone-pass", phase: "before", why: ["x"], where: `${ORIGIN}/permits/sfjsp` }]);
+  const a = fx.audits("portal.info_page_pass_incident").filter((x) => JSON.parse(x.details).passId === "gone-pass");
+  assert.equal(a.length, 1);
+  assert.equal(JSON.parse(a[0].details).withdrawn, false);
+});
+
+// ── DELETE PROJECT ───────────────────────────────────────────────────────────────────────────────
+await check("deleting the project a page was verified on deletes its candidates and withdraws that pass (audited with no project)", async () => {
+  const { P, passId } = await verifiedPage("Deleted Project Page");
+  fx.repo.deleteProject(db, P);
+  assert.equal(db.query("SELECT id FROM portal_info_page_candidates WHERE project_id = ?", [P]).length, 0);
+  assert.equal(db.query("SELECT id FROM portal_info_page_passes WHERE id = ?", [passId]).length, 0);
+  const a = fx.audits("portal.info_page_pass_withdrawn").filter((x) => JSON.parse(x.details).passId === passId);
+  assert.equal(a.length, 1);
+  assert.equal(a[0].project_id, null);
+  assert.match(JSON.parse(a[0].details).reason, /project it was verified on was deleted/);
+  assert.ok(IP.liveInfoPagePasses(db).some((p) => p.id === pass2), "another project's pass was touched");
+});
+
 // ── PRIOR PROGRESS ───────────────────────────────────────────────────────────────────────────────
+await check("prior progress: a portal run on the same side that recorded a number or was submitted refuses; the other side does not", () => {
+  const P = fx.newProject();
+  const url = `${ORIGIN}/permits/sfjsp`;
+  db.run("INSERT INTO portal_runs (id, project_id, run_type, status, started_at, permit_type, confirmation_number) VALUES (?, ?, 'stage', 'failed', '2026-10-15', 'nem', 'NEM-1234')", [`r1-${P}`, P]);
+  assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), false);
+  assert.equal(IP.infoPagePriorProgress(db, P, url, "utility"), true);
+  db.run("INSERT INTO portal_runs (id, project_id, run_type, status, started_at, permit_type) VALUES (?, ?, 'stage', 'awaiting_human_submit', '2026-10-15', 'permit')", [`r2-${P}`, P]);
+  assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), true);
+});
 await check("prior progress: a tracking number on the SAME origin refuses; another origin does not; unknown refuses", () => {
   const P = fx.newProject();
   const url = `${ORIGIN}/permits/sfjsp?interviewID=Home`;
@@ -334,12 +493,12 @@ setUserPassword(db, "u-other", "info-test-password-1");
 const dbPath = String(process.env.AUTOPILOT_DB_PATH);
 db.close();
 
-await check("v49 replays after its schema_meta row is deleted (CREATE … IF NOT EXISTS; nothing lost)", async () => {
+await check("v50 replays after its schema_meta row is deleted (CREATE … IF NOT EXISTS; nothing lost)", async () => {
   const dbMod = await import("../src/db");
-  const before = await (async () => { const d = await dbMod.openDatabase(); try { const n = d.query("SELECT id FROM portal_info_page_candidates").length; d.run("DELETE FROM schema_meta WHERE version >= 49"); return n; } finally { d.close(); } })();
+  const before = await (async () => { const d = await dbMod.openDatabase(); try { const n = d.query("SELECT id FROM portal_info_page_candidates").length; d.run("DELETE FROM schema_meta WHERE version >= 50"); return n; } finally { d.close(); } })();
   const d = await dbMod.openDatabase();
   try {
-    assert.equal(Number(d.get<{ v: number }>("SELECT MAX(version) AS v FROM schema_meta")!.v) >= 49, true);
+    assert.equal(Number(d.get<{ v: number }>("SELECT MAX(version) AS v FROM schema_meta")!.v) >= 50, true);
     assert.equal(d.query("SELECT id FROM portal_info_page_candidates").length, before);
     assert.equal(d.query("SELECT name FROM sqlite_master WHERE name LIKE '%info_page%' AND name NOT LIKE 'sqlite_%'").length, 6);
   } finally { d.close(); }
@@ -450,7 +609,7 @@ const readDb = async <T>(fn: (d: typeof db) => T): Promise<T> => {
       assert.equal(cross.status, 403, cross.text);
       const ok = await call(PORT, "POST", u, { body: { withdrawnBy: "Pat Synthetic", reason: "the page changed" }, headers: same });
       assert.equal(ok.status, 200, ok.text);
-      assert.ok(JSON.parse(ok.text).passes.some((p: { id: string; status: string }) => p.id === routePass && p.status === "withdrawn"));
+      assert.ok(JSON.parse(ok.text).passes.every((p: { id: string; status: string }) => p.id !== routePass));
     });
   } finally { stop(server); }
 }

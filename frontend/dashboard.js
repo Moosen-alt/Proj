@@ -7842,7 +7842,7 @@ function infoPageCandidateCardsHtml(candidates, projectId) {
       <p class="muted" style="font-size:11px;margin-top:4px">Marking it lets automation press "${esc(c.controlLabel)}" on exactly this page, for every client, only on a run that has entered nothing. It never applies after a field is filled, on a resumed draft or signature, or if anything on the page changes.</p>
     </article>`;
   }).join("");
-  const done = decided.map((c) => `<p class="muted" style="font-size:12px">Information page ${esc(c.origin)}${esc(c.path)}: ${c.status === "verified" ? "verified" : "marked not an information page"} by ${esc(c.decidedBy || "a person")} ${esc(String(c.decidedAt || "").slice(0, 10))}.</p>`).join("");
+  const done = decided.map((c) => `<p class="muted" style="font-size:12px">Information page ${esc(c.origin)}${esc(c.path)}: ${c.status === "verified" ? (c.passLive ? "verified" : "verified, since withdrawn") : "marked not an information page"} by ${esc(c.decidedBy || "a person")} ${esc(String(c.decidedAt || "").slice(0, 10))}.</p>`).join("");
   return cards + done;
 }
 
@@ -7894,19 +7894,21 @@ function bindInfoPageCandidateButtons(projectId) {
 }
 
 // The shared list (Knowledge modal): where each verified page lives, its control, its request's
-// field NAMES, when it was verified, and whether it was withdrawn — never its text or a hash.
+// field NAMES and when it was verified — never its text or a hash. A withdrawn pass is DELETED (the
+// audit log keeps its history), so every row here is a pass; one with no person's verification on
+// record is shown as such and is never handed to a run.
 function infoPagePassRowsHtml(passes) {
   const list = Array.isArray(passes) ? passes : [];
-  if (!list.length) return `<p class="muted">No information page has been verified. A run held at one offers it on the project's Portal runs.</p>`;
+  if (!list.length) return `<p class="muted">No information page is verified. A run held at one offers it on the project's Portal runs.</p>`;
   return list.map((p) => {
     const req = p.request || {};
-    const live = p.status === "live";
+    const live = p.live === true;
     return `
-    <article class="item ${live ? "info" : ""}">
-      <div class="item-title"><span>${esc(p.origin)}${esc(p.path)}</span><span class="badge">${live ? "live" : "withdrawn"}</span></div>
+    <article class="item ${live ? "info" : "warning"}">
+      <div class="item-title"><span>${esc(p.origin)}${esc(p.path)}</span><span class="badge">${live ? "live" : "no verification on record — never used"}</span></div>
       <p class="muted" style="font-size:12px">Control: <strong>${esc(p.controlLabel)}</strong> (${esc(p.controlName)}) · request ${esc(req.method)} ${esc(req.where)} · ${esc(req.media)} · fields: ${esc((req.fieldNames || []).join(", ") || "none")} · identity ${esc(p.identityPrefix)}…</p>
-      <p class="muted" style="font-size:12px">Verified ${esc(String(p.verifiedAt || "").slice(0, 10))}${live ? "" : ` · withdrawn ${esc(String(p.withdrawnAt || "").slice(0, 10))}: ${esc(p.withdrawReason)}`}</p>
-      ${live ? `<button class="secondary" data-info-withdraw="${esc(p.id)}" style="font-size:12px">Withdraw</button>` : ""}
+      <p class="muted" style="font-size:12px">Verified ${esc(String(p.verifiedAt || "").slice(0, 10))}</p>
+      <button class="secondary" data-info-withdraw="${esc(p.id)}" style="font-size:12px">Withdraw</button>
     </article>`;
   }).join("");
 }
@@ -7918,11 +7920,11 @@ async function loadInfoPagePasses() {
   try { data = await api("/api/info-page-passes"); } catch (err) { wrap.innerHTML = `<p class="muted">${esc(err.message)}</p>`; return; }
   const passes = data.passes || [];
   wrap.innerHTML = infoPagePassRowsHtml(passes);
-  if ($("infoPagePassesCount")) $("infoPagePassesCount").textContent = `${passes.filter((p) => p.status === "live").length} live`;
+  if ($("infoPagePassesCount")) $("infoPagePassesCount").textContent = `${passes.filter((p) => p.live === true).length} live`;
   wrap.querySelectorAll("button[data-info-withdraw]").forEach((button) => {
     button.addEventListener("click", async () => {
       const auth = await authForDecision();
-      const name = namedPersonConsent(auth, "Withdraw this verified information page? Runs that START after this stop at the page again. A run already in progress keeps the pass it started with.", "withdrew this verified page", "a pass is withdrawn by a named person");
+      const name = namedPersonConsent(auth, "Withdraw this verified information page? The pass is deleted (the audit log keeps it). Runs that START after this stop at the page again; a run already in progress keeps the pass it started with.", "withdrew this verified page", "a pass is withdrawn by a named person");
       if (name === null) return;
       const reason = String(window.prompt("Why is it withdrawn? (required, up to 200 characters)", "") || "").trim();
       if (!reason) { showMessage("A reason is required to withdraw a verified page.", "warning"); return; }
