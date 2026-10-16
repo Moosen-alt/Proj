@@ -7873,13 +7873,26 @@ function infoPageProjectStateHtml(states) {
   }).join("");
 }
 
+// #344 round 3 — THE VERIFIED PAGE MAY HAVE FILED: a pass this project used was withdrawn by an
+// after-click incident (the page it led to read like a receipt, or the run entered none of this job's
+// data there). Plain, first on the card, every value escaped.
+function infoPageFilingWarningsHtml(warnings) {
+  const list = Array.isArray(warnings) ? warnings : [];
+  return list.slice(0, 5).map((w) => `
+    <article class="item blocker" data-info-may-have-filed="${esc(w.passId)}">
+      <div class="item-title"><span>The verified page may have filed — check the portal for this project</span><span class="badge">check the portal</span></div>
+      <p style="font-size:12px">Automation passed the verified information page ${esc(w.where)}${w.controlLabel ? ` ("${esc(w.controlLabel)}")` : ""} on a run of this project. On ${esc(String(w.at || "").slice(0, 10))} a run that passed it met a page that did not prove to be an unfiled application, so the verification was withdrawn. Look this project up on the portal before anything is filed again: an application may already be on file.</p>
+      ${(Array.isArray(w.why) && w.why.length) ? `<p class="muted" style="font-size:11px">Why: ${w.why.map((x) => esc(x)).join("; ")}</p>` : ""}
+    </article>`).join("");
+}
+
 async function loadInfoPageCandidates(projectId) {
   const wrap = $("infoPageCandidates");
   if (!wrap || !projectId) return;
   let data;
   try { data = await api(`/api/projects/${encodeURIComponent(projectId)}/info-page-candidates`); } catch { return; }
   if (state.selectedProjectId !== projectId || !$("infoPageCandidates")) return;
-  $("infoPageCandidates").innerHTML = infoPageCandidateCardsHtml(data.candidates, projectId) + infoPageProjectStateHtml(data.projectState);
+  $("infoPageCandidates").innerHTML = infoPageFilingWarningsHtml(data.filingWarnings) + infoPageCandidateCardsHtml(data.candidates, projectId) + infoPageProjectStateHtml(data.projectState);
   bindInfoPageCandidateButtons(projectId);
 }
 
@@ -7958,13 +7971,28 @@ function infoPagePassRowsHtml(passes) {
   }).join("");
 }
 
+// #344 round 3 — on the pass's entry: each pass an after-click incident withdrew, and the projects
+// that used it (only those in your own organisation are named by the server).
+function infoPagePassFilingWarningsHtml(list) {
+  const items = Array.isArray(list) ? list : [];
+  return items.slice(0, 20).map((w) => {
+    const projects = Array.isArray(w.projects) ? w.projects : [];
+    return `
+    <article class="item blocker" data-info-pass-may-have-filed="${esc(w.passId)}">
+      <div class="item-title"><span>${esc(w.where)} — withdrawn after an incident</span><span class="badge">may have filed</span></div>
+      <p style="font-size:12px"><strong>The verified page may have filed — check the portal for this project</strong>${projects.length ? ":" : "."} ${projects.length ? projects.map((p) => `<strong>${esc(p.name || p.id)}</strong>${p.address ? ` (${esc(p.address)})` : ""}`).join(", ") : "No project of yours used it."}</p>
+      <p class="muted" style="font-size:11px">Control "${esc(w.controlLabel)}" · incident ${esc(String(w.at || "").slice(0, 10))}. The pass is deleted; a run that reaches the page again stops there and offers it to a person.</p>
+    </article>`;
+  }).join("");
+}
+
 async function loadInfoPagePasses() {
   const wrap = $("infoPagePasses");
   if (!wrap) return;
   let data;
   try { data = await api("/api/info-page-passes"); } catch (err) { wrap.innerHTML = `<p class="muted">${esc(err.message)}</p>`; return; }
   const passes = data.passes || [];
-  wrap.innerHTML = infoPagePassRowsHtml(passes);
+  wrap.innerHTML = infoPagePassFilingWarningsHtml(data.filingWarnings) + infoPagePassRowsHtml(passes);
   if ($("infoPagePassesCount")) $("infoPagePassesCount").textContent = `${passes.filter((p) => p.live === true).length} live`;
   wrap.querySelectorAll("button[data-info-withdraw]").forEach((button) => {
     button.addEventListener("click", async () => {

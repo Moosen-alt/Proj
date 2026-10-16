@@ -35,6 +35,15 @@
 // number that was not on the information page), or the run stops. Either incident withdraws the
 // pass (the backend deletes it) and nothing is recorded as filed.
 //
+// PROOF OF PROGRESS (round 3 — a STRUCTURAL check that reads no wording): a page that passed the
+// after-click reading must then take THIS JOB'S OWN DATA before the run may leave it. The backstop
+// holds every state-changing request but the run's own writes until the learner records a fill /
+// select / check bound to one of the job's own values there (infoPageProofStepRefusals — not a
+// policy default, a company constant, a literal, a secret or a trivial value). A run that leaves the
+// page, ends, stops or finds "nothing fillable" first is the same incident: the pass is withdrawn,
+// and every project that used it is told the verified page may have filed. The content readings
+// above stay as an extra layer.
+//
 // The contract follows signatureRequestGate.ts / portalSafety.finalSubmitRefusals: PURE (node:crypto
 // only — no DOM, network or database), a plain boolean (mayPassInfoPage) and its reasons from a
 // separately named function (infoPagePassRefusals). ONE predicate: the backstop's openInfoPagePass
@@ -731,8 +740,9 @@ export interface InfoPageAfterClickReading {
   /** The page's text with the step navigator cut (what the shared readings judge). */
   text: string;
   /** THE POSITIVE EVIDENCE: the most EMPTY plain fields in ONE same-origin POST form, outside every
-   *  header / nav / footer / banner / search / dialog landmark, search / feedback / sign-in boxes
-   *  not counted (see portalSafety infoPageAfterClickInPage). */
+   *  header / nav / footer / banner / search / dialog landmark AND (round 3) every element whose id,
+   *  class or role names a header, nav, footer, menu, toolbar, search or lookup, search / feedback /
+   *  sign-in boxes not counted (see portalSafety infoPageAfterClickInPage). */
   formFields: number;
   /** Visible iframe / frame / object / embed: what the reading cannot see into. */
   frames: number;
@@ -771,7 +781,74 @@ export function infoPageNumberTokens(text: string | null | undefined): string[] 
     const hyphen = tok.includes("-");
     if ((hashed && digits >= 3) || (hyphen && digits >= 4) || (letters && digits >= 3 && tok.length >= 5) || (!letters && !hyphen && digits >= 6)) out.add(tok);
   }
+  for (const tok of infoPageLabeledCodes(t)) out.add(tok);
   return Array.from(out);
+}
+
+/**
+ * ROUND 3 — A SHORT CODE AFTER A RECORD WORD is a record number too (round 2's verifier: "Your
+ * request number 4471 was sent", "Confirmation: KXQ-PLM-ZRT" carried no token the shape rule above
+ * knows). After confirmation / reference / request / record / application / permit / case / ticket
+ * (also receipt / tracking / submission / intake), with a connector — ":", "#", "No.", "number",
+ * "ID", "code", or "is" — a code of 2+ digits, or an UPPER-CASE letters code of 4+ characters
+ * (case-sensitive: "Type", "Tech", "only" never count); with no connector, a code of 3+ digits
+ * ("request 4471"). Compared, like every token, against the information page's own text: a code on
+ * both pages is not new. "project" is deliberately NOT a record word — a form page's "Project
+ * Information" heading is the genuine next step. A false token is a false stop, the safe direction.
+ */
+const RECORD_WORD = /\b(confirmation|reference|ref|request|record|application|permit|case|ticket|receipt|tracking|submission|intake)s?\b/gi;
+export function infoPageLabeledCodes(text: string | null | undefined): string[] {
+  const t = String(text ?? "").replace(/[‐‑–]/g, "-");
+  const out = new Set<string>();
+  RECORD_WORD.lastIndex = 0;
+  for (let m = RECORD_WORD.exec(t); m; m = RECORD_WORD.exec(t)) {
+    const rest = t.slice(m.index + m[0].length, m.index + m[0].length + 60);
+    const c = /^(\s*(?:number|num|nbr|no|id|code)\b\.?)?(\s*[:#])?(\s+is\b)?\s*([A-Za-z0-9][A-Za-z0-9-]{1,23})/i.exec(rest);
+    if (!c) continue;
+    const connector = !!(c[1] || c[2] || c[3]);
+    const code = c[4].replace(/-+$/, "");
+    const digits = (code.match(/\d/g) ?? []).length;
+    const letters = (code.match(/[A-Za-z]/g) ?? []).length;
+    const upperCode = !/[a-z]/.test(code) && letters >= 3 && code.length >= 4;
+    const ok = connector ? (digits >= 2 || upperCode) : (digits >= 3 && /^[A-Za-z0-9-]+$/.test(code));
+    if (ok) out.add(code.toUpperCase());
+  }
+  return Array.from(out);
+}
+
+/**
+ * ROUND 3 — WORDING THAT SAYS SOMETHING WAS SENT OR RECEIVED, asked ONLY of the page after a
+ * verified click (round 2's verifier: "Your solar permit request was sent to the City",
+ * "Confirmation: KXQ-PLM-ZRT", "We've got your permit request" all read unknown).
+ *
+ * NOT added to portalSafety.classifySubmissionText, deliberately: that shared reading answers "is
+ * this POSITIVELY filed?" for the doors that RECORD a filing on "accepted" (replay's outcome after an
+ * approved final submit, draftCreated's filed-or-draft reading). Loose wording there would record a
+ * filing on "a verification code was sent to your email" — the unsafe direction. This door asks the
+ * opposite question — "MIGHT this be filed?" — where a loose match only stops the run and withdraws
+ * the pass. Two questions, two predicates; this one is only ever a refusal.
+ */
+const AFTER_CLICK_SENT_WORDING: RegExp[] = [
+  /\b(?:was|were|has\s+been|have\s+been)\s+(?:sent|forwarded|routed|delivered|transmitted)\s+(?:to|for)\b/i,
+  /\b(?:has|have)\s+been\s+(?:sent|received|submitted|filed|forwarded|delivered)\b/i,
+  /\b(?:was|were)\s+(?:received|submitted|filed)\b/i,
+  /\bwe(?:'ve|’ve|\s+have)\s+(?:got|received)\s+your\b/i,
+];
+const CONFIRMATION_LABEL = /\bconfirmation\s*(?:number|no\.?|#|code|id)?\s*[:#]\s*/gi;
+export function infoPageAfterClickSentWording(text: string | null | undefined): string | null {
+  const t = String(text ?? "").replace(/\s+/g, " ");
+  for (const re of AFTER_CLICK_SENT_WORDING) {
+    const m = re.exec(t);
+    if (m) return m[0];
+  }
+  // "Confirmation: <CODE>" — the code case-sensitive (an "Email confirmation:" label followed by the
+  // next label's word is not a receipt).
+  CONFIRMATION_LABEL.lastIndex = 0;
+  for (let m = CONFIRMATION_LABEL.exec(t); m; m = CONFIRMATION_LABEL.exec(t)) {
+    const code = /^[A-Z0-9][A-Z0-9-]{2,}(?![A-Za-z0-9])/.exec(t.slice(m.index + m[0].length));
+    if (code) return `${m[0]}${code[0]}`;
+  }
+  return null;
 }
 
 /** The label is a filing-, submit- or pay-worded control: the SAME triple the information page's own
@@ -785,7 +862,8 @@ const isFilingWordedLabel = (l: string): boolean => isFinalSubmitControl(l) || i
  *   - the page reads, and the shared terminal reading says it is NOT the review / terminal page
  *     (portalSafety terminalPageInPage: what 4(b) and replay's click gate read);
  *   - the shared receipt / error reading finds nothing either way (portalSafety
- *     classifySubmissionText: what every submit outcome reads);
+ *     classifySubmissionText: what every submit outcome reads), and (round 3) no wording says
+ *     something was sent or received (infoPageAfterClickSentWording — this door only);
  *   - ONE form offers at least INFO_PAGE_AFTER_CLICK_MIN_FIELDS empty plain fields outside the
  *     page's chrome (search / feedback / sign-in boxes never count);
  *   - no frame, and no visible filing-, submit- or pay-worded control;
@@ -805,6 +883,8 @@ export function infoPageAfterClickRefusals(r: InfoPageAfterClickReading | null |
   if (outcome.verdict === "accepted") out.push(`the page after the click reads as filed ("${mask(outcome.evidence)}")`);
   else if (outcome.verdict === "rejected") out.push(`the page after the click reads as an error ("${mask(outcome.evidence)}")`);
   else if (outcome.evidence) out.push(`the page after the click reads both as filed and as an error (${mask(outcome.evidence)})`);
+  const sent = infoPageAfterClickSentWording(r.text);
+  if (sent) out.push(`the page after the click says something was sent or received ("${mask(sent)}")`);
   if (!(typeof r.formFields === "number" && Number.isFinite(r.formFields) && r.formFields >= INFO_PAGE_AFTER_CLICK_MIN_FIELDS)) {
     out.push(`the page after the click shows no application form (fewer than ${INFO_PAGE_AFTER_CLICK_MIN_FIELDS} empty plain fields in one form outside the page's header, navigation, footer and search; search, feedback and sign-in boxes do not count)`);
   }
@@ -822,6 +902,83 @@ export function infoPageAfterClickRefusals(r: InfoPageAfterClickReading | null |
     if (fresh.length) out.push(`the page after the click shows a number that was not on the information page ("${mask(fresh[0])}") — a confirmation, request or receipt number`);
   }
   return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// PROOF OF PROGRESS (round 3): the page after the click must take THIS JOB'S OWN DATA
+// ---------------------------------------------------------------------------------------------
+
+/** A step the run recorded on the page a verified click led to, as the proof reads it. `value` is
+ *  what was entered (kept in the learner's memory only, never on the step). */
+export interface InfoPageProofStep {
+  action: string;
+  field?: string;
+  note?: string;
+  value?: string;
+  sensitive?: boolean;
+  gapFill?: boolean;
+}
+
+/** The incident's reason when no such step was recorded before the run left the page or ended. */
+export const INFO_PAGE_NO_PROGRESS = "the run entered none of this job's own data on the page the verified click led to";
+
+// A recorded answer that is the run's own policy, a deterministic pass or a signature — never the
+// job's data, whatever it binds to.
+const NOT_JOB_DATA_NOTE = /^(policy default|[a-z][a-z ]{0,30} default|e-signature|signature|gap[- ]?fill|application entry|permit type|choice tile|record type|accela|address version|other-specify|section email|contact\(|attachment|compute totals)\b/i;
+// An answer any page could take: empty, zero, a yes / no / on / off token.
+const TRIVIAL_VALUE = /^(?:|0+(?:\.0+)?|yes|no|y|n|true|false|on|off|none|n\/?a|null|undefined|-+|checked|unchecked)$/i;
+
+/**
+ * EVERY REASON ONE RECORDED STEP IS NOT PROOF OF PROGRESS. Empty only for a fill / select / check
+ * BOUND to one of this job's own values (`jobKeys`: the keys whose value is this project's own —
+ * backend autoLearn's infoPageJobValueKeys: not a policy default, not the company's constant, never
+ * a secret), not a policy / deterministic / signature step, not a gap fill, whose entered value is
+ * not empty or trivial. A literal (no binding) is never proof: any page takes a literal.
+ */
+export function infoPageProofStepRefusals(step: InfoPageProofStep | null | undefined, jobKeys: ReadonlyArray<string> | null | undefined): string[] {
+  if (!step || typeof step !== "object") return ["no step"];
+  const out: string[] = [];
+  const action = String(step.action ?? "");
+  if (!/^(fill|select|check)$/.test(action)) out.push(`a "${action}" step is not a fill, select or check`);
+  const field = String(step.field ?? "").trim();
+  if (!field) out.push("the value is a literal, not bound to a project value");
+  else if (!Array.isArray(jobKeys)) out.push("this job's own values were not given");
+  else if (!jobKeys.includes(field)) out.push(`"${field.slice(0, 40)}" is not one of this job's own values (a policy default, a company constant or an unknown key)`);
+  if (step.sensitive === true) out.push("a secret is never the proof");
+  if (step.gapFill === true) out.push("a gap fill is a guess, never the proof");
+  const note = collapse(step.note);
+  if (NOT_JOB_DATA_NOTE.test(note)) out.push(`a "${note.slice(0, 30)}" step is the run's own policy, never the job's data`);
+  const value = collapse(step.value);
+  if (TRIVIAL_VALUE.test(value) || (value.match(/[A-Za-z0-9]/g) ?? []).length < 2) out.push("the value entered is empty or trivial");
+  return out;
+}
+
+/** THE PROOF: one step recorded on the page the verified click led to passes infoPageProofStepRefusals.
+ *  Empty = proved; anything unread refuses. */
+export function infoPageProofOfProgressRefusals(steps: ReadonlyArray<InfoPageProofStep> | null | undefined, jobKeys: ReadonlyArray<string> | null | undefined): string[] {
+  if (!Array.isArray(jobKeys)) return [`${INFO_PAGE_NO_PROGRESS} (this job's own values were not given)`];
+  if (!Array.isArray(steps)) return [`${INFO_PAGE_NO_PROGRESS} (the run's steps were not given)`];
+  if (steps.some((s) => infoPageProofStepRefusals(s, jobKeys).length === 0)) return [];
+  return [`${INFO_PAGE_NO_PROGRESS} (no fill, select or check bound to a project value)`];
+}
+
+/**
+ * THIS JOB'S OWN VALUES: the keys whose value for this project is non-empty and DIFFERS from what a
+ * blank project of the same company, portal and track resolves to (the backend resolves both through
+ * portalRecipes.resolveRecipeFieldValues). A policy default ("0" stories, behind-the-meter) and the
+ * company's own constants (licence, phone, address) resolve the same for a blank project, so they
+ * never prove that a page asked for THIS job. Secret keys are dropped (`isSecret`).
+ */
+export function infoPageJobValueKeys(values: Record<string, unknown> | null | undefined, blankValues: Record<string, unknown> | null | undefined, isSecret: (k: string) => boolean = () => false): string[] {
+  if (!values || typeof values !== "object" || !blankValues || typeof blankValues !== "object") return [];
+  const out: string[] = [];
+  for (const [k, v] of Object.entries(values)) {
+    const val = collapse(v === null || v === undefined ? "" : String(v));
+    if (!val || isSecret(k)) continue;
+    const blank = collapse(blankValues[k] === null || blankValues[k] === undefined ? "" : String(blankValues[k]));
+    if (val !== blank) out.push(k);
+  }
+  return out.sort();
 }
 
 // ---------------------------------------------------------------------------------------------

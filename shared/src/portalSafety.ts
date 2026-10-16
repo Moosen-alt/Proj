@@ -1956,7 +1956,9 @@ export function portalSafetyFactory() {
    *   - formFields: the most EMPTY plain fields (text-like input, textarea, select with no value) in
    *     ONE same-origin POST <form>, counting only fields that are visible, enabled, writable, outside
    *     every header / nav / footer / aside / dialog / banner / search / navigation / contentinfo /
-   *     complementary landmark, and not a search, feedback, comment, rating, newsletter or sign-in
+   *     complementary landmark — and (round 3) outside every element whose id, class or role NAMES
+   *     a header, nav, footer, menu, toolbar, search or lookup —, and not a search, feedback,
+   *     comment, rating, newsletter or sign-in
    *     box (by name, id, placeholder, label, aria-label or title). A form inside such a landmark, a
    *     form that is itself a search / feedback / sign-in widget, or one carrying a password field,
    *     counts nothing. (A big form wrapping the whole page — DevHub's SmartGuide, ASP.NET — counts
@@ -1989,6 +1991,22 @@ export function portalSafetyFactory() {
       return r.width > 2 && r.height > 2;
     }).length;
     const CHROME = "header, nav, footer, aside, dialog, [role=banner], [role=search], [role=navigation], [role=contentinfo], [role=complementary], [role=dialog]";
+    // ROUND 3: CHROME BY NAME, NOT ONLY BY ELEMENT. An ASP.NET WebForms page wraps the whole page in
+    // one POST form, and its header is a <div id="header"> with a permit LOOKUP (round 2's n14: two
+    // empty boxes there counted as the application form). A field inside any element — itself, its
+    // form, or any ancestor — whose id, class or role NAMES a header, masthead, banner, nav, footer,
+    // menu, toolbar, top / side bar, search or lookup is never form evidence. Words, split at
+    // separators and camelCase ("pageHeader", "site-search", "ctl00_header"); a false exclusion is a
+    // false stop, the safe direction.
+    const CHROME_NAME = /(^|[^a-z0-9])(header|masthead|banner|nav|navbar|navigation|footer|menu|menubar|toolbar|topbar|sidebar|search\w*|lookup\w*)(?![a-z0-9])/;
+    const chromeNamed = (el: Element): boolean => {
+      for (let n: Element | null = el; n && n !== d.body && n !== d.documentElement; n = n.parentElement) {
+        const words = ["id", "class", "role"].map((a) => String(n!.getAttribute(a) || "")).join(" ")
+          .replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_\-$:.]+/g, " ").toLowerCase();
+        if (CHROME_NAME.test(words)) return true;
+      }
+      return false;
+    };
     const WIDGET = /\b(search\w*|query|keywords?|feedback|survey|comments?|rating|rate\s+(us|this|your)|subscribe|newsletter|log\s*in|login|sign\s*in|signin|username|password)\b/i;
     const PLAIN_INPUT = /^(text|email|tel|number|date|url|month|week|time|datetime-local)$/;
     const attrWords = (el: Element): string => ["name", "id", "placeholder", "aria-label", "title", "class", "action"]
@@ -2011,6 +2029,7 @@ export function portalSafetyFactory() {
       const plain = Array.from(f.elements).filter((el) => {
         const tag = el.tagName.toLowerCase();
         if (el.closest(CHROME)) return false;
+        if (chromeNamed(el)) return false;
         const ctl = el as HTMLInputElement;
         if (ctl.disabled === true || ctl.readOnly === true) return false;
         if (tag === "input") {

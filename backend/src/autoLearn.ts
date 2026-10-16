@@ -26,6 +26,7 @@ import fs from "node:fs";
 import type { AppDb } from "./db";
 import type { InfoPageIncident, PortalRecipe, ProjectRecord, RecipeStep } from "../../shared/src/types";
 import { FINAL_SUBMIT_GATE_SENTENCE, redactSecretValues } from "../../shared/src/portalSafety";
+import { infoPageJobValueKeys } from "../../shared/src/infoPagePass";
 import { isPlannerSecretKey, projectSecretValues } from "./projectSecrets";
 import { perJobAnswerKeyFor, perJobControlOfField } from "../../shared/src/perJobQuestions";
 import { parseHasBattery } from "../../shared/src/batteryControls";
@@ -1157,6 +1158,8 @@ async function autoLearnPortalInner(
     attempt: [] as Array<{ passId: string; where: string }>,
     attemptStartId: "",
     withdrawn: [] as string[],
+    /** Round 3: the projects an after-click incident warned (the verified page may have filed). */
+    warned: [] as string[],
     afterIncident: false,
     incidentRecorded: false,
     incidentError: "",
@@ -1205,6 +1208,7 @@ async function autoLearnPortalInner(
       try {
         const out = recordInfoPagePassIncidents(db, infoPageProjectRow ? projectId : null, runId, incidents);
         infoPageCall.withdrawn.push(...out.withdrawn);
+        for (const w of out.warned) if (!infoPageCall.warned.includes(w)) infoPageCall.warned.push(w);
         infoPageCall.incidentRecorded = true;
         if (incidents.some((i) => i.phase === "after")) infoPageCall.afterIncident = true;
       } catch (err) {
@@ -1219,6 +1223,22 @@ async function autoLearnPortalInner(
     }
   };
   let infoPageInput: InfoPageAttemptInput = noInfoPagePass;
+  // #344 round 3 — PROOF OF PROGRESS needs to know which values are THIS JOB'S OWN: the keys whose
+  // replay value for this project is non-empty and differs from what a BLANK project of the same
+  // company, portal and track resolves to (per-job fields emptied, the id, client, state, AHJ,
+  // utility and account kept) — so a policy default ("0" stories, behind-the-meter), a company
+  // constant (licence, phone) or a per-job answer column never counts, and secrets never do
+  // (shared infoPageJobValueKeys). Unreadable = none: every admitted pass then ends as an incident.
+  const infoPageProofKeys = ((): string[] => {
+    try {
+      const values = resolveRecipeFieldValues(db, project, portalType, learnTrack, issuerTrack);
+      const blank: ProjectRecord = {
+        ...project, homeownerName: "", projectAddress: "", city: "", zip: "",
+        systemSizeDcKw: null, systemSizeAcKw: null, totalExportKw: null, parserSnapshot: {}, existingSystem: undefined,
+      };
+      return infoPageJobValueKeys(values, resolveRecipeFieldValues(db, blank, portalType, learnTrack, issuerTrack), isPlannerSecretKey);
+    } catch { return []; }
+  })();
   let learn;
   // THE BUDGET IS FOR THE PORTAL, NOT FOR EACH ATTEMPT.
   //
@@ -1412,6 +1432,8 @@ async function autoLearnPortalInner(
       infoPagePasses: infoPageInput.passes,
       infoPagePriorProgress: infoPageInput.priorProgress,
       onInfoPagePassed,
+      // #344 round 3: the page after a verified one must take one of these before the run leaves it.
+      infoPageProofKeys,
     });
   // WRITE IT DOWN BEFORE WE TOUCH THE PORTAL, NOT AFTER. This run is about to log into a
   // REAL account and start a REAL application; a run that dies mid-way has still created
@@ -1552,6 +1574,12 @@ async function autoLearnPortalInner(
       infoPageLine += infoPageCall.withdrawn.length
         ? ` ${infoPageCall.afterIncident ? "The page after a verified information page did not read as an unfiled application form" : "A verified information page changed"}; that verification was withdrawn (${infoPageCall.withdrawn.length}) and a person must look again.`
         : " An incident on a verified information page was recorded.";
+      // ROUND 3: an after-click incident means the verified page may have filed — for this project
+      // and for every project that used the pass (each carries the warning on its card).
+      if (infoPageCall.afterIncident) {
+        const others = infoPageCall.warned.filter((p) => p !== projectId).length;
+        infoPageLine += ` The verified page may have filed — check the portal for this project${others ? ` (and ${others} other project(s) that used this verified page: each is warned on its card)` : ""}.`;
+      }
     }
     if (Array.isArray(learn.infoPageHeldVerified) && learn.infoPageHeldVerified.length) {
       infoPageLine += " Held at a verified information page because this project already made progress on this portal; a person who has checked the application can allow it once more (project → Portal runs).";

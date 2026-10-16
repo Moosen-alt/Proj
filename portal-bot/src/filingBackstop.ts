@@ -54,6 +54,14 @@
 //      checkInfoPageAfterClick judges the page it led to: anything but POSITIVE evidence of an
 //      unfiled application form (infoPageAfterClickRefusals) arms the sticky lock (4a) and is the
 //      run's incident — it stops, the pass is withdrawn.
+//      PROOF OF PROGRESS (round 3, structural: it reads no wording). A page that passed that
+//      reading is then HELD: no state-changing request from any page passes — but the run's own
+//      writes (an open own-write window or drain on the requesting page) — until the learner has
+//      recorded a fill / select / check bound to THIS JOB'S own data there and says so
+//      (infoPageProofGiven). Leaving that page's document by a GET navigation first makes the proof
+//      impossible (state "left": the hold stays). A held document request or filing URL stops the
+//      run (as 4b's do); the learner then reports the incident (the run never entered the job's data
+//      on the page the verified click led to), the pass is withdrawn, nothing is recorded as filed.
 //
 // Every abort is recorded (origin + path only — never a query string, which can carry a
 // customer's data) so the run reports it; a filing, payment or lockdown abort also stops the run,
@@ -191,6 +199,14 @@ export interface FilingBackstop {
    *  review lock (nothing more posts from here) and is the run's incident: it stops, the backend
    *  withdraws the pass, nothing is recorded as filed. */
   checkInfoPageAfterClick(page?: unknown): Promise<{ ok: boolean; refusals: string[] }>;
+  /** PROOF OF PROGRESS (round 3): the learner recorded a fill / select / check bound to this job's
+   *  own data on the page a verified click led to (infoPagePass.infoPageProofStepRefusals). Lifts the
+   *  hold checkInfoPageAfterClick armed — only while the run is still on that page's document (state
+   *  "pending"). true = proved (now or before); false = nothing to lift, or the run already left. */
+  infoPageProofGiven(): boolean;
+  /** "none" (no verified click passed), "pending" (held, on the page), "proved", or "left" (the page's
+   *  document was left before the proof: the hold stays for the rest of the run). */
+  infoPageProofState(): "none" | "pending" | "proved" | "left";
   /** The unverified page whose forward request was held, once (then forgotten), or null. */
   takeInfoPageCandidate(): InfoPageCandidateTake | null;
   /** Each request the info-page slot admitted: exempted = it passed 4(b) only because of the
@@ -613,6 +629,11 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   const infoPageAdmissions: Array<{ entryId: string; where: string; exempted: boolean }> = [];
   const infoPageRefusedRequests: Array<{ where: string; refusals: string[] }> = [];
   const admittedEntryIds: string[] = [];
+  // PROOF OF PROGRESS (round 3): armed when the page a verified click led to passed the after-click
+  // reading; until the learner proves it entered this job's own data there, nothing state-changing
+  // but the run's own writes passes (the hold in the handler, rule 3b).
+  let infoProof: { page: unknown; entryId: string; state: "pending" | "proved" | "left" } | null = null;
+  const ownWriteOn = (pg: unknown): boolean => !!pg && [...ownWrites.values()].some((w) => w.page === pg);
   const infoSlotLive = (): boolean => !!infoSlot && infoSlot.open && Date.now() < infoSlot.until;
   const infoWatchLive = (): boolean => !!infoWatch && infoWatch.open && Date.now() < infoWatch.until;
   const closeInfoSlot = (): void => {
@@ -712,6 +733,16 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
           }
         } catch { /* unreadable: the slot keeps its other closers */ }
       }
+      // PROOF OF PROGRESS (round 3): the page a verified click led to navigating AWAY by GET before
+      // the run proved it entered this job's data there — the proof can no longer be given on that
+      // page (state "left"; the hold stays). The run's own write in flight on it (a cascading select
+      // that reloads) is not leaving.
+      if (method === "GET" && infoProof && infoProof.state === "pending") {
+        try {
+          const pg = pageOfRequest(request);
+          if (request.isNavigationRequest() && pg && pg === infoProof.page && request.frame() === pg.mainFrame() && !ownWriteOn(pg)) infoProof.state = "left";
+        } catch { /* unreadable: the hold stays as it is */ }
+      }
       await route.fallback().catch(() => null);
       return;
     }
@@ -790,6 +821,30 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       const w = open[open.length - 1];
       await abort(w.rule, w.why);
       return;
+    }
+    // 3b. PROOF OF PROGRESS (#344 round 3): after a verified information page's click led to a page
+    // that read as an unfiled form, NOTHING state-changing passes until the run has entered this
+    // job's own data on that page (infoPageProofGiven) — but the run's own writes there: an open
+    // own-write window on the requesting page (a fill's autosave), or a drain's same-origin fetch /
+    // XHR. A document request (a form submit: the run or the page leaving it) or a filing URL held
+    // here stops the run (isStoppingAbort, as 4b's do); a background call is held and reported.
+    // Never lifted by anything but the proof; the approved final-submit slot is never open on such a
+    // run (it never opens after an information-page pass, and vice versa).
+    if (!approved && infoProof && infoProof.state !== "proved") {
+      const pg = pageOfRequest(request);
+      let navigation = true;
+      try { navigation = !!request.isNavigationRequest(); } catch { /* unknown: a navigation */ }
+      let ownWrite = ownWriteOn(pg);
+      if (!ownWrite && pg && !navigation && /^(xhr|fetch)$/i.test(resourceType) && [...drains.values()].some((d) => d.page === pg)) {
+        let pageUrl = "";
+        try { pageUrl = typeof pg.url === "function" ? String(pg.url() || "") : ""; } catch { pageUrl = ""; }
+        const origin = originOf(url);
+        ownWrite = origin !== "" && origin === originOf(pageUrl);
+      }
+      if (!ownWrite) {
+        await abort("review-lockdown", `PROOF OF PROGRESS — the page a verified information page led to has not taken this job's own data yet (${infoProof.state === "left" ? "the run left it first" : "nothing bound to the job was entered there"}), so nothing leaves it (${label})`);
+        return;
+      }
     }
     // 4. REVIEW-PAGE LOCKDOWN: the run locked it, or the requesting page reads as terminal now.
     if (!approved) {
@@ -1070,8 +1125,17 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         await new Promise((r) => setTimeout(r, 500));
       }
       if (refusals.length) bs.lockReview(`the page after a verified information page did not read as an unfiled form (${refusals[0].slice(0, 60)})`);
+      // PROOF OF PROGRESS (round 3): a page that reads as an unfiled form must now TAKE this job's
+      // data before anything leaves it — the hold (rule 3b) is armed on it until the learner proves it.
+      else infoProof = { page: p, entryId: baseline ? baseline.entryId : "", state: "pending" };
       return { ok: refusals.length === 0, refusals };
     },
+    infoPageProofGiven() {
+      if (!infoProof) return false;
+      if (infoProof.state === "pending") infoProof.state = "proved";
+      return infoProof.state === "proved";
+    },
+    infoPageProofState() { return infoProof ? infoProof.state : "none"; },
     takeInfoPageCandidate() {
       const c = infoCandidate;
       infoCandidate = null;
@@ -1083,6 +1147,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       disposed = true;
       closeSlot();
       closeInfo();
+      infoProof = null;
       if (REGISTRY.get(page) === bs) REGISTRY.delete(page);
       if (target !== page && REGISTRY.get(target) === bs) REGISTRY.delete(target);
       windows.clear();

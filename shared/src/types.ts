@@ -4082,6 +4082,28 @@ export interface InfoPageIncident {
   where: string;
 }
 
+/** #344 round 3 — on a PROJECT's card: a pass this project used was withdrawn by an after-click
+ *  incident (a receipt-like page, or the run entered none of the job's data on the page it led to) —
+ *  the verified page may have filed for this project. */
+export interface InfoPageFilingWarning {
+  passId: string;
+  /** origin + path of the verified information page. */
+  where: string;
+  controlLabel: string;
+  at: string;
+  why: string[];
+}
+
+/** #344 round 3 — on the pass's KNOWLEDGE-BASE entry: the same warning, with every project that used
+ *  the pass named — only those inside the viewer's own org (rule 6). */
+export interface InfoPagePassFilingWarning {
+  passId: string;
+  where: string;
+  controlLabel: string;
+  at: string;
+  projects: Array<{ id: string; name: string; address: string }>;
+}
+
 export interface PortalRecipeLoginStep {
   /** Selector for the username/email field. */
   usernameSel?: RecipeSelector;

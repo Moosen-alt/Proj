@@ -29,12 +29,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
-  INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, digestInfoPageIdentity, infoPageAfterClickRefusals, infoPageBackstopRefusals, infoPageDriftedEntries, infoPageEvidence, infoPageMatchRefusals,
+  INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, INFO_PAGE_NO_PROGRESS, digestInfoPageIdentity, infoPageAfterClickSentWording, infoPageJobValueKeys, infoPageLabeledCodes, infoPageProofOfProgressRefusals, infoPageProofStepRefusals, infoPageAfterClickRefusals, infoPageBackstopRefusals, infoPageDriftedEntries, infoPageEvidence, infoPageMatchRefusals,
   infoPageNumberTokens, infoPageObservedRequest, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageRunStateRefusals,
   infoPageShapeRefusals, infoPageVerifyWarnings, isMatchClassRefusal, mayPassInfoPage, parseFormBodyFields, verifiedInfoPageFromCandidate,
-  type InfoPageBackstopState, type InfoPageIdentityMaterial, type InfoPagePassContext, type InfoPageRunState, type InfoPageRunStep,
+  type InfoPageBackstopState, type InfoPageIdentityMaterial, type InfoPagePassContext, type InfoPageProofStep, type InfoPageRunState, type InfoPageRunStep,
 } from "../../shared/src/infoPagePass";
-import { isInterstitialForwardLabel, portalSafetyFactory } from "../../shared/src/portalSafety";
+import { classifySubmissionText, isInterstitialForwardLabel, portalSafetyFactory } from "../../shared/src/portalSafety";
 import type { VerifiedInfoPage } from "../../shared/src/types";
 
 let failures = 0;
@@ -383,6 +383,74 @@ console.log("\nAFTER THE CLICK (proposal §4; round 2): only POSITIVE evidence o
   for (const [t, want] of has) check(`a number-shaped token: "${t}" → ${want}`, tok(t).includes(want), JSON.stringify(tok(t)));
   const none = ["Step 2 of 5", "Max 1000 characters", "Copyright 2026", "COVID-19 notice", "ZIP 97204", "Form W-9", "Unit 4B", "10/16/2026"];
   for (const t of none) check(`not a number-shaped token: "${t}"`, tok(t).length === 0, JSON.stringify(tok(t)));
+
+  // ROUND 3 — CHEAP CONTENT GAPS (round 2's verifier, B0): each an extra layer, each pinned ALONE —
+  // a real two-field form, not terminal, no filing control, so only the gap's own rule can refuse.
+  // (Proof of progress, the structural check, is pinned in infoPageIncident.dom: these shapes
+  // would be incidents there anyway; here the content rules must not depend on it.)
+  const r3has: Array<[string, string]> = [["Your request number 4471 was sent to a Permit Tech", "4471"], ["Confirmation: KXQ-PLM-ZRT. We sent the details.", "KXQ-PLM-ZRT"],
+    ["Case #77 opened", "77"], ["Ticket No. 512", "512"], ["Your request 4471 was sent to the City", "4471"], ["Record ID: AB12", "AB12"], ["Application number is 9921", "9921"],
+    ["Permit: 2026-77", "2026-77"], ["Reference: QWRT", "QWRT"]];
+  for (const [t, want] of r3has) check(`round 3: a labelled short code is a record number: "${t}" → ${want}`, tok(t).includes(want), JSON.stringify(tok(t)));
+  const r3none = ["A Permit Tech will review your submission", "Project Information 12345 Main St", "Request Type: Solar Permit Request", "Application Date: 10/16/2026", "Permit #: Site Address",
+    "PERMIT TYPE: SOLAR", "Request: NEW", "Record 1 of 3", "This is a permit request only.", "Please do not submit additional requests for the same scope of work."];
+  for (const t of r3none) check(`round 3: not a labelled code: "${t}"`, infoPageLabeledCodes(t).length === 0, JSON.stringify(infoPageLabeledCodes(t)));
+  const two = { ...form, text: "Project Information Site Address Unit / Suite Previous Next Call 503-000-0000 or TTY 711." };
+  const alone: Array<[string, string, RegExp]> = [
+    ["n2: 'Your request number 4471 was sent' beside a real two-field form (the labelled-code rule alone)", "Project Information Your request number 4471 is with a Permit Tech. Site Address Unit / Suite", /number that was not on the information page/],
+    ["n3: 'Confirmation: KXQ-PLM-ZRT' beside a real two-field form (the labelled-code rule)", "Project Information Confirmation: KXQ-PLM-ZRT Site Address Unit / Suite", /number that was not on the information page/],
+    ["n14 / n1: 'was sent to the City' beside a real two-field form (the sent / received wording alone)", "Project Information Your solar permit request was sent to the City on 10/16/2026. Site Address Unit / Suite", /says something was sent or received/],
+    ["'has been received' beside a real two-field form", "Project Information Your request has been received Site Address Unit / Suite", /sent or received|reads as filed/],
+    ["'has been sent' beside a real two-field form", "Project Information Your application has been sent. Site Address Unit / Suite", /says something was sent or received/],
+    ["'We've got your permit request' beside a real two-field form", "Project Information We've got your permit request. Site Address Unit / Suite", /says something was sent or received/],
+    ["'Confirmation: KXQ-PLM-ZRT' is also sent / received wording", "Project Information Confirmation: KXQ-PLM-ZRT Site Address Unit / Suite", /says something was sent or received/],
+  ];
+  for (const [what, text, re] of alone) {
+    const r = infoPageAfterClickRefusals({ ...two, text }, baseline);
+    check(`round 3, refused: ${what}`, r.some((x) => re.test(x)), JSON.stringify(r));
+  }
+  const fine = ["Project Information Site Address Unit / Suite Email confirmation: Phone", "Project Information Your application will be sent to a Permit Tech once you finish. Site Address",
+    "Project Information Request Type: Solar Permit Request Site Address Unit / Suite"];
+  for (const t of fine) check(`round 3 (positive control): a genuine form's wording is not a receipt: "${t.slice(0, 70)}"`, infoPageAfterClickRefusals({ ...two, text: t }, baseline).length === 0, JSON.stringify(infoPageAfterClickRefusals({ ...two, text: t }, baseline)));
+  check("round 3: the sent / received wording is the after-click door's ONLY — the shared receipt reading is unchanged ('was sent to the City' is not 'accepted' there)",
+    classifySubmissionText("Your solar permit request was sent to the City.").verdict === "unknown" && infoPageAfterClickSentWording("Your solar permit request was sent to the City.") !== null);
+}
+
+// ---------------------------------------------------------------------------------------------
+console.log("\nPROOF OF PROGRESS (round 3): the page after the click must take THIS JOB'S OWN DATA");
+{
+  const KEYS = ["street", "projectAddress", "parcelNumber", "systemSizeDcKw", "homeownerName"];
+  const ok: InfoPageProofStep = { action: "fill", field: "street", note: "Site Address", value: "1 Test St" };
+  check("a fill bound to one of this job's own values, with a real value, is the proof", infoPageProofStepRefusals(ok, KEYS).length === 0, JSON.stringify(infoPageProofStepRefusals(ok, KEYS)));
+  check("…a select bound to one (the parcel) too", infoPageProofStepRefusals({ action: "select", field: "parcelNumber", note: "Parcel", value: "R123456" }, KEYS).length === 0);
+  const notProof: Array<[string, InfoPageProofStep, RegExp]> = [
+    ["a LITERAL (no binding) — any page takes one", { ...ok, field: undefined }, /literal/],
+    ["a key that is not this job's own (a company constant / policy default)", { ...ok, field: "installerPhone" }, /not one of this job's own values/],
+    ["a secret", { ...ok, sensitive: true }, /secret/],
+    ["a gap fill", { ...ok, gapFill: true }, /gap fill/],
+    ["a policy default", { ...ok, note: "policy default: Module height → Yes" }, /own policy/],
+    ["an e-signature", { ...ok, note: "e-signature: typed signature" }, /own policy/],
+    ["a trivial value '0'", { ...ok, value: "0" }, /empty or trivial/],
+    ["a trivial value 'Yes'", { ...ok, value: "Yes" }, /empty or trivial/],
+    ["an empty value", { ...ok, value: "" }, /empty or trivial/],
+    ["one character", { ...ok, value: "7" }, /empty or trivial/],
+    ["a click", { ...ok, action: "click" }, /not a fill, select or check/],
+    ["an upload", { ...ok, action: "upload" }, /not a fill, select or check/],
+  ];
+  for (const [what, st, re] of notProof) check(`not the proof: ${what}`, infoPageProofStepRefusals(st, KEYS).some((x) => re.test(x)), JSON.stringify(infoPageProofStepRefusals(st, KEYS)));
+  check("not the proof: this job's own values were not given (unknown refuses)", infoPageProofStepRefusals(ok, null).some((x) => /not given/.test(x)));
+  check("the proof over a page's steps: one qualifying step among others proves it", infoPageProofOfProgressRefusals([{ action: "select", note: "Existing contact", value: "New Contact" }, ok], KEYS).length === 0);
+  check("…none qualifying is the incident's reason (\"the run entered none of this job's own data…\")",
+    infoPageProofOfProgressRefusals([{ action: "select", note: "Existing contact", value: "New Contact" }, { ...ok, field: "installerPhone" }], KEYS).some((x) => x.startsWith(INFO_PAGE_NO_PROGRESS)));
+  check("…no step at all is the incident's reason", infoPageProofOfProgressRefusals([], KEYS).some((x) => x.startsWith(INFO_PAGE_NO_PROGRESS)));
+  check("…unknown steps or keys refuse", infoPageProofOfProgressRefusals(null, KEYS).length > 0 && infoPageProofOfProgressRefusals([ok], null).length > 0);
+  // THIS JOB'S OWN VALUES: what differs from a blank project of the same company / portal / track.
+  const values = { street: "1 Test St", city: "Springfield", numberOfStories: "0", systemConfiguration: "behind-the-meter", installerPhone: "(555) 010-0000", accountNumber: "12345678", homeownerName: "Pat Q", emptyKey: "" };
+  const blank = { street: "", city: "", numberOfStories: "0", systemConfiguration: "behind-the-meter", installerPhone: "(555) 010-0000", accountNumber: "12345678", homeownerName: "" };
+  const jk = infoPageJobValueKeys(values, blank, (k) => k === "accountNumber");
+  check("this job's own values: the per-job values (street, city, homeowner) count; a policy default, a company constant, a secret and an empty value do not",
+    JSON.stringify(jk) === JSON.stringify(["city", "homeownerName", "street"]), JSON.stringify(jk));
+  check("this job's own values: unknown (no blank resolution) is none", infoPageJobValueKeys(values, null).length === 0 && infoPageJobValueKeys(null, blank).length === 0);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -503,6 +571,8 @@ console.log("\nGREP PINS");
     ["portal.info_page_passed", "ACT_PASSED", "recordInfoPagePassUses"],
     ["portal.info_page_held_verified", "ACT_HELD_VERIFIED", "recordInfoPageHeldVerified"],
     ["portal.info_page_pass_allowed_again", "ACT_ALLOWED_AGAIN", "allowInfoPagePassOnceMore"],
+    // Round 3: the may-have-filed warning (evidence) — one writer: the after-click incident.
+    ["portal.info_page_may_have_filed", "ACT_MAY_HAVE_FILED", "recordInfoPagePassIncidents"],
   ];
   for (const [literal, constant, writer] of ledger) {
     const namers = everything.filter((f) => fs.readFileSync(f, "utf8").includes(literal)).map(rel).sort();
@@ -528,8 +598,16 @@ console.log("\nGREP PINS");
     assigns.length === 1 && /options\.infoPagePasses/.test(assigns[0]) && !/step\w*\.(infoPage|verifiedInfoPage)/.test(learnerSrc), JSON.stringify(assigns));
   const learner = fs.readFileSync(path.join(root, "portal-bot/src/adapters/autoLearnAdapter.ts"), "utf8");
   check("the learner opens an information-page pass at exactly one place", (learner.match(/\.openInfoPagePass\(/g) ?? []).length === 1);
+  // ROUND 3: the proof hold is lifted at exactly one place — noteInfoPageProof, after the shared
+  // predicate (infoPageProofStepRefusals) found a step bound to this job's own data.
+  const lifts = learner.match(/\.infoPageProofGiven\(/g) ?? [];
+  const noteAt = learner.indexOf("private noteInfoPageProof(");
+  const noteBody = noteAt < 0 ? "" : learner.slice(noteAt, learner.indexOf("private infoProofStepOf(", noteAt));
+  check("round 3: the learner lifts the proof-of-progress hold at exactly one place, after the shared proof predicate",
+    lifts.length === 1 && /infoPageProofStepRefusals\(/.test(noteBody) && /\.infoPageProofGiven\(/.test(noteBody), `${lifts.length} lift(s)`);
   const replay = fs.readFileSync(path.join(root, "portal-bot/src/adapters/recipeAdapter.ts"), "utf8");
   check("replay never opens one (learner-only in this change: replay stops as on main)", !/openInfoPagePass/.test(replay));
+  check("round 3: replay never lifts the proof hold either", !/infoPageProofGiven/.test(replay));
   const infoFiles = files.filter((f) => /infoPage/i.test(fs.readFileSync(f, "utf8")) && /allowApprovedFiling/.test(fs.readFileSync(f, "utf8")))
     .filter((f) => !/filingBackstop\.ts$|recipeAdapter\.ts$/.test(f)).map(rel);
   check("no info-page code path calls allowApprovedFiling", infoFiles.length === 0, JSON.stringify(infoFiles));

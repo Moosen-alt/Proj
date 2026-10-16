@@ -3078,9 +3078,11 @@ const infoPageCandidateId = (req: Request): string => {
   return cid;
 };
 app.get("/api/projects/:id/info-page-candidates", asyncHandler(async (req, res) => {
-  const { listInfoPageCandidates, listInfoPageProjectState } = await import("./infoPages");
+  const { listInfoPageCandidates, listInfoPageProjectState, listInfoPageFilingWarnings } = await import("./infoPages");
   const pid = infoPageProjectId(req);
-  res.json({ candidates: listInfoPageCandidates(db, pid), projectState: listInfoPageProjectState(db, pid) });
+  // #344 round 3: filingWarnings — a pass this project used was withdrawn by an after-click incident
+  // (the verified page may have filed for it).
+  res.json({ candidates: listInfoPageCandidates(db, pid), projectState: listInfoPageProjectState(db, pid), filingWarnings: listInfoPageFilingWarnings(db, pid) });
 }));
 // "ALLOW ONCE MORE FOR THIS PROJECT" (#344 round 2): a pass admits at most once per project and side;
 // after that the project's runs stop at the page as on main until a NAMED PERSON who checked the
@@ -3090,12 +3092,12 @@ app.post("/api/projects/:id/info-page-allow-once-more", asyncHandler(async (req,
   requireSameOriginMutation(req);
   requireSuperadminWhenSignedIn(req, "allow a verified information page once more");
   const { isConfirmingPerson } = await import("./feeConfirm");
-  const { allowInfoPagePassOnceMore, listInfoPageCandidates, listInfoPageProjectState } = await import("./infoPages");
+  const { allowInfoPagePassOnceMore, listInfoPageCandidates, listInfoPageProjectState, listInfoPageFilingWarnings } = await import("./infoPages");
   const pid = infoPageProjectId(req);
   const scope = String(req.body?.scope || "");
   const who = infoPagePerson(req, req.body?.allowedBy, isConfirmingPerson, "allow a verified information page once more");
   allowInfoPagePassOnceMore(db, pid, scope, { by: who.name, userId: who.userId });
-  res.json({ candidates: listInfoPageCandidates(db, pid), projectState: listInfoPageProjectState(db, pid) });
+  res.json({ candidates: listInfoPageCandidates(db, pid), projectState: listInfoPageProjectState(db, pid), filingWarnings: listInfoPageFilingWarnings(db, pid) });
 }));
 app.get("/api/projects/:id/info-page-candidates/:cid/screenshot", asyncHandler(async (req, res) => {
   const { infoPageCandidateScreenshot } = await import("./infoPages");
@@ -3129,9 +3131,11 @@ app.post("/api/projects/:id/info-page-candidates/:cid/dismiss", asyncHandler(asy
   dismissInfoPageCandidate(db, pid, cid, { dismissedBy: who.name, userId: who.userId });
   res.json({ candidates: listInfoPageCandidates(db, pid) });
 }));
-app.get("/api/info-page-passes", asyncHandler(async (_req, res) => {
-  const { listInfoPagePasses } = await import("./infoPages");
-  res.json({ passes: listInfoPagePasses(db) });
+app.get("/api/info-page-passes", asyncHandler(async (req, res) => {
+  const { listInfoPagePasses, listInfoPagePassFilingWarnings } = await import("./infoPages");
+  // #344 round 3: each pass an after-click incident withdrew, with the projects that used it NAMED
+  // only inside the caller's own org (reqOrgFilter; null = the superadmin) — rule 6.
+  res.json({ passes: listInfoPagePasses(db), filingWarnings: listInfoPagePassFilingWarnings(db, reqOrgFilter(db, req)) });
 }));
 app.post("/api/info-page-passes/:passId/withdraw", asyncHandler(async (req, res) => {
   requireSameOriginMutation(req);

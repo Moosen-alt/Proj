@@ -31,7 +31,13 @@
 // a named person's "allow once more" — and infoPagePriorProgress reads it with the project's
 // filings, numbers, drafts and staged / paused / interrupted runs. Every one of those actions is
 // named only here and written by one function each (infoPagePass.test's source scan).
-import type { AppDb } from "./db";
+//
+// MAY HAVE FILED (round 3): an after-click incident (a receipt-like page, the run entering none of
+// the job's data on the page the verified click led to, or a learn that died before that page was
+// judged) puts a warning on EVERY project in the pass's use ledger — "The verified page may have
+// filed — check the portal for this project" — read on the project's card and, named within the
+// viewer's own org, on the pass's knowledge-base entry.
+import { DEFAULT_ORG_ID, type AppDb } from "./db";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
 import { id as newId } from "./ids";
@@ -42,7 +48,7 @@ import {
   type InfoPageDigest, type InfoPageEvidence, type InfoPageObservedRequest, type InfoPagePrefixStep,
 } from "../../shared/src/infoPagePass";
 import { isFilingOrPaymentRequest, isPayRequestUrl } from "../../shared/src/portalSafety";
-import type { InfoPageCandidateCapture, InfoPageCandidateRecord, InfoPageIncident, InfoPagePassRecord, InfoPageProjectSideState, VerifiedInfoPage } from "../../shared/src/types";
+import type { InfoPageCandidateCapture, InfoPageCandidateRecord, InfoPageFilingWarning, InfoPageIncident, InfoPagePassFilingWarning, InfoPagePassRecord, InfoPageProjectSideState, VerifiedInfoPage } from "../../shared/src/types";
 
 type Row = Record<string, unknown>;
 const s = (v: unknown): string => (v === null || v === undefined ? "" : String(v));
@@ -133,6 +139,9 @@ const ACT_PASSED = "portal.info_page_passed";
 const ACT_HELD_VERIFIED = "portal.info_page_held_verified";
 /** A named person allowed the pass ONCE MORE for this project and side. */
 const ACT_ALLOWED_AGAIN = "portal.info_page_pass_allowed_again";
+/** ROUND 3: an after-click incident on a pass this project USED — the verified page may have filed
+ *  for this project (the warning on its card and on the pass's knowledge-base entry). Evidence only. */
+const ACT_MAY_HAVE_FILED = "portal.info_page_may_have_filed";
 
 type Side = "ahj" | "utility";
 const sideOf = (scope: unknown): Side | "" => (scope === "ahj" || scope === "utility" ? scope : "");
@@ -157,15 +166,21 @@ export function recordInfoPageLearnStart(db: AppDb, projectId: string, scope: Si
 /** IS THIS LEARN'S RESULT A CLEAN HOLD? It stopped at the backstop's hold of an information page
  *  whose run state was clean at the click (the candidate watch opens only then, and its request
  *  was observed — held), passed no verified page, reported no after-click incident, reached no
- *  review, paused for nothing and continued no draft. Nothing else is clean: unknown is progress. */
+ *  review, paused for nothing and continued no draft — and (round 3, V9) its recorded steps are an
+ *  array with NO write in them (fill / select / check / uncheck / upload / press), and it says it
+ *  filled nothing. Nothing else is clean: unknown is progress. */
+const WRITE_STEP = /^(fill|select|check|uncheck|upload|press|type)$/;
 export function isCleanInfoPageHold(l: unknown): boolean {
   const r = (l && typeof l === "object" ? l : {}) as Row;
   const cand = r.infoPageCandidate as Row | undefined;
   const passed = r.infoPagePassed as unknown[] | undefined;
   const incidents = r.infoPageIncidents as Array<{ phase?: string }> | undefined;
+  const steps = r.steps as Array<{ action?: unknown }> | undefined;
   return r.stopReason === "backstop_abort" && !!cand && typeof cand === "object" && !!cand.observed
     && !(Array.isArray(passed) && passed.length) && !(Array.isArray(incidents) && incidents.some((i) => i && i.phase === "after"))
-    && r.reachedReview !== true && !r.pauseReason && !r.continuedDraft;
+    && r.reachedReview !== true && !r.pauseReason && !r.continuedDraft
+    && Array.isArray(steps) && !steps.some((st) => !st || typeof st !== "object" || WRITE_STEP.test(String(st.action ?? "")))
+    && r.filledSomething !== true;
 }
 
 /** THE LEARN ENDED CLEAN (isCleanInfoPageHold): its start no longer counts as progress. */
@@ -573,9 +588,17 @@ export function withdrawInfoPagePass(db: AppDb, passId: string, input: { by: str
  *     a confirmation number, a filed status, the review page, an error, no form, unreadable) — the
  *     run stopped and nothing is recorded as filed.
  * A pass already gone is audited all the same (withdrawn: false).
+ *
+ * ROUND 3 — AN AFTER-CLICK INCIDENT MEANS THE VERIFIED PAGE MAY HAVE FILED: the page it led to was a
+ * receipt-like page, or the run entered none of the job's data there (proof of progress), or the
+ * learn died before it was judged. Every project that USED this pass (the use ledger, ACT_PASSED) —
+ * and the incident's own — gets a may-have-filed row: the warning on its card ("The verified page may
+ * have filed — check the portal for this project") and, named within the viewer's own org, on the
+ * pass's knowledge-base entry. Before-click incidents sent nothing: no warning.
  */
-export function recordInfoPagePassIncidents(db: AppDb, projectId: string | null, runId: string, incidents: ReadonlyArray<InfoPageIncident> | null | undefined): { withdrawn: string[] } {
+export function recordInfoPagePassIncidents(db: AppDb, projectId: string | null, runId: string, incidents: ReadonlyArray<InfoPageIncident> | null | undefined): { withdrawn: string[]; warned: string[] } {
   const withdrawn: string[] = [];
+  const warned: string[] = [];
   for (const inc of Array.isArray(incidents) ? incidents : []) {
     const passId = s(inc?.passId).slice(0, 80);
     const phase = inc?.phase === "after" ? "after" : "before";
@@ -584,6 +607,14 @@ export function recordInfoPagePassIncidents(db: AppDb, projectId: string | null,
     db.transaction(() => {
       const r = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE id = ?", [passId]);
       const details = { phase, why, runId: s(runId).slice(0, 120), where: s(inc?.where).slice(0, 200) };
+      if (phase === "after") {
+        const users = new Set(db.query<{ project_id: string }>(
+          "SELECT DISTINCT project_id FROM audit_logs WHERE action = ? AND project_id IS NOT NULL AND json_extract(details, '$.passId') = ?",
+          [ACT_PASSED, passId]).map((u) => s(u.project_id)).filter(Boolean));
+        if (projectId) users.add(projectId);
+        const warning = { passId, where: details.where || (r ? `${s(r.origin)}${s(r.path)}` : ""), controlLabel: r ? s(r.control_label) : "", runId: details.runId, why };
+        for (const pid of users) { addAuditLog(db, pid, "portal_bot", "network backstop", ACT_MAY_HAVE_FILED, warning); warned.push(pid); }
+      }
       if (r) {
         removeInfoPagePass(db, r, { projectId, actorType: "portal_bot", actor: "network backstop", action: "portal.info_page_pass_incident", details: { ...details, withdrawn: true } });
         withdrawn.push(passId);
@@ -592,7 +623,46 @@ export function recordInfoPagePassIncidents(db: AppDb, projectId: string | null,
       }
     });
   }
-  return { withdrawn };
+  return { withdrawn, warned: Array.from(new Set(warned)) };
+}
+
+/** THE WARNING ON A PROJECT'S CARD (round 3): every after-click incident on a pass this project used
+ *  — the verified page may have filed for it. Newest first. Reads only. */
+export function listInfoPageFilingWarnings(db: AppDb, projectId: string): InfoPageFilingWarning[] {
+  return db.query<{ details: string; created_at: string }>(
+    "SELECT details, created_at FROM audit_logs WHERE project_id = ? AND action = ? ORDER BY rowid DESC LIMIT 20", [projectId, ACT_MAY_HAVE_FILED])
+    .map((r) => {
+      const d = parse<Row>(r.details, {});
+      return { passId: s(d.passId), where: s(d.where), controlLabel: s(d.controlLabel), at: s(r.created_at), why: (Array.isArray(d.why) ? d.why as unknown[] : []).map((w) => s(w)).slice(0, 4) };
+    });
+}
+
+/**
+ * THE WARNING ON THE PASS'S KNOWLEDGE-BASE ENTRY (round 3): each pass an after-click incident
+ * withdrew, with every project that used it NAMED — only the projects inside `orgId` (null = every
+ * org: the superadmin). The pass itself is shared knowledge; which projects used it is tenant data,
+ * so another org's project is never named or counted here (rule 6). Newest first. Reads only.
+ */
+export function listInfoPagePassFilingWarnings(db: AppDb, orgId: string | null): InfoPagePassFilingWarning[] {
+  const rows = db.query<{ project_id: string; details: string; created_at: string; pid: string | null; homeowner_name: string | null; project_address: string | null; org_id: string | null }>(
+    `SELECT a.project_id, a.details, a.created_at, p.id AS pid, p.homeowner_name, p.project_address, p.org_id
+       FROM audit_logs a LEFT JOIN projects p ON p.id = a.project_id
+      WHERE a.action = ? ORDER BY a.rowid DESC LIMIT 500`, [ACT_MAY_HAVE_FILED]);
+  const byPass = new Map<string, InfoPagePassFilingWarning>();
+  for (const r of rows) {
+    const d = parse<Row>(r.details, {});
+    const passId = s(d.passId);
+    if (!passId) continue;
+    let w = byPass.get(passId);
+    if (!w) { w = { passId, where: s(d.where), controlLabel: s(d.controlLabel), at: s(r.created_at), projects: [] }; byPass.set(passId, w); }
+    // A deleted project is named nowhere; a project with no org row belongs to the default tenant
+    // (scope.assertInScope's rule).
+    if (!r.project_id || !r.pid) continue;
+    if (orgId !== null && (s(r.org_id) || DEFAULT_ORG_ID) !== orgId) continue;
+    if (w.projects.some((p) => p.id === s(r.project_id))) continue;
+    w.projects.push({ id: s(r.project_id), name: s(r.homeowner_name), address: s(r.project_address).split(",")[0].trim() });
+  }
+  return Array.from(byPass.values()).slice(0, 50);
 }
 
 /** THE PROJECT IS BEING DELETED (repository.deleteProject, inside its transaction): its candidates
