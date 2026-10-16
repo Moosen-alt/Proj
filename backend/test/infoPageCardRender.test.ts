@@ -14,6 +14,8 @@
 //   (g) round 2: a project that passed (or was held at) a verified page shows why later runs stop
 //       there and "Allow once more for this project" — disabled while a HARD reason stands, every
 //       value escaped; the allow goes through api() with a JSON body like the other decisions.
+//   (h) round 3: "The verified page may have filed — check the portal for this project", first on the
+//       card and on the pass's KB entry naming the projects that used it; every value escaped.
 //
 //   npx tsx backend/test/infoPageCardRender.test.ts
 import "./_isolate"; // FIRST
@@ -122,6 +124,28 @@ check("(e) verify goes through authForDecision + namedPersonConsent and sends th
   check("(g) every value is escaped: no raw <img anywhere", !hostileHtml.includes("<img src=x") && hostileHtml.includes("&lt;img src=x") && hostileHtml.includes("interconnection (NEM) side"), hostileHtml);
   check("(g) no state, no card", stateHtml([]) === "" && stateHtml(null as never) === "");
   check("(g) the card loader renders the state beside the candidates", cut("loadInfoPageCandidates").includes("infoPageProjectStateHtml(data.projectState)"));
+}
+
+// (h) ROUND 3 — "The verified page may have filed — check the portal for this project": first on the
+// project's card, and on the pass's knowledge-base entry with the projects that used it.
+{
+  const warnHtml = new Function(`${cut("esc")}\n${cut("infoPageFilingWarningsHtml")}\nreturn infoPageFilingWarningsHtml;`)() as (w: unknown[]) => string;
+  const kbHtml = new Function(`${cut("esc")}\n${cut("infoPagePassFilingWarningsHtml")}\nreturn infoPagePassFilingWarningsHtml;`)() as (w: unknown[]) => string;
+  const w = (o: Record<string, unknown> = {}) => ({ passId: "pass-1", where: "https://permits.example.test/permits/sfjsp", controlLabel: "Next", at: "2026-10-16T12:00:00Z", why: ["the run entered none of this job's own data on the page the verified click led to"], ...o });
+  const card = warnHtml([w()]);
+  check("(h) the project's card says, plainly, 'The verified page may have filed — check the portal for this project', with the page and the date",
+    card.includes("The verified page may have filed — check the portal for this project") && card.includes("https://permits.example.test/permits/sfjsp") && card.includes("2026-10-16") && card.includes("item blocker"), card);
+  check("(h) no warning, no card", warnHtml([]) === "" && warnHtml(null as never) === "");
+  const hostileCard = warnHtml([w({ passId: H, where: H, controlLabel: H, at: H, why: [H] })]);
+  check("(h) every value on the warning is escaped", !hostileCard.includes("<img src=x") && hostileCard.includes("&lt;img src=x"), hostileCard);
+  const kb = kbHtml([{ passId: "pass-1", where: "https://permits.example.test/permits/sfjsp", controlLabel: "Next", at: "2026-10-16T12:00:00Z", projects: [{ id: "p1", name: "Pat Q Homeowner", address: "101 Solar Way" }, { id: "p2", name: "", address: "" }] }]);
+  check("(h) the pass's KB entry carries the same warning and NAMES every project that used it (the server sends only the caller's own org's)",
+    kb.includes("The verified page may have filed — check the portal for this project") && kb.includes("Pat Q Homeowner") && kb.includes("101 Solar Way") && kb.includes("<strong>p2</strong>"), kb);
+  check("(h) …with none of the caller's own: says so", kbHtml([{ passId: "pass-1", where: "x", controlLabel: "Next", at: "", projects: [] }]).includes("No project of yours used it."));
+  const hostileKb = kbHtml([{ passId: H, where: H, controlLabel: H, at: H, projects: [{ id: H, name: H, address: H }] }]);
+  check("(h) every value on the KB entry is escaped", !hostileKb.includes("<img src=x") && hostileKb.includes("&lt;img src=x"), hostileKb);
+  check("(h) the card loader puts the warnings FIRST; the KB loader renders them above the passes",
+    cut("loadInfoPageCandidates").includes("infoPageFilingWarningsHtml(data.filingWarnings) + infoPageCandidateCardsHtml(") && cut("loadInfoPagePasses").includes("infoPagePassFilingWarningsHtml(data.filingWarnings) + infoPagePassRowsHtml("));
 }
 
 if (failures) { console.error(`\n${failures}/${total} infoPageCardRender check(s) FAILED.`); process.exit(1); }

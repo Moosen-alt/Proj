@@ -37,6 +37,13 @@
 //               afresh (P3/B2): attempt 1's use is on record and attempt 2 gets no pass. A learn that
 //               throws after a use withdraws the pass. ALLOW ONCE MORE: a named person lifts the
 //               learn history once; a hard reason, nothing to allow or a bad side refuses.
+//   ROUND 3   — the learn is handed THIS JOB'S OWN VALUES (per-job keys; never a secret, a company
+//               constant or a policy default); V9: a held result that recorded a write, or whose
+//               steps are unknown, is never a clean hold; an AFTER-click incident (the run entered
+//               none of the job's data on the page the verified click led to) withdraws the pass
+//               after ONE project and warns EVERY project in its use ledger "may have filed" (the
+//               card; the KB entry names them only inside the caller's org); a before-click incident
+//               warns nobody; a learn that threw after a use warns its project.
 //   ROUTES    — auth OFF: JSON only (415); cross-origin and a rebinding Host are 403 and write
 //               nothing; no name / "operator" is 400; a typed name verifies. Auth ON: 401 signed
 //               out; an org ADMIN is 403 on verify (superadmin only) and the superadmin's verify
@@ -137,7 +144,7 @@ const stubLearn = () => ({
 });
 // Round 2: every attempt's input is kept (the headed retry is a second call), and a test may script
 // the attempts itself (report a use through the learner's own callback, throw, look bot-blocked…).
-type LearnInput = { infoPagePasses?: Array<{ id: string }>; infoPagePriorProgress?: boolean; onInfoPagePassed?: (p: { passId: string; where: string }) => void };
+type LearnInput = { infoPagePasses?: Array<{ id: string }>; infoPagePriorProgress?: boolean; onInfoPagePassed?: (p: { passId: string; where: string }) => void; infoPageProofKeys?: string[] };
 let handedAll: LearnInput[] = [];
 let scripted: Array<(input: LearnInput) => unknown> = [];
 autoLearn.setAutoLearnSeamsForTests({ learnPortal: (async (input: LearnInput) => {
@@ -665,6 +672,81 @@ await check("prior progress: a staged submission on the same side refuses; one o
   assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), true);
 });
 
+// ── ROUND 3: PROOF OF PROGRESS, MAY HAVE FILED, V9 ──────────────────────────────────────────────
+await check("round 3: the learn is handed THIS JOB'S OWN VALUES — per-job keys (the homeowner, the street), never a secret, a company constant or a policy default", async () => {
+  const P = fx.newProject();
+  await runLearn(P);
+  const keys = (handed as LearnInput).infoPageProofKeys;
+  assert.ok(Array.isArray(keys) && keys.length > 0, JSON.stringify(keys));
+  assert.ok(keys!.includes("homeownerName"), JSON.stringify(keys));
+  assert.ok(keys!.some((k) => /street/i.test(k)), JSON.stringify(keys));
+  for (const banned of ["accountNumber", "meterNumber", "numberOfStories", "existingBuildingArea", "systemConfiguration"]) assert.ok(!keys!.includes(banned), `${banned} is not this job's own value: ${JSON.stringify(keys)}`);
+  assert.ok(!keys!.some((k) => /^(installer|company|contractor|license|licence)/i.test(k)), `a company constant: ${JSON.stringify(keys)}`);
+});
+await check("round 3 (V9): a held result that RECORDED a fill is never a clean hold; neither is one whose steps are unknown — the next learn is handed priorProgress TRUE", async () => {
+  const clean = { stopReason: "backstop_abort", infoPageCandidate: { observed: { method: "POST" } }, steps: [{ action: "goto" }, { action: "click", note: "application entry: Apply" }, { action: "click", note: "advance: Next" }] };
+  assert.equal(IP.isCleanInfoPageHold(clean), true, "the positive control: a held, untouched learn is clean");
+  for (const action of ["fill", "select", "check", "uncheck", "upload", "press"]) {
+    assert.equal(IP.isCleanInfoPageHold({ ...clean, steps: [...clean.steps.slice(0, 2), { action, note: "Site Address" }, clean.steps[2]] }), false, `a ${action} step`);
+  }
+  assert.equal(IP.isCleanInfoPageHold({ ...clean, steps: undefined }), false, "unknown steps");
+  assert.equal(IP.isCleanInfoPageHold({ ...clean, filledSomething: true }), false, "filledSomething");
+  const P = fx.newProject();
+  scripted = [() => ({ ...stubLearn(), ...clean, infoPageCandidate: capture(material((m) => { m.title = "V9 Page"; })), steps: [{ action: "goto", value: sfjsp }, { action: "fill", note: "Site Address", value: "x" }] })];
+  await runLearn(P);
+  await runLearn(P);
+  assert.equal(handedOf(handed as LearnInput).priorProgress, true);
+});
+await check("round 3: an AFTER-CLICK incident (the run entered none of the job's data on the page the verified click led to) WITHDRAWS the pass after ONE project, and EVERY project that used it is warned 'may have filed'", async () => {
+  const { P: verifiedOn, passId } = await verifiedPage("May Have Filed Page");
+  // Project A passed the page earlier (its run looked fine).
+  const A = fx.newProject();
+  scripted = [(input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); return passedResult({ infoPagePassed: [{ passId, where: sfjsp }] }); }];
+  await runLearn(A);
+  // Project B passes it and the walk reports the proof-of-progress incident.
+  const B = fx.newProject();
+  const why = ["the run entered none of this job's own data on the page the verified click led to (no fill, select or check bound to a project value) — the run ended first"];
+  scripted = [(input) => {
+    assert.ok((input.infoPagePasses ?? []).some((e) => e.id === passId), "B was handed the pass");
+    input.onInfoPagePassed?.({ passId, where: sfjsp });
+    return passedResult({ stopReason: "info_page_incident", message: "STOPPED AFTER A VERIFIED INFORMATION PAGE: …", infoPagePassed: [{ passId, where: sfjsp }], infoPageIncidents: [{ passId, phase: "after", why, where: sfjsp }] });
+  }];
+  const r = await runLearn(B);
+  assert.equal(db.query("SELECT id FROM portal_info_page_passes WHERE id = ?", [passId]).length, 0, "the pass is withdrawn");
+  assert.equal(r.status, "failed");
+  assert.match(String(r.message), /The verified page may have filed — check the portal for this project \(and 1 other project\(s\) that used this verified page/);
+  for (const p of [A, B]) {
+    const w = IP.listInfoPageFilingWarnings(db, p);
+    assert.equal(w.length, 1, `project ${p === A ? "A" : "B"} is warned`);
+    assert.equal(w[0].passId, passId);
+    assert.equal(w[0].where, sfjsp);
+  }
+  assert.equal(IP.listInfoPageFilingWarnings(db, verifiedOn).length, 0, "the project the page was verified on never used it");
+  // Project C: the pass is gone — at most ONE project met the changed page.
+  const C = fx.newProject();
+  await runLearn(C);
+  assert.ok(!((handed as LearnInput).infoPagePasses ?? []).some((e) => e.id === passId), "C was handed the withdrawn pass");
+  // The pass's knowledge-base entry names both projects — inside their own org only.
+  const all = IP.listInfoPagePassFilingWarnings(db, null).find((x) => x.passId === passId);
+  assert.deepEqual(all?.projects.map((p) => p.id).sort(), [A, B].sort());
+  assert.deepEqual(IP.listInfoPagePassFilingWarnings(db, "org-default").find((x) => x.passId === passId)?.projects.map((p) => p.id).sort(), [A, B].sort());
+  const elsewhere = IP.listInfoPagePassFilingWarnings(db, "org-elsewhere").find((x) => x.passId === passId);
+  assert.ok(elsewhere && elsewhere.projects.length === 0, "another org sees the shared warning but no project of ours");
+  assert.ok(!JSON.stringify(elsewhere).includes(A) && !JSON.stringify(elsewhere).includes(B));
+});
+await check("round 3: a BEFORE-click incident (nothing was sent) warns no project", async () => {
+  const { P, passId } = await verifiedPage("Before Only Page");
+  await runLearn(P, undefined, undefined, [{ passId, phase: "before", why: ["the page's text changed"], where: sfjsp }]);
+  assert.equal(fx.audits("portal.info_page_may_have_filed").filter((x) => JSON.parse(x.details).passId === passId).length, 0);
+});
+await check("round 3: a learn that THREW after using the pass warns the project too (the page after it was never judged)", async () => {
+  const { passId } = await verifiedPage("Threw Page");
+  const T = fx.newProject();
+  scripted = [(input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); throw new Error("browser crashed"); }];
+  await runLearn(T).catch(() => null);
+  assert.equal(IP.listInfoPageFilingWarnings(db, T).length, 1);
+});
+
 // ── ROUTES ───────────────────────────────────────────────────────────────────────────────────────
 // Everything the routes need is written now; the in-process handle closes before a server opens it.
 const routeP = fx.newProject();
@@ -685,6 +767,10 @@ const usedOnce = async (title: string): Promise<string> => {
 };
 const allowRouteP = await usedOnce("Allow Route Page");
 const allowAuthP = await usedOnce("Allow Auth Page");
+// Round 3: a project warned "may have filed" (the default org), for the card and the KB routes.
+const warnedRow = fx.audits("portal.info_page_may_have_filed").find((x) => !!x.project_id);
+const warnedP = String(warnedRow?.project_id ?? "");
+const warnedPass = String(warnedRow ? JSON.parse(warnedRow.details).passId : "");
 const { setUserPassword } = await import("../src/auth");
 const { grantProduct } = await import("../src/entitlements");
 db.run("INSERT INTO orgs (id, name, edition, created_at) VALUES ('org-b', 'Org B', 'full', '2026-10-15')");
@@ -767,6 +853,16 @@ const readDb = async <T>(fn: (d: typeof db) => T): Promise<T> => {
       const s = await call(PORT, "GET", `/api/projects/${routeP}/info-page-candidates/${routeCid}/screenshot`);
       assert.equal(s.status, 200);
       assert.equal(s.headers["content-type"], "image/png");
+    });
+    await check("auth off (round 3): the warned project's card carries 'may have filed' (filingWarnings); the KB list names it in the default org", async () => {
+      assert.ok(warnedP && warnedPass, "premise: a project was warned above");
+      const r = await call(PORT, "GET", `/api/projects/${warnedP}/info-page-candidates`);
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      assert.ok(JSON.parse(r.text).filingWarnings.some((w: { passId: string }) => w.passId === warnedPass), r.text.slice(0, 400));
+      const k = await call(PORT, "GET", "/api/info-page-passes");
+      assert.equal(k.status, 200, k.text.slice(0, 200));
+      const entry = JSON.parse(k.text).filingWarnings.find((w: { passId: string }) => w.passId === warnedPass);
+      assert.ok(entry && entry.projects.some((p: { id: string }) => p.id === warnedP), k.text.slice(0, 600));
     });
     await check("auth off: a CROSS-ORIGIN verify is 403 and writes nothing", async () => {
       const r = await call(PORT, "POST", verifyUrl, { body: { identitySha256: routeIdentity, verifiedBy: "Pat Synthetic" }, headers: { origin: "http://evil.example", "sec-fetch-site": "cross-site" } });
@@ -862,6 +958,19 @@ const readDb = async <T>(fn: (d: typeof db) => T): Promise<T> => {
       const r = await call(PORT, "POST", verifyUrl, { body: { identitySha256: authIdentity }, headers: { ...same, cookie } });
       assert.equal(r.status, 403, r.text);
       assert.equal(await readDb((d) => d.query("SELECT id FROM portal_info_page_passes WHERE identity_sha256 = ?", [authIdentity]).length), 0);
+    });
+    await check("auth on (round 3, rule 6): ANOTHER ORG's admin sees the shared may-have-filed entry on the KB list but NO project of ours; the superadmin sees them named", async () => {
+      const other = await login("other@info.test");
+      const o = await call(PORT, "GET", "/api/info-page-passes", { headers: { cookie: other } });
+      assert.equal(o.status, 200, o.text.slice(0, 200));
+      const oe = JSON.parse(o.text).filingWarnings.find((w: { passId: string }) => w.passId === warnedPass);
+      assert.ok(oe && oe.projects.length === 0, o.text.slice(0, 600));
+      assert.ok(!o.text.includes(warnedP), "another org's caller saw our project id");
+      const sup = await login("super@info.test");
+      const s = await call(PORT, "GET", "/api/info-page-passes", { headers: { cookie: sup } });
+      assert.ok(JSON.parse(s.text).filingWarnings.find((w: { passId: string }) => w.passId === warnedPass)?.projects.some((p: { id: string }) => p.id === warnedP), s.text.slice(0, 600));
+      const g = await call(PORT, "GET", `/api/projects/${warnedP}/info-page-candidates`, { headers: { cookie: other } });
+      assert.equal(g.status, 404, "another org reads our project's card");
     });
     await check("auth on: ANOTHER ORG's admin gets 404 for this project's candidates (rule 6), never 403", async () => {
       const cookie = await login("other@info.test");

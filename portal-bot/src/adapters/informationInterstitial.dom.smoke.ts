@@ -520,12 +520,14 @@ console.log("\n[1b] the same page, VERIFIED from [1a]'s candidate: Next passes, 
   const entry: VerifiedInfoPage | null = c
     ? { id: "pass-post", verifiedAt: "2026-10-15T12:00:00.000Z", ...verifiedInfoPageFromCandidate({ identityVersion: c.identityVersion, identitySha256: c.identitySha256, digest: c.digest as InfoPageDigest, prefix: c.prefix }) }
     : null;
+  // Round 3: the form page must take THIS JOB'S own data before the run leaves it (proof of
+  // progress): the planner binds the job's street, which the backend names as one of its own values.
   const w = await runLearn("/post", (req) => {
     const at = pathOf(req.url);
-    if (at === "/post/project") return { fills: [{ selectorIndex: idx(req, "Site Address"), value: ADDRESS }], atReview: false, advanceSelectorIndex: idx(req, "Next") };
+    if (at === "/post/project") return { fills: [{ selectorIndex: idx(req, "Site Address"), value: ADDRESS, field: "street" }], atReview: false, advanceSelectorIndex: idx(req, "Next") };
     if (at === "/post/review") return { fills: [], atReview: true, finalSubmitSelectorIndex: idx(req, "Submit Application") };
     return null;
-  }, { infoPagePasses: entry ? [entry] : [], infoPagePriorProgress: false });
+  }, { infoPagePasses: entry ? [entry] : [], infoPagePriorProgress: false, infoPageProofKeys: ["street", "city", "zip"] });
   const nexts = w.hits.filter((h) => h.method === "POST" && h.url.startsWith("/post/sg"));
   check("[1b] premise: [1a] produced a candidate to verify", !!entry);
   check("[1b] the Next's multipart POST reached the server ONCE, carrying the submitter",
