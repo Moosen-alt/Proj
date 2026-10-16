@@ -21,7 +21,7 @@
 //      the tenant the draft-created page was on, the label that was clicked, and the signature of the
 //      WHOLE recipe it was seen with (recipeStepsSignature). It is written on the heal itself, or on a
 //      later draft seen after a person clicked the last step that an earlier heal (its row, or its own
-//      audit record) names — never on note text. A replay gets the stamp (draftSubmitStampForReplay)
+//      audit record) names by index, label AND selector — never on note text, never by label alone. A replay gets the stamp (draftSubmitStampForReplay)
 //      only when the steps it replays are exactly those signed: any edit, relabel, re-aim, self-heal
 //      or restore turns the click off until a person's click is again seen to make a draft. The
 //      stamp is what lets a replay click that step ITSELF (portal-bot draftSubmitGate.ts), on that
@@ -75,19 +75,26 @@ const draftTenant = (draft: ObservedDraft): string => s(draft.tenantKey).trim().
 /** The signature a stamp is bound to: of the steps exactly as a later read of steps_json parses them. */
 const signedSteps = (steps: RecipeStep[]): string => recipeStepsSignature(parseJson<RecipeStep[]>(asJson(steps), []));
 
+/** The fingerprint of a step's own selector (canonical: key order and undefined fields ignored). A
+ *  heal record names the step it healed by this, never by its label alone: Part 1 and Part 2 of a
+ *  two-part portal can share a label. */
+const selectorSig = (step: RecipeStep | null | undefined): string =>
+  step?.selector ? recipeStepsSignature([{ action: "click", selector: step.selector } as RecipeStep]) : "";
+
 /** The server-owned record (4 above), or null. */
 function draftSubmitRow(db: AppDb, recipeId: string): Row | null {
   return db.get<Row>("SELECT * FROM portal_recipe_draft_submits WHERE recipe_id = ?", [recipeId]) ?? null;
 }
 
 /** Writes the record (4 above). The ONLY writer of portal_recipe_draft_submits besides the disarm's delete. */
-function writeDraftSubmitRow(db: AppDb, recipeId: string, rec: { stepIndex: number; stepsSig: string; tenantKey: string; label: string; healedAt: string }): void {
+function writeDraftSubmitRow(db: AppDb, recipeId: string, rec: { stepIndex: number; stepsSig: string; tenantKey: string; label: string; selectorSig: string; healedAt: string }): void {
   db.run(
-    `INSERT INTO portal_recipe_draft_submits (recipe_id, step_index, steps_sig, tenant_key, label, healed_at, armed_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?)
+    `INSERT INTO portal_recipe_draft_submits (recipe_id, step_index, steps_sig, tenant_key, label, selector_sig, healed_at, armed_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(recipe_id) DO UPDATE SET step_index = excluded.step_index, steps_sig = excluded.steps_sig,
-       tenant_key = excluded.tenant_key, label = excluded.label, healed_at = excluded.healed_at, armed_at = excluded.armed_at`,
-    [recipeId, rec.stepIndex, rec.stepsSig, rec.tenantKey, rec.label.slice(0, 120), rec.healedAt, rec.tenantKey ? nowIso() : ""],
+       tenant_key = excluded.tenant_key, label = excluded.label, selector_sig = excluded.selector_sig,
+       healed_at = excluded.healed_at, armed_at = excluded.armed_at`,
+    [recipeId, rec.stepIndex, rec.stepsSig, rec.tenantKey, rec.label.slice(0, 120), rec.selectorSig, rec.healedAt, rec.tenantKey ? nowIso() : ""],
   );
 }
 
@@ -135,9 +142,10 @@ export function healDraftCreatingFinalSubmit(
     if (Number(db.get<{ n: number }>("SELECT changes() AS n")?.n ?? 0) === 0) return { healed: false, why: "the recipe changed while the page was being read" };
     // 4 above: the record, bound to the steps the heal just wrote. Without a tenant it is "healed,
     // not yet stamped": a later draft seen after a person's click of this step stamps it.
-    writeDraftSubmitRow(db, recipeId, { stepIndex: idx, stepsSig: signedSteps(steps), tenantKey: tenant, label: recorded, healedAt: nowIso() });
+    const healedSelector = selectorSig(steps[idx]);
+    writeDraftSubmitRow(db, recipeId, { stepIndex: idx, stepsSig: signedSteps(steps), tenantKey: tenant, label: recorded, selectorSig: healedSelector, healedAt: nowIso() });
     addAuditLog(db, ctx.projectId ?? null, "system", "submit capture", DRAFT_HEALED_ACTION, {
-      recipeId, stepIndex: idx, label: recorded.slice(0, 80), nextForm: draft.nextForm.slice(0, 90), runId: ctx.runId ?? null,
+      recipeId, stepIndex: idx, label: recorded.slice(0, 80), selectorSig: healedSelector, nextForm: draft.nextForm.slice(0, 90), runId: ctx.runId ?? null,
       stampedTenant: tenant || null,
     });
     return { healed: true, why: `step ${idx + 1} ("${recorded}") is no longer flagged as the final submit` };
@@ -147,24 +155,30 @@ export function healDraftCreatingFinalSubmit(
 }
 
 /**
- * The heal's own record that steps[idx] of this recipe, under this label, was healed: the server-owned
- * row (any tenant, any signature), or — for a heal written before #330 — its audit record. Never the
- * step's note, which any save can write.
+ * The heal's own record that THIS step — steps[idx] of this recipe, under this label AND this selector —
+ * was healed: the server-owned row (any tenant, any signature), or its heal audit record (the row is
+ * deleted by a disarm or a save; the audit stays). Never the step's note, which any save can write,
+ * and never by label alone: a save that re-aims the last step at another control with the same label
+ * (Part 2's "Submit" on a two-part portal) has a different selector, so it is not that heal's step.
+ * An audit written before the heal recorded the selector is not honoured: a re-record flags the click
+ * final again, and the next person's draft click heals and stamps it fresh.
  */
-function healRecordFor(db: AppDb, recipeId: string, idx: number, label: string): boolean {
+function healRecordFor(db: AppDb, recipeId: string, idx: number, step: RecipeStep, label: string): boolean {
+  const sel = selectorSig(step);
+  if (!sel) return false;
   const row = draftSubmitRow(db, recipeId);
-  if (row && Number(row.step_index) === idx && labelKey(row.label) === labelKey(label)) return true;
+  if (row && Number(row.step_index) === idx && labelKey(row.label) === labelKey(label) && s(row.selector_sig) === sel) return true;
   const audits = db.query<Row>("SELECT details FROM audit_logs WHERE action = ? AND details LIKE ?", [DRAFT_HEALED_ACTION, `%${recipeId}%`]);
   return audits.some((a) => {
     const d = parseJson<Record<string, unknown>>(s(a.details) || "{}", {});
-    return s(d.recipeId) === recipeId && Number(d.stepIndex) === idx && labelKey(d.label) === labelKey(label);
+    return s(d.recipeId) === recipeId && Number(d.stepIndex) === idx && labelKey(d.label) === labelKey(label) && s(d.selectorSig) === sel;
   });
 }
 
 /**
  * 4 above, for a step already healed (a heal with no tenant on the page read, one written before #330,
  * or one whose recipe has changed since): the draft is seen again after a person clicked the recipe's
- * LAST step, which a heal record names (healRecordFor), which is not flagged final, and whose label is
+ * LAST step, which a heal record names by index, label and selector (healRecordFor), which is not flagged final, and whose label is
  * what was clicked. Only the "created" wording, only that one step, and bound to the steps as they
  * are now. Writes nothing to the recipe. Never throws.
  */
@@ -182,7 +196,7 @@ function armHealedDraftStep(
   const recorded = stepLabel(step);
   const clicked = s(draft.clickedLabel);
   if (!clicked || !recorded || labelKey(clicked) !== labelKey(recorded)) return { healed: false, why: `${none}; the click ("${clicked || "unknown"}") is not the recipe's last step ("${recorded || "unlabelled"}")` };
-  if (!healRecordFor(db, recipeId, idx, recorded)) return { healed: false, why: `${none}; no heal is on record for step ${idx + 1} ("${recorded}")` };
+  if (!healRecordFor(db, recipeId, idx, step, recorded)) return { healed: false, why: `${none}; no heal is on record for step ${idx + 1} ("${recorded}")` };
   const tenant = draftTenant(draft);
   if (!tenant) return { healed: false, why: `${none}; the page's tenant is unknown, so the healed step is not stamped` };
   const sig = signedSteps(steps);
@@ -190,7 +204,7 @@ function armHealedDraftStep(
   if (row && s(row.tenant_key) === tenant && s(row.steps_sig) === sig && Number(row.step_index) === idx) {
     return { healed: false, why: `${none}; the healed step is already stamped for ${tenant}` };
   }
-  writeDraftSubmitRow(db, recipeId, { stepIndex: idx, stepsSig: sig, tenantKey: tenant, label: recorded, healedAt: nowIso() });
+  writeDraftSubmitRow(db, recipeId, { stepIndex: idx, stepsSig: sig, tenantKey: tenant, label: recorded, selectorSig: selectorSig(step), healedAt: nowIso() });
   addAuditLog(db, ctx.projectId ?? null, "system", "submit capture", "portal_recipe.draft_submit_stamped", {
     recipeId, stepIndex: idx, label: recorded.slice(0, 80), stampedTenant: tenant, stepsSig: sig, runId: ctx.runId ?? null,
   });

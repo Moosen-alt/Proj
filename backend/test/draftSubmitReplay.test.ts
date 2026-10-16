@@ -24,6 +24,12 @@
 //   P3 a disarmed stamp's steps written back by an abandoned re-record's restore;
 //   P4 a save writes the heal's note onto a last click no heal ever named.
 //   And a plain round-trip save of the very same steps turns it off too.
+//   THE HELM'S RE-REVIEW (92608b70):
+//   P6 an incident whose message reads as a bot wall (a challenge after the click) never starts the
+//      headed retry: one runner call, the incident recorded, the stamp gone for the next replay;
+//   P4b a save that re-aims the healed last step at another control with the SAME label: a person's
+//      later draft click never re-arms it (the heal record names the healed step's selector), and a
+//      legacy heal audit with no selector is not honoured.
 //
 // KILL TESTS (run by hand on this tree):
 //   K1 draftSubmitStampForReplay: drop the signature comparison → P2 fails.
@@ -31,6 +37,8 @@
 //   K3 armHealedDraftStep: accept the heal note in place of healRecordFor → P4 fails.
 //   K4 repository: drop the draftSubmitUnexpected branch → (e) fails (record kept, no incident row).
 //   K5 repository: pass the stamp on every track → (c) fails.
+//   K6 repository: drop draftClickReachedPortal from the headed-retry condition → P6 fails.
+//   K7 healRecordFor: drop the selector comparison → P4b fails.
 //
 // Run: npx tsx backend/test/draftSubmitReplay.test.ts
 import "./_isolate"; // FIRST
@@ -38,6 +46,7 @@ import assert from "node:assert/strict";
 import type { RecipeStep } from "../../shared/src/types";
 import { recipeShapeProblems } from "../../shared/src/portalSafety";
 import { setupStageFixture, check, finish } from "./_stageFixture";
+import { addAuditLog } from "../src/audit";
 
 const fx = await setupStageFixture("draft-submit-replay");
 const { db, repo, recipes } = fx;
@@ -127,12 +136,13 @@ await check("(b) a healed, unstamped last step is stamped on its heal record whe
   assert.equal(String(fx.recipeRow(recipe.id).steps_json), before, "stamping wrote to the recipe");
   assert.equal(fx.audits("portal_recipe.draft_submit_stamped").length, 1);
 
-  // A heal written BEFORE #330: only its audit row is on record (no server-owned row yet).
+  // The row gone (a disarm or a save deletes it): the heal's own audit record, which names the step's
+  // index, label and selector, is enough.
   const old = fx.completeRecipe([...fx.fills(2), fx.REVIEW, fx.FINAL]);
   draftMod.healDraftCreatingFinalSubmit(db, old.id, { ...DRAFT, clickedLabel: "Submit Application" });
-  db.run("DELETE FROM portal_recipe_draft_submits WHERE recipe_id = ?", [old.id]); // a DB from before v49
+  db.run("DELETE FROM portal_recipe_draft_submits WHERE recipe_id = ?", [old.id]);
   draftMod.healDraftCreatingFinalSubmit(db, old.id, { ...DRAFT, clickedLabel: "Submit Application", tenantKey: TENANT });
-  assert.equal(row(old.id)?.tenant_key, TENANT, "a pre-#330 heal (its audit record) was not stamped");
+  assert.equal(row(old.id)?.tenant_key, TENANT, "a heal on record only in its audit was not stamped");
   assert.equal(draftMod.draftSubmitStampForReplay(db, old.id, stepsOf(old.id))?.stepIndex, 3);
 });
 
@@ -271,6 +281,48 @@ await check("P4 a save that writes the heal's note onto a last click no heal nam
   draftMod.healDraftCreatingFinalSubmit(db, r.id, { ...DRAFT, clickedLabel: "Submit", tenantKey: NEM_TENANT });
   assert.equal(row(r.id), null, "a moved heal note was stamped");
   assert.equal((await nemStamp()).stamp, null);
+});
+
+await check("P4b a save that re-aims the healed step at a same-label control: a person's later draft click never re-arms it; a legacy audit with no selector is not honoured", async () => {
+  const r = armedNem();
+  const steps = stepsOf(r.id);
+  const reaimed = { action: "click", selector: { text: "Submit Application", css: "#part2 .file-it" }, note: "submit" } as RecipeStep;
+  recipes.savePortalRecipeSteps(db, r.id, [...steps.slice(0, -1), reaimed], { status: "complete", notes: "test" });
+  assert.equal((await nemStamp()).stamp, null, "precondition: the save turned the stamp off");
+  draftMod.healDraftCreatingFinalSubmit(db, r.id, { ...DRAFT, clickedLabel: "Submit Application", tenantKey: NEM_TENANT });
+  assert.equal(row(r.id), null, "a re-aimed step with the healed label was re-armed");
+  assert.equal((await nemStamp()).stamp, null);
+
+  // A heal audit from before the selector was recorded: index and label only. Not honoured.
+  const legacy = recipes.startPortalRecording(db, { scopeType: "utility", state: "WA", utility: "Legacy Utility", portalUrl: "https://legacy.powerclerk.example/MvcAccount/Login", portalPlatform: "powerclerk", createdBy: "test" });
+  const healedClick = { action: "click", selector: { text: "Submit Application" }, note: `final submit | ${draftMod.DRAFT_HEAL_NOTE}` } as RecipeStep;
+  recipes.savePortalRecipeSteps(db, legacy.id, [...fx.fills(2), fx.REVIEW, healedClick], { status: "complete", notes: "test" });
+  addAuditLog(db, null, "system", "submit capture", draftMod.DRAFT_HEALED_ACTION, { recipeId: legacy.id, stepIndex: 3, label: "Submit Application", nextForm: "", runId: null });
+  draftMod.healDraftCreatingFinalSubmit(db, legacy.id, { ...DRAFT, clickedLabel: "Submit Application", tenantKey: "legacy.powerclerk.example" });
+  assert.equal(row(legacy.id), null, "a legacy heal audit with no selector armed the step");
+});
+
+await check("P6 an incident whose message reads as a bot wall never starts the headed retry: one call, the incident recorded, the stamp gone", async () => {
+  armedNem();
+  assert.ok((await nemStamp()).stamp, "precondition: stamped");
+  const msg = "UNEXPECTED PAGE AFTER A DRAFT-CREATING SUBMIT: automation clicked \"Submit Application\", the submit this portal answered with a draft before, and a challenge appeared after the click (challenge captcha detected (challenges.cloudflare.com)) — never answered by automation. The portal MAY HAVE FILED this application.";
+  const incident = { label: "Submit Application", verdict: "challenge", tenantKey: NEM_TENANT, stepIndex: 3, evidence: "challenge captcha detected (challenges.cloudflare.com)" };
+  const calls: Array<Record<string, unknown>> = [];
+  fx.stubRunner(async (_recipe, _project, _values, _docs, _files, opts) => {
+    calls.push((opts ?? {}) as Record<string, unknown>);
+    // A retry that "got further" would replace the result: answer it with a clean staged run.
+    if (calls.length > 1) return staged() as never;
+    return {
+      portalName: "stub", ok: false, finalSubmitClicked: false, pauseReason: "draft_submit_unexpected", message: msg, draftSubmitUnexpected: incident,
+      steps: [{ ok: true, message: "Opened stub portal." }, { ok: false, pauseReason: "draft_submit_unexpected", message: msg, data: { finalSubmitClicked: false, draftSubmitUnexpected: incident } }],
+    } as never;
+  });
+  const projectId = fx.newProject();
+  await repo.prepareSubmission(db, projectId, "nem" as never);
+  assert.equal(calls.length, 1, `the headed retry ran after the draft click (${calls.length} runner calls)`);
+  assert.equal(fx.audits(draftMod.DRAFT_SUBMIT_UNEXPECTED_ACTION).filter((a) => a.project_id === projectId).length, 1, "the incident was not recorded");
+  assert.equal(String(fx.latestRun(projectId)!.status), "paused_for_human");
+  assert.equal((await nemStamp()).stamp, null, "the stamp is still armed after the incident");
 });
 
 await check("a plain round-trip save of the very same steps turns the auto-click off; a person's next draft click re-arms it", async () => {

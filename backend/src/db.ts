@@ -2593,7 +2593,9 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       // person's click seen to make a draft) and only disarmDraftCreatingSubmit deletes one.
       // steps_sig is recipeStepsSignature of the WHOLE recipe the draft was seen with: a replay gets
       // the stamp only when the steps it replays are exactly those (any edit turns it off). An empty
-      // tenant_key is "healed, not yet stamped" (the heal's page had no readable tenant). One row per
+      // tenant_key is "healed, not yet stamped" (the heal's page had no readable tenant). selector_sig
+      // fingerprints the healed step's own selector, so a re-aimed last step with the same label is
+      // never re-armed from this record (portalDraft healRecordFor). One row per
       // recipe; portal_recipes is shared knowledge, so no org_id (CLAUDE.md). No foreign key: a deleted
       // recipe's id is never reused, so its orphan row is never read, and a key would block the delete.
       db.exec(`
@@ -2603,6 +2605,7 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
           steps_sig TEXT NOT NULL,
           tenant_key TEXT NOT NULL DEFAULT '',
           label TEXT NOT NULL,
+          selector_sig TEXT NOT NULL DEFAULT '',
           healed_at TEXT NOT NULL,
           armed_at TEXT NOT NULL DEFAULT ''
         );

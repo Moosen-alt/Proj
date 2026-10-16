@@ -9363,7 +9363,12 @@ export async function prepareSubmission(
       // were actually headless, and only when the operator has not switched it off. The retry
       // result is kept only if it got further, so a second refusal cannot erase the first
       // result's diagnostics.
-      if (!result.ok && looksBotBlocked(stageFailureText(result)) && stageOptions.headless !== false
+      // NEVER after the replay's own draft-creating click (#330): that click may have reached the
+      // portal, so a second browser would start the application again, and the incident it raised
+      // must stay this run's result (recorded and disarmed below), never be replaced by a retry's.
+      const draftClickReachedPortal = Boolean((result as { draftSubmitUnexpected?: unknown }).draftSubmitUnexpected
+        || (result as { draftCreatedByReplay?: unknown }).draftCreatedByReplay);
+      if (!result.ok && !draftClickReachedPortal && looksBotBlocked(stageFailureText(result)) && stageOptions.headless !== false
           && process.env.PORTAL_HEADED_RETRY !== "0") {
         logger.info("portal", "portal refused a headless browser at staging — retrying with a real window", {
           projectId, portal: portalLabel,
@@ -9372,8 +9377,7 @@ export async function prepareSubmission(
           ledgerStagingLaunch(`staging replay (${track ?? "permit"} track, run ${runId}) — headed retry, a second browser; may leave a second draft`, String(recipe.portalUrl || credentialUrl || ""));
           const headedResult = await recipeStageRunner(
             boundRecipe, stagedProject, boundValues, docsByType, files,
-            // Never a second draft-creating click after one already reached the portal (#330).
-            { ...replayOptions, headless: false, draftSubmitStamp: (result as { draftSubmitUnexpected?: unknown }).draftSubmitUnexpected ? null : draftSubmitStamp },
+            { ...replayOptions, headless: false },
           );
           const before = Array.isArray((result as { steps?: unknown[] }).steps) ? (result as { steps: unknown[] }).steps.length : 0;
           const after = Array.isArray((headedResult as { steps?: unknown[] }).steps) ? (headedResult as { steps: unknown[] }).steps.length : 0;
