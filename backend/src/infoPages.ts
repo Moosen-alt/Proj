@@ -147,20 +147,27 @@ function infoPagePassUseCounts(db: AppDb): Map<string, number> | null {
   } catch { return null; }
 }
 
+/** The use counts, read at most once per caller (a list reads the ledger once, not once per row). */
+type UsesOf = () => Map<string, number> | null;
+const usesOnce = (db: AppDb): UsesOf => {
+  let memo: Map<string, number> | null | undefined;
+  return () => (memo === undefined ? (memo = infoPagePassUseCounts(db)) : memo);
+};
+
 /** ROUND 4 — why this pass row's verification is no longer authority (empty = within both limits).
  *  Reads only. */
-function passExpiry(db: AppDb, r: Row, nowMs: number = Date.now()): string[] {
-  const uses = infoPagePassUseCounts(db);
+function passExpiry(db: AppDb, r: Row, nowMs: number = Date.now(), usesOf: UsesOf = usesOnce(db)): string[] {
+  const uses = usesOf();
   return infoPagePassExpiryRefusals(s(r.verified_at), uses ? uses.get(s(r.id)) ?? 0 : null, nowMs);
 }
 
 /** ROUND 4 — the EXPIRED pass for this exact page, if one is on file: why it expired (the card and
  *  the run message say "verification expired — a person re-verifies"). Empty = none, or it is live.
  *  Reads only. */
-export function expiredInfoPagePassFor(db: AppDb, identitySha256: string, nowMs: number = Date.now()): { passId: string; verifiedAt: string; why: string[] } | null {
+export function expiredInfoPagePassFor(db: AppDb, identitySha256: string, nowMs: number = Date.now(), usesOf: UsesOf = usesOnce(db)): { passId: string; verifiedAt: string; why: string[] } | null {
   const r = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE identity_sha256 = ?", [s(identitySha256)]);
   if (!r) return null;
-  const why = passExpiry(db, r, nowMs);
+  const why = passExpiry(db, r, nowMs, usesOf);
   return why.length ? { passId: s(r.id), verifiedAt: s(r.verified_at), why } : null;
 }
 
@@ -466,7 +473,7 @@ const prefixShapeRefusals = (prefix: InfoPagePrefixStep[]): string[] => {
 };
 
 /** Every reason "OK to advance" is refused for this candidate ROW (verify and the card both ask). */
-function candidateRefusals(db: AppDb, r: Row): string[] {
+function candidateRefusals(db: AppDb, r: Row, usesOf: UsesOf = usesOnce(db)): string[] {
   const out: string[] = [];
   const digest = parse<InfoPageDigest | null>(r.digest_json, null);
   const observed = parse<InfoPageObservedRequest | null>(r.observed_json, null);
@@ -492,11 +499,11 @@ function candidateRefusals(db: AppDb, r: Row): string[] {
   // A pass for this exact page refuses a second one — unless its verification EXPIRED (round 4): then
   // this verify is the re-verification, and it replaces the expired row (verifyInfoPageCandidate).
   const existing = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE identity_sha256 = ?", [s(r.identity_sha256)]);
-  if (existing && !passExpiry(db, existing).length) out.push("a pass for this exact page already exists (withdraw it first to verify again)");
+  if (existing && !passExpiry(db, existing, Date.now(), usesOf).length) out.push("a pass for this exact page already exists (withdraw it first to verify again)");
   return Array.from(new Set(out));
 }
 
-const candidateRowToRecord = (db: AppDb, r: Row): InfoPageCandidateRecord => {
+const candidateRowToRecord = (db: AppDb, r: Row, usesOf: UsesOf = usesOnce(db)): InfoPageCandidateRecord => {
   const digest = parse<InfoPageDigest | null>(r.digest_json, null);
   const evidence = parse<InfoPageEvidence>(r.evidence_json, { title: "", headings: [], forms: [], frames: [], controlLabels: [], text: "" });
   return {
@@ -523,13 +530,13 @@ const candidateRowToRecord = (db: AppDb, r: Row): InfoPageCandidateRecord => {
     passId: s(r.pass_id),
     passLive: s(r.status) === "verified" && !!s(r.pass_id) && ((): boolean => {
       const p = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE id = ?", [s(r.pass_id)]);
-      return !!p && passExpiry(db, p).length === 0;
+      return !!p && passExpiry(db, p, Date.now(), usesOf).length === 0;
     })(),
-    refusals: s(r.status) === "open" ? candidateRefusals(db, r) : [],
+    refusals: s(r.status) === "open" ? candidateRefusals(db, r, usesOf) : [],
     warnings: infoPageVerifyWarnings(digest ? digest.shape : null, evidence.text),
     // ROUND 4: this exact page's verification EXPIRED (30 days / 10 projects): the run was held as on
     // main, and a person re-verifies on this card.
-    expiredPass: s(r.status) === "open" ? expiredInfoPagePassFor(db, s(r.identity_sha256)) : null,
+    expiredPass: s(r.status) === "open" ? expiredInfoPagePassFor(db, s(r.identity_sha256), Date.now(), usesOf) : null,
   };
 };
 
@@ -538,7 +545,8 @@ export function listInfoPageCandidates(db: AppDb, projectId: string): InfoPageCa
   const rows = db.query<Row>(
     "SELECT * FROM portal_info_page_candidates WHERE project_id = ? ORDER BY CASE status WHEN 'open' THEN 0 WHEN 'dismissed' THEN 1 ELSE 2 END, last_seen_at DESC LIMIT 50",
     [projectId]);
-  return rows.map((r) => candidateRowToRecord(db, r));
+  const usesOf = usesOnce(db);
+  return rows.map((r) => candidateRowToRecord(db, r, usesOf));
 }
 
 /** The masked screenshot of THIS project's candidate, or null. */
@@ -810,8 +818,9 @@ export function deleteProjectInfoPages(db: AppDb, projectId: string): void {
  *  receives); `expired` = why it expired (round 4: the limit reached, never a count — the count spans
  *  tenants). */
 export function listInfoPagePasses(db: AppDb, nowMs: number = Date.now()): InfoPagePassRecord[] {
+  const usesOf = usesOnce(db);
   return db.query<Row>("SELECT * FROM portal_info_page_passes ORDER BY verified_at DESC LIMIT 200").map((r) => {
-    const expired = passExpiry(db, r, nowMs);
+    const expired = passExpiry(db, r, nowMs, usesOf);
     return {
       id: s(r.id),
       origin: s(r.origin),
