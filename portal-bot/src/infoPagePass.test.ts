@@ -12,9 +12,12 @@
 //             a page the backstop would not hold.
 //   INVALID — before the click: a signature, control, request or step-sequence change at the pass's
 //             host + path is an incident on that pass (infoPageDriftedEntries); another path is not.
-//   AFTER   — after the click: only an unfiled form passes (infoPageAfterClickRefusals); a receipt,
-//             a confirmation number, a filed status, the review page, an error, no field, an
-//             unreadable or unjudged page each refuse.
+//   AFTER   — after the click: only POSITIVE evidence of an unfiled application form passes
+//             (infoPageAfterClickRefusals, round 2): every s1/s2 receipt beside a search or feedback
+//             box, a new number-shaped token, a frame, a filing-worded control, one field, a receipt,
+//             a confirmation number, a filed status, the review page, an error, an unreadable or
+//             unjudged page, and a missing baseline each refuse; a footer number on both pages is
+//             not new.
 //   REQUEST — Chromium-shaped multipart and urlencoded bodies parse; every substitution refuses.
 //   GREP    — the predicate is called only from shared/src/infoPagePass.ts and filingBackstop.ts;
 //             THE SINGLE WRITER: the pass table is named only by its migration and infoPages.ts,
@@ -27,7 +30,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, digestInfoPageIdentity, infoPageAfterClickRefusals, infoPageBackstopRefusals, infoPageDriftedEntries, infoPageEvidence, infoPageMatchRefusals,
-  infoPageObservedRequest, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageRunStateRefusals,
+  infoPageNumberTokens, infoPageObservedRequest, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageRunStateRefusals,
   infoPageShapeRefusals, infoPageVerifyWarnings, isMatchClassRefusal, mayPassInfoPage, parseFormBodyFields, verifiedInfoPageFromCandidate,
   type InfoPageBackstopState, type InfoPageIdentityMaterial, type InfoPagePassContext, type InfoPageRunState, type InfoPageRunStep,
 } from "../../shared/src/infoPagePass";
@@ -311,27 +314,75 @@ console.log("\nINVALIDATION BEFORE THE CLICK (proposal §4)");
 }
 
 // ---------------------------------------------------------------------------------------------
-console.log("\nAFTER THE CLICK (proposal §4): the page must read as an unfiled form");
+console.log("\nAFTER THE CLICK (proposal §4; round 2): only POSITIVE evidence of an unfiled application form passes");
 {
-  const form = { readable: true, fillable: 3, terminal: false, text: "Project Information Site Address Owner Name Previous Next" };
-  check("the application form (fields, not terminal, neither filed nor an error) passes", infoPageAfterClickRefusals(form).length === 0, JSON.stringify(infoPageAfterClickRefusals(form)));
+  // The information page's own text carries the footer's phone number; so does the form page. A
+  // token on both pages is not new.
+  const INFO_TEXT = `Permitting Information ${PROSE} Previous Next Call 503-000-0000 or TTY 711.`;
+  const baseline = { tokens: infoPageNumberTokens(INFO_TEXT) };
+  const form = { readable: true, fillable: 3, terminal: false, text: "Project Information Site Address Unit / Suite Previous Next Call 503-000-0000 or TTY 711.", formFields: 2, frames: 0, controlLabels: ["Placeholder Solar Co", "Previous", "Next"] };
+  check("the application form (two empty plain fields in one form, not terminal, neither filed nor an error, no new number) passes",
+    infoPageAfterClickRefusals(form, baseline).length === 0, JSON.stringify(infoPageAfterClickRefusals(form, baseline)));
+  check("a number on BOTH pages (the footer's phone) is not new — the check is 'newly present', not 'present'",
+    baseline.tokens.includes("503-000-0000") && infoPageAfterClickRefusals(form, baseline).length === 0, JSON.stringify(baseline.tokens));
+  // Every after-click shape the round-1 verifiers found PASSING (s1 f_receipt_miss1-4; s2 list,
+  // reqnum, confcolon, status, iframe, feedback, paid, receiptRef, confirmEdit, confirmCertify), as
+  // the page reader reads them — a header search box or a feedback box is a visible fillable control
+  // (fillable 1) but never a plain field of an application form (formFields 0).
   const bad: Array<[string, Record<string, unknown>, RegExp]> = [
-    ["a receipt ('Your application has been submitted')", { text: "Thank you. Your application has been submitted.", fillable: 0 }, /reads as filed/],
-    ["a confirmation number", { text: "Confirmation number: PR-2026-00042", fillable: 0 }, /reads as filed/],
-    ["a filed status beside a form", { text: "Request status: your request was received. Your submission was received.", fillable: 2 }, /reads as filed/],
+    ["s1 f_receipt_miss1: 'request has been created and sent … Request 26-104233-000-00-PR' + a header search box",
+      { text: "Your solar permit request has been created and sent to a Permit Tech for intake. Request 26-104233-000-00-PR.", fillable: 1, formFields: 0 }, /no application form/],
+    ["s1 f_receipt_miss1: …and its request number is new", { text: "Your solar permit request has been created and sent to a Permit Tech for intake. Request 26-104233-000-00-PR.", fillable: 1, formFields: 0 }, /number that was not on the information page/],
+    ["s1 f_receipt_miss2: 'We've got your permit request' + a search box", { text: "We've got your permit request. A Permit Tech will contact you.", fillable: 1, formFields: 0 }, /no application form/],
+    ["s1 f_receipt_miss3: 'Your request was sent to the City on 10/16/2026' + a feedback textarea in main content", { text: "Your request was sent to the City on 10/16/2026. Tell us how we did.", fillable: 1, formFields: 0 }, /no application form/],
+    ["s1 f_receipt_miss4: 'Intake request #A-26-0042 is now in the queue' + a search box", { text: "Intake request #A-26-0042 is now in the queue.", fillable: 1, formFields: 0 }, /number that was not on the information page/],
+    ["s2 list: My Permits & Requests with the new row '26-104455-RS … Submitted' + a search box", { text: "My Permits & Requests 26-104455-RS Solar Permit Request Submitted 10/16/2026", fillable: 1, formFields: 0 }, /number that was not on the information page/],
+    ["s2 reqnum: 'Your request number is 26-104455-RS' + a search box", { text: "We have received your request. Your request number is 26-104455-RS.", fillable: 1, formFields: 0 }, /number that was not on the information page/],
+    ["s2 confcolon: 'Confirmation: PR-2026-00042' + a search box", { text: "Confirmation: PR-2026-00042", fillable: 1, formFields: 0 }, /number that was not on the information page/],
+    ["s2 status: 'Status: Submitted' + a search box (no number at all)", { text: "Status: Submitted", fillable: 1, formFields: 0 }, /no application form/],
+    ["s2 iframe: the receipt in an iframe, a search box in the top frame", { text: "Development Hub Fixture", fillable: 1, formFields: 0, frames: 1 }, /frame\(s\) the reading cannot see into/],
+    ["s2 feedback: 'Thank you! Your request is complete.' + a feedback textarea", { text: "Thank you! Your request is complete. Feedback", fillable: 1, formFields: 0 }, /no application form/],
+    ["s2 paid: 'Payment received. Receipt 26-104455. Amount paid $350.00.' + a search box", { text: "Payment received. Receipt 26-104455. Amount paid $350.00.", fillable: 1, formFields: 0 }, /number that was not on the information page/],
+    ["s2 receiptRef: 'Your reference is SR-2026-104455'", { text: "Your reference is SR-2026-104455", fillable: 1, formFields: 0 }, /number that was not on the information page/],
+    ["s2 confirmEdit: a prefilled input and 'Submit Application'", { text: "Confirm and send. Press Submit Application to send it to the City.", fillable: 1, formFields: 0, controlLabels: ["Previous", "Submit Application"] }, /submit-, filing- or pay-worded control/],
+    ["s2 confirmCertify: an input, an 'I certify' box and 'Send to City'", { text: "I certify the information is correct. Send to City", fillable: 2, formFields: 0, controlLabels: ["Send to City"] }, /no application form/],
+    // Each rule on its own (the other rules satisfied): what pins the rule, not the shape.
+    ["a new number beside a real two-field form (the token rule alone)", { text: "Project Information Request 26-104233 Site Address Unit / Suite Previous Next" }, /number that was not on the information page/],
+    ["a filing-worded control beside a real two-field form (the control rule alone)", { controlLabels: ["Previous", "Submit Application"] }, /submit-, filing- or pay-worded control/],
+    ["a pay-worded control beside a real two-field form", { controlLabels: ["Previous", "Pay Fees"] }, /submit-, filing- or pay-worded control/],
+    ["one empty plain field only (the field rule alone)", { formFields: 1 }, /no application form/],
+    ["a frame beside a real two-field form (the frame rule alone)", { frames: 1 }, /frame\(s\)/],
+    // The round-1 shapes still refuse.
+    ["a receipt ('Your application has been submitted')", { text: "Thank you. Your application has been submitted.", formFields: 0 }, /reads as filed/],
+    ["a confirmation number", { text: "Confirmation number: PR-2026-00042", formFields: 0 }, /reads as filed/],
+    ["a filed status beside a form", { text: "Request status: your request was received. Your submission was received." }, /reads as filed/],
     ["the review page", { terminal: true, text: "Please review your application before submitting." }, /review \/ terminal/],
-    ["an error page", { text: "There was an error processing your request.", fillable: 1 }, /reads as an error/],
-    ["a page that reads both ways", { text: "Your application has been submitted. There was an error.", fillable: 1 }, /both as filed and as an error/],
-    ["the same information page again (no field)", { fillable: 0, text: "Permitting Information. A Permit Tech will review your submission." }, /no fillable field/],
-    ["an unreadable page", { readable: false, text: "", fillable: 0 }, /could not be read/],
+    ["an error page", { text: "There was an error processing your request." }, /reads as an error/],
+    ["a page that reads both ways", { text: "Your application has been submitted. There was an error." }, /both as filed and as an error/],
+    ["the same information page again (no field)", { fillable: 0, formFields: 0, text: "Permitting Information. A Permit Tech will review your submission." }, /no application form/],
+    ["an unreadable page", { readable: false, text: "", fillable: 0, formFields: 0 }, /could not be read/],
     ["an unknown terminal reading", { terminal: null }, /could not be judged/],
+    // Unread = refused.
+    ["the form count was not read", { formFields: undefined }, /no application form/],
+    ["the frames were not read", { frames: undefined }, /not read for frames/],
+    ["the controls were not read", { controlLabels: undefined }, /not read for its controls/],
   ];
   for (const [what, patch, re] of bad) {
-    const r = infoPageAfterClickRefusals({ ...form, ...patch } as never);
+    const r = infoPageAfterClickRefusals({ ...form, ...patch } as never, baseline);
     check(`refused (an incident): ${what}`, r.some((x) => re.test(x)), JSON.stringify(r));
   }
-  check("refused: no reading at all", infoPageAfterClickRefusals(null).length > 0);
-  check("quoted evidence never carries the number itself", !infoPageAfterClickRefusals({ ...form, text: "Confirmation number: PR-2026-00042" }).join(" ").includes("2026"));
+  check("refused: no reading at all", infoPageAfterClickRefusals(null, baseline).length > 0);
+  check("refused: the information page's own tokens were not kept (no baseline)", infoPageAfterClickRefusals(form, null).some((x) => /own text was not kept/.test(x)));
+  check("refused: a malformed baseline", infoPageAfterClickRefusals(form, { tokens: null } as never).some((x) => /own text was not kept/.test(x)));
+  check("quoted evidence never carries the number itself", !infoPageAfterClickRefusals({ ...form, text: "Confirmation number: PR-2026-00042" }, baseline).join(" ").includes("2026")
+    && !infoPageAfterClickRefusals({ ...form, text: "Request 26-104233-000-00-PR" }, baseline).join(" ").includes("104233"));
+  // The token shape.
+  const tok = (t: string): string[] => infoPageNumberTokens(t);
+  const has: Array<[string, string]> = [["Request 26-104233-000-00-PR.", "26-104233-000-00-PR"], ["Intake request #A-26-0042", "A-26-0042"], ["Confirmation: PR-2026-00042", "PR-2026-00042"],
+    ["number is 26-104455-rs.", "26-104455-RS"], ["reference SR2026104455", "SR2026104455"], ["Receipt 1044552", "1044552"], ["Request #12345", "12345"], ["Ref 26–104455", "26-104455"]];
+  for (const [t, want] of has) check(`a number-shaped token: "${t}" → ${want}`, tok(t).includes(want), JSON.stringify(tok(t)));
+  const none = ["Step 2 of 5", "Max 1000 characters", "Copyright 2026", "COVID-19 notice", "ZIP 97204", "Form W-9", "Unit 4B", "10/16/2026"];
+  for (const t of none) check(`not a number-shaped token: "${t}"`, tok(t).length === 0, JSON.stringify(tok(t)));
 }
 
 // ---------------------------------------------------------------------------------------------

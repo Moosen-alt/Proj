@@ -1949,16 +1949,35 @@ export function portalSafetyFactory() {
 
   /**
    * Runs IN THE PAGE: THE PAGE A VERIFIED INFORMATION PAGE'S CLICK LED TO (#344, proposal §4) —
-   * what the network backstop judges before the run may go on. It must read as an UNFILED FORM:
-   * text, at least one visible enabled fillable control, and the shared readings say no (the
-   * terminal reading here; the receipt / error reading, classifySubmissionText, in Node on `text`).
-   * No new wording: the same terminalPageInPage and navigator-cut text every door reads.
+   * what the network backstop judges before the run may go on. It must read as an UNFILED
+   * APPLICATION FORM, and that needs POSITIVE evidence (round 2: "a visible field and no known filed
+   * phrase" passed a receipt beside a header search box or a feedback box). Read here, judged in Node
+   * (infoPagePass.infoPageAfterClickRefusals):
+   *   - formFields: the most EMPTY plain fields (text-like input, textarea, select with no value) in
+   *     ONE same-origin POST <form>, counting only fields that are visible, enabled, writable, outside
+   *     every header / nav / footer / aside / dialog / banner / search / navigation / contentinfo /
+   *     complementary landmark, and not a search, feedback, comment, rating, newsletter or sign-in
+   *     box (by name, id, placeholder, label, aria-label or title). A form inside such a landmark, a
+   *     form that is itself a search / feedback / sign-in widget, or one carrying a password field,
+   *     counts nothing. (A big form wrapping the whole page — DevHub's SmartGuide, ASP.NET — counts
+   *     only its plain fields: its header search box and sidebar never do.)
+   *   - frames: visible iframe / frame / object / embed (a page the reading cannot see into);
+   *   - controlLabels: every visible button's label (a filing- or pay-worded one refuses, in Node);
+   *   - terminal and text: the shared terminal reading and the navigator-cut text every door reads
+   *     (the receipt / error reading and the new-number check run on it in Node).
+   * `fillable` (any visible enabled fillable control) is kept for diagnostics only.
    */
-  const infoPageAfterClickInPage = (): { readable: boolean; fillable: number; terminal: boolean | null; text: string } => {
+  const infoPageAfterClickInPage = (): { readable: boolean; fillable: number; terminal: boolean | null; text: string; formFields: number; frames: number; controlLabels: string[] } => {
     const d = (globalThis as { document?: Document }).document;
-    if (!d || !d.body) return { readable: false, fillable: 0, terminal: null, text: "" };
+    if (!d || !d.body) return { readable: false, fillable: 0, terminal: null, text: "", formFields: 0, frames: 0, controlLabels: [] };
     const t = terminalPageInPage();
     const text = String(pageTextWithoutNavigatorInPage(d) || "").replace(/\s+/g, " ").trim();
+    const shown = (el: Element): boolean => {
+      const r = (el as HTMLElement).getBoundingClientRect();
+      if (!(r.width > 2 && r.height > 2)) return false;
+      const cs = (globalThis as unknown as { getComputedStyle: (e: Element) => CSSStyleDeclaration }).getComputedStyle(el);
+      return cs.visibility !== "hidden" && cs.display !== "none" && cs.opacity !== "0";
+    };
     const fillable = Array.from(d.querySelectorAll("input, select, textarea, [contenteditable]")).filter((el) => {
       const tag = el.tagName.toLowerCase();
       if (tag === "input") {
@@ -1969,7 +1988,50 @@ export function portalSafetyFactory() {
       const r = (el as HTMLElement).getBoundingClientRect();
       return r.width > 2 && r.height > 2;
     }).length;
-    return { readable: text.length > 0, fillable, terminal: typeof t.terminal === "boolean" ? t.terminal : null, text: text.slice(0, 20_000) };
+    const CHROME = "header, nav, footer, aside, dialog, [role=banner], [role=search], [role=navigation], [role=contentinfo], [role=complementary], [role=dialog]";
+    const WIDGET = /\b(search\w*|query|keywords?|feedback|survey|comments?|rating|rate\s+(us|this|your)|subscribe|newsletter|log\s*in|login|sign\s*in|signin|username|password)\b/i;
+    const PLAIN_INPUT = /^(text|email|tel|number|date|url|month|week|time|datetime-local)$/;
+    const attrWords = (el: Element): string => ["name", "id", "placeholder", "aria-label", "title", "class", "action"]
+      .map((a) => String(el.getAttribute(a) || "")).join(" ").replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ");
+    const labelWords = (el: Element): string => {
+      const labels = (el as HTMLInputElement).labels;
+      return labels ? Array.from(labels).map((l) => String(l.textContent || "")).join(" ") : "";
+    };
+    let pageOrigin = "";
+    try { pageOrigin = new URL(String(d.URL || "")).origin; } catch { pageOrigin = ""; }
+    let formFields = 0;
+    for (const f of Array.from(d.querySelectorAll("form")) as HTMLFormElement[]) {
+      if (f.closest(CHROME)) continue;
+      if (String(f.getAttribute("method") || "").trim().toLowerCase() !== "post") continue;
+      let actionOrigin = "";
+      try { actionOrigin = new URL(String(f.getAttribute("action") || "").trim() || String(d.URL || ""), String(d.baseURI || d.URL || "")).origin; } catch { actionOrigin = ""; }
+      if (!actionOrigin || actionOrigin !== pageOrigin) continue;
+      if (WIDGET.test(attrWords(f))) continue;
+      if (f.querySelector("input[type=password]")) continue;
+      const plain = Array.from(f.elements).filter((el) => {
+        const tag = el.tagName.toLowerCase();
+        if (el.closest(CHROME)) return false;
+        const ctl = el as HTMLInputElement;
+        if (ctl.disabled === true || ctl.readOnly === true) return false;
+        if (tag === "input") {
+          const ty = String(el.getAttribute("type") || "text").trim().toLowerCase() || "text";
+          if (!PLAIN_INPUT.test(ty)) return false;
+          if (String(ctl.value || "").trim() !== "") return false;
+        } else if (tag === "textarea") {
+          if (String((el as HTMLTextAreaElement).value || "").trim() !== "") return false;
+        } else if (tag === "select") {
+          if (String((el as HTMLSelectElement).value || "") !== "") return false;
+        } else return false;
+        if (!shown(el)) return false;
+        if (/^q$/i.test(String(el.getAttribute("name") || "")) || WIDGET.test(`${attrWords(el)} ${labelWords(el)}`)) return false;
+        return true;
+      }).length;
+      if (plain > formFields) formFields = plain;
+    }
+    const frames = Array.from(d.querySelectorAll("iframe, frame, object, embed")).filter((el) => shown(el)).length;
+    const controlLabels = Array.from(d.querySelectorAll("button, input[type=submit], input[type=button], input[type=image], [role=button]"))
+      .filter((el) => shown(el)).map((el) => String(controlLabelInPage(el) || "").replace(/\s+/g, " ").trim()).filter(Boolean).slice(0, 60);
+    return { readable: text.length > 0, fillable, terminal: typeof t.terminal === "boolean" ? t.terminal : null, text: text.slice(0, 20_000), formFields, frames, controlLabels };
   };
 
   return {

@@ -29,9 +29,11 @@
 // WHAT INVALIDATES IT (proposal §4, approved 2026-10-16): before the click, a page at a verified
 // page's origin + path that reads differently (signature, control, request, the steps before it) is
 // held exactly as on main and each such pass is an incident (infoPageDriftedEntries); after the
-// click, the page it led to must read as an unfiled form (infoPageAfterClickRefusals — text, a
-// fillable field, and the shared terminal and receipt / error readings say no), or the run stops.
-// Either incident withdraws the pass (the backend deletes it) and nothing is recorded as filed.
+// click, the page it led to must show POSITIVE evidence of an unfiled application form
+// (infoPageAfterClickRefusals — two empty plain fields in one form outside the page's chrome, the
+// shared terminal and receipt / error readings say no, no frame, no filing-worded control and no
+// number that was not on the information page), or the run stops. Either incident withdraws the
+// pass (the backend deletes it) and nothing is recorded as filed.
 //
 // The contract follows signatureRequestGate.ts / portalSafety.finalSubmitRefusals: PURE (node:crypto
 // only — no DOM, network or database), a plain boolean (mayPassInfoPage) and its reasons from a
@@ -404,8 +406,9 @@ export interface InfoPageRunState {
   signatureDone: boolean;
   writes: number;
   gapFills: number;
-  /** The backend says this project already reached review / recorded an application number /
-   *  found an existing draft on this portal origin (critique [1]). */
+  /** The backend says this project already made progress on this portal (critique [1]; round 2:
+   *  an earlier admitted pass, a learn that did not end held untouched, a run that reached review,
+   *  paused or was interrupted, a tracked number, a draft or a filing). */
   priorProgress: boolean;
   /** The project's own values (street, name, parcel, kW) — refused when on the page. */
   projectValues: string[];
@@ -444,6 +447,11 @@ export function infoPagePrefixOf(steps: ReadonlyArray<InfoPageRunStep>): InfoPag
   });
 }
 
+/** The refusal a run gets when the backend says this project already made progress on this portal
+ *  (backend/src/infoPages.ts infoPagePriorProgress). Named so the learner can tell a page HELD AT A
+ *  VERIFIED PAGE only because of it — a person may then allow the pass once more for the project. */
+export const INFO_PAGE_PRIOR_PROGRESS_REFUSAL = "this project already made progress on this portal (an earlier run passed a verified information page, may have entered data, reached review, paused, was interrupted, or recorded a number, a draft or a filing)";
+
 /** Run-state: every prior step is an entry click, a goto / wait, or an advance an earlier pass of
  *  this run admitted; every flag false. A LITERAL list under test: a new note prefix widens it. */
 export function infoPageRunStateRefusals(run: InfoPageRunState | null | undefined): string[] {
@@ -467,7 +475,7 @@ export function infoPageRunStateRefusals(run: InfoPageRunState | null | undefine
     ["signatureCheck", "the run read a record's signature to resume"],
     ["signatureStep", "the run reached a signature step"],
     ["signatureDone", "the run signed something"],
-    ["priorProgress", "this project already reached review, recorded an application number or found a draft on this portal"],
+    ["priorProgress", INFO_PAGE_PRIOR_PROGRESS_REFUSAL],
   ];
   for (const [k, why] of flags) {
     const v = run[k];
@@ -715,24 +723,78 @@ export function infoPageRequestRefusals(expected: InfoPageExpectedRequest | null
 export interface InfoPageAfterClickReading {
   /** The page has a body with text. */
   readable: boolean;
-  /** VISIBLE, enabled fillable controls (input / select / textarea / contenteditable). */
+  /** VISIBLE, enabled fillable controls anywhere (input / select / textarea / contenteditable) —
+   *  diagnostics only: a header search box or a feedback box is one (round 2). */
   fillable: number;
   /** The shared terminal reading (terminalPageInPage().terminal): null = unknown. */
   terminal: boolean | null;
   /** The page's text with the step navigator cut (what the shared readings judge). */
   text: string;
+  /** THE POSITIVE EVIDENCE: the most EMPTY plain fields in ONE same-origin POST form, outside every
+   *  header / nav / footer / banner / search / dialog landmark, search / feedback / sign-in boxes
+   *  not counted (see portalSafety infoPageAfterClickInPage). */
+  formFields: number;
+  /** Visible iframe / frame / object / embed: what the reading cannot see into. */
+  frames: number;
+  /** Every visible button's label. */
+  controlLabels: string[];
 }
 
+/** The information page's own text, kept at the click (its number-shaped tokens): a token on the
+ *  page AFTER the click that was not on the information page is a new record number. */
+export interface InfoPageAfterClickBaseline {
+  tokens: string[];
+}
+
+/** How many empty plain fields one form must offer to be the application form (round 2). */
+export const INFO_PAGE_AFTER_CLICK_MIN_FIELDS = 2;
+
 /**
- * EVERY REASON THE PAGE AFTER A VERIFIED INFORMATION PAGE'S CLICK IS NOT AN UNFILED FORM. Empty
- * only when the page reads, carries a fillable field, and the shared readings all say no: not the
- * review / terminal page (portalSafety terminalPageInPage, the reading 4(b) and replay's click gate
- * use), and neither a receipt / confirmation number / filed status nor an error
- * (portalSafety classifySubmissionText, the reading every submit outcome uses). A reading that goes
- * both ways, or none at all, refuses. Any refusal is an incident: the run stops, the pass is
- * withdrawn and nothing is recorded as filed. Digits in quoted evidence are masked.
+ * NUMBER-SHAPED TOKENS in a text, upper-cased, de-duplicated — what a confirmation, request,
+ * receipt or reference number looks like WITHOUT a label (round 2: "Request 26-104233-000-00-PR",
+ * "Intake request #A-26-0042", "Your reference is SR-2026-104455" all passed
+ * classifySubmissionText, whose record-number reading needs a "confirmation / record / application
+ * … number" label). Deliberately broad, and only ever compared against the information page's own
+ * tokens (a token on both pages — a footer phone number — is not new): a run of letters, digits and
+ * hyphens that has a hyphen and 4+ digits, or letters and 3+ digits in 5+ characters, or 6+ digits
+ * alone; or anything after a "#" with 3+ digits. A new date or phone number reads as one too: a false
+ * stop, the safe direction.
  */
-export function infoPageAfterClickRefusals(r: InfoPageAfterClickReading | null | undefined): string[] {
+export function infoPageNumberTokens(text: string | null | undefined): string[] {
+  const out = new Set<string>();
+  const t = String(text ?? "");
+  for (const m of t.matchAll(/(#\s*)?([A-Za-z0-9]+(?:[-‐‑–][A-Za-z0-9]+)*)/g)) {
+    const hashed = !!m[1];
+    const tok = m[2].replace(/[‐‑–]/g, "-").toUpperCase();
+    const digits = (tok.match(/\d/g) ?? []).length;
+    const letters = /[A-Z]/.test(tok);
+    const hyphen = tok.includes("-");
+    if ((hashed && digits >= 3) || (hyphen && digits >= 4) || (letters && digits >= 3 && tok.length >= 5) || (!letters && !hyphen && digits >= 6)) out.add(tok);
+  }
+  return Array.from(out);
+}
+
+/** The label is a filing-, submit- or pay-worded control: the SAME triple the information page's own
+ *  shape refuses (infoPageShapeRefusals), asked of every visible control on the page after it. */
+const isFilingWordedLabel = (l: string): boolean => isFinalSubmitControl(l) || isSubmitIntent(l) || isPayFee(l);
+
+/**
+ * EVERY REASON THE PAGE AFTER A VERIFIED INFORMATION PAGE'S CLICK IS NOT AN UNFILED APPLICATION
+ * FORM. Empty only on POSITIVE evidence (round 2 — the absence of a known filed phrase was not
+ * enough: a receipt beside a search box passed):
+ *   - the page reads, and the shared terminal reading says it is NOT the review / terminal page
+ *     (portalSafety terminalPageInPage: what 4(b) and replay's click gate read);
+ *   - the shared receipt / error reading finds nothing either way (portalSafety
+ *     classifySubmissionText: what every submit outcome reads);
+ *   - ONE form offers at least INFO_PAGE_AFTER_CLICK_MIN_FIELDS empty plain fields outside the
+ *     page's chrome (search / feedback / sign-in boxes never count);
+ *   - no frame, and no visible filing-, submit- or pay-worded control;
+ *   - no number-shaped token that was not on the information page itself (infoPageNumberTokens) —
+ *     and the information page's own tokens must have been kept (no baseline refuses).
+ * Anything unread, unknown or ambiguous refuses. Any refusal is an incident: the run stops, the pass
+ * is withdrawn and nothing is recorded as filed. Digits in quoted evidence are masked.
+ */
+export function infoPageAfterClickRefusals(r: InfoPageAfterClickReading | null | undefined, baseline: InfoPageAfterClickBaseline | null | undefined): string[] {
   if (!r || typeof r !== "object") return ["the page after the click could not be read"];
   const out: string[] = [];
   const mask = (x: string | null): string => String(x ?? "").replace(/\d/g, "#").slice(0, 80);
@@ -743,7 +805,22 @@ export function infoPageAfterClickRefusals(r: InfoPageAfterClickReading | null |
   if (outcome.verdict === "accepted") out.push(`the page after the click reads as filed ("${mask(outcome.evidence)}")`);
   else if (outcome.verdict === "rejected") out.push(`the page after the click reads as an error ("${mask(outcome.evidence)}")`);
   else if (outcome.evidence) out.push(`the page after the click reads both as filed and as an error (${mask(outcome.evidence)})`);
-  if (!(typeof r.fillable === "number" && Number.isFinite(r.fillable) && r.fillable > 0)) out.push("the page after the click has no fillable field — it is not the application form");
+  if (!(typeof r.formFields === "number" && Number.isFinite(r.formFields) && r.formFields >= INFO_PAGE_AFTER_CLICK_MIN_FIELDS)) {
+    out.push(`the page after the click shows no application form (fewer than ${INFO_PAGE_AFTER_CLICK_MIN_FIELDS} empty plain fields in one form outside the page's header, navigation, footer and search; search, feedback and sign-in boxes do not count)`);
+  }
+  if (!(typeof r.frames === "number" && Number.isFinite(r.frames))) out.push("the page after the click was not read for frames");
+  else if (r.frames > 0) out.push(`the page after the click composes ${r.frames} frame(s) the reading cannot see into`);
+  if (!Array.isArray(r.controlLabels)) out.push("the page after the click was not read for its controls");
+  else {
+    const filing = r.controlLabels.find((l) => isFilingWordedLabel(collapse(l)));
+    if (filing) out.push(`the page after the click offers "${mask(collapse(filing)).slice(0, 40)}", a submit-, filing- or pay-worded control`);
+  }
+  if (!baseline || !Array.isArray(baseline.tokens)) out.push("the information page's own text was not kept, so a new record number cannot be told apart");
+  else {
+    const before = new Set(baseline.tokens.map((x) => String(x).toUpperCase()));
+    const fresh = infoPageNumberTokens(r.text).filter((x) => !before.has(x));
+    if (fresh.length) out.push(`the page after the click shows a number that was not on the information page ("${mask(fresh[0])}") — a confirmation, request or receipt number`);
+  }
   return out;
 }
 

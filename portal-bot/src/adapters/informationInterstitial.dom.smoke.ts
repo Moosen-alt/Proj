@@ -255,7 +255,14 @@ const draftPage = (p: string): string => `<!doctype html><html><head><meta chars
   <h1>Draft 2026-0141</h1><form action="${p}/act/save-draft-0141" method="get">
   <label for="addr">Site Address</label><input id="addr" name="addr"><button type="submit">Next</button></form>
 </body></html>`;
-const projectPage = (p: string): string => shell(p, {
+// #344 round 2: on /post (the verified pass's walk, [1b]) the page the verified Next leads to must
+// show POSITIVE evidence of an application form: two empty plain fields in one POST form (DevHub's
+// SmartGuide steps all POST). Its Next posts to /project-next, never under /sg (the Next count).
+const projectPage = (p: string): string => p === "/post" ? shell(p, {
+  title: "Project Information", method: "POST", action: `${p}/project-next`,
+  content: `<div class="form-group"><label for="addr" class="control-label">Site Address</label><input id="addr" name="addr" type="text"></div><div class="form-group"><label for="unit" class="control-label">Unit / Suite</label><input id="unit" name="unit" type="text"></div>`,
+  nav: PREV_NEXT,
+}) : shell(p, {
   title: "Project Information", method: "GET", action: `${p}/sg2`,
   content: `<div class="form-group"><label for="addr" class="control-label">Site Address</label><input id="addr" name="addr" type="text"></div>`,
   nav: PREV_NEXT,
@@ -342,9 +349,10 @@ const route = (q: http.IncomingMessage, r: http.ServerResponse, body: Buffer): v
     return redirect(`${p}/apply`);
   }
   if (rest === "/project") return send(projectPage(p));
-  if (rest === "/sg2") {
-    const addr = qs.get("addr") ?? "";
-    if (qs.has("t_p1685049573549")) return redirect(`${p}/info`);
+  if (rest === "/sg2" || (rest === "/project-next" && method === "POST")) {
+    const fields = rest === "/project-next" ? new URLSearchParams(body.toString("utf8")) : qs;
+    const addr = fields.get("addr") ?? "";
+    if (fields.has("t_p1685049573549")) return redirect(`${p}/info`);
     return redirect(`${p}/${p === "/next-files" ? "review-next" : "review"}?addr=${encodeURIComponent(addr)}`);
   }
   if (rest === "/review") return send(reviewPage(p, qs.get("addr") ?? ""));
