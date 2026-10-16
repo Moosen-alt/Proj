@@ -24,6 +24,7 @@ import path from "node:path";
 import { chromium, type Page } from "playwright";
 import {
   classifyRecordedClick,
+  isInterstitialForwardLabel,
   isPayFee,
   isSecretField,
   isSubmitIntent,
@@ -204,6 +205,17 @@ try {
     };
     check("Chromium's __portalSafety answers exactly as Node's shared module", JSON.stringify(inPage) === JSON.stringify(node),
       `page ${JSON.stringify(inPage)}\n         node ${JSON.stringify(node)}`);
+    // #344: the interstitial's forward-label answer moved into the factory — the page and Node give
+    // the same answers; and the information-page identity reader exists in the page.
+    const fwdLabels = [...labels, "Continue", "Proceed", "Get Started", "Save and Continue", "Next »", "Previous", "Continue Later", "Next Record", "Continue Draft"];
+    const fwdPage = await p.evaluate((ls: string[]) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ps = (globalThis as any).__portalSafety;
+      return { fwd: ls.map((l) => ps.isInterstitialForwardLabel(l)), identity: typeof ps.infoPageIdentityInPage, version: ps.INFO_PAGE_IDENTITY_VERSION };
+    }, fwdLabels);
+    check("#344: isInterstitialForwardLabel answers the same in Chromium and in Node; the page carries infoPageIdentityInPage (version 1)",
+      JSON.stringify(fwdPage.fwd) === JSON.stringify(fwdLabels.map((l) => isInterstitialForwardLabel(l))) && fwdPage.identity === "function" && fwdPage.version === 1,
+      JSON.stringify(fwdPage));
 
     // ---- 2. Read-only page detection ---------------------------------------------------------
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

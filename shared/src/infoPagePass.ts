@@ -151,6 +151,8 @@ export interface InfoPageShape {
   baseTarget: string;
   /** The text carries a draft / in-progress / application-number notice (read in Node, raw). */
   draftNotice: boolean;
+  /** The text asks for an amount due / charged NOW (read in Node, raw). */
+  amountDueNow: boolean;
 }
 
 export interface InfoPageComponents {
@@ -220,6 +222,13 @@ export const infoPagePlaceKey = (url: string): string => {
 const DRAFT_NOTICE = /\b(in\s+progress|draft|saved\s+application|resume\s+(your\s+)?application)\b|\b(application|record|request|permit)\s*(no\.?|number|#)\s*:?\s*(?=[A-Z0-9-]*\d)[A-Z0-9][A-Z0-9-]{3,}/i;
 export const infoPageTextHasDraftNotice = (text: string): boolean => DRAFT_NOTICE.test(String(text ?? ""));
 
+/** An AMOUNT due or charged NOW, in one sentence ("A $350 fee is due now", "will be charged to the
+ *  card on file now"): a page that asks for money before anything was entered is never an
+ *  information page (rule 1: automation never pays). DevHub's "how to pay your intake fees" names
+ *  no amount and no "now", so it stays a warning there. */
+export const infoPageTextAsksAmountNow = (text: string): boolean => String(text ?? "").split(/[.!?\n]+/).some((s) =>
+  /\$\s*\d/.test(s) && /\b(due|charged?|payable|owed|pay|paid)\b/i.test(s) && /\b(now|today|immediately)\b/i.test(s));
+
 /**
  * THE DIGEST: six component hashes and one identity hash over them, plus what is kept in clear
  * (origin, path, query KEYS, the control's tag/type/name/label, form field NAMES). Raw hidden
@@ -266,6 +275,7 @@ export function digestInfoPageIdentity(m: InfoPageIdentityMaterial): InfoPageDig
     masked: m.facts.masked,
     baseTarget: m.facts.baseTarget,
     draftNotice: infoPageTextHasDraftNotice(m.text),
+    amountDueNow: infoPageTextAsksAmountNow(m.text),
   };
   return {
     version: m.version,
@@ -326,6 +336,7 @@ export function infoPageShapeRefusals(shape: InfoPageShape | null | undefined): 
   if (extra.length) out.push(`the request carries field(s) beyond the hidden inputs and the control (${extra.slice(0, 5).join(", ")})`);
   if (s.masked > 1) out.push("more than one control qualifies for the tenant mask");
   if (s.draftNotice) out.push("the page names a draft, an application in progress or an application / record number");
+  if (s.amountDueNow !== false) out.push("the page asks for an amount due or charged now — automation never pays");
   if (isFilingOrPaymentRequest("POST", s.actionWhere) || isPayRequestUrl(s.actionWhere)) out.push("the form's action reads as a filing or a payment");
   return out;
 }

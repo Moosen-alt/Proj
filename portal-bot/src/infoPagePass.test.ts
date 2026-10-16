@@ -132,6 +132,8 @@ console.log("\nSHAPE");
     ["a draft-in-progress notice", (m) => { m.text += " You have an application in progress. Draft 2026-0141."; }, /draft/],
     ["an application number on the page", (m) => { m.text += " Application number: BLD-2026-0141."; }, /draft|number/],
     ["two maskable toggles", (m) => { m.facts.masked = 2; }, /tenant mask/],
+    ["an amount due now (pns: 'A $350 fee is due now')", (m) => { m.text += " A $350 fee is due now. Click Continue to proceed."; }, /amount due or charged now/],
+    ["a charge now (pay2: 'will be charged to the card on file now')", (m) => { m.text += " The $350 application fee will be charged to the card on file now."; }, /amount due or charged now/],
   ];
   for (const [what, mutate, re] of refuse) {
     const m = devhub();
