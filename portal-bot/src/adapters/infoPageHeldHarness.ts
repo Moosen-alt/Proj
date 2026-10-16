@@ -2,7 +2,8 @@
 //
 // Every page shape the #349 rounds broke (Helm m1–m8 and d1/d2, skeptic A a1–a6, b1, e1/e2, f1/f2,
 // k1, dr1, pay1/pay2, h1; skeptic B m7/m7a/m7c/m7g, lr/lrn/lrp, late, dr; skeptic C pf1/pf1a/pf1sg,
-// tw, d1m/d1ma/d1mcap, cap/caps, ol, pns, gl/glf, m2–m6, capf/capfo, fo) is walked by the REAL
+// tw, d1m/d1ma/d1mcap, cap/caps, ol, pns, gl/glf, m2–m6, capf/capfo, fo) — and the shapes those
+// rounds found equal (skeptic A c1, d1 as d1s, d2 as d2s, g1; skeptic C tt) — is walked by the REAL
 // learner (AutoLearnAdapter.learn, the network backstop installed by learn itself) TWICE:
 //   (i)  with NO verified information page — exactly main's behaviour (no slot can open);
 //   (ii) with a NEAR-MISS verified entry: the shape's OWN page read live (its forward control),
@@ -312,6 +313,41 @@ export const HELD_SHAPES: Record<string, HeldShape> = {
   capfo: { desc: "capf + on-load POST /autosave", firstTarget: "/form",
     route: (p, rest) => fromForm(p, rest) ?? (rest === "/step3" ? { html: summaryPage(p, { prose: PREAMBLE + MODAL, onLoadPost: "/autosave" }) } : rest === "/autosave" ? { status: 204 } : null),
     plan: adv({ "/form": "Next", "/step3": "Next" }), leak: /^POST \/(autosave|file)/ },
+  // ---- the rest of skeptic A's and C's shapes (equal on main and on #349's head; pinned anyway).
+  c1: { desc: "send page, GET form Continue -> /sendget (main lets it through: #346)", firstTarget: "/target",
+    route: (p, rest) => rest === "/target" ? { html: sendPage(p, SEND_PROSE, "Continue", "GET", "/sendget") } : null, plan: adv({ "/target": "Continue" }), leak: /^GET \/sendget/, mainLeaks: true },
+  d1s: { desc: "send page whose control is 'Submit Request' (POST /sg): stops at review, the final recorded and never clicked", firstTarget: "/target",
+    route: (p, rest) => rest === "/target" ? { html: sendPage(p, SEND_PROSE.replace("Click Continue", "Click Submit Request"), "Submit Request", "POST", "/sg") } : null, plan: silent, leak: /^POST \/sg/ },
+  d2s: { desc: "send page whose control is 'Send' (POST /sg): no forward control adopted", firstTarget: "/target",
+    route: (p, rest) => rest === "/target" ? { html: sendPage(p, SEND_PROSE.replace("Click Continue", "Click Send"), "Send", "POST", "/sg") } : null, plan: silent, leak: /^POST \/sg/ },
+  g1: { desc: "send page, Continue POST -> /renewal/submit (a filing URL: rule 2)", firstTarget: "/target",
+    route: (p, rest) => rest === "/target" ? { html: sendPage(p, SEND_PROSE, "Continue", "POST", "/renewal/submit") } : null, plan: adv({ "/target": "Continue" }), leak: /^POST \/renewal/ },
+  tt: { desc: "tile -> a second page with ONE choice tile -> summary (POST Next files)", firstTarget: "/tt1",
+    route: (p, rest) => rest === "/tt1" ? { html: shell(p, { title: "Project Type", content: card("div_t_1", "Residential Rooftop", "One- and two-family dwellings."),
+      script: delegation(`function (t) { return '${p}/step3'; }`) }) } : rest === "/step3" ? { html: summaryPage(p, { prose: MODAL }) } : null,
+    plan: silent, leak: /^POST \/file/ },
+  caps: { desc: "cap with the planner silent", firstTarget: "/step3",
+    route: (p, rest) => rest === "/step3" ? { html: summaryPage(p, { prose: PREAMBLE + MODAL }) } : null, plan: silent, leak: /^POST \/file/ },
+  // skeptic B's dr: a resumed draft whose record page and Part 2 FORM page each POST by themselves on load.
+  dr: { desc: "continueDraft: home -> record NEM-90017 (on-load POST /rec/90017/touch) -> Begin Part 2 -> a Part 2 FORM (on-load POST /p2/autosave) -> review", firstTarget: "/home", start: "/home", premise: "/p2/1",
+    options: { maxPages: 10, continueDraft: { nextForm: "Interconnection Application - Part 2", street: "1234 North Example Street, Lynden, WA, 98264", required: true } },
+    project: { projectAddress: "1234 North Example Street, Lynden, WA, 98264", city: "Lynden", state: "WA", zip: "98264", homeownerName: "Jordan Testcase" },
+    route: (p, rest) => rest === "/home" ? { html: plainShell("Program Home", `<h1>Program Home</h1><a href="${p}/new" class="btn">Start a New Application</a>
+    <table><thead><tr><th>Project</th><th>Status</th><th>Customer</th><th>Site</th></tr></thead><tbody>
+      <tr><td><a href="${p}/rec/80001">NEM-80001</a></td><td>Approved</td><td>Riley Sample</td><td>77 Other Rd, Lynden</td></tr>
+      <tr><td><a href="${p}/rec/90017">NEM-90017</a></td><td>Application Draft</td><td>Jordan Testcase</td><td>1234 N Example St, Lynden</td></tr>
+    </tbody></table>`).replace("HOME", `${p}/home`) }
+      : rest === "/rec/90017" ? { html: plainShell("NEM-90017", `<h1>NEM-90017</h1><p>Status: Application Draft</p><p>1234 N Example St, Lynden</p><p>The utility will review your application once Part 2 is complete.</p>
+    <div class="card"><div class="card-header">Current Forms</div><table><tbody>
+      <tr><td>Interconnection Application - Part 2 <button type="button" onclick="location.href='${p}/p2/1'">Begin</button></td><td>New Form</td></tr>
+    </tbody></table></div>`, `<script>fetch(${JSON.stringify(`${p}/rec/90017/touch`)}, { method: "POST", body: "t=1" }).catch(function () {});</script>`).replace("HOME", `${p}/home`) }
+      : rest === "/p2/1" ? { html: plainShell("Part 2 - Project", `<h1>Interconnection Application - Part 2</h1><p>Staff will review your application within 5 business days.</p>
+    <form action="${p}/p2/2" method="get"><label for="sz">System Size (kW)</label><input id="sz" name="sz" type="text"><button type="submit">Next</button></form>`,
+        `<script>fetch(${JSON.stringify(`${p}/p2/autosave`)}, { method: "POST", body: "a=1" }).catch(function () {});</script>`).replace("HOME", `${p}/home`) }
+      : rest === "/p2/2" ? { html: plainShell("Part 2 - Review", `<h1>Review and Submit</h1><p>Review your application before submitting.</p><form action="${p}/file" method="post"><button type="submit">Submit Application</button></form>`).replace("HOME", `${p}/home`) }
+      : rest === "/p2/autosave" || rest === "/rec/90017/touch" ? { status: 204 } : null,
+    plan: (rest, idx) => rest === "/p2/1" ? { fills: [], atReview: false, advanceSelectorIndex: idx("Next") } : rest === "/p2/2" ? { fills: [], atReview: true } : null,
+    leak: /^POST \/(rec|p2|file)/ },
   fo: { desc: "tile -> FIRST form page (prefilled) with modal-only review prose that POSTs /autosave on load -> Step 3: Review", firstTarget: "/form2",
     route: (p, rest) => rest === "/form2" ? { html: shell(p, { title: "Project Information", method: "GET", action: `${p}/to-step3`,
       content: `<p>Staff will review your application within 5 business days of submission.</p><div class="form-group"><label for="addr" class="control-label">Site Address</label><input id="addr" name="addr" type="text" value="${ADDRESS}"></div>`,

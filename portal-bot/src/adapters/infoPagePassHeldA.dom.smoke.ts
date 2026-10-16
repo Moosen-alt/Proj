@@ -7,4 +7,4 @@
 import "../smokeArtifactDirs"; // hand-run safe: artifact dirs default to a temp folder, never data/
 import { runHeldShapes } from "./infoPageHeldHarness";
 
-await runHeldShapes("infoPagePassHeldA.dom.smoke", ["pf1", "pf1a", "pf1sg", "tw", "d1m", "d1ma", "d1mcap", "cap", "ol", "pns", "gl", "glf", "capf", "capfo", "fo"], { concurrency: 3 });
+await runHeldShapes("infoPagePassHeldA.dom.smoke", ["pf1", "pf1a", "pf1sg", "tw", "d1m", "d1ma", "d1mcap", "cap", "ol", "pns", "gl", "glf", "capf", "capfo", "fo", "c1", "d1s", "d2s", "g1", "tt", "caps"], { concurrency: 3 });

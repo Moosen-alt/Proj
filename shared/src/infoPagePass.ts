@@ -522,7 +522,10 @@ export function infoPageMatchRefusals(
   entries: ReadonlyArray<VerifiedInfoPage>,
   prefix: ReadonlyArray<InfoPagePrefixStep>,
 ): { entry: VerifiedInfoPage | null; refusals: string[] } {
-  const same = entries.filter((e) => e && e.identityVersion === digest.version && e.identitySha256 === digest.identitySha256);
+  // The identity hash already covers the address; the entry's own origin / path / query keys must
+  // say the same (a record moved to another host or tenant path is never this page's).
+  const same = entries.filter((e) => e && e.identityVersion === digest.version && e.identitySha256 === digest.identitySha256
+    && e.origin === digest.origin && e.path === digest.path && JSON.stringify(e.queryKeys ?? []) === JSON.stringify(digest.queryKeys));
   const samePage = same.filter((e) => e.controlName === digest.control.name && collapse(e.controlLabel) === digest.control.label
     && e.request.method === digest.expected.method && e.request.where === digest.expected.where
     && e.request.actionSha256 === digest.expected.actionUrlSha && e.request.media === digest.expected.media

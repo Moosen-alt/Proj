@@ -299,6 +299,8 @@ const NEAR: Array<{ id: string; what: string; opts?: Partial<ReplicaOpts>; query
   { id: "c16", what: "onclick rewrites form.action to /file", script: `<script>document.querySelector('button[name="${NEXT_NAME}"]').addEventListener('click', function () { document.getElementById('smartguide_ApplyForAPermit').setAttribute('action', 'file'); });</script>` },
   { id: "c17", what: "onclick preventDefault + requestSubmit() with no submitter", script: `<script>document.querySelector('button[name="${NEXT_NAME}"]').addEventListener('click', function (e) { e.preventDefault(); document.getElementById('smartguide_ApplyForAPermit').requestSubmit(); });</script>` },
   { id: "c18", what: "a hidden input added between the identity read and the click", between: async (page) => { await page.evaluate(() => { const i = document.createElement("input"); i.type = "hidden"; i.name = "addr"; i.value = "1 Test St"; document.getElementById("smartguide_ApplyForAPermit")!.appendChild(i); }); } },
+  { id: "c18f", what: "formaction set on the Next between the identity read and the click (request substitution)", between: async (page) => { await page.evaluate((n) => { document.querySelector(`button[name="${n}"]`)!.setAttribute("formaction", "sfjsp2"); }, NEXT_NAME); } },
+  { id: "c18v", what: "the Next's value changed between the identity read and the click", between: async (page) => { await page.evaluate((n) => { document.querySelector(`button[name="${n}"]`)!.setAttribute("value", "go"); }, NEXT_NAME); } },
   { id: "c19", what: "preventDefault + fetch POST (not a navigation)", script: `<script>document.querySelector('button[name="${NEXT_NAME}"]').addEventListener('click', function (e) { e.preventDefault(); fetch('sfjsp', { method: 'POST', body: new FormData(document.getElementById('smartguide_ApplyForAPermit'), e.target) }).catch(function () {}); });</script>` },
   { id: "c20", what: "a banner 'Application ready to file' outside the form", opts: { outsideForm: `<div class="alert">Application ready to file</div>` } },
   { id: "c21", what: "the same page with the toggle label 'Other Tenant LLC' (amendment [8]: no landmark, no mask — HELD)", opts: { toggleLabel: "Other Tenant LLC" } },
@@ -372,6 +374,13 @@ const DCASES: Array<{ id: string; what: string; run?: (s: string) => InfoPageRun
   { id: "d14", what: "a near-miss entry (the text hash one off)", entry: (e) => nearMissEntry(e, "textSha") },
   { id: "d15", what: "a near-miss entry (the request hash one off)", entry: (e) => nearMissEntry(e, "requestSha") },
   { id: "d16", what: "an entry of an older identity version", entry: (e) => ({ ...e, identityVersion: INFO_PAGE_IDENTITY_VERSION - 1 }) },
+  // MOVED RECORD (proposal §5): the verified entry itself moved to another host, tenant path,
+  // control, request or step sequence — never this page's pass.
+  { id: "mv1", what: "MOVED RECORD: the entry moved to another host", entry: (e) => ({ ...e, origin: e.origin.replace("127.0.0.1", "localhost") }) },
+  { id: "mv2", what: "MOVED RECORD: the entry moved to another tenant path", entry: (e) => ({ ...e, path: `/agency-b${e.path}` }) },
+  { id: "mv3", what: "MOVED RECORD: the entry moved to another control", entry: (e) => ({ ...e, controlName: PREV_NAME, controlLabel: "Previous" }) },
+  { id: "mv4", what: "MOVED RECORD: the entry moved to another request", entry: (e) => ({ ...e, request: { ...e.request, where: `${e.request.where}2` } }) },
+  { id: "mv5", what: "MOVED RECORD: the entry moved to another step sequence (another tile)", entry: (e) => ({ ...e, prefix: e.prefix.map((s, i) => (i === 2 ? [s[0], "permit type: Trade Permits", s[2]] : s) as [string, string, string]) }) },
 ];
 for (const c of want("D") ? DCASES : []) {
   const p = `/${c.id}`;

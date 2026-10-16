@@ -261,6 +261,20 @@ const ctxWith = (o: Partial<{ run: InfoPageRunState; backstop: InfoPageBackstopS
   check("a near-miss names what drifted and the date, never a person",
     m.entry === null && m.refusals.length === 1 && m.refusals[0].startsWith(INFO_PAGE_NO_MATCH) && /text/.test(m.refusals[0]) && /2026-10-15/.test(m.refusals[0]), JSON.stringify(m.refusals));
   check("undefined context refuses", !mayPassInfoPage(undefined) && infoPagePassRefusals(undefined).length > 0);
+  // MOVED RECORD: the entry's own address fields must say this page (the identity hash covers the
+  // page; a record moved to another host / tenant path / query is still refused).
+  const movedCases: Array<[string, (e: VerifiedInfoPage) => void]> = [
+    ["another host", (e) => { e.origin = "https://permits.other.test"; }],
+    ["another tenant path", (e) => { e.path = `/agency-b${e.path}`; }],
+    ["other query keys", (e) => { e.queryKeys = ["interviewID"]; }],
+    ["another control", (e) => { e.controlName = "t_p1685049573549"; }],
+    ["another step sequence", (e) => { e.prefix = [...e.prefix.slice(0, 2), ["click", "permit type: Trade Permits", ""]]; }],
+  ];
+  for (const [what, move] of movedCases) {
+    const e = entryFor(devhub());
+    move(e);
+    check(`refused: the verified entry MOVED to ${what}`, !mayPassInfoPage(ctxWith({ entries: [e] })), JSON.stringify(infoPagePassRefusals(ctxWith({ entries: [e] }))));
+  }
   // Two entries for the same page through different tiles: the run's own steps pick exactly one.
   const viaA = entryFor(devhub(), PREFIX_STEPS, "pass-a");
   const viaB = entryFor(devhub(), [...PREFIX_STEPS.slice(0, 2), { action: "click", note: "permit type: Trade Permits" }], "pass-b");
