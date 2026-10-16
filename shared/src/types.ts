@@ -4034,6 +4034,22 @@ export interface InfoPageCandidateRecord {
 
 /** A shared pass as GET /api/info-page-passes lists it (critique [5]: no component or value hashes,
  *  no verifier identity, no project id). */
+/** #344 round 2 — one side of a project's information-page state, for its card: the verified pages
+ *  it passed or was held at since a person last allowed it, why later runs stop there, and whether a
+ *  person may allow the pass once more (only with nothing HARD in the way). */
+export interface InfoPageProjectSideState {
+  scope: "ahj" | "utility";
+  passed: Array<{ passId: string; where: string; at: string }>;
+  held: Array<{ passId: string; where: string; at: string }>;
+  /** Never lifted here: a filing, a number, a draft, a staged / paused / interrupted run. */
+  hard: string[];
+  /** This project's earlier learns on this side: lifted by "Allow once more for this project". */
+  learn: string[];
+  canAllow: boolean;
+  lastAllowedBy: string;
+  lastAllowedAt: string;
+}
+
 export interface InfoPagePassRecord {
   id: string;
   origin: string;

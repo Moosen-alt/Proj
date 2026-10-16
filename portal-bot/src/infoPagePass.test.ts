@@ -492,6 +492,30 @@ console.log("\nGREP PINS");
     deletes.length === 1 && /DELETE\s+FROM\s+portal_info_page_passes\b/i.test(fnBody("removeInfoPagePass")), `${deletes.length} delete(s)`);
   check("the db.ts migration only CREATEs the pass table (no row is written by a migration)",
     !/(INSERT\s+(OR\s+\w+\s+)?INTO|UPDATE|DELETE\s+FROM|REPLACE\s+INTO)\s+portal_info_page_passes\b/i.test(fs.readFileSync(path.join(root, "backend/src/db.ts"), "utf8")));
+  // ROUND 2 — THE LEARN LEDGER AND THE ALLOWANCE ARE AUTHORITY TOO: a forged "learn ended clean" row
+  // would turn a learn that entered data into one that did not; a forged allowance would lift a
+  // project's progress; a deleted "passed" row would admit the same project again. Each action is
+  // NAMED only in backend/src/infoPages.ts (once: its constant), WRITTEN only by its one function,
+  // and audit_logs is written only by audit.ts's addAuditLog (never with an action a body chose).
+  const ledger: Array<[string, string, string]> = [
+    ["portal.info_page_learn_started", "ACT_LEARN_STARTED", "recordInfoPageLearnStart"],
+    ["portal.info_page_learn_clean", "ACT_LEARN_CLEAN", "recordInfoPageLearnClean"],
+    ["portal.info_page_passed", "ACT_PASSED", "recordInfoPagePassUses"],
+    ["portal.info_page_held_verified", "ACT_HELD_VERIFIED", "recordInfoPageHeldVerified"],
+    ["portal.info_page_pass_allowed_again", "ACT_ALLOWED_AGAIN", "allowInfoPagePassOnceMore"],
+  ];
+  for (const [literal, constant, writer] of ledger) {
+    const namers = everything.filter((f) => fs.readFileSync(f, "utf8").includes(literal)).map(rel).sort();
+    const times = infoSrc.split(literal).length - 1;
+    check(`round 2: "${literal}" is named only by backend/src/infoPages.ts, once (its constant ${constant})`,
+      JSON.stringify(namers) === JSON.stringify(["backend/src/infoPages.ts"]) && times === 1 && new RegExp(`const ${constant} = "${literal.replace(/\./g, "\\.")}"`).test(infoSrc),
+      JSON.stringify({ namers, times }));
+    const writes = infoSrc.match(new RegExp(`addAuditLog\\([^;]*\\b${constant}\\b`, "g")) ?? [];
+    check(`round 2: ${constant} is written by exactly one addAuditLog, inside ${writer}`,
+      writes.length === 1 && new RegExp(`addAuditLog\\([^;]*\\b${constant}\\b`).test(fnBody(writer)), `${writes.length} write(s)`);
+  }
+  const auditWriters = everything.filter((f) => /INSERT\s+(OR\s+\w+\s+)?INTO\s+audit_logs\b/i.test(fs.readFileSync(f, "utf8"))).map(rel).sort();
+  check("round 2: audit_logs is written only by backend/src/audit.ts (addAuditLog)", JSON.stringify(auditWriters) === JSON.stringify(["backend/src/audit.ts"]), JSON.stringify(auditWriters));
   // THE BOT RECEIVES PASSES ONLY AS INPUT, from the one effective-row predicate: liveInfoPagePasses
   // is read only by autoLearn (the learn's input) and infoPages itself; the learner keeps only its
   // frozen options copy, never anything from recipe steps.

@@ -35,7 +35,7 @@ import {
   type InfoPageDigest, type InfoPageEvidence, type InfoPageObservedRequest, type InfoPagePrefixStep,
 } from "../../shared/src/infoPagePass";
 import { isFilingOrPaymentRequest, isPayRequestUrl } from "../../shared/src/portalSafety";
-import type { InfoPageCandidateCapture, InfoPageCandidateRecord, InfoPageIncident, InfoPagePassRecord, VerifiedInfoPage } from "../../shared/src/types";
+import type { InfoPageCandidateCapture, InfoPageCandidateRecord, InfoPageIncident, InfoPagePassRecord, InfoPageProjectSideState, VerifiedInfoPage } from "../../shared/src/types";
 
 type Row = Record<string, unknown>;
 const s = (v: unknown): string => (v === null || v === undefined ? "" : String(v));
@@ -107,39 +107,217 @@ export function liveInfoPagePasses(db: AppDb): VerifiedInfoPage[] {
   return rows.filter((r) => passIsOnRecord(db, r)).map(passRowToVerified);
 }
 
-/**
- * HAS THIS PROJECT ALREADY MADE PROGRESS ON THIS PORTAL? (critique [1]) The portal session and its
- * server-side interview survive between runs (a persistent per-client profile), so a page a person
- * verified at the START of the interview could be shown again at a later server position where its
- * Next files. Refused (true) when this project already has, on this portal:
- *   - a tracking target on the same origin with an application or permit number;
- *   - a submission on the same side (permit vs NEM) that reached review or was filed;
- *   - a portal run on the same side that reached review, was submitted or recorded a number;
- *   - a draft recorded on the same side (portal.draft_created).
- * Unknown (an unparseable portal URL, a read error) is true: an unknown never reassures.
- */
-export function infoPagePriorProgress(db: AppDb, projectId: string, portalUrl: string, scopeType: "ahj" | "utility"): boolean {
-  let origin = "";
-  try { origin = new URL(portalUrl).origin; } catch { return true; }
-  if (!origin || origin === "null") return true;
-  try {
-    const targets = db.query<Row>("SELECT portal_url, application_number, permit_number FROM permit_check_targets WHERE project_id = ?", [projectId]);
-    for (const t of targets) {
-      let o = "";
-      try { o = new URL(s(t.portal_url)).origin; } catch { o = ""; }
-      if (o === origin && (s(t.application_number).trim() || s(t.permit_number).trim())) return true;
-    }
-    const nem = scopeType === "utility";
-    const subs = db.query<Row>("SELECT permit_type, status FROM submissions WHERE project_id = ?", [projectId]);
-    if (subs.some((x) => (s(x.permit_type) === "nem") === nem && ["awaiting_human_submit", "submitted", "submitted_unconfirmed", "staged", "approved", "issued"].includes(s(x.status)))) return true;
-    const runs = db.query<Row>("SELECT permit_type, status, confirmation_number FROM portal_runs WHERE project_id = ?", [projectId]);
-    if (runs.some((x) => (s(x.permit_type) === "nem") === nem && (s(x.confirmation_number).trim() !== "" || ["awaiting_human_submit", "submitted", "submitted_unconfirmed"].includes(s(x.status))))) return true;
-    const drafts = db.query<Row>("SELECT details FROM audit_logs WHERE project_id = ? AND action = 'portal.draft_created'", [projectId]);
-    if (drafts.some((d) => (s(parse<Row>(d.details, {}).track) === "nem") === nem)) return true;
-    return false;
-  } catch {
-    return true;
+// ---------------------------------------------------------------------------------------------
+// The learn ledger and prior progress (round 2: a pass admits at most once per project)
+// ---------------------------------------------------------------------------------------------
+
+// THE AUDIT ACTIONS THAT ARE AUTHORITY for the information-page question. Named only here (the
+// infoPagePass.test source scan pins every literal to this file, and each write to its one function):
+// a forged "clean" row would turn a learn that entered data into one that did not, a forged
+// allowance would lift a project's progress. Only addAuditLog writes audit_logs, never with an action
+// a request body chose.
+/** A learn of this project touched this portal (written BEFORE the walk: a learn that dies keeps it). */
+const ACT_LEARN_STARTED = "portal.info_page_learn_started";
+/** That learn ended HELD, untouched, at an information page (the only learn that is not progress). */
+const ACT_LEARN_CLEAN = "portal.info_page_learn_clean";
+/** The backstop admitted a verified page's one request on a run of this project (written at once). */
+const ACT_PASSED = "portal.info_page_passed";
+/** A run of this project was held at a verified page only because of its prior progress. */
+const ACT_HELD_VERIFIED = "portal.info_page_held_verified";
+/** A named person allowed the pass ONCE MORE for this project and side. */
+const ACT_ALLOWED_AGAIN = "portal.info_page_pass_allowed_again";
+
+type Side = "ahj" | "utility";
+const sideOf = (scope: unknown): Side | "" => (scope === "ahj" || scope === "utility" ? scope : "");
+/** A row's side: its details.scope, else its track (nem = utility). Unknown = both sides. */
+const rowOnSide = (details: Row, side: Side): boolean => {
+  const sc = sideOf(details.scope);
+  if (sc) return sc === side;
+  const tr = s(details.track);
+  if (tr) return (tr === "nem") === (side === "utility");
+  return true;
+};
+const maskDigits = (x: unknown): string => s(x).replace(/\d/g, "#");
+
+/** BEFORE EACH LEARN ATTEMPT TOUCHES THE PORTAL (autoLearn): on record first, so a learn that dies,
+ *  throws or is interrupted is progress unless it ends clean. Returns the start's id. */
+export function recordInfoPageLearnStart(db: AppDb, projectId: string, scope: Side, attempt: number): string {
+  const startId = newId();
+  addAuditLog(db, projectId, "system", "auto-learn", ACT_LEARN_STARTED, { startId, scope, attempt });
+  return startId;
+}
+
+/** IS THIS LEARN'S RESULT A CLEAN HOLD? It stopped at the backstop's hold of an information page
+ *  whose run state was clean at the click (the candidate watch opens only then, and its request
+ *  was observed — held), passed no verified page, reported no after-click incident, reached no
+ *  review, paused for nothing and continued no draft. Nothing else is clean: unknown is progress. */
+export function isCleanInfoPageHold(l: unknown): boolean {
+  const r = (l && typeof l === "object" ? l : {}) as Row;
+  const cand = r.infoPageCandidate as Row | undefined;
+  const passed = r.infoPagePassed as unknown[] | undefined;
+  const incidents = r.infoPageIncidents as Array<{ phase?: string }> | undefined;
+  return r.stopReason === "backstop_abort" && !!cand && typeof cand === "object" && !!cand.observed
+    && !(Array.isArray(passed) && passed.length) && !(Array.isArray(incidents) && incidents.some((i) => i && i.phase === "after"))
+    && r.reachedReview !== true && !r.pauseReason && !r.continuedDraft;
+}
+
+/** THE LEARN ENDED CLEAN (isCleanInfoPageHold): its start no longer counts as progress. */
+export function recordInfoPageLearnClean(db: AppDb, projectId: string, scope: Side, startId: string): void {
+  if (!startId) return;
+  addAuditLog(db, projectId, "system", "auto-learn", ACT_LEARN_CLEAN, { startId, scope });
+}
+
+/** A run of this project was held at a verified page because of its prior progress (the card then
+ *  offers "Allow once more for this project"). Evidence, never authority. */
+export function recordInfoPageHeldVerified(db: AppDb, projectId: string, scope: Side, runId: string, held: ReadonlyArray<{ passId: string; where: string; why?: string[] }> | null | undefined): void {
+  for (const h of Array.isArray(held) ? held.slice(0, 3) : []) {
+    addAuditLog(db, projectId, "portal_bot", "network backstop", ACT_HELD_VERIFIED, {
+      scope, runId: s(runId).slice(0, 120), passId: s(h?.passId).slice(0, 80), where: s(h?.where).slice(0, 200),
+    });
   }
+}
+
+interface PriorProgressReasons {
+  /** Never lifted by an allowance: a filing, a number, a draft, a stage that reached review, paused
+   *  or was interrupted. */
+  hard: string[];
+  /** This project's earlier LEARNS on this side, after the latest allowance: lifted by a person's
+   *  "Allow once more for this project". */
+  learn: string[];
+}
+
+/**
+ * WHY THIS PROJECT HAS ALREADY MADE PROGRESS ON THIS SIDE (critique [1]; round 2: fail closed). The
+ * portal session and its server-side interview survive between runs (a persistent per-client
+ * profile), so a page a person verified at the START of the interview could be shown again at a
+ * later server position where its Next files.
+ *
+ * HARD (a person can never lift these here — the page is then done by hand for this project):
+ *   - any tracked application or permit number of this project, WHATEVER its portal URL (blank, this
+ *     host or another: the table carries no side);
+ *   - a submission on this side in any status but "failed" (staged, awaiting a person, paused,
+ *     submitted, approved, issued — and any status not known here);
+ *   - a portal run on this side with a confirmation number, or in any status but queued / running
+ *     (this stage's own row) / failed (interrupted, paused for a person, awaiting a submit or a
+ *     resubmit, submitted — and any status not known here);
+ *   - a draft recorded on this side (portal.draft_created);
+ *   - a staging or autopilot job of this project interrupted mid-flight (side unknown: both).
+ * LEARN (after the latest allowance on this side; lifted by the next one):
+ *   - an earlier admitted pass (ACT_PASSED) — so a pass admits AT MOST ONCE per project and side;
+ *   - an earlier learn that did not end clean (ACT_LEARN_STARTED with no ACT_LEARN_CLEAN): it may
+ *     have entered data, it reached review, it paused, it threw, or it was cut off;
+ *   - an earlier learn's own outcome on record: reached review (auto_learned_trusted / _draft),
+ *     paused, continued a draft, filled fields without reaching review, a replay self-test, a
+ *     person's fix captured mid-learn.
+ * A read error is a hard reason: an unknown never reassures.
+ */
+export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scopeType: Side): PriorProgressReasons {
+  const hard: string[] = [];
+  const learn: string[] = [];
+  const side: Side = scopeType === "utility" ? "utility" : "ahj";
+  const nem = side === "utility";
+  try {
+    for (const t of db.query<Row>("SELECT application_number, permit_number FROM permit_check_targets WHERE project_id = ?", [projectId])) {
+      const n = s(t.application_number).trim() || s(t.permit_number).trim();
+      if (n) { hard.push(`a filing of this project is tracked by number (${maskDigits(n).slice(0, 24)})`); break; }
+    }
+    for (const x of db.query<Row>("SELECT permit_type, status, application_number, permit_number, confirmation_number FROM submissions WHERE project_id = ?", [projectId])) {
+      if ((s(x.permit_type) === "nem") !== nem) continue;
+      const numbered = !!(s(x.application_number).trim() || s(x.permit_number).trim() || s(x.confirmation_number).trim());
+      if (s(x.status) !== "failed" || numbered) { hard.push(`a submission on this side is ${s(x.status) || "of unknown status"}${numbered ? " with a number" : ""}`); break; }
+    }
+    for (const x of db.query<Row>("SELECT permit_type, status, confirmation_number FROM portal_runs WHERE project_id = ?", [projectId])) {
+      if ((s(x.permit_type) === "nem") !== nem) continue;
+      const numbered = s(x.confirmation_number).trim() !== "";
+      if (numbered || !["queued", "running", "failed"].includes(s(x.status))) { hard.push(`a portal run on this side ${numbered ? "recorded a confirmation number" : `is ${s(x.status) || "of unknown status"}`}`); break; }
+    }
+    for (const d of db.query<Row>("SELECT details FROM audit_logs WHERE project_id = ? AND action = 'portal.draft_created'", [projectId])) {
+      if (rowOnSide(parse<Row>(d.details, {}), side)) { hard.push("a draft of this project is on record on this side"); break; }
+    }
+    const interrupted = db.get<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM job_queue WHERE project_id = ? AND job_type IN ('prepare_submission', 'autopilot') AND status = 'failed' AND error LIKE 'portal run was interrupted%'",
+      [projectId]);
+    if (Number(interrupted?.n ?? 0) > 0) hard.push("a staging run of this project was interrupted mid-flight");
+    // LEARN history, in write order (rowid), after the latest allowance on this side.
+    const rows = db.query<{ rid: number; action: string; details: string; created_at: string }>(
+      `SELECT rowid AS rid, action, details, created_at FROM audit_logs WHERE project_id = ? AND action IN
+        (?, ?, ?, ?, 'portal.auto_learned_trusted', 'portal.auto_learned_draft', 'portal.auto_learn_paused', 'portal.draft_continued',
+         'portal.auto_learn_failed', 'portal.replay_selftest_passed', 'portal.replay_selftest_failed', 'portal.recipe_human_patch_started')
+       ORDER BY rowid`,
+      [projectId, ACT_LEARN_STARTED, ACT_LEARN_CLEAN, ACT_PASSED, ACT_ALLOWED_AGAIN]);
+    const parsed = rows.map((r) => ({ rid: Number(r.rid), action: s(r.action), d: parse<Row>(r.details, {}), at: s(r.created_at).slice(0, 10) }));
+    const allowedAt = Math.max(0, ...parsed.filter((r) => r.action === ACT_ALLOWED_AGAIN && sideOf(r.d.scope) === side).map((r) => r.rid));
+    const clean = new Set(parsed.filter((r) => r.action === ACT_LEARN_CLEAN).map((r) => s(r.d.startId)).filter(Boolean));
+    for (const r of parsed) {
+      if (r.rid <= allowedAt || r.action === ACT_ALLOWED_AGAIN || r.action === ACT_LEARN_CLEAN || !rowOnSide(r.d, side)) continue;
+      if (r.action === ACT_PASSED) learn.push(`an earlier run of this project passed a verified information page (${r.at})`);
+      else if (r.action === ACT_LEARN_STARTED) { if (!clean.has(s(r.d.startId))) learn.push(`an earlier learn of this project did not end held, untouched, at an information page — it may have entered data (${r.at})`); }
+      else if (r.action === "portal.auto_learn_failed") { if (s(r.d.reason)) learn.push(`an earlier learn of this project ${s(r.d.reason) === "no_review" ? "filled fields" : "reached a review-like screen"} (${r.at})`); }
+      else learn.push(`an earlier learn of this project: ${r.action.replace(/^portal\./, "").replace(/_/g, " ")} (${r.at})`);
+    }
+  } catch {
+    hard.push("this project's progress on this portal could not be read");
+  }
+  return { hard: Array.from(new Set(hard)), learn: Array.from(new Set(learn)) };
+}
+
+/**
+ * HAS THIS PROJECT ALREADY MADE PROGRESS ON THIS PORTAL? true refuses the pass (the learner's
+ * INFO_PAGE_PRIOR_PROGRESS_REFUSAL). Every reason of infoPagePriorProgressReasons counts; an
+ * unparseable portal URL or a read error is true: an unknown never reassures.
+ */
+export function infoPagePriorProgress(db: AppDb, projectId: string, portalUrl: string, scopeType: Side): boolean {
+  try { const o = new URL(portalUrl).origin; if (!o || o === "null") return true; } catch { return true; }
+  const r = infoPagePriorProgressReasons(db, projectId, scopeType);
+  return r.hard.length > 0 || r.learn.length > 0;
+}
+
+/** What the project's card shows per side (round 2): the verified pages this project passed or was
+ *  held at since the latest allowance, why later runs stop there, and whether a person may allow
+ *  the pass once more (only when nothing HARD stands in the way). Reads only. */
+export function listInfoPageProjectState(db: AppDb, projectId: string): InfoPageProjectSideState[] {
+  const out: InfoPageProjectSideState[] = [];
+  const rows = db.query<{ rid: number; action: string; details: string; created_at: string }>(
+    "SELECT rowid AS rid, action, details, created_at FROM audit_logs WHERE project_id = ? AND action IN (?, ?, ?) ORDER BY rowid",
+    [projectId, ACT_PASSED, ACT_HELD_VERIFIED, ACT_ALLOWED_AGAIN]);
+  for (const side of ["ahj", "utility"] as const) {
+    const parsed = rows.map((r) => ({ rid: Number(r.rid), action: s(r.action), d: parse<Row>(r.details, {}), at: s(r.created_at) }));
+    const allowed = parsed.filter((r) => r.action === ACT_ALLOWED_AGAIN && sideOf(r.d.scope) === side);
+    const last = allowed.length ? allowed[allowed.length - 1] : null;
+    const since = parsed.filter((r) => r.rid > (last?.rid ?? 0) && r.action !== ACT_ALLOWED_AGAIN && rowOnSide(r.d, side));
+    if (!since.length) continue;
+    const reasons = infoPagePriorProgressReasons(db, projectId, side);
+    out.push({
+      scope: side,
+      passed: since.filter((r) => r.action === ACT_PASSED).map((r) => ({ passId: s(r.d.passId), where: s(r.d.where), at: r.at })).slice(-5),
+      held: since.filter((r) => r.action === ACT_HELD_VERIFIED).map((r) => ({ passId: s(r.d.passId), where: s(r.d.where), at: r.at })).slice(-5),
+      hard: reasons.hard,
+      learn: reasons.learn,
+      canAllow: reasons.hard.length === 0 && reasons.learn.length > 0,
+      lastAllowedBy: last ? s(last.d.by) : "",
+      lastAllowedAt: last ? last.at : "",
+    });
+  }
+  return out;
+}
+
+/**
+ * "ALLOW ONCE MORE FOR THIS PROJECT" (round 2): a NAMED PERSON who checked this project's application
+ * on the portal lifts its LEARN history on one side — the next run may pass a verified page once
+ * more; after that it stops there again. THE ONLY WRITER of ACT_ALLOWED_AGAIN (the source scan pins
+ * it). Refused (409) unless a verified page was passed or held on this side since the last allowance
+ * and nothing HARD stands in the way (a filing, a number, a draft, a paused / interrupted / staged run).
+ */
+export function allowInfoPagePassOnceMore(db: AppDb, projectId: string, scope: string, input: { by: string; userId: string }): void {
+  const side = sideOf(scope);
+  if (!side) throw new HttpError(400, "scope must be \"ahj\" or \"utility\".");
+  db.transaction(() => {
+    const state = listInfoPageProjectState(db, projectId).find((x) => x.scope === side);
+    if (!state) throw new HttpError(409, "No verified information page was passed or held for this project on this side since it was last allowed.");
+    if (state.hard.length) throw new HttpError(409, `This project cannot be allowed again here: ${state.hard.join("; ")}. Do that page by hand.`, { refusals: state.hard });
+    if (!state.learn.length) throw new HttpError(409, "Nothing stands in the way: the next run may already pass the page.");
+    addAuditLog(db, projectId, "human", input.by, ACT_ALLOWED_AGAIN, { scope: side, by: input.by, byUserId: input.userId, lifted: state.learn.slice(0, 8) });
+  });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -439,9 +617,12 @@ export function listInfoPagePasses(db: AppDb): InfoPagePassRecord[] {
   }));
 }
 
-/** Every use of the relaxation is on record: one audit row per admission. */
-export function recordInfoPagePassUses(db: AppDb, projectId: string, runId: string, passed: ReadonlyArray<{ passId: string; where: string }> | null | undefined): void {
+/** Every use of the relaxation is on record: one audit row per admission, written the moment the
+ *  learner reports it (autoLearn's onInfoPagePassed), with its side — and every later run of this
+ *  project on that side counts it as progress (a pass admits at most once per project and side). A
+ *  write that fails throws: the caller's own counter and the unclean learn start still refuse. */
+export function recordInfoPagePassUses(db: AppDb, projectId: string, runId: string, scope: Side, passed: ReadonlyArray<{ passId: string; where: string }> | null | undefined): void {
   for (const p of Array.isArray(passed) ? passed : []) {
-    try { addAuditLog(db, projectId, "portal_bot", "network backstop", "portal.info_page_passed", { runId, passId: s(p.passId), where: s(p.where).slice(0, 200) }); } catch { /* best-effort */ }
+    addAuditLog(db, projectId, "portal_bot", "network backstop", ACT_PASSED, { runId, scope, passId: s(p.passId), where: s(p.where).slice(0, 200) });
   }
 }

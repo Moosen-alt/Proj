@@ -7847,13 +7847,39 @@ function infoPageCandidateCardsHtml(candidates, projectId) {
   return cards + done;
 }
 
+// #344 round 2 — A PASS ADMITS AT MOST ONCE PER PROJECT (and side): after this project passed a
+// verified page, or was held at one because of its earlier progress, its runs stop there as on main.
+// A named person who checked the application on the portal may allow it ONCE MORE; a filing, a
+// number, a draft or a paused / interrupted run (the "hard" reasons) can never be lifted here.
+function infoPageProjectStateHtml(states) {
+  const list = Array.isArray(states) ? states : [];
+  const li = (items) => items.map((x) => `<li>${esc(x)}</li>`).join("");
+  return list.map((st) => {
+    const side = st.scope === "utility" ? "interconnection (NEM)" : "permit";
+    const passed = (Array.isArray(st.passed) ? st.passed : []).map((p) => `passed ${esc(p.where)} on ${esc(String(p.at || "").slice(0, 10))}`);
+    const held = (Array.isArray(st.held) ? st.held : []).map((p) => `held at ${esc(p.where)} on ${esc(String(p.at || "").slice(0, 10))}`);
+    const hard = Array.isArray(st.hard) ? st.hard : [];
+    const learn = Array.isArray(st.learn) ? st.learn : [];
+    return `
+    <article class="item warning" data-info-state="${esc(st.scope)}">
+      <div class="item-title"><span>Verified information page — ${esc(side)} side</span><span class="badge warning">at most once per project</span></div>
+      <p style="font-size:12px">This project ${[...passed, ...held].join("; ") || "used a verified information page"}. A verified page lets automation through once per project: later runs of this project stop at that page, exactly as before it was verified.</p>
+      ${learn.length ? `<p style="font-size:12px;margin:6px 0 2px"><strong>Why later runs stop there:</strong></p><ul style="font-size:12px;margin:0">${li(learn)}</ul>` : ""}
+      ${hard.length ? `<p style="font-size:12px;margin:6px 0 2px"><strong>Cannot be allowed again here (do the page by hand):</strong></p><ul style="font-size:12px;margin:0">${li(hard)}</ul>` : ""}
+      ${st.lastAllowedAt ? `<p class="muted" style="font-size:11px">Last allowed once more by ${esc(st.lastAllowedBy || "a person")} on ${esc(String(st.lastAllowedAt).slice(0, 10))}.</p>` : ""}
+      <div style="margin-top:8px"><button data-info-allow="${esc(st.scope)}"${st.canAllow ? "" : " disabled"}>Allow once more for this project</button></div>
+      <p class="muted" style="font-size:11px;margin-top:4px">Only after you checked this project's application on the portal: nothing filed twice, no draft or request left half-done. The next run may pass the page once more; after that it stops there again.</p>
+    </article>`;
+  }).join("");
+}
+
 async function loadInfoPageCandidates(projectId) {
   const wrap = $("infoPageCandidates");
   if (!wrap || !projectId) return;
   let data;
   try { data = await api(`/api/projects/${encodeURIComponent(projectId)}/info-page-candidates`); } catch { return; }
   if (state.selectedProjectId !== projectId || !$("infoPageCandidates")) return;
-  $("infoPageCandidates").innerHTML = infoPageCandidateCardsHtml(data.candidates, projectId);
+  $("infoPageCandidates").innerHTML = infoPageCandidateCardsHtml(data.candidates, projectId) + infoPageProjectStateHtml(data.projectState);
   bindInfoPageCandidateButtons(projectId);
 }
 
@@ -7885,6 +7911,24 @@ function bindInfoPageCandidateButtons(projectId) {
       try {
         await api(`/api/projects/${encodeURIComponent(projectId)}/info-page-candidates/${encodeURIComponent(button.dataset.infoDismiss)}/dismiss`,
           { method: "POST", body: JSON.stringify({ dismissedBy: name }) });
+        loadInfoPageCandidates(projectId);
+      } catch (err) {
+        showMessage(err.message, "error");
+        button.disabled = false;
+      }
+    });
+  });
+  document.querySelectorAll("#infoPageCandidates button[data-info-allow]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const auth = await authForDecision();
+      const lede = "Allow the verified information page ONCE MORE for this project? Only if you checked this project's application on the portal: nothing would be filed twice and no request is left half-done. The next run may pass the page once; after that it stops there again.";
+      const name = namedPersonConsent(auth, lede, "allowed the information page once more", "a pass is allowed once more by a named person");
+      if (name === null) return;
+      button.disabled = true;
+      try {
+        await api(`/api/projects/${encodeURIComponent(projectId)}/info-page-allow-once-more`,
+          { method: "POST", body: JSON.stringify({ scope: button.dataset.infoAllow, allowedBy: name }) });
+        showMessage("Allowed once more. The next run of this project may pass the verified page once.");
         loadInfoPageCandidates(projectId);
       } catch (err) {
         showMessage(err.message, "error");

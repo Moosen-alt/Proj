@@ -24,7 +24,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import type { AppDb } from "./db";
-import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../shared/src/types";
+import type { InfoPageIncident, PortalRecipe, ProjectRecord, RecipeStep } from "../../shared/src/types";
 import { FINAL_SUBMIT_GATE_SENTENCE, redactSecretValues } from "../../shared/src/portalSafety";
 import { isPlannerSecretKey, projectSecretValues } from "./projectSecrets";
 import { perJobAnswerKeyFor, perJobControlOfField } from "../../shared/src/perJobQuestions";
@@ -44,7 +44,7 @@ import { logger } from "./logger";
 import { ensurePlanSetSplit } from "./docSplitter";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
-import { infoPagePriorProgress, liveInfoPagePasses, recordInfoPageCandidate, recordInfoPagePassIncidents, recordInfoPagePassUses } from "./infoPages";
+import { infoPagePriorProgress, isCleanInfoPageHold, liveInfoPagePasses, recordInfoPageCandidate, recordInfoPageHeldVerified, recordInfoPageLearnClean, recordInfoPageLearnStart, recordInfoPagePassIncidents, recordInfoPagePassUses } from "./infoPages";
 import { formPurposeMismatch } from "./formPurpose";
 import { looksBotBlocked } from "./runAbort";
 import { id } from "./ids";
@@ -1142,12 +1142,83 @@ async function autoLearnPortalInner(
   // server, where a headed launch cannot work and the retry would just cost time.
   let headlessForAttempt = input.headless;
   let headedRetryUsed = false;
-  // #344 — read here, never lazily inside the walk: an unreadable table means no pass (and the
-  // progress question unknown = refused), never a failed learn.
-  const infoPageInput = (() => {
-    try { return { passes: liveInfoPagePasses(db), priorProgress: infoPagePriorProgress(db, projectId, portalUrl, scopeType) }; }
-    catch { return { passes: [] as ReturnType<typeof liveInfoPagePasses>, priorProgress: true }; }
-  })();
+  // #344 — THE INFORMATION-PAGE PASS IS PER autoLearnPortal CALL, NOT PER ATTEMPT (round 2). Before
+  // EACH attempt (the first and the headed retry) the answer is computed afresh — the live passes and
+  // this project's prior progress — and THEN the attempt's start is put on record (a learn that dies
+  // is progress unless it ends clean). One counter spans the attempts: once any attempt of this call
+  // was admitted, a later attempt is handed no pass and told "prior progress" (it never re-admits).
+  // Every admission is written down the moment the learner reports it (onInfoPagePassed), so a learn
+  // that throws later still has it on record. A learn with no project row (a benchmark), an unreadable
+  // table or a start that could not be recorded gets no pass, never a failed learn.
+  const infoPageProjectRow = (() => { try { return !!db.get<{ id: string }>("SELECT id FROM projects WHERE id = ?", [projectId]); } catch { return false; } })();
+  const infoPageCall = {
+    admitted: [] as Array<{ passId: string; where: string }>,
+    /** The CURRENT attempt's admissions the callback reported (settle adds any it did not). */
+    attempt: [] as Array<{ passId: string; where: string }>,
+    attemptStartId: "",
+    withdrawn: [] as string[],
+    afterIncident: false,
+    incidentRecorded: false,
+    incidentError: "",
+  };
+  type InfoPageAttemptInput = { passes: ReturnType<typeof liveInfoPagePasses>; priorProgress: boolean };
+  const noInfoPagePass: InfoPageAttemptInput = { passes: [], priorProgress: true };
+  const armInfoPageAttempt = (attempt: number): InfoPageAttemptInput => {
+    infoPageCall.attempt = [];
+    infoPageCall.attemptStartId = "";
+    if (!infoPageProjectRow) return noInfoPagePass;
+    let input: InfoPageAttemptInput;
+    try {
+      input = infoPageCall.admitted.length
+        ? noInfoPagePass
+        : { passes: liveInfoPagePasses(db), priorProgress: infoPagePriorProgress(db, projectId, portalUrl, scopeType) };
+    } catch { input = noInfoPagePass; }
+    try { infoPageCall.attemptStartId = recordInfoPageLearnStart(db, projectId, scopeType, attempt); }
+    catch { return noInfoPagePass; }
+    return input;
+  };
+  const onInfoPagePassed = (p: { passId: string; where: string }): void => {
+    const use = { passId: String(p?.passId ?? ""), where: String(p?.where ?? "") };
+    infoPageCall.admitted.push(use);
+    infoPageCall.attempt.push(use);
+    if (!infoPageProjectRow) return;
+    try { recordInfoPagePassUses(db, projectId, "", scopeType, [use]); } catch { /* the counter and the unclean start still refuse */ }
+  };
+  // After each attempt: the admissions the callback did not write, its incidents (a discarded retry's
+  // too — a withdrawal is never lost), whether it ended clean, and a verified page it was held at.
+  // A learn that THREW after a pass was used never had the page after it judged: every pass that
+  // attempt used is an incident (phase "after") and is withdrawn.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const settleInfoPageAttempt = (l: any, threw: boolean): void => {
+    const runId = l?.debugDir ? path.basename(String(l.debugDir)) : "";
+    const passed: Array<{ passId: string; where: string }> = Array.isArray(l?.infoPagePassed) ? l.infoPagePassed : [];
+    const missed = passed.slice(infoPageCall.attempt.length);
+    if (missed.length) {
+      infoPageCall.admitted.push(...missed);
+      infoPageCall.attempt.push(...missed);
+      if (infoPageProjectRow) { try { recordInfoPagePassUses(db, projectId, runId, scopeType, missed); } catch { /* the counter still refuses */ } }
+    }
+    const thisAttempt = [...infoPageCall.attempt];
+    const incidents: InfoPageIncident[] = Array.isArray(l?.infoPageIncidents) ? [...l.infoPageIncidents] : [];
+    if (threw) for (const a of thisAttempt) incidents.push({ passId: a.passId, phase: "after", why: ["the learn failed after the pass was used: the page after it was never judged"], where: a.where });
+    if (incidents.length) {
+      try {
+        const out = recordInfoPagePassIncidents(db, infoPageProjectRow ? projectId : null, runId, incidents);
+        infoPageCall.withdrawn.push(...out.withdrawn);
+        infoPageCall.incidentRecorded = true;
+        if (incidents.some((i) => i.phase === "after")) infoPageCall.afterIncident = true;
+      } catch (err) {
+        infoPageCall.incidentError = err instanceof Error ? err.message.slice(0, 120) : String(err);
+      }
+    }
+    if (!threw && infoPageCall.attemptStartId && !thisAttempt.length && isCleanInfoPageHold(l)) {
+      try { recordInfoPageLearnClean(db, projectId, scopeType, infoPageCall.attemptStartId); } catch { /* not clean, then */ }
+    }
+    if (!threw && infoPageProjectRow && Array.isArray(l?.infoPageHeldVerified) && l.infoPageHeldVerified.length) {
+      try { recordInfoPageHeldVerified(db, projectId, scopeType, runId, l.infoPageHeldVerified); } catch { /* evidence only */ }
+    }
+  };
+  let infoPageInput: InfoPageAttemptInput = noInfoPagePass;
   let learn;
   // THE BUDGET IS FOR THE PORTAL, NOT FOR EACH ATTEMPT.
   //
@@ -1335,10 +1406,12 @@ async function autoLearnPortalInner(
       continueDraft: input.continueDraft,
       signatureRequestApproval: input.signatureRequestApproval ?? null,
       runId: input.runId,
-      // #344: the human-verified information pages, read once per run (a withdrawal applies from
-      // the next run), and whether this project already made progress on this portal (refuses).
+      // #344: the human-verified information pages and whether this project already made progress
+      // on this portal (refuses) — computed afresh before EACH attempt (armInfoPageAttempt), and
+      // every admission reported at once.
       infoPagePasses: infoPageInput.passes,
       infoPagePriorProgress: infoPageInput.priorProgress,
+      onInfoPagePassed,
     });
   // WRITE IT DOWN BEFORE WE TOUCH THE PORTAL, NOT AFTER. This run is about to log into a
   // REAL account and start a REAL application; a run that dies mid-way has still created
@@ -1354,11 +1427,14 @@ async function autoLearnPortalInner(
     credentials: project.clientId ? listPortalCredentials(db, project.clientId) : [],
   });
   if (draftTouch) recordDraftTouch(draftTouch);
+  infoPageInput = armInfoPageAttempt(1);
   try {
     learn = await browserLimiter(runLearn);
   } catch (err) {
+    settleInfoPageAttempt(null, true);
     throw new HttpError(502, `Portal learn failed: ${err instanceof Error ? err.message : String(err)}`);
   }
+  settleInfoPageAttempt(learn, false);
 
   // The headed retry described above. Re-runs the identical learn with a real window when —
   // and only when — the failure looks like a bot block.
@@ -1379,15 +1455,20 @@ async function autoLearnPortalInner(
     logger.info("auto-learn", "portal refused a headless browser — retrying with a real window", { portal: portalUrl });
     // A SECOND BROWSER IS A SECOND POSSIBLE DRAFT (dryrun-0928 B11): its own ledger row, before it opens.
     if (draftTouch) recordDraftTouch({ ...draftTouch, at: new Date().toISOString(), purpose: `${draftTouch.purpose} (headed retry — a second browser; may leave a second draft)` });
+    // THE RETRY IS ASKED AFRESH (round 2): attempt 1 is on record (its start, any use), so a pass it
+    // used — or a learn that did not end clean — refuses here; and the call's own counter never
+    // re-admits.
+    infoPageInput = armInfoPageAttempt(2);
     try {
       const retried = await browserLimiter(runLearn);
+      settleInfoPageAttempt(retried, false);
       // Keep the retry only if it actually got further; a second refusal should not erase
       // the first result's diagnostics.
       if (retried && (retried.ok || (retried.pageCount ?? 0) > (learn?.pageCount ?? 0))) {
         learn = retried;
         learn.message = `${learn.message} (succeeded on a headed retry — this portal refuses headless browsers)`;
       }
-    } catch { /* the headless result stands */ }
+    } catch { settleInfoPageAttempt(null, true); /* the headless result stands */ }
     }
   }
   // THE LEARN'S DRAFT, NAMED (dryrun-0928 B11). The ledger row above says a draft may exist; the page
@@ -1450,31 +1531,30 @@ async function autoLearnPortalInner(
   // have saved, and the portal's own background calls the lockdown held back — carried into EVERY
   // outcome's message, since the learn's own message is not what the operator reads.
   const handoffNotes = (learn.reviewHandoffNotes ?? []).filter(Boolean);
-  // #344 — AN INFORMATION PAGE THE BACKSTOP HELD, FOR A PERSON TO VERIFY (and every verified one this
-  // walk passed, on record, and every INCIDENT on a verified one acted on). Written once, here,
-  // before any outcome is chosen: the ONE writer of a candidate (infoPages.recordInfoPageCandidate).
-  // A database failure never fails the learn — it is named in the message. A learn with no project
+  // #344 — AN INFORMATION PAGE THE BACKSTOP HELD, FOR A PERSON TO VERIFY. Written once, here, before
+  // any outcome is chosen: the ONE writer of a candidate (infoPages.recordInfoPageCandidate). Every
+  // verified page an attempt passed, every INCIDENT and every hold at a verified page were already
+  // put on record per attempt (settleInfoPageAttempt); here they are only named in the message. A
+  // database failure never fails the learn — it is named in the message. A learn with no project
   // row (a benchmark) records no candidate.
   let infoPageLine = "";
   let infoPageSummary: { identitySha256: string; origin: string; path: string; controlLabel: string } | null = null;
   {
     const learnRunId = debugDir ? path.basename(debugDir) : "";
-    const projectRow = (() => { try { return db.get<{ id: string }>("SELECT id FROM projects WHERE id = ?", [projectId]); } catch { return null; } })();
-    if (projectRow && Array.isArray(learn.infoPagePassed) && learn.infoPagePassed.length) recordInfoPagePassUses(db, projectId, learnRunId, learn.infoPagePassed);
+    const projectRow = infoPageProjectRow;
     // AN INCIDENT ON A VERIFIED PAGE (proposal §4): audited and the pass WITHDRAWN (deleted) — the
     // page drifted before the click (held exactly as on main; the new page is the fresh candidate
-    // below), or the page after the click did not read as "not filed" (the learn stopped, ok:false:
-    // the failed outcome below, which records nothing as filed).
-    if (Array.isArray(learn.infoPageIncidents) && learn.infoPageIncidents.length) {
-      try {
-        const out = recordInfoPagePassIncidents(db, projectRow ? projectId : null, learnRunId, learn.infoPageIncidents);
-        const after = learn.infoPageIncidents.some((i) => i.phase === "after");
-        infoPageLine += out.withdrawn.length
-          ? ` ${after ? "The page after a verified information page did not read as an unfiled form" : "A verified information page changed"}; that verification was withdrawn (${out.withdrawn.length}) and a person must look again.`
-          : " An incident on a verified information page was recorded.";
-      } catch (err) {
-        infoPageLine += ` An incident on a verified information page could not be recorded (${err instanceof Error ? err.message.slice(0, 120) : String(err)}).`;
-      }
+    // below), or the page after the click did not read as an unfiled application form (the learn
+    // stopped, ok:false: the failed outcome below, which records nothing as filed).
+    if (infoPageCall.incidentError) {
+      infoPageLine += ` An incident on a verified information page could not be recorded (${infoPageCall.incidentError}).`;
+    } else if (infoPageCall.incidentRecorded) {
+      infoPageLine += infoPageCall.withdrawn.length
+        ? ` ${infoPageCall.afterIncident ? "The page after a verified information page did not read as an unfiled application form" : "A verified information page changed"}; that verification was withdrawn (${infoPageCall.withdrawn.length}) and a person must look again.`
+        : " An incident on a verified information page was recorded.";
+    }
+    if (Array.isArray(learn.infoPageHeldVerified) && learn.infoPageHeldVerified.length) {
+      infoPageLine += " Held at a verified information page because this project already made progress on this portal; a person who has checked the application can allow it once more (project → Portal runs).";
     }
     const cand = learn.infoPageCandidate;
     if (cand && cand.observed && projectRow) {

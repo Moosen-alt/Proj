@@ -54,7 +54,7 @@ import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAns
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
 // Types only (erased): the information-page door is reached duck-typed on the installed backstop.
 import type { FilingBackstop, InfoPageCandidateTake, InfoPagePassOpen } from "../filingBackstop";
-import { infoPageEvidence, type InfoPageRunState, type InfoPageRunStep } from "../../../shared/src/infoPagePass";
+import { INFO_PAGE_PRIOR_PROGRESS_REFUSAL, infoPageEvidence, type InfoPageRunState, type InfoPageRunStep } from "../../../shared/src/infoPagePass";
 import type { InfoPageCandidateCapture, InfoPageIncident, VerifiedInfoPage } from "../../../shared/src/types";
 import { hostOfUrl, sameCredentialScope } from "../siteOf";
 import { attachmentTypeFor, isDocumentTypeList, isPlanSetDocType } from "./attachmentTypes";
@@ -277,6 +277,10 @@ export interface LearnResult {
    *  (held exactly as on main), or the page after the verified click did not read as an unfiled
    *  form (the walk stopped, stopReason "info_page_incident"). The backend withdraws each pass. */
   infoPageIncidents?: InfoPageIncident[];
+  /** VERIFIED information pages this walk was HELD at only because the backend said this project
+   *  already made progress on this portal (round 2): the page matched, nothing was sent. A person may
+   *  allow the pass once more for the project (project -> Portal runs). */
+  infoPageHeldVerified?: Array<{ passId: string; where: string; why: string[] }>;
 }
 
 // Live progress signal emitted while learning a portal, so the UI can show a real
@@ -2136,6 +2140,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   private infoPageCandidate: InfoPageCandidateCapture | null = null;
   private infoPagePassed: Array<{ passId: string; where: string }> = [];
   private infoPageIncidents: InfoPageIncident[] = [];
+  private infoPageHeldVerified: Array<{ passId: string; where: string; why: string[] }> = [];
+  /** #344 round 2 — told AT ONCE of every admission (the backend writes the use down before anything
+   *  else can happen: a learn that throws later still has it on record). */
+  private onInfoPagePassed: ((p: { passId: string; where: string }) => void) | undefined;
   /** The project's own values (street, name, parcel, system size): a page that shows them before
    *  anything was entered is a summary, never an information page. */
   private infoPageProjectValues: string[] = [];
@@ -2348,6 +2356,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       /** #344: the backend's answer to "has this project already reached review, recorded an
        *  application number or found a draft on this portal origin?". Not given = true (refuses). */
       infoPagePriorProgress?: boolean;
+      /** #344 round 2: called synchronously for every information page the backstop admitted, the
+       *  moment the click is settled (the backend records the use before the walk goes on). */
+      onInfoPagePassed?: (p: { passId: string; where: string }) => void;
     } = {},
   ) {
     super();
@@ -2360,6 +2371,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     this.signatureRequestApproval = options.signatureRequestApproval ?? null;
     this.infoPagePasses = Object.freeze((options.infoPagePasses ?? []).map((e) => Object.freeze(JSON.parse(JSON.stringify(e)) as VerifiedInfoPage)));
     this.infoPagePriorProgress = options.infoPagePriorProgress !== false;
+    this.onInfoPagePassed = typeof options.onInfoPagePassed === "function" ? options.onInfoPagePassed : undefined;
     this.runId = String(options.runId ?? "");
     this.allowFinalSubmit = options.allowFinalSubmit === true;
     this.hasBattery = options.hasBattery;
@@ -3627,6 +3639,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       if (this.infoPageCandidate) result = { ...result, infoPageCandidate: this.infoPageCandidate };
       if (this.infoPagePassed.length) result = { ...result, infoPagePassed: [...this.infoPagePassed] };
       if (this.infoPageIncidents.length) result = { ...result, infoPageIncidents: this.infoPageIncidents.map((i) => ({ ...i, why: i.why.map((w) => this.scrubSecrets(w)) })) };
+      if (this.infoPageHeldVerified.length) result = { ...result, infoPageHeldVerified: this.infoPageHeldVerified.map((h) => ({ ...h, why: h.why.map((w) => this.scrubSecrets(w)) })) };
       // Hand-off first (the route comes off), then every abort up to that moment is counted.
       await backstop?.dispose().catch(() => null);
       // WHAT THE PERSON TAKING THE REVIEW PAGE MUST KNOW (dryrun-0928 B3 + B14), in the hand-off itself:
@@ -5419,6 +5432,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
               ...fail(steps, this.portalName, changed.length
                 ? `HELD AT AN INFORMATION PAGE THAT CHANGED SINCE A PERSON VERIFIED IT (${changed[0].why.slice(0, 3).join("; ")}): ${held} That verification is withdrawn. A person can mark the page as it is now (project → Portal runs → Information page to verify).`
                 : `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: ${held} A person can mark this exact page once (project → Portal runs → Information page to verify); after that, runs pass it — only this page, and only before anything is entered on the run.`, null, pageCount, portalNotices),
+              stopReason: "backstop_abort",
+            };
+          }
+          // A VERIFIED PAGE HELD BECAUSE THIS PROJECT ALREADY MADE PROGRESS ON THIS PORTAL (round 2: a
+          // pass admits at most once per project). The hold is main's; the message says what a person
+          // can do about it.
+          if (this.infoPageHeldVerified.length) {
+            return {
+              ...fail(steps, this.portalName, `HELD AT A VERIFIED INFORMATION PAGE: ${describeBackstopAbort(stopping[0])}. Nothing was sent. The page is one a person verified, but this project already made progress on this portal (an earlier run passed this page, may have entered data, reached review, or a number, draft or filing is on record), so automation does not pass it again. Check this project's application on the portal; a person can then allow the pass once more for this project (project → Portal runs).`, null, pageCount, portalNotices),
               stopReason: "backstop_abort",
             };
           }
@@ -8818,6 +8840,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       this.infoPageIncidents.push({ passId: d.entryId, phase: "before", why: d.why.slice(0, 6), where: d.where });
       this.debug?.event({ type: "info_page_incident", page: pageCount, phase: "before", passId: d.entryId, why: d.why.slice(0, 6) });
     }
+    // HELD AT A VERIFIED PAGE ONLY BECAUSE OF THIS PROJECT'S PRIOR PROGRESS (round 2): the click is
+    // held exactly as on main; the run says so, and a person may allow the pass once more.
+    if (!r.opened && r.heldVerifiedEntryId && r.refusals.includes(INFO_PAGE_PRIOR_PROGRESS_REFUSAL)) {
+      let where = "";
+      try { const u = new URL(String(this.page?.url() ?? "")); where = `${u.origin}${u.pathname}`; } catch { where = ""; }
+      this.infoPageHeldVerified.push({ passId: r.heldVerifiedEntryId, where, why: r.refusals.slice(0, 6) });
+    }
     const pg = this.page;
     if (!r.candidateWatch || !pg) return undefined;
     const shot = await this.withSecretMask("info page screenshot", (mask) => pg.screenshot({ fullPage: true, mask })).catch(() => undefined);
@@ -8853,7 +8882,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     const admitted = Array.isArray(door.infoPageAdmissions) ? door.infoPageAdmissions.slice(admissionsBefore).filter((a) => a.exempted) : [];
     if (admitted.length) {
       this.infoPassAdmittedSteps.add(advStep);
-      for (const a of admitted) this.infoPagePassed.push({ passId: a.entryId, where: a.where });
+      for (const a of admitted) {
+        this.infoPagePassed.push({ passId: a.entryId, where: a.where });
+        // ON RECORD AT ONCE (round 2): the backend writes the use before the walk goes on.
+        try { this.onInfoPagePassed?.({ passId: a.entryId, where: a.where }); } catch { /* the result still carries it */ }
+      }
       this.debug?.event({ type: "info_page_pass", page: pageCount, passes: admitted.map((a) => ({ passId: a.entryId, where: a.where })) });
     }
     return admitted.map((a) => ({ passId: a.entryId, where: a.where }));

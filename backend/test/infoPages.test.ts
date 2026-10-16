@@ -28,12 +28,20 @@
 //   DELETE    — deleting the project a page was verified on deletes its candidates and withdraws
 //               that pass (audited with no project, so the history survives the project).
 //   SHARED    — GET /api/info-page-passes carries no text, no hash of a value, no verifier, no project.
-//   PROGRESS  — a tracking number on the same origin, a staged submission on the same side or a
-//               recorded draft refuses; another origin / the other side does not; unknown refuses.
+//   PROGRESS  — (round 2, fail closed) a tracking number of this project WHATEVER its URL (P5), a
+//               staged / paused (P6) / interrupted (P4) / numbered run or submission on the same side,
+//               an interrupted staging job, a recorded draft, and this project's earlier LEARNS
+//               refuse: a use of a pass (at most once per project: B1a/P1, B1b/P2), and any learn that
+//               did not end held, untouched, at an information page. The positive control: capture →
+//               verify → the SAME project's next learn is handed false. THE HEADED RETRY is asked
+//               afresh (P3/B2): attempt 1's use is on record and attempt 2 gets no pass. A learn that
+//               throws after a use withdraws the pass. ALLOW ONCE MORE: a named person lifts the
+//               learn history once; a hard reason, nothing to allow or a bad side refuses.
 //   ROUTES    — auth OFF: JSON only (415); cross-origin and a rebinding Host are 403 and write
 //               nothing; no name / "operator" is 400; a typed name verifies. Auth ON: 401 signed
 //               out; an org ADMIN is 403 on verify (superadmin only) and the superadmin's verify
-//               ignores a body name; another org's admin gets 404; withdraw needs a reason.
+//               ignores a body name; another org's admin gets 404; withdraw needs a reason. Allow
+//               once more: the same guards, superadmin when signed in, another org 404.
 //
 //   npx tsx backend/test/infoPages.test.ts
 import "./_isolate"; // FIRST
@@ -127,9 +135,18 @@ const stubLearn = () => ({
   stopReason: nextIncidents?.some((i) => i.phase === "after") ? "info_page_incident" : "backstop_abort",
   ...(nextCapture ? { infoPageCandidate: nextCapture } : {}), ...(nextPassed ? { infoPagePassed: nextPassed } : {}), ...(nextIncidents ? { infoPageIncidents: nextIncidents } : {}),
 });
-autoLearn.setAutoLearnSeamsForTests({ learnPortal: (async (input: typeof handed) => { handed = input; return stubLearn(); }) as never });
+// Round 2: every attempt's input is kept (the headed retry is a second call), and a test may script
+// the attempts itself (report a use through the learner's own callback, throw, look bot-blocked…).
+type LearnInput = { infoPagePasses?: Array<{ id: string }>; infoPagePriorProgress?: boolean; onInfoPagePassed?: (p: { passId: string; where: string }) => void };
+let handedAll: LearnInput[] = [];
+let scripted: Array<(input: LearnInput) => unknown> = [];
+autoLearn.setAutoLearnSeamsForTests({ learnPortal: (async (input: LearnInput) => {
+  handed = input; handedAll.push(input);
+  const next = scripted.shift();
+  return next ? next(input) : stubLearn();
+}) as never });
 const runLearn = async (projectId: string, c?: InfoPageCandidateCapture, passed?: Array<{ passId: string; where: string }>, incidents?: InfoPageIncident[]) => {
-  nextCapture = c; nextPassed = passed; nextIncidents = incidents; handed = null;
+  nextCapture = c; nextPassed = passed; nextIncidents = incidents; handed = null; handedAll = [];
   return autoLearn.autoLearnPortal(db, projectId, { scope: "ahj", portalUrl: `${ORIGIN}/permits/sfjsp?interviewID=Home`, createdBy: "operator", permitType: "structural" });
 };
 
@@ -415,7 +432,7 @@ await check("INCIDENT AFTER THE CLICK: the pass is DELETED and audited; the lear
   assert.equal(JSON.parse(a[0].details).phase, "after");
   assert.equal(fx.audits("portal.info_page_passed").filter((x) => JSON.parse(x.details).passId === passId).length, 1, "the use itself is on record too");
   assert.equal(r.status, "failed");
-  assert.match(String(r.message), /did not read as an unfiled form; that verification was withdrawn/);
+  assert.match(String(r.message), /did not read as an unfiled application form; that verification was withdrawn/);
   assert.equal(db.query("SELECT id FROM submissions WHERE project_id = ? AND status IN ('submitted', 'submitted_unconfirmed', 'awaiting_human_submit', 'staged')", [P]).length, 0);
   assert.equal(db.query("SELECT id FROM portal_runs WHERE project_id = ? AND (confirmation_number <> '' OR status = 'submitted')", [P]).length, 0);
   assert.equal(db.query("SELECT id FROM permit_check_targets WHERE project_id = ? AND (application_number <> '' OR permit_number <> '')", [P]).length, 0);
@@ -451,15 +468,192 @@ await check("prior progress: a portal run on the same side that recorded a numbe
   db.run("INSERT INTO portal_runs (id, project_id, run_type, status, started_at, permit_type) VALUES (?, ?, 'stage', 'awaiting_human_submit', '2026-10-15', 'permit')", [`r2-${P}`, P]);
   assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), true);
 });
-await check("prior progress: a tracking number on the SAME origin refuses; another origin does not; unknown refuses", () => {
-  const P = fx.newProject();
+await check("prior progress (round 2, P5): a tracking number of this project refuses WHATEVER its portal URL — another host, a blank one or this one; unknown refuses", () => {
   const url = `${ORIGIN}/permits/sfjsp?interviewID=Home`;
-  assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), false);
-  db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", [`t-${P}`, P, "https://other.example.test/x", "A-1", "2026-10-15", "2026-10-15"]);
-  assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), false);
-  db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", [`u-${P}`, P, `${ORIGIN}/records/1`, "B-2", "2026-10-15", "2026-10-15"]);
-  assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), true);
-  assert.equal(IP.infoPagePriorProgress(db, P, "not a url", "ahj"), true);
+  for (const [what, portalUrl] of [["another host", "https://other.example.test/x"], ["a BLANK portal URL (P5)", ""], ["this host", `${ORIGIN}/records/1`]] as const) {
+    const P = fx.newProject();
+    assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), false, `${what}: fresh`);
+    db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", [`t-${P}`, P, portalUrl, "26-104455-RS", "2026-10-15", "2026-10-15"]);
+    assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), true, what);
+    assert.equal(IP.infoPagePriorProgress(db, P, url, "utility"), true, `${what}: the table has no side, so both`);
+    assert.ok(!JSON.stringify(IP.infoPagePriorProgressReasons(db, P, "ahj")).includes("104455"), "the number is masked in the reasons");
+  }
+  assert.equal(IP.infoPagePriorProgress(db, fx.newProject(), "not a url", "ahj"), true);
+});
+
+// ── PRIOR PROGRESS, ROUND 2: through the real autoLearnPortal (the learner stubbed) ──────────────
+const sfjsp = `${ORIGIN}/permits/sfjsp`;
+const handedOf = (i: LearnInput | null | undefined) => ({ passes: Array.isArray(i?.infoPagePasses) ? i!.infoPagePasses!.length : -1, priorProgress: i?.infoPagePriorProgress });
+const passedResult = (o: Record<string, unknown> = {}) => ({
+  ok: false, portalName: "stub", steps: [{ action: "goto", value: `${ORIGIN}/permits/sfjsp?interviewID=Home` }, { action: "fill", note: "Site Address", value: "{{street}}" }],
+  reviewScreen: { fields: [], bodyTextSnippet: "" }, finalSubmitRecorded: false, pageCount: 4, pauseReason: null,
+  message: "Auto-learn could not finish the wizard.", stopReason: "no_progress", ...o,
+});
+await check("THE DISCRIMINATOR FLOW (positive control): capture → a person verifies → the SAME project's next learn is handed the pass and priorProgress FALSE (a clean hold is not progress)", async () => {
+  const { P, passId } = await verifiedPage("Discriminator Flow Page");
+  assert.equal(fx.audits("portal.info_page_learn_started").filter((a) => a.project_id === P).length, 1, "the capture learn's start is on record");
+  assert.equal(fx.audits("portal.info_page_learn_clean").filter((a) => a.project_id === P).length, 1, "…and it ended clean (held, untouched)");
+  await runLearn(P);
+  assert.deepEqual(handedOf(handed as LearnInput), { passes: IP.liveInfoPagePasses(db).length, priorProgress: false });
+  assert.ok((handed as LearnInput).infoPagePasses!.some((e) => e.id === passId));
+});
+await check("B1a / P1 / 'twice': a learn PASSED the verified page, filled fields and failed mid-wizard → the next learn of that project is handed priorProgress TRUE (at most once per project)", async () => {
+  const { P, passId } = await verifiedPage("B1a Page");
+  scripted = [(input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); return passedResult({ infoPagePassed: [{ passId, where: sfjsp }] }); }];
+  await runLearn(P);
+  assert.equal(handedOf(handedAll[0]).priorProgress, false, "the first use was admitted");
+  assert.equal(fx.audits("portal.info_page_passed").filter((a) => a.project_id === P).length, 1, "the use is on record ONCE (the callback; settle wrote no duplicate)");
+  assert.equal(JSON.parse(fx.audits("portal.info_page_passed").filter((a) => a.project_id === P)[0].details).scope, "ahj");
+  await runLearn(P);
+  assert.equal(handedOf(handed as LearnInput).priorProgress, true, "the SAME project's next learn is refused");
+  const why = IP.infoPagePriorProgressReasons(db, P, "ahj");
+  assert.ok(why.learn.some((w) => /passed a verified information page/.test(w)), JSON.stringify(why));
+  assert.ok(why.learn.some((w) => /may have entered data/.test(w)), JSON.stringify(why));
+  assert.equal(IP.infoPagePriorProgress(db, P, sfjsp, "utility"), false, "the other side is untouched");
+});
+await check("B1b / P2: a learn PASSED the page and REACHED REVIEW (the real outcome path) → the next learn is handed priorProgress TRUE", async () => {
+  const { P, passId } = await verifiedPage("B1b Page");
+  scripted = [(input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); return passedResult({
+    ok: true, reachedReview: true, filledSomething: true, stopReason: undefined, message: "Human review required. Auto-learn reached the review screen after 4 page(s).",
+    steps: [{ action: "goto", value: `${ORIGIN}/permits/sfjsp?interviewID=Home` }, { action: "fill", note: "Site Address", value: "{{street}}", selector: { css: "#addr" } }, { action: "stopForReview", note: "review" }],
+    reviewScreen: { fields: [{ label: "Site Address", value: "1 Test St" }], bodyTextSnippet: "Review your application" }, infoPagePassed: [{ passId, where: sfjsp }] }); }];
+  await runLearn(P);
+  const outcomes = db.query<{ action: string }>("SELECT action FROM audit_logs WHERE project_id = ? AND action LIKE 'portal.auto_learn%'", [P]).map((r) => r.action);
+  await runLearn(P);
+  assert.equal(handedOf(handed as LearnInput).priorProgress, true, JSON.stringify(outcomes));
+});
+await check("a learn that never passed a page but did NOT end clean (it entered data, then failed) is progress too", async () => {
+  const { P } = await verifiedPage("Unclean Page");
+  scripted = [() => passedResult()];
+  await runLearn(P);
+  assert.equal(handedOf(handedAll[0]).priorProgress, false);
+  await runLearn(P);
+  assert.equal(handedOf(handed as LearnInput).priorProgress, true);
+});
+await check("P3 / B2 — THE HEADED RETRY IS ASKED AFRESH: attempt 1 passed the page (reported through the callback) and hit a bot wall → attempt 2 is handed NO pass and priorProgress TRUE, and attempt 1's use is on record", async () => {
+  const { P, passId } = await verifiedPage("B2 Page");
+  const wall = "403 Forbidden. Attention Required — checking your browser.";
+  scripted = [
+    (input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); return passedResult({ message: wall, pageCount: 1, infoPagePassed: [{ passId, where: sfjsp }] }); },
+    () => passedResult({ message: "headed: still nothing", pageCount: 0 }),
+  ];
+  await runLearn(P);
+  assert.equal(handedAll.length, 2, "the bot wall triggered the headed retry");
+  assert.deepEqual(handedOf(handedAll[0]), { passes: IP.liveInfoPagePasses(db).length, priorProgress: false });
+  assert.deepEqual(handedOf(handedAll[1]), { passes: 0, priorProgress: true });
+  assert.equal(fx.audits("portal.info_page_passed").filter((a) => a.project_id === P && JSON.parse(a.details).passId === passId).length, 1, "attempt 1's use is on record");
+  assert.equal(fx.audits("portal.info_page_learn_started").filter((a) => a.project_id === P).length, 3, "capture + both attempts started on record");
+});
+await check("P3 / B2 — the same when attempt 1's use reaches the backend only in its RESULT (no callback): attempt 2 is still refused, and the use is recorded once", async () => {
+  const { P, passId } = await verifiedPage("B2 Result Page");
+  scripted = [
+    () => passedResult({ message: "403 Forbidden — access denied", pageCount: 1, infoPagePassed: [{ passId, where: sfjsp }] }),
+    () => passedResult({ message: "headed: still nothing", pageCount: 0 }),
+  ];
+  await runLearn(P);
+  assert.equal(handedAll.length, 2);
+  assert.deepEqual(handedOf(handedAll[1]), { passes: 0, priorProgress: true });
+  assert.equal(fx.audits("portal.info_page_passed").filter((a) => a.project_id === P && JSON.parse(a.details).passId === passId).length, 1);
+});
+await check("P3 — a bot-blocked attempt 1 that passed NOTHING still leaves attempt 2 refused (fail closed: it did not end held, untouched, at an information page)", async () => {
+  const { P } = await verifiedPage("B2 Nothing Page");
+  scripted = [() => passedResult({ message: "403 Forbidden — access denied", pageCount: 0, steps: [] }), () => passedResult({ message: "headed: still nothing", pageCount: 0 })];
+  await runLearn(P);
+  assert.equal(handedAll.length, 2);
+  assert.equal(handedOf(handedAll[0]).priorProgress, false);
+  assert.equal(handedOf(handedAll[1]).priorProgress, true);
+  assert.ok(handedOf(handedAll[1]).passes > 0, "the pass is still handed (only prior progress refuses)");
+});
+await check("a learn that THROWS after the pass was used: the use is on record, the pass is WITHDRAWN as an after-click incident (the page after it was never judged)", async () => {
+  const { P, passId } = await verifiedPage("Throw Page");
+  scripted = [(input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); throw new Error("browser crashed"); }];
+  await assert.rejects(() => runLearn(P), /Portal learn failed/);
+  assert.equal(fx.audits("portal.info_page_passed").filter((a) => a.project_id === P && JSON.parse(a.details).passId === passId).length, 1);
+  assert.ok(!IP.liveInfoPagePasses(db).some((p) => p.id === passId), "withdrawn");
+  const inc = fx.audits("portal.info_page_pass_incident").filter((a) => JSON.parse(a.details).passId === passId);
+  assert.equal(inc.length, 1);
+  assert.equal(JSON.parse(inc[0].details).phase, "after");
+  assert.equal(IP.infoPagePriorProgress(db, P, sfjsp, "ahj"), true);
+});
+await check("P4: a stage run INTERRUPTED (recoverInterruptedPortalRuns: 'the portal may already hold a draft or a filing') refuses on its side", async () => {
+  const { recoverInterruptedPortalRuns } = await import("../src/repository");
+  const P = fx.newProject();
+  db.run("INSERT INTO portal_runs (id, project_id, run_type, status, started_at, permit_type, runner) VALUES (?, ?, 'prepare_submit', 'running', '2026-10-15', 'structural', 'gone-runner')", [`ri-${P}`, P]);
+  assert.equal(IP.infoPagePriorProgress(db, P, sfjsp, "ahj"), false, "a RUNNING row is this stage's own: not progress");
+  recoverInterruptedPortalRuns(db, { projectId: P, isAlive: () => false });
+  assert.equal(String(db.get<{ status: string }>("SELECT status FROM portal_runs WHERE id = ?", [`ri-${P}`])!.status), "interrupted");
+  assert.equal(IP.infoPagePriorProgress(db, P, sfjsp, "ahj"), true);
+  assert.equal(IP.infoPagePriorProgress(db, P, sfjsp, "utility"), false);
+});
+await check("P6: a submission and a portal run PAUSED FOR A PERSON refuse on their side; a FAILED stage (a held self-seed) does not", async () => {
+  const P = fx.newProject();
+  db.run("INSERT INTO portal_runs (id, project_id, run_type, status, started_at, permit_type) VALUES (?, ?, 'prepare_submit', 'failed', '2026-10-15', 'structural')", [`rf-${P}`, P]);
+  db.run("INSERT INTO submissions (id, project_id, submission_type, permit_type, status, created_at) VALUES (?, ?, 'portal', 'structural', 'failed', '2026-10-15')", [`sf-${P}`, P]);
+  assert.equal(IP.infoPagePriorProgress(db, P, sfjsp, "ahj"), false, "a failed stage is not progress (the capture's stage fails)");
+  db.run("INSERT INTO submissions (id, project_id, submission_type, permit_type, status, created_at) VALUES (?, ?, 'portal', 'structural', 'paused_for_human', '2026-10-15')", [`sp-${P}`, P]);
+  assert.equal(IP.infoPagePriorProgress(db, P, sfjsp, "ahj"), true, "submission paused_for_human");
+  const Q = fx.newProject();
+  db.run("INSERT INTO portal_runs (id, project_id, run_type, status, started_at, permit_type) VALUES (?, ?, 'prepare_submit', 'paused_for_human', '2026-10-15', 'structural')", [`rp-${Q}`, Q]);
+  assert.equal(IP.infoPagePriorProgress(db, Q, sfjsp, "ahj"), true, "portal run paused_for_human");
+  const R = fx.newProject();
+  db.run("INSERT INTO portal_runs (id, project_id, run_type, status, started_at, permit_type) VALUES (?, ?, 'prepare_submit', 'some_future_status', '2026-10-15', 'structural')", [`ru-${R}`, R]);
+  assert.equal(IP.infoPagePriorProgress(db, R, sfjsp, "ahj"), true, "a status not known here refuses");
+});
+await check("an interrupted staging JOB of this project refuses (side unknown: both sides)", async () => {
+  const P = fx.newProject();
+  db.run("INSERT INTO job_queue (id, job_type, payload, status, project_id, created_at, error) VALUES (?, 'prepare_submission', '{}', 'failed', ?, '2026-10-15', ?)",
+    [`jq-${P}`, P, "portal run was interrupted — not auto-rerun (staging is not idempotent portal-side); a human must check the portal and re-stage"]);
+  assert.equal(IP.infoPagePriorProgress(db, P, sfjsp, "ahj"), true);
+  assert.equal(IP.infoPagePriorProgress(db, P, sfjsp, "utility"), true);
+});
+
+// ── ALLOW ONCE MORE (round 2) ─────────────────────────────────────────────────────────────────────
+await check("ALLOW ONCE MORE: after a use the card shows it (canAllow); a named person's allowance lets the NEXT learn pass once; after that use it stops again", async () => {
+  const { P, passId } = await verifiedPage("Allow Page");
+  const use = () => { scripted = [(input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); return passedResult({ infoPagePassed: [{ passId, where: sfjsp }] }); }]; };
+  use();
+  await runLearn(P);
+  const st = IP.listInfoPageProjectState(db, P);
+  assert.equal(st.length, 1);
+  assert.equal(st[0].scope, "ahj");
+  assert.equal(st[0].passed.length, 1);
+  assert.equal(st[0].canAllow, true, JSON.stringify(st[0]));
+  IP.allowInfoPagePassOnceMore(db, P, "ahj", { by: "Pat Allower", userId: "" });
+  assert.deepEqual(IP.infoPagePriorProgressReasons(db, P, "ahj"), { hard: [], learn: [] });
+  assert.equal(IP.listInfoPageProjectState(db, P).length, 0, "nothing since the allowance");
+  use();
+  await runLearn(P);
+  assert.equal(handedOf(handedAll[0]).priorProgress, false, "allowed once more");
+  await runLearn(P);
+  assert.equal(handedOf(handed as LearnInput).priorProgress, true, "…and only once");
+  const a = fx.audits("portal.info_page_pass_allowed_again").filter((x) => x.project_id === P);
+  assert.equal(a.length, 1);
+  assert.equal(a[0].actor_name, "Pat Allower");
+});
+await check("ALLOW ONCE MORE is refused (409, nothing written) with a HARD reason (a paused submission), with nothing to allow, or a bad side (400)", async () => {
+  const { P, passId } = await verifiedPage("Allow Hard Page");
+  scripted = [(input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); return passedResult({ infoPagePassed: [{ passId, where: sfjsp }] }); }];
+  await runLearn(P);
+  db.run("INSERT INTO submissions (id, project_id, submission_type, permit_type, status, created_at) VALUES (?, ?, 'portal', 'structural', 'paused_for_human', '2026-10-15')", [`sh-${P}`, P]);
+  assert.equal(IP.listInfoPageProjectState(db, P)[0].canAllow, false);
+  expect409(() => IP.allowInfoPagePassOnceMore(db, P, "ahj", { by: "Pat Allower", userId: "" }), /cannot be allowed again here/);
+  expect409(() => IP.allowInfoPagePassOnceMore(db, fx.newProject(), "ahj", { by: "Pat Allower", userId: "" }), /No verified information page was passed or held/);
+  assert.throws(() => IP.allowInfoPagePassOnceMore(db, P, "nem", { by: "Pat Allower", userId: "" }), (e: { status?: number }) => e.status === 400);
+  assert.equal(fx.audits("portal.info_page_pass_allowed_again").filter((x) => x.project_id === P).length, 0);
+});
+await check("HELD AT A VERIFIED PAGE by prior progress: the learn reports it, the backend records it, and the card offers the allowance", async () => {
+  const { P, passId } = await verifiedPage("Held Verified Page");
+  scripted = [() => passedResult()];
+  await runLearn(P);
+  scripted = [() => passedResult({ stopReason: "backstop_abort", message: "HELD AT A VERIFIED INFORMATION PAGE: …", infoPageHeldVerified: [{ passId, where: sfjsp, why: ["this project already made progress on this portal"] }] })];
+  const r = await runLearn(P);
+  assert.equal(handedOf(handed as LearnInput).priorProgress, true);
+  assert.match(String(r.message), /allow it once more/);
+  const st = IP.listInfoPageProjectState(db, P);
+  assert.equal(st.length, 1);
+  assert.equal(st[0].held.length, 1);
+  assert.equal(st[0].passed.length, 0);
+  assert.equal(st[0].canAllow, true);
 });
 await check("prior progress: a staged submission on the same side refuses; one on the other side does not", () => {
   const P = fx.newProject();
@@ -481,6 +675,16 @@ const authP = fx.newProject();
 await runLearn(authP, capture(material((m) => { m.title = "Auth Info Page"; })));
 const authCid = String(cand(authP)[0].id);
 const authIdentity = String(cand(authP)[0].identity_sha256);
+// Round 2: two projects that PASSED a verified page once (so the card offers "Allow once more").
+const usedOnce = async (title: string): Promise<string> => {
+  const { P, passId } = await verifiedPage(title);
+  scripted = [(input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); return passedResult({ infoPagePassed: [{ passId, where: sfjsp }] }); }];
+  await runLearn(P);
+  assert.equal(IP.listInfoPageProjectState(db, P)[0]?.canAllow, true);
+  return P;
+};
+const allowRouteP = await usedOnce("Allow Route Page");
+const allowAuthP = await usedOnce("Allow Auth Page");
 const { setUserPassword } = await import("../src/auth");
 const { grantProduct } = await import("../src/entitlements");
 db.run("INSERT INTO orgs (id, name, edition, created_at) VALUES ('org-b', 'Org B', 'full', '2026-10-15')");
@@ -612,6 +816,29 @@ const readDb = async <T>(fn: (d: typeof db) => T): Promise<T> => {
       assert.equal(ok.status, 200, ok.text);
       assert.ok(JSON.parse(ok.text).passes.every((p: { id: string; status: string }) => p.id !== routePass));
     });
+    await check("auth off (round 2): GET candidates carries the project's state — the page it passed once, and canAllow", async () => {
+      const r = await call(PORT, "GET", `/api/projects/${allowRouteP}/info-page-candidates`);
+      assert.equal(r.status, 200, r.text.slice(0, 200));
+      const st = JSON.parse(r.text).projectState;
+      assert.equal(st.length, 1);
+      assert.equal(st[0].scope, "ahj");
+      assert.equal(st[0].canAllow, true);
+    });
+    await check("auth off (round 2): ALLOW ONCE MORE is guarded like verify — cross-origin 403, form-encoded 415, a rebinding Host 403, no name / 'operator' 400 — and writes nothing until a named person's same-origin JSON", async () => {
+      const u = `/api/projects/${allowRouteP}/info-page-allow-once-more`;
+      const allowed = () => readDb((d) => d.query("SELECT id FROM audit_logs WHERE project_id = ? AND action = 'portal.info_page_pass_allowed_again'", [allowRouteP]).length);
+      assert.equal((await call(PORT, "POST", u, { body: { scope: "ahj", allowedBy: "Pat Synthetic" }, headers: { origin: "http://evil.example", "sec-fetch-site": "cross-site" } })).status, 403);
+      assert.equal((await call(PORT, "POST", u, { body: "scope=ahj&allowedBy=Pat", json: false, headers: same })).status, 415);
+      assert.equal((await call(PORT, "POST", u, { body: { scope: "ahj", allowedBy: "Pat Synthetic" }, headers: { host: `rebind.example:${PORT}`, origin: `http://rebind.example:${PORT}`, "sec-fetch-site": "same-origin" } })).status, 403);
+      for (const n of [undefined, "operator"]) assert.equal((await call(PORT, "POST", u, { body: { scope: "ahj", allowedBy: n }, headers: same })).status, 400, String(n));
+      assert.equal(await allowed(), 0);
+      const ok = await call(PORT, "POST", u, { body: { scope: "ahj", allowedBy: "Pat Synthetic" }, headers: same });
+      assert.equal(ok.status, 200, ok.text);
+      assert.equal(await allowed(), 1);
+      assert.equal(JSON.parse(ok.text).projectState.length, 0, "nothing since the allowance");
+      const again = await call(PORT, "POST", u, { body: { scope: "ahj", allowedBy: "Pat Synthetic" }, headers: same });
+      assert.equal(again.status, 409, again.text);
+    });
   } finally { stop(server); }
 }
 
@@ -650,6 +877,21 @@ const readDb = async <T>(fn: (d: typeof db) => T): Promise<T> => {
       const row = await readDb((d) => d.get<Record<string, unknown>>("SELECT verified_by, verified_by_user_id FROM portal_info_page_passes WHERE identity_sha256 = ?", [authIdentity]));
       assert.equal(row?.verified_by, "Sam Superadmin");
       assert.equal(row?.verified_by_user_id, "u-super");
+    });
+    await check("auth on (round 2): ALLOW ONCE MORE — signed out 401, an ORG ADMIN 403, ANOTHER ORG's admin 404 (rule 6); the SUPERADMIN allows, recorded under the session's name", async () => {
+      const u = `/api/projects/${allowAuthP}/info-page-allow-once-more`;
+      assert.equal((await call(PORT, "POST", u, { body: { scope: "ahj", allowedBy: "Forged Name" }, headers: same })).status, 401);
+      const admin = await login("admin@info.test");
+      assert.equal((await call(PORT, "POST", u, { body: { scope: "ahj" }, headers: { ...same, cookie: admin } })).status, 403);
+      const other = await login("other@info.test");
+      assert.equal((await call(PORT, "POST", u, { body: { scope: "ahj" }, headers: { ...same, cookie: other } })).status, 404);
+      const zero = await readDb((d) => d.query("SELECT id FROM audit_logs WHERE project_id = ? AND action = 'portal.info_page_pass_allowed_again'", [allowAuthP]).length);
+      assert.equal(zero, 0);
+      const sup = await login("super@info.test");
+      const ok = await call(PORT, "POST", u, { body: { scope: "ahj", allowedBy: "Forged Name" }, headers: { ...same, cookie: sup } });
+      assert.equal(ok.status, 200, ok.text);
+      const row = await readDb((d) => d.get<{ actor_name: string }>("SELECT actor_name FROM audit_logs WHERE project_id = ? AND action = 'portal.info_page_pass_allowed_again'", [allowAuthP]));
+      assert.equal(row?.actor_name, "Sam Superadmin");
     });
   } finally { stop(server); }
 }

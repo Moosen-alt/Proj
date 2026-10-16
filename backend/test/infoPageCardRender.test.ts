@@ -11,6 +11,9 @@
 //       withdrawn pass is deleted, so it is never listed); a row with no verification on record says so;
 //   (e) the withdraw flow requires a reason and says runs in flight keep the pass; the page wires
 //       the card into the project's pinned portal runs and the list beside the recipes.
+//   (g) round 2: a project that passed (or was held at) a verified page shows why later runs stop
+//       there and "Allow once more for this project" — disabled while a HARD reason stands, every
+//       value escaped; the allow goes through api() with a JSON body like the other decisions.
 //
 //   npx tsx backend/test/infoPageCardRender.test.ts
 import "./_isolate"; // FIRST
@@ -40,6 +43,7 @@ const cut = (name: string): string => {
 };
 const cards = new Function(`${cut("esc")}\n${cut("infoPageCandidateCardsHtml")}\nreturn infoPageCandidateCardsHtml;`)() as (c: unknown[], projectId: string) => string;
 const rows = new Function(`${cut("esc")}\n${cut("infoPagePassRowsHtml")}\nreturn infoPagePassRowsHtml;`)() as (p: unknown[]) => string;
+const stateHtml = new Function(`${cut("esc")}\n${cut("infoPageProjectStateHtml")}\nreturn infoPageProjectStateHtml;`)() as (s: unknown[]) => string;
 
 const H = `<img src=x onerror=alert(1)>`;
 const candidate = (o: Record<string, unknown> = {}) => ({
@@ -98,9 +102,26 @@ check("(e) verify goes through authForDecision + namedPersonConsent and sends th
   const apiFn = apiAt < 0 ? "" : dashboard.slice(apiAt, dashboard.indexOf("\n}\n", apiAt) + 2);
   const calls = [cut("bindInfoPageCandidateButtons"), cut("loadInfoPagePasses")].join("\n");
   const decisionCalls = calls.match(/await api\([^;]*method: "POST"[^;]*\);/g) ?? [];
-  check("(f) the dashboard's api() sends Content-Type: application/json, and verify / dismiss / withdraw go through it with a JSON body and no header override",
-    /"Content-Type": "application\/json"/.test(apiFn) && decisionCalls.length === 3 && decisionCalls.every((c) => c.includes("JSON.stringify(") && !/headers\s*:/.test(c)),
+  check("(f) the dashboard's api() sends Content-Type: application/json, and verify / dismiss / allow once more / withdraw go through it with a JSON body and no header override",
+    /"Content-Type": "application\/json"/.test(apiFn) && decisionCalls.length === 4 && decisionCalls.every((c) => c.includes("JSON.stringify(") && !/headers\s*:/.test(c))
+    && decisionCalls.some((c) => c.includes("/info-page-allow-once-more") && c.includes("scope: button.dataset.infoAllow") && c.includes("allowedBy: name")),
     JSON.stringify({ api: apiFn.slice(0, 200), decisionCalls }));
+}
+
+// (g) ROUND 2 — "Allow once more for this project".
+{
+  const side = (o: Record<string, unknown> = {}) => ({ scope: "ahj", passed: [{ passId: "pass-1", where: "https://permits.example.test/permits/sfjsp", at: "2026-10-16T10:00:00Z" }], held: [],
+    hard: [], learn: ["an earlier run of this project passed a verified information page (2026-10-16)"], canAllow: true, lastAllowedBy: "", lastAllowedAt: "", ...o });
+  const okHtml = stateHtml([side()]);
+  check("(g) a project that passed a verified page: why later runs stop there, and an ENABLED 'Allow once more for this project'",
+    okHtml.includes("passed https://permits.example.test/permits/sfjsp on 2026-10-16") && okHtml.includes("an earlier run of this project passed a verified information page")
+    && okHtml.includes("Allow once more for this project") && /data-info-allow="ahj"(?![^>]*disabled)[^>]*>/.test(okHtml) && okHtml.includes("permit side"), okHtml);
+  const hardHtml = stateHtml([side({ hard: ["a submission on this side is paused_for_human"], canAllow: false })]);
+  check("(g) a HARD reason disables the button and is listed (do the page by hand)", /data-info-allow="ahj"[^>]*disabled/.test(hardHtml) && hardHtml.includes("do the page by hand") && hardHtml.includes("paused_for_human"), hardHtml);
+  const hostileHtml = stateHtml([side({ scope: "utility", passed: [{ passId: H, where: H, at: H }], held: [{ passId: H, where: H, at: H }], hard: [H], learn: [H], lastAllowedBy: H, lastAllowedAt: "2026-10-16" })]);
+  check("(g) every value is escaped: no raw <img anywhere", !hostileHtml.includes("<img src=x") && hostileHtml.includes("&lt;img src=x") && hostileHtml.includes("interconnection (NEM) side"), hostileHtml);
+  check("(g) no state, no card", stateHtml([]) === "" && stateHtml(null as never) === "");
+  check("(g) the card loader renders the state beside the candidates", cut("loadInfoPageCandidates").includes("infoPageProjectStateHtml(data.projectState)"));
 }
 
 if (failures) { console.error(`\n${failures}/${total} infoPageCardRender check(s) FAILED.`); process.exit(1); }

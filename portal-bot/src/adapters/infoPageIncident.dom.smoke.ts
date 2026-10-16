@@ -26,6 +26,9 @@
 //   THE POSITIVE CONTROL — form: the real application form (two empty plain fields in the
 //   SmartGuide form) beside a header search box, the footer's phone number on both pages: no
 //   incident, the walk goes on.
+//   ROUND 2, AT MOST ONCE PER PROJECT — progress: the backend says this project already made progress
+//   on this portal; the exact verified page is held as on main and the run names it (infoPageHeldVerified).
+//   Every admitted walk reports its use AT ONCE through onInfoPagePassed.
 //   BEFORE THE CLICK — the verified page itself drifted:
 //     drift    — one sentence added: held exactly as on main (nothing posted), the pass reported
 //                as an incident (phase "before"), the page as it is now recorded as the candidate,
@@ -218,16 +221,20 @@ interface Walk {
   notes: string[]; finals: string[]; locks: string[];
   hits: Array<{ method: string; url: string; names: string[] }>;
   candidate?: InfoPageCandidateCapture; passed?: Array<{ passId: string; where: string }>; incidents?: InfoPageIncident[];
+  /** Round 2: what the learner reported AT ONCE through onInfoPagePassed, and the verified pages it
+   *  was held at because of the project's prior progress. */
+  reported: Array<{ passId: string; where: string }>; heldVerified?: Array<{ passId: string; where: string; why: string[] }>;
   secs: number;
 }
-const walk = async (mode: string, entries: VerifiedInfoPage[], permitType = "structural"): Promise<Walk> => {
+const walk = async (mode: string, entries: VerifiedInfoPage[], permitType = "structural", priorProgress = false): Promise<Walk> => {
   const ctx = await browser.newContext();
   await ctx.addInitScript("globalThis.__name = globalThis.__name || function (fn) { return fn; };");
   await ctx.addCookies([{ name: "mode", value: mode, url: base }]);
   const pw = await ctx.newPage();
   await pw.goto(`${base}${P}/home`);
   const plan: LearnPlanner = async () => ({ fills: [], atReview: false });
-  const a = new AutoLearnAdapter("Incident Walk", plan, { maxPages: 6, budgetMs: 180_000, infoPagePasses: entries, infoPagePriorProgress: false });
+  const reported: Array<{ passId: string; where: string }> = [];
+  const a = new AutoLearnAdapter("Incident Walk", plan, { maxPages: 6, budgetMs: 180_000, infoPagePasses: entries, infoPagePriorProgress: priorProgress, onInfoPagePassed: (p) => { reported.push(p); } });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (a as any).page = pw;
   const locks: string[] = [];
@@ -252,6 +259,7 @@ const walk = async (mode: string, entries: VerifiedInfoPage[], permitType = "str
     notes: steps.map((s) => String(s.note ?? "")), finals: steps.filter((s) => s.isFinalSubmit).map((s) => String(s.note ?? "")), locks,
     hits: hits.filter((h) => h.mode === mode).map(({ method, url, names }) => ({ method, url, names })),
     candidate: r.infoPageCandidate as InfoPageCandidateCapture | undefined, passed: r.infoPagePassed as Walk["passed"], incidents: r.infoPageIncidents as InfoPageIncident[] | undefined,
+    reported, heldVerified: r.infoPageHeldVerified as Walk["heldVerified"],
     secs: Math.round((Date.now() - t0) / 1000),
   };
 };
@@ -284,11 +292,11 @@ const ROUND2: Record<string, RegExp> = {
 };
 const AFTER_MODES = ["receipt", "filed", "review", "error", "same", "blank", ...Object.keys(ROUND2)];
 const results: Record<string, Walk> = {};
-const queue: Array<[string, string]> = [...AFTER_MODES.map((m) => [m, "structural"] as [string, string]), ["form", "structural"], ["drift", "structural"], ["tileb", "structural"]];
+const queue: Array<[string, string]> = [...AFTER_MODES.map((m) => [m, "structural"] as [string, string]), ["form", "structural"], ["progress", "structural"], ["drift", "structural"], ["tileb", "structural"]];
 await Promise.all(Array.from({ length: 4 }, async () => {
   while (queue.length) {
     const [mode, permitType] = queue.shift()!;
-    results[mode] = await walk(mode, entry ? [entry] : [], permitType);
+    results[mode] = await walk(mode, entry ? [entry] : [], permitType, mode === "progress");
   }
 }));
 
@@ -320,7 +328,22 @@ for (const mode of AFTER_MODES) {
   check("after [form] (round 2 positive control): NO incident — the page after the click read as an unfiled application form (a search box and a number both pages carry do not count against it)",
     w.stopReason !== "info_page_incident" && !(w.incidents ?? []).length && !w.locks.some((l) => /did not read as an unfiled form/.test(l)),
     JSON.stringify({ ok: w.ok, stop: w.stopReason, incidents: w.incidents, locks: w.locks, message: w.message.slice(0, 300) }));
+  check("after [form] (round 2): the learner reported the use AT ONCE through onInfoPagePassed (the backend writes it before the walk goes on), exactly once",
+    w.reported.length === 1 && w.reported[0].passId === "pass-incident" && /\/x\/sg$/.test(w.reported[0].where), JSON.stringify(w.reported));
   lines.push(`  note - [form] ${w.secs}s`);
+}
+{
+  // ROUND 2 — A PASS ADMITS AT MOST ONCE PER PROJECT: the backend says this project already made
+  // progress on this portal. The exact verified page, on its exact steps, is HELD as on main, and
+  // the run says it was held at a verified page (a person may allow it once more).
+  const w = results.progress;
+  check("[progress] (round 2): with the project's prior progress, the verified page's Next is HELD exactly as on main — nothing posted, no pass used, nothing reported",
+    posts(w).length === 0 && !(w.passed ?? []).length && !w.reported.length && w.stopReason === "backstop_abort", JSON.stringify({ posts: posts(w), passed: w.passed, stop: w.stopReason }));
+  check("[progress] (round 2): the run names the verified page it was held at (infoPageHeldVerified) and says a person may allow it once more; no candidate, no incident",
+    (w.heldVerified ?? []).length === 1 && w.heldVerified![0].passId === "pass-incident" && w.heldVerified![0].why.some((x) => /already made progress on this portal/.test(x))
+    && /^HELD AT A VERIFIED INFORMATION PAGE/.test(w.message) && /allow the pass once more/.test(w.message) && !w.candidate && !(w.incidents ?? []).length,
+    JSON.stringify({ held: w.heldVerified, message: w.message.slice(0, 300), cand: !!w.candidate, incidents: w.incidents }));
+  lines.push(`  note - [progress] ${w.secs}s`);
 }
 
 {

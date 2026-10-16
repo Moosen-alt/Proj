@@ -3078,8 +3078,24 @@ const infoPageCandidateId = (req: Request): string => {
   return cid;
 };
 app.get("/api/projects/:id/info-page-candidates", asyncHandler(async (req, res) => {
-  const { listInfoPageCandidates } = await import("./infoPages");
-  res.json({ candidates: listInfoPageCandidates(db, infoPageProjectId(req)) });
+  const { listInfoPageCandidates, listInfoPageProjectState } = await import("./infoPages");
+  const pid = infoPageProjectId(req);
+  res.json({ candidates: listInfoPageCandidates(db, pid), projectState: listInfoPageProjectState(db, pid) });
+}));
+// "ALLOW ONCE MORE FOR THIS PROJECT" (#344 round 2): a pass admits at most once per project and side;
+// after that the project's runs stop at the page as on main until a NAMED PERSON who checked the
+// application on the portal allows it once more. It lifts rule 1's lockdown for one more request, so
+// it is guarded exactly as verify is (same origin, superadmin when signed in, a named person).
+app.post("/api/projects/:id/info-page-allow-once-more", asyncHandler(async (req, res) => {
+  requireSameOriginMutation(req);
+  requireSuperadminWhenSignedIn(req, "allow a verified information page once more");
+  const { isConfirmingPerson } = await import("./feeConfirm");
+  const { allowInfoPagePassOnceMore, listInfoPageCandidates, listInfoPageProjectState } = await import("./infoPages");
+  const pid = infoPageProjectId(req);
+  const scope = String(req.body?.scope || "");
+  const who = infoPagePerson(req, req.body?.allowedBy, isConfirmingPerson, "allow a verified information page once more");
+  allowInfoPagePassOnceMore(db, pid, scope, { by: who.name, userId: who.userId });
+  res.json({ candidates: listInfoPageCandidates(db, pid), projectState: listInfoPageProjectState(db, pid) });
 }));
 app.get("/api/projects/:id/info-page-candidates/:cid/screenshot", asyncHandler(async (req, res) => {
   const { infoPageCandidateScreenshot } = await import("./infoPages");
