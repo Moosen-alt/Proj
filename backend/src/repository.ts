@@ -97,7 +97,7 @@ import { readAndRecordPortalFees } from "./portalFeeReadings";
 import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential } from "./portalCredentials";
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
 import { logger } from "./logger";
-import { draftContinuationGaps, openPortalDraftFor, recordPortalDraft, type ObservedDraft } from "./portalDraft";
+import { disarmDraftCreatingSubmit, draftContinuationGaps, openPortalDraftFor, recordPortalDraft, DRAFT_SUBMIT_UNEXPECTED_ACTION, type ObservedDraft } from "./portalDraft";
 import { claimSignatureRequestApproval, runningJobSignatureRequestApprovalId } from "./signatureRequestApproval";
 import { nemSignatureState, nemStageIsResume } from "./signatureTrack";
 import { siteKey } from "../../portal-bot/src/draftCreated";
@@ -9042,6 +9042,12 @@ export async function prepareSubmission(
     loginUrl: credentialUrl || undefined,
     // The replay's existing-draft check (#302): NEM only — the two-part utility portals.
     siteDraft: siteDraftParts,
+    // A KNOWN DRAFT-CREATING SUBMIT MAY BE CLICKED BY THE REPLAY ITSELF (#330, owner ruling 2026-10-16):
+    // NEM only, because only the NEM track's next stage continues a draft (openPortalDraftFor) — on any
+    // other track the next stage would replay the start again and make a second application. And only
+    // on this entity's OWN recipe: a borrowed recipe's stamp is another entity's evidence.
+    // portal-bot's draftSubmitGate decides each click; this is never an approval to file.
+    draftSubmitClick: track === "nem" && !borrowed,
   };
 
   // UNIVERSAL-FIRST dispatch with SELF-SEED (see selectStagingActor):
@@ -9418,6 +9424,31 @@ export async function prepareSubmission(
           projectId, track: "nem", runId, recipeId: null, source: "replay",
           draft: { applicationNumber: existingDraft.applicationNumber, nextForm: "", evidence: String(existingDraft.why ?? ""), strength: "status" },
         });
+      }
+      // THE REPLAY CLICKED A KNOWN DRAFT-CREATING SUBMIT ITSELF (#330). A draft-created page after it:
+      // the draft is written down exactly as a person's click would have written it (the next stage
+      // continues it), and NOTHING is filed. Any other page: the incident — audited, the recipe's
+      // stamp comes off so no replay clicks that step again until a person's click of it is again
+      // seen to make a draft, and the track is not read as filed (the run is a pause, never a
+      // submission; no record number is taken from it).
+      const draftByReplay = (result as { draftCreatedByReplay?: ObservedDraft }).draftCreatedByReplay ?? null;
+      if (draftByReplay) {
+        recordPortalDraft(db, { projectId, track: track ?? "permit", draft: draftByReplay, runId, recipeId: null, source: "replay" });
+        addAuditLog(db, projectId, "portal_bot", "portal staging", "portal.draft_submit_clicked", {
+          track: track ?? "permit", runId, recipeId: recipe.id, label: String(draftByReplay.clickedLabel ?? "").slice(0, 80),
+          applicationNumber: String(draftByReplay.applicationNumber ?? "").slice(0, 40), tenant: String(draftByReplay.tenantKey ?? "").slice(0, 200),
+        });
+      }
+      const draftIncident = (result as { draftSubmitUnexpected?: Record<string, unknown> }).draftSubmitUnexpected ?? null;
+      if (draftIncident) {
+        addAuditLog(db, projectId, "portal_bot", "portal staging", DRAFT_SUBMIT_UNEXPECTED_ACTION, {
+          track: track ?? "permit", runId, recipeId: recipe.id, ...draftIncident,
+        });
+        disarmDraftCreatingSubmit(db, recipe.id, { projectId, runId, why: `the page after the replay's click read as ${String(draftIncident.verdict ?? "not a draft")}` });
+        logger.warn("portal", "a known draft-creating submit produced an unexpected page — run stopped, recipe disarmed, nothing recorded as filed", {
+          projectId, track, runId, verdict: String(draftIncident.verdict ?? ""),
+        });
+        result = { ...result, finalSubmitClicked: false, finalSubmitClickedByAutomation: false, capturedPermitNumber: "", capturedConfirmationNumber: "" };
       }
       const replayFailed = result && result.ok === false && !(typeof result.pauseReason === "string" && result.pauseReason) && !existingDraft;
       // THE PORTAL SAID THIS ADDRESS IS NOT SERVED THERE (portal-truth D5). The replay stopped with

@@ -5,6 +5,7 @@ import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, ok, fail, type PortalContext, 
 import { applyFormatHint } from "../formatHint";
 import { extractRecordNumber, pageConfirmsSubmission } from "../recordNumber";
 import { findSiteDraft, readDraftCreated } from "../draftCreated";
+import { draftCreatingClickRefusals, draftLabelKey, draftStampOf, draftStepLabel, draftTenantKey, readDraftAfterClick } from "../draftSubmitGate";
 import { armHumanCaptureOnPage, HUMAN_SUBMIT_OBSERVED_NOTE } from "../humanCapture";
 import { feeBracketCoverage, feeBracketCoverageMessage, decideFeeTier, FEE_TIER_DC_FIELD, FEE_TIER_RATING_FIELD, kvaText, parseFeeBracketFieldKey, readTierLabel, sameFeeTier, TIER_UNIT_RE, type TierBoxOnPage } from "../feeBracketQuantity";
 
@@ -659,6 +660,10 @@ export class RecipeAdapter extends BasePortalAdapter {
   private finalSubmitAttempted = false;
   /** A native dialog we dismissed cancelled the approved click: nothing was sent (M3). */
   private finalSubmitNothingSent = false;
+  /** Set before a known draft-creating submit is clicked (#330): at most once per run. */
+  private draftSubmitAttempted = false;
+  /** The draft the replay's own draft-creating click made, as the page after it read (#330). */
+  private draftSubmitOutcome: (ReturnType<typeof readDraftCreated> & { clickedLabel: string; tenantKey: string }) | null = null;
   /** The recipe step index the loop is on — the final-submit gate's "is this the terminal step". */
   private currentStepIdx = -1;
   /** The step whose selector resolveLocator is resolving right now (for disambiguation). */
@@ -692,6 +697,11 @@ export class RecipeAdapter extends BasePortalAdapter {
        *  application, an unsubmitted draft already listed for this street stops the replay, named
        *  — a two-part portal made that draft at its Part 1 Submit, and a second one is a failure. */
       siteDraft?: { street?: string; city?: string; zip?: string; siblingAtSameStreet?: boolean };
+      /** THE REPLAY MAY CLICK A KNOWN DRAFT-CREATING SUBMIT ITSELF (#330). Set by the backend for the
+       *  NEM track's own recipe only; draftSubmitGate.draftCreatingClickRefusals decides each click,
+       *  and the page after it must read as draft-created. Not an approval to file: the final-submit
+       *  gate never reads it. */
+      draftSubmitClick?: boolean;
     } = {},
   ) {
     super();
@@ -1030,6 +1040,15 @@ export class RecipeAdapter extends BasePortalAdapter {
         { finalSubmitClicked: true, finalSubmitOutcome: outcome },
       );
     }
+    // THE REPLAY CLICKED A KNOWN DRAFT-CREATING SUBMIT AND THE PORTAL MADE THE DRAFT (#330). No review
+    // screen was staged: the next stage of this track opens that draft and continues it.
+    if (this.draftSubmitOutcome) {
+      const d = this.draftSubmitOutcome;
+      return ok(
+        `${this.portalName}: automation clicked "${d.clickedLabel.slice(0, 60)}" — the submit this portal answers with a draft, never the filing — and the portal created draft ${d.applicationNumber || "(no number shown)"}. NOTHING WAS FILED.${d.nextForm ? ` The filing is in "${d.nextForm}".` : ""} Stage this track again: the next run opens this draft and continues it (never a new application), and its own submit still stops for review. AUTOMATION HAS STOPPED.`,
+        { finalSubmitClicked: false, draftSubmitClickedByAutomation: true },
+      );
+    }
     // WHAT THE PERSON MUST KNOW BEFORE SUBMITTING (dryrun-0928 B3 / B14): answers the portal may
     // not have saved, and the portal's own background calls the lockdown held back on this page.
     const notes = this.reviewHandoffNotes;
@@ -1083,10 +1102,13 @@ export class RecipeAdapter extends BasePortalAdapter {
       // submitted. Read the draft first and report it as a draft — never as a record number.
       const draft = readDraftCreated(bodyText);
       if (draft.draft) {
+        const here = typeof this.page.url === "function" ? String(this.page.url() ?? "") : "";
         return ok(`The click created a DRAFT${draft.applicationNumber ? ` (${draft.applicationNumber})` : ""}, not a filing${draft.nextForm ? ` — the filing is in "${draft.nextForm}"` : ""}.`, {
           permitNumber: "",
-          recordLink: cleanRecordLink(typeof this.page.url === "function" ? String(this.page.url() ?? "") : ""),
+          recordLink: cleanRecordLink(here),
           draftCreated: draft,
+          // The tenant the draft was seen on (#330): what the heal stamps on the step that was clicked.
+          draftTenantKey: draftTenantKey(here),
         });
       }
       const read = extractRecordNumber(bodyText);
@@ -1565,6 +1587,38 @@ export class RecipeAdapter extends BasePortalAdapter {
         await this.runGapFill(this.page);
         this.gapFilledPage = await this.pageIdentity().catch(() => "");
         break;
+      }
+
+      // A KNOWN DRAFT-CREATING SUBMIT (#330: PSE's Part 1). The recipe's last step was healed from a
+      // draft-created page (portalDraft.ts) and stamped with that tenant and label. Reached here — on
+      // that step, or on the stopForReview right in front of it — the replay clicks it ITSELF when
+      // draftSubmitGate allows, then reads the page: a draft ends the run as staged-to-draft, anything
+      // else stops it as an incident. Refused, it is today's stop: a person clicks it. No stamp, no
+      // change to anything below.
+      {
+        const draftIdx = this.draftCreatingStepAt(stepIdx);
+        if (draftIdx >= 0 && !pastReview) {
+          const d = await this.clickDraftCreatingSubmit(draftIdx);
+          if (d.kind === "draft") {
+            executed++;
+            break;
+          }
+          if (d.kind === "unexpected") {
+            closePrevStepTiming();
+            return {
+              ...fail(d.message, {
+                executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals,
+                failedStepIndex: draftIdx, trace, slowSteps, needsHuman: true, finalSubmitClicked: false, draftSubmitUnexpected: d.incident,
+                pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath,
+              }),
+              pauseReason: "draft_submit_unexpected",
+            };
+          }
+          this.agingNotes.push(`draft-creating submit left for a person (not clicked: ${d.refusals.join("; ")})`);
+          await this.runGapFill(this.page);
+          this.gapFilledPage = await this.pageIdentity().catch(() => "");
+          break;
+        }
       }
 
       // THE RECORDED FINAL SUBMIT IS WHERE A GUIDED RUN ENDS. A learn records the filing click
@@ -2147,6 +2201,23 @@ export class RecipeAdapter extends BasePortalAdapter {
           continue;
         }
       }
+    }
+
+    // THE REPLAY'S OWN DRAFT-CREATING CLICK MADE THE DRAFT (#330). Nothing was filed: this run ends on
+    // the draft-created page (not a review page, so the review read and the before-review stop below
+    // do not apply), and the caller records the draft for the next stage to continue.
+    if (this.draftSubmitOutcome) {
+      closePrevStepTiming();
+      this.dischargeCoveredWarning();
+      const d = this.draftSubmitOutcome;
+      return ok(`Replayed ${executed} recorded step(s) and clicked "${d.clickedLabel.slice(0, 60)}", the submit this portal answers with a draft: it created draft ${d.applicationNumber || "(no number shown)"}. NOTHING WAS FILED${d.nextForm ? ` — the filing is in "${d.nextForm}"` : ""}.`, {
+        executed, skipped, finalSubmitClicked: false,
+        draftCreatedByReplay: {
+          applicationNumber: d.applicationNumber, nextForm: d.nextForm, evidence: d.evidence, strength: d.strength,
+          clickedLabel: d.clickedLabel, tenantKey: d.tenantKey,
+        },
+        gapFill: this.gapFillReport, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, slowSteps, requiredStillEmpty: this.requiredStillEmpty, unresolvedFields: this.unresolvedFields, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, requiredFieldsSeen: this.requiredFieldsSeen, pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath,
+      });
     }
 
     if (this.finalSubmitClicked) {
@@ -5335,7 +5406,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    */
   private async guardAction(intent:
     | { kind: "goto"; url: string; why: string }
-    | { kind: "click" | "press"; target: unknown; why: string; key?: string; passThrough?: boolean; finalSubmitApproved?: boolean },
+    | { kind: "click" | "press"; target: unknown; why: string; key?: string; passThrough?: boolean; finalSubmitApproved?: boolean; draftCreatingApproved?: boolean },
   ): Promise<string> {
     const refuse = (reason: string): string => {
       const line = `REFUSED ${intent.kind} (${intent.why}): ${reason}`;
@@ -5398,6 +5469,12 @@ export class RecipeAdapter extends BasePortalAdapter {
     //     request). Not the filing, but never a replay's to click: only the learner clicks it, in a run
     //     a named person approved (signatureRequestGate).
     if (isSignatureRequestControl(label)) return refuse(`"${label.slice(0, 60)}" sends the homeowner a signature request — a person clicks it, or an approved run`);
+    // 1c) THE KNOWN DRAFT-CREATING SUBMIT (#330). Only clickDraftCreatingSubmit sets this, after
+    //     draftSubmitGate passed for the stamped step and the control's live label matched the stamp.
+    //     Fees (1) and a signature request (1b) were refused above; what the stamp answers is the
+    //     submit wording and the terminal-page reading below — and the page after the click must
+    //     read as draft-created, or the run stops as an incident.
+    if (intent.draftCreatingApproved) return "";
     const ctx = await this.pageSafetyContext();
     // 2) THE filing click, as the shared predicate knows it: submit-worded, or "Continue
     //    Application" on a page that names itself the review step.
@@ -5419,7 +5496,7 @@ export class RecipeAdapter extends BasePortalAdapter {
   }
 
   /** Every click in replay. Refused → throws ReplayGuardRefusal (named), nothing clicked. */
-  private async guardedClick(target: unknown, why: string, opts?: { timeout?: number; force?: boolean }, flags: { passThrough?: boolean; finalSubmitApproved?: boolean } = {}): Promise<void> {
+  private async guardedClick(target: unknown, why: string, opts?: { timeout?: number; force?: boolean }, flags: { passThrough?: boolean; finalSubmitApproved?: boolean; draftCreatingApproved?: boolean } = {}): Promise<void> {
     const reason = await this.guardAction({ kind: "click", target, why, ...flags });
     if (reason) throw new ReplayGuardRefusal(reason);
     // THE APPROVED FINAL SUBMIT (and its confirm dialog) is the one click whose FILING request
@@ -5427,7 +5504,10 @@ export class RecipeAdapter extends BasePortalAdapter {
     // passed. A payment endpoint stays blocked even then.
     // The slot is bound to THIS page (portal-run-close-2 M4) and carries the native-dialog handler
     // for the click (M3); see filingBackstop.allowApprovedFiling.
-    if (flags.finalSubmitApproved) this.backstop?.allowApprovedFiling(20_000, { page: this.page });
+    // THE KNOWN DRAFT-CREATING SUBMIT (#330) takes the same one-request slot: its request is the
+    // portal's "submit" endpoint too (the backstop's filing-URL rule would abort it otherwise), and
+    // it is checked after the click by the page it produced, not by its URL.
+    if (flags.finalSubmitApproved || flags.draftCreatingApproved) this.backstop?.allowApprovedFiling(20_000, { page: this.page });
     await (target as { click: (o?: unknown) => Promise<void> }).click(opts);
   }
 
@@ -5501,6 +5581,110 @@ export class RecipeAdapter extends BasePortalAdapter {
     if (!this.page || typeof this.page.evaluate !== "function" || typeof this.page.addInitScript !== "function") return;
     await installSettleProbe(this.page).catch(() => null);
     await waitForSettled(this.page, { timeoutMs }).catch(() => null);
+  }
+
+  /** THE STAMPED DRAFT-CREATING STEP this loop position reaches (#330), or -1: the recipe's last step
+   *  when it carries a draft-creating stamp — reached on itself, or on the plain stopForReview right
+   *  in front of it (the learner records the filing click behind one). Anything else: -1, and the
+   *  loop runs exactly as before. */
+  private draftCreatingStepAt(i: number): number {
+    const steps = this.recipe.steps;
+    const last = steps.length - 1;
+    if (last < 0 || !draftStampOf(steps[last])) return -1;
+    if (i === last) return last;
+    if (i === last - 1 && steps[i]?.action === "stopForReview" && !steps[i]?.outwardAction) return last;
+    return -1;
+  }
+
+  /**
+   * CLICK A KNOWN DRAFT-CREATING SUBMIT, THEN PROVE IT ONLY MADE A DRAFT (#330).
+   *
+   * "refused": nothing was clicked (draftSubmitGate said no, the page is not ready, or the control
+   * on the page is not the one stamped) — the run stops for a person exactly as before.
+   * "draft": the page after the click reads as draft-created (draftSubmitGate.readDraftAfterClick).
+   * "unexpected": the click happened and the page after it is a receipt, a filed status, an error
+   * or unreadable — the portal MAY have filed. The run stops (pause draft_submit_unexpected) and the
+   * caller records the incident; nothing here or there reads it as a filing.
+   *
+   * Rule 1 is untouched: a step flagged isFinalSubmit never comes here (the gate refuses it), and
+   * neither PORTAL_ALLOW_FINAL_SUBMIT nor a run approval is read. Fees and a signature request are
+   * refused at the click (guardAction), and no CAPTCHA/MFA is ever answered: one on the page refuses
+   * the click, one after it is an incident.
+   */
+  private async clickDraftCreatingSubmit(idx: number): Promise<
+    | { kind: "draft" }
+    | { kind: "refused"; refusals: string[] }
+    | { kind: "unexpected"; message: string; incident: Record<string, unknown> }
+  > {
+    const step = this.recipe.steps[idx];
+    const urlNow = (): string => (this.page && typeof this.page.url === "function" ? String(this.page.url() ?? "") : "");
+    const refusals = draftCreatingClickRefusals(this.recipe.steps, idx, {
+      pageUrl: urlNow(), enabled: this.options.draftSubmitClick === true, alreadyClicked: this.draftSubmitAttempted,
+    });
+    if (refusals.length) return { kind: "refused", refusals };
+    const stamp = draftStampOf(step)!;
+    // READY, AS A PERSON WOULD CHECK BEFORE CLICKING: the page re-asserted and gap-filled, nothing
+    // required left empty, no challenge on it, and the run's own pending save drained.
+    await this.reassertBlanksOnce(false).catch(() => [] as string[]);
+    await this.runGapFill(this.page).catch(() => null);
+    this.gapFilledPage = await this.pageIdentity().catch(() => "");
+    const empty = await this.emptyRequiredControls().catch(() => [] as string[]);
+    if (empty.length) return { kind: "refused", refusals: [`required field(s) still empty on the page: ${empty.slice(0, 4).join(", ")}`] };
+    const before = await detectChallengeFrame(this.page).catch(() => null);
+    if (before) return { kind: "refused", refusals: [`a challenge is on the page (${before}) — never answered by automation`] };
+    // THE CONTROL ON THE PAGE MUST STILL BE THE ONE STAMPED, by its own label.
+    this.resolvingStep = step;
+    let scoped = await this.resolveLocator(step.selector, String(step.note ?? "")).finally(() => { this.resolvingStep = null; });
+    scoped = await this.narrowToOne(scoped, step);
+    const live = await this.controlLabelOf(scoped).catch(() => "");
+    if (!live || draftLabelKey(live) !== draftLabelKey(stamp.label)) {
+      return { kind: "refused", refusals: [`the control on the page reads "${live.slice(0, 60) || "nothing readable"}", not "${stamp.label.slice(0, 60)}"`] };
+    }
+    await this.drainBeforeReviewLock();
+    const label = draftStepLabel(step) || stamp.label;
+    // AT MOST ONCE PER RUN, marked before the click: a click that throws may still have reached the portal.
+    this.draftSubmitAttempted = true;
+    const incident = (verdict: string, evidence: string): Record<string, unknown> => ({
+      label: label.slice(0, 80), verdict, tenantKey: stamp.tenantKey, stepIndex: idx,
+      evidence: String(evidence || "").replace(/\d{4,}/g, "####").slice(0, 200),
+    });
+    const unexpected = async (verdict: string, evidence: string, what: string) => {
+      await this.capturePageShot("DRAFT-SUBMIT-UNEXPECTED", true).catch(() => null);
+      return {
+        kind: "unexpected" as const,
+        incident: incident(verdict, evidence),
+        message: `UNEXPECTED PAGE AFTER A DRAFT-CREATING SUBMIT: automation clicked "${label.slice(0, 60)}", the submit this portal answered with a draft before, and ${what}. The portal MAY HAVE FILED this application. Automation has stopped and NOTHING is recorded as filed: a person must check the portal's application list now, and record the filing by hand if one was made. Automation will not click this step again until a person re-confirms it.`,
+      };
+    };
+    try {
+      await this.guardedClick(scoped, "the known draft-creating submit (#330)", undefined, { draftCreatingApproved: true });
+    } catch (err) {
+      // Refused at the click (a fee, a signature request): nothing was clicked, a person clicks it.
+      if (err instanceof ReplayGuardRefusal) return { kind: "refused", refusals: [err.message] };
+      return unexpected("click_error", "", `the click did not complete (${err instanceof Error ? err.message.split("\n")[0].slice(0, 120) : String(err)}) — it may still have reached the portal`);
+    }
+    // THE PAGE THE CLICK PRODUCED, read until it says something (a slow portal answers late).
+    await smartWait(this.page, 3000);
+    let after = readDraftAfterClick("");
+    for (let i = 0; i < 12; i++) {
+      const text = String(await this.page.locator("body").innerText({ timeout: 5000 }).catch(() => "") || "");
+      after = readDraftAfterClick(text);
+      if (after.verdict !== "other") break;
+      await sleep(1000);
+    }
+    this.backstop?.closeApprovedSlot();
+    const challenge = await detectChallengeFrame(this.page).catch(() => null);
+    if (challenge) return unexpected("challenge", challenge, `a challenge appeared after the click (${challenge}) — never answered by automation`);
+    const dismissed = this.backstop?.approvedDialogs.find((dlg) => dlg.action === "dismissed");
+    if (dismissed) return unexpected("dialog_dismissed", dismissed.message, `the click opened a ${dismissed.type} that was dismissed ("${dismissed.message.slice(0, 80)}")`);
+    if (after.verdict === "draft") {
+      this.draftSubmitOutcome = { ...after.read, clickedLabel: label, tenantKey: draftTenantKey(urlNow()) };
+      await this.capturePageShot("DRAFT-CREATED", true).catch(() => null);
+      return { kind: "draft" };
+    }
+    return after.verdict === "filed"
+      ? unexpected("filed", after.evidence, `the page after it reads as a FILING ("${after.evidence.slice(0, 100)}")`)
+      : unexpected("not_a_draft", after.evidence, "the page after it does not say a draft was created");
   }
 
   /** Why the final submit may NOT be clicked right now — the shared gate, asked at the click.

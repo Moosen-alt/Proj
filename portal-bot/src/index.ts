@@ -13,10 +13,13 @@ import { HUMAN_REVIEW_MESSAGE } from "./adapter";
 import { clearReviewOpen, markReviewOpen } from "./reviewSession";
 import { draftReferenceFromUrl } from "./adapters/submissionLedger";
 import { readDraftCreated, type DraftCreatedRead } from "./draftCreated";
+import { draftTenantKey } from "./draftSubmitGate";
 import { HUMAN_SUBMIT_OBSERVED_NOTE } from "./humanCapture";
 
-/** A draft-created page observed after a person's submit click, with the control they clicked. */
-export type DraftCreatedObserved = DraftCreatedRead & { clickedLabel: string };
+/** A draft-created page observed after a person's submit click, with the control they clicked and
+ *  the tenant the page was on (draftSubmitGate.draftTenantKey — what the heal stamps, #330; "" when
+ *  the page's URL could not be read, and then nothing is stamped). */
+export type DraftCreatedObserved = DraftCreatedRead & { clickedLabel: string; tenantKey?: string };
 
 /**
  * THE LEARN'S LEFT-OPEN PAGE, WATCHED FOR A SUBMIT THAT ONLY MADE A DRAFT (#302). Every captured
@@ -26,7 +29,7 @@ export type DraftCreatedObserved = DraftCreatedRead & { clickedLabel: string };
  * that filed nothing) and onDraftCreated hears the draft instead. Read-only: it clicks nothing.
  */
 export function draftAwareHumanSink(
-  adapter: { readCurrentPageText?: () => Promise<string> },
+  adapter: { readCurrentPageText?: () => Promise<string>; readCurrentPageUrl?: () => string },
   onHumanStep: (step: import("../../shared/src/types").RecipeStep) => void,
   onDraftCreated?: (draft: DraftCreatedObserved) => void,
   settleMs = 4000,
@@ -41,7 +44,9 @@ export function draftAwareHumanSink(
       if (draft.draft) {
         // The capture sink disarmed itself at this click (humanCapture.ts), so nothing a person does
         // after it on the same page is observed. Fine for PSE's flow: the next stage continues the draft.
-        try { onDraftCreated({ ...draft, clickedLabel: String(step.value ?? "") }); } catch { /* reporting must never disturb the operator's window */ }
+        let tenantKey = "";
+        try { tenantKey = draftTenantKey(typeof adapter.readCurrentPageUrl === "function" ? adapter.readCurrentPageUrl() : ""); } catch { /* no tenant: nothing is stamped */ }
+        try { onDraftCreated({ ...draft, clickedLabel: String(step.value ?? ""), tenantKey }); } catch { /* reporting must never disturb the operator's window */ }
         return;
       }
       onHumanStep(step);
@@ -297,6 +302,10 @@ interface StageOptions {
   onProgress?: (p: import("./adapters/recipeAdapter").RecipeProgress) => void;
   /** The project's site, for the replay's existing-draft check (#302, RecipeAdapter siteDraft). */
   siteDraft?: { street?: string; city?: string; zip?: string; siblingAtSameStreet?: boolean };
+  /** The replay may click a recipe step healed as a KNOWN draft-creating submit itself (#330,
+   *  RecipeAdapter draftSubmitClick; draftSubmitGate decides). The backend sets it for the NEM
+   *  track's own recipe only. Never an approval to file, and never read by the final-submit gate. */
+  draftSubmitClick?: boolean;
 }
 
 // Headed, guided-manual staging leaves the browser OPEN at the review screen so the human
@@ -344,7 +353,7 @@ async function armSubmitCapture(
             options.onSubmitCaptured?.({
               recordNumber: "", confidence: "low", source: "draft_created", reason: capture.message,
               recordLink: String(data.recordLink ?? ""),
-              draftCreated: { ...draft, clickedLabel: String(clickedLabel ?? "") },
+              draftCreated: { ...draft, clickedLabel: String(clickedLabel ?? ""), tenantKey: String(data.draftTenantKey ?? "") },
             });
             return;
           }
@@ -566,6 +575,11 @@ async function runAdapter(
     const outcomeShotPath = steps.map((s) => String(s?.data?.outcomeShotPath ?? "")).filter(Boolean).pop() ?? "";
     // This address already had an unsubmitted draft on the portal (#302): carried up for the caller.
     const existingDraft = steps.map((s) => s?.data?.existingDraft).find((d) => d && typeof d === "object") ?? null;
+    // THE REPLAY CLICKED A KNOWN DRAFT-CREATING SUBMIT ITSELF (#330): the draft it made, for the
+    // caller to record — or the page after the click did NOT read as a draft, an incident the caller
+    // records and never reads as a filing.
+    const draftCreatedByReplay = steps.map((s) => s?.data?.draftCreatedByReplay).find((d) => d && typeof d === "object") ?? null;
+    const draftSubmitUnexpected = steps.map((s) => s?.data?.draftSubmitUnexpected).find((d) => d && typeof d === "object") ?? null;
 
     // Leave the browser OPEN for the human ONLY when: this is a guided-manual run (no
     // autosubmit), it's headed (the human is watching), it staged cleanly to review, and we
@@ -622,6 +636,8 @@ async function runAdapter(
       capturedRecordLink: captured?.recordLink || "",
       ...(draftReference && draftReference.link ? { draftReference } : {}),
       ...(existingDraft ? { existingDraft } : {}),
+      ...(draftCreatedByReplay ? { draftCreatedByReplay } : {}),
+      ...(draftSubmitUnexpected ? { draftSubmitUnexpected } : {}),
       evidenceDir,
       outcomeShotPath,
       pauseReason: stepPause,
@@ -687,6 +703,7 @@ export async function stageWithRecipe(
     onProgress: options.onProgress,
     owedAttachments: options.owedAttachments,
     siteDraft: options.siteDraft,
+    draftSubmitClick: options.draftSubmitClick === true,
   }), project, files, options));
 }
 
