@@ -11,6 +11,10 @@
 //       product's own path): the POST reaches the server ONCE carrying the submitter; one admission,
 //       exempted; page.url() at request time is still the information page (R5); a GA-like fetch
 //       POST fired from Next's onclick and an on-load fetch POST are still aborted (non-stopping).
+//   [R] ROUND 5 — RESERVED AT THE ADMISSION: the backstop awaits the use's reservation the moment it
+//       would let the request through (asked then, never at the open); a refusal (an expired
+//       verification), a throw, a malformed answer or no reservation at all HOLDS it exactly as on
+//       main; an asynchronous reservation is awaited and the request passes once.
 //   [E] SLOT LIFETIME: an opened slot that is not used within 20 s is gone; a GET reload closes it;
 //       a second matching POST after the admission is held (the same page served again: d8).
 //   [N] NEAR MISSES with DevHub's entry live, the variant served at the SAME origin + path: every
@@ -27,7 +31,7 @@
 import "./smokeArtifactDirs";
 import http from "node:http";
 import { chromium, type Page } from "playwright";
-import { backstopFor, installFilingBackstop, isStoppingAbort, type FilingBackstop, type InfoPagePassOpen } from "./filingBackstop";
+import { INFO_PAGE_NO_RESERVATION, backstopFor, installFilingBackstop, isStoppingAbort, type FilingBackstop, type InfoPagePassOpen, type InfoPageReserve } from "./filingBackstop";
 import {
   INFO_PAGE_IDENTITY_VERSION, infoPagePrefixOf, infoPageRequestRefusals, sha256Hex, verifiedInfoPageFromCandidate, type InfoPageRunState, type InfoPageRunStep,
 } from "../../shared/src/infoPagePass";
@@ -117,8 +121,14 @@ interface Run {
   /** Between the open and the click. */
   between?: (page: Page, bs: FilingBackstop) => Promise<void>;
   waitBeforeOpenMs?: number;
+  /** Round 5: the reservation the backstop awaits at the admission (default: always reserved,
+   *  recorded in `reserveCalls`); null = none given. */
+  reserve?: InfoPageReserve | null;
 }
 const startUrlOf = (p: string): string => `${base}${p}/permits/sfjsp?interviewID=Home`;
+// Round 5: every reservation the default (always-OK) reserve was asked for: [entryId, where].
+const reserveCalls: Array<[string, string]> = [];
+const okReserve: InfoPageReserve = (entryId, where) => { reserveCalls.push([entryId, where]); return []; };
 async function go(o: Run): Promise<Outcome> {
   VARIANTS[o.p] = { html: o.html, next: o.next };
   const before = hits.length;
@@ -138,7 +148,8 @@ async function go(o: Run): Promise<Outcome> {
   const door = bs as FilingBackstop & { openInfoPagePass?: FilingBackstop["openInfoPagePass"] };
   const hasDoor = typeof door.openInfoPagePass === "function";
   const run = (o.run ?? ((s: string) => cleanRun(devhubPrefix(s))))(startUrlOf(o.p));
-  const open = hasDoor ? await door.openInfoPagePass(page, page.locator(o.selector ?? NEXT), { entries: o.entries, run }) : null;
+  const reserve = o.reserve === null ? undefined : (o.reserve ?? okReserve);
+  const open = hasDoor ? await door.openInfoPagePass(page, page.locator(o.selector ?? NEXT), { entries: o.entries, run, reserve }) : null;
   if (o.between) await o.between(page, bs);
   await page.locator(o.clickSelector ?? o.selector ?? NEXT).first().click({ timeout: 5000 }).catch(() => null);
   await page.waitForLoadState("load").catch(() => null);
@@ -215,7 +226,11 @@ console.log("\n[B] VERIFIED: Next's POST passes once, exactly as the verified co
   const onclick = `<script>document.querySelector('button[name="${NEXT_NAME}"]').addEventListener('click', function (e) { if (window.__sent) return; e.preventDefault(); var b = e.currentTarget; fetch('/g/collect', { method: 'POST', body: 'v=2&en=click' }).catch(function () {}).then(function () { window.__sent = true; document.getElementById('smartguide_ApplyForAPermit').requestSubmit(b); }); });
 setTimeout(function () { fetch('autosave', { method: 'POST', body: 'x=1' }).catch(function () {}); }, 200);</script>`;
   // [A]'s entry is for /A; [B] serves the same page at /A again (the candidate's own place).
+  const reservedBefore = reserveCalls.length;
   const B = await go({ p: "/A", html: (p) => devhubReplica({ p, script: onclick }), entries: DEVHUB ? [DEVHUB] : [] });
+  const bReserved = reserveCalls.slice(reservedBefore);
+  check("[B] round 5: the use was RESERVED once, at the admission, for the verified entry and the request's own where",
+    bReserved.length === 1 && bReserved[0][0] === "pass-devhub" && /\/A\/permits\/sfjsp$/.test(bReserved[0][1]), JSON.stringify(bReserved));
   // The script changes nothing the identity reads (scripts are skipped), so [A]'s entry matches.
   check("[B] the door opens the pass for the verified page", !!B.open && B.open.opened === true && B.open.entryId === "pass-devhub", JSON.stringify(B.open));
   const next = B.posts.filter((h) => /\/A\/permits\/sfjsp$/.test(h.path));
@@ -227,6 +242,54 @@ setTimeout(function () { fetch('autosave', { method: 'POST', body: 'x=1' }).catc
   check("[B] the GA-like onclick fetch and the on-load fetch POST were still aborted, non-stopping",
     B.aborts.some((a) => /\/g\/collect$/.test(a.where) && !a.stopping) && B.aborts.some((a) => /\/autosave$/.test(a.where) && !a.stopping) && !B.aborts.some((a) => a.stopping),
     JSON.stringify(B.aborts));
+}
+
+// ===========================================================================================
+// [R] round 5: the use is RESERVED AT THE ADMISSION (verification round 4's B1). The pass opens
+//     (the verification read live when the run was handed it); the backstop then awaits the
+//     reservation at the moment it would let the request through. Refused, thrown, malformed or
+//     absent: HELD exactly as on main. Kill: admit without awaiting the reservation and R1-R3 pass
+//     their POST.
+// ===========================================================================================
+console.log("\n[R] ROUND 5: THE USE IS RESERVED AT THE ADMISSION");
+if (want("R")) {
+  const EXPIRED = "verification expired — a person re-verifies (a verification is authority for 30 days; this one is older)";
+  const stoppingHold = (o: Outcome, re: RegExp): boolean => held(o) && o.admissions.length === 0
+    && o.aborts.some((a) => a.rule === "review-lockdown" && a.resourceType === "document" && a.stopping && re.test(a.why));
+  // R1: the verification expired while the run was in flight — the reservation refuses.
+  const e1 = await devhubEntryAt("/R1");
+  const calls1: Array<[string, string]> = [];
+  let atOpen1 = -1;
+  const r1 = await go({
+    p: "/R1", html: (p) => devhubReplica({ p }), entries: e1 ? [e1] : [],
+    reserve: (id, where) => { calls1.push([id, where]); return [EXPIRED]; },
+    between: async () => { atOpen1 = calls1.length; },
+  });
+  check("[R1] premise: the door OPENED the pass (the run was handed a live verification)", !!r1.open?.opened, brief(r1));
+  check("[R1] the reservation is asked at the ADMISSION, not at the open: none after the open, one at the click (the entry, the request's own where)",
+    atOpen1 === 0 && calls1.length === 1 && calls1[0][0] === e1?.id && /\/R1\/permits\/sfjsp$/.test(calls1[0][1]), JSON.stringify({ atOpen1, calls1 }));
+  check("[R1] REFUSED at the admission ('verification expired'): HELD exactly as on main — nothing reached the server, no admission, the stopping review-lockdown abort names why",
+    stoppingHold(r1, /verification expired — a person re-verifies/), brief(r1));
+  // R2: the reservation throws (the ledger could not be written).
+  const e2 = await devhubEntryAt("/R2");
+  const r2 = await go({ p: "/R2", html: (p) => devhubReplica({ p }), entries: e2 ? [e2] : [], reserve: () => { throw new Error("database is locked"); } });
+  check("[R2] a reservation that THROWS: HELD, and the abort says the use could not be reserved", !!r2.open?.opened && stoppingHold(r2, /could not be reserved \(database is locked\)/), brief(r2));
+  // R3: a malformed answer (not a list of refusals).
+  const e3 = await devhubEntryAt("/R3");
+  const r3 = await go({ p: "/R3", html: (p) => devhubReplica({ p }), entries: e3 ? [e3] : [], reserve: (() => "ok") as unknown as InfoPageReserve });
+  check("[R3] a malformed reservation answer: HELD", !!r3.open?.opened && stoppingHold(r3, /could not be reserved \(no answer\)/), brief(r3));
+  // R4: no reservation at all — nothing opens.
+  const e4 = await devhubEntryAt("/R4");
+  const r4 = await go({ p: "/R4", html: (p) => devhubReplica({ p }), entries: e4 ? [e4] : [], reserve: null });
+  check("[R4] no reservation given: the pass does not open (fail closed) and the Next is HELD",
+    !!r4.open && !r4.open.opened && r4.open.refusals.includes(INFO_PAGE_NO_RESERVATION) && held(r4), brief(r4));
+  // R5 (positive control): an asynchronous reservation that answers after 600 ms is AWAITED — the
+  // request waits for it, then passes once.
+  const e5 = await devhubEntryAt("/R5");
+  let answeredAt = 0;
+  const r5 = await go({ p: "/R5", html: (p) => devhubReplica({ p }), entries: e5 ? [e5] : [], reserve: async () => { await sleep(600); answeredAt = Date.now(); return []; } });
+  check("[R5] (positive control) an asynchronous reservation is AWAITED: the Next waits for it and passes ONCE, exempted",
+    !!r5.open?.opened && answeredAt > 0 && r5.posts.length === 1 && r5.admissions.filter((a) => a.exempted).length === 1, brief(r5));
 }
 
 // ===========================================================================================
@@ -258,12 +321,12 @@ if (want("E")) {
     await sleep(400);
     const before = hits.length;
     const run = cleanRun(devhubPrefix(startUrlOf("/E4")));
-    const first = bs && typeof bs.openInfoPagePass === "function" ? await bs.openInfoPagePass(page, page.locator(NEXT), { entries: e4 ? [e4] : [], run }) : null;
+    const first = bs && typeof bs.openInfoPagePass === "function" ? await bs.openInfoPagePass(page, page.locator(NEXT), { entries: e4 ? [e4] : [], run, reserve: okReserve }) : null;
     await page.locator(NEXT).click().catch(() => null);
     await page.waitForLoadState("load").catch(() => null);
     await sleep(600);
     const run2 = cleanRun([...devhubPrefix(startUrlOf("/E4")), { action: "click", note: "advance: Next", admitted: true }]);
-    const second = bs && typeof bs.openInfoPagePass === "function" ? await bs.openInfoPagePass(page, page.locator(NEXT), { entries: e4 ? [e4] : [], run: run2 }) : null;
+    const second = bs && typeof bs.openInfoPagePass === "function" ? await bs.openInfoPagePass(page, page.locator(NEXT), { entries: e4 ? [e4] : [], run: run2, reserve: okReserve }) : null;
     await page.locator(NEXT).click().catch(() => null);
     await page.waitForLoadState("load").catch(() => null);
     await sleep(600);

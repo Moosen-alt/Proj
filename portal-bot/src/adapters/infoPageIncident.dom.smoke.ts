@@ -47,6 +47,9 @@
 //   and so is pq_list_ended (the job's street held, but the walk never leaves through its advance:
 //   the read-back happens only as the run leaves). pq_list_bound (the residual) now leaves through
 //   the filter's own button with the street held: the proof is met, on purpose.
+//   ROUND 5 — r1_decimal (verification round 4's R1_decimal): a digits-only Subject turns the job's
+//   bound 6.5 (acKw) into 65 — another number, never the proof: an incident. Every admitted walk's use
+//   is RESERVED at the admission (reserveInfoPagePass, asked by the backstop) before it is reported.
 //   ROUND 2, AT MOST ONCE PER PROJECT — progress: the backend says this project already made progress
 //   on this portal; the exact verified page is held as on main and the run names it (infoPageHeldVerified).
 //   Every admitted walk reports its use AT ONCE through onInfoPagePassed.
@@ -168,7 +171,8 @@ const aspx = (title: string, receiptHtml: string, extra = ""): string => plain(t
 </form>`);
 const EMAIL_COPY = `<p><label for="ctl00_txtEmailCopy">Email me a copy</label> <input name="ctl00$txtEmailCopy" type="email" id="ctl00_txtEmailCopy"> <input type="submit" name="ctl00$btnEmail" value="Email receipt" id="ctl00_btnEmail"></p>`;
 const NOTE_FORM = `<h2>Add a note for the Permit Tech</h2><form method="post" action="${P}/notes"><label for="subj">Subject</label> <input id="subj" name="subject" type="text"><br><label for="msg">Message</label> <textarea id="msg" name="message"></textarea><br><button type="submit">Add note</button></form>`;
-const PREFS_FORM = `<form method="post" action="${P}/prefs"><p>How should we reach you about it?</p><label for="ph">Phone</label> <input id="ph" name="phone" type="tel"> <label for="em">Email</label> <input id="em" name="email" type="email"> <button type="submit">Save</button></form>`;
+const NOTE_FORM_DIGITS = NOTE_FORM.replace(`<input id="subj" name="subject" type="text">`, `<input id="subj" name="subject" type="text" oninput="this.value = this.value.replace(/[^0-9]/g, '')">`);
+const PREFS_FORM =`<form method="post" action="${P}/prefs"><p>How should we reach you about it?</p><label for="ph">Phone</label> <input id="ph" name="phone" type="tel"> <label for="em">Email</label> <input id="em" name="email" type="email"> <button type="submit">Save</button></form>`;
 const LIST_PAGE = (): string => plain("My Permits & Requests", `<div class="content"><h1>My Permits &amp; Requests</h1>
 <form method="post" action="${P}/my-permits"><label for="st">Status</label> <select id="st" name="ddlStatus"><option value="">All</option><option value="sub">Submitted</option></select> <label for="fa">Address</label> <input id="fa" name="txtAddress" type="text"> <button type="submit">Filter</button></form>
 <table><thead><tr><th>Request</th><th>Type</th><th>Status</th><th>Date</th></tr></thead><tbody><tr><td>4471</td><td>${SOLAR}</td><td>Submitted</td><td>10/16/2026</td></tr></tbody></table></div>`);
@@ -273,6 +277,9 @@ const AFTER: Record<string, () => string> = {
 <script>['aa','ap'].forEach(function (id) { var el = document.getElementById(id); ['input','change','blur','keyup'].forEach(function (ev) { el.addEventListener(ev, function () { setTimeout(function () { el.value = ''; }, 0); }); }); });</script>`),
   g_pqaspx: () => aspx("Thank you", `<h1>Thank you</h1><p>A Permit Tech will email you within 5 business days.</p>${EMAIL_COPY}<p><label for="sms">Text me updates</label> <input id="sms" name="ctl00$Main$txtSms" type="tel"></p>`),
   clientid: () => plain("All done", `<main><h1>All done!</h1><p>A Permit Tech will email you within 5 business days.</p>${NOTE_FORM}</main>`),
+  // ROUND 5 — verification round 4's R1_decimal: the note form, its Subject behind a DIGITS-ONLY mask.
+  // The planner binds the job's acKw (6.5) and types it; the mask turns it into 65 — another number.
+  r1_decimal: () => plain("All done", `<main><h1>All done!</h1><p>A Permit Tech will email you within 5 business days.</p>${NOTE_FORM_DIGITS}</main>`),
 };
 
 const hits: Array<{ method: string; url: string; names: string[]; mode: string }> = [];
@@ -313,6 +320,9 @@ interface Walk {
   /** Round 2: what the learner reported AT ONCE through onInfoPagePassed, and the verified pages it
    *  was held at because of the project's prior progress. */
   reported: Array<{ passId: string; where: string }>; heldVerified?: Array<{ passId: string; where: string; why: string[] }>;
+  /** Round 5: every reservation the backstop asked for at an admission (always reserved here), and
+   *  how many reports had come in when each was asked (0 = asked before the use was reported). */
+  reserved: Array<{ passId: string; where: string; reportedBefore: number }>;
   secs: number;
 }
 // ROUND 3/4: THIS JOB'S OWN VALUES — what the backend hands the learner, computed by the SAME shared
@@ -321,11 +331,11 @@ interface Walk {
 // resolves it to "") and its phone are never among them (round 4) — and what the planner does on the
 // page the verified click led to, per walk. Every other page: nothing.
 const CLIENT_ID = "bb153551-be5a-4658-8c03-4ee5a71861e8";
-const RESOLVED = { street: "1 Test St", city: "Springfield", zip: "62701", homeownerName: "T", projectName: "Test Owner Solar", workDescription: "Residential solar PV system, 8.6 kW DC", clientId: CLIENT_ID, installerPhone: "(555) 010-0000" };
-const BLANK = { street: "", city: "", zip: "", homeownerName: "", projectName: "", workDescription: "", clientId: "", installerPhone: "(555) 010-0000" };
+const RESOLVED = { street: "1 Test St", city: "Springfield", zip: "62701", homeownerName: "T", projectName: "Test Owner Solar", workDescription: "Residential solar PV system, 8.6 kW DC", clientId: CLIENT_ID, installerPhone: "(555) 010-0000", acKw: "6.5" };
+const BLANK = { street: "", city: "", zip: "", homeownerName: "", projectName: "", workDescription: "", clientId: "", installerPhone: "(555) 010-0000", acKw: "" };
 const JOB_VALUES = infoPageJobValues(RESOLVED, BLANK, () => false, [CLIENT_ID]);
-check("premise (round 4): this job's own values are the street, city, zip, project name and work description — never the company's id or phone, never a one-letter name",
-  JSON.stringify(Object.keys(JOB_VALUES)) === JSON.stringify(["city", "projectName", "street", "workDescription", "zip"]), JSON.stringify(JOB_VALUES));
+check("premise (round 4/5): this job's own values are the AC size (a decimal: round 5), street, city, zip, project name and work description — never the company's id or phone, never a one-letter name",
+  JSON.stringify(Object.keys(JOB_VALUES)) === JSON.stringify(["acKw", "city", "projectName", "street", "workDescription", "zip"]), JSON.stringify(JOB_VALUES));
 const fieldIdx = (req: LearnPlanRequest, label: string): number => req.fields.findIndex((f) => String(f.label ?? "").trim() === label);
 const PLANS: Record<string, (req: LearnPlanRequest) => Promise<LearnPlanResponse> | LearnPlanResponse> = {
   // The positive control: the job's street, BOUND (the proof), then Next.
@@ -347,6 +357,8 @@ const PLANS: Record<string, (req: LearnPlanRequest) => Promise<LearnPlanResponse
   g_pqaspx: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Address"), value: "1 Test St", field: "street" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Find") }),
   // ROUND 4: the company's id bound as clientId (a company constant, never this job's own value).
   clientid: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Subject"), value: CLIENT_ID, field: "clientId" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Add note") }),
+  // ROUND 5 (R1_decimal): the job's acKw, bound and typed — into a digits-only Subject that keeps 65.
+  r1_decimal: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Subject"), value: "6.5", field: "acKw" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Add note") }),
 };
 const walk = async (mode: string, entries: VerifiedInfoPage[], permitType = "structural", priorProgress = false): Promise<Walk> => {
   const ctx = await browser.newContext();
@@ -360,7 +372,13 @@ const walk = async (mode: string, entries: VerifiedInfoPage[], permitType = "str
     return at === `${P}/after` && PLANS[mode] ? PLANS[mode](req) : { fills: [], atReview: false };
   };
   const reported: Array<{ passId: string; where: string }> = [];
-  const a = new AutoLearnAdapter("Incident Walk", plan, { maxPages: 6, budgetMs: 180_000, infoPagePasses: entries, infoPagePriorProgress: priorProgress, onInfoPagePassed: (p) => { reported.push(p); }, infoPageProofValues: JOB_VALUES });
+  const reserved: Walk["reserved"] = [];
+  const a = new AutoLearnAdapter("Incident Walk", plan, {
+    maxPages: 6, budgetMs: 180_000, infoPagePasses: entries, infoPagePriorProgress: priorProgress, onInfoPagePassed: (p) => { reported.push(p); }, infoPageProofValues: JOB_VALUES,
+    // Round 5: the backend's reservation at the admission — always reserved here (its refusals are
+    // pinned in infoPagePass.dom.smoke [R] and backend infoPages.test).
+    reserveInfoPagePass: (p) => { reserved.push({ ...p, reportedBefore: reported.length }); return []; },
+  });
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   (a as any).page = pw;
   const locks: string[] = [];
@@ -385,7 +403,7 @@ const walk = async (mode: string, entries: VerifiedInfoPage[], permitType = "str
     notes: steps.map((s) => String(s.note ?? "")), finals: steps.filter((s) => s.isFinalSubmit).map((s) => String(s.note ?? "")), locks,
     hits: hits.filter((h) => h.mode === mode).map(({ method, url, names }) => ({ method, url, names })),
     candidate: r.infoPageCandidate as InfoPageCandidateCapture | undefined, passed: r.infoPagePassed as Walk["passed"], incidents: r.infoPageIncidents as InfoPageIncident[] | undefined,
-    reported, heldVerified: r.infoPageHeldVerified as Walk["heldVerified"],
+    reported, heldVerified: r.infoPageHeldVerified as Walk["heldVerified"], reserved,
     secs: Math.round((Date.now() - t0) / 1000),
   };
 };
@@ -431,7 +449,10 @@ const PROOF_ONLY = Object.keys(ROUND3).filter((m) => ROUND3[m] === NO_PROGRESS);
 // the control holds, the chrome rule or the job's own values catch them. Each is an incident after ONE
 // project (the backend withdraws the pass on it: infoPages.test).
 const ROUND4: Record<string, RegExp> = { n4_wrongval: NO_PROGRESS, n5_clear: NO_PROGRESS, g_pqaspx: NO_PROGRESS, clientid: NO_PROGRESS, pq_list_ended: NO_PROGRESS };
-const AFTER_MODES = ["receipt", "filed", "review", "error", "same", "blank", ...Object.keys(ROUND2), ...Object.keys(ROUND3), ...Object.keys(ROUND4)];
+// Round 5: verification round 4's R1_decimal — the job's 6.5, held as 65 by a digits-only mask: the
+// control holds another number, so there is no proof — an incident after ONE project.
+const ROUND5: Record<string, RegExp> = { r1_decimal: NO_PROGRESS };
+const AFTER_MODES = ["receipt", "filed", "review", "error", "same", "blank", ...Object.keys(ROUND2), ...Object.keys(ROUND3), ...Object.keys(ROUND4), ...Object.keys(ROUND5)];
 const results: Record<string, Walk> = {};
 const queue: Array<[string, string]> = [...AFTER_MODES.map((m) => [m, "structural"] as [string, string]), ["form", "structural"], ["pq_list_bound", "structural"], ["progress", "structural"], ["drift", "structural"], ["tileb", "structural"]];
 await Promise.all(Array.from({ length: 4 }, async () => {
@@ -463,6 +484,13 @@ for (const mode of AFTER_MODES) {
     check(`after [${mode}] (round 4, the planner BOUND a job key; every content rule passed it): no proof — the incident names it`,
       (w.incidents?.[0]?.why ?? []).some((x) => ROUND4[mode].test(x)), JSON.stringify(w.incidents?.[0]?.why ?? []));
   }
+  if (ROUND5[mode]) {
+    check(`after [${mode}] (round 5, the job's 6.5 held as 65 by a digits-only mask): no proof — the incident names it, and the note never reached the server`,
+      (w.incidents?.[0]?.why ?? []).some((x) => ROUND5[mode].test(x)) && !w.hits.some((h) => h.method !== "GET" && h.url.startsWith(`${P}/notes`)),
+      JSON.stringify({ why: w.incidents?.[0]?.why ?? [], posts: posts(w) }));
+  }
+  check(`after [${mode}] (round 5): the use was RESERVED once, at the admission — before the learner reported it`,
+    w.reserved.length === 1 && w.reserved[0].passId === "pass-incident" && w.reserved[0].reportedBefore === 0 && /\/x\/sg$/.test(w.reserved[0].where), JSON.stringify({ reserved: w.reserved, reported: w.reported }));
   lines.push(`  note - [${mode}] ${w.secs}s: ${(w.incidents?.[0]?.why ?? []).join("; ").slice(0, 200)}`);
 }
 {
@@ -487,6 +515,8 @@ for (const mode of AFTER_MODES) {
     JSON.stringify({ ok: w.ok, stop: w.stopReason, incidents: w.incidents, locks: w.locks, message: w.message.slice(0, 300) }));
   check("after [form] (round 2): the learner reported the use AT ONCE through onInfoPagePassed (the backend writes it before the walk goes on), exactly once",
     w.reported.length === 1 && w.reported[0].passId === "pass-incident" && /\/x\/sg$/.test(w.reported[0].where), JSON.stringify(w.reported));
+  check("after [form] (round 5): the use was RESERVED once, at the admission, BEFORE it was reported (the backend checks the limits there)",
+    w.reserved.length === 1 && w.reserved[0].passId === "pass-incident" && w.reserved[0].reportedBefore === 0 && /\/x\/sg$/.test(w.reserved[0].where), JSON.stringify(w.reserved));
   check("after [form] (round 3 positive control): the run entered the job's street (bound) — its own autosave passed the proof hold, then the form's Next reached the server",
     w.hits.some((h) => h.method === "POST" && h.url === `${P}/autosave`) && w.hits.some((h) => h.method === "POST" && h.url === `${P}/sg2`), JSON.stringify(posts(w)));
   lines.push(`  note - [form] ${w.secs}s`);

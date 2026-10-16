@@ -527,7 +527,10 @@ console.log("\n[1b] the same page, VERIFIED from [1a]'s candidate: Next passes, 
     if (at === "/post/project") return { fills: [{ selectorIndex: idx(req, "Site Address"), value: ADDRESS, field: "street" }], atReview: false, advanceSelectorIndex: idx(req, "Next") };
     if (at === "/post/review") return { fills: [], atReview: true, finalSubmitSelectorIndex: idx(req, "Submit Application") };
     return null;
-  }, { infoPagePasses: entry ? [entry] : [], infoPagePriorProgress: false, infoPageProofValues: { street: ADDRESS, city: "Springfield", zip: "62701" } });
+  }, { infoPagePasses: entry ? [entry] : [], infoPagePriorProgress: false, infoPageProofValues: { street: ADDRESS, city: "Springfield", zip: "62701" },
+    // Round 5: the backend reserves each use at the admission; here it always reserves (the
+    // reservation's own refusals are pinned in infoPagePass.dom.smoke [R] and backend infoPages.test).
+    reserveInfoPagePass: () => [] });
   const nexts = w.hits.filter((h) => h.method === "POST" && h.url.startsWith("/post/sg"));
   check("[1b] premise: [1a] produced a candidate to verify", !!entry);
   check("[1b] the Next's multipart POST reached the server ONCE, carrying the submitter",

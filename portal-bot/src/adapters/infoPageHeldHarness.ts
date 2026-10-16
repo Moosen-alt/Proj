@@ -423,7 +423,8 @@ export async function runHeldShapes(name: string, ids: string[], o: { concurrenc
       const idx = (label: string): number => req.fields.findIndex((f) => String(f.label ?? "").trim() === label);
       return s.plan(rest, idx) ?? { fills: [], atReview: false };
     };
-    const a = new AutoLearnAdapter("Held Walk", plan, { maxPages: 8, budgetMs: 240_000, infoPagePasses: entries, infoPagePriorProgress: false, ...(s.options ?? {}) });
+    // Round 5: an always-OK reservation, so each shape is held for its OWN reason, never for want of one.
+    const a = new AutoLearnAdapter("Held Walk", plan, { maxPages: 8, budgetMs: 240_000, infoPagePasses: entries, infoPagePriorProgress: false, reserveInfoPagePass: () => [], ...(s.options ?? {}) });
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (a as any).page = pw;
     let asked = 0;
