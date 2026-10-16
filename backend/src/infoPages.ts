@@ -24,6 +24,13 @@
 // written any other way (a direct INSERT, a copy, a row "moved" to another host / path / control /
 // step sequence) is never handed to a run (the #354 lesson: data a generic path can write is never
 // authority for a click).
+//
+// AT MOST ONCE PER PROJECT (round 2): this module also owns the project's LEARN LEDGER in the audit
+// log — each learn attempt's start (before it touches the portal), whether it ended as a clean hold,
+// each admitted use (written the moment the learner reports it), each hold at a verified page, and
+// a named person's "allow once more" — and infoPagePriorProgress reads it with the project's
+// filings, numbers, drafts and staged / paused / interrupted runs. Every one of those actions is
+// named only here and written by one function each (infoPagePass.test's source scan).
 import type { AppDb } from "./db";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";

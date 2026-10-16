@@ -2353,8 +2353,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
        *  liveInfoPagePasses). Only the network backstop reads them, at the interstitial's forward
        *  click (openInfoPagePass). None = every information page is held exactly as before. */
       infoPagePasses?: ReadonlyArray<VerifiedInfoPage>;
-      /** #344: the backend's answer to "has this project already reached review, recorded an
-       *  application number or found a draft on this portal origin?". Not given = true (refuses). */
+      /** #344: the backend's answer to "has this project already made progress on this portal?"
+       *  (backend infoPages.infoPagePriorProgress: an earlier admitted pass, a learn that did not end
+       *  held untouched, a run that reached review / paused / was interrupted, a number, a draft or a
+       *  filing). Not given = true (refuses). */
       infoPagePriorProgress?: boolean;
       /** #344 round 2: called synchronously for every information page the backstop admitted, the
        *  moment the click is settled (the backend records the use before the walk goes on). */
