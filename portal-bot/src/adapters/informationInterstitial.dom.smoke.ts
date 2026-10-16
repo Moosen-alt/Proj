@@ -257,11 +257,13 @@ const draftPage = (p: string): string => `<!doctype html><html><head><meta chars
 </body></html>`;
 // #344 round 2: on /post (the verified pass's walk, [1b]) the page the verified Next leads to must
 // show POSITIVE evidence of an application form: two empty plain fields in one POST form (DevHub's
-// SmartGuide steps all POST). Its Next posts to /project-next, never under /sg (the Next count).
+// SmartGuide steps all POST). Q4 (round 6): like DevHub's, its Next posts back to the interview's own
+// endpoint (/sg, routed by its BODY: its own submitter t_n_project) — the SAME INTERVIEW rule lets
+// only that through after the verified Next.
 const projectPage = (p: string): string => p === "/post" ? shell(p, {
-  title: "Project Information", method: "POST", action: `${p}/project-next`,
+  title: "Project Information", method: "POST", action: `${p}/sg`,
   content: `<div class="form-group"><label for="addr" class="control-label">Site Address</label><input id="addr" name="addr" type="text"></div><div class="form-group"><label for="unit" class="control-label">Unit / Suite</label><input id="unit" name="unit" type="text"></div>`,
-  nav: PREV_NEXT,
+  nav: `<button type="submit" name="t_p1685049573549" class="btn btn-primary">Previous</button><button type="submit" name="t_n_project" class="btn btn-primary ms-auto ">Next</button>`,
 }) : shell(p, {
   title: "Project Information", method: "GET", action: `${p}/sg2`,
   content: `<div class="form-group"><label for="addr" class="control-label">Site Address</label><input id="addr" name="addr" type="text"></div>`,
@@ -345,6 +347,7 @@ const route = (q: http.IncomingMessage, r: http.ServerResponse, body: Buffer): v
     // The interstitial's own form: Next → the project page, Previous → back to Apply. A POST is
     // routed by its BODY, as DevHub's is: only a body that carries Next's submitter goes forward.
     const names = hits[hits.length - 1].names ?? [];
+    if (method === "POST" && names.includes("t_n_project")) return redirect(`${p}/review?addr=${encodeURIComponent(new URLSearchParams(body.toString("utf8")).get("addr") ?? "")}`);
     if ((method === "POST" && names.includes("t_n1685049573549")) || qs.has("t_n1685049573549")) return redirect(`${p}/project`);
     return redirect(`${p}/apply`);
   }
@@ -531,7 +534,7 @@ console.log("\n[1b] the same page, VERIFIED from [1a]'s candidate: Next passes, 
     // Round 5: the backend reserves each use at the admission; here it always reserves (the
     // reservation's own refusals are pinned in infoPagePass.dom.smoke [R] and backend infoPages.test).
     reserveInfoPagePass: () => [] });
-  const nexts = w.hits.filter((h) => h.method === "POST" && h.url.startsWith("/post/sg"));
+  const nexts = w.hits.filter((h) => h.method === "POST" && h.url.startsWith("/post/sg") && (h.names ?? []).includes("t_n1685049573549"));
   check("[1b] premise: [1a] produced a candidate to verify", !!entry);
   check("[1b] the Next's multipart POST reached the server ONCE, carrying the submitter",
     nexts.length === 1 && (nexts[0].names ?? []).includes("t_n1685049573549"), JSON.stringify(w.hits.map((h) => `${h.method} ${h.url} ${(h.names ?? []).join(",")}`)));

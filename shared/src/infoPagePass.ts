@@ -763,6 +763,9 @@ export interface InfoPageAfterClickReading {
  *  page AFTER the click that was not on the information page is a new record number. */
 export interface InfoPageAfterClickBaseline {
   tokens: string[];
+  /** Q4: the acknowledgement wording the information page itself carried (infoPageAfterClickAckWording):
+   *  the same words on the page after are not new. Absent = nothing excused. */
+  ack?: string[];
 }
 
 /** How many empty plain fields one form must offer to be the application form (round 2). */
@@ -860,6 +863,64 @@ export function infoPageAfterClickSentWording(text: string | null | undefined): 
   return null;
 }
 
+/**
+ * Q4 — AN ACKNOWLEDGEMENT IS NEVER THE NEXT INTERVIEW STEP (an uncertain page only VETOES). The
+ * sent-wording list above names how a portal says it FILED; a portal that filed on the verified
+ * click can say so in a thousand other ways ("You're all set", "Thanks! Request complete", "Success.
+ * Request accepted. Status: In queue.") and still show a small form ("Start another request", "Tell
+ * us more", a contact form) — which then took this job's data and a second request. So this door
+ * reads the page for the VOCABULARY of an acknowledgement, by concept, not by phrase: gratitude,
+ * completion / success, acceptance / receipt / queue / status, a follow-up promise, "another"
+ * request, a confirmation / receipt / tracking record. Any hit refuses (the run stops, the pass is
+ * withdrawn). A hit that the information page's OWN text also carried (its prose, the shared chrome)
+ * is not new and does not count (baseline.ack, kept at the admission). A false hit is a false stop,
+ * the safe direction; a page that only reads "unknown" never votes progress on its own — the form,
+ * no number, no filing control and no acknowledgement must ALL hold.
+ */
+const AFTER_CLICK_ACK_WORDING: RegExp[] = [
+  // gratitude
+  /\bthank(?:s|\s+you)\b/gi,
+  // completion / success
+  /\ball\s+(?:set|done|finished)\b/gi,
+  /\b(?:you|we)(?:'|’)?(?:re|\s+are)\s+(?:all\s+)?(?:set|done|finished)\b/gi,
+  /\bsuccess(?:ful(?:ly)?)?\b/gi,
+  /\b(?:request|application|submission|registration|intake|permit)\s+(?:is\s+|was\s+|has\s+been\s+|now\s+)*(?:complete|completed|finished|done|accepted|received|submitted|filed|sent|queued|created|recorded|logged|registered|confirmed)\b/gi,
+  /\b(?:complete|completed|done|finished|submitted|received|accepted|sent|filed)\s*!/gi,
+  // acceptance / receipt / queue / status
+  /\baccepted\b(?!\s+(?:file|format|document|payment|method|type|form)s?\b)/gi,
+  /\breceived\b/gi,
+  /\bgot\s+(?:it|your)\b/gi,
+  /\bon\s+(?:its|it(?:'|’)s)\s+way\b/gi,
+  /\b(?:in\s+(?:the\s+|our\s+)?queue|queued)\b/gi,
+  /\bstatus\s*(?:is\s*)?[:\-–—]/gi,
+  /\b(?:in|under|pending|awaiting)\s+(?:review|approval|intake|processing)\b/gi,
+  /\b(?:is|now)\s+(?:pending|being\s+(?:reviewed|processed))\b/gi,
+  // a follow-up promise
+  /\bwill\s+(?:be\s+in\s+touch|contact\s+you|e-?mail\s+you|call\s+you|text\s+you|reach\s+out|get\s+back\s+to\s+you|follow\s+up|notify\s+you|be\s+notified|hear\s+from)\b/gi,
+  /\b(?:you(?:'|’)ll|you\s+will)\s+(?:receive|get|hear)\b/gi,
+  /\bwithin\s+(?:\d+|one|two|three|four|five|ten)\s+(?:business\s+|working\s+|calendar\s+)?(?:days?|hours?|weeks?)\b/gi,
+  // another request
+  /\banother\s+(?:[a-z]+\s+){0,2}(?:request|application|permit|submission|project)\b/gi,
+  /\b(?:start|begin|submit|file|create|make)\s+(?:a\s+)?new\s+(?:[a-z]+\s+){0,2}(?:request|application|permit|submission|project)\b/gi,
+  // a confirmation / receipt / tracking record
+  /\bconfirmed\b/gi,
+  /\b(?:your|this\s+is\s+your|here\s+is\s+your)\s+confirmation\b/gi,
+  /\bconfirmation\s+(?:number|no\b|#|code|id\b|page|e-?mail\s+(?:was|has|will))/gi,
+  /\breceipt\b/gi,
+  /\b(?:tracking|reference|ticket|case)\s*(?:number|no\.?|id|#|code)\b/gi,
+];
+/** Every acknowledgement hit in a text, lower-cased with whitespace collapsed (the comparable form). */
+export function infoPageAfterClickAckWording(text: string | null | undefined): string[] {
+  // Invisible characters (zero-width, soft hyphen, bidi marks) never split a word apart.
+  const t = String(text ?? "").replace(/[\u00AD\u200B-\u200F\u2060\uFEFF]/g, "").replace(/\s+/g, " ");
+  const out = new Set<string>();
+  for (const re of AFTER_CLICK_ACK_WORDING) {
+    re.lastIndex = 0;
+    for (let m = re.exec(t); m; m = re.exec(t)) out.add(m[0].toLowerCase().replace(/’/g, "'"));
+  }
+  return Array.from(out);
+}
+
 /** The label is a filing-, submit- or pay-worded control: the SAME triple the information page's own
  *  shape refuses (infoPageShapeRefusals), asked of every visible control on the page after it. */
 const isFilingWordedLabel = (l: string): boolean => isFinalSubmitControl(l) || isSubmitIntent(l) || isPayFee(l);
@@ -894,6 +955,10 @@ export function infoPageAfterClickRefusals(r: InfoPageAfterClickReading | null |
   else if (outcome.evidence) out.push(`the page after the click reads both as filed and as an error (${mask(outcome.evidence)})`);
   const sent = infoPageAfterClickSentWording(r.text);
   if (sent) out.push(`the page after the click says something was sent or received ("${mask(sent)}")`);
+  // Q4: any acknowledgement vocabulary the information page did not itself carry refuses.
+  const ownAck = new Set(baseline && Array.isArray(baseline.ack) ? baseline.ack.map((x) => String(x).toLowerCase()) : []);
+  const ack = infoPageAfterClickAckWording(r.text).filter((x) => !ownAck.has(x));
+  if (ack.length) out.push(`the page after the click reads as an acknowledgement, not the next step ("${mask(ack[0])}")`);
   if (!(typeof r.formFields === "number" && Number.isFinite(r.formFields) && r.formFields >= INFO_PAGE_AFTER_CLICK_MIN_FIELDS)) {
     out.push(`the page after the click shows no application form (fewer than ${INFO_PAGE_AFTER_CLICK_MIN_FIELDS} empty plain fields in one form outside the page's header, navigation, footer and search; search, feedback and sign-in boxes do not count)`);
   }

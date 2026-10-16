@@ -36,17 +36,17 @@
 //   the run must record a fill / select / check bound to THIS JOB'S own data on the page the
 //   verified click led to before it leaves, ends or stops; a literal, a company constant or nothing
 //   at all is no proof; and a page that posts its own form while the run is still reading it is
-//   HELD by the backstop (nothing reaches the server). RESIDUAL (stated in the PR, passes on
-//   purpose): pq_list_bound — the account's list whose address filter the planner binds to the
-//   job's street satisfies the proof.
+//   HELD by the backstop (nothing reaches the server). (Round 4's stated residual, pq_list_bound —
+//   the account's list whose address filter the planner binds to the job's street — is closed in
+//   round 6: see below.)
 //   ROUND 4 — THE PROOF IS WHAT THE PAGE HOLDS: a bound job key counts only when its control, read
 //   back just before the run leaves the page, HOLDS the job's own value (case, spaces and
 //   punctuation aside) outside the page's chrome: n4_wrongval (other text typed under projectName /
 //   workDescription), n5_clear (inputs that clear what is typed), g_pqaspx (the street typed into the
 //   header lookup) and clientid (the company's id: never one of this job's own values) are incidents,
 //   and so is pq_list_ended (the job's street held, but the walk never leaves through its advance:
-//   the read-back happens only as the run leaves). pq_list_bound (the residual) now leaves through
-//   the filter's own button with the street held: the proof is met, on purpose.
+//   the read-back happens only as the run leaves). pq_list_bound leaves through the filter's own
+//   button with the street held: the proof is met — round 6 catches it (below).
 //   ROUND 5 — r1_decimal (verification round 4's R1_decimal): a digits-only Subject turns the job's
 //   bound 6.5 (acKw) into 65 — another number, never the proof: an incident. Every admitted walk's use
 //   is RESERVED at the admission (reserveInfoPagePass, asked by the backstop) before it is reported.
@@ -54,6 +54,13 @@
 //   click led to sends its own POST (an auto-submit at +422 ms, a hidden second form, a fetch) while
 //   the after-click reading is still running. The proof hold is armed AT THE ADMISSION, so each is
 //   held (nothing reaches the server) and the walk is the incident; the pass is reported for withdrawal.
+//   ROUND 6 (Helm's review, blocker 2) — A RECEIPT NEVER READS AS PROGRESS: zzc_another / zzc_more /
+//   zzc_inqueue (a receipt with no number and no sent wording beside a small form the planner fills
+//   with the job's values) read as an ACKNOWLEDGEMENT at the after-click reading (veto-only wording);
+//   q4_noack_other / q4_noack_more carry no such wording, and SAME INTERVIEW (rule 3c: after the
+//   proof, the one way off the page is its own main-frame form back to the verified request's
+//   origin + path) holds their post elsewhere. pq_list_bound is caught by both. The positive control
+//   (form) now posts its Next back to the interview's own endpoint, as DevHub's SmartGuide does.
 //   ROUND 2, AT MOST ONCE PER PROJECT — progress: the backend says this project already made progress
 //   on this portal; the exact verified page is held as on main and the run names it (infoPageHeldVerified).
 //   Every admitted walk reports its use AT ONCE through onInfoPagePassed.
@@ -164,6 +171,9 @@ const TWO_FIELDS = `<div class="form-group"><label for="addr">Site Address</labe
 const TWO_FIELDS_AUTOSAVE = TWO_FIELDS.replace(/<input id="(addr|unit)" name="(addr|unit)" type="text">/g,
   `<input id="$1" name="$2" type="text" onchange="fetch('${P}/autosave', { method: 'POST', body: 'f=$2' })">`);
 const NEXT_SG2 = `<button type="submit" name="t_n2" formaction="${P}/sg2" class="btn btn-primary ms-auto">Next</button>`;
+// Q4: the interview's next step posts back to the interview's own endpoint (DevHub's SmartGuide posts
+// every step to its own sfjsp) — the positive control's Next.
+const NEXT_SG_STEP = `<button type="submit" name="t_n2" class="btn btn-primary ms-auto">Next</button>`;
 // Round 2's verifier's shapes (round 3 pins them). ASP.NET WebForms: ONE whole-page POST form; the
 // header is a <div id="header"> (no landmark) carrying a permit LOOKUP.
 const aspx = (title: string, receiptHtml: string, extra = ""): string => plain(title, `<form method="post" action="${P}/Receipt.aspx" id="aspnetForm">
@@ -232,7 +242,17 @@ const AFTER: Record<string, () => string> = {
   // a header search box beside it (never counted), and the footer's phone number, which the
   // information page carries too (not new). Round 3: each field AUTOSAVES on change (a fetch POST,
   // the run's own write — it passes the proof hold). No incident; the walk goes on.
-  form: () => receipt("Project Information", TWO_FIELDS_AUTOSAVE, "", HEADER_SEARCH, NEXT_SG2),
+  form: () => receipt("Project Information", TWO_FIELDS_AUTOSAVE, "", HEADER_SEARCH, NEXT_SG_STEP),
+  // Q4 (round 6) — a receipt with no record number and no sent wording beside a small POST form the
+  // planner fills with the job's own values. The first three carry acknowledgement wording (the
+  // after-click reading refuses them); the last two carry none (only SAME INTERVIEW stops them: the
+  // form posts somewhere other than the interview's own endpoint).
+  zzc_another: () => plain("All set", `<main><h1>You're all set</h1><p>A Permit Tech will email you within 5 business days.</p>
+<h2>Start another solar request</h2><form method="post" action="${P}/another"><label for="aa">Site Address</label> <input id="aa" name="addr" type="text"><br><label for="ap">City</label> <input id="ap" name="city" type="text"><br><button type="submit" name="go">Next</button></form></main>`),
+  zzc_more: () => receipt("Request complete", `<p>Thanks! Request complete. A Permit Tech will reach out within 5 business days.</p><p>Tell us more about the site (optional):</p>`, TWO_FIELDS, HEADER_SEARCH, `<button type="submit" name="t_more" formaction="${P}/more" class="btn btn-primary ms-auto">Next</button>`),
+  zzc_inqueue: () => plain("Success", `<main><h1>Success</h1><p>Request accepted. Status: In queue.</p><form method="post" action="${P}/contact"><label for="c1">Site Address</label> <input id="c1" name="site" type="text"><br><label for="c2">ZIP</label> <input id="c2" name="zip" type="text"><br><button type="submit" name="go">Continue</button></form></main>`),
+  q4_noack_other: () => plain("Next steps", `<main><h1>Next steps</h1><p>Your solar request is now with the city.</p><h2>Details for the inspector</h2><form method="post" action="${P}/another"><label for="aa">Site Address</label> <input id="aa" name="addr" type="text"><br><label for="ap">City</label> <input id="ap" name="city" type="text"><br><button type="submit" name="go">Next</button></form></main>`),
+  q4_noack_more: () => receipt("Nice work", `<p>A Permit Tech has it. Optional details:</p>`, TWO_FIELDS, HEADER_SEARCH, `<button type="submit" name="t_more" formaction="${P}/more" class="btn btn-primary ms-auto">Next</button>`),
   // ROUND 3 — round 2's verifier's B0 / B1 shapes (each passed round 2's after-click check).
   n1_aspx_nonum: () => aspx("Request sent", `<h1>Request sent</h1><p>Your solar permit request was sent to the City on 10/16/2026. A Permit Tech will email you within 5 business days.</p>`, EMAIL_COPY),
   n2_aspx_shortnum: () => aspx("Request sent", `<h1>Thank you</h1><p>Your request number 4471 was sent to a Permit Tech for intake on 10/16/2026.</p>`, EMAIL_COPY),
@@ -357,6 +377,11 @@ const fieldIdx = (req: LearnPlanRequest, label: string): number => req.fields.fi
 const PLANS: Record<string, (req: LearnPlanRequest) => Promise<LearnPlanResponse> | LearnPlanResponse> = {
   // The positive control: the job's street, BOUND (the proof), then Next.
   form: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St", field: "street" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
+  zzc_another: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St", field: "street" }, { selectorIndex: fieldIdx(req, "City"), value: "Springfield", field: "city" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
+  zzc_more: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St", field: "street" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
+  zzc_inqueue: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St", field: "street" }, { selectorIndex: fieldIdx(req, "ZIP"), value: "62701", field: "zip" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Continue") }),
+  q4_noack_other: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St", field: "street" }, { selectorIndex: fieldIdx(req, "City"), value: "Springfield", field: "city" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
+  q4_noack_more: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St", field: "street" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
   form_nofill: (req) => ({ fills: [], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
   form_literal: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "1 Test St" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
   form_company: (req) => ({ fills: [{ selectorIndex: fieldIdx(req, "Site Address"), value: "(555) 010-0000", field: "installerPhone" }], atReview: false, advanceSelectorIndex: fieldIdx(req, "Next") }),
@@ -453,7 +478,9 @@ const ROUND2: Record<string, RegExp> = {
 };
 // Round 3: round 2's verifier's B0 / B1 shapes (any rule may catch them — most are caught twice now),
 // and the PROOF-ONLY shapes, which every content rule passes: only the proof of progress catches them.
-const NO_PROGRESS = /entered none of this job's own data on the page the verified click led to/;
+// Round 6 (Q4): a receipt the proof-only shapes below put beside their form ("All done!", "Thank
+// you") now also reads as an acknowledgement at the after-click reading — an incident either way.
+const NO_PROGRESS = /entered none of this job's own data on the page the verified click led to|reads as an acknowledgement, not the next step/;
 const ROUND3: Record<string, RegExp> = {
   n1_aspx_nonum: /./, n2_aspx_shortnum: /./, n3_aspx_alphacode: /./, n4_note_form: /./, n5_contact_prefs: /./, n6_lookup_bar: /./, n7_list_filters: /./,
   n11_aspx_shadow: /./, n12_dialog: /./, n13_aspx_spannum: /./, n14_aspx_chrome_only: /./,
@@ -472,9 +499,14 @@ const ROUND5: Record<string, RegExp> = { r1_decimal: NO_PROGRESS };
 // Round 6 (Helm's blocker 1): the next page's own request, fired before the after-click reading
 // returned — the URL it went to (held: it must never reach the server).
 const HELM_B1: Record<string, string> = { b1_autoproc: `${P}/process`, b1_newapp: `${P}/newapp`, b1_fetchapp: `${P}/api/applications` };
-const AFTER_MODES = ["receipt", "filed", "review", "error", "same", "blank", ...Object.keys(ROUND2), ...Object.keys(ROUND3), ...Object.keys(ROUND4), ...Object.keys(ROUND5), ...Object.keys(HELM_B1)];
+// Round 6 (Q4): a receipt beside a small form the planner fills with the job's values. Acknowledgement
+// wording is refused at the after-click reading; with none, SAME INTERVIEW holds the form's post. The
+// account's list (pq_list_bound, round 4's stated residual) is now SAME INTERVIEW's too.
+const STRAYED = /somewhere other than the interview's own form/;
+const ROUND6: Record<string, RegExp> = { zzc_another: /acknowledgement/, zzc_more: /acknowledgement/, zzc_inqueue: /acknowledgement/, q4_noack_other: STRAYED, q4_noack_more: STRAYED, pq_list_bound: /acknowledgement|somewhere other than the interview's own form/ };
+const AFTER_MODES = ["receipt", "filed", "review", "error", "same", "blank", ...Object.keys(ROUND2), ...Object.keys(ROUND3), ...Object.keys(ROUND4), ...Object.keys(ROUND5), ...Object.keys(HELM_B1), ...Object.keys(ROUND6)];
 const results: Record<string, Walk> = {};
-const queue: Array<[string, string]> = [...AFTER_MODES.map((m) => [m, "structural"] as [string, string]), ["form", "structural"], ["pq_list_bound", "structural"], ["progress", "structural"], ["drift", "structural"], ["tileb", "structural"]];
+const queue: Array<[string, string]> = [...AFTER_MODES.map((m) => [m, "structural"] as [string, string]), ["form", "structural"], ["progress", "structural"], ["drift", "structural"], ["tileb", "structural"]];
 await Promise.all(Array.from({ length: 4 }, async () => {
   while (queue.length) {
     const [mode, permitType] = queue.shift()!;
@@ -503,6 +535,11 @@ for (const mode of AFTER_MODES) {
   if (ROUND4[mode]) {
     check(`after [${mode}] (round 4, the planner BOUND a job key; every content rule passed it): no proof — the incident names it`,
       (w.incidents?.[0]?.why ?? []).some((x) => ROUND4[mode].test(x)), JSON.stringify(w.incidents?.[0]?.why ?? []));
+  }
+  if (ROUND6[mode]) {
+    check(`after [${mode}] (round 6, Q4): the incident names the rule that caught it, and nothing of the job reached the receipt's form`,
+      (w.incidents?.[0]?.why ?? []).some((x) => ROUND6[mode].test(x)) && !w.hits.some((h) => h.method !== "GET" && /\/x\/(another|more|contact|my-permits)$/.test(h.url)),
+      JSON.stringify({ why: w.incidents?.[0]?.why ?? [], posts: posts(w) }));
   }
   if (ROUND5[mode]) {
     check(`after [${mode}] (round 5, the job's 6.5 held as 65 by a digits-only mask): no proof — the incident names it, and the note never reached the server`,
@@ -551,21 +588,8 @@ for (const [mode, sent] of Object.entries(HELM_B1)) {
   check("after [form] (round 5): the use was RESERVED once, at the admission, BEFORE it was reported (the backend checks the limits there)",
     w.reserved.length === 1 && w.reserved[0].passId === "pass-incident" && w.reserved[0].reportedBefore === 0 && /\/x\/sg$/.test(w.reserved[0].where), JSON.stringify(w.reserved));
   check("after [form] (round 3 positive control): the run entered the job's street (bound) — its own autosave passed the proof hold, then the form's Next reached the server",
-    w.hits.some((h) => h.method === "POST" && h.url === `${P}/autosave`) && w.hits.some((h) => h.method === "POST" && h.url === `${P}/sg2`), JSON.stringify(posts(w)));
+    w.hits.some((h) => h.method === "POST" && h.url === `${P}/autosave`) && w.hits.some((h) => h.method === "POST" && h.url === `${P}/sg` && h.names.includes("t_n2")), JSON.stringify(posts(w)));
   lines.push(`  note - [form] ${w.secs}s`);
-}
-{
-  // RESIDUAL (stated in the PR under "What remains"; passes ON PURPOSE): the account's list after the
-  // verified Next filed — but it offers an address filter, and the planner binds the job's street
-  // into it and the filter KEEPS it. That IS this job's own data held on that page: the proof is
-  // satisfied, no content rule catches the page, so no incident — to every reader the bot has it is
-  // the normal flow. Nothing detects it; what bounds it is once per project plus the verification's
-  // EXPIRY (round 4: INFO_PAGE_PASS_MAX_AGE_DAYS / INFO_PAGE_PASS_MAX_PROJECTS), not one project. If
-  // this check ever fails because the gap was closed, update the PR's "What remains".
-  const w = results.pq_list_bound;
-  check("RESIDUAL [pq_list_bound] (passes on purpose, stated in the PR): a filed page offering a field the planner binds to the job's own data satisfies the proof — no incident",
-    w.stopReason !== "info_page_incident" && !(w.incidents ?? []).length && (w.passed ?? []).length === 1, JSON.stringify({ stop: w.stopReason, incidents: w.incidents, message: w.message.slice(0, 200) }));
-  lines.push(`  note - [pq_list_bound] ${w.secs}s (residual)`);
 }
 {
   // ROUND 2 — A PASS ADMITS AT MOST ONCE PER PROJECT: the backend says this project already made

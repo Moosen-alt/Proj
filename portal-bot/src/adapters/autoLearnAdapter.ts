@@ -2163,6 +2163,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    *  read back (what its control holds, whether it is chrome) just before the run leaves the page,
    *  and only one that passes the shared predicate then lifts the hold. */
   private infoProof: { passes: Array<{ passId: string; where: string }>; page: number; step: RecipeStep | null; left: boolean; candidates: RecipeStep[] } | null = null;
+  /** Q4: the proof settled as the walk left that page — kept so a SAME INTERVIEW stray the backstop
+   *  held on the way out (state "strayed") is still the pass's incident at the walk's end. */
+  private infoProofSettled: AutoLearnAdapter["infoProof"] = null;
   /** What each fill / select / check entered (memory only, never on the step): the proof needs to
    *  know the value was not empty or trivial. Secrets are never kept here. */
   private infoProofValues = new WeakMap<RecipeStep, string>();
@@ -7727,6 +7730,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // proved page into a false incident at the walk's end.
         if (this.infoProof) {
           this.debug?.event({ type: "info_page_proof_settled", page: pageCount, field: String(this.infoProof.step?.field ?? "").slice(0, 40) });
+          this.infoProofSettled = this.infoProof;
           this.infoProof = null;
         }
         // An interstitial's forward control is clicked once per page (c2i'): remembered now, as
@@ -9148,18 +9152,24 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    * final submit). A walk whose proof is on record is returned unchanged.
    */
   private settleInfoPageProof(result: LearnResult, backstop: FilingBackstop | null): LearnResult {
-    const p = this.infoProof;
+    const state = backstop && typeof backstop.infoPageProofState === "function" ? backstop.infoPageProofState() : "none";
+    // Q4: the proof was given, but the page then sent its form somewhere other than the interview's
+    // own endpoint (the backstop's SAME INTERVIEW rule held it) — a receipt's form: the same incident.
+    const strayed = state === "strayed";
+    const p = this.infoProof ?? (strayed ? this.infoProofSettled : null);
     if (!p) return result;
     const steps = Array.isArray(result.steps) ? result.steps : [];
     const recorded = !!p.step && steps.includes(p.step)
       && infoPageProofOfProgressRefusals([this.infoProofStepOf(p.step)], this.infoPageProofValues).length === 0;
-    if (recorded) return result;
+    if (recorded && !strayed) return result;
     this.infoProof = null;
-    const state = backstop && typeof backstop.infoPageProofState === "function" ? backstop.infoPageProofState() : "none";
+    this.infoProofSettled = null;
     const left = p.left || state === "left";
     if (backstop && !left) { try { backstop.lockReview("a verified information page led to a page that took none of this job's data"); } catch { /* disposed */ } }
     const why = [
-      `${infoPageProofOfProgressRefusals([], this.infoPageProofValues)[0]} — the run ${left ? "left that page" : result.stopReason === "info_page_incident" ? "was about to leave that page" : "ended"} first`,
+      strayed
+        ? "the page the verified click led to took this job's data, then sent it somewhere other than the interview's own form (the backstop held it) — not the next step of this application"
+        : `${infoPageProofOfProgressRefusals([], this.infoPageProofValues)[0]} — the run ${left ? "left that page" : result.stopReason === "info_page_incident" ? "was about to leave that page" : "ended"} first`,
     ];
     for (const a of p.passes) this.infoPageIncidents.push({ passId: a.passId, phase: "after", why, where: a.where });
     this.debug?.event({ type: "info_page_incident", page: p.page, phase: "after", kind: "no_progress", left, why });
@@ -9172,7 +9182,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       reachedReview: false,
       pauseReason: null,
       stopReason: "info_page_incident",
-      message: `STOPPED AFTER A VERIFIED INFORMATION PAGE: the network backstop let one request through on the page a person verified; the page it led to read as a form, but the run ${left ? "left it" : "did not continue past it"} without entering any of this job's own data there (no fill, select or check bound to a project value whose control kept that value) — so nothing showed it was this job's application. It may have been a receipt: the verified page may have filed — check the portal for this project. Nothing is recorded as filed, and that verification is withdrawn. (The walk said: ${prior})`,
+      message: `STOPPED AFTER A VERIFIED INFORMATION PAGE: the network backstop let one request through on the page a person verified; the page it led to read as a form, but ${strayed ? "it then tried to send this job's data somewhere other than the interview's own form (held: nothing reached the server) — so it was not the next step of this job's application" : `the run ${left ? "left it" : "did not continue past it"} without entering any of this job's own data there (no fill, select or check bound to a project value whose control kept that value) — so nothing showed it was this job's application`}. It may have been a receipt: the verified page may have filed — check the portal for this project. Nothing is recorded as filed, and that verification is withdrawn. (The walk said: ${prior})`,
     };
   }
 

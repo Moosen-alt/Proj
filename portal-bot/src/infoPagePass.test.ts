@@ -30,7 +30,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, INFO_PAGE_NO_PROGRESS, INFO_PAGE_PASS_CLOCK_SKEW_MS, INFO_PAGE_PASS_EXPIRED, INFO_PAGE_PASS_MAX_AGE_DAYS, INFO_PAGE_PASS_MAX_PROJECTS, digestInfoPageIdentity, infoPageAfterClickSentWording, infoPageJobValueKeys, infoPageJobValues, infoPagePassExpiryRefusals, infoPageProofNorm, infoPageLabeledCodes, infoPageProofOfProgressRefusals, infoPageProofStepRefusals, infoPageAfterClickRefusals, infoPageBackstopRefusals, infoPageDriftedEntries, infoPageEvidence, infoPageMatchRefusals,
-  infoPageNumberTokens, infoPageObservedRequest, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageRunStateRefusals,
+  infoPageNumberTokens, infoPageAfterClickAckWording, infoPageObservedRequest, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageRunStateRefusals,
   infoPageShapeRefusals, infoPageVerifyWarnings, isMatchClassRefusal, mayPassInfoPage, parseFormBodyFields, verifiedInfoPageFromCandidate,
   type InfoPageBackstopState, type InfoPageIdentityMaterial, type InfoPagePassContext, type InfoPageProofStep, type InfoPageRunState, type InfoPageRunStep,
 } from "../../shared/src/infoPagePass";
@@ -320,6 +320,24 @@ console.log("\nAFTER THE CLICK (proposal §4; round 2): only POSITIVE evidence o
   // token on both pages is not new.
   const INFO_TEXT = `Permitting Information ${PROSE} Previous Next Call 503-000-0000 or TTY 711.`;
   const baseline = { tokens: infoPageNumberTokens(INFO_TEXT) };
+  // Q4 (round 6): a receipt with no record number and no sent wording beside a small form — the
+  // acknowledgement vocabulary refuses it; the information page's own wording never counts.
+  {
+    const ackBase = { tokens: infoPageNumberTokens(INFO_TEXT), ack: infoPageAfterClickAckWording(INFO_TEXT) };
+    const formReading = (text: string) => ({ readable: true, fillable: 2, terminal: false, text, formFields: 2, frames: 0, controlLabels: ["Next"] });
+    for (const t of [
+      "You're all set. A Permit Tech will email you within 5 business days. Start another solar request Site Address City Next",
+      "Thanks! Request complete. Tell us more about the site (optional): Site Address Unit / Suite Next",
+      "Success. Request accepted. Status: In queue. Site Address ZIP Continue",
+      "Request accepted - status: In Review. Additional details (optional) Name Phone Next",
+      "Received. Please provide additional information. Name Phone Next",
+    ]) {
+      const r = infoPageAfterClickRefusals(formReading(t), ackBase);
+      check(`Q4: an acknowledgement beside a small form refuses (${t.slice(0, 40)}…)`, r.some((x) => /acknowledgement/.test(x)), JSON.stringify(r));
+    }
+    const legit = infoPageAfterClickRefusals(formReading(`Project Information Please complete the following. Site Address Unit / Suite Next ${INFO_TEXT}`), ackBase);
+    check("Q4: the next step's form (the information page's own wording beside it) is not an acknowledgement", legit.length === 0, JSON.stringify(legit));
+  }
   const form = { readable: true, fillable: 3, terminal: false, text: "Project Information Site Address Unit / Suite Previous Next Call 503-000-0000 or TTY 711.", formFields: 2, frames: 0, controlLabels: ["Placeholder Solar Co", "Previous", "Next"] };
   check("the application form (two empty plain fields in one form, not terminal, neither filed nor an error, no new number) passes",
     infoPageAfterClickRefusals(form, baseline).length === 0, JSON.stringify(infoPageAfterClickRefusals(form, baseline)));
