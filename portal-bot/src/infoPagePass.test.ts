@@ -643,7 +643,9 @@ console.log("\nGREP PINS");
   const ledger: Array<[string, string, string]> = [
     ["portal.info_page_learn_started", "ACT_LEARN_STARTED", "recordInfoPageLearnStart"],
     ["portal.info_page_learn_clean", "ACT_LEARN_CLEAN", "recordInfoPageLearnClean"],
-    ["portal.info_page_passed", "ACT_PASSED", "recordInfoPagePassUses"],
+    // Round 5: a use is RESERVED at the admission itself — the reservation is the one writer (a use
+    // reported without one is recorded through it too, never by a second write).
+    ["portal.info_page_passed", "ACT_PASSED", "reserveInfoPagePassUse"],
     ["portal.info_page_held_verified", "ACT_HELD_VERIFIED", "recordInfoPageHeldVerified"],
     ["portal.info_page_pass_allowed_again", "ACT_ALLOWED_AGAIN", "allowInfoPagePassOnceMore"],
     // Round 3: the may-have-filed warning (evidence) — one writer: the after-click incident.

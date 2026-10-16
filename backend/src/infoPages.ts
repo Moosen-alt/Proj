@@ -837,12 +837,55 @@ export function listInfoPagePasses(db: AppDb, nowMs: number = Date.now()): InfoP
   });
 }
 
-/** Every use of the relaxation is on record: one audit row per admission, written the moment the
- *  learner reports it (autoLearn's onInfoPagePassed), with its side — and every later run of this
- *  project on that side counts it as progress (a pass admits at most once per project and side). A
- *  write that fails throws: the caller's own counter and the unclean learn start still refuse. */
+/**
+ * ROUND 5 — A USE IS RESERVED AT ADMISSION, NOT WHEN THE PASS IS HANDED OUT. The network backstop
+ * awaits this (through the learner's reserveInfoPagePass, autoLearn) at the moment it would let a
+ * verified page's ONE request through; a refusal — or a throw — holds that request exactly as on
+ * main. Inside ONE transaction: re-read the pass (still a person's verification on record, at the
+ * current identity version — a pass withdrawn while the run was in flight refuses), re-read the use
+ * ledger, refuse when the verification is expired NOW (shared infoPagePassExpiryRefusals: 30 days,
+ * a clock-skewed time, or INFO_PAGE_PASS_MAX_PROJECTS distinct projects already — so a NEW project
+ * that would make it 11 refuses), else write the use row. The pass is handed out earlier
+ * (liveInfoPagePasses, per attempt): runs in flight at the same time were each handed it, and only
+ * this check decides. THE ONLY WRITER OF ACT_PASSED (the source scan pins it).
+ *
+ * `admitted` (recordInfoPagePassUses only): the request ALREADY went — a use the learner reported
+ * without a reservation. Nothing can be refused then; it is written all the same (counted, never
+ * dropped: over-counting holds runs, under-counting would admit them). Returns the refusals (empty =
+ * reserved / recorded).
+ */
+export function reserveInfoPagePassUse(
+  db: AppDb, projectId: string, runId: string, scope: Side, use: { passId: string; where: string },
+  opts: { nowMs?: number; admitted?: boolean } = {},
+): string[] {
+  const passId = s(use?.passId);
+  const where = s(use?.where).slice(0, 200);
+  return db.transaction(() => {
+    if (opts.admitted !== true) {
+      // The clock is read HERE, at the admission — never the hand-out's.
+      const nowMs = typeof opts.nowMs === "number" && Number.isFinite(opts.nowMs) ? opts.nowMs : Date.now();
+      if (!passId) return ["the use could not be reserved (no verified page named)"];
+      const r = db.get<Row>("SELECT * FROM portal_info_page_passes WHERE id = ?", [passId]);
+      if (!r || Number(r.identity_version) !== INFO_PAGE_IDENTITY_VERSION || !passIsOnRecord(db, r)) {
+        return ["the use could not be reserved (that verification is no longer on record: it was withdrawn or changed while the run was in flight)"];
+      }
+      const uses = infoPagePassUseCounts(db);
+      const why = infoPagePassExpiryRefusals(s(r.verified_at), uses ? uses.get(passId) ?? 0 : null, nowMs);
+      if (why.length) return why;
+    }
+    addAuditLog(db, projectId, "portal_bot", "network backstop", ACT_PASSED, { runId, scope, passId, where });
+    return [];
+  });
+}
+
+/** Every use of the relaxation is on record: one audit row per admission — RESERVED at the admission
+ *  itself (round 5: reserveInfoPagePassUse, the one writer) — with its side, and every later run of
+ *  this project on that side counts it as progress (a pass admits at most once per project and
+ *  side). This records a use the learner reported that was NOT reserved (autoLearn skips the ones it
+ *  reserved: one row per use, never two). A write that fails throws: the caller's own counter and
+ *  the unclean learn start still refuse. */
 export function recordInfoPagePassUses(db: AppDb, projectId: string, runId: string, scope: Side, passed: ReadonlyArray<{ passId: string; where: string }> | null | undefined): void {
   for (const p of Array.isArray(passed) ? passed : []) {
-    addAuditLog(db, projectId, "portal_bot", "network backstop", ACT_PASSED, { runId, scope, passId: s(p.passId), where: s(p.where).slice(0, 200) });
+    reserveInfoPagePassUse(db, projectId, runId, scope, { passId: s(p.passId), where: s(p.where) }, { admitted: true });
   }
 }

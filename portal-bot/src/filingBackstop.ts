@@ -83,6 +83,15 @@ import type { VerifiedInfoPage } from "../../shared/src/types";
 
 export type BackstopRule = "filing-url" | "dismisser-window" | "enter-window" | "review-lockdown";
 
+/** #344 round 5 — THE USE IS RESERVED AT ADMISSION: asked (and awaited) the moment the backstop would
+ *  let a verified page's ONE request through 4(b) — the backend re-reads the verification's limits
+ *  and writes the use in one transaction (backend infoPages.reserveInfoPagePassUse). Returns the
+ *  refusals; empty = reserved. A refusal, a throw, or no reservation at all holds the request exactly
+ *  as on main. */
+export type InfoPageReserve = (entryId: string, where: string) => ReadonlyArray<string> | Promise<ReadonlyArray<string>>;
+/** The refusal when the run has no way to reserve a use (fail closed: held as on main). */
+export const INFO_PAGE_NO_RESERVATION = "a use of this verified page cannot be reserved on this run (no reservation given)";
+
 /** What openInfoPagePass answered (#344). `candidateWatch`: no verified page matched, and ONLY
  *  that refused — the backstop watches this page's held forward request so the run can record it
  *  for a person to verify. */
@@ -187,8 +196,10 @@ export interface FilingBackstop {
    *  Passing, ONE slot opens: that page's main-frame document POST equal to the verified control's
    *  request passes rule 4(b) only, once, within 20 s. Refused only because no verified page
    *  matches, a WATCH opens instead: the held request is observed for takeInfoPageCandidate. Any
-   *  other refusal opens nothing. Opening closes any earlier slot or watch. */
-  openInfoPagePass(page: unknown, control: unknown, opts: { entries: ReadonlyArray<VerifiedInfoPage>; run: InfoPageRunState }): Promise<InfoPagePassOpen>;
+   *  other refusal opens nothing. Opening closes any earlier slot or watch. Round 5: the slot's
+   *  request is let through only after `reserve` (awaited at that admission) reserved the use; with
+   *  no `reserve` nothing opens. */
+  openInfoPagePass(page: unknown, control: unknown, opts: { entries: ReadonlyArray<VerifiedInfoPage>; run: InfoPageRunState; reserve?: InfoPageReserve }): Promise<InfoPagePassOpen>;
   /** Close the info-page slot and watch now (the caller's click is over). */
   closeInfoPagePass(): void;
   /** AFTER A VERIFIED INFORMATION PAGE'S CLICK (proposal §4): read the page it led to (main frame)
@@ -618,7 +629,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // watch, and what each admitted. Every closer below also closes these.
   let everWrote = false;
   let approvedEverOpened = false;
-  type InfoSlot = { page: unknown; entryId: string; expected: InfoPageExpectedRequest; pageKey: string; beforeTokens: string[]; until: number; open: boolean; timer: ReturnType<typeof setTimeout> | null; detach: () => void };
+  type InfoSlot = { page: unknown; entryId: string; expected: InfoPageExpectedRequest; pageKey: string; beforeTokens: string[]; reserve: InfoPageReserve; until: number; open: boolean; timer: ReturnType<typeof setTimeout> | null; detach: () => void };
   let infoSlot: InfoSlot | null = null;
   type InfoWatch = { page: unknown; capture: InfoPageCandidateTake; until: number; open: boolean; timer: ReturnType<typeof setTimeout> | null; detach: () => void };
   let infoWatch: InfoWatch | null = null;
@@ -757,7 +768,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     // slot is gone, and consuming it changes no rule's outcome: the request meets payment, the
     // filing-URL rule, the windows and the sticky lock (4a) below exactly as on main, and only 4(b)
     // can be lifted — only when R2-R5 all hold (URL, media, ordered body, the page's address).
-    let infoAdmit: { entryId: string; refusals: string[]; tokens: string[] } | null = null;
+    let infoAdmit: { entryId: string; refusals: string[]; tokens: string[]; reserve: InfoPageReserve } | null = null;
     if (infoSlotLive()) {
       const s = infoSlot!;
       const pg = pageOfRequest(request);
@@ -779,7 +790,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         let pageUrl = "";
         try { pageUrl = String(pg.url() || ""); } catch { pageUrl = ""; }
         if (!pageUrl || pageKeyOf(pageUrl) !== s.pageKey) refusals.push("the page's address is not the one whose identity was read");
-        infoAdmit = { entryId: s.entryId, refusals, tokens: s.beforeTokens };
+        infoAdmit = { entryId: s.entryId, refusals, tokens: s.beforeTokens, reserve: s.reserve };
         if (refusals.length) infoPageRefusedRequests.push({ where: whereOf(url), refusals });
       }
     }
@@ -886,6 +897,26 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         // A HUMAN-VERIFIED INFORMATION PAGE'S ONE REQUEST (#344): the slot openInfoPagePass opened
         // (identity, prefix, run state and shape all held at the click) took this request and it
         // is exactly the verified control's. 4(b) only: everything above already applied.
+        // ROUND 5 — RESERVED HERE, AT THE ADMISSION: the verification's limits (30 days, 10
+        // projects, a skewed clock, still on record) are checked again and the use written in one
+        // backend transaction before anything is let through. A refusal, a throw or a malformed
+        // answer falls through to the abort below — the hold exactly as on main, its reason named.
+        if (infoAdmit && infoAdmit.refusals.length === 0) {
+          let reserved: string[];
+          try {
+            const answer = await infoAdmit.reserve(infoAdmit.entryId, whereOf(url));
+            reserved = Array.isArray(answer) ? answer.map((x) => String(x)) : ["the use could not be reserved (no answer)"];
+          } catch (e) {
+            reserved = [`the use could not be reserved (${String((e as { message?: string })?.message ?? e).slice(0, 80)})`];
+          }
+          // The await is the one place this handler yields with a slot's request in hand: a run that
+          // locked or was disposed meanwhile is never let through (the use stays counted).
+          if (!reserved.length && (locked || disposed)) reserved = ["the run locked while the use was being reserved"];
+          if (reserved.length) {
+            infoAdmit.refusals.push(...reserved);
+            infoPageRefusedRequests.push({ where: whereOf(url), refusals: reserved });
+          }
+        }
         if (infoAdmit && infoAdmit.refusals.length === 0) {
           infoPageAdmissions.push({ entryId: infoAdmit.entryId, where: whereOf(url), exempted: true });
           admittedEntryIds.push(infoAdmit.entryId);
@@ -1026,7 +1057,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       if (!locked) locked = `the run is at review (${String(why || label).slice(0, 100)}) — nothing legitimate posts from here until a person takes the page`;
     },
     stoppingAborts() { return aborts.filter(isStoppingAbort); },
-    async openInfoPagePass(pg: unknown, control: unknown, opts: { entries: ReadonlyArray<VerifiedInfoPage>; run: InfoPageRunState }): Promise<InfoPagePassOpen> {
+    async openInfoPagePass(pg: unknown, control: unknown, opts: { entries: ReadonlyArray<VerifiedInfoPage>; run: InfoPageRunState; reserve?: InfoPageReserve }): Promise<InfoPagePassOpen> {
       // A new open closes any earlier slot or watch (a candidate already observed is kept).
       closeInfo();
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1062,10 +1093,13 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       if (!refusals.length && reading.ok && digest) {
         const entry = infoPagePassEntry(ctx);
         if (!entry) return { opened: false, refusals: ["no verified information page matches"], candidateWatch: false };
+        // Round 5: no way to reserve the use at the admission = nothing opens (held as on main).
+        const reserve = opts && typeof opts.reserve === "function" ? opts.reserve : null;
+        if (!reserve) return { opened: false, refusals: [INFO_PAGE_NO_RESERVATION], candidateWatch: false };
         const m = reading.material;
         const q = m.page.query.map(([k, v]) => [k, v]);
         const s: InfoSlot = {
-          page: p, entryId: entry.id, expected: digest.expected, beforeTokens: infoPageNumberTokens(m.text),
+          page: p, entryId: entry.id, expected: digest.expected, beforeTokens: infoPageNumberTokens(m.text), reserve,
           pageKey: JSON.stringify([m.page.origin, m.page.path, q]), until: Date.now() + INFO_PAGE_SLOT_MS, open: true, timer: null, detach: () => undefined,
         };
         const c = bindInfoClosers(p, () => { if (infoSlot === s) closeInfoSlot(); });

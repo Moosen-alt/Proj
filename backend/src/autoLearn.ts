@@ -45,7 +45,7 @@ import { logger } from "./logger";
 import { ensurePlanSetSplit } from "./docSplitter";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
-import { expiredInfoPagePassFor, infoPagePriorProgress, isCleanInfoPageHold, liveInfoPagePasses, recordInfoPageCandidate, recordInfoPageHeldVerified, recordInfoPageLearnClean, recordInfoPageLearnStart, recordInfoPagePassIncidents, recordInfoPagePassUses } from "./infoPages";
+import { expiredInfoPagePassFor, infoPagePriorProgress, isCleanInfoPageHold, liveInfoPagePasses, recordInfoPageCandidate, recordInfoPageHeldVerified, recordInfoPageLearnClean, recordInfoPageLearnStart, recordInfoPagePassIncidents, recordInfoPagePassUses, reserveInfoPagePassUse } from "./infoPages";
 import { formPurposeMismatch } from "./formPurpose";
 import { looksBotBlocked } from "./runAbort";
 import { id } from "./ids";
@@ -1165,6 +1165,11 @@ async function autoLearnPortalInner(
     afterIncident: false,
     incidentRecorded: false,
     incidentError: "",
+    /** Round 5: the uses RESERVED at admission (reserveInfoPagePass) whose row is already written — the
+     *  learner's report of each (onInfoPagePassed, or settle's "missed") consumes one and writes nothing. */
+    reserved: [] as Array<{ passId: string; where: string }>,
+    /** Round 5: why a reservation held the request (the run message names an expired verification). */
+    reserveRefused: [] as string[],
   };
   type InfoPageAttemptInput = { passes: ReturnType<typeof liveInfoPagePasses>; priorProgress: boolean };
   const noInfoPagePass: InfoPageAttemptInput = { passes: [], priorProgress: true };
@@ -1182,11 +1187,36 @@ async function autoLearnPortalInner(
     catch { return noInfoPagePass; }
     return input;
   };
+  // ROUND 5 — THE USE IS RESERVED AT ADMISSION: the network backstop awaits this the moment it would
+  // let a verified page's one request through. The pass was handed out at the attempt's start, so the
+  // limits are checked again HERE, in one transaction with the use row (infoPages.reserveInfoPagePassUse):
+  // an expired verification (30 days, a skewed clock, 10 projects — counting the runs in flight that
+  // reserved first) or a pass withdrawn meanwhile refuses, and a refusal or a throw holds the request
+  // exactly as on main. A learn with no project row reserves nothing (and was handed no pass).
+  const reserveInfoPagePass = (p: { passId: string; where: string }): string[] => {
+    const use = { passId: String(p?.passId ?? ""), where: String(p?.where ?? "") };
+    let why: string[];
+    if (!infoPageProjectRow) why = ["the use could not be reserved (no project row)"];
+    else {
+      try { why = reserveInfoPagePassUse(db, projectId, "", scopeType, use); }
+      catch (err) { why = [`the use could not be reserved (${err instanceof Error ? err.message.slice(0, 80) : String(err).slice(0, 80)})`]; }
+    }
+    if (why.length) infoPageCall.reserveRefused.push(...why.slice(0, 3));
+    else infoPageCall.reserved.push(use);
+    return why;
+  };
+  /** A use already written by its reservation: consumed once, so the report writes no second row. */
+  const takeReserved = (use: { passId: string }): boolean => {
+    const i = infoPageCall.reserved.findIndex((r) => r.passId === use.passId);
+    if (i < 0) return false;
+    infoPageCall.reserved.splice(i, 1);
+    return true;
+  };
   const onInfoPagePassed = (p: { passId: string; where: string }): void => {
     const use = { passId: String(p?.passId ?? ""), where: String(p?.where ?? "") };
     infoPageCall.admitted.push(use);
     infoPageCall.attempt.push(use);
-    if (!infoPageProjectRow) return;
+    if (!infoPageProjectRow || takeReserved(use)) return;
     try { recordInfoPagePassUses(db, projectId, "", scopeType, [use]); } catch { /* the counter and the unclean start still refuse */ }
   };
   // After each attempt: the admissions the callback did not write, its incidents (a discarded retry's
@@ -1201,7 +1231,15 @@ async function autoLearnPortalInner(
     if (missed.length) {
       infoPageCall.admitted.push(...missed);
       infoPageCall.attempt.push(...missed);
-      if (infoPageProjectRow) { try { recordInfoPagePassUses(db, projectId, runId, scopeType, missed); } catch { /* the counter still refuses */ } }
+      const unreserved = missed.filter((u) => !takeReserved(u));
+      if (infoPageProjectRow && unreserved.length) { try { recordInfoPagePassUses(db, projectId, runId, scopeType, unreserved); } catch { /* the counter still refuses */ } }
+    }
+    // ROUND 5: a use RESERVED (the backstop admitted it) that the learner never reported is a use of
+    // this attempt all the same — its row is written; a learn that threw after it is an incident.
+    if (infoPageCall.reserved.length) {
+      const unreported = infoPageCall.reserved.splice(0);
+      infoPageCall.admitted.push(...unreported);
+      infoPageCall.attempt.push(...unreported);
     }
     const thisAttempt = [...infoPageCall.attempt];
     const incidents: InfoPageIncident[] = Array.isArray(l?.infoPageIncidents) ? [...l.infoPageIncidents] : [];
@@ -1449,6 +1487,8 @@ async function autoLearnPortalInner(
       // every admission reported at once.
       infoPagePasses: infoPageInput.passes,
       infoPagePriorProgress: infoPageInput.priorProgress,
+      // Round 5: the backstop reserves each use at the admission itself (limits checked there).
+      reserveInfoPagePass,
       onInfoPagePassed,
       // #344 round 3: the page after a verified one must take one of these before the run leaves it.
       infoPageProofValues,
@@ -1602,6 +1642,12 @@ async function autoLearnPortalInner(
     }
     if (Array.isArray(learn.infoPageHeldVerified) && learn.infoPageHeldVerified.length) {
       infoPageLine += " Held at a verified information page because this project already made progress on this portal; a person who has checked the application can allow it once more (project → Portal runs).";
+    }
+    // ROUND 5: held at a verified page's click because its use could not be RESERVED at the admission
+    // (the verification expired while the run was in flight, it was withdrawn, or the ledger failed).
+    if (infoPageCall.reserveRefused.length) {
+      const why = infoPageCall.reserveRefused.find((w) => w.startsWith(INFO_PAGE_PASS_EXPIRED)) ?? infoPageCall.reserveRefused[0];
+      infoPageLine += ` Held at a verified information page's click, exactly as without a verification: ${why}.`;
     }
     const cand = learn.infoPageCandidate;
     if (cand && cand.observed && projectRow) {

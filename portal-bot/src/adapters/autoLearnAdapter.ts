@@ -2144,6 +2144,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   /** #344 round 2 — told AT ONCE of every admission (the backend writes the use down before anything
    *  else can happen: a learn that throws later still has it on record). */
   private onInfoPagePassed: ((p: { passId: string; where: string }) => void) | undefined;
+  /** #344 round 5 — the backend's RESERVATION of a use, asked by the network backstop at the admission
+   *  itself (the verification's limits checked again there). None = no use can be reserved: every
+   *  verified page is held exactly as on main (fail closed). */
+  private reserveInfoPagePass: ((p: { passId: string; where: string }) => ReadonlyArray<string> | Promise<ReadonlyArray<string>>) | undefined;
   /** The project's own values (street, name, parcel, system size): a page that shows them before
    *  anything was entered is a summary, never an information page. */
   private infoPageProjectValues: string[] = [];
@@ -2376,6 +2380,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
        *  held untouched, a run that reached review / paused / was interrupted, a number, a draft or a
        *  filing). Not given = true (refuses). */
       infoPagePriorProgress?: boolean;
+      /** #344 round 5: the backend's reservation of a use (infoPages.reserveInfoPagePassUse), awaited
+       *  by the network backstop at the admission of a verified page's one request. Refusals; empty =
+       *  reserved. A refusal, a throw or none given holds the request exactly as on main. */
+      reserveInfoPagePass?: (p: { passId: string; where: string }) => ReadonlyArray<string> | Promise<ReadonlyArray<string>>;
       /** #344 round 2: called synchronously for every information page the backstop admitted, the
        *  moment the click is settled (the backend records the use before the walk goes on). */
       onInfoPagePassed?: (p: { passId: string; where: string }) => void;
@@ -2398,6 +2406,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     this.infoPagePasses = Object.freeze((options.infoPagePasses ?? []).map((e) => Object.freeze(JSON.parse(JSON.stringify(e)) as VerifiedInfoPage)));
     this.infoPagePriorProgress = options.infoPagePriorProgress !== false;
     this.onInfoPagePassed = typeof options.onInfoPagePassed === "function" ? options.onInfoPagePassed : undefined;
+    this.reserveInfoPagePass = typeof options.reserveInfoPagePass === "function" ? options.reserveInfoPagePass : undefined;
     this.infoPageProofValues = Object.freeze(((): Record<string, string> => {
       const v = options.infoPageProofValues;
       const out: Record<string, string> = {};
@@ -8890,8 +8899,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       projectValues: [...this.infoPageProjectValues],
     };
     let r: InfoPagePassOpen;
+    // Round 5: the backstop awaits the backend's reservation at the admission itself.
+    const reserveFn = this.reserveInfoPagePass;
+    const reserve = reserveFn ? (entryId: string, where: string) => reserveFn({ passId: entryId, where }) : undefined;
     try {
-      r = await door.openInfoPagePass(this.page, loc, { entries: this.infoPagePasses, run });
+      r = await door.openInfoPagePass(this.page, loc, { entries: this.infoPagePasses, run, reserve });
     } catch (e) {
       r = { opened: false, refusals: [`the pass could not be asked (${String((e as { message?: string })?.message ?? e).slice(0, 80)})`], candidateWatch: false };
     }

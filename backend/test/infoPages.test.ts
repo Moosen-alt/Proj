@@ -152,7 +152,10 @@ const stubLearn = () => ({
 });
 // Round 2: every attempt's input is kept (the headed retry is a second call), and a test may script
 // the attempts itself (report a use through the learner's own callback, throw, look bot-blocked…).
-type LearnInput = { infoPagePasses?: Array<{ id: string }>; infoPagePriorProgress?: boolean; onInfoPagePassed?: (p: { passId: string; where: string }) => void; infoPageProofValues?: Record<string, string> };
+type LearnInput = {
+  infoPagePasses?: Array<{ id: string }>; infoPagePriorProgress?: boolean; onInfoPagePassed?: (p: { passId: string; where: string }) => void; infoPageProofValues?: Record<string, string>;
+  reserveInfoPagePass?: (p: { passId: string; where: string }) => ReadonlyArray<string> | Promise<ReadonlyArray<string>>;
+};
 let handedAll: LearnInput[] = [];
 let scripted: Array<(input: LearnInput) => unknown> = [];
 autoLearn.setAutoLearnSeamsForTests({ learnPortal: (async (input: LearnInput) => {
@@ -935,6 +938,110 @@ await check("round 4 (expiry, age): a verification is authority for 30 days — 
   } finally { Date.now = realNow; }
   assert.ok(IP.liveInfoPagePasses(db).some((p) => p.id === reverified), "the re-verified pass is live");
   assert.equal(db.query("SELECT id FROM portal_info_page_passes WHERE id = ?", [passId]).length, 0);
+});
+
+// ── ROUND 5: THE USE IS RESERVED AT ADMISSION (verification round 4's B1) ───────────────────────
+// The pass is handed out at each attempt's start; the limits are checked again — and the use written
+// — at the moment the backstop would let the request through (the learner's reserveInfoPagePass →
+// infoPages.reserveInfoPagePassUse, one transaction). Kill: make the reservation always succeed and
+// the race admits three, day 30 admits.
+// (An earlier check plants a malformed ledger row on purpose: read each row defensively.)
+const usesOf = (passId: string) => fx.audits("portal.info_page_passed").filter((a) => { try { return JSON.parse(a.details).passId === passId; } catch { return false; } });
+const heldAtClick = () => passedResult({ stopReason: "backstop_abort", message: "Stopped by the network backstop.", steps: [], pageCount: 3 });
+await check("round 5 (B1, the race): three learns IN FLIGHT at once on three projects (different utilities: no lease separates them), each HANDED the pass while the ledger read 9 — exactly ONE is admitted at the admission, the other two are HELD ('verification expired — a person re-verifies'), the ledger stops at 10, and the admitted use is on record ONCE", async () => {
+  const { passId } = await verifiedPage("Round5 Race Page");
+  for (let i = 0; i < 9; i++) IP.recordInfoPagePassUses(db, fx.newProject(), "", "ahj", [{ passId, where: sfjsp }]);
+  assert.equal(new Set(usesOf(passId).map((a) => a.project_id)).size, 9, "premise: the ledger reads 9");
+  assert.ok(IP.liveInfoPagePasses(db).some((p) => p.id === passId), "premise: at 9 the pass is live");
+  const Q = [fx.newProject({ utility: "PGE" }), fx.newProject({ utility: "Pacific Power" }), fx.newProject({ utility: "Portland General Electric" })];
+  // ALL THREE HANDED OUT FIRST: each call computes its passes and then records its learn start
+  // (armInfoPageAttempt) BEFORE the browser queue (MAX_CONCURRENT_PORTAL_RUNS, 2 by default — the third
+  // learn waits there holding the pass it was handed, as a run waiting on a portal profile does). No
+  // learn reaches its click until all three starts are on record.
+  const allHanded = async (): Promise<void> => {
+    for (let i = 0; i < 1000; i++) {
+      if (Q.every((q) => fx.audits("portal.info_page_learn_started").some((a) => a.project_id === q))) return;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error("the three learns were not all handed out");
+  };
+  const seen: Array<{ handed: boolean; why: string[] }> = [];
+  const racer = async (input: LearnInput) => {
+    const handedIt = (input.infoPagePasses ?? []).some((e) => e.id === passId);
+    await allHanded(); // all three were handed the pass before any one reaches its click
+    const why = [...(await input.reserveInfoPagePass!({ passId, where: sfjsp }))];
+    seen.push({ handed: handedIt, why });
+    if (why.length) return heldAtClick();
+    input.onInfoPagePassed?.({ passId, where: sfjsp });
+    return passedResult({ infoPagePassed: [{ passId, where: sfjsp }] });
+  };
+  scripted = [racer, racer, racer];
+  const rs = await Promise.all(Q.map((q) => runLearn(q)));
+  assert.equal(seen.length, 3, "all three learns reached their click");
+  assert.ok(seen.every((x) => x.handed), `every learn was handed the pass: ${JSON.stringify(seen)}`);
+  const admitted = seen.filter((x) => x.why.length === 0);
+  assert.equal(admitted.length, 1, `exactly ONE admitted: ${JSON.stringify(seen)}`);
+  assert.ok(seen.filter((x) => x.why.length).every((x) => x.why.some((w) => /^verification expired — a person re-verifies/.test(w) && /at most 10 projects/.test(w))), JSON.stringify(seen));
+  const ledger = usesOf(passId);
+  assert.equal(new Set(ledger.map((a) => a.project_id)).size, 10, "the ledger stops at 10 distinct projects");
+  const won = Q.filter((q) => ledger.some((a) => a.project_id === q));
+  assert.equal(won.length, 1);
+  assert.equal(ledger.filter((a) => a.project_id === won[0]).length, 1, "the reserved use is on record ONCE (the report wrote no second row)");
+  for (const [i, q] of Q.entries()) {
+    if (q === won[0]) continue;
+    assert.equal(ledger.filter((a) => a.project_id === q).length, 0, "a held run wrote no use");
+    assert.match(String(rs[i].message), /verification expired — a person re-verifies/);
+  }
+  assert.ok(!IP.liveInfoPagePasses(db).some((p) => p.id === passId), "after 10 the pass is no longer live");
+});
+await check("round 5 (B1, day 30): a pass HANDED OUT one minute before day 30 and reaching its click one minute after it is HELD at the admission (the clock is read there); the same run reaching its click before day 30 is admitted (the positive control)", async () => {
+  const { passId } = await verifiedPage("Round5 Day30 Page");
+  const realNow = Date.now;
+  const day30 = 30 * 86_400_000;
+  const run = async (clickAt: number): Promise<{ handed: boolean; why: string[]; message: string; project: string }> => {
+    const project = fx.newProject();
+    let handedIt = false;
+    let why: string[] = [];
+    scripted = [async (input: LearnInput) => {
+      handedIt = (input.infoPagePasses ?? []).some((e) => e.id === passId);
+      Date.now = () => realNow() + clickAt; // the walk (and any profile wait) took this long
+      why = [...(await input.reserveInfoPagePass!({ passId, where: sfjsp }))];
+      if (why.length) return heldAtClick();
+      input.onInfoPagePassed?.({ passId, where: sfjsp });
+      return passedResult({ infoPagePassed: [{ passId, where: sfjsp }] });
+    }];
+    try {
+      Date.now = () => realNow() + day30 - 60_000; // handed out one minute before day 30
+      const r = await runLearn(project);
+      return { handed: handedIt, why, message: String(r.message), project };
+    } finally { Date.now = realNow; }
+  };
+  const late = await run(day30 + 60_000);
+  assert.ok(late.handed, "premise: handed the pass before day 30");
+  assert.ok(late.why.some((w) => /^verification expired — a person re-verifies/.test(w) && /30 days/.test(w)), JSON.stringify(late.why));
+  assert.equal(usesOf(passId).filter((a) => a.project_id === late.project).length, 0, "nothing admitted, nothing written");
+  assert.match(late.message, /verification expired — a person re-verifies/);
+  const early = await run(day30 - 30_000);
+  assert.ok(early.handed && early.why.length === 0, `admitted before day 30: ${JSON.stringify(early.why)}`);
+  assert.equal(usesOf(passId).filter((a) => a.project_id === early.project).length, 1);
+});
+await check("round 5: a pass withdrawn (or never on record) while a run was in flight cannot be reserved — held", () => {
+  const why = IP.reserveInfoPagePassUse(db, fx.newProject(), "", "ahj", { passId: "no-such-pass", where: sfjsp });
+  assert.ok(why.some((w) => /no longer on record/.test(w)), JSON.stringify(why));
+  assert.equal(usesOf("no-such-pass").length, 0);
+});
+await check("round 5 (clock skew): a verification whose time reads 10 minutes in the FUTURE is not handed out and cannot be reserved; 4 minutes ahead is within the tolerance", async () => {
+  const { passId } = await verifiedPage("Round5 Skew Page");
+  const realNow = Date.now;
+  try {
+    Date.now = () => realNow() - 10 * 60_000;
+    assert.ok(!IP.liveInfoPagePasses(db).some((p) => p.id === passId), "a future verification time was handed out");
+    const why = IP.reserveInfoPagePassUse(db, fx.newProject(), "", "ahj", { passId, where: sfjsp });
+    assert.ok(why.some((w) => /^verification expired — a person re-verifies/.test(w) && /future/.test(w)), JSON.stringify(why));
+    assert.equal(usesOf(passId).length, 0);
+    Date.now = () => realNow() - 4 * 60_000;
+    assert.ok(IP.liveInfoPagePasses(db).some((p) => p.id === passId), "4 minutes ahead: within the tolerance");
+  } finally { Date.now = realNow; }
 });
 
 // ── ROUTES ───────────────────────────────────────────────────────────────────────────────────────
