@@ -330,40 +330,9 @@ export function portalSafetyFactory() {
   // production false stop as the "(Read-only)" marker. "Review and Confirm" counts only as a
   // heading (end of line / sentence) or followed by the application / submission / permit /
   // request it confirms.
-  // PRE-FORM ONLY: SOMEONE ELSE'S FUTURE REVIEW (#344; scoped by Helm's review of #349).
-  // "<someone> will / shall / may / would / is going to review your submission" is prose about
-  // someone else's future review of what will be filed. On a page BEFORE the application's form
-  // it is not the page naming itself the review step: City of Portland DevHub (live, 2026-10-14)
-  // says "A Permit Tech will review your submission for minimum submittal standards" on its
-  // PERMITTING INFORMATION page; the learner already passes that page as an interstitial
-  // (#341/#345), but the network backstop's live review lockdown (4b) read it as terminal and
-  // aborted its Next POST, so the permit run stopped there with nothing entered.
-  // REVIEW_PAGE_PRE_FORM drops that ONE alternative under a bounded modal (at most one short
-  // adverb between: "will then review", "will carefully review"). It is asked ONLY with
-  // { preForm: true }, and only the backstop's 4b passes that, only while the learner says no page
-  // with a form control has been seen yet on this run (filingBackstop setPreForm). Everywhere else —
-  // the learner's own classification, replay's click gate, the signature reader, and the backstop
-  // from the first form page on — main's WIDE reading holds: a real review page whose ONLY review
-  // wording is "Staff will review your application within 5 business days. Click Next to send it"
-  // must stop. On the narrowed reading everywhere such a page FILED (Helm's probes m2–m5, PR #349):
-  // with no review signal left it was neither the learner's review page nor the backstop's terminal
-  // one. An uncertain reading may veto, never pass.
-  // Even pre-form, deliberately NOT "to review your …" ("Take a moment to review your application
-  // before submitting") and NOT must / can / should ("You must review your application before
-  // submitting") — both are the review page talking to the applicant. And NOT a present-tense "we
-  // review": PacifiCorp's PowerClerk submit page names no step and its ONE review wording is "Once
-  // we review the application and confirm it is eligible …" — any wider cut un-names a real
-  // filing page.
-  // THE APPLICANT AS SUBJECT STAYS REVIEW (a conservative default, kept on Helm's review): in "You
-  // may review your application below before submitting" / "You're going to review your details"
-  // the modal's subject is "you" (you / you are / you're) — the page talking to the person who
-  // files, so the pre-form narrowing does not apply. Not widened past "you".
-  const REVIEW_PAGE_WIDE =
+  const REVIEW_PAGE =
     /\bstep\s*\d+\s*[:.\-–—]?\s*review\b|\breview\s+(and|&)\s+(submit|sign|file|certify|finish)\b|\breview\s+(and|&)\s+confirm\b(?=\s*($|[\n.:!])|\s+(your|the|this)\s+(application|submission|permit|request)\b)|\breview\s+(all\s+(of\s+)?(your\s+|the\s+)?|(your|the)\s+)(application|information|details|entries|submission)\b|\bwill\s+not\s+be\s+submitted\s+until\b/i;
-  const REVIEW_PAGE_PRE_FORM =
-    /\bstep\s*\d+\s*[:.\-–—]?\s*review\b|\breview\s+(and|&)\s+(submit|sign|file|certify|finish)\b|\breview\s+(and|&)\s+confirm\b(?=\s*($|[\n.:!])|\s+(your|the|this)\s+(application|submission|permit|request)\b)|(?<!(?<!\byou\s+(are\s+)?|\byou['’]re\s+)\b(will|shall|may|would|going\s+to)\s+((\w+ly|then|also|first|next|not)\s+)?)\breview\s+(all\s+(of\s+)?(your\s+|the\s+)?|(your|the)\s+)(application|information|details|entries|submission)\b|\bwill\s+not\s+be\s+submitted\s+until\b/i;
-  const isReviewPageText = (text: string | null | undefined, opts?: { preForm?: boolean } | null): boolean =>
-    (opts?.preForm === true ? REVIEW_PAGE_PRE_FORM : REVIEW_PAGE_WIDE).test(String(text ?? ""));
+  const isReviewPageText = (text: string | null | undefined): boolean => REVIEW_PAGE.test(String(text ?? ""));
   /** A URL that names the review step: Accela's CapConfirm / Confirm.aspx, a "/review" path
    *  segment (bounded — "/reviewer", "/review-comments" are not it). */
   const REVIEW_URL = /capconfirm|confirm\.aspx|\/review(?=[/?#.]|$)/i;
@@ -371,8 +340,8 @@ export function portalSafetyFactory() {
   /** THE review signal the learner's page classification, its atReview override, replay's click
    *  gate and the network backstop all read: the page's text (navigator cut) names the review
    *  step, or its URL does. */
-  const reviewSignals = (text: string | null | undefined, url?: string | null, opts?: { preForm?: boolean } | null): boolean =>
-    isReviewPageText(text, opts) || looksLikeReviewUrl(url);
+  const reviewSignals = (text: string | null | undefined, url?: string | null): boolean =>
+    isReviewPageText(text) || looksLikeReviewUrl(url);
 
   /**
    * Submit-, file- or commit-worded. "Continue Application" — Accela's advance, which FILES on
@@ -1088,10 +1057,10 @@ export function portalSafetyFactory() {
    * page's own title in a <header>, and losing it would un-name a review page — the direction
    * that files.
    */
-  const terminalPageInPage = (opts?: { preForm?: boolean } | null): { reviewPage?: boolean; readOnlyPage?: boolean; filingControl?: string; terminal?: boolean } => {
+  const terminalPageInPage = (): { reviewPage?: boolean; readOnlyPage?: boolean; filingControl?: string; terminal?: boolean } => {
     const d = (globalThis as { document?: Document }).document;
     if (!d || !d.body) return {};
-    const reviewPage = reviewSignals(pageTextWithoutNavigatorInPage(d), (globalThis as { location?: { href?: string } }).location?.href, opts);
+    const reviewPage = reviewSignals(pageTextWithoutNavigatorInPage(d), (globalThis as { location?: { href?: string } }).location?.href);
     const readOnlyPage = readOnlyPageInPage();
     const filing = Array.from(d.querySelectorAll("button, a, input[type=submit], input[type=button], input[type=image], [role=button], [role=link]"))
       .filter((el) => { const r = (el as HTMLElement).getBoundingClientRect(); return r.width > 2 && r.height > 2; })

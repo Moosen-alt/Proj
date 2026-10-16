@@ -49,7 +49,7 @@ export interface ContinueDraft {
    *  Submit; not signed, or unreadable, it stops on the record page and names why. */
   awaitingSignature?: boolean;
 }
-import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isPayNowDialogText, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
+import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
 import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
 import { hostOfUrl, sameCredentialScope } from "../siteOf";
@@ -5363,16 +5363,6 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         break;
       }
       pageCount++;
-      // PRE-FORM (Helm review of #349): until a page with a form control has been SEEN on this run
-      // (and never for a resumed draft or a signature check), the backstop does not read someone
-      // else's future review as the review step. The switch OFF happens on the form page itself,
-      // where formPageSeen is set (c2i, below) — not only here at the next boundary: a page that
-      // fires a POST on load right after a form (shape m6) was judged pre-form for one page while
-      // the flag waited for this boundary, and its POST reached the server where main holds it.
-      // The cost: the form page's own POSTs are judged on main's reading too, so PGE's first
-      // application page (a checkbox under "we will review the application …") goes back to
-      // main's lockdown reading.
-      backstopFor(this.page)?.setPreForm(!this.formPageSeen && !this.continuedDraft && !this.signatureCheck);
       // THE BACKSTOP ABORTED A FILING, A PAYMENT OR A REVIEW-PAGE POST: stop here, named. Walking
       // on would drive the same page (and its filing control) again. learn() reports every abort.
       {
@@ -6282,29 +6272,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const reviewShaped = hasSubmitIntentBtn || hasAcceptTermsCheckbox || looksLikeReviewUrl(url)
         || fields.some((f) => f.fieldType === "button" && onPageControl(f) && isFinalSubmitControl(f.label));
       const plannerSaidReview = plan.atReview === true;
-      //      THE ONE WAY FORWARD (used in c2i' below), computed here. It is NOT a gate of its own
-      //      (#344, Helm's review of #349): a DASHBOARD-shaped page with one bare "Continue" after
-      //      the permit-type tile is as likely an in-progress-draft notice ("You have an application
-      //      in progress … Continue") as an interstitial — passing it opened somebody's draft and
-      //      saved over it. A page reaches the interstitial path only by READING as review (main's
-      //      wide reading — DevHub's interstitial does) or by the planner calling it review, and
-      //      its way forward is adopted only on a non-dashboard page.
-      const norm = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
-      const fwdCands = fields.map((f, i) => ({ f, i })).filter(({ f }) => f.fieldType === "button" && !f.disabled && !f.tile
-        && onPageControl(f) && isInterstitialForwardLabel(f.label) && !this.isOffLimitsButton(f));
-      const oneForward = fwdCands.length > 0 && fwdCands.length <= 2
-        && new Set(fwdCands.map(({ f }) => norm(f.label).toLowerCase())).size === 1;
       const interstitial = !hasFillable && !reviewShaped && !anyFormMutationRecorded && !entryDisclaimer
         && !this.continuedDraft && !this.signatureCheck && !signatureDone
         && !this.formPageSeen
         && steps.some((s) => /^(application entry|permit type):/.test(String(s.note ?? "")))
         && (!isDashboard || plannerSaidReview);
-      if (hasFillable) {
-        this.formPageSeen = true;
-        // Main's review reading for the backstop from THIS page on (#344, shape m6): see PRE-FORM
-        // at the page boundary.
-        backstopFor(this.page)?.setPreForm(false);
-      }
+      if (hasFillable) this.formPageSeen = true;
       const isReviewPage =
         ((!hasFillable && !isDashboard) ||
           (reviewSignals && hasSubmitIntentBtn) ||
@@ -6390,33 +6363,18 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //       be one control (a top and a bottom copy at most, one label) — a list whose rows each
       //       say "Continue" is somebody's records, not an interstitial — and a page that was a
       //       dashboard by structure (only the planner called it review) is not advanced here.
-      //       NEVER TOWARD A PAYMENT (#344). A no-field page whose words tell the walker to PAY in
-      //       order to press its forward control ("Pay the $350 application fee now by card to
-      //       continue") is not passed. The ONE pay-now reading (paymentDialogVerdict, via
-      //       isPayNowDialogText) is asked of the sentences that NAME the forward control — not of
-      //       the whole page: that reading is fail-closed on any fee mention by design (right for a
-      //       dialog), and on DevHub's own interstitial it reads pays_now ("you will be provided with
-      //       instructions via email for how to pay your intake fees"), while the sentence that
-      //       names its control is 'click "Continue"'. Coverage limit: a pay page whose money
-      //       sentence does not name the control ("A $350 fee is due now. Click Continue.") is not
-      //       refused HERE; the hard lines are unchanged — pay-worded controls are off-limits,
-      //       card fields are never filled, and the backstop aborts every payment request.
       let interstitialAdvanceKey = "";
       if (interstitial) {
-        let fwd = !isDashboard && oneForward ? fwdCands[0].i : -1;
-        let payNow = false;
-        if (fwd >= 0) {
-          const words = norm(fields[fwd].label).toLowerCase().match(/[a-z]+/g) ?? [];
-          const names = words.length ? new RegExp(`\\b${words.join("\\s+")}\\b`, "i") : null;
-          const forwardSentences = String(reading?.text ?? bodyText ?? "").split(/[.?!;](?=\s|$)|\n+/)
-            .filter((s) => !!names && names.test(s));
-          payNow = isPayNowDialogText(forwardSentences.join(". "));
-          if (payNow) fwd = -1;
-        }
+        const norm = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
+        const fwdCands = fields.map((f, i) => ({ f, i })).filter(({ f }) => f.fieldType === "button" && !f.disabled && !f.tile
+          && onPageControl(f) && isInterstitialForwardLabel(f.label) && !this.isOffLimitsButton(f));
+        const oneWay = !isDashboard && fwdCands.length > 0 && fwdCands.length <= 2
+          && new Set(fwdCands.map(({ f }) => norm(f.label).toLowerCase())).size === 1;
+        const fwd = oneWay ? fwdCands[0].i : -1;
         const fwdLabel = fwd >= 0 ? norm(fields[fwd].label) : "";
         const key = fwd >= 0 ? this.navClickKey(url, `${fwdLabel} @ ${loopFp}`) : "";
         const repeat = !!key && this.navClicksByPath.has(key);
-        this.debug?.event({ type: "interstitial_not_review", page: pageCount, forward: fwdLabel.slice(0, 40) || null, candidates: fwdCands.length, plannerSaidReview, repeat, ...(payNow ? { payNow: true } : {}) });
+        this.debug?.event({ type: "interstitial_not_review", page: pageCount, forward: fwdLabel.slice(0, 40) || null, candidates: fwdCands.length, plannerSaidReview, repeat });
         if (repeat) {
           return {
             ...fail(steps, this.portalName, `Stopped on an information page ("${(redactStatusText(pageTitle) || "this page").slice(0, 60)}"): its "${fwdLabel.slice(0, 40)}" was clicked once already and the walk is back on the same page, so it is not clicked again. Nothing has been entered on this run. Continue past the page by hand, or record the portal.`, null, pageCount, portalNotices),
