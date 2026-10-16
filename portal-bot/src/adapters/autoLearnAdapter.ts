@@ -446,8 +446,15 @@ const OTHER_SPECIFY_VALUE = "Solar";
 
 // `scope`: "nem" (the default) applies on utility interconnection learns (profile residential_nem);
 // "permit" applies on AHJ/permit learns (profile permit_standard). A policy never crosses scopes.
-const POLICY_RADIO_DEFAULTS: Array<{ question: RegExp; answer: "Yes" | "No"; enforce?: boolean; scope?: "nem" | "permit" }> = [
-  { question: /do you propose to limit the export capacity/i, answer: "No" },
+// `jobKey`: the replay-map key (backend resolveRecipeFieldValues) that carries THIS job's own answer
+// to the question; the replay of a control its recipe never recorded binds that key ahead of the
+// standing answer (unrecordedControls POLICY_QUESTION_JOB_KEYS, derived from this table — so the
+// question is ONE regex, here). A rule without one has only the standing answer.
+// Every `question` is a non-global regex: the replay tests the same RegExp objects, so a `g`/`y` flag
+// would carry lastIndex between the two callers.
+export type PolicyRadioRule = Readonly<{ question: RegExp; answer: "Yes" | "No"; enforce?: boolean; scope?: "nem" | "permit"; jobKey?: string }>;
+export const POLICY_RADIO_DEFAULTS: ReadonlyArray<PolicyRadioRule> = Object.freeze(([
+  { question: /do you propose to limit the export capacity/i, answer: "No", jobKey: "exportLimiting" },
   // HYPHENS COUNT. Ameren Illinois asks "Is the inverter lab-certified as that term is
   // defined in the Illinois Distributed Generation Interconnection Standard?" — hyphenated,
   // which a whitespace-only pattern misses, leaving a REQUIRED question blank on every
@@ -493,7 +500,7 @@ const POLICY_RADIO_DEFAULTS: Array<{ question: RegExp; answer: "Yes" | "No"; enf
   // project." — "can be yes"; the learn picked No and the operator corrected it mid-run). enforce: a
   // planner's No is corrected.
   { question: /consent\s+to\s+drone|drones?\b.{0,60}\binspections?\b|drone\s+inspection/i, answer: "Yes", enforce: true, scope: "permit" },
-];
+] as PolicyRadioRule[]).map((rule) => Object.freeze(rule)));
 
 /** A POLICY SCOPE: "nem" on a utility interconnection, "permit" on an AHJ, "none" when the operator
  *  turned the policy answers off (PORTAL_POLICY_DEFAULTS=off). Read from policyProfileFor below — the

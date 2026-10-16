@@ -17,8 +17,9 @@
 //      has none, the operator's standing answer for THAT KEY if there is one (below); else nothing.
 //   3. A POLICY QUESTION — the learner's own table (autoLearnAdapter policyDefaultAnswerFor), so a
 //      learn and a replay give one question one answer. When the job itself carries the answer
-//      (POLICY_QUESTION_JOB_KEYS: the export-capacity question ↔ exportLimiting), the job's value,
-//      bound to that key; the standing answer only when the key is absent or empty.
+//      (a learner rule's own `jobKey`, read through POLICY_QUESTION_JOB_KEYS: the export-capacity
+//      question ↔ exportLimiting), the job's value, bound to that key; the standing answer only when
+//      the key is absent or empty.
 // A control none of these knows is not this module's: the LLM gap-fill and the required sweep keep it.
 //
 // THE STANDING ANSWER FOR AN UNRECORDED PER-JOB CONTROL IS READ BY ITS KEY. The distance question
@@ -30,7 +31,7 @@
 // openPerJobQuestions) — this module does not touch that; it only answers a control the recipe could
 // not have asked about, and only when it is EMPTY.
 import { operatorPolicyAnswer, perJobAnswerKeyFor, perJobControlOfField } from "../../shared/src/perJobQuestions";
-import { isSensitiveLabel, policyDefaultAnswerFor, type PolicyScope } from "./adapters/autoLearnAdapter";
+import { isSensitiveLabel, POLICY_RADIO_DEFAULTS, policyDefaultAnswerFor, type PolicyScope } from "./adapters/autoLearnAdapter";
 
 export type DisconnectPartKey = "disconnectMake" | "disconnectModel" | "disconnectMakeModel";
 
@@ -156,22 +157,26 @@ export const UNPINNED_CONTROL_WHY = "a value is on file, but the empty control b
  * table (policyDefaultAnswerFor) already answers the question in this scope, so it never widens or
  * narrows which controls or which recipes get an answer; it only says WHOSE answer that is.
  *
- * The one entry: "Do you propose to limit the export capacity of this system?". The policy table's
- * standing answer is "No", but the replay map carries the job's own `exportLimiting` (backend
- * resolveRecipeFieldValues: "Yes" when the design shows a PCS / export limit / non-export / NGOM),
- * and the round-3 pass filed the standing "No" on an export-limited job. The per-job rule does not
- * catch this wording (per-job:export-limit reads "export limit", not "limit the export capacity").
- * The pattern is the learner's own rule for the question, copied verbatim (autoLearnAdapter
- * POLICY_RADIO_DEFAULTS); unrecordedControls.test pins that the two still read the same question.
+ * ONE SOURCE: the learner's table (autoLearnAdapter POLICY_RADIO_DEFAULTS). A rule gets a job key by
+ * carrying `jobKey` THERE; this list is derived from it and holds each such rule's own RegExp object —
+ * never a copy (issue #352 review: a copied regex would not follow a widened learner wording), and
+ * unrecordedControls.test pins that every entry IS the learner rule's regex, by identity.
  *
- * No other policy question has a replay-map key: lab-certified / UL 1741, the distance question
- * (a per-job key, answered above by perJobAnswerKeyFor), public school, kWh netting, monetize,
- * knife-blade, meter collar and drone consent match nothing resolveRecipeFieldValues emits (its own
- * keys or the parser snapshot's).
+ * Today one rule carries a key: "Do you propose to limit the export capacity of this system?" ↔
+ * `exportLimiting`. The table's standing answer is "No", but the replay map carries the job's own
+ * `exportLimiting` (backend resolveRecipeFieldValues: "Yes" when the design shows a PCS / export
+ * limit / non-export / NGOM), and the round-3 pass filed the standing "No" on an export-limited job.
+ * The per-job rule does not catch this wording (per-job:export-limit reads "export limit", not "limit
+ * the export capacity").
+ *
+ * No other policy rule carries a key: lab-certified / UL 1741, the distance question (a per-job key,
+ * answered above by perJobAnswerKeyFor), public school, kWh netting, monetize, knife-blade, meter
+ * collar and drone consent match nothing resolveRecipeFieldValues emits (its own keys or the parser
+ * snapshot's).
  */
-const POLICY_QUESTION_JOB_KEYS: ReadonlyArray<{ question: RegExp; key: string }> = Object.freeze([
-  { question: /do you propose to limit the export capacity/i, key: "exportLimiting" },
-]);
+export const POLICY_QUESTION_JOB_KEYS: ReadonlyArray<Readonly<{ question: RegExp; key: string }>> = Object.freeze(
+  POLICY_RADIO_DEFAULTS.flatMap((rule) => (rule.jobKey ? [Object.freeze({ question: rule.question, key: rule.jobKey })] : [])),
+);
 
 /** The replay-map key that carries this job's own answer to a policy question, or null. */
 function policyQuestionJobKeyFor(question: string): string | null {

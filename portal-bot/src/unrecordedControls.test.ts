@@ -7,8 +7,8 @@
 //
 // Run: npx tsx portal-bot/src/unrecordedControls.test.ts
 import assert from "node:assert/strict";
-import { answerForUnrecordedControl, disconnectPartKeyFor, missingRequiredStopMessage, readDisconnectPart, UNPINNED_CONTROL_WHY } from "./unrecordedControls";
-import { policyDefaultAnswerFor, policyProfileFor, policyScopeFor } from "./adapters/autoLearnAdapter";
+import { answerForUnrecordedControl, disconnectPartKeyFor, missingRequiredStopMessage, POLICY_QUESTION_JOB_KEYS, readDisconnectPart, UNPINNED_CONTROL_WHY } from "./unrecordedControls";
+import { POLICY_RADIO_DEFAULTS, policyDefaultAnswerFor, policyProfileFor, policyScopeFor } from "./adapters/autoLearnAdapter";
 import { operatorPolicyAnswer, perJobAnswerKeyFor } from "../../shared/src/perJobQuestions";
 
 let failures = 0;
@@ -211,6 +211,22 @@ const EXPORT_Q = "Do you propose to limit the export capacity of this system?";
 check("preconditions: the export-capacity question is a policy question with a standing No, and NOT a per-job one", () => {
   assert.equal(policyDefaultAnswerFor(EXPORT_Q, "nem"), "No", "the learner's table still answers it (else this map is consulted for nothing)");
   assert.equal(perJobAnswerKeyFor(EXPORT_Q, { control: "select", answer: "", options: YES_NO }), null, "the per-job route does not take it (else the policy branch never sees it)");
+});
+// ONE QUESTION, ONE PREDICATE (#352 review): the job-key map is not a second regex for the question.
+// A sample wording that both happen to match proves nothing — a copy passes that until the learner's
+// rule is widened and the copy is not. So: every map entry IS a learner rule's own RegExp object.
+check("ONE RULE: every job-key map entry IS the learner rule's own regex (same object), and every learner rule carrying a jobKey is in the map", () => {
+  const carrying = POLICY_RADIO_DEFAULTS.filter((rule) => rule.jobKey);
+  assert.ok(carrying.length > 0, "precondition: the learner's table carries at least one jobKey");
+  assert.equal(POLICY_QUESTION_JOB_KEYS.length, carrying.length, "the map is exactly the learner rules that carry a jobKey");
+  POLICY_QUESTION_JOB_KEYS.forEach((entry, i) => {
+    assert.ok(entry.question === carrying[i].question,
+      `map entry ${i} (${entry.question}) is not the learner's own regex object (${carrying[i].question}) — a copy, which will not follow a widened learner wording`);
+    assert.equal(entry.key, carrying[i].jobKey);
+  });
+  const exportRule = POLICY_RADIO_DEFAULTS.find((rule) => (rule.scope ?? "nem") === "nem" && rule.question.test(EXPORT_Q));
+  assert.equal(exportRule?.jobKey, "exportLimiting", "the learner's own export-capacity rule carries the job key");
+  assert.equal(exportRule?.answer, policyDefaultAnswerFor(EXPORT_Q, "nem"), "the rule carrying the key is the one that gives the standing answer");
 });
 check("the export-capacity question: the job's exportLimiting \"Yes\" is bound and selected, never the standing No", () => {
   assert.deepEqual(answerForUnrecordedControl({ label: EXPORT_Q, fieldType: "select", options: YES_NO }, { ...STD, exportLimiting: "Yes" }, "nem"),
