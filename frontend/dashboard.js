@@ -1030,6 +1030,13 @@ async function loadEmailTracker() {
   }
 }
 
+// The ops plan + brief, runbook, handoff packet, communication drafts and installer actions panels
+// are hidden for solo operation (#hiddenTeamArtifacts in dashboard.html keeps their DOM so renders
+// never error), so selectProject no longer fetches them on every project open (#361). Their
+// loaders stay defined, and the actions that change their data still call them; restore the calls
+// in selectProject when the panels are un-hidden. Note GET ops-plan also syncs operation_steps,
+// which the visible project timeline reads, so the timeline's ops-step entries now refresh only
+// when one of those actions runs.
 async function loadOpsPlan() {
   if (!state.selectedProjectId) {
     state.opsPlan = null;
@@ -2333,11 +2340,14 @@ async function selectProject(projectId) {
   safeRender("opsActions", renderOpsActions);
   // allSettled (not all): one failing/​flaky panel loader must NOT abort the others
   // or prevent renderDetail from running — otherwise the whole detail view breaks.
+  // NOT LOADED ON OPEN (#361): the six hidden team panels (ops plan + brief, runbook, handoff
+  // packet, communication drafts, installer actions) and the whole knowledge base. Nothing visible
+  // reads the panels, and they were most of an open's server time (each rebuilds the reviewer
+  // gate). The KB is loaded at board load, by its own actions and when the Knowledge modal opens.
+  // backend/test/selectProjectHiddenPanels.test.ts fails if any of them comes back here.
   await Promise.allSettled([
-    loadKnowledgeBase(),
-    loadOpsPlan(), loadSubmitGate(), loadRunbook(), loadHandoffPacket(),
-    loadCommunicationDrafts(), loadLiveReadiness(), loadProjectTimeline(),
-    loadProcessMap(), loadInstallerPacket(), loadProjectDocuments(),
+    loadSubmitGate(), loadLiveReadiness(), loadProjectTimeline(),
+    loadProcessMap(), loadProjectDocuments(),
     loadSubmittalTracks(), loadPaymentQuotes(), loadFeeSheet(), loadPortalQuestions(),
     loadStageResults(), loadCorrectionNotice(),
     loadStaleReadings(),
