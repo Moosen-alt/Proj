@@ -38,6 +38,11 @@
 // filed — check the portal for this project" — read on the project's card and, named within the
 // viewer's own org, on the pass's knowledge-base entry.
 import { DEFAULT_ORG_ID, type AppDb } from "./db";
+import { trackKind } from "./permitMonitor";
+import { isInformationalPageUrl, isUtilityPlatformUrl, portalHostOf, portalUrlsInText, salesforceTenantKind } from "./portalChannel";
+import { utilityFilingKey } from "./utilityFilingLookup";
+import { sameUtilityEntity } from "./utilityIdentity";
+import { sameEntity } from "./portalRecipes";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
 import { id as newId } from "./ids";
@@ -213,14 +218,17 @@ const maskDigits = (x: unknown): string => s(x).replace(/\d/g, "#");
 
 /** BEFORE EACH LEARN ATTEMPT TOUCHES THE PORTAL (autoLearn): on record first, so a learn that dies,
  *  throws or is interrupted is progress unless it ends clean. Returns the start's id. */
-export function recordInfoPageLearnStart(db: AppDb, projectId: string, scope: Side, attempt: number): string {
+export function recordInfoPageLearnStart(db: AppDb, projectId: string, scope: Side, attempt: number, portalUrl: string): string {
   const startId = newId();
-  addAuditLog(db, projectId, "system", "auto-learn", ACT_LEARN_STARTED, { startId, scope, attempt });
+  // The learn's own portal URL: the project card reads it back (listInfoPageProjectState), so the
+  // card judges the same portal the learner's own check did.
+  addAuditLog(db, projectId, "system", "auto-learn", ACT_LEARN_STARTED, { startId, scope, attempt, portalUrl: s(portalUrl).slice(0, 300) });
   return startId;
 }
 
 /** IS THIS LEARN'S RESULT A CLEAN HOLD? It stopped at the backstop's hold of an information page
- *  whose run state was clean at the click (the candidate watch opens only then, and its request
+ *  whose run state was clean at the click (the candidate watch opens only then — #366: the
+ *  project's history may also have refused, which is not this run's own state — and its request
  *  was observed — held), passed no verified page, reported no after-click incident, reached no
  *  review, paused for nothing and continued no draft — and (round 3, V9) its recorded steps are an
  *  array with NO write in them (fill / select / check / uncheck / upload / press), and it says it
@@ -255,6 +263,124 @@ export function recordInfoPageHeldVerified(db: AppDb, projectId: string, scope: 
   }
 }
 
+/** Whose filing a tracked row is (#365): "utility" or "ahj" only when its columns say so and agree —
+ *  trackKind, the one answer, plus a consistency check. A row on the columns' defaults (no
+ *  permit_type: legacy rows, raw writes) or with contradictory columns ('nem' + a permit discipline)
+ *  cannot say: null, and it counts on both sides. */
+function trackedRowSide(t: Row): Side | null {
+  const pt = s(t.permit_type).trim().toLowerCase();
+  if (trackKind(s(t.target_type), pt) === "nem") return pt === "" || pt === "nem" ? "utility" : null;
+  // Helm's review (S5): only the permit tracks ensureCheckTarget writes are positively the permit
+  // side — free text a body field stored ("interconnection") cannot say, so it counts on both.
+  return KNOWN_PERMIT_TRACKS.has(pt) ? "ahj" : null;
+}
+const KNOWN_PERMIT_TRACKS = new Set(["building", "electrical", "combo", "permit", "mpu", "structural"]);
+
+/** A POSITIVE interconnection platform (Helm's review, blocker 1): a utility platform host — never a
+ *  Salesforce tenant the classifier cannot place. isUtilityPlatformUrl fails closed for LAUNCHING on
+ *  the permit track, so it reads an unknown tenant (a city's own my.site.com portal) as a utility's;
+ *  as evidence that a filing was made ELSEWHERE that would fail open. */
+function isPositiveInterconnectionPlatform(u: string): boolean {
+  return isUtilityPlatformUrl(u) && salesforceTenantKind(u) !== "unknown";
+}
+
+/** POSITIVE EVIDENCE THAT THIS UTILITY'S NEM IS FILED ON ITS OWN PLATFORM (#365): its own records —
+ *  utility-keyed KB rows of ANY confidence and its utility recipes — name at least one portal, and
+ *  every portal they name is a utility interconnection platform (information pages ignored). A
+ *  utility that names a city's portal anywhere (a carve-out utility, verified or only seeded: the
+ *  operator may have filed it there by hand), any other portal, or nothing at all: false.
+ *  WHOSE records: only a STRONG match (a known identity, or the same name) is evidence FOR the
+ *  platform; a row that matches only by the fuzzy entity score (portalRecipes.sameEntity) can add
+ *  caution — a non-platform portal there counts the number — but never vouches for a platform. */
+function utilityFilesOnlyOnInterconnectionPlatform(db: AppDb, state: string, utility: string, hostsInQuestion: ReadonlySet<string>): boolean {
+  if (!utility.trim()) return false;
+  const st = state.trim().toUpperCase();
+  const norm = (x: string): string => x.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  // A STRONG match is in this state for certain: a row with no state can add caution, never vouch.
+  const sameState = (r: Row) => s(r.state).trim().toUpperCase() === st && st !== "";
+  const strong = (r: Row) => sameState(r) && (sameUtilityEntity(state, s(r.utility), utility) || norm(s(r.utility)) === norm(utility));
+  const weak = (r: Row) => !strong(r) && sameEntity(state, utility, s(r.state).trim() || state, s(r.utility));
+  const rows: Array<{ r: Row; urls: string[] }> = [
+    // portal_url read RAW (Helm's review, S4: portalUrlsInText's TLD list drops .online, .co, .city…);
+    // portal_name is free text, read for the links in it.
+    ...db.query<Row>("SELECT state, utility, portal_url, portal_name FROM permit_utility_knowledge WHERE (ahj IS NULL OR ahj = '') AND utility != ''")
+      .map((r) => ({ r, urls: [s(r.portal_url), ...portalUrlsInText(s(r.portal_name))] })),
+    ...db.query<Row>("SELECT state, utility, portal_url FROM portal_recipes WHERE scope_type = 'utility' AND portal_url IS NOT NULL AND portal_url != ''")
+      .map((r) => ({ r, urls: [s(r.portal_url)] })),
+  ];
+  // WHERE THE PRODUCT SAYS THIS UTILITY TAKES ITS APPLICATION (Helm's review, blocker 2): the utility
+  // filing lookup (migration v37) — the NEM track card shows its URL ahead of a seeded KB row, so it is
+  // the utility's own record, keyed by its exact name. Its portal and any portal it named but did not
+  // keep are strong evidence. A lookup that cannot be read: no evidence for a platform (counts).
+  let lookupUrls: string[];
+  try {
+    const row = db.get<Row>("SELECT payload_json FROM utility_filing_lookups WHERE profile_key = ?", [utilityFilingKey(state, utility)]);
+    // A row that cannot be parsed throws: unknown, so no evidence for a platform (counts).
+    const filing = row ? ((JSON.parse(s(row.payload_json) || "{}") as Row).filing as Row | undefined) : undefined;
+    const value = filing && typeof filing.value === "object" && filing.value ? (filing.value as Row) : null;
+    lookupUrls = [s(value?.url), s(filing?.claimed)].filter(Boolean);
+  } catch {
+    return false;
+  }
+  const keep = (u: string) => portalHostOf(u) !== "" && !isInformationalPageUrl(u);
+  const portals = (pick: (r: Row) => boolean) => rows.filter((x) => pick(x.r)).flatMap((x) => x.urls).filter(keep);
+  const own = [...portals(strong), ...lookupUrls.filter(keep)];
+  const fuzzy = portals(weak);
+  // A portal this utility names (strong or fuzzy, platform or not) ON a portal in question: it may
+  // have filed here — never skipped.
+  if ([...own, ...fuzzy].some((u) => hostsInQuestion.has(portalHostOf(u)))) return false;
+  if (!own.length || !own.every((u) => isPositiveInterconnectionPlatform(u))) return false;
+  return fuzzy.every((u) => isPositiveInterconnectionPlatform(u));
+}
+
+/** A TRACKED NUMBER OF THIS PROJECT AS A HARD REASON (#365), or "" — the one answer for the hand-out
+ *  (infoPagePriorProgressReasons) and the admission (reserveInfoPagePassUse). A number of the OTHER
+ *  side is skipped only when its row positively is that side's, it was not recorded on any portal in
+ *  question, and there is positive evidence it was filed elsewhere (see the HARD bullet above). No
+ *  readable portal: every number counts. A read error is a reason. */
+function trackedNumberHardReason(db: AppDb, projectId: string, side: Side, portalUrls: ReadonlyArray<string>): string {
+  try {
+    const nem = side === "utility";
+    const urls = (Array.isArray(portalUrls) ? portalUrls : []).map((u) => s(u).trim()).filter((u) => portalHostOf(u) !== "");
+    const hosts = new Set(urls.map((u) => portalHostOf(u)));
+    let elsewhere: boolean | null = null;
+    const filedElsewhere = (): boolean => {
+      if (elsewhere !== null) return elsewhere;
+      elsewhere = false;
+      if (!urls.length) return false;
+      if (nem) {
+        // A permit number on the utility side: permits are never filed on an interconnection platform.
+        elsewhere = urls.every((u) => isPositiveInterconnectionPlatform(u));
+      } else {
+        // A NEM number on the permit side: this utility files only on its own platform.
+        const p = db.get<Row>("SELECT state, utility FROM projects WHERE id = ?", [projectId]);
+        elsewhere = !!p && utilityFilesOnlyOnInterconnectionPlatform(db, s(p.state), s(p.utility), hosts);
+      }
+      return elsewhere;
+    };
+    for (const t of db.query<Row>("SELECT application_number, permit_number, target_type, permit_type, portal_url, tracking_url FROM permit_check_targets WHERE project_id = ?", [projectId])) {
+      const n = s(t.application_number).trim() || s(t.permit_number).trim();
+      if (!n) continue;
+      const rowSide = trackedRowSide(t);
+      if (rowSide !== null && rowSide !== side) {
+        const rowUrls = [s(t.portal_url), s(t.tracking_url)].filter((u) => u.trim() !== "");
+        const recordedHere = rowUrls.some((u) => { const h = portalHostOf(u); return h !== "" && hosts.has(h); });
+        // THE PROJECT'S OWN NEM ROW (Helm's review, S3): a URL it kept that is not positively a
+        // platform (a city status page, a sibling host, the city's Accela tenant) is its own evidence
+        // that the filing was NOT on the utility's platform — it counts.
+        const ownUrlNotPlatform = rowSide === "utility" && rowUrls.some((u) => !isPositiveInterconnectionPlatform(u));
+        if (!recordedHere && !ownUrlNotPlatform && filedElsewhere()) continue;
+      }
+      return `a filing of this project is tracked by number (${maskDigits(n).slice(0, 24)})`;
+    }
+    return "";
+  } catch {
+    return INFO_PAGE_TRACKED_UNREADABLE;
+  }
+}
+const INFO_PAGE_TRACKED_UNREADABLE = "this project's tracked filings could not be read";
+const INFO_PAGE_PROGRESS_UNREADABLE = "this project's progress on this portal could not be read";
+
 interface PriorProgressReasons {
   /** Never lifted by an allowance: a filing, a number, a draft, a stage that reached review, paused
    *  or was interrupted. */
@@ -271,8 +397,15 @@ interface PriorProgressReasons {
  * later server position where its Next files.
  *
  * HARD (a person can never lift these here — the page is then done by hand for this project):
- *   - any tracked application or permit number of this project, WHATEVER its portal URL (blank, this
- *     host or another: the table carries no side);
+ *   - a tracked application or permit number of this project (trackedNumberHardReason, #365). A
+ *     number of the OTHER side is skipped only on POSITIVE evidence that it was filed elsewhere: a
+ *     NEM number when this utility's own records (KB rows of any confidence, its recipes) name a
+ *     portal and every one is a utility interconnection platform (PowerClerk and kin — never a
+ *     city's permit portal); a permit number when every portal in question is such a platform
+ *     (permits are never filed there). A row on the columns' defaults or with contradictory columns,
+ *     a number recorded on this very host, a utility that names any other portal or none, or no
+ *     portal given: it counts, as before. Asked again at the admission on the page the request
+ *     actually leaves from (reserveInfoPagePassUse);
  *   - a submission on this side in any status but "failed" (staged, awaiting a person, paused,
  *     submitted, approved, issued — and any status not known here);
  *   - a portal run on this side with a confirmation number, or in any status but queued / running
@@ -289,16 +422,14 @@ interface PriorProgressReasons {
  *     person's fix captured mid-learn.
  * A read error is a hard reason: an unknown never reassures.
  */
-export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scopeType: Side): PriorProgressReasons {
+export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scopeType: Side, portalUrls: ReadonlyArray<string>): PriorProgressReasons {
   const hard: string[] = [];
   const learn: string[] = [];
   const side: Side = scopeType === "utility" ? "utility" : "ahj";
   const nem = side === "utility";
   try {
-    for (const t of db.query<Row>("SELECT application_number, permit_number FROM permit_check_targets WHERE project_id = ?", [projectId])) {
-      const n = s(t.application_number).trim() || s(t.permit_number).trim();
-      if (n) { hard.push(`a filing of this project is tracked by number (${maskDigits(n).slice(0, 24)})`); break; }
-    }
+    const tracked = trackedNumberHardReason(db, projectId, side, portalUrls);
+    if (tracked) hard.push(tracked);
     for (const x of db.query<Row>("SELECT permit_type, status, application_number, permit_number, confirmation_number FROM submissions WHERE project_id = ?", [projectId])) {
       if ((s(x.permit_type) === "nem") !== nem) continue;
       const numbered = !!(s(x.application_number).trim() || s(x.permit_number).trim() || s(x.confirmation_number).trim());
@@ -334,7 +465,7 @@ export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scope
       else learn.push(`an earlier learn of this project: ${r.action.replace(/^portal\./, "").replace(/_/g, " ")} (${r.at})`);
     }
   } catch {
-    hard.push("this project's progress on this portal could not be read");
+    hard.push(INFO_PAGE_PROGRESS_UNREADABLE);
   }
   return { hard: Array.from(new Set(hard)), learn: Array.from(new Set(learn)) };
 }
@@ -342,11 +473,17 @@ export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scope
 /**
  * HAS THIS PROJECT ALREADY MADE PROGRESS ON THIS PORTAL? true refuses the pass (the learner's
  * INFO_PAGE_PRIOR_PROGRESS_REFUSAL). Every reason of infoPagePriorProgressReasons counts; an
- * unparseable portal URL or a read error is true: an unknown never reassures.
+ * unparseable portal URL is true; a read error THROWS (the caller hands its stand-in): an unknown
+ * never reassures, and never reads as this project's history.
  */
 export function infoPagePriorProgress(db: AppDb, projectId: string, portalUrl: string, scopeType: Side): boolean {
   try { const o = new URL(portalUrl).origin; if (!o || o === "null") return true; } catch { return true; }
-  const r = infoPagePriorProgressReasons(db, projectId, scopeType);
+  const r = infoPagePriorProgressReasons(db, projectId, scopeType, [portalUrl]);
+  // A READ ERROR IS NOT A READING (Helm's review, optional): it throws, so the caller hands its
+  // fail-closed stand-in (passUnavailable: no pass AND no card), never a history reading that would
+  // record a history-stamped card. The card itself still shows the reason (listInfoPageProjectState).
+  const unreadable = r.hard.find((h) => h === INFO_PAGE_TRACKED_UNREADABLE || h === INFO_PAGE_PROGRESS_UNREADABLE);
+  if (unreadable) throw new Error(unreadable);
   return r.hard.length > 0 || r.learn.length > 0;
 }
 
@@ -364,7 +501,16 @@ export function listInfoPageProjectState(db: AppDb, projectId: string): InfoPage
     const last = allowed.length ? allowed[allowed.length - 1] : null;
     const since = parsed.filter((r) => r.rid > (last?.rid ?? 0) && r.action !== ACT_ALLOWED_AGAIN && rowOnSide(r.d, side));
     if (!since.length) continue;
-    const reasons = infoPagePriorProgressReasons(db, projectId, side);
+    // THE PORTAL(S) IN QUESTION: every verified page this side passed or was held at, and every
+    // learn's own portal URL on this side — a number counts unless it is ruled off ALL of them, so
+    // the card is never more permissive than the learner's own check (which reads its portal URL).
+    // None known: every number counts.
+    const portals = [
+      ...since.map((r) => s(r.d.where)),
+      ...db.query<{ details: string }>("SELECT details FROM audit_logs WHERE project_id = ? AND action = ?", [projectId, ACT_LEARN_STARTED])
+        .map((r) => parse<Row>(r.details, {})).filter((d) => rowOnSide(d, side)).map((d) => s(d.portalUrl)),
+    ];
+    const reasons = infoPagePriorProgressReasons(db, projectId, side, portals);
     out.push({
       scope: side,
       passed: since.filter((r) => r.action === ACT_PASSED).map((r) => ({ passId: s(r.d.passId), where: s(r.d.where), at: r.at })).slice(-5),
@@ -426,7 +572,7 @@ export function recordInfoPageCandidate(db: AppDb, projectId: string, learnRunId
   const at = nowIso();
   return db.transaction(() => {
     const existing = db.get<Row>(
-      "SELECT id, status, decided_by, decided_at FROM portal_info_page_candidates WHERE project_id = ? AND identity_sha256 = ? AND status <> 'verified'",
+      "SELECT id, status, decided_by, decided_at, evidence_json FROM portal_info_page_candidates WHERE project_id = ? AND identity_sha256 = ? AND status <> 'verified'",
       [projectId, c.identitySha256]);
     if (existing) {
       const open = s(existing.status) === "open";
@@ -435,6 +581,10 @@ export function recordInfoPageCandidate(db: AppDb, projectId: string, learnRunId
           [at, learnRunId, shot, JSON.stringify(c.observed ?? null), JSON.stringify(c.observed ?? null), s(existing.id)]);
       } else {
         db.run("UPDATE portal_info_page_candidates SET last_seen_at = ?, seen_count = seen_count + 1, learn_run_id = ? WHERE id = ?", [at, learnRunId, s(existing.id)]);
+      }
+      if (open && c.capturedWithHistory === true) {
+        const ev = parse<Record<string, unknown>>(existing.evidence_json, {});
+        if (ev.capturedWithHistory !== true) db.run("UPDATE portal_info_page_candidates SET evidence_json = ? WHERE id = ?", [JSON.stringify({ ...ev, capturedWithHistory: true }), s(existing.id)]);
       }
       return { id: s(existing.id), status: open ? "open" as const : "dismissed" as const, inserted: false, decidedBy: s(existing.decided_by), decidedAt: s(existing.decided_at) };
     }
@@ -445,11 +595,14 @@ export function recordInfoPageCandidate(db: AppDb, projectId: string, learnRunId
          digest_json, prefix_json, evidence_json, observed_json, screenshot_png, status)
        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')`,
       [cid, projectId, learnRunId, at, at, s(c.origin), s(c.path), c.identityVersion, c.identitySha256,
-        JSON.stringify(c.digest), JSON.stringify(c.prefix), JSON.stringify(c.evidence ?? {}), JSON.stringify(c.observed ?? null), shot && shot.length ? shot : null],
+        JSON.stringify(c.digest), JSON.stringify(c.prefix), JSON.stringify(c.capturedWithHistory === true ? { ...((c.evidence ?? {}) as Record<string, unknown>), capturedWithHistory: true } : (c.evidence ?? {})), JSON.stringify(c.observed ?? null), shot && shot.length ? shot : null],
     );
     return { id: cid, status: "open" as const, inserted: true, decidedBy: "", decidedAt: "" };
   });
 }
+
+/** #366: the warning a card captured on a project with history carries. */
+export const INFO_PAGE_HISTORY_CAPTURE_WARNING = "Captured on a project that already made progress on this portal: make sure this is the page EVERY project sees at this step — not this project's own resumed or in-progress application.";
 
 /** The project's own values, read from its row (street, homeowner, parcel, system size). */
 function projectValues(db: AppDb, projectId: string): string[] {
@@ -533,7 +686,10 @@ const candidateRowToRecord = (db: AppDb, r: Row, usesOf: UsesOf = usesOnce(db)):
       return !!p && passExpiry(db, p, Date.now(), usesOf).length === 0;
     })(),
     refusals: s(r.status) === "open" ? candidateRefusals(db, r, usesOf) : [],
-    warnings: infoPageVerifyWarnings(digest ? digest.shape : null, evidence.text),
+    warnings: [
+      ...infoPageVerifyWarnings(digest ? digest.shape : null, evidence.text),
+      ...((evidence as { capturedWithHistory?: unknown }).capturedWithHistory === true ? [INFO_PAGE_HISTORY_CAPTURE_WARNING] : []),
+    ],
     // ROUND 4: this exact page's verification EXPIRED (30 days / 10 projects): the run was held as on
     // main, and a person re-verifies on this card.
     expiredPass: s(r.status) === "open" ? expiredInfoPagePassFor(db, s(r.identity_sha256), Date.now(), usesOf) : null,
@@ -911,6 +1067,11 @@ export function reserveInfoPagePassUse(
       // run's own learn start is on record, and it is not progress here.)
       const earlier = earlierInfoPageUseOnSide(db, projectId, scope === "utility" ? "utility" : "ahj");
       if (earlier) return [earlier];
+      // #365, ASKED AGAIN ON THE REAL PAGE: the hand-out judged the learn's own portal URL; the walk
+      // may have reached a page on another host. The use is judged on the page the verified request
+      // leaves from. Only the tracked-number reason: this run's own learn start is on record.
+      const tracked = trackedNumberHardReason(db, projectId, scope === "utility" ? "utility" : "ahj", [where]);
+      if (tracked) return [`the use could not be reserved (${tracked})`];
     }
     addAuditLog(db, projectId, "portal_bot", "network backstop", ACT_PASSED, { runId, scope, passId, where });
     return [];
