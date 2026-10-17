@@ -12,6 +12,7 @@ import { issuingAgencyFor } from "./permitProcess";
 import { resolvePermitPath } from "./permitPath";
 import { iowaPvWorksheetValues } from "./iowaPvWorksheet";
 import { pvWorksheetRequirement } from "./requiredDocuments";
+import { operatorPolicyAnswer } from "../../shared/src/perJobQuestions";
 
 // Per-project client intake requests.
 //
@@ -62,7 +63,8 @@ export interface PortalIntakeQuestion {
   options: string[];
   portalType?: string;
   /** The bank's PortalQuestionKind for this question, when it came from the bank.
-   *  Only "bound-empty" is load-bearing here — see OPERATOR_POLICY_ANSWERS. */
+   *  Only "bound-empty" is load-bearing here — see OPERATOR_POLICY_ANSWERS
+   *  (shared/src/perJobQuestions.ts) and policySettles below. */
   kind?: string;
   /** Set when the installer explicitly answered "I'm not sure" — the operator
    *  resolves it instead of the automation guessing. */
@@ -182,30 +184,13 @@ const CANONICAL_BINDING_OPTIONS: Record<string, string[]> = {
 // ---------------------------------------------------------------------------
 // OPERATOR POLICY ANSWERS — a standing answer for a per-job binding.
 //
-// "Is your disconnect within 10 feet of the PGE utility meter?" was reaching the
-// homeowner's intake form on every PGE job. It is per-job in PRINCIPLE, but this
-// operator has a standing call on it: the standard residential detail places the
-// lockable AC disconnect within the required distance on every install. The
-// learn-time pass already applies exactly that answer (POLICY_RADIO_DEFAULTS in
-// portal-bot/src/adapters/autoLearnAdapter.ts), so the two halves of the system
-// held opposite beliefs about the same question and the client paid for it.
-//
-// THIS IS DATA, NOT A RULE. The operator will one day have a job where the
-// answer is No, and this table is deliberately the LOWEST-ranked answer source:
-// projectAnswer() consults the parser snapshot, the project record, and the v17
-// per-job column FIRST, so anything recorded for a specific project still wins.
-// Adding/removing a policy answer is a one-line data edit here, with its reason.
-const OPERATOR_POLICY_ANSWERS: Record<string, { answer: string; why: string }> = {
-  disconnectWithin10ft: {
-    answer: "Yes",
-    why: "standard residential detail places the lockable AC disconnect within the required distance on every install — the operator's standing answer, and the same one autoLearnAdapter's POLICY_RADIO_DEFAULTS files at learn time",
-  },
-};
-
-/** The operator's standing answer for a binding, or "" when there is none. */
-export function operatorPolicyAnswer(key: string): string {
-  return OPERATOR_POLICY_ANSWERS[key]?.answer ?? "";
-}
+// The table is DATA in shared/src/perJobQuestions.ts (OPERATOR_POLICY_ANSWERS, with
+// its reasons), so the intake here and the replay's answer to a required control its
+// recipe never recorded (portal-bot unrecordedControls) read the SAME standing answer,
+// by the same key. It is the LOWEST-ranked answer source: projectAnswer() consults
+// the parser snapshot, the project record, and the v17 per-job column FIRST, so
+// anything recorded for a specific project still wins.
+export { operatorPolicyAnswer };
 
 /** True when the operator's standing answer settles this question, so nobody
  *  should be asked it.
@@ -233,7 +218,7 @@ export function operatorPolicyAnswer(key: string): string {
  *  surfaces. Live bank questions are unaffected: extractPortalQuestions builds
  *  every PortalQuestion with an explicit kind, and storedJson now persists it. */
 function policySettles(q: PortalIntakeQuestion): boolean {
-  if (!OPERATOR_POLICY_ANSWERS[q.key]) return false;
+  if (!operatorPolicyAnswer(q.key)) return false;
   return !!q.kind && q.kind !== "bound-empty";
 }
 

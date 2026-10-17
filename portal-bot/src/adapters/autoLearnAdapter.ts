@@ -59,6 +59,7 @@ import {
   type ContactFieldKind, type ContactRole, type ContactTrack,
 } from "../../../shared/src/contactRoles";
 import { portalSaysNotServed } from "../../../shared/src/portalNotServed";
+import { prepareComputeSettle, waitForComputeSettled } from "../computeSettle";
 
 // AutoLearnAdapter — AUTONOMOUSLY learns an unknown AHJ/utility portal form instead of
 // having a human record it. Each page is scraped into a structured snapshot
@@ -445,8 +446,15 @@ const OTHER_SPECIFY_VALUE = "Solar";
 
 // `scope`: "nem" (the default) applies on utility interconnection learns (profile residential_nem);
 // "permit" applies on AHJ/permit learns (profile permit_standard). A policy never crosses scopes.
-const POLICY_RADIO_DEFAULTS: Array<{ question: RegExp; answer: "Yes" | "No"; enforce?: boolean; scope?: "nem" | "permit" }> = [
-  { question: /do you propose to limit the export capacity/i, answer: "No" },
+// `jobKey`: the replay-map key (backend resolveRecipeFieldValues) that carries THIS job's own answer
+// to the question; the replay of a control its recipe never recorded binds that key ahead of the
+// standing answer (unrecordedControls POLICY_QUESTION_JOB_KEYS, derived from this table — so the
+// question is ONE regex, here). A rule without one has only the standing answer.
+// Every `question` is a non-global regex: the replay tests the same RegExp objects, so a `g`/`y` flag
+// would carry lastIndex between the two callers.
+export type PolicyRadioRule = Readonly<{ question: RegExp; answer: "Yes" | "No"; enforce?: boolean; scope?: "nem" | "permit"; jobKey?: string }>;
+export const POLICY_RADIO_DEFAULTS: ReadonlyArray<PolicyRadioRule> = Object.freeze(([
+  { question: /do you propose to limit the export capacity/i, answer: "No", jobKey: "exportLimiting" },
   // HYPHENS COUNT. Ameren Illinois asks "Is the inverter lab-certified as that term is
   // defined in the Illinois Distributed Generation Interconnection Standard?" — hyphenated,
   // which a whitespace-only pattern misses, leaving a REQUIRED question blank on every
@@ -492,7 +500,45 @@ const POLICY_RADIO_DEFAULTS: Array<{ question: RegExp; answer: "Yes" | "No"; enf
   // project." — "can be yes"; the learn picked No and the operator corrected it mid-run). enforce: a
   // planner's No is corrected.
   { question: /consent\s+to\s+drone|drones?\b.{0,60}\binspections?\b|drone\s+inspection/i, answer: "Yes", enforce: true, scope: "permit" },
-];
+] as PolicyRadioRule[]).map((rule) => Object.freeze(rule)));
+
+/** A POLICY SCOPE: "nem" on a utility interconnection, "permit" on an AHJ, "none" when the operator
+ *  turned the policy answers off (PORTAL_POLICY_DEFAULTS=off). Read from policyProfileFor below — the
+ *  one rule the learn (backend autoLearn.ts) and the replay (policyScopeFor) both ask. */
+export type PolicyScope = "nem" | "permit" | "none";
+
+/** Which deterministic policy-answer set a run may use (the learner's constructor option). */
+export type PolicyProfile = "residential_nem" | "permit_standard" | "none";
+
+/** THE ONE RULE FOR WHICH POLICY ANSWERS APPLY (PR #353 round 2: the backend's learn and the replay
+ *  each carried a copy). Deterministic policy answers (export capacity → No, UL 1741 → Yes) are
+ *  standard-residential-NEM domain policy: a UTILITY interconnection gets them, an AHJ/permit portal
+ *  gets the permit set, and PORTAL_POLICY_DEFAULTS=off (or 0) disables them everywhere (non-standard
+ *  projects; the planner + project data then decide). */
+export function policyProfileFor(scopeType: string | null | undefined, env: NodeJS.ProcessEnv = process.env): PolicyProfile {
+  if (env.PORTAL_POLICY_DEFAULTS === "off" || env.PORTAL_POLICY_DEFAULTS === "0") return "none";
+  return scopeType === "utility" ? "residential_nem" : "permit_standard";
+}
+
+/** THE LEARNER'S STANDING ANSWER TO A QUESTION, read from POLICY_RADIO_DEFAULTS — the one table
+ *  (issue #352). The replay asks it for a REQUIRED control its recipe has no step for (PacifiCorp's
+ *  knife-blade question renders only for a larger system, so a recipe learned on a small one never
+ *  recorded it), so a learn and a replay give one question one answer. "" when no rule matches or the
+ *  scope is "none". `enforce` is the learner's correction of a planner's other pick; a caller that
+ *  only ever answers an EMPTY control has nothing to correct, so it does not apply. */
+export function policyDefaultAnswerFor(question: string, scope: PolicyScope): "Yes" | "No" | "" {
+  if (scope === "none") return "";
+  const text = String(question ?? "");
+  const hit = POLICY_RADIO_DEFAULTS.find((p) => (p.scope ?? "nem") === scope && p.question.test(text));
+  return hit ? hit.answer : "";
+}
+
+/** The policy scope a replay runs under: the learn's own profile (policyProfileFor) for the recipe's
+ *  scope, as the scope POLICY_RADIO_DEFAULTS rules carry. */
+export function policyScopeFor(scopeType: string | null | undefined, env: NodeJS.ProcessEnv = process.env): PolicyScope {
+  const profile = policyProfileFor(scopeType, env);
+  return profile === "none" ? "none" : profile === "residential_nem" ? "nem" : "permit";
+}
 
 // Sensitive field labels whose literal value must NEVER be stored in a recorded step.
 // FREE-TEXT IDENTIFIERS. An account or meter number is typed; it is never one of three
@@ -9149,7 +9195,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const label = ((await btn.textContent().catch(() => "")) || "").trim();
       // Defense in depth: never click something that's actually a pay or submit control.
       if (isPayFee(label) || SUBMIT_INTENT.test(label)) return false;
+      // WAIT FOR THE RESULT, NOT THE CLICK (issue #352). A question the computed rating decides
+      // (PacifiCorp's AC disconnect section) renders only when the result is back; reading the page
+      // before that recorded nothing for it, and the learn's own sweep then found it required and
+      // never filled. The shared settle reads the page's own "still computing" signals, bounded.
+      await prepareComputeSettle(this.page);
       await this.clickResilient(btn);
+      const computed = await waitForComputeSettled(this.page);
+      this.debug?.event({ type: "compute_settled", label: label.slice(0, 40), settled: computed.settled, ms: computed.waitedMs, reason: computed.reason.slice(0, 160) });
       await this.waitForDynamicFieldsSettle();
       await this.clearOverlays();
       steps.push({

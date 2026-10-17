@@ -33,6 +33,7 @@ import { learnPortal, browserLimiter } from "../../portal-bot/src/index";
 import { resolveHeadless } from "../../portal-bot/src/browser";
 import { compareReviewFields, utilityIdentifiersEnteredBySteps } from "../../portal-bot/src/reviewScreenScraper";
 import type { LearnPlanRequest, LearnPlanResponse } from "../../portal-bot/src/adapters/autoLearnAdapter";
+import { policyProfileFor } from "../../portal-bot/src/adapters/autoLearnAdapter";
 import { createLLMProvider, getRecentLlmCalls } from "./llm";
 import { getDecryptedCredentialForPortal, getDecryptedCredentialByUrl, listPortalCredentials, nearestStoredLogins, recordLoginOutcome } from "./portalCredentials";
 import { learnNoteTopicsFromMisses, activeLearnedNoteTerms } from "./noteTopics";
@@ -1271,11 +1272,9 @@ async function autoLearnPortalInner(
       // Deterministic policy answers (export capacity → No, UL 1741 → Yes) are standard-
       // residential-NEM domain policy: apply them only on UTILITY interconnection learns,
       // never on AHJ/permit portals. PORTAL_POLICY_DEFAULTS=off disables them everywhere
-      // (non-standard projects); the planner + project data then decide.
-      policyProfile:
-        process.env.PORTAL_POLICY_DEFAULTS === "off" || process.env.PORTAL_POLICY_DEFAULTS === "0"
-          ? "none"
-          : scopeType === "utility" ? "residential_nem" : "permit_standard",
+      // (non-standard projects); the planner + project data then decide. ONE rule, shared with
+      // the replay's answer to a required control its recipe never recorded (policyScopeFor).
+      policyProfile: policyProfileFor(scopeType),
       // The keys a REPLAY can resolve. The planner picks the field each fill binds to, and
       // a key that exists only in the planner's richer map (or one it invents outright)
       // fills "" forever. Handing the adapter the replay map stops a dead binding being
