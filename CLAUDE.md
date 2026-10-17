@@ -62,6 +62,15 @@ production data.
    (shared/src/portalSafety.ts) / `automaticSubmitRefusals` (repository.ts), the
    single answer at every door. `portal_recipes.auto_submit_enabled` is never
    authority. Without that approval, automation never files.
+   One carve-out, which is NOT a filing (operator ruling 2026-10-16 on #330, "Yes to PSE"):
+   a NEM replay may click a submit that was SEEN to only create a draft (PSE Part 1) —
+   only when the backend's server-owned stamp (`portal_recipe_draft_submits`, written
+   only by `portalDraft.ts`, never a step field) names that LAST step, its tenant and
+   label, and the replayed steps match the whole recipe signature it was seen with;
+   `draftSubmitGate.ts` is the one answer. The page after must read as draft-created,
+   or the run stops, the incident is audited and the stamp is deleted. It never reads
+   the final-submit gate or stands in for it; a step flagged `isFinalSubmit` is never
+   clicked this way.
 2. Secrets (passwords, account/meter numbers, SSN, ESI/SA ids) never reach the LLM
    downstream — stripped in `buildPortalPlanner`; sensitive fields bind by name, not
    literal. The one allowed read: INTAKE may read the customer's own document (bill,
