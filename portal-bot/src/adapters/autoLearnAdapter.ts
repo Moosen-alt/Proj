@@ -143,6 +143,11 @@ export interface ExtractedField {
    *  post-reveal re-scan — this key lets it recognize (and never re-answer) a group that
    *  already has a recorded answer, which would silently flip the selection. */
   group?: string;
+  /** A radio's / checkbox's GROUP QUESTION (#362): its own label is the option word ("Yes"), and
+   *  the question ("Are you ready to submit…?") lives in the fieldset legend, the radiogroup's
+   *  accessible name, or a group label tied to no single option. Read by the gap-fill's
+   *  submit-intent guard; never sent to a planner. */
+  groupPrompt?: string;
   /** True when the control cannot be operated right now — :disabled (which also covers a
    *  control inside <fieldset disabled>), aria-disabled="true", or a `disabled` class token.
    *  Carried because A DISABLED NEXT IS A GATE, NOT AN ABSENCE: a wizard step whose Next
@@ -1318,6 +1323,8 @@ export interface RawField {
   offstage?: boolean;
   /** True when the control is not operable right now. See ExtractedField.disabled. */
   disabled?: boolean;
+  /** See ExtractedField.groupPrompt. */
+  groupPrompt?: string;
   /** A choice tile (markChoiceTilesInPage): a card clicked as a whole, labelled by its title.
    *  Its selector is the title TEXT — getByRole finds nothing on a plain container. */
   tile?: boolean;
@@ -1747,6 +1754,36 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       requiredByAsterisk = labelHasAsterisk(forLbl?.textContent) || labelHasAsterisk(wrapLbl?.textContent);
     }
     const required = (el as HTMLInputElement).required || el.getAttribute("aria-required") === "true" || requiredByAsterisk || undefined;
+    // THE GROUP'S OWN QUESTION (#362), in order: the fieldset legend; the radiogroup/group's
+    // aria-labelledby / aria-label; then a label in the group's container tied to no single option
+    // (no for=, or a for= naming no choice control, and not wrapping one) or a .control-label.
+    let groupPrompt = "";
+    if (fieldType === "radio" || fieldType === "checkbox") {
+      const clean = (t: string | null | undefined): string => String(t || "").replace(/\s+/g, " ").trim();
+      const legend = el.closest("fieldset")?.querySelector("legend");
+      groupPrompt = clean(legend?.textContent);
+      if (!groupPrompt) {
+        const rg = el.closest('[role="radiogroup"], [role="group"]');
+        if (rg) {
+          const by = (rg.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean)
+            .map((ref) => clean(document.getElementById(ref)?.textContent)).filter(Boolean).join(" ");
+          groupPrompt = by || clean(rg.getAttribute("aria-label"));
+        }
+      }
+      if (!groupPrompt) {
+        const box = el.closest("fieldset, .form-group, [class*='form-group'], [class*='field'], .row, [class*='row']");
+        const lbls = box ? Array.from(box.querySelectorAll("label, .control-label, .field-label")) : [];
+        for (const l of lbls) {
+          if (l.querySelector("input, select, textarea")) continue;
+          const f = l.getAttribute("for");
+          const tgt = f ? document.getElementById(f) : null;
+          if (tgt && /^(radio|checkbox)$/i.test((tgt as HTMLInputElement).type || "")) continue;
+          const t = clean(l.textContent);
+          if (t && t !== label) { groupPrompt = t; break; }
+        }
+      }
+      groupPrompt = groupPrompt.slice(0, 200);
+    }
 
     out.push({
       label, fieldType, options, role, name, placeholder, id, text, href,
@@ -1754,6 +1791,7 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       required: required || undefined,
       section: sectionFor(el) || undefined,
       testCss,
+      groupPrompt: groupPrompt || undefined,
       ariaLabel: el.getAttribute("aria-label")?.trim() || undefined,
       inActiveScope: scopeEl ? scopeEl.contains(el) : undefined,
       offstage: scopeEl ? !!el.closest('[aria-hidden="true"], [inert]') : undefined,
@@ -1877,6 +1915,7 @@ export function toExtractedField(raw: RawField): ExtractedField {
     };
   }
   if (raw.fieldType === "radio" && raw.name) field.group = raw.name;
+  if (raw.groupPrompt) field.groupPrompt = raw.groupPrompt;
   return field;
 }
 

@@ -97,6 +97,52 @@ await check("MUST EXCLUDE: an answer that reads as submitting is never typed, ev
   assert.deepEqual(out.attempted, []);
 });
 
+await check("MUST EXCLUDE: a select whose OPTIONS read as submitting is never offered or written, and is still reported", async () => {
+  const opts = ["Select…", "Yes, submit my application now", "No, save as a draft"];
+  for (const [label, answer] of [["Please choose", "Yes"], ["Next step", "application"]] as const) {
+    const { page, writes } = fakePage([{ label, fieldType: "select", options: opts, id: "nxt", required: true } as RawField]);
+    let asked = 0;
+    const planner = async (): Promise<LearnPlanResponse> => { asked++; return { fills: [{ selectorIndex: 0, value: answer }], atReview: false }; };
+    const out = await gapFillCurrentPage(page, planner, {});
+    assert.equal(asked, 0, `${label}: the planner was not asked`);
+    assert.equal(writes.length, 0, `${label}: writes: ${JSON.stringify(writes)}`);
+    assert.ok(out.reportedMissing.includes(label), `${label}: reported for a person: ${JSON.stringify(out)}`);
+  }
+});
+
+await check("MUST EXCLUDE: a Yes/No radio group whose QUESTION reads as submitting — no member offered, reported under the question", async () => {
+  // The three shapes extractFieldsInPage reads the question from (fieldset legend, a form-group
+  // label tied to no option, an aria radiogroup) all land as groupPrompt on each option.
+  const radio = (id: string, label: string): RawField => ({ label, fieldType: "radio", id, name: "readyR", groupPrompt: READY, required: true } as RawField);
+  const { page, writes } = fakePage([radio("rY", "Yes"), radio("rN", "No"), yesNo("agree", AGREE)]);
+  const offered: string[] = [];
+  const planner = async (req: LearnPlanRequest): Promise<LearnPlanResponse> => {
+    req.fields.forEach((f) => offered.push(`${f.fieldType}:${String(f.label ?? "")}`));
+    return { fills: req.fields.map((f, i) => ({ selectorIndex: i, value: "Yes" })), atReview: false };
+  };
+  const out = await gapFillCurrentPage(page, planner, {});
+  assert.ok(!offered.some((o) => o.startsWith("radio:")), `offered: ${JSON.stringify(offered)}`);
+  assert.ok(!writes.some((w) => w.key.includes("Yes") || w.key.includes("rY")), `writes: ${JSON.stringify(writes)}`);
+  assert.ok(out.reportedMissing.includes(READY), `the question is reported, not "Yes": ${JSON.stringify(out.reportedMissing)}`);
+  assert.equal(gapFillMayAnswer({ label: "Yes", groupPrompt: READY }), false);
+  assert.equal(gapFillMayAnswer({ label: "Yes", groupPrompt: AGREE }), true);
+});
+
+await check("MUST PASS: a write that throws after it reached the page is still reported in attempted", async () => {
+  const { page, writes } = fakePage([yesNo("agree", AGREE)]);
+  const throwing = (page as unknown as { getByLabel: (l: string) => Record<string, unknown> });
+  const orig = page.getByLabel;
+  const origLocator = page.locator;
+  const wrap = (l: Record<string, unknown>) => ({ ...l, first: () => wrap(l), selectOption: async (v: unknown) => { writes.push({ key: "agree", value: String(v) }); throw new Error("detached"); } });
+  throwing.getByLabel = (l: string) => wrap(orig(l) as unknown as Record<string, unknown>);
+  (page as unknown as { locator: (c: string) => unknown }).locator = (c: string) => (c === "body" ? origLocator(c) : wrap(origLocator(c) as unknown as Record<string, unknown>));
+  const { planner } = yesPlanner();
+  const out = await gapFillCurrentPage(page, planner, {});
+  assert.ok(writes.length >= 1, `the write reached the page: ${JSON.stringify(writes)}`);
+  assert.deepEqual(out.attempted, [AGREE]);
+  assert.equal(out.attemptedControls[0]?.id, "agree");
+});
+
 await check("MUST PASS: the predicate is portalSafety's reading — submit wording out, ordinary wording in", () => {
   assert.equal(gapFillMayAnswer(READY), false);
   assert.equal(gapFillMayAnswer("Finalize your application"), false);

@@ -41,6 +41,10 @@ export interface GapFillOutcome {
   /** Every field label a fill was ATTEMPTED on, landed or not (#362): a fill that threw half-way
    *  may still have written to the page, so "what automation wrote here" is read from this. */
   attempted: string[];
+  /** The control behind each attempted write, as the page named it when it was written (#362):
+   *  its label, id and name. The element itself also carries data-al-unrec (UNRECORDED_WRITE_ATTR),
+   *  so a replay can tell whether that control is still in front of a stamped draft click. */
+  attemptedControls: Array<{ label: string; id: string; name: string }>;
   /** Planned fills rejected because they weren't grounded in real project data. */
   skippedUngrounded: string[];
   /** Required, empty fields the PROJECT GENUINELY LACKS — surfaced so the human can act. */
@@ -53,7 +57,7 @@ export interface GapFillOutcome {
 }
 
 function emptyOutcome(): GapFillOutcome {
-  return { filled: [], attempted: [], skippedUngrounded: [], reportedMissing: [], unfilledDespiteData: [] };
+  return { filled: [], attempted: [], attemptedControls: [], skippedUngrounded: [], reportedMissing: [], unfilledDespiteData: [] };
 }
 
 function normalize(v: string): string {
@@ -189,13 +193,67 @@ function boolAgrees(a: string, b: string): boolean {
 // NEVER AN ANSWER THAT READS AS SUBMITTING (#362). "Are you ready to submit your Net Metering
 // application?" is a control whose Yes turns the page's Submit into a filing: the gap-fill prompt
 // says a required Yes/No MUST be answered, and a planner obeying it filed with no approval. So a
-// control whose label reads as submit intent (portalSafety isSubmitIntent, the one reading) is never
-// offered to the planner, and an answer that itself reads as submitting ("Yes, submit now") is never
-// typed. Left blank, it is a required field a person answers. Exported for tests.
-export function gapFillMayAnswer(label: string | null | undefined, value?: string | null): boolean {
-  if (isSubmitIntent(label)) return false;
+// control is never offered to the planner, and never written, when its label, its group's question
+// (a radio's own label is only "Yes"), or any of a select's options reads as submit intent
+// (portalSafety isSubmitIntent, the one reading) — "Yes" lands on "Yes, submit my application now"
+// by containment — and an answer that itself reads as submitting is never typed. Left blank, it is
+// a required field a person answers. Exported for tests.
+export function gapFillMayAnswer(
+  field: { label?: string | null; groupPrompt?: string | null; options?: string[] | null } | string | null | undefined,
+  value?: string | null,
+): boolean {
+  const f = typeof field === "string" || field == null ? { label: field ?? "" } : field;
+  if (isSubmitIntent(f.label) || isSubmitIntent(f.groupPrompt)) return false;
+  if ((f.options ?? []).some((o) => isSubmitIntent(o))) return false;
   if (value != null && isSubmitIntent(value)) return false;
   return true;
+}
+
+/** The attribute a gap-fill write leaves on the element it wrote (its value: the label). */
+export const UNRECORDED_WRITE_ATTR = "data-al-unrec";
+
+/** The #id the extractor saw for this field, when it saw one. */
+function extractedIdOf(field: ExtractedField): string {
+  const fromCss = (css: string | undefined): string => {
+    const m = /^#([A-Za-z_][\w:.-]*)$/.exec(String(css ?? "").trim());
+    return m ? m[1] : "";
+  };
+  return fromCss(field.selector?.css) || (field.selector?.fallbacks ?? []).map((fb) => fromCss(fb.css)).find(Boolean) || "";
+}
+
+/** IS THE CONTROL THE LOCATOR RESOLVED THE ONE THE EXTRACTOR SAW, AND MAY IT BE ANSWERED? (#362)
+ *  getByLabel(label).first() is a substring match: "Net Metering" resolves to an earlier "Are you
+ *  ready to submit your Net Metering application?" select. So the resolved element's id must be the
+ *  extracted one when there was one, and its OWN label (label[for], wrapping label, aria-label, and
+ *  for a radio/checkbox its legend / radiogroup name) must pass gapFillMayAnswer. A passing control
+ *  is stamped (UNRECORDED_WRITE_ATTR) BEFORE the write, so a write that throws half-way still marks
+ *  it. null = refused (or unreadable); a locator that cannot be evaluated (a test double) passes
+ *  with no stamp. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function claimForWrite(loc: any, field: ExtractedField, label: string): Promise<{ id: string; name: string } | null> {
+  if (typeof loc?.evaluate !== "function") return { id: extractedIdOf(field), name: "" };
+  const read = await loc.evaluate((el: Element) => {
+    const clean = (t: string | null | undefined): string => String(t || "").replace(/\s+/g, " ").trim();
+    const id = el.getAttribute("id") || "";
+    const parts: string[] = [];
+    if (id) parts.push(clean(document.querySelector(`label[for="${id.replace(/"/g, '\\"')}"]`)?.textContent));
+    parts.push(clean(el.closest("label")?.textContent), clean(el.getAttribute("aria-label")));
+    const type = ((el as HTMLInputElement).type || "").toLowerCase();
+    if (type === "radio" || type === "checkbox") {
+      parts.push(clean(el.closest("fieldset")?.querySelector("legend")?.textContent));
+      const rg = el.closest('[role="radiogroup"], [role="group"]');
+      if (rg) parts.push(clean(rg.getAttribute("aria-label")), ...(rg.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean).map((r) => clean(document.getElementById(r)?.textContent)));
+    }
+    const options = el.tagName === "SELECT" ? Array.from((el as HTMLSelectElement).options).map((o) => clean(o.textContent)) : [];
+    return { id, name: el.getAttribute("name") || "", labels: parts.filter(Boolean), options };
+  }).catch(() => null) as { id: string; name: string; labels: string[]; options: string[] } | null;
+  if (!read) return null;
+  const want = extractedIdOf(field);
+  if (want && read.id !== want) return null;
+  if (read.labels.some((l) => !gapFillMayAnswer(l)) || !gapFillMayAnswer({ options: read.options })) return null;
+  const stamped = await loc.evaluate((el: Element, a: { attr: string; label: string }) => { el.setAttribute(a.attr, a.label); return true; },
+    { attr: UNRECORDED_WRITE_ATTR, label }).catch(() => false);
+  return stamped ? { id: read.id, name: read.name } : null;
 }
 
 // Best-effort: neutralize the transparent loading scrims / onboarding popovers that
@@ -312,7 +370,10 @@ export async function gapFillCurrentPage(
     // Keep only the still-empty controls (don't overwrite the adapter's deterministic fills).
     const empties: Array<{ field: ExtractedField; loc: unknown }> = [];
     for (const field of candidates) {
-      const loc = buildLocator(page, field.selector);
+      // THE CONTROL THE EXTRACTOR SAW (#362): by its #id when it has one — a label locator is a
+      // substring match that can resolve to a neighbour.
+      const exactId = extractedIdOf(field);
+      const loc = buildLocator(page, exactId ? { css: `[id="${exactId.replace(/"/g, '\\"')}"]`, frame: field.selector?.frame } : field.selector);
       if (!loc) continue;
       if ((await isFieldEmpty(loc, field.fieldType)) === true) empties.push({ field, loc });
     }
@@ -325,7 +386,7 @@ export async function gapFillCurrentPage(
     if (!empties.some((e) => e.field.required)) return out;
     // A submit-intent control is never offered (gapFillMayAnswer); it stays in `empties`, so a
     // required one left blank is still reported below for a person to answer.
-    const offered = empties.filter((e) => gapFillMayAnswer(e.field.label));
+    const offered = empties.filter((e) => gapFillMayAnswer(e.field));
 
     const url = typeof page.url === "function" ? String(page.url() ?? "") : "";
     const pageTitle = typeof page.title === "function" ? String((await page.title().catch(() => "")) ?? "") : "";
@@ -353,12 +414,16 @@ export async function gapFillCurrentPage(
       if (!slot) continue;
       const { field, loc } = slot;
       if (isPayFee(field.label) || isSensitiveLabel(field.label)) continue;
-      if (!gapFillMayAnswer(field.label, fill.value)) continue;
+      if (!gapFillMayAnswer(field, fill.value)) continue;
       if (!isGrounded(field, fill.value, fill.field, projectFields)) {
         out.skippedUngrounded.push(field.label || field.fieldType);
         continue;
       }
-      out.attempted.push(field.label || field.fieldType);
+      const shown = field.label || field.fieldType;
+      const claimed = await claimForWrite(loc, field, shown);
+      if (!claimed) continue;
+      out.attempted.push(shown);
+      out.attemptedControls.push({ label: shown, id: claimed.id, name: claimed.name });
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const applied = await applyGrounded(page, loc as any, field, fill.value);
       if (applied) out.filled.push(field.label || field.fieldType);
@@ -395,7 +460,8 @@ export async function gapFillCurrentPage(
       projectHasValueForLabel(`${field.label || ""} ${field.fieldType || ""}`, projectFields);
     for (const { field } of empties) {
       if (!field.required) continue;
-      const lbl = field.label || field.fieldType;
+      // A submit-intent group left blank is reported under its QUESTION, not its option word "Yes".
+      const lbl = (!gapFillMayAnswer(field) && field.groupPrompt) || field.label || field.fieldType;
       if (out.filled.includes(lbl)) continue;
       if (projectHasValueFor(field)) {
         if (!out.unfilledDespiteData.includes(lbl)) out.unfilledDespiteData.push(lbl);

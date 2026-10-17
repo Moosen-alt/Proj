@@ -126,9 +126,9 @@ export abstract class BasePortalAdapter implements PortalAdapter {
   protected gapPlanner: import("./adapters/autoLearnAdapter").LearnPlanner | null = null;
   protected gapFields: Record<string, string> = {};
   protected gapFilledLabels: string[] = [];
-  /** The labels the LAST runGapFill tried to write (landed or not) — what that pass put on the page
-   *  that no recorded step did (#362). Reset at the start of every pass. */
-  protected lastGapFillWrites: string[] = [];
+  /** The controls the LAST runGapFill tried to write (landed or not), by label, id and name — what
+   *  that pass put on the page that no recorded step did (#362). Reset at the start of every pass. */
+  protected lastGapFillWrites: Array<{ label: string; id: string; name: string }> = [];
   /** Accumulated across pages; surfaced in the run result so the operator can see what the
    *  LLM filled and which required fields had no backing data (left blank, not guessed). */
   public gapFillReport: { filled: string[]; skippedUngrounded: string[]; reportedMissing: string[] } = {
@@ -154,7 +154,7 @@ export abstract class BasePortalAdapter implements PortalAdapter {
     try {
       const { gapFillCurrentPage } = await import("./llmGapFill");
       const r = await gapFillCurrentPage(page, this.gapPlanner, this.gapFields, this.gapFilledLabels);
-      this.lastGapFillWrites = [...r.attempted];
+      this.lastGapFillWrites = [...r.attemptedControls];
       this.gapFilledLabels.push(...r.filled);
       this.gapFillReport.filled.push(...r.filled);
       this.gapFillReport.skippedUngrounded.push(...r.skippedUngrounded);

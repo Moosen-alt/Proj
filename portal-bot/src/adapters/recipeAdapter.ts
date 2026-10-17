@@ -110,6 +110,7 @@ import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describe
 const DRIFT_SETTLE_MS = Math.max(2000, Number(process.env.RECIPE_DRIFT_SETTLE_MS ?? 15000));
 import { redactCaptureText, readbackMatches, detectChallengeFrame, frameSelectorFor, hasNumericValidationError, RETRY_BACKOFF_MS, sleep, smartWait, toBareNumber, waitForElement, waitForInteractiveControls } from "../safeAction";
 import { findFilingStatus } from "../statusFinder";
+import { UNRECORDED_WRITE_ATTR } from "../llmGapFill";
 import { performLogin, portalErrorPage } from "./loginFlow";
 import { chooseCorrectionForm, correctionFormSelector, isRefusal, scanProjectForms, type ProjectFormRow } from "./correctionForm";
 import { type ExtractedField, EXTRACT_SEL, extractFieldsInPage, toExtractedField, dismissPageModals, clearPageOverlays, equipmentMakeCandidates, pageFingerprintOf, collectValidationErrorsFrom, acaApplyEntryFrom, advanceSignatureOf } from "./autoLearnAdapter";
@@ -520,19 +521,87 @@ export class RecipeAdapter extends BasePortalAdapter {
   /** The page identity the last gap-fill ran against, so the end-of-run pass can tell a page
    *  that still needs one from a page that has just had one. */
   private gapFilledPage = "";
-  /** WHAT AUTOMATION WROTE ON THIS PAGE THAT NO RECORDED STEP WROTE (#362): labels, never values.
-   *  The AI gap-fill's fills and every other unrecorded write (an unrecorded upload slot, an owed
-   *  document's row, a Type chosen for an untyped row, a service-line box, a tier box the recording
-   *  did not name, a contact dialog's corrected values). Read by clickDraftCreatingSubmit: the
+  /** WHAT AUTOMATION WROTE THAT NO RECORDED STEP WROTE (#362), for the whole run: labels, never
+   *  values. The AI gap-fill's fills and every other unrecorded write (an unrecorded upload slot, an
+   *  owed document's row, a Type chosen for an untyped row, a service-line box, a tier box the
+   *  recording did not name, a contact dialog's corrected values, an array row the recording never
+   *  had, a re-assert of another page's recorded value). Read by clickDraftCreatingSubmit: the
    *  stamped draft click only happens on the page the stamp saw, and a page that needed answers the
    *  recorded steps never gave is not that page.
-   *  CLEARED ONLY WHEN THE PAGE IS SEEN TO BE LEFT: an advance whose move assertAdvanced confirmed,
-   *  or a recorded goto. An in-page click that only reveals controls, or a move that could not be
-   *  read, keeps the list, so the draft click refuses rather than guesses. */
-  private unrecordedWritesOnPage: string[] = [];
-  private noteUnrecordedWrite(what: string): void {
-    const w = String(what || "").replace(/\s+/g, " ").trim().slice(0, 80) || "a control";
-    if (!this.unrecordedWritesOnPage.includes(w)) this.unrecordedWritesOnPage.push(w);
+   *  KEYED TO THE CONTROL, NOT TO "LEAVING THE PAGE": the element written carries
+   *  UNRECORDED_WRITE_ATTR, and its id / name are kept. At the draft click, any control automation
+   *  wrote this run that is still in the document (stamped, or by id / name — visible or hidden, and
+   *  so a revisit too) refuses the click. A write with no control to point at (a dialog in a frame,
+   *  an array row, an owed document) is tied to the DOCUMENT it was made in (`doc`) and refuses
+   *  while that document is still the one in front. A real navigation (a new document) leaves them
+   *  behind; an advance that only reveals more of the same page never does. */
+  private unrecordedWrites: Array<{ label: string; id: string; name: string; doc: string }> = [];
+  /** The step index the page in front began at (a seen advance or a recorded goto), and the document
+   *  each recorded fill/select step last ran in: what tells a re-assert of THIS page's recorded value
+   *  from one carried over from an earlier page (#362). */
+  private pageStartStepIdx = 0;
+  private recordedStepDoc = new Map<number, string>();
+  /** The main document's token: set once on its <html>, so a new document reads a new one. "*" when
+   *  it cannot be read — which then matches every document (fail closed). */
+  private async docToken(): Promise<string> {
+    if (!this.page || typeof this.page.evaluate !== "function") return "*";
+    const t = await this.page.evaluate(() => {
+      const d = document.documentElement;
+      let tok = d.getAttribute("data-al-doc");
+      if (!tok) { tok = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`; d.setAttribute("data-al-doc", tok); }
+      return tok;
+    }).catch(() => "");
+    return String(t || "") || "*";
+  }
+  private async noteUnrecordedWrite(what: string, control?: { id?: string; name?: string }): Promise<void> {
+    const label = String(what || "").replace(/\s+/g, " ").trim().slice(0, 100) || "a control";
+    const id = String(control?.id ?? "");
+    const name = String(control?.name ?? "");
+    const doc = await this.docToken();
+    if (this.unrecordedWrites.some((w) => w.label === label && w.id === id && w.name === name && w.doc === doc)) return;
+    this.unrecordedWrites.push({ label, id, name, doc });
+  }
+  /** Note a write to the control a locator resolves: stamp it, keep its id / name. A control that
+   *  cannot be read is tied to the document instead. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async noteUnrecordedWriteAt(what: string, loc: any): Promise<void> {
+    const label = String(what || "").replace(/\s+/g, " ").trim().slice(0, 100) || "a control";
+    const ctl = loc && typeof loc.evaluate === "function"
+      ? await loc.evaluate((el: Element, a: { attr: string; label: string }) => {
+        el.setAttribute(a.attr, a.label);
+        return { id: el.getAttribute("id") || "", name: el.getAttribute("name") || "" };
+      }, { attr: UNRECORDED_WRITE_ATTR, label }, { timeout: 1500 }).catch(() => null) as { id: string; name: string } | null
+      : null;
+    await this.noteUnrecordedWrite(label, ctl ?? undefined);
+  }
+  /** Which unrecorded writes are still in front of the draft click (see unrecordedWrites). Unreadable
+   *  = every one of them (fail closed). */
+  private async unrecordedWritesInFront(): Promise<string[]> {
+    if (!this.unrecordedWrites.length) return [];
+    const all = (): string[] => Array.from(new Set(this.unrecordedWrites.map((w) => w.label)));
+    if (!this.page || typeof this.page.evaluate !== "function") return all();
+    const doc = await this.docToken();
+    const main = await this.page.evaluate((a: { attr: string; writes: Array<{ label: string; id: string; name: string; doc: string }>; doc: string }) => {
+      const out: string[] = [];
+      for (const el of Array.from(document.querySelectorAll(`[${a.attr}]`))) out.push(el.getAttribute(a.attr) || "a control");
+      for (const w of a.writes) {
+        const here = w.id ? !!document.getElementById(w.id)
+          : w.name ? document.getElementsByName(w.name).length > 0
+          : w.doc === "*" || a.doc === "*" || w.doc === a.doc;
+        if (here) out.push(w.label);
+      }
+      return out;
+    }, { attr: UNRECORDED_WRITE_ATTR, writes: this.unrecordedWrites, doc }).catch(() => null) as string[] | null;
+    if (!main) return all();
+    // ...and a stamp a gap-fill left inside a frame (a dialog the planner filled).
+    const framed: string[] = [];
+    const frames = typeof this.page.frames === "function" ? this.page.frames() : [];
+    for (const fr of Array.isArray(frames) ? frames : []) {
+      if (typeof this.page.mainFrame === "function" && fr === this.page.mainFrame()) continue;
+      const got = await fr.evaluate((attr: string) => Array.from(document.querySelectorAll(`[${attr}]`)).map((el) => el.getAttribute(attr) || "a control"), UNRECORDED_WRITE_ATTR).catch(() => [] as string[]);
+      framed.push(...(Array.isArray(got) ? got : []));
+    }
+    return Array.from(new Set([...main, ...framed]));
   }
   private stoppedAtPayment = false;
   /** Set by a fill step whose control the in-page reading marks as a signature box when this
@@ -844,7 +913,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     try {
       return await super.runGapFill(page);
     } finally {
-      for (const label of this.lastGapFillWrites) this.noteUnrecordedWrite(`gap-fill: ${label}`);
+      for (const w of this.lastGapFillWrites) await this.noteUnrecordedWrite(`gap-fill: ${w.label}`, w);
     }
   }
 
@@ -2687,6 +2756,8 @@ export class RecipeAdapter extends BasePortalAdapter {
   private async afterArrayBlock(): Promise<{ repeat: boolean; stop?: string }> {
     const want = this.projectArrayCount();
     if (this.arrayPass < want) {
+      // Every add, merge and row-N fill passes here: rows the recording never had (#362).
+      await this.noteUnrecordedWrite(`PV array rows beyond the recorded one (project has ${want} arrays)`);
       if (await this.addAnotherArrayRow()) {
         this.arrayPass++;
         if (this.arrayRowMode) this.rowArrays.push([this.arrayPass]);
@@ -3852,7 +3923,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       // basename carries the on-disk UUID prefix into what the portal reviewer sees.
       const payload = this.stageUpload(uploadPayloadFor(file, pdf));
       this.options.beforeUpload?.(hit.docType, file);
-      this.noteUnrecordedWrite(`upload: ${label}`);
+      await this.noteUnrecordedWriteAt(`upload: ${label}`, loc);
       // A REFUSED ATTACH IS REPORTED, NEVER SWALLOWED. This was `.catch(() => false)` and a
       // bare continue: a document Playwright refused (a 50MB+ buffer did, every time) was
       // simply not attached, with no warning — a missing document nobody was told about.
@@ -4070,6 +4141,11 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  review lockdown's live reading let it through. Its filing/payment rules and the run's own
    *  review lock (set at stopForReview) are untouched. Clicks, presses and gotos get no window. */
   private async executeStep(step: RecipeStep, pastReview: boolean): Promise<boolean> {
+    // Which document each recorded write ran in (#362: a re-assert from another page is unrecorded).
+    if (RecipeAdapter.WRITE_ACTIONS.has(step.action) && !this.inPolicyRetry) {
+      const idx = this.recipe.steps.indexOf(step);
+      if (idx >= 0) this.recordedStepDoc.set(idx, await this.docToken());
+    }
     if (!RecipeAdapter.WRITE_ACTIONS.has(step.action) || !this.backstop) return this.executeStepInner(step, pastReview);
     return withOwnWriteWindow(this.page, `recorded ${step.action}${step.note ? ` (${String(step.note).slice(0, 50)})` : ""}`, () => this.executeStepInner(step, pastReview));
   }
@@ -4295,8 +4371,8 @@ export class RecipeAdapter extends BasePortalAdapter {
         const target = this.resolveValue(step);
         const why = `recipe goto${step.note ? ` (${String(step.note).slice(0, 40)})` : ""}`;
         await this.withProgress("goto", `Opening ${String(step.note ?? "the recipe's page").slice(0, 40)}`, () => this.guardedGoto(target, why, { waitUntil: "domcontentloaded", timeout: 30000 }));
-        // A recorded goto opens a fresh page: what automation wrote on the last one stays there (#362).
-        this.unrecordedWritesOnPage = [];
+        // A recorded goto opens a fresh page (#362: what a re-assert counts as "this page").
+        this.pageStartStepIdx = this.currentStepIdx;
         const landedOnError = await this.recoverFromPortalErrorPage(target, why);
         await smartWait(this.page);
         // A recorded goto lands on a fresh section that a Vue/SPA portal may still be mounting.
@@ -5015,7 +5091,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       return;
     }
     this.rowsTypedByDocument.add(commitStep);
-    if (r.status === "chosen" || r.status === "not-taken") this.noteUnrecordedWrite(`attachment Type for the ${doc}`);
+    if (r.status === "chosen" || r.status === "not-taken") await this.noteUnrecordedWrite(`attachment Type for the ${doc}`);
     if (r.status === "chosen") {
       this.agingNotes.push(`the recorded attachment row for the ${doc} has no Type step — chose "${r.pick}" by the document from the portal's own list`);
     } else if (r.status === "no-fit") {
@@ -5141,7 +5217,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         continue;
       }
       await this.waitForLoadingMaskClear(`attaching ${label.slice(0, 40)}`);
-      this.noteUnrecordedWrite(`owed document: ${label}`);
+      await this.noteUnrecordedWrite(`owed document: ${label}`);
       const uploaded = await this.executeStep({ ...row.upload, docType: o.docType, note: `upload ${o.docType}: ${slotLabel}` }, false).catch(() => false);
       if (!uploaded) { fail("the page's file control did not take it"); continue; }
       // THE ROW IS NOW ON THE PAGE, UNSAVED. Anything that stops here leaves it pending, and the NEXT
@@ -5660,10 +5736,14 @@ export class RecipeAdapter extends BasePortalAdapter {
     // that they never write (the gap-fill above, or any write noteUnrecordedWrite records), it is
     // filled and the run stops here like a review stop: the answers stay on the page for a person to
     // check, the stamp is kept, and nothing is clicked. Never an incident.
-    if (this.unrecordedWritesOnPage.length) {
-      const shown = this.unrecordedWritesOnPage.slice(0, 6).join(", ");
-      const more = this.unrecordedWritesOnPage.length > 6 ? ` and ${this.unrecordedWritesOnPage.length - 6} more` : "";
-      return { kind: "refused", refusals: [`automation filled ${this.unrecordedWritesOnPage.length} control(s) on this page that the recorded steps never fill (${shown}${more}) — a person checks them and clicks Submit`] };
+    const inFront = await this.unrecordedWritesInFront();
+    if (inFront.length) {
+      const shown = inFront.slice(0, 6).join(", ");
+      const more = inFront.length > 6 ? ` and ${inFront.length - 6} more` : "";
+      // THE PERSON IS TOLD, not only the run log: reviewHandoffNotes rides the stop message.
+      const tell = `AUTOMATION ADDED ANSWERS THE RECORDING NEVER GIVES on the page in front of "${stamp.label.slice(0, 40)}" (${shown}${more}): it did NOT click it — check those answers, then click it yourself.`;
+      if (!this.reviewHandoffNotes.includes(tell)) this.reviewHandoffNotes.push(tell);
+      return { kind: "refused", refusals: [`automation filled ${inFront.length} control(s) on this page that the recorded steps never fill (${shown}${more}) — a person checks them and clicks Submit`] };
     }
     const empty = await this.emptyRequiredControls().catch(() => [] as string[]);
     if (empty.length) return { kind: "refused", refusals: [`required field(s) still empty on the page: ${empty.slice(0, 4).join(", ")}`] };
@@ -6029,12 +6109,11 @@ export class RecipeAdapter extends BasePortalAdapter {
     // (best-effort; never skips — the retry/reload loop still recovers a genuine miss).
     await waitForInteractiveControls(this.page);
     const moved = await this.assertAdvanced(step, beforeUrl, beforeFp, beforeEffect);
-    // THE PAGE WAS LEFT: what automation wrote on it stays with it (#362). Only an advance that was
-    // SEEN to move, and never a contact dialog's step (assertAdvanced's own exclusion): an in-page
-    // action that reveals controls, or a dialog closing onto a new contact row, also changes the
-    // page's identity without leaving it.
+    // A NEW PAGE BEGINS HERE (#362: what a re-assert counts as "this page"). Only an advance seen to
+    // move, never a contact dialog's step. A reveal read as a move only makes a later re-assert of
+    // this page's value count as carried over — the safe direction.
     const dialogStep = !!step.selector?.frame || isContactOpener(`${step.selector?.name ?? ""} ${step.selector?.text ?? ""} ${step.selector?.label ?? ""} ${step.note ?? ""}`);
-    if (moved && this.isAdvancingClick(step) && !dialogStep) this.unrecordedWritesOnPage = [];
+    if (moved && this.isAdvancingClick(step) && !dialogStep) this.pageStartStepIdx = this.currentStepIdx + 1;
     return true;
   }
 
@@ -7095,8 +7174,9 @@ export class RecipeAdapter extends BasePortalAdapter {
       this.feeTierFilled.set(pageKey, chosen.id);
       this.agingNotes.push(`kVA tier read from the page: ${ratingRaw} kVA → "${chosenLabel}" = ${chosen.value}${scheduleTierKey ? " (the stored fee schedule agrees)" : " (no fee schedule needed — the page prints its own bounds)"}`);
       const recorded = readTierLabel(stepLabel);
+      // Not provably the recorded box: an unrecorded write (#362).
+      if (!recorded || !sameFeeTier(recorded, chosen.bounds)) await this.noteUnrecordedWriteAt(chosenLabel, loc);
       if (recorded && !sameFeeTier(recorded, chosen.bounds)) {
-        this.noteUnrecordedWrite(chosenLabel);
         this.agingNotes.push(`the recorded box "${stepLabel}" is not this project's tier — "${chosenLabel}" was ticked instead, and the recorded box was left empty`);
       }
       // The constructor's coverage warning ("this job's bracket has NO box in the recorded recipe")
@@ -7189,13 +7269,13 @@ export class RecipeAdapter extends BasePortalAdapter {
       const loc = frame.locator(`[id="${b.id}"]`).first();
       if (!want) {
         if (b.tag !== "select" && otherVal && holds(b.kind, b, otherVal)) {
-          this.noteUnrecordedWrite(`contact: ${b.label}`);
+          await this.noteUnrecordedWrite(`contact: ${b.label}`);
           if (await loc.fill("", { timeout: FILL_TIMEOUT_MS }).then(() => true).catch(() => false)) fixed++;
         }
         continue;
       }
       if (holds(b.kind, b, want)) continue;
-      this.noteUnrecordedWrite(`contact: ${b.label}`);
+      await this.noteUnrecordedWrite(`contact: ${b.label}`);
       let ok = false;
       if (b.tag === "select") {
         ok = await loc.selectOption(want).then(() => true).catch(async () => loc.selectOption({ label: want }).then(() => true).catch(() => false));
@@ -7271,7 +7351,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         if (!this.fieldsVerified.includes(label)) this.fieldsVerified.push(label);
         continue;
       }
-      this.noteUnrecordedWrite(label);
+      await this.noteUnrecordedWriteAt(label, loc);
       const typed = await loc.fill(value, { timeout: FILL_TIMEOUT_MS }).then(() => true).catch(() => false);
       if (typed) await this.commitAndSettle(loc);
       const held = String((await loc.inputValue().catch(() => "")) ?? "").trim();
@@ -7844,18 +7924,33 @@ export class RecipeAdapter extends BasePortalAdapter {
     let blanks = await this.emptyRequiredControls();
     if (blanks.length && !this.inPolicyRetry) {
       const norm = (t: string): string => t.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-      const refills = this.recipe.steps.filter((rs) => {
-        if (rs.action !== "fill" && rs.action !== "select") return false;
+      const bare = (b: string): string => b.replace(/ — the portal flagged this field$/, "");
+      // NEVER INTO A BLANK THAT READS AS SUBMITTING (#362): an earlier page's "Net Metering" = Yes
+      // matched "Are you ready to submit your Net Metering (kWh) application?" by label, and the
+      // stamped draft Submit then filed. Left blank, a person answers it.
+      const open = blanks.filter((b) => !isSubmitIntent(bare(b)));
+      const matchOf = (rs: RecipeStep): string => {
         const name = norm(String(rs.note ?? rs.selector?.label ?? ""));
-        return !!name && blanks.some((b) => {
-          const nb = norm(b.replace(/ — the portal flagged this field$/, ""));
+        if (!name) return "";
+        return open.find((b) => {
+          const nb = norm(bare(b));
           return nb === name || (nb.length > 6 && name.includes(nb)) || (name.length > 6 && nb.includes(name));
-        });
-      }).slice(0, REASSERT_MAX_FIELDS);
+        }) ?? "";
+      };
+      const refills = this.recipe.steps.filter((rs) => (rs.action === "fill" || rs.action === "select") && !!matchOf(rs)).slice(0, REASSERT_MAX_FIELDS);
       if (refills.length) {
         this.inPolicyRetry = true;   // reuses the re-entry guard: no retry of a retry
         try {
+          const doc = await this.docToken();
           for (const rs of refills) {
+            // A RECORDED VALUE FROM ANOTHER PAGE IS AN UNRECORDED WRITE HERE (#362), on every attempt,
+            // landed or not, named by the live control it lands in. This page's own re-rendered
+            // recorded fields stay what they were: re-asserts of a recorded step.
+            const idx = this.recipe.steps.indexOf(rs);
+            const ranDoc = this.recordedStepDoc.get(idx);
+            if (idx < this.pageStartStepIdx || !ranDoc || (ranDoc !== doc && ranDoc !== "*")) {
+              await this.noteUnrecordedWrite(`re-assert into "${bare(matchOf(rs)).slice(0, 60)}" (the recorded "${String(rs.note ?? rs.field ?? "").slice(0, 40)}")`);
+            }
             const done = await this.executeStep(rs, pastReview).catch(() => false);
             // BOTH OUTCOMES, or this becomes the sixth silent path in this file. A
             // re-assert that fails says something different from one that was never
