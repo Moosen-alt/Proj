@@ -561,6 +561,11 @@ await check("#365: a tracked number counts on ITS side only, ruled by rule 5's o
   assert.equal(IP.infoPagePriorProgress(db, M, "https://aca-prod.accela.com/OTHEROR/Default.aspx", "ahj"), false, "…and not on another tenant of that host");
   // A host the predicate cannot judge (no entity evidence names it): the number counts.
   assert.equal(IP.infoPagePriorProgress(db, Nb, "https://permits.nowhere.example.test/apply", "ahj"), true, "an unjudgeable host never hides the number");
+  // Only a POSITIVE conflict rules a number off: the predicate refusing a portal for any other reason
+  // (here an information page, not a portal at all) never hides it.
+  const infoUrl = "https://www.cityofexample.gov/permits/solar-guide.pdf";
+  assert.equal(hostFitsTrackAndEntity("nem", portalEntityEvidence(db, { scope: "utility", state: "OR", name: "PGE" }), infoUrl, "kb").code, "not_a_portal", "precondition: refused, but not as a track conflict");
+  assert.equal(IP.infoPagePriorProgress(db, Nb, infoUrl, "ahj"), true, "a refusal that is not a track or platform conflict never hides the number");
   // No portal given at all: every number counts.
   assert.ok(IP.infoPagePriorProgressReasons(db, N, "ahj", []).hard.length > 0, "no portal: the number counts");
   assert.ok(IP.infoPagePriorProgressReasons(db, N, "ahj", ["not a url", ""]).hard.length > 0, "unreadable portals: the number counts");
