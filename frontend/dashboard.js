@@ -581,6 +581,10 @@ async function loadKnowledgeBase() {
     } catch { state.codeProfiles = []; state.designLookups = []; }
     $("knowledgeCount").textContent = state.knowledgeProfiles.length;
     renderKnowledgeBase();
+    // The open no longer reloads the KB (#361), so a KB that arrives late (the board-load fetch
+    // failed, then the modal or a refresh succeeded) must still reach the open project's
+    // record-portal URL prefill.
+    if (state.detail) safeRender("recordPortal", renderRecordPortal);
   } catch (err) {
     const countEl = $("knowledgeCount");
     if (countEl) countEl.textContent = "—";
@@ -1030,6 +1034,13 @@ async function loadEmailTracker() {
   }
 }
 
+// The ops plan + brief, runbook, handoff packet, communication drafts and installer actions panels
+// are hidden for solo operation (#hiddenTeamArtifacts in dashboard.html keeps their DOM so renders
+// never error), so selectProject no longer fetches them on every project open (#361). Their
+// loaders stay defined, and the actions that change their data still call them; restore the calls
+// in selectProject when the panels are un-hidden. The visible Project Timeline reads the stored
+// operation_steps that this sync writes, so the open keeps that one write through
+// loadProjectTimelineSynced (POST ops-plan/sync, then the timeline) without the panel loads.
 async function loadOpsPlan() {
   if (!state.selectedProjectId) {
     state.opsPlan = null;
@@ -1087,6 +1098,19 @@ async function loadStaleReadings() {
 
 async function loadProjectTimeline() {
   await loadProjectResource("projectTimeline", "timeline");
+}
+
+// THE OPEN'S TIMELINE IS CURRENT (#361 review). The timeline's phase entries and its blocker count
+// come from the stored operation_steps, which only a sync rewrites. The open used to get that sync
+// as a side effect of the hidden ops-plan GET, racing the timeline read; now it is one POST, awaited
+// first so the read sees it. A failed sync still shows the last stored timeline.
+async function loadProjectTimelineSynced() {
+  if (state.selectedProjectId) {
+    try {
+      await api(`/api/projects/${state.selectedProjectId}/ops-plan/sync`, { method: "POST", body: "{}" });
+    } catch { /* read what is stored */ }
+  }
+  await loadProjectTimeline();
 }
 
 async function loadProcessMap() {
@@ -2333,11 +2357,15 @@ async function selectProject(projectId) {
   safeRender("opsActions", renderOpsActions);
   // allSettled (not all): one failing/​flaky panel loader must NOT abort the others
   // or prevent renderDetail from running — otherwise the whole detail view breaks.
+  // NOT LOADED ON OPEN (#361): the six hidden team panels (ops plan + brief, runbook, handoff
+  // packet, communication drafts, installer actions) and the whole knowledge base. Nothing visible
+  // reads the panels, and they were most of an open's server time (each rebuilds the reviewer
+  // gate). The KB is loaded at board load, by its own actions and when the Knowledge modal opens.
+  // The ops-plan SYNC stays (loadProjectTimelineSynced): the visible timeline reads what it writes.
+  // backend/test/selectProjectHiddenPanels.test.ts fails if any of them comes back here.
   await Promise.allSettled([
-    loadKnowledgeBase(),
-    loadOpsPlan(), loadSubmitGate(), loadRunbook(), loadHandoffPacket(),
-    loadCommunicationDrafts(), loadLiveReadiness(), loadProjectTimeline(),
-    loadProcessMap(), loadInstallerPacket(), loadProjectDocuments(),
+    loadSubmitGate(), loadLiveReadiness(), loadProjectTimelineSynced(),
+    loadProcessMap(), loadProjectDocuments(),
     loadSubmittalTracks(), loadPaymentQuotes(), loadFeeSheet(), loadPortalQuestions(),
     loadStageResults(), loadCorrectionNotice(),
     loadStaleReadings(),
