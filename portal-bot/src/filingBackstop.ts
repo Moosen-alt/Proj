@@ -69,8 +69,11 @@
 // named (replay: backstopStop; learner: at the next page boundary and in its result).
 //
 // Installed at the CONTEXT level when the page has one, so a filing that opens in a popup is
-// covered too, and handed on with route.fallback() — never continue() — so a smoke's own
-// context.route fixture server still answers what this layer lets through.
+// covered too. A GET is handed on with route.fallback() — never continue() — so a smoke's own
+// context.route fixture server still answers what this layer lets through. An ALLOWED
+// state-changing request is sent by the backstop itself (forward, #358) so that a 307 / 308 to
+// another URL is judged as a fresh request before it is followed — handed on with fallback() only
+// when a route below answers it or its body cannot be re-sent (see forward).
 //
 // Known cost: Playwright disables the browser's HTTP cache while any route is installed.
 import { isFilingOrPaymentRequest, isPayRequestUrl, paymentDialogVerdict, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE } from "../../shared/src/portalSafety";
@@ -187,6 +190,9 @@ export interface FilingBackstop {
   openDrain(page: unknown, why: string): () => void;
   /** Where (origin + path) each request the drain let through went, in order. */
   readonly drainRequests: string[];
+  /** Allowed state-changing requests the backstop could not send (#358: the network failed, or the
+   *  send timed out) — ABORTED, never handed on unjudged. origin + path. */
+  readonly forwardFailures: ReadonlyArray<{ method: string; where: string; why: string }>;
   /** The run is at review: abort every state-changing request until dispose() hands the page to
    *  a person. Sticky. */
   lockReview(why: string): void;
@@ -534,6 +540,68 @@ function pageOfRequest(request: any): any {
   } catch { return null; }
 }
 
+// A REDIRECT IS A FRESH REQUEST (#358). Handed on to the network, an allowed POST answered 307 / 308
+// is re-sent — body and all — to the Location by the browser's network stack, and Playwright never
+// routes that second leg ("the handler will only be called for the first url"), so payment, the
+// filing-URL rule and the lockdown never saw where the data went. So the backstop sends an allowed
+// state-changing request itself (route.fetch, maxRedirects 0) and judges each method-keeping hop's
+// Location with the WHOLE handler, as a fresh request from the same page, before following it.
+/** Method-keeping hops followed after the first request; one more is aborted (stopping, named). */
+export const MAX_REDIRECT_HOPS = 3;
+/** One forwarded leg's budget (a large upload on a slow portal); a timeout is a failure (aborted). */
+const FORWARD_TIMEOUT_MS = 300_000;
+
+/** Does a redirect with this status re-send `method` (and its body) to the Location? The Fetch
+ *  standard: 307 / 308 always; 301 / 302 for anything but POST (a PUT / DELETE keeps its method);
+ *  303 never (it becomes a GET, which the browser follows as an ordinary GET). */
+export function redirectKeepsMethod(status: number, method: string): boolean {
+  const m = String(method || "").toUpperCase();
+  if (status === 307 || status === 308) return true;
+  if (status === 301 || status === 302) return m !== "POST";
+  return false;
+}
+
+/** Can the backstop re-send this body byte for byte? Chromium leaves a FILE the page picked through
+ *  <input type=file> out of what interception sees: a multipart body (a form upload, or a FormData
+ *  built from input.files) arrives with that part empty, and an XHR whose body IS such a file
+ *  arrives with no body at all — re-sent, the upload would arrive empty. Such a body cannot be
+ *  replayed and is handed on as on main: a multipart body with an empty file part (or no readable
+ *  boundary), and a missing body whose media type is not a form / JSON / text one (an XHR PUT of a
+ *  PDF). A missing body with no media type, or a form / JSON / text one, is an empty request and is
+ *  re-sent as one (KNOWN COST: an XHR of a picked file with no type reads the same way). A
+ *  constructed Blob / File (a fetch body, a FormData of a new File) carries its bytes. */
+export function bodyCanBeReplayed(contentType: string, body: Buffer | null | undefined): boolean {
+  const ct = String(contentType || "").trim();
+  if (!body || !body.length) return !ct || /^(application\/(x-www-form-urlencoded|json|xml|[\w.+-]+\+(json|xml))|text\/)/i.test(ct);
+  if (!/^multipart\/form-data/i.test(ct)) return true;
+  const b = /boundary=(?:"([^"]+)"|([^\s;]+))/i.exec(ct);
+  const boundary = b ? (b[1] ?? b[2]) : "";
+  if (!boundary) return false;
+  const parts = body.toString("latin1").split(`--${boundary}`).slice(1);
+  for (const part of parts) {
+    if (part.startsWith("--")) break;
+    const cut = part.indexOf("\r\n\r\n");
+    if (cut < 0) return false;
+    const headers = part.slice(0, cut);
+    const content = part.slice(cut + 4).replace(/\r\n$/, "");
+    if (/;\s*filename\*?=/i.test(headers) && content.length === 0) return false;
+  }
+  return true;
+}
+
+/** The same request, as the hop to `url` the redirect asks for: same method, body, page, frame,
+ *  navigation and resource type — only its URL is the Location's. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function asRedirectedTo(request: any, url: string): any {
+  return new Proxy(request, {
+    get(t, p) {
+      if (p === "url") return () => url;
+      const v = Reflect.get(t, p, t);
+      return typeof v === "function" ? v.bind(t) : v;
+    },
+  });
+}
+
 /** Install the backstop for one learn/replay run. null when the page cannot route (a unit-test
  *  double) — the word gates still run; nothing claims a backstop that is not there. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -627,6 +695,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   const drains = new Map<number, { page: unknown; why: string }>();
   let nextDrain = 1;
   const drainRequests: string[] = [];
+  const forwardFailures: Array<{ method: string; where: string; why: string }> = [];
   let locked = "";
   let disposed = false;
   // #344 — THE INFORMATION-PAGE PASS. Run-wide facts its predicate asks (the run wrote through an
@@ -724,7 +793,8 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   } catch { /* no events (a double): live reads only */ }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const handler = async (route: any, request: any): Promise<void> => {
+  // `hop` > 0: a redirect's Location, judged as a fresh request (forward, #358).
+  const handler = async (route: any, request: any, hop = 0): Promise<void> => {
     let method = "";
     let url = "";
     try { method = String(request.method() || "").toUpperCase(); url = String(request.url() || ""); } catch { /* unreadable: fall through as not-GET */ }
@@ -929,7 +999,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         const own = pg ? [...ownWrites.values()].find((w) => w.page === pg) : undefined;
         if (own) {
           ownWriteRequests.push(whereOf(url));
-          await route.fallback().catch(() => null);
+          await forward(route, request, hop);
           return;
         }
         // THE RUN'S OWN SAVE, STILL IN FLIGHT (dryrun-0928 B3): while drainOwnWrites holds the page, a
@@ -942,7 +1012,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
           const origin = originOf(url);
           if (origin !== "" && origin === originOf(pageUrl)) {
             drainRequests.push(whereOf(url));
-            await route.fallback().catch(() => null);
+            await forward(route, request, hop);
             return;
           }
         }
@@ -979,7 +1049,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
           // are held from its first byte, not only after checkInfoPageAfterClick returns.
           infoProof = { page: pg, entryId: infoAdmit.entryId, state: "pending", checked: false };
           infoProofEndpoint = whereOf(url);
-          await route.fallback().catch(() => null);
+          await forward(route, request, hop);
           return;
         }
         // AN UNVERIFIED INFORMATION PAGE'S HELD REQUEST, OBSERVED (#344): the watch the click opened
@@ -1008,7 +1078,76 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     }
     // The slot's request was not one 4(b) would have held: it passes as on main (recorded).
     if (infoAdmit && infoAdmit.refusals.length === 0) infoPageAdmissions.push({ entryId: infoAdmit.entryId, where: whereOf(url), exempted: false });
-    await route.fallback().catch(() => null);
+    await forward(route, request, hop);
+  };
+
+  // A ROUTE BELOW THIS ONE ANSWERS (a smoke's fixture server, a test's loopback-only guard, the demo
+  // recorder's fake portal, a second run's backstop on the same context): hand the request on with
+  // fallback() as before, so that route still decides — route.fetch would go straight to the network
+  // past it. Read from Playwright's handler list (no public API says what lies below); unreadable,
+  // or this handler not found in it, reads as "nothing below": the backstop sends it itself.
+  const lowerRouteTakes = (url: string): boolean => {
+    let routes: unknown;
+    try { routes = (target as { _routes?: unknown })._routes; } catch { return false; }
+    if (!Array.isArray(routes)) return false;
+    const i = routes.findIndex((r) => r && (r as { handler?: unknown }).handler === handler);
+    if (i < 0) return false;
+    return routes.slice(i + 1).some((r) => {
+      try { return typeof (r as { matches?: unknown })?.matches !== "function" || !!(r as { matches: (u: string) => boolean }).matches(url); } catch { return true; }
+    });
+  };
+  // THE ALLOWED REQUEST GOES OUT HERE (#358): sent by the backstop with maxRedirects 0. A
+  // method-keeping redirect (redirectKeepsMethod) is a NEW request to its Location: the whole
+  // handler judges it, from the same page / frame / resource type, with nothing the first leg
+  // consumed (the approved slot, the information-page slot) — then this follows it, at most
+  // MAX_REDIRECT_HOPS times. A redirect that turns into a GET (303; 301 / 302 of a POST) is handed to
+  // the browser as the response, which follows it as an ordinary GET. A failed send is ABORTED,
+  // never handed on unjudged. KNOWN COSTS: a followed 307 / 308 navigation shows the final page under
+  // the first URL; a judged hop of the approved filing meets the filing-URL rule like any other
+  // request. NOT COVERED (as on main, the redirect is the browser's): a body Chromium does not give
+  // interception (bodyCanBeReplayed — an <input type=file> upload) and a request a route below this
+  // one answers (lowerRouteTakes).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const forward = async (route: any, request: any, hop: number): Promise<void> => {
+    let url = "";
+    let method = "";
+    try { url = String(request.url() || ""); method = String(request.method() || "").toUpperCase(); } catch { /* checked below */ }
+    if (hop === 0) {
+      let contentType = "";
+      let body: Buffer | null = null;
+      try { contentType = String(request.headers()["content-type"] || ""); } catch { contentType = ""; }
+      try { body = request.postDataBuffer(); } catch { body = null; }
+      if (lowerRouteTakes(url) || !bodyCanBeReplayed(contentType, body)) {
+        await route.fallback().catch(() => null);
+        return;
+      }
+    }
+    const fail = async (why: string): Promise<void> => {
+      forwardFailures.push({ method: method || "?", where: whereOf(url), why: why.slice(0, 160) });
+      await route.abort("failed").catch(() => null);
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let res: any;
+    try { res = await route.fetch({ url, maxRedirects: 0, timeout: FORWARD_TIMEOUT_MS }); }
+    catch (e) { await fail(`the request could not be sent (${String((e as { message?: string })?.message ?? e).split("\n")[0]})`); return; }
+    let status = 0;
+    let location = "";
+    try { status = Number(res.status()); location = String(res.headers()["location"] || ""); } catch { /* fulfilled as is */ }
+    if (redirectKeepsMethod(status, method) && location) {
+      await Promise.resolve(res.dispose()).catch(() => null);
+      let next = "";
+      try { next = new URL(location, url).href; } catch { next = ""; }
+      const resourceType = (() => { try { return String(request.resourceType() || ""); } catch { return ""; } })();
+      const refuse = async (why: string): Promise<void> => {
+        aborts.push({ rule: "filing-url", method: method || "?", where: whereOf(next || url), why, resourceType });
+        await route.abort("blockedbyclient").catch(() => null);
+      };
+      if (!/^https?:\/\//i.test(next)) { await refuse(`a ${status} redirect to a Location the backstop cannot judge (${label})`); return; }
+      if (hop >= MAX_REDIRECT_HOPS) { await refuse(`a ${status} redirect past ${MAX_REDIRECT_HOPS} hops — the backstop follows no more (${label})`); return; }
+      await handler(route, asRedirectedTo(request, next), hop + 1);
+      return;
+    }
+    await route.fulfill({ response: res }).catch(() => null);
   };
 
   await target.route("**/*", handler);
@@ -1108,6 +1247,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       return () => { drains.delete(id); };
     },
     drainRequests,
+    forwardFailures,
     approvedSlotOpen() { return slotLive(); },
     closeApprovedSlot() { closeSlot(); },
     lockReview(why: string) {
