@@ -3629,6 +3629,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     const body = await this.page.locator("body").innerText({ timeout: 5000 }).catch(() => "");
     return this.scrubSecrets(String(body ?? ""));
   }
+  /** The left-open page's URL ("" without one) — the draft-created page's tenant (#330). */
+  readCurrentPageUrl(): string {
+    try { return this.page && typeof this.page.url === "function" ? String(this.page.url() ?? "") : ""; } catch { return ""; }
+  }
 
   // PATCH-BY-DEMONSTRATION: arm the (still-open, headed) page so anything the human
   // fixes by hand at the review handoff — a missed dropdown, an unmapped field — is
