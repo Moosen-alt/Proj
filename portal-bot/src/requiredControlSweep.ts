@@ -147,7 +147,16 @@ export async function sweepEmptyRequiredControls(
           const dy = cr.top - er.bottom;
           if (dy < -40 || dy > 90) continue;
           if (Math.abs(cr.left - er.left) > 420) continue;
-          const d = Math.abs(dy) + Math.abs(cr.left - er.left) / 8;
+          // BESIDE IS NOT FARTHER THAN BELOW (#327). A message on the SAME LINE, just after its
+          // field, overlaps it vertically, so |dy| charged it the field's whole height — and an
+          // empty box ending exactly where the message's line begins, far to the left, won by
+          // under a pixel: requiredBlank.dom.smoke's "This field is required." beside the empty
+          // inverter Manufacturer was blamed on the optional "Additional notes" box above it
+          // whenever the fonts wrapped that box onto the line above (since 3817c24d). Only a
+          // message to the RIGHT of the field counts as beside it; one that merely shares a
+          // line with a control further right is still measured as before.
+          const beside = cr.top < er.bottom && cr.bottom > er.top && cr.left >= er.right - 4;
+          const d = (beside ? 0 : Math.abs(dy)) + Math.abs(cr.left - er.left) / 8;
           if (d < bestD) { bestD = d; best = el; }
         }
         if (best) break;

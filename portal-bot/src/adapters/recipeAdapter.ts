@@ -3438,7 +3438,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    * worse ones — the exact mistake that broke a working replay earlier today.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private async reanchorIfWrongControl(step: RecipeStep, scoped: any): Promise<any | "abort" | null> {
+  private async reanchorIfWrongControl(step: RecipeStep, scoped: any, rescued = false): Promise<any | "abort" | null> {
     const recorded = String(step.selector?.label || step.note || "").trim();
     if (!recorded || !scoped || typeof scoped.count !== "function") return null;
     // Nothing resolved at all is a different problem (a genuine miss); leave it alone.
@@ -3556,7 +3556,18 @@ export class RecipeAdapter extends BasePortalAdapter {
           ? this.page.locator(`[id="${String(fp.id).replace(/["\\]/g, "\\$&")}"]`)
           : this.page.locator(`[name="${String(fp.name).replace(/["\\]/g, "\\$&")}"]`);
         const n = await target.count().catch(() => 0);
-        if (n === 1 && await this.insideArrayRow(target.first())) {
+        // NOT BACK ONTO THE CONTROL THE RESCUE JUST REJECTED (#327). When the recorded id now
+        // names a CONCEALED shadow (PGE's inverter "Model": opacity:0 behind the real select),
+        // the hook/section rescue above replaced it with the visible control of the recorded
+        // section. The fingerprint id is that same stale id, so this redirect sent the write
+        // straight back into the concealed box — the visible Model stayed "Select..." and the
+        // step missed. Since b05a9a5e (MF5) sectionDisambiguation.dom.smoke was red for that.
+        // A redirect onto a control a person CAN act on (MF5's owner/applicant boxes) is kept.
+        const backOntoRejected = rescued && n === 1 && await this.looksOutOfReach(target);
+        if (backOntoRejected) {
+          this.resolveTrail.push(`  ...fingerprint #${String(fp.id || fp.name).slice(0, 40)} is the concealed control the rescue passed over — kept the rescue`);
+        }
+        if (n === 1 && !backOntoRejected && await this.insideArrayRow(target.first())) {
           const meant = await target.first().evaluate((el: Element) => {
             const id = el.getAttribute("id");
             const forLbl = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
@@ -4183,6 +4194,9 @@ export class RecipeAdapter extends BasePortalAdapter {
     // "Model" selects differ only by "Inverter Clone System" versus "PV ArrayDelete Array",
     // and that string has been sitting in every such step's fingerprint since the day it was
     // learned. Consulted last, because a working selector needs no rescue.
+    // `rescued` tells the identity check below that the recorded control was passed over
+    // BECAUSE a person could not act on it, so it must not be handed straight back (#327).
+    let rescued = false;
     if (!isToggle && await this.looksOutOfReach(scoped)) {
       // THE PORTAL'S OWN NAME FOR THE CONTROL FIRST. A test hook is stable across renders and
       // says which side it belongs to; a recorded id is neither.
@@ -4201,10 +4215,10 @@ export class RecipeAdapter extends BasePortalAdapter {
       const usable = async (loc: unknown): Promise<boolean> =>
         !!loc && await this.isTrulyVisible(loc as never).catch(() => false);
       const byHook = await this.resolveByTestHook(step);
-      if (await usable(byHook) && await this.insideArrayRow(byHook)) scoped = byHook as never;
+      if (await usable(byHook) && await this.insideArrayRow(byHook)) { scoped = byHook as never; rescued = true; }
       else if (step.fingerprint?.section) {
         const bySection = await this.resolveBySection(step);
-        if (await usable(bySection) && await this.insideArrayRow(bySection)) scoped = bySection as never;
+        if (await usable(bySection) && await this.insideArrayRow(bySection)) { scoped = bySection as never; rescued = true; }
         else if (bySection || byHook) {
           this.resolveTrail.push(`  ...rescue: ${byHook ? "the test hook" : "the section"} resolved a control that is STILL concealed — the portal puts its hook on the hidden native input; kept the original`);
         }
@@ -4249,7 +4263,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // nothing reported. So confirm the control's own label still agrees with what was
     // recorded before touching it, and re-anchor by label when it does not.
     if (IDENTITY_CHECKED.has(step.action)) {
-      const anchored = await this.reanchorIfWrongControl(step, scoped);
+      const anchored = await this.reanchorIfWrongControl(step, scoped, rescued);
       if (anchored === "abort") return false;
       if (anchored) scoped = anchored;
     }
@@ -7397,7 +7411,22 @@ export class RecipeAdapter extends BasePortalAdapter {
     const shown = await this.shownBy(scoped);
     if (!shown) return null;
     if (!shown.text.trim() && !shown.value.trim()) return false;
-    return readbackMatches(shown.text, want) || (!!shown.value && readbackMatches(shown.value, want));
+    if (readbackMatches(shown.text, want) || (!!shown.value && readbackMatches(shown.value, want))) return true;
+    // A WIDGET'S BACKING INPUT HOLDS THE OPTION'S KEY, NOT ITS TEXT (#327). Miami's Telerik Job
+    // Category keeps <input id="JobCategoryID" style="display:none"> behind its face: picking
+    // "STAND-ALONE" writes "5" there and "STAND-ALONE" on the face. Since fb9d5d56 added this
+    // read-back, that landed pick was re-asserted, called FAILED and reported skipped
+    // (widgetDropdownReplay.dom.smoke). So when a concealed <input> holds SOME value (the pick
+    // did land in the form) that is not the answer's text, what the widget's face shows
+    // decides. An empty backing input still fails above, and a native select or a visible
+    // input is judged exactly as before.
+    const loc = scoped as { evaluate?: (fn: unknown, arg?: unknown) => Promise<unknown> } | null;
+    const concealedInput = !!loc && typeof loc.evaluate === "function"
+      && await loc.evaluate((el: Element) => el.tagName === "INPUT").catch(() => false)
+      && !(await this.isTrulyVisible(scoped as never).catch(() => true));
+    if (!concealedInput) return false;
+    const face = String(await loc!.evaluate!(comboboxFaceInPage, "text").catch(() => "") ?? "");
+    return !!face.trim() && readbackMatches(face, want);
   }
 
   /** WHAT A CONTROL SHOWS — the one reader for the select held-check and the array-row

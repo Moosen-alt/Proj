@@ -126,6 +126,27 @@ const PAGES: Record<string, string> = {
     <div class="form-group"><label for="d">Description</label>
       <textarea id="d">Solar PV plan set</textarea></div>`),
 
+  // ---- A COMPLAINT BESIDE ITS FIELD BELONGS TO THAT FIELD (#327) ---------------------
+  // requiredBlank.dom.smoke's page as the container's fonts laid it out: the optional notes
+  // box wrapped onto the line just above, ending where the complaint's line starts, and the
+  // complaint sits right after the empty Manufacturer select. Pinned with absolute positions
+  // so the geometry no longer depends on which fonts a machine has.
+  besideOwnField: shell(`
+    <label for="bn" style="position:absolute;left:8px;top:40px">Additional notes</label>
+    <input id="bn" style="position:absolute;left:8px;top:80px;width:185px;height:21px;box-sizing:border-box" />
+    <label for="bm" style="position:absolute;left:8px;top:101px">Inverter Manufacturer</label>
+    <select id="bm" style="position:absolute;left:154px;top:101px;width:168px;height:19px"><option value="">Please select...</option></select>
+    <span class="err" style="position:absolute;left:325px;top:101px;display:inline">This field is required.</span>`),
+
+  // ...and its mirror: a complaint UNDER its field, sharing a line with another empty control
+  // further RIGHT, still belongs to the field above it.
+  underWithNeighbourRight: shell(`
+    <label for="ua" style="position:absolute;left:8px;top:20px">Meter number</label>
+    <input id="ua" style="position:absolute;left:8px;top:60px;width:185px;height:21px;box-sizing:border-box" />
+    <span class="err" style="position:absolute;left:8px;top:111px;display:inline">This field is required.</span>
+    <label for="uc" style="position:absolute;left:200px;top:90px">Fax</label>
+    <input id="uc" style="position:absolute;left:200px;top:111px;width:185px;height:21px;box-sizing:border-box" />`),
+
   // ---- a complaint no control can own must still be reported -------------------------
   orphanComplaint: shell(`
     <div class="err">Please select at least one option before continuing.</div>
@@ -185,6 +206,15 @@ check("one complaint claims ONE field, not the whole page",
   many.length === 1, `${many.length} reported: ${JSON.stringify(many)}`);
 check("...and it is the field the message sits under",
   many.some((r) => /meter/i.test(r.name)), JSON.stringify(many));
+
+const beside = await sweep("besideOwnField");
+check("a complaint BESIDE its empty select is that select's, not the empty box on the line above (#327)",
+  beside.some((r) => /inverter manufacturer/i.test(r.name)) && !beside.some((r) => /additional notes/i.test(r.name)),
+  JSON.stringify(beside));
+const under = await sweep("underWithNeighbourRight");
+check("...and a complaint UNDER its field is not handed to an empty control further right on its line",
+  under.some((r) => /meter number/i.test(r.name)) && !under.some((r) => /fax/i.test(r.name)),
+  JSON.stringify(under));
 
 const instr = await sweep("instructions");
 check("INSTRUCTIONAL 'please select all that apply' is not treated as a complaint",
