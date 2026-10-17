@@ -93,9 +93,9 @@ export type InfoPageReserve = (entryId: string, where: string) => ReadonlyArray<
 /** The refusal when the run has no way to reserve a use (fail closed: held as on main). */
 export const INFO_PAGE_NO_RESERVATION = "a use of this verified page cannot be reserved on this run (no reservation given)";
 
-/** What openInfoPagePass answered (#344). `candidateWatch`: no verified page matched, and ONLY
- *  that refused — the backstop watches this page's held forward request so the run can record it
- *  for a person to verify. */
+/** What openInfoPagePass answered (#344). `candidateWatch`: no verified page matched, and nothing
+ *  else refused but (#366) at most the project's history on this portal — the backstop watches this
+ *  page's held forward request so the run can record it for a person to verify. */
 export interface InfoPagePassOpen {
   opened: boolean;
   entryId?: string;

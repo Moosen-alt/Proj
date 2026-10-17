@@ -2134,6 +2134,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   /** #344 — the backend's answer: has this project already made progress on this portal origin?
    *  Unknown (not given) is TRUE: an unknown never reassures. */
   private infoPagePriorProgress: boolean;
+  /** #366: no reading was given (the backend's fail-closed stand-in, or no backend at all). */
+  private infoPagePassUnavailable: boolean;
   /** The "advance:" steps an information-page pass of THIS run admitted (critique [9]: the step
    *  objects, never their indexes, which a rolled-back walk reuses). */
   private infoPassAdmittedSteps = new WeakSet<RecipeStep>();
@@ -2386,6 +2388,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
        *  held untouched, a run that reached review / paused / was interrupted, a number, a draft or a
        *  filing). Not given = true (refuses). */
       infoPagePriorProgress?: boolean;
+      /** #366: the backend handed this attempt no reading at all. Not given = true when no
+       *  prior-progress reading was given either (a caller with no backend): no pass, no card. */
+      infoPagePassUnavailable?: boolean;
       /** #344 round 5: the backend's reservation of a use (infoPages.reserveInfoPagePassUse), awaited
        *  by the network backstop at the admission of a verified page's one request. Refusals; empty =
        *  reserved. A refusal, a throw or none given holds the request exactly as on main. */
@@ -2411,6 +2416,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     this.signatureRequestApproval = options.signatureRequestApproval ?? null;
     this.infoPagePasses = Object.freeze((options.infoPagePasses ?? []).map((e) => Object.freeze(JSON.parse(JSON.stringify(e)) as VerifiedInfoPage)));
     this.infoPagePriorProgress = options.infoPagePriorProgress !== false;
+    this.infoPagePassUnavailable = options.infoPagePassUnavailable === true || typeof options.infoPagePriorProgress !== "boolean";
     this.onInfoPagePassed = typeof options.onInfoPagePassed === "function" ? options.onInfoPagePassed : undefined;
     this.reserveInfoPagePass = typeof options.reserveInfoPagePass === "function" ? options.reserveInfoPagePass : undefined;
     this.infoPageProofValues = Object.freeze(((): Record<string, string> => {
@@ -5491,7 +5497,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
                 : this.infoPageCandidateWithHistory
                   // #366: an unknown never reads as reassurance — this project's own next run is held
                   // at the verified page until a person allows it once more.
-                  ? `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: ${held} A person can mark this exact page once (project → Portal runs → Information page to verify); other projects' runs then pass it. THIS project already made progress on this portal, so its next run still stops at the verified page until a person who checked its application allows it once more (project → Portal runs), or the page is done by hand.`
+                  ? `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: ${held} A person can mark this exact page once (project → Portal runs → Information page to verify); other projects' runs then pass it. THIS project already made progress on this portal, so its next run still stops at the verified page: a person who checked its application may be able to allow it once more (project → Portal runs; the card says whether), or the page is done by hand.`
                   : `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: ${held} A person can mark this exact page once (project → Portal runs → Information page to verify); after that, runs pass it — only this page, and only before anything is entered on the run.`, null, pageCount, portalNotices),
               stopReason: "backstop_abort",
             };
@@ -8912,6 +8918,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       gapFills: 0,
       priorProgress: this.infoPagePriorProgress,
       projectValues: [...this.infoPageProjectValues],
+      passUnavailable: this.infoPagePassUnavailable,
     };
     let r: InfoPagePassOpen;
     // Round 5: the backstop awaits the backend's reservation at the admission itself.
@@ -8982,6 +8989,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         observed: take.observed,
         evidence: infoPageEvidence(take.material, scrub),
         ...(shot ? { screenshotBase64: shot } : {}),
+        ...(this.infoPageCandidateWithHistory ? { capturedWithHistory: true } : {}),
       };
       if (!this.infoPageCandidate || (!this.infoPageCandidate.observed && capture.observed)) this.infoPageCandidate = capture;
       this.debug?.event({ type: "info_page_candidate", page: pageCount, identity: take.digest.identitySha256.slice(0, 12), held: !!take.observed, screenshot: !!shot });

@@ -311,6 +311,8 @@ const ctxWith = (o: Partial<{ run: InfoPageRunState; backstop: InfoPageBackstopS
       ["no verified page, a step before this page is not an entry click → no card", { entries: [], run: { ...history, priorSteps: [...clone(PREFIX_STEPS), { action: "fill", note: "Site Address" }] } }, false],
       ["no verified page, the backstop already stopped a request → no card", { entries: [], run: history, backstop: { ...liveBackstop(), stoppingAbort: true } }, false],
       ["no verified page, the run locked review (4a) → no card", { entries: [], run: history, backstop: { ...liveBackstop(), locked: true } }, false],
+      ["no verified page, the backend gave NO reading (its fail-closed stand-in) → no card", { entries: [], run: { ...history, passUnavailable: true } }, false],
+      ["no verified page, a clean run with passUnavailable false → a card", { entries: [], run: { ...cleanRun(), passUnavailable: false } }, true],
     ];
     for (const [what, o, want] of cases) {
       const w = watchFor(o);

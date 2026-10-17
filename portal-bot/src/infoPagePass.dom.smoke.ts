@@ -225,8 +225,9 @@ check("[A2] no use was reserved (the pass was never opened)", reserveCalls.lengt
 check("[A2] the card was recorded: the held request observed, and it is exactly what the identity said the control sends",
   !!A2.candidate?.observed && infoPageRequestRefusals(A2.candidate.digest.expected, A2.candidate.observed).length === 0,
   JSON.stringify(A2.candidate?.observed ?? null));
-const A3 = await go({ p: "/A3", html: (p) => devhubReplica({ p }), entries: [], run: (s) => cleanRun(devhubPrefix(s), { priorProgress: true, writes: 1 }) });
-check("[A3] history AND a value already written on this run: no watch, no card, held",
+// The shape the real learner gives for entered data: a recorded fill before this page.
+const A3 = await go({ p: "/A3", html: (p) => devhubReplica({ p }), entries: [], run: (s) => cleanRun([...devhubPrefix(s), { action: "fill", note: "Site Address" }], { priorProgress: true }) });
+check("[A3] history AND a value already entered on this run (a recorded fill): no watch, no card, held",
   !!A3.open && A3.open.opened === false && A3.open.candidateWatch === false && !A3.candidate && held(A3), JSON.stringify({ open: A3.open, candidate: !!A3.candidate }));
 check("[A] the tenant name is in the page text the identity read (amendment [8]: not in a landmark, not masked)",
   !!A.candidate && A.candidate.material.text.includes(ACCOUNT));

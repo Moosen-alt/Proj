@@ -493,6 +493,10 @@ export interface InfoPageRunState {
   priorProgress: boolean;
   /** The project's own values (street, name, parcel, kW) — refused when on the page. */
   projectValues: string[];
+  /** #366: the backend handed this attempt NO reading at all (its fail-closed stand-in: no project
+   *  row, a read that threw, a retry after an admission, or no backend). Refuses the pass AND the
+   *  card — unlike priorProgress, which is a real reading that refuses only the pass. Absent = false. */
+  passUnavailable?: boolean;
 }
 
 export interface InfoPageBackstopState {
@@ -568,8 +572,13 @@ export function infoPageRunStateRefusals(run: InfoPageRunState | null | undefine
   if (typeof run.gapFills !== "number" || !Number.isFinite(run.gapFills)) out.push("the run did not count its gap fills");
   else if (run.gapFills > 0) out.push(`the run already filled ${run.gapFills} gap(s)`);
   if (!Array.isArray(run.projectValues)) out.push("the run did not give the project's values");
+  if (run.passUnavailable === true) out.push(INFO_PAGE_PASS_UNAVAILABLE_REFUSAL);
   return out;
 }
+
+/** #366: the refusal for an attempt the backend handed no reading (InfoPageRunState.passUnavailable).
+ *  Never in the candidate class: an unknown records no card and claims no history. */
+export const INFO_PAGE_PASS_UNAVAILABLE_REFUSAL = "the information-page pass was not available on this attempt (the backend gave no reading)";
 
 /** The backstop's own state (read by the backstop itself, never by a caller). */
 export const MAX_INFO_PAGE_ADMISSIONS = 3;
