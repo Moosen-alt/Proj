@@ -33,7 +33,19 @@
 //      the page's reading at its last load, since a navigating page cannot be asked), so a page
 //      script that posts a second after the review page loads is caught however fast the run
 //      is. Lifted only by the approved
-//      final submit's window (non-payment URLs) and by dispose() — the hand-off to a person.
+//      final submit's window (non-payment URLs), by dispose(), and — for a PERSON'S OWN click only —
+//      by the hand-over (#333, owner ruling 2026-10-14 "we'll have to allow that in the future").
+//      HAND-OVER (handOverToHuman): a guided-manual replay stopped at review hands the page to a
+//      person BEFORE its read-only housekeeping (the review read-back, screenshots), not after it.
+//      From that moment a state-changing request whose page saw a TRUSTED pointer / Enter / Space
+//      input within HUMAN_INPUT_MS passes rules 2 and 4 (the filing-URL rule and this lockdown):
+//      the person's own submit. How a person's request is told apart from automation's: the input
+//      watch (watchHumanInput) is armed only after the run's LAST input on the page, and the run
+//      makes no input after the hand-over (everything after it is reads) — so a trusted input the
+//      watch sees can only be the person's. A page script posting with no input meets the lockdown
+//      exactly as before; payment (rule 1) and an open dismisser / Enter window (rule 3, the
+//      run's own action in flight) are never lifted. An abort that follows such an input is
+//      flagged humanInput, so the run can say "your click was held back — click again".
 //      (b) exempts the RUN'S OWN recorded write on that page while it is in flight
 //      (withOwnWriteWindow: a fill / select / check whose per-field autosave posts — PowerClerk's
 //      Terms checkbox at review); (a), the filing-URL rule and payment never exempt anything.
@@ -130,6 +142,9 @@ export interface BackstopAbort {
   /** What was in flight (the window's reason), or the filing-URL rule's reason. */
   why: string;
   resourceType: string;
+  /** #333: the requesting page saw a person's own input (watchHumanInput) within HUMAN_INPUT_MS —
+   *  the held request was most likely their click, not the page acting by itself. */
+  humanInput?: boolean;
 }
 
 export interface FilingBackstop {
@@ -190,6 +205,22 @@ export interface FilingBackstop {
   /** The run is at review: abort every state-changing request until dispose() hands the page to
    *  a person. Sticky. */
   lockReview(why: string): void;
+  /** #333 — WATCH FOR A PERSON'S OWN INPUT: from now on a trusted pointerdown / mousedown /
+   *  touchstart, or an Enter / Space keydown, in any frame of any page of the run's context is
+   *  recorded against its page. Call it only once the run has made its LAST input on the page (the
+   *  run's own clicks are trusted input too). false = it could not be armed (the hand-over then
+   *  lets nothing through: fail closed). */
+  watchHumanInput(): Promise<boolean>;
+  /** #333 — THE HAND-OVER: the run is done acting on the page and gives it to a person. From here a
+   *  request that follows that person's own input (watchHumanInput) passes the filing-URL rule and
+   *  the review lockdown; nothing else changes. false = disposed, or the input watch is not armed. */
+  handOverToHuman(why: string): boolean;
+  /** Has the run handed the page over (and not been disposed)? */
+  handedOver(): boolean;
+  /** Each request a person's own input let through after the hand-over: where it went (origin +
+   *  path), whether it was a main-frame document request (a form submission), and how many aborts
+   *  had been recorded before it (aborts after it are the page the person's click led to). */
+  readonly humanRequests: Array<{ where: string; document: boolean; abortsBefore: number }>;
   /** Aborts that stop the run: filing, payment, review lockdown. */
   stoppingAborts(): BackstopAbort[];
   /** A HUMAN-VERIFIED INFORMATION PAGE (#344): read `page`'s identity fresh on `control` (a
@@ -253,6 +284,21 @@ export const isStoppingAbort = (a: BackstopAbort): boolean => a.rule === "filing
   || (a.rule === "review-lockdown" && (/^document$/i.test(String(a.resourceType || "")) || isFilingOrPaymentRequest(a.method, a.where)));
 
 const REGISTRY = new WeakMap<object, FilingBackstop>();
+
+/** #333: how long after a person's own input a state-changing request is theirs. A click's form
+ *  POST follows its pointerdown by well under a second; a confirm() answered first takes longer. */
+const HUMAN_INPUT_MS = 4_000;
+/** The page binding the input watch reports through (one per context or page, never removed). */
+const HUMAN_INPUT_BINDING = "__solarBackstopHumanInput";
+/** The in-page watch. A string, not a function: tsx's __name wrapper does not exist in the page. */
+const HUMAN_INPUT_SCRIPT = `(() => { const w = window; if (w.__solarBackstopHumanInputArmed) return; w.__solarBackstopHumanInputArmed = true;
+  const note = (e) => { if (!e || !e.isTrusted) return; if (e.type === "keydown" && e.key !== "Enter" && e.key !== " ") return;
+    try { if (typeof w.${HUMAN_INPUT_BINDING} === "function") w.${HUMAN_INPUT_BINDING}(); } catch (_) { /* the watch never breaks the page */ } };
+  for (const t of ["pointerdown", "mousedown", "touchstart", "keydown"]) w.addEventListener(t, note, true); })();`;
+/** The binding is exposed once per host and dispatches to whichever backstop watches that host now
+ *  (a second run in the same window — a correction reopen — must not lose its watch). */
+const HUMAN_INPUT_EXPOSED = new WeakSet<object>();
+const HUMAN_INPUT_SINKS = new WeakMap<object, (page: unknown) => void>();
 
 /** The backstop installed on this page's run, or null (a page no run owns: human capture). */
 export function backstopFor(page: unknown): FilingBackstop | null {
@@ -629,6 +675,17 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   const drainRequests: string[] = [];
   let locked = "";
   let disposed = false;
+  // #333 — THE HAND-OVER. When each page last saw a person's own input (watchHumanInput), and when
+  // the run handed the page over (0 = not yet).
+  const humanInputAt = new WeakMap<object, number>();
+  let humanWatchArmed = false;
+  let handedOverAt = 0;
+  const humanRequests: Array<{ where: string; document: boolean; abortsBefore: number }> = [];
+  const recentHumanInput = (pg: unknown): boolean => {
+    if (!pg || typeof pg !== "object") return false;
+    const t = humanInputAt.get(pg as object) ?? 0;
+    return t > 0 && Date.now() - t <= HUMAN_INPUT_MS;
+  };
   // #344 — THE INFORMATION-PAGE PASS. Run-wide facts its predicate asks (the run wrote through an
   // own-write window; an approved final-submit slot was ever opened), its ONE slot, its candidate
   // watch, and what each admitted. Every closer below also closes these.
@@ -767,10 +824,16 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     }
     let resourceType = "";
     try { resourceType = String(request.resourceType() || ""); } catch { /* keep "" */ }
+    const requestPage = pageOfRequest(request);
     const abort = async (rule: BackstopRule, why: string): Promise<void> => {
-      aborts.push({ rule, method: method || "?", where: whereOf(url), why, resourceType });
+      aborts.push({ rule, method: method || "?", where: whereOf(url), why, resourceType, ...(recentHumanInput(requestPage) ? { humanInput: true } : {}) });
       await route.abort("blockedbyclient").catch(() => null);
     };
+    // #333 — A PERSON'S OWN REQUEST AFTER THE HAND-OVER: the requesting page saw their input (the
+    // watch is armed only after the run's last input, and the run makes none after the hand-over)
+    // and no run action is in flight (a dismisser / Enter window). It passes the filing-URL rule and
+    // the review lockdown below; payment and the windows still apply.
+    const human = handedOverAt > 0 && !disposed && windows.size === 0 && recentHumanInput(requestPage);
     // R0 — THE INFORMATION-PAGE SLOT IS CONSUMED by the FIRST request that could be the verified
     // control's (#344): the bound page's own main-frame document navigation. Matched or not, the
     // slot is gone, and consuming it changes no rule's outcome: the request meets payment, the
@@ -834,7 +897,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       }
     }
     // 2. FILING URL: only inside THE approved final submit's window.
-    if (isFilingOrPaymentRequest(method || "POST", url) && !approved) {
+    if (isFilingOrPaymentRequest(method || "POST", url) && !approved && !human) {
       await abort("filing-url", `a filing endpoint, and no named approval covers this request (${label})`);
       return;
     }
@@ -910,7 +973,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       }
     }
     // 4. REVIEW-PAGE LOCKDOWN: the run locked it, or the requesting page reads as terminal now.
-    if (!approved) {
+    if (!approved && !human) {
       if (locked) { await abort("review-lockdown", locked); return; }
       const pg = pageOfRequest(request);
       let navigation = true;
@@ -1008,6 +1071,11 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     }
     // The slot's request was not one 4(b) would have held: it passes as on main (recorded).
     if (infoAdmit && infoAdmit.refusals.length === 0) infoPageAdmissions.push({ entryId: infoAdmit.entryId, where: whereOf(url), exempted: false });
+    if (human) {
+      let mainFrame = false;
+      try { mainFrame = !!requestPage && typeof requestPage.mainFrame === "function" && request.frame() === requestPage.mainFrame(); } catch { mainFrame = false; }
+      humanRequests.push({ where: whereOf(url), document: mainFrame && /^document$/i.test(resourceType), abortsBefore: aborts.length });
+    }
     await route.fallback().catch(() => null);
   };
 
@@ -1114,6 +1182,47 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       closeInfo();
       if (!locked) locked = `the run is at review (${String(why || label).slice(0, 100)}) — nothing legitimate posts from here until a person takes the page`;
     },
+    async watchHumanInput() {
+      if (disposed) return false;
+      if (humanWatchArmed) return true;
+      // The binding and the init script live on the context when there is one, so a popup the
+      // person opens is watched too; the existing documents get the script now.
+      const host = ctx && typeof ctx.exposeBinding === "function" && typeof ctx.addInitScript === "function" ? ctx
+        : typeof page.exposeBinding === "function" && typeof page.addInitScript === "function" ? page : null;
+      if (!host) return false;
+      HUMAN_INPUT_SINKS.set(host, (pg) => { if (!disposed && pg && typeof pg === "object") humanInputAt.set(pg as object, Date.now()); });
+      try {
+        if (!HUMAN_INPUT_EXPOSED.has(host)) {
+          await host.exposeBinding(HUMAN_INPUT_BINDING, (source: { page?: unknown }) => {
+            try { HUMAN_INPUT_SINKS.get(host)?.(source && source.page); } catch { /* the watch never breaks the page */ }
+          });
+          HUMAN_INPUT_EXPOSED.add(host);
+          await host.addInitScript({ content: HUMAN_INPUT_SCRIPT });
+        }
+      } catch { return false; }
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const pages: any[] = host === ctx && typeof ctx.pages === "function" ? ctx.pages() : [page];
+      const inject = async (): Promise<void> => {
+        for (const p of pages) {
+          for (const f of typeof p?.frames === "function" ? p.frames() : []) await f.evaluate(HUMAN_INPUT_SCRIPT).catch(() => null);
+        }
+      };
+      // A navigating frame cannot answer; the init script covers the document it is loading.
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      await Promise.race([inject(), new Promise<void>((r) => { timer = setTimeout(r, TERMINAL_READ_TIMEOUT_MS); })]);
+      if (timer) clearTimeout(timer);
+      humanWatchArmed = !disposed;
+      return humanWatchArmed;
+    },
+    handOverToHuman(_why: string) {
+      if (disposed || !humanWatchArmed) return false;
+      closeSlot();
+      closeInfo();
+      if (!handedOverAt) handedOverAt = Date.now();
+      return true;
+    },
+    handedOver() { return handedOverAt > 0 && !disposed; },
+    humanRequests,
     stoppingAborts() { return aborts.filter(isStoppingAbort); },
     async openInfoPagePass(pg: unknown, control: unknown, opts: { entries: ReadonlyArray<VerifiedInfoPage>; run: InfoPageRunState; reserve?: InfoPageReserve }): Promise<InfoPagePassOpen> {
       // A new open closes any earlier slot or watch (a candidate already observed is kept).
@@ -1247,6 +1356,8 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       ownWrites.clear();
       drains.clear();
       locked = "";
+      // The input binding stays exposed (Playwright cannot remove it); it now reports to nobody.
+      for (const h of [ctx, page]) if (h && typeof h === "object" && HUMAN_INPUT_SINKS.has(h)) HUMAN_INPUT_SINKS.delete(h);
       for (const u of unwatch.splice(0)) u();
       await target.unroute("**/*", handler).catch(() => null);
     },

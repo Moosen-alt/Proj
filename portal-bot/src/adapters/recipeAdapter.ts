@@ -102,7 +102,11 @@ import {
 } from "../../../shared/src/portalSafety";
 import { commitField, installSettleProbe, waitForSettled } from "../settle";
 import { siteOfUrl } from "../siteOf";
-import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, type FilingBackstop } from "../filingBackstop";
+import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, isStoppingAbort, type FilingBackstop } from "../filingBackstop";
+
+/** #333: what the person is told when their own click on the review page came before the run had
+ *  handed it over (the backstop held it; nothing was sent). */
+export const HUMAN_CLICK_HELD_NOTE = "YOUR CLICK WAS HELD BACK: you clicked on the review page before the run had handed it over to you, so that request was stopped and nothing was sent — the run has let go of the page now, so click again.";
 
 // How long the drift precheck waits for an async-rendered form to paint before concluding
 // the replay is on the wrong page. PowerClerk's Ameren form reports zero inputs for several
@@ -943,6 +947,9 @@ export class RecipeAdapter extends BasePortalAdapter {
 
   private backstop: FilingBackstop | null = null;
   private backstopReported = 0;
+  /** #333: after the hand-over, a person's own main-frame form request went (their submit, or a
+   *  postback they made) — the run's end page is theirs now, not where the run "stopped". */
+  private personMovedOn = false;
   /** What the person taking the review page must know before submitting (B3 / B14) — carried into
    *  stopAtReview's hand-off message and data. */
   private reviewHandoffNotes: string[] = [];
@@ -983,7 +990,16 @@ export class RecipeAdapter extends BasePortalAdapter {
       this.guardRefusals.push(line);
       this.driftWarnings.push(line);
     }
-    const stopping = bs.stoppingAborts();
+    // #333 — NEITHER OF THESE IS THE PAGE ACTING BY ITSELF: an abort that followed a person's own
+    // input (their click came before the run handed the page over: nothing was sent, and they are
+    // told to click again), and anything after a request a person's input sent past the hand-over
+    // (the page their own submit led to). Neither fails a run that reached review.
+    const firstHuman = bs.humanRequests.length ? bs.humanRequests[0].abortsBefore : Infinity;
+    const stopping = bs.aborts.filter((a, i) => isStoppingAbort(a) && !a.humanInput && i < firstHuman);
+    if (bs.aborts.some((a, i) => isStoppingAbort(a) && a.humanInput && i < firstHuman)) {
+      if (!this.reviewHandoffNotes.includes(HUMAN_CLICK_HELD_NOTE)) this.reviewHandoffNotes.push(HUMAN_CLICK_HELD_NOTE);
+      if (!this.driftWarnings.includes(HUMAN_CLICK_HELD_NOTE)) this.driftWarnings.push(HUMAN_CLICK_HELD_NOTE);
+    }
     if (!stopping.length) return "";
     const first = stopping[0];
     return first.rule === "review-lockdown"
@@ -1051,6 +1067,18 @@ export class RecipeAdapter extends BasePortalAdapter {
         { finalSubmitClicked: false, draftSubmitClickedByAutomation: true },
       );
     }
+    // THE PERSON SUBMITTED (OR MOVED ON) FROM THE REVIEW WINDOW WHILE THE RUN WAS FINISHING (#333).
+    // Automation clicked nothing; the run staged the page and handed it over, and the person's own
+    // click went. Never "failed", never "click submit" to someone who already has.
+    if (this.personMovedOn || this.humanSubmit) {
+      const filed = !!this.humanSubmit;
+      return ok(
+        `${this.portalName}: the recipe staged the review screen and handed it to you, and you ${filed ? "submitted" : "moved on"} from the review window while the run was finishing — automation clicked nothing. `
+          + (filed ? "The completion page is read and the filing is recorded on the project; check the record number it shows." : "If that click was the submit, the completion page is read and recorded on the project; if not, finish in the open window.")
+          + " No fee payment was automated. AUTOMATION HAS STOPPED.",
+        { finalSubmitClicked: false, humanSubmittedInReviewWindow: filed, ...(this.reviewHandoffNotes.length ? { reviewHandoffNotes: [...this.reviewHandoffNotes] } : {}) },
+      );
+    }
     // WHAT THE PERSON MUST KNOW BEFORE SUBMITTING (dryrun-0928 B3 / B14): answers the portal may
     // not have saved, and the portal's own background calls the lockdown held back on this page.
     const notes = this.reviewHandoffNotes;
@@ -1081,11 +1109,61 @@ export class RecipeAdapter extends BasePortalAdapter {
    */
   async armSubmitWatch(onSubmitObserved: (clickedLabel?: string) => void): Promise<boolean> {
     if (!this.page) return false;
-    return armHumanCaptureOnPage(this.page, (step) => {
-      // The detector emits one submitObserved step when the final submit is clicked; every
-      // other captured step belongs to the learn path and is ignored here.
-      if (String(step.note || "").includes(HUMAN_SUBMIT_OBSERVED_NOTE)) onSubmitObserved(step.value || undefined);
+    // A submit the person made after the hand-over, before the runner asked (#333), is handed on now.
+    const seen = this.humanSubmit;
+    this.submitObservers.push(onSubmitObserved);
+    const armed = await this.armOwnSubmitWatch();
+    if (seen) { try { onSubmitObserved(seen.label); } catch { /* an observer never breaks the run */ } }
+    return armed;
+  }
+
+  /** #333 — THE PERSON'S OWN SUBMIT, SEEN ONCE, whoever asks (the hand-over arms it; the runner's
+   *  armSubmitWatch later registers on the same watch — the page binding can be exposed only once). */
+  private humanSubmit: { label?: string } | null = null;
+  private submitObservers: Array<(clickedLabel?: string) => void> = [];
+  private submitWatch: Promise<boolean> | null = null;
+  private noteHumanSubmit(label?: string): void {
+    if (this.humanSubmit) return;
+    this.humanSubmit = { label };
+    for (const fn of this.submitObservers) { try { fn(label); } catch { /* an observer never breaks the run */ } }
+  }
+  private armOwnSubmitWatch(): Promise<boolean> {
+    if (this.submitWatch) return this.submitWatch;
+    const page = this.page;
+    if (!page) return Promise.resolve(false);
+    // The completion page itself is the second signal: a final control the click classifier does
+    // not know is still a filing when the page it led to says so (CapCompletions.aspx: "successfully
+    // submitted" + a record number). Read-only, main frame, each new document once.
+    try {
+      if (typeof page.on === "function") {
+        const onLoad = (): void => {
+          if (this.humanSubmit) return;
+          void (async () => {
+            await sleep(1200);
+            const body = String(await page.locator("body").innerText().catch(() => ""));
+            if (pageConfirmsSubmission(body) || readDraftCreated(body).draft) this.noteHumanSubmit(undefined);
+          })().catch(() => null);
+        };
+        page.on("domcontentloaded", onLoad);
+      }
+    } catch { /* watching is best-effort */ }
+    // The click detector the learn path already uses: one submitObserved step when the FINAL submit
+    // is clicked; every other captured step belongs to the learn path and is ignored here.
+    this.submitWatch = armHumanCaptureOnPage(page, (step) => {
+      if (String(step.note || "").includes(HUMAN_SUBMIT_OBSERVED_NOTE)) this.noteHumanSubmit(step.value || undefined);
     }).catch(() => false);
+    return this.submitWatch;
+  }
+
+  /** #333 — HAND THE REVIEW PAGE TO THE PERSON, before the run's read-only housekeeping. The backstop
+   *  lets their own click through from here (filingBackstop handOverToHuman), and the submit watch is
+   *  armed now, not after the run returns: a filing made in the run's last seconds is captured. */
+  private async handOverReviewPage(): Promise<void> {
+    const bs = this.backstop;
+    if (!bs || !bs.handOverToHuman(`replay staged ${this.recipe.id} to review`)) return;
+    this.progress("wait", "Staged to review — the page is yours to verify and submit", 0);
+    const armed = this.armOwnSubmitWatch();
+    await Promise.race([armed, sleep(3000)]);
   }
 
   async captureSubmissionConfirmation(): Promise<PortalStepResult> {
@@ -2307,8 +2385,18 @@ export class RecipeAdapter extends BasePortalAdapter {
     // aborted and stops the run, named. ...BUT NOT BEFORE THE PORTAL HAS SAVED WHAT THE RUN WROTE
     // (dryrun-0928 B3): PowerClerk batches a page's answers into one save seconds after the first
     // change; the final-submit refusal and stopForReview exits both arrive here with it pending.
+    // #333 — FROM HERE THE RUN MAKES NO INPUT ON THIS PAGE, so a person's own click can be told from
+    // it: the backstop's input watch is armed now (a guided-manual run only — an approved run clicks
+    // its own final submit and is never handed over).
+    const handingOver = !this.options.autoSubmit && !this.finalSubmitClicked && !!this.backstop;
+    if (handingOver) await this.backstop!.watchHumanInput().catch(() => false);
     await this.drainBeforeReviewLock();
     this.backstop?.lockReview(`replay stopped at review (${this.recipe.id})`);
+    // THE HAND-OVER (#333, owner ruling 2026-10-14): BEFORE the read-only housekeeping below (the
+    // review read-back, its screenshot), not after it. A person watching the window who clicks the
+    // portal's submit now is let through by the backstop and their filing is captured; the page's
+    // own scripts posting with no click still meet the lockdown until fillApplication returns.
+    if (handingOver) await this.handOverReviewPage();
     const review = await this.verifyReviewScreen(project);
     const data = {
       executed, skipped, finalSubmitClicked: false, gapFill: this.gapFillReport,
@@ -2322,7 +2410,11 @@ export class RecipeAdapter extends BasePortalAdapter {
     // attachments page with 0 of 5 project values found, and was recorded ready-to-submit. A run
     // that ends on a page the shared reading says is NOT the review page, showing none of the
     // project's values, pauses for a person, named — never "staged to the review screen".
-    const stop = !pastReview && !this.stoppedAtPayment ? await this.whereTheRunStopped(review.confirmed) : null;
+    // A page the person already moved on from (their own submit or postback went) is not where the
+    // run stopped: the run did reach it and handed it over.
+    const personMovedOn = (this.backstop?.humanRequests ?? []).some((r) => r.document);
+    this.personMovedOn = personMovedOn;
+    const stop = !pastReview && !this.stoppedAtPayment && !personMovedOn ? await this.whereTheRunStopped(review.confirmed) : null;
     if (stop) {
       this.stoppedBeforeReview = stop.message;
       return { ...ok(`Replayed ${executed} recorded step(s); ${stop.message}${review.summary}`, { ...data, stoppedBeforeReview: stop.where }), pauseReason: "stopped_before_review" };
