@@ -520,6 +520,20 @@ export class RecipeAdapter extends BasePortalAdapter {
   /** The page identity the last gap-fill ran against, so the end-of-run pass can tell a page
    *  that still needs one from a page that has just had one. */
   private gapFilledPage = "";
+  /** WHAT AUTOMATION WROTE ON THIS PAGE THAT NO RECORDED STEP WROTE (#362): labels, never values.
+   *  The AI gap-fill's fills and every other unrecorded write (an unrecorded upload slot, an owed
+   *  document's row, a Type chosen for an untyped row, a service-line box, a tier box the recording
+   *  did not name, a contact dialog's corrected values). Read by clickDraftCreatingSubmit: the
+   *  stamped draft click only happens on the page the stamp saw, and a page that needed answers the
+   *  recorded steps never gave is not that page.
+   *  CLEARED ONLY WHEN THE PAGE IS SEEN TO BE LEFT: an advance whose move assertAdvanced confirmed,
+   *  or a recorded goto. An in-page click that only reveals controls, or a move that could not be
+   *  read, keeps the list, so the draft click refuses rather than guesses. */
+  private unrecordedWritesOnPage: string[] = [];
+  private noteUnrecordedWrite(what: string): void {
+    const w = String(what || "").replace(/\s+/g, " ").trim().slice(0, 80) || "a control";
+    if (!this.unrecordedWritesOnPage.includes(w)) this.unrecordedWritesOnPage.push(w);
+  }
   private stoppedAtPayment = false;
   /** Set by a fill step whose control the in-page reading marks as a signature box when this
    *  client has no authorized signer: runAll pauses signature_no_signer right after it. */
@@ -827,7 +841,11 @@ export class RecipeAdapter extends BasePortalAdapter {
         return;
       }
     }
-    return super.runGapFill(page);
+    try {
+      return await super.runGapFill(page);
+    } finally {
+      for (const label of this.lastGapFillWrites) this.noteUnrecordedWrite(`gap-fill: ${label}`);
+    }
   }
 
   /** Does the in-page reading (portalSafety signatureStepInPage — the learner's own, run fresh on
@@ -3834,6 +3852,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       // basename carries the on-disk UUID prefix into what the portal reviewer sees.
       const payload = this.stageUpload(uploadPayloadFor(file, pdf));
       this.options.beforeUpload?.(hit.docType, file);
+      this.noteUnrecordedWrite(`upload: ${label}`);
       // A REFUSED ATTACH IS REPORTED, NEVER SWALLOWED. This was `.catch(() => false)` and a
       // bare continue: a document Playwright refused (a 50MB+ buffer did, every time) was
       // simply not attached, with no warning — a missing document nobody was told about.
@@ -4276,6 +4295,8 @@ export class RecipeAdapter extends BasePortalAdapter {
         const target = this.resolveValue(step);
         const why = `recipe goto${step.note ? ` (${String(step.note).slice(0, 40)})` : ""}`;
         await this.withProgress("goto", `Opening ${String(step.note ?? "the recipe's page").slice(0, 40)}`, () => this.guardedGoto(target, why, { waitUntil: "domcontentloaded", timeout: 30000 }));
+        // A recorded goto opens a fresh page: what automation wrote on the last one stays there (#362).
+        this.unrecordedWritesOnPage = [];
         const landedOnError = await this.recoverFromPortalErrorPage(target, why);
         await smartWait(this.page);
         // A recorded goto lands on a fresh section that a Vue/SPA portal may still be mounting.
@@ -4994,6 +5015,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       return;
     }
     this.rowsTypedByDocument.add(commitStep);
+    if (r.status === "chosen" || r.status === "not-taken") this.noteUnrecordedWrite(`attachment Type for the ${doc}`);
     if (r.status === "chosen") {
       this.agingNotes.push(`the recorded attachment row for the ${doc} has no Type step — chose "${r.pick}" by the document from the portal's own list`);
     } else if (r.status === "no-fit") {
@@ -5119,6 +5141,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         continue;
       }
       await this.waitForLoadingMaskClear(`attaching ${label.slice(0, 40)}`);
+      this.noteUnrecordedWrite(`owed document: ${label}`);
       const uploaded = await this.executeStep({ ...row.upload, docType: o.docType, note: `upload ${o.docType}: ${slotLabel}` }, false).catch(() => false);
       if (!uploaded) { fail("the page's file control did not take it"); continue; }
       // THE ROW IS NOW ON THE PAGE, UNSAVED. Anything that stops here leaves it pending, and the NEXT
@@ -5632,6 +5655,16 @@ export class RecipeAdapter extends BasePortalAdapter {
     await this.reassertBlanksOnce(false).catch(() => [] as string[]);
     await this.runGapFill(this.page).catch(() => null);
     this.gapFilledPage = await this.pageIdentity().catch(() => "");
+    // NOT THE PAGE THE STAMP SAW (#362, owner ruling 2026-10-17 "Stop for me"). The stamp vouches
+    // that the recorded steps replayed unchanged; if automation had to write anything on this page
+    // that they never write (the gap-fill above, or any write noteUnrecordedWrite records), it is
+    // filled and the run stops here like a review stop: the answers stay on the page for a person to
+    // check, the stamp is kept, and nothing is clicked. Never an incident.
+    if (this.unrecordedWritesOnPage.length) {
+      const shown = this.unrecordedWritesOnPage.slice(0, 6).join(", ");
+      const more = this.unrecordedWritesOnPage.length > 6 ? ` and ${this.unrecordedWritesOnPage.length - 6} more` : "";
+      return { kind: "refused", refusals: [`automation filled ${this.unrecordedWritesOnPage.length} control(s) on this page that the recorded steps never fill (${shown}${more}) — a person checks them and clicks Submit`] };
+    }
     const empty = await this.emptyRequiredControls().catch(() => [] as string[]);
     if (empty.length) return { kind: "refused", refusals: [`required field(s) still empty on the page: ${empty.slice(0, 4).join(", ")}`] };
     const before = await detectChallengeFrame(this.page).catch(() => null);
@@ -5995,7 +6028,13 @@ export class RecipeAdapter extends BasePortalAdapter {
     // interactive control to mount before the next fill so we never type onto an unmounted page
     // (best-effort; never skips — the retry/reload loop still recovers a genuine miss).
     await waitForInteractiveControls(this.page);
-    await this.assertAdvanced(step, beforeUrl, beforeFp, beforeEffect);
+    const moved = await this.assertAdvanced(step, beforeUrl, beforeFp, beforeEffect);
+    // THE PAGE WAS LEFT: what automation wrote on it stays with it (#362). Only an advance that was
+    // SEEN to move, and never a contact dialog's step (assertAdvanced's own exclusion): an in-page
+    // action that reveals controls, or a dialog closing onto a new contact row, also changes the
+    // page's identity without leaving it.
+    const dialogStep = !!step.selector?.frame || isContactOpener(`${step.selector?.name ?? ""} ${step.selector?.text ?? ""} ${step.selector?.label ?? ""} ${step.note ?? ""}`);
+    if (moved && this.isAdvancingClick(step) && !dialogStep) this.unrecordedWritesOnPage = [];
     return true;
   }
 
@@ -6120,9 +6159,11 @@ export class RecipeAdapter extends BasePortalAdapter {
   /** How long an advance check waits for vanished controls to come back (or the page to move). */
   static VANISHED_CONTROLS_WAIT_MS = 6000;
 
-  private async assertAdvanced(step: RecipeStep, beforeUrl: string, beforeFp: string, beforeEffect = ""): Promise<void> {
+  /** true when the page was seen to move; false when it did not (an in-page action) or could not be
+   *  read. Throws on a confirmed block. */
+  private async assertAdvanced(step: RecipeStep, beforeUrl: string, beforeFp: string, beforeEffect = ""): Promise<boolean> {
     // No identity means a mock/no-DOM page (the unit-test doubles) — assert nothing.
-    if (!beforeFp) return;
+    if (!beforeFp) return false;
     const urlNow = (): string => (typeof this.page.url === "function" ? String(this.page.url() ?? "") : "");
     const moved = async (): Promise<boolean> => {
       if (urlNow() && urlNow() !== beforeUrl) return true;
@@ -6146,7 +6187,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // FAST PATH 1 — it moved. One identity read, no waiting. This is the common case and it
     // must stay free: an earlier ordering settled first and put 5s on every click, which is
     // the opposite of what "fast once learned" needs.
-    if (await moved()) return;
+    if (await moved()) return true;
 
     // FAST PATH 2 — it did not move and the portal is not complaining. NOT every recorded
     // click is an advance: "Calculate", "Add Array", "Add New" contact and saves all
@@ -6182,7 +6223,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       const afterEffect = beforeEffect ? await this.pageEffect() : "";
       if (afterEffect && afterEffect !== beforeEffect) {
         this.agingNotes.push(`click "${String(step.note ?? "click").slice(0, 44)}" acted on the page without advancing it — the in-page action the recipe recorded`);
-        return;
+        return false;
       }
       // ONLY CLAIM THE FINDING WE ACTUALLY MADE. If the before-snapshot never came back —
       // an evaluate the portal interrupted, a page mid-navigation — then nothing was
@@ -6193,7 +6234,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       this.driftWarnings.push(measured
         ? `click "${String(step.note ?? "click").slice(0, 44)}" changed nothing on the page — no value, row or option moved, so it was either a no-op control or an advance the portal silently refused`
         : `click "${String(step.note ?? "click").slice(0, 44)}" left the page unchanged and the page could not be re-read to tell an in-page action from an advance that silently did nothing`);
-      return;
+      return false;
     }
 
     // The portal is refusing. Give a slow SPA a moment in case the complaint is stale and
@@ -6201,14 +6242,14 @@ export class RecipeAdapter extends BasePortalAdapter {
     // more — an announcement modal ate every click of a diagnostic probe for fourteen
     // iterations without it ever noticing.
     await this.timed("advance-settle", async () => { for (let i = 0; i < ADVANCE_SETTLE_TRIES && !(await moved()); i++) await sleep(ADVANCE_SETTLE_MS); });
-    if (await moved()) return;
+    if (await moved()) return true;
     await this.timed("advance-overlays", async () => { await this.dismissModalsGuarded(); await clearPageOverlays(this.page).catch(() => null); });
     const again = await this.resolveLocator(step.selector).catch(() => null);
     if (again && typeof again.click === "function") await this.timed("advance-retry-click", () => this.guardedClick(again, "retry an advance that did not move", { timeout: 8000 }).catch(() => null));
     await this.timed("advance-settle", async () => { for (let i = 0; i < ADVANCE_SETTLE_TRIES && !(await moved()); i++) await sleep(ADVANCE_SETTLE_MS); });
     if (await moved()) {
       this.driftWarnings.push(`advance "${String(step.note ?? "click").slice(0, 44)}" needed an overlay dismissed before it took`);
-      return;
+      return true;
     }
 
     // Still refused. Report the PORTAL'S OWN words — "Meter Number: This field is required."
@@ -7055,6 +7096,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       this.agingNotes.push(`kVA tier read from the page: ${ratingRaw} kVA → "${chosenLabel}" = ${chosen.value}${scheduleTierKey ? " (the stored fee schedule agrees)" : " (no fee schedule needed — the page prints its own bounds)"}`);
       const recorded = readTierLabel(stepLabel);
       if (recorded && !sameFeeTier(recorded, chosen.bounds)) {
+        this.noteUnrecordedWrite(chosenLabel);
         this.agingNotes.push(`the recorded box "${stepLabel}" is not this project's tier — "${chosenLabel}" was ticked instead, and the recorded box was left empty`);
       }
       // The constructor's coverage warning ("this job's bracket has NO box in the recorded recipe")
@@ -7147,11 +7189,13 @@ export class RecipeAdapter extends BasePortalAdapter {
       const loc = frame.locator(`[id="${b.id}"]`).first();
       if (!want) {
         if (b.tag !== "select" && otherVal && holds(b.kind, b, otherVal)) {
+          this.noteUnrecordedWrite(`contact: ${b.label}`);
           if (await loc.fill("", { timeout: FILL_TIMEOUT_MS }).then(() => true).catch(() => false)) fixed++;
         }
         continue;
       }
       if (holds(b.kind, b, want)) continue;
+      this.noteUnrecordedWrite(`contact: ${b.label}`);
       let ok = false;
       if (b.tag === "select") {
         ok = await loc.selectOption(want).then(() => true).catch(async () => loc.selectOption({ label: want }).then(() => true).catch(() => false));
@@ -7227,6 +7271,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         if (!this.fieldsVerified.includes(label)) this.fieldsVerified.push(label);
         continue;
       }
+      this.noteUnrecordedWrite(label);
       const typed = await loc.fill(value, { timeout: FILL_TIMEOUT_MS }).then(() => true).catch(() => false);
       if (typed) await this.commitAndSettle(loc);
       const held = String((await loc.inputValue().catch(() => "")) ?? "").trim();

@@ -12,6 +12,7 @@ import {
 import { buildLocator } from "./adapters/loginFlow";
 import { selectWithFallback } from "./comboboxFill";
 import { redactStatusText } from "./safeAction";
+import { isSubmitIntent } from "../../shared/src/portalSafety";
 
 // ---------------------------------------------------------------------------
 // LLM-assisted gap-fill (hybrid staging).
@@ -37,6 +38,9 @@ import { redactStatusText } from "./safeAction";
 export interface GapFillOutcome {
   /** Field labels the LLM filled this page (non-PII labels only). */
   filled: string[];
+  /** Every field label a fill was ATTEMPTED on, landed or not (#362): a fill that threw half-way
+   *  may still have written to the page, so "what automation wrote here" is read from this. */
+  attempted: string[];
   /** Planned fills rejected because they weren't grounded in real project data. */
   skippedUngrounded: string[];
   /** Required, empty fields the PROJECT GENUINELY LACKS — surfaced so the human can act. */
@@ -49,7 +53,7 @@ export interface GapFillOutcome {
 }
 
 function emptyOutcome(): GapFillOutcome {
-  return { filled: [], skippedUngrounded: [], reportedMissing: [], unfilledDespiteData: [] };
+  return { filled: [], attempted: [], skippedUngrounded: [], reportedMissing: [], unfilledDespiteData: [] };
 }
 
 function normalize(v: string): string {
@@ -182,6 +186,18 @@ function boolAgrees(a: string, b: string): boolean {
   return ta !== null && tb !== null && ta === tb;
 }
 
+// NEVER AN ANSWER THAT READS AS SUBMITTING (#362). "Are you ready to submit your Net Metering
+// application?" is a control whose Yes turns the page's Submit into a filing: the gap-fill prompt
+// says a required Yes/No MUST be answered, and a planner obeying it filed with no approval. So a
+// control whose label reads as submit intent (portalSafety isSubmitIntent, the one reading) is never
+// offered to the planner, and an answer that itself reads as submitting ("Yes, submit now") is never
+// typed. Left blank, it is a required field a person answers. Exported for tests.
+export function gapFillMayAnswer(label: string | null | undefined, value?: string | null): boolean {
+  if (isSubmitIntent(label)) return false;
+  if (value != null && isSubmitIntent(value)) return false;
+  return true;
+}
+
 // Best-effort: neutralize the transparent loading scrims / onboarding popovers that
 // intercept clicks so the gap-fill's fills actually land. Portal-agnostic — covers
 // PowerClerk's Vue scrim + "new feature" popover and Accela's ExtJS .x-mask. Never throws.
@@ -307,6 +323,9 @@ export async function gapFillCurrentPage(
     // replay nearly as slow (and as expensive) as the original learn. When a required
     // gap does exist, the optionals ride along in the same request.
     if (!empties.some((e) => e.field.required)) return out;
+    // A submit-intent control is never offered (gapFillMayAnswer); it stays in `empties`, so a
+    // required one left blank is still reported below for a person to answer.
+    const offered = empties.filter((e) => gapFillMayAnswer(e.field.label));
 
     const url = typeof page.url === "function" ? String(page.url() ?? "") : "";
     const pageTitle = typeof page.title === "function" ? String((await page.title().catch(() => "")) ?? "") : "";
@@ -316,7 +335,7 @@ export async function gapFillCurrentPage(
     const req: LearnPlanRequest = {
       url,
       pageTitle,
-      fields: empties.map((e) => e.field),
+      fields: offered.map((e) => e.field),
       bodyText,
       alreadyFilledLabels: alreadyFilled,
       isDashboard: false,
@@ -324,20 +343,22 @@ export async function gapFillCurrentPage(
 
     let plan;
     try {
-      plan = await planner(req);
+      plan = offered.some((e) => e.field.required) ? await planner(req) : { fills: [] };
     } catch {
       return out; // planner/LLM unavailable — leave the page as the adapter left it.
     }
 
     for (const fill of plan.fills ?? []) {
-      const slot = empties[fill.selectorIndex];
+      const slot = offered[fill.selectorIndex];
       if (!slot) continue;
       const { field, loc } = slot;
       if (isPayFee(field.label) || isSensitiveLabel(field.label)) continue;
+      if (!gapFillMayAnswer(field.label, fill.value)) continue;
       if (!isGrounded(field, fill.value, fill.field, projectFields)) {
         out.skippedUngrounded.push(field.label || field.fieldType);
         continue;
       }
+      out.attempted.push(field.label || field.fieldType);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const applied = await applyGrounded(page, loc as any, field, fill.value);
       if (applied) out.filled.push(field.label || field.fieldType);
