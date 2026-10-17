@@ -78,10 +78,24 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS");
     ["verifyReviewScreen", /  private async verifyReviewScreen\(/],
     ["writeSanitizedCapture", /  private async writeSanitizedCapture\(/],
     ["whereTheRunStopped", /  private async whereTheRunStopped\(/],
+    // …and the readers those call (skeptic round 1: the scan reached only the named methods).
+    ["pageSafetyContext", /  private async pageSafetyContext\(/],
+    ["readPortalRefusal", /  private async readPortalRefusal\(/],
+    ["pageLabelNow", /  private async pageLabelNow\(/],
+    ["heldHumanClick", /  private heldHumanClick\(/],
+    ["firstHumanDocument", /  private firstHumanDocument\(/],
+    ["pageUrlNoHash", /  private pageUrlNoHash\(/],
   ] as const) {
     const body = methodBody(recipe, sig);
     check(`${name}: found, and makes no input on the page`, body.length > 0 && !INPUT_CALL.test(body), body ? (body.match(INPUT_CALL) || [""])[0] : "not found");
   }
+  // THE HAND-OVER COMES BEFORE THE DRAIN (round 2, skeptic r2 F2), and the person is told after it.
+  const handAt = tail.indexOf("this.handOverReviewPage()");
+  const drainAt = tail.indexOf("this.drainBeforeReviewLock()");
+  const lockAt = tail.indexOf(".lockReview(");
+  const yoursAt = tail.indexOf("the page is yours");
+  check("the hand-over is called BEFORE the run drains its own save", handAt > 0 && drainAt > 0 && handAt < drainAt, `hand=${handAt} drain=${drainAt}`);
+  check("…and the person is told 'the page is yours' only AFTER the drain and the lock", yoursAt > lockAt && lockAt > drainAt, `drain=${drainAt} lock=${lockAt} yours=${yoursAt}`);
   const scraper = read("portal-bot/src/reviewScreenScraper.ts");
   check("reviewScreenScraper.ts (the review read-back) makes no input on the page", !INPUT_CALL.test(scraper), (scraper.match(INPUT_CALL) || [""])[0]);
 }
@@ -96,6 +110,10 @@ console.log("\n4. EVERY INPUT THE RUN MAKES IS FENCED");
   const typing = recipe.split("\n").filter((l) => /\.(?:pressSequentially|type)!?\s*\(/.test(l));
   const unfenced = typing.filter((l) => !/withAutomationInput\(/.test(l));
   check("every typing call (pressSequentially / type) in recipeAdapter.ts is fenced", typing.length >= 3 && unfenced.length === 0, JSON.stringify(unfenced.map((l) => l.trim().slice(0, 140))));
+  // Checkbox writes too (skeptic round 1: check / uncheck were trusted input outside the fence).
+  const ticks = recipe.split("\n").filter((l) => /\.(?:check|uncheck)\s*\(/.test(l));
+  const unfencedTicks = ticks.filter((l) => !/withAutomationInput\(/.test(l));
+  check("every checkbox write (check / uncheck) in recipeAdapter.ts is fenced", ticks.length >= 4 && unfencedTicks.length === 0, JSON.stringify(unfencedTicks.map((l) => l.trim().slice(0, 140))));
 }
 
 if (failures) { console.error(`\n${failures}/${total} humanHandover.test check(s) FAILED.`); process.exit(1); }

@@ -29,6 +29,16 @@
 //     B3  automation tries to click after the hand-over: the replay refuses its own input
 //         (inputsClosed), 0 POSTs.
 //     B4  an approved run (autoSubmit) is never handed over (the watch is never armed).
+//   [B, skeptic round 2] — each FAILS at 1de7f6e2 (the round-1 head):
+//     B5  a person's request after the hand-over, then the page they land on is "My Records" (a list
+//         headed "Record Number" with ANOTHER application's number): not a filing, rated "low".
+//     B6  a fetch submit + location.href to the completion page, under a label the click classifier
+//         does not know: the person's submit, never "stopped before review"; rated "high".
+//     B7  the person's fetch submit WHILE the run drains its own save: recorded as theirs (never the
+//         drain's own-save exemption), never "stopped before review", captured.
+//     B8  an older record ("Your application has been received") opened after the run let go: not
+//         this run's filing.
+//     B2 also: a held click's error page is not "where the run stopped".
 // Against main (no hand-over) A1 and B1 FAIL by name: the person's POST is aborted.
 //
 //   npx tsx portal-bot/src/adapters/humanSubmitAfterReview.dom.smoke.ts
@@ -55,8 +65,33 @@ const RECORD = "BLD-2026-900123";
 const posts: Array<{ k: string; path: string }> = [];
 const html = (title: string, body: string): string => `<!doctype html><html><head><title>${title}</title></head><body>${body}</body></html>`;
 const COMPLETION = html("Application Submitted", `<h1>Application Submitted</h1><p>Your application has been successfully submitted.</p><p>Record Number: ${RECORD}</p>`);
+// "My Records": a list headed "Record Number" carrying ANOTHER application's (Accela-shaped) number.
+const MY_RECORDS = html("My Records", `<h1>My Records</h1><table><tr><th>Record Number</th><th>Type</th><th>Status</th></tr><tr><td>517-26-000274-STR</td><td>Residential Solar</td><td>Issued</td></tr></table>`);
+// An OLDER application's record page, whose own text says it was received.
+const OLD_RECORD = html("Record BLD-2026-900001", `<h1>Record BLD-2026-900001</h1><p>Your application has been received.</p><p>Record Number: BLD-2026-900001</p>`);
+const formSubmit = (k: string): string => `<form method="post" action="/h/${k}/apply/submit"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
+// A fetch submit, then the completion page by location.href — under a label the click classifier
+// does not know (classifyRecordedClick("Send to City") is "capture", never "finalSubmit").
+const SEND = (k: string): string => `<button type="button" id="send" onclick="fetch('/h/${k}/api/application', { method: 'POST', body: 'x=1' }).then(function () { location.href = '/h/${k}/done'; })">Send to City</button>`;
 const reviewBody = (k: string): string => {
   const summary = `<h1>Step 3: Review</h1><p>Please review your application before you submit it.</p><table><tr><th>Address</th><td>100 Fixture Way</td></tr></table>`;
+  if (k === "B5") return `${summary}${formSubmit(k)}<button type="button" id="saveLater" onclick="fetch('/h/B5/api/save-later', { method: 'POST', body: 'x=1' }).then(function () { location.href = '/h/B5/records'; })">Save for Later</button>`;
+  if (k === "B6") return `${summary}${formSubmit(k)}${SEND(k)}`;
+  // The run's tick on the review page starts an 8 s "Saving..." (PowerClerk's batched autosave shape;
+  // long enough to outlast the run's tail up to its drain).
+  if (k === "B7") return `${summary}<span data-test-role="project-save-state">Saved</span>
+    <div><input type="checkbox" id="terms"> <label for="terms">I certify the information in this application is correct</label></div>${formSubmit(k)}${SEND(k)}
+    <script>
+      var st = document.querySelector("[data-test-role='project-save-state']"); var timer = null;
+      document.getElementById('terms').addEventListener('change', function () {
+        st.textContent = 'Saving...';
+        if (timer) return;
+        timer = setTimeout(function () {
+          fetch('/h/B7/Project/SaveChanges', { method: 'POST', body: 'terms=on' }).then(function () { st.textContent = 'Saved'; }).catch(function () { st.textContent = 'Save failed'; });
+        }, 8000);
+      });
+    </script>`;
+  if (k === "B8") return `${summary}${formSubmit(k)}<a id="older" href="/h/B8/record">Older application BLD-2026-900001</a>`;
   if (k === "A4") return `${summary}<button type="button" id="btnSubmit" onclick="window.open('/h/A4/popup', '_blank')">Submit Application</button>`;
   if (k === "A5") return `${summary}<button type="button" id="btnSubmit" onclick="fetch('/h/A5/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function(){})">Submit Application</button>`;
   return `${summary}<form method="post" action="/h/${k}/apply/submit"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
@@ -71,6 +106,9 @@ const server = http.createServer((req, res) => {
   if (req.method === "POST" && rest === "apply/submit") { send(COMPLETION); return; }
   if (rest === "popup") { send(html("Processing", `<h1>Processing</h1><script>fetch('/h/${k}/popup/post', { method: 'POST', body: 'from=popup' }).catch(function(){});</script>`)); return; }
   if (req.method !== "GET") { res.writeHead(204); res.end(); return; }
+  if (rest === "records") { send(MY_RECORDS); return; }
+  if (rest === "record") { send(OLD_RECORD); return; }
+  if (rest === "done") { send(COMPLETION); return; }
   if (rest === "review" || rest === "") { send(html("Review and Submit", reviewBody(k))); return; }
   send(html("Not found", "<h1>Not found</h1>"));
 });
@@ -207,25 +245,42 @@ console.log("\n[A] THE BACKSTOP, DIRECTLY");
 // ---------------------------------------------------------------------------------------------
 console.log("\n[B] THE REPLAY (guided manual: the flagged final submit is never clicked by automation)");
 const flagged: RecipeStep = { action: "click", selector: { css: "#btnSubmit" }, note: "final submit: Submit Application", isFinalSubmit: true } as RecipeStep;
-const recipeFor = (k: string): PortalRecipe => ({
+const TICK = { action: "check", selector: { css: "#terms", label: "I certify the information in this application is correct" }, note: "I certify the information in this application is correct" } as RecipeStep;
+const recipeFor = (k: string, extra: RecipeStep[] = []): PortalRecipe => ({
   id: `human-submit-${k}`, scopeType: "ahj", profileKey: "or|fernhollow|", state: "OR", ahj: "City of Fernhollow", utility: "",
   portalPlatform: "fixture", portalUrl: `${base}/h/${k}/review`, status: "complete", version: 1, createdBy: "smoke", createdAt: "", updatedAt: "", notes: "",
   steps: [
     { action: "goto", value: `${base}/h/${k}/review`, note: "open the review page" } as RecipeStep,
+    ...extra,
     { action: "stopForReview" } as RecipeStep,
     flagged,
   ],
 } as PortalRecipe);
-interface Replay { ok: boolean; message: string; data: Record<string, unknown>; review: { ok: boolean; message: string; data: Record<string, unknown> }; posts: string[]; watchArmed: boolean; handedOver: boolean; extra?: unknown }
-async function replay(k: string, opts: { autoSubmit?: boolean; onHandOver?: (page: Page, adapter: RecipeAdapter) => Promise<unknown>; onArmed?: (page: Page) => Promise<void> } = {}): Promise<Replay> {
+interface Replay {
+  ok: boolean; message: string; data: Record<string, unknown>; pauseReason: string;
+  review: { ok: boolean; message: string; data: Record<string, unknown> };
+  posts: string[]; watchArmed: boolean; handedOver: boolean; extra?: unknown;
+  /** What the runner's submit watch (index.ts armSubmitCapture) was handed: one entry per submit. */
+  observed: string[];
+  /** The replay's own rating of a record number read off the page the window ended on. */
+  captureConfidence: string;
+  /** The backstop's record of the person's own requests (path only). */
+  humanRequests: string[];
+  /** When the run's first own-save drain closed (0: none). */
+  drainClosedAt: number;
+}
+async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: RecipeStep[]; onHandOver?: (page: Page, adapter: RecipeAdapter) => Promise<unknown>; onArmed?: (page: Page, track: (p: Promise<unknown>) => void) => Promise<void>; onDrain?: (page: Page, track: (p: Promise<unknown>) => void) => void; afterFill?: (page: Page) => Promise<unknown> } = {}): Promise<Replay> {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
   const from = posts.length;
   let watchArmed = false;
   let extra: unknown;
   let pending: Promise<unknown> | null = null;
+  const spied: { bs: FilingBackstop | null } = { bs: null };
+  const tracked: Array<Promise<unknown>> = [];
+  const drain = { closedAt: 0 };
   // The adapter's own progress line at the hand-over is the moment a watching person can click.
-  const adapter: RecipeAdapter = new RecipeAdapter(recipeFor(k), {}, {}, {
+  const adapter: RecipeAdapter = new RecipeAdapter(recipeFor(k, opts.extraSteps ?? []), {}, {}, {
     ...(opts.autoSubmit ? { autoSubmit: true } : {}),
     onProgress: (p) => {
       if (/the page is yours/i.test(String(p.message ?? "")) && opts.onHandOver && !pending) pending = opts.onHandOver(page, adapter).then((v) => { extra = v; }, (e) => { extra = e; });
@@ -237,23 +292,53 @@ async function replay(k: string, opts: { autoSubmit?: boolean; onHandOver?: (pag
     const bs = backstopFor(page) as (FilingBackstop & { __spied?: boolean }) | null;
     if (!bs || bs.__spied) return;
     bs.__spied = true;
+    spied.bs = bs;
     const orig = bs.watchHumanInput.bind(bs);
-    bs.watchHumanInput = async () => { const r = await orig(); watchArmed = watchArmed || r; if (r && opts.onArmed) await opts.onArmed(page); return r; };
+    bs.watchHumanInput = async () => { const r = await orig(); watchArmed = watchArmed || r; if (r && opts.onArmed) await opts.onArmed(page, (p) => { tracked.push(p); }); return r; };
+    // THE RUN IS STILL FINISHING WHEN THE PERSON ACTS. On this local fixture the run's tail takes
+    // milliseconds (on a real portal its review read-back and screenshots take seconds), so the
+    // backstop is let go only once the person's action, and the page it led to, have settled.
+    const dispose = bs.dispose.bind(bs);
+    bs.dispose = async () => { if (pending) tracked.push(pending); await Promise.allSettled(tracked); if (tracked.length) await sleep(1500); return dispose(); };
+    // The moment the run starts draining its own save is when onDrain's person acts (whatever the
+    // run's tail took to get there).
+    if (opts.onDrain) {
+      const openDrain = bs.openDrain.bind(bs);
+      let fired = false;
+      bs.openDrain = (pg: unknown, why: string) => {
+        const first = !fired;
+        if (first) { fired = true; opts.onDrain!(page, (p) => { tracked.push(p); }); }
+        const close = openDrain(pg, why);
+        return () => { if (first) drain.closedAt = Date.now(); close(); };
+      };
+    }
   }, 2);
   const project = { id: `p-${k}` } as ProjectRecord;
   const fill = await adapter.fillApplication(project);
   clearInterval(spy);
   if (pending) await pending;
   await sleep(600);
+  // What the runner does next for a left-open window (index.ts armSubmitCapture): register for the
+  // person's submit — one seen during the run is handed on at once.
+  const observed: string[] = [];
+  await adapter.armSubmitWatch((label?: string) => { observed.push(label || "(completion page)"); }).catch(() => false);
+  if (opts.afterFill) await opts.afterFill(page).catch(() => null);
+  await sleep(2000); // a completion page's read lands ~1.2 s after its load
   const review = await adapter.stopAtReview();
+  const capture = await adapter.captureSubmissionConfirmation().catch(() => null);
   await ctx.close().catch(() => null);
   return {
     ok: fill.ok, message: String(fill.message ?? ""), data: (fill.data ?? {}) as Record<string, unknown>,
+    pauseReason: String((fill as { pauseReason?: unknown }).pauseReason ?? ""),
     review: { ok: review.ok, message: String(review.message ?? ""), data: (review.data ?? {}) as Record<string, unknown> },
     posts: postsFor(k, from).map((p) => p.path), watchArmed, handedOver: /the page is yours/.test(String(fill.message ?? "")) || watchArmed, extra,
+    observed,
+    captureConfidence: String(((capture?.data ?? {}) as Record<string, unknown>).recordNumberConfidence ?? ""),
+    humanRequests: (spied.bs?.humanRequests ?? []).map((r) => r.where.replace(base, "")),
+    drainClosedAt: drain.closedAt,
   };
 }
-const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, posts: r.posts, msg: r.message.slice(0, 260), review: { ok: r.review.ok, msg: r.review.message.slice(0, 260), human: r.review.data.humanSubmittedInReviewWindow }, armed: r.watchArmed, extra: r.extra instanceof Error ? r.extra.message.slice(0, 160) : r.extra }).slice(0, 900);
+const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseReason, posts: r.posts, msg: r.message.slice(0, 260), review: { ok: r.review.ok, msg: r.review.message.slice(0, 200), human: r.review.data.humanSubmittedInReviewWindow }, armed: r.watchArmed, observed: r.observed, conf: r.captureConfidence, humanRequests: r.humanRequests, extra: r.extra instanceof Error ? r.extra.message.slice(0, 160) : r.extra }).slice(0, 1100);
 
 {
   const r = await replay("B1", { onHandOver: (page) => personClicks(page) });
@@ -267,6 +352,7 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, posts: r.posts,
   const r = await replay("B2", { onArmed: (page) => personClicks(page) });
   check("B2 the person clicks BEFORE the hand-over: held, nothing reached the portal", r.posts.length === 0, rbrief(r));
   check("B2 …the run is not failed, and it says plainly to click again", r.ok === true && (r.message.includes(HUMAN_CLICK_HELD_NOTE) || JSON.stringify(r.data).includes("YOUR CLICK WAS HELD BACK") || JSON.stringify(r.review.data).includes("YOUR CLICK WAS HELD BACK")), rbrief(r));
+  check("B2 …and the error page a held click leaves is not 'where the run stopped' (never 'stopped before review')", r.pauseReason !== "stopped_before_review", rbrief(r));
 }
 {
   const r = await replay("B3", {
@@ -281,6 +367,50 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, posts: r.posts,
 {
   const r = await replay("B4", { autoSubmit: true });
   check("B4 an approved (autoSubmit) run is never handed over: the input watch is never armed", r.watchArmed === false && r.posts.length === 0, rbrief(r));
+}
+
+{
+  // B5 (skeptic r2 F1): after the hand-over the person saves for later — their own request goes — and
+  // lands on "My Records", a list headed "Record Number" with ANOTHER application's number.
+  const r = await replay("B5", { onHandOver: (page) => personClicks(page, "#saveLater") });
+  check("B5 a person's request after the hand-over, then a records list: the request went", r.posts.some((p) => /\/api\/save-later$/.test(p)), rbrief(r));
+  check("B5 …the records list is NOT taken for a filing: no submit reported, nothing handed to the capture",
+    r.observed.length === 0 && r.review.data.humanSubmittedInReviewWindow !== true, rbrief(r));
+  check("B5 …a number read off that list is rated 'low' (recorded as a note, never as the filing)", r.captureConfidence === "low", rbrief(r));
+  check("B5 …and the run is not 'stopped before review' (the person moved on from the page it handed over)", r.ok === true && r.pauseReason !== "stopped_before_review", rbrief(r));
+}
+{
+  // B6 (skeptic r2 F3): a fetch submit, then location.href to the completion page, under a label the
+  // click classifier does not know.
+  const r = await replay("B6", { onHandOver: (page) => personClicks(page, "#send") });
+  check("B6 a fetch submit after the hand-over reaches the portal", r.posts.filter((p) => /\/api\/application$/.test(p)).length === 1, rbrief(r));
+  check("B6 …the run is not failed and not 'stopped before review'", r.ok === true && r.pauseReason !== "stopped_before_review", rbrief(r));
+  check("B6 …the completion page it led to is the person's submit: reported, and handed to the capture once",
+    r.observed.length === 1 && r.review.data.humanSubmittedInReviewWindow === true, rbrief(r));
+  check("B6 …and the completion page's number is rated 'high' (a sentence says it was submitted)", r.captureConfidence === "high", rbrief(r));
+}
+{
+  // B7 (skeptic r2 F2): the run ticks a box on the review page, the portal reads "Saving...", and the
+  // person clicks the fetch submit the moment the run starts draining that save (the run's own steps
+  // wait the indicator out first, so the drain is short; the tick is long past the fence's grace).
+  let clickedAt = 0;
+  const r = await replay("B7", {
+    extraSteps: [TICK],
+    onDrain: (page, track) => { track(personClicks(page, "#send").then(() => { clickedAt = Date.now(); })); },
+  });
+  check("B7 a person's fetch submit reaches the portal, clicked while the run's drain was open",
+    r.posts.filter((p) => /\/api\/application$/.test(p)).length === 1 && clickedAt > 0 && r.drainClosedAt > 0 && clickedAt < r.drainClosedAt,
+    `clickedAt=${clickedAt} drainClosedAt=${r.drainClosedAt} ${rbrief(r)}`);
+  check("B7 …and is recorded as the person's request (never taken by the drain's own-save exemption)", r.humanRequests.some((w) => /\/api\/application$/.test(w)), rbrief(r));
+  check("B7 …the run is not failed and not 'stopped before review'", r.ok === true && r.pauseReason !== "stopped_before_review", rbrief(r));
+  check("B7 …and the completion page is handed to the capture once", r.observed.length === 1, rbrief(r));
+}
+{
+  // B8 (skeptic r2 F1): after the run has let go (its backstop disposed), the person opens an OLDER
+  // record whose page says "Your application has been received".
+  const r = await replay("B8", { afterFill: (page) => personClicks(page, "#older") });
+  check("B8 an older record opened after the run let go is NOT taken for this run's filing",
+    r.observed.length === 0 && r.review.data.humanSubmittedInReviewWindow !== true, rbrief(r));
 }
 
 await browser.close();

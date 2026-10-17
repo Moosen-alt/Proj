@@ -2356,6 +2356,20 @@ export function classifySubmissionText(body: string | null | undefined): Submiss
   return { verdict: "unknown", evidence: null };
 }
 
+/**
+ * #333 — SENTENCE-LEVEL ACCEPTANCE ONLY: the page says, in a sentence, that the submission completed
+ * ("…has been submitted", "successfully submitted", "thank you for your submission"), and nothing on
+ * it reads as a rejection. A record-number LABEL alone is not this: every records list ("My Records")
+ * carries a "Record Number" column of OTHER applications' numbers. The phrase, or null.
+ */
+export function submissionAcceptedSentence(body: string | null | undefined): string | null {
+  const text = String(body ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  const phrase = ACCEPTED_EVIDENCE.map((re) => text.match(re)?.[0]).find(Boolean) ?? null;
+  if (!phrase) return null;
+  return REJECTED_EVIDENCE.some((re) => re.test(text)) ? null : phrase;
+}
+
 // ---------------------------------------------------------------------------------------------
 // Recipe shape
 // ---------------------------------------------------------------------------------------------

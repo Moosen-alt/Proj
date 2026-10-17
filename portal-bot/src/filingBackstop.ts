@@ -36,18 +36,26 @@
 //      final submit's window (non-payment URLs), by dispose(), and — for a PERSON'S OWN click only —
 //      by the hand-over (#333, owner ruling 2026-10-14 "we'll have to allow that in the future").
 //      HAND-OVER (handOverToHuman): a guided-manual replay stopped at review hands the page to a
-//      person BEFORE its read-only housekeeping (the review read-back, screenshots), not after it.
+//      person BEFORE it drains its own pending save and before its read-only housekeeping (the
+//      review read-back, screenshots), not after them.
 //      From that moment a state-changing request whose page saw a TRUSTED pointer / Enter / Space
 //      input within HUMAN_INPUT_MS passes rules 2 and 4 (the filing-URL rule and this lockdown):
 //      the person's own submit. How a person's request is told apart from automation's — a
-//      Playwright click or key press is a TRUSTED event in the page too, so two layers, either of
-//      which holds alone:
-//        (1) ORDERING: the input watch (watchHumanInput) is armed only after the run's LAST input on
-//            the page, the replay refuses any input of its own from that moment (recipeAdapter
-//            inputsClosed), and everything after it is reads (a source scan pins it);
-//        (2) THE FENCE: every input the run makes goes through withAutomationInput, and input the
-//            watch sees while a fenced action is in flight, or within AUTOMATION_INPUT_GRACE_MS after
-//            it, is never recorded as a person's.
+//      Playwright click or key press is a TRUSTED event in the page too:
+//        (1) ORDERING — THE GUARANTEE: the input watch (watchHumanInput) is armed only after the
+//            run's LAST input on the page, the replay refuses any input of its own from that moment
+//            (recipeAdapter inputsClosed), and everything after it is reads (a source scan pins it);
+//        (2) THE FENCE — A SECOND LINE for the replay's own input doors: its guarded clicks, presses,
+//            typing and checkbox writes run inside withAutomationInput, and input the watch sees
+//            while one is in flight, or within AUTOMATION_INPUT_GRACE_MS after it, is never recorded
+//            as a person's. Helper modules' input (combobox fill, gap fill, login, signature) is not
+//            fenced: the ordering covers it (all of it is awaited before the run's input closes).
+//      THE TRADE-OFF, STATED (#333 skeptic round 1): for HUMAN_INPUT_MS after a person's input, ANY
+//      state-changing request from that page passes rules 2 and 4 — the page's own scripts included.
+//      It cannot be narrowed to "the click's own request" or "a click on a control" without holding
+//      back a person's submit whose click first fires an analytics fetch, or whose control is a
+//      styled div (DevHub's tiles). It lasts only until dispose() — seconds — after which main lets
+//      everything through anyway. Automation's own input never opens it (the ordering).
 //      Only input that arrives AFTER the hand-over counts (an input just before it is not carried
 //      over), and only for the page that saw it. A page script posting with no input meets the lockdown
 //      exactly as before; payment (rule 1) and an open dismisser / Enter window (rule 3, the
@@ -92,6 +100,7 @@
 // context.route fixture server still answers what this layer lets through.
 //
 // Known cost: Playwright disables the browser's HTTP cache while any route is installed.
+import { randomBytes } from "node:crypto";
 import { isFilingOrPaymentRequest, isPayRequestUrl, paymentDialogVerdict, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE } from "../../shared/src/portalSafety";
 import {
   digestInfoPageIdentity, infoPageAfterClickAckWording, infoPageAfterClickRefusals, infoPageDriftedEntries, infoPageNumberTokens, infoPageMatchRefusals, infoPageObservedRequest, infoPagePassEntry, infoPagePassRefusals,
@@ -224,6 +233,10 @@ export interface FilingBackstop {
   handOverToHuman(why: string): boolean;
   /** Has the run handed the page over (and not been disposed)? */
   handedOver(): boolean;
+  /** #333 round 2 — did a person's own input reach `pg` (default: the run's page) at any time after
+   *  the hand-over? Not time-limited (unlike the exemption): it tells "the person acted here" for
+   *  the run's report, never lets anything through. */
+  personActedSinceHandOver(pg?: unknown): boolean;
   /** #333 — THE FENCE: run `fn` (an input the run itself makes on `pg`: a click, a key press,
    *  typing) so the input watch never records it as a person's — while it is in flight and for
    *  AUTOMATION_INPUT_GRACE_MS after it (the trusted event lands in the page after the call
@@ -304,8 +317,10 @@ const HUMAN_INPUT_MS = 4_000;
  *  CDP event is dispatched after the Playwright call's own round trip; measured well under 100 ms
  *  on the replica, kept generous). */
 const AUTOMATION_INPUT_GRACE_MS = 1_500;
-/** The page binding the input watch reports through (one per context or page, never removed). */
-const HUMAN_INPUT_BINDING = "__solarBackstopHumanInput";
+/** The page binding the input watch reports through (one per context or page, never removed). Named
+ *  per process, not a fixed public name (the repo is public): a page script cannot call it by
+ *  knowing this file (#333 skeptic round 1; Playwright's own binding global stays shared). */
+const HUMAN_INPUT_BINDING = `__solarBackstopHumanInput_${randomBytes(6).toString("hex")}`;
 /** The in-page watch. A string, not a function: tsx's __name wrapper does not exist in the page. */
 const HUMAN_INPUT_SCRIPT = `(() => { const w = window; if (w.__solarBackstopHumanInputArmed) return; w.__solarBackstopHumanInputArmed = true;
   const note = (e) => { if (!e || !e.isTrusted) return; if (e.type === "keydown" && e.key !== "Enter" && e.key !== " ") return;
@@ -1231,8 +1246,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
           await host.exposeBinding(HUMAN_INPUT_BINDING, (source: { page?: unknown }) => {
             try { HUMAN_INPUT_SINKS.get(host)?.(source && source.page); } catch { /* the watch never breaks the page */ }
           });
-          HUMAN_INPUT_EXPOSED.add(host);
           await host.addInitScript({ content: HUMAN_INPUT_SCRIPT });
+          // Marked only once BOTH are in place: a failed init script is retried by the next arm.
+          HUMAN_INPUT_EXPOSED.add(host);
         }
       } catch { return false; }
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1246,7 +1262,21 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       let timer: ReturnType<typeof setTimeout> | null = null;
       await Promise.race([inject(), new Promise<void>((r) => { timer = setTimeout(r, TERMINAL_READ_TIMEOUT_MS); })]);
       if (timer) clearTimeout(timer);
-      humanWatchArmed = !disposed;
+      // ARMED MEANS THE RUN'S OWN PAGE IS LISTENING (#333 skeptic rounds 1 and 2): the marker is read
+      // back from its main frame. A frame that cannot answer (navigating, hung) is NOT armed — the
+      // hand-over then fails closed and says so (NOT_HANDED_OVER_NOTE), never "the page is yours"
+      // over a document that cannot see the person's click.
+      let listening = false;
+      try {
+        const mf = typeof page.mainFrame === "function" ? page.mainFrame() : null;
+        let readTimer: ReturnType<typeof setTimeout> | null = null;
+        listening = mf ? Boolean(await Promise.race([
+          Promise.resolve(mf.evaluate("!!window.__solarBackstopHumanInputArmed")).catch(() => false),
+          new Promise<boolean>((r) => { readTimer = setTimeout(() => r(false), TERMINAL_READ_TIMEOUT_MS); }),
+        ])) : false;
+        if (readTimer) clearTimeout(readTimer);
+      } catch { listening = false; }
+      humanWatchArmed = !disposed && listening;
       return humanWatchArmed;
     },
     handOverToHuman(_why: string) {
@@ -1257,6 +1287,10 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       return true;
     },
     handedOver() { return handedOverAt > 0 && !disposed; },
+    personActedSinceHandOver(pg?: unknown) {
+      const p = (pg && typeof pg === "object" ? pg : page) as object;
+      return handedOverAt > 0 && !disposed && (humanInputAt.get(p) ?? 0) > handedOverAt;
+    },
     async withAutomationInput<T>(pg: unknown, fn: () => Promise<T>): Promise<T> {
       const p = (pg && typeof pg === "object" ? pg : page) as object;
       automationDepth.set(p, (automationDepth.get(p) ?? 0) + 1);
