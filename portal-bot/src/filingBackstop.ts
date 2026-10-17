@@ -161,6 +161,9 @@ export interface BackstopAbort {
   /** #333: the requesting page saw a person's own input (watchHumanInput) within HUMAN_INPUT_MS —
    *  the held request was most likely their click, not the page acting by itself. */
   humanInput?: boolean;
+  /** #333: …and that input came BEFORE the hand-over (or there was none): "your click was held back,
+   *  click again" is true of it. A flagged abort after the hand-over is the person's own payment. */
+  beforeHandOver?: boolean;
 }
 
 export interface FilingBackstop {
@@ -875,7 +878,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     try { resourceType = String(request.resourceType() || ""); } catch { /* keep "" */ }
     const requestPage = pageOfRequest(request);
     const abort = async (rule: BackstopRule, why: string): Promise<void> => {
-      aborts.push({ rule, method: method || "?", where: whereOf(url), why, resourceType, ...(recentHumanInput(requestPage) ? { humanInput: true } : {}) });
+      const heldInput = recentHumanInput(requestPage);
+      const beforeHandOver = heldInput && (!handedOverAt || (humanInputAt.get(requestPage as object) ?? 0) <= handedOverAt);
+      aborts.push({ rule, method: method || "?", where: whereOf(url), why, resourceType, ...(heldInput ? { humanInput: true, ...(beforeHandOver ? { beforeHandOver: true } : {}) } : {}) });
       await route.abort("blockedbyclient").catch(() => null);
     };
     // #333 — A PERSON'S OWN REQUEST AFTER THE HAND-OVER: the requesting page saw their input (the

@@ -29,15 +29,20 @@
 //     B3  automation tries to click after the hand-over: the replay refuses its own input
 //         (inputsClosed), 0 POSTs.
 //     B4  an approved run (autoSubmit) is never handed over (the watch is never armed).
-//   [B, skeptic round 2] — each FAILS at 1de7f6e2 (the round-1 head):
-//     B5  a person's request after the hand-over, then the page they land on is "My Records" (a list
-//         headed "Record Number" with ANOTHER application's number): not a filing, rated "low".
-//     B6  a fetch submit + location.href to the completion page, under a label the click classifier
-//         does not know: the person's submit, never "stopped before review"; rated "high".
+//   [B, skeptic rounds 2-3] — ONLY THE CLICK DETECTOR SAYS "THE PERSON SUBMITTED" (main's detector, armed
+//   at the hand-over); what a page reads never does. A request the person sent that went through is
+//   said plainly instead (PERSON_REQUEST_WENT_NOTE: "if it was the submit, enter its number"):
+//     B5  a person's request, then "My Records" (a list headed "Record Number" with ANOTHER
+//         application's number): not a filing; the request is said plainly.
+//     B6  a fetch submit + location.href to the completion page under a label the click detector does
+//         not know: never "stopped before review", never "click submit manually"; said plainly.
 //     B7  the person's fetch submit WHILE the run drains its own save: recorded as theirs (never the
-//         drain's own-save exemption), never "stopped before review", captured.
+//         drain's own-save exemption), never "stopped before review"; said plainly.
 //     B8  an older record ("Your application has been received") opened after the run let go: not
 //         this run's filing.
+//     B9  the person's payment click after the hand-over: aborted (automation never pays, and the
+//         run still holds the page), the run is not failed, and never "your click before the
+//         hand-over was held back".
 //     B2 also: a held click's error page is not "where the run stopped".
 // Against main (no hand-over) A1 and B1 FAIL by name: the person's POST is aborted.
 //
@@ -47,7 +52,7 @@ import http from "node:http";
 import { chromium, type Page } from "playwright";
 import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../../shared/src/types";
 import { backstopFor, installFilingBackstop, isStoppingAbort, withBackstopWindow, type FilingBackstop } from "../filingBackstop";
-import { HUMAN_CLICK_HELD_NOTE, RecipeAdapter } from "./recipeAdapter";
+import { HUMAN_CLICK_HELD_NOTE, PERSON_REQUEST_WENT_NOTE, RecipeAdapter } from "./recipeAdapter";
 
 let failures = 0;
 let total = 0;
@@ -92,6 +97,7 @@ const reviewBody = (k: string): string => {
       });
     </script>`;
   if (k === "B8") return `${summary}${formSubmit(k)}<a id="older" href="/h/B8/record">Older application BLD-2026-900001</a>`;
+  if (k === "B9") return `${summary}${formSubmit(k)}<button type="button" id="pay" onclick="fetch('/h/B9/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function () {})">Pay Fees</button>`;
   if (k === "A4") return `${summary}<button type="button" id="btnSubmit" onclick="window.open('/h/A4/popup', '_blank')">Submit Application</button>`;
   if (k === "A5") return `${summary}<button type="button" id="btnSubmit" onclick="fetch('/h/A5/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function(){})">Submit Application</button>`;
   return `${summary}<form method="post" action="/h/${k}/apply/submit"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
@@ -262,8 +268,6 @@ interface Replay {
   posts: string[]; watchArmed: boolean; handedOver: boolean; extra?: unknown;
   /** What the runner's submit watch (index.ts armSubmitCapture) was handed: one entry per submit. */
   observed: string[];
-  /** The replay's own rating of a record number read off the page the window ended on. */
-  captureConfidence: string;
   /** The backstop's record of the person's own requests (path only). */
   humanRequests: string[];
   /** When the run's first own-save drain closed (0: none). */
@@ -325,7 +329,6 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
   if (opts.afterFill) await opts.afterFill(page).catch(() => null);
   await sleep(2000); // a completion page's read lands ~1.2 s after its load
   const review = await adapter.stopAtReview();
-  const capture = await adapter.captureSubmissionConfirmation().catch(() => null);
   await ctx.close().catch(() => null);
   return {
     ok: fill.ok, message: String(fill.message ?? ""), data: (fill.data ?? {}) as Record<string, unknown>,
@@ -333,12 +336,16 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
     review: { ok: review.ok, message: String(review.message ?? ""), data: (review.data ?? {}) as Record<string, unknown> },
     posts: postsFor(k, from).map((p) => p.path), watchArmed, handedOver: /the page is yours/.test(String(fill.message ?? "")) || watchArmed, extra,
     observed,
-    captureConfidence: String(((capture?.data ?? {}) as Record<string, unknown>).recordNumberConfidence ?? ""),
     humanRequests: (spied.bs?.humanRequests ?? []).map((r) => r.where.replace(base, "")),
     drainClosedAt: drain.closedAt,
   };
 }
-const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseReason, posts: r.posts, msg: r.message.slice(0, 260), review: { ok: r.review.ok, msg: r.review.message.slice(0, 200), human: r.review.data.humanSubmittedInReviewWindow }, armed: r.watchArmed, observed: r.observed, conf: r.captureConfidence, humanRequests: r.humanRequests, extra: r.extra instanceof Error ? r.extra.message.slice(0, 160) : r.extra }).slice(0, 1100);
+/** The person's request was said plainly, and nobody was told to "click submit manually". */
+const saidPlainly = (r: Replay): boolean => {
+  const notes = (r.review.data.reviewHandoffNotes as string[] | undefined) ?? [];
+  return notes.includes(PERSON_REQUEST_WENT_NOTE) && !/click submit manually/i.test(r.review.message);
+};
+const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseReason, posts: r.posts, msg: r.message.slice(0, 260), review: { ok: r.review.ok, msg: r.review.message.slice(0, 200), human: r.review.data.humanSubmittedInReviewWindow }, armed: r.watchArmed, observed: r.observed, humanRequests: r.humanRequests, extra: r.extra instanceof Error ? r.extra.message.slice(0, 160) : r.extra }).slice(0, 1100);
 
 {
   const r = await replay("B1", { onHandOver: (page) => personClicks(page) });
@@ -376,7 +383,7 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
   check("B5 a person's request after the hand-over, then a records list: the request went", r.posts.some((p) => /\/api\/save-later$/.test(p)), rbrief(r));
   check("B5 …the records list is NOT taken for a filing: no submit reported, nothing handed to the capture",
     r.observed.length === 0 && r.review.data.humanSubmittedInReviewWindow !== true, rbrief(r));
-  check("B5 …a number read off that list is rated 'low' (recorded as a note, never as the filing)", r.captureConfidence === "low", rbrief(r));
+  check("B5 …the request that went is said plainly ('if it was the submit, enter its number')", saidPlainly(r), rbrief(r));
   check("B5 …and the run is not 'stopped before review' (the person moved on from the page it handed over)", r.ok === true && r.pauseReason !== "stopped_before_review", rbrief(r));
 }
 {
@@ -385,9 +392,9 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
   const r = await replay("B6", { onHandOver: (page) => personClicks(page, "#send") });
   check("B6 a fetch submit after the hand-over reaches the portal", r.posts.filter((p) => /\/api\/application$/.test(p)).length === 1, rbrief(r));
   check("B6 …the run is not failed and not 'stopped before review'", r.ok === true && r.pauseReason !== "stopped_before_review", rbrief(r));
-  check("B6 …the completion page it led to is the person's submit: reported, and handed to the capture once",
-    r.observed.length === 1 && r.review.data.humanSubmittedInReviewWindow === true, rbrief(r));
-  check("B6 …and the completion page's number is rated 'high' (a sentence says it was submitted)", r.captureConfidence === "high", rbrief(r));
+  check("B6 …what the page it led to reads is never taken for a filing (the click detector did not see a final submit)",
+    r.observed.length === 0 && r.review.data.humanSubmittedInReviewWindow !== true, rbrief(r));
+  check("B6 …and the request that went is said plainly, never 'click submit manually'", saidPlainly(r), rbrief(r));
 }
 {
   // B7 (skeptic r2 F2): the run ticks a box on the review page, the portal reads "Saving...", and the
@@ -403,7 +410,7 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
     `clickedAt=${clickedAt} drainClosedAt=${r.drainClosedAt} ${rbrief(r)}`);
   check("B7 …and is recorded as the person's request (never taken by the drain's own-save exemption)", r.humanRequests.some((w) => /\/api\/application$/.test(w)), rbrief(r));
   check("B7 …the run is not failed and not 'stopped before review'", r.ok === true && r.pauseReason !== "stopped_before_review", rbrief(r));
-  check("B7 …and the completion page is handed to the capture once", r.observed.length === 1, rbrief(r));
+  check("B7 …and the request that went is said plainly, never 'click submit manually'", saidPlainly(r), rbrief(r));
 }
 {
   // B8 (skeptic r2 F1): after the run has let go (its backstop disposed), the person opens an OLDER
@@ -411,6 +418,14 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
   const r = await replay("B8", { afterFill: (page) => personClicks(page, "#older") });
   check("B8 an older record opened after the run let go is NOT taken for this run's filing",
     r.observed.length === 0 && r.review.data.humanSubmittedInReviewWindow !== true, rbrief(r));
+}
+{
+  // B9 (skeptic r2b): the person clicks "Pay Fees" after the hand-over. Payment is never lifted, so it
+  // is aborted; that is the person's own click after the hand-over, not one held back before it.
+  const r = await replay("B9", { onHandOver: (page) => personClicks(page, "#pay") });
+  const all = JSON.stringify({ m: r.message, d: r.data, rm: r.review.message, rd: r.review.data });
+  check("B9 the person's payment click after the hand-over is aborted (automation never pays; the run still holds the page)", r.posts.length === 0, rbrief(r));
+  check("B9 …the run is not failed, and never says the click came before the hand-over", r.ok === true && !all.includes("YOUR CLICK WAS HELD BACK"), rbrief(r));
 }
 
 await browser.close();

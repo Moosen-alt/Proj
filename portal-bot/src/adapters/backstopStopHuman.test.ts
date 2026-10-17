@@ -8,7 +8,9 @@
 //   3. a person's harmless click whose BACKGROUND request went (a same-origin fetch), then a page
 //      script trying to file: still a failure — only a request that LEFT the page (the person's own
 //      document submit or navigation) ends what the run answers for;
-//   4. a person's own document submit went, then an abort on the page it led to: not a failure.
+//   4. a person's own document submit went, then an abort on the page it led to: not a failure;
+//   5. a person's input AFTER the hand-over whose request was still held (their own payment click:
+//      rule 1 never lifts): not a failure, and never "your click before the hand-over was held".
 //
 //   npx tsx portal-bot/src/adapters/backstopStopHuman.test.ts
 import type { PortalRecipe } from "../../../shared/src/types";
@@ -38,9 +40,13 @@ const stopFor = (aborts: BackstopAbort[], humanRequests: HumanRequest[]): { stop
   return { stop, notes: [...adapter.reviewHandoffNotes] };
 };
 
-const filingDoc = (humanInput: boolean): BackstopAbort => ({
+// humanInput: the backstop flagged a person's input; beforeHandOver: …and it came before the hand-over.
+const filingDoc = (humanInput: boolean, beforeHandOver = humanInput): BackstopAbort => ({
   rule: "review-lockdown", method: "POST", where: "https://portal.example/apply/submit", why: "the run is at review", resourceType: "document",
-  ...(humanInput ? { humanInput: true } : {}),
+  ...(humanInput ? { humanInput: true, ...(beforeHandOver ? { beforeHandOver: true } : {}) } : {}),
+} as BackstopAbort);
+const payment = (): BackstopAbort => ({
+  rule: "filing-url", method: "POST", where: "https://portal.example/payment/charge", why: "a fee-payment endpoint — automation never pays", resourceType: "fetch", humanInput: true,
 } as BackstopAbort);
 
 console.log("\n#333 backstopStop after the hand-over");
@@ -61,6 +67,11 @@ console.log("\n#333 backstopStop after the hand-over");
 {
   const r = stopFor([filingDoc(false)], [{ where: "https://portal.example/apply/submit", document: true, abortsBefore: 0 }]);
   check("4. the person's own document submit went, then an abort on the page it led to: not a failure", r.stop === "", r.stop);
+}
+{
+  const r = stopFor([payment()], []);
+  check("5. the person's own payment click after the hand-over, held: not a failure", r.stop === "", r.stop);
+  check("5. …and never 'your click before the hand-over was held back'", !r.notes.includes(HUMAN_CLICK_HELD_NOTE), JSON.stringify(r.notes));
 }
 
 if (failures) { console.error(`\n${failures}/${total} backstopStopHuman.test check(s) FAILED.`); process.exit(1); }

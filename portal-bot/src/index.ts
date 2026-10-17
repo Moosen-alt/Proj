@@ -359,12 +359,8 @@ async function armSubmitCapture(
             return;
           }
           const recordNumber = String(data.permitNumber ?? data.confirmationNumber ?? "");
-          // An adapter that rates its own read (the replay: "high" only beside a sentence that says
-          // the submission completed — #333 round 2) is believed when it says "low": a records list
-          // carries a "Record Number" column of OTHER applications' numbers.
-          const rated: "high" | "low" = data.recordNumberConfidence === "low" ? "low" : "high";
           const read = recordNumber
-            ? { confidence: rated, source: "completion_page", reason: capture.message }
+            ? { confidence: "high" as const, source: "completion_page", reason: capture.message }
             : { confidence: "low" as const, source: "none", reason: capture.message };
           options.onSubmitCaptured?.({
             recordNumber,
