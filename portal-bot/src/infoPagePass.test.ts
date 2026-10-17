@@ -787,6 +787,18 @@ console.log("\nGREP PINS");
     lifts.length === 1 && /infoPageProofStepRefusals\(/.test(noteBody) && /\.infoPageProofGiven\(/.test(noteBody), `${lifts.length} lift(s)`);
   const replay = fs.readFileSync(path.join(root, "portal-bot/src/adapters/recipeAdapter.ts"), "utf8");
   check("replay never opens one (learner-only in this change: replay stops as on main)", !/openInfoPagePass/.test(replay));
+  // Helm's review of #369 (S6): the stand-in's "no reading" reaches the learner through two forwards
+  // the backend test's stubbed learner never crosses — each is pinned here, and the learner fails
+  // closed (unavailable) when either is dropped.
+  const backendLearn = fs.readFileSync(path.join(root, "backend/src/autoLearn.ts"), "utf8");
+  const runnerIndex = fs.readFileSync(path.join(root, "portal-bot/src/index.ts"), "utf8");
+  const adapterSrc = fs.readFileSync(path.join(root, "portal-bot/src/adapters/autoLearnAdapter.ts"), "utf8");
+  check("#366 S6: the backend forwards the stand-in's flag to the learner (infoPagePassUnavailable: infoPageInput.unavailable)",
+    /infoPagePassUnavailable:\s*infoPageInput\.unavailable/.test(backendLearn));
+  check("#366 S6: the runner passes it into the AutoLearnAdapter (infoPagePassUnavailable: input.infoPagePassUnavailable)",
+    /new AutoLearnAdapter\([^;]*infoPagePassUnavailable:\s*input\.infoPagePassUnavailable/.test(runnerIndex));
+  check("#366 S6: the learner is unavailable unless told otherwise (only an explicit false opens a pass or a card)",
+    /this\.infoPagePassUnavailable = options\.infoPagePassUnavailable !== false;/.test(adapterSrc));
   check("round 3: replay never lifts the proof hold either", !/infoPageProofGiven/.test(replay));
   const infoFiles = files.filter((f) => /infoPage/i.test(fs.readFileSync(f, "utf8")) && /allowApprovedFiling/.test(fs.readFileSync(f, "utf8")))
     .filter((f) => !/filingBackstop\.ts$|recipeAdapter\.ts$/.test(f)).map(rel);

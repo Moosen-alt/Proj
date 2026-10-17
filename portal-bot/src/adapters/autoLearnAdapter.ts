@@ -2388,8 +2388,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
        *  held untouched, a run that reached review / paused / was interrupted, a number, a draft or a
        *  filing). Not given = true (refuses). */
       infoPagePriorProgress?: boolean;
-      /** #366: the backend handed this attempt no reading at all. Not given = true when no
-       *  prior-progress reading was given either (a caller with no backend): no pass, no card. */
+      /** #366: the backend handed this attempt no reading at all. Not given = true (a caller with no
+       *  backend, or a forward that was dropped): no pass, no card. Only an explicit false — the
+       *  backend's real reading — opens either. */
       infoPagePassUnavailable?: boolean;
       /** #344 round 5: the backend's reservation of a use (infoPages.reserveInfoPagePassUse), awaited
        *  by the network backstop at the admission of a verified page's one request. Refusals; empty =
@@ -2416,7 +2417,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     this.signatureRequestApproval = options.signatureRequestApproval ?? null;
     this.infoPagePasses = Object.freeze((options.infoPagePasses ?? []).map((e) => Object.freeze(JSON.parse(JSON.stringify(e)) as VerifiedInfoPage)));
     this.infoPagePriorProgress = options.infoPagePriorProgress !== false;
-    this.infoPagePassUnavailable = options.infoPagePassUnavailable === true || typeof options.infoPagePriorProgress !== "boolean";
+    // Helm's review (S6): unavailable unless the caller says otherwise — a dropped forward from the
+    // backend fails closed (no pass, no card), never open.
+    this.infoPagePassUnavailable = options.infoPagePassUnavailable !== false;
     this.onInfoPagePassed = typeof options.onInfoPagePassed === "function" ? options.onInfoPagePassed : undefined;
     this.reserveInfoPagePass = typeof options.reserveInfoPagePass === "function" ? options.reserveInfoPagePass : undefined;
     this.infoPageProofValues = Object.freeze(((): Record<string, string> => {

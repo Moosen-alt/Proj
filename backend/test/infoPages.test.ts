@@ -155,6 +155,7 @@ const stubLearn = () => ({
 type LearnInput = {
   infoPagePasses?: Array<{ id: string }>; infoPagePriorProgress?: boolean; onInfoPagePassed?: (p: { passId: string; where: string }) => void; infoPageProofValues?: Record<string, string>;
   reserveInfoPagePass?: (p: { passId: string; where: string }) => ReadonlyArray<string> | Promise<ReadonlyArray<string>>;
+  infoPagePassUnavailable?: boolean;
 };
 let handedAll: LearnInput[] = [];
 let scripted: Array<(input: LearnInput) => unknown> = [];
@@ -609,6 +610,113 @@ await check("#365: a tracked number of the OTHER side is skipped only on POSITIV
   IP.recordInfoPageLearnStart(db, K, "utility", 1, "https://www.examplecity.gov/utilities/interconnection");
   assert.ok(IP.listInfoPageProjectState(db, K)[0].hard.length > 0, "a learn's own portal that is not a platform: the card counts the number too");
 });
+await check("#365, HELM'S REVIEW OF #369: a city's own Salesforce tenant is never a platform (both sides); the utility filing lookup and a utility's portal on a host in question count; the project's own NEM row URL counts; KB portal_url read raw; free-text permit types, default-columns rows, a city URL in portal_name, a utility recipe on a city portal, stateless and out-of-state rows all count", async () => {
+  const { getProjectDetail, createPermitCheckTarget } = await import("../src/repository");
+  const { ensureCheckTarget } = await import("../src/submittalTracks");
+  const { saveUtilityFilingLookup } = await import("../src/utilityFilingLookup");
+  const { isUtilityPlatformUrl } = await import("../src/portalChannel");
+  const permitUrl = "https://aca-oregon.accela.com/oregon/Default.aspx";
+  const nemUrl = "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login";
+  const at = new Date().toISOString();
+  const kbRow = (id: string, utility: string, url: string, name = "", state = "OR", verified = false) => db.run(
+    `INSERT INTO permit_utility_knowledge (id, profile_key, state, ahj, utility, portal_url, portal_name, confidence, first_seen_at, last_learned_at, updated_at, verified_at, verified_by)
+     VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, `${state.toLowerCase()}||${utility.toLowerCase()}|${id}`, state, utility, url, name, verified ? "verified" : "seeded", at, at, at, verified ? at : null, verified ? "synthetic.reviewer@example.com" : ""]);
+  const nemTarget = (P: string, portalUrl: string) => ensureCheckTarget(db, getProjectDetail(db, P).project, {
+    targetType: "nem", permitType: "nem", applicationNumber: "APP-900418", portalName: "Utility NEM portal", portalUrl,
+  });
+  const cityForce = "https://cedarvale.my.site.com/s/permits";
+  assert.equal(isUtilityPlatformUrl(cityForce), true, "precondition: the launch predicate reads a city's unknown Salesforce tenant as a utility's");
+
+  // BLOCKER 1, utility side: a permit number with the NEM learn on the city's own Salesforce site.
+  const S1 = fx.newProject();
+  ensureCheckTarget(db, getProjectDetail(db, S1).project, { targetType: "permit", permitType: "building", applicationNumber: "BLD-2026-501", portalName: "City permits", portalUrl: "" });
+  assert.equal(IP.infoPagePriorProgress(db, S1, cityForce, "utility"), true, "a permit number counts on a city's Salesforce tenant (never a platform)");
+  assert.equal(IP.infoPagePriorProgress(db, S1, nemUrl, "utility"), false, "…and is still skipped on a real interconnection platform");
+  // BLOCKER 1, permit side: a carve-out muni whose verified row names the city's Salesforce site.
+  const SFM = "Example Salesforce Muni";
+  kbRow("kb-369-sfm-a", SFM, "https://sfmuni.powerclerk.com/MvcAccount/Login");
+  kbRow("kb-369-sfm-b", SFM, "https://cedarvale.my.site.com/s/apply", "", "OR", true);
+  const S2 = fx.newProject({ utility: SFM });
+  nemTarget(S2, "");
+  assert.equal(IP.infoPagePriorProgress(db, S2, cityForce, "ahj"), true, "a utility naming the city's Salesforce site: its NEM number counts there");
+  assert.equal(IP.infoPagePriorProgress(db, S2, permitUrl, "ahj"), true, "…and on any permit host (its own records name a non-platform portal)");
+
+  // BLOCKER 2: the utility filing lookup names a city host; a seeded PowerClerk KB row beside it.
+  const LK = "Example Lookup Power";
+  kbRow("kb-369-lk", LK, "https://lookuppower.powerclerk.com/MvcAccount/Login");
+  const cited = <T,>(value: T) => ({ value, sourceUrl: "https://lookuppower.example.test/interconnection", quote: "Apply through the city portal.", origin: "lookup" as const });
+  saveUtilityFilingLookup(db, { state: "OR", utility: LK, filing: cited({ name: "City permit portal", url: "https://permits.lookupcity.gov/apply" }), program: cited("net_metering" as const), lookedUpAt: at });
+  const L1 = fx.newProject({ utility: LK });
+  nemTarget(L1, "");
+  assert.equal(IP.infoPagePriorProgress(db, L1, permitUrl, "ahj"), true, "a lookup naming a city portal makes the NEM number count");
+  assert.equal(IP.infoPagePriorProgress(db, L1, "https://permits.lookupcity.gov/apply", "ahj"), true, "…and on the very host the lookup names");
+  const LP = "Example Lookup Platform Power";
+  kbRow("kb-369-lp", LP, "https://lookupplatform.powerclerk.com/MvcAccount/Login");
+  saveUtilityFilingLookup(db, { state: "OR", utility: LP, filing: cited({ name: "PowerClerk", url: "https://lookupplatform.powerclerk.com/MvcAccount/Login" }), program: cited("net_metering" as const), lookedUpAt: at });
+  const L2 = fx.newProject({ utility: LP });
+  nemTarget(L2, "");
+  assert.equal(IP.infoPagePriorProgress(db, L2, permitUrl, "ahj"), false, "a lookup naming the utility's own platform agrees: skipped");
+
+  // A portal the utility names ON a portal in question (any kind, any match strength): counts.
+  const HQ = "Example Here Power";
+  kbRow("kb-369-hq-a", HQ, "https://herepower.powerclerk.com/MvcAccount/Login");
+  kbRow("kb-369-hq-b", HQ, "https://aca-oregon.accela.com/oregon/HerePower");
+  const H1 = fx.newProject({ utility: HQ });
+  nemTarget(H1, "");
+  assert.equal(IP.infoPagePriorProgress(db, H1, permitUrl, "ahj"), true, "a utility naming a portal on the host in question: counts");
+
+  // S3: the project's own NEM row kept a city status URL on a sibling host — its own evidence.
+  const O1 = fx.newProject();
+  nemTarget(O1, "https://status.examplecity.gov/interconnection/123");
+  assert.equal(IP.infoPagePriorProgress(db, O1, permitUrl, "ahj"), true, "the project's own NEM row URL off any platform: counts");
+  const O2 = fx.newProject();
+  nemTarget(O2, nemUrl);
+  assert.equal(IP.infoPagePriorProgress(db, O2, permitUrl, "ahj"), false, "…while a NEM row kept on the platform is still skipped");
+
+  // S4: a verified carve-out row on a TLD portalUrlsInText does not know (.online).
+  const ON = "Example Online Muni";
+  kbRow("kb-369-on-a", ON, "https://onlinemuni.powerclerk.com/MvcAccount/Login");
+  kbRow("kb-369-on-b", ON, "https://permits.examplemuni.online/apply", "", "OR", true);
+  const N1 = fx.newProject({ utility: ON });
+  nemTarget(N1, "");
+  assert.equal(IP.infoPagePriorProgress(db, N1, permitUrl, "ahj"), true, "a carve-out row on a .online host is read: counts");
+
+  // S5: a free-text permit_type a body field stored ('interconnection') cannot say its side.
+  const F1 = fx.newProject();
+  createPermitCheckTarget(db, F1, { targetType: "permit", permitType: "interconnection", applicationNumber: "INT-2026-7", portalName: "Utility portal" });
+  assert.equal(IP.infoPagePriorProgress(db, F1, nemUrl, "utility"), true, "a free-text permit type counts on the utility side");
+  // S7a: the dashboard's add-target form writes the defaults shape (only a number).
+  const D1 = fx.newProject();
+  createPermitCheckTarget(db, D1, { applicationNumber: "26-104477-RS", portalName: "City permits" });
+  assert.equal(IP.infoPagePriorProgress(db, D1, nemUrl, "utility"), true, "a default-columns row counts on the utility side");
+  assert.equal(IP.infoPagePriorProgress(db, D1, permitUrl, "ahj"), true, "…and on the permit side");
+  // S7b: a city URL only in a KB row's portal_name, beside a PowerClerk portal_url.
+  const PN = "Example Name Power";
+  kbRow("kb-369-pn", PN, "https://namepower.powerclerk.com/MvcAccount/Login", "Online application; municipal customers apply at https://permits.namecity.gov/apply");
+  const P1n = fx.newProject({ utility: PN });
+  nemTarget(P1n, "");
+  assert.equal(IP.infoPagePriorProgress(db, P1n, permitUrl, "ahj"), true, "a city URL in portal_name counts");
+  // S7c: a utility recipe on a city portal beside a PowerClerk-only KB row.
+  const RC = "Example Recipe Power";
+  kbRow("kb-369-rc", RC, "https://recipepower.powerclerk.com/MvcAccount/Login");
+  db.run("INSERT INTO portal_recipes (id, scope_type, profile_key, state, ahj, utility, portal_url, status, version, steps_json, created_at, updated_at) VALUES (?, 'utility', ?, 'OR', '', ?, 'https://permits.recipecity.gov/interconnection', 'complete', 1, '[]', ?, ?)",
+    ["rc-369", `or||${RC.toLowerCase()}`, RC, at, at]);
+  const R1 = fx.newProject({ utility: RC });
+  nemTarget(R1, "");
+  assert.equal(IP.infoPagePriorProgress(db, R1, permitUrl, "ahj"), true, "a utility recipe on a city portal counts");
+  // Optional: a row with no state, or another state's row, never vouches for the platform.
+  const NS = "Example Stateless Power";
+  kbRow("kb-369-ns", NS, "https://statelesspower.powerclerk.com/MvcAccount/Login", "", "");
+  const T1 = fx.newProject({ utility: NS });
+  nemTarget(T1, "");
+  assert.equal(IP.infoPagePriorProgress(db, T1, permitUrl, "ahj"), true, "a stateless row never vouches");
+  const XS = "Example Elsewhere Power";
+  kbRow("kb-369-xs", XS, "https://elsewherepower.powerclerk.com/MvcAccount/Login", "", "WA");
+  const T2 = fx.newProject({ utility: XS });
+  nemTarget(T2, "");
+  assert.equal(IP.infoPagePriorProgress(db, T2, permitUrl, "ahj"), true, "another state's row never vouches");
+});
 
 // ── PRIOR PROGRESS, ROUND 2: through the real autoLearnPortal (the learner stubbed) ──────────────
 const sfjsp = `${ORIGIN}/permits/sfjsp`;
@@ -854,6 +962,43 @@ await check("#366: a card captured on a project with history WARNS the person ve
   assert.ok(clean() && !clean()!.warnings.includes(IP.INFO_PAGE_HISTORY_CAPTURE_WARNING), "a clean capture carries no history warning");
   IP.recordInfoPageCandidate(db, Q, "run-c2", { ...c2, capturedWithHistory: true });
   assert.ok(clean()!.warnings.includes(IP.INFO_PAGE_HISTORY_CAPTURE_WARNING), "a later capture of the same page on a history run stamps the open card");
+});
+await check("#366 S6 (Helm): the stand-in reaches the learner as passUnavailable — true on the retry after an admission, a failed learn-start record and a passes read that throws; false on a real reading; a tracked-filings read error throws instead of reading as history", async () => {
+  const P0 = fx.newProject();
+  scripted = [() => passedResult()];
+  await runLearn(P0);
+  assert.equal(handedAll[0]?.infoPagePassUnavailable, false, "a real reading is handed passUnavailable false");
+  // The retry after an admission (the headed bot-wall retry).
+  const { P, passId } = await verifiedPage("S6 Retry Page");
+  const wall = "403 Forbidden. Attention Required — checking your browser.";
+  scripted = [
+    (input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); return passedResult({ message: wall, pageCount: 1, infoPagePassed: [{ passId, where: sfjsp }] }); },
+    () => passedResult({ message: "headed: still nothing", pageCount: 0 }),
+  ];
+  await runLearn(P);
+  assert.equal(handedAll.length, 2, "the bot wall triggered the headed retry");
+  assert.equal(handedAll[0]?.infoPagePassUnavailable, false);
+  assert.equal(handedAll[1]?.infoPagePassUnavailable, true, "the retry after an admission is handed the stand-in");
+  // A learn-start record that cannot be written.
+  db.run("CREATE TEMP TRIGGER s6_no_learn_start BEFORE INSERT ON audit_logs WHEN NEW.action = 'portal.info_page_learn_started' BEGIN SELECT RAISE(ABORT, 's6 no learn start'); END");
+  try {
+    scripted = [() => passedResult()];
+    await runLearn(fx.newProject()).catch(() => null);
+    assert.equal(handedAll[0]?.infoPagePassUnavailable, true, "a failed learn-start record hands the stand-in");
+  } finally { db.run("DROP TRIGGER IF EXISTS s6_no_learn_start"); }
+  // A passes read that throws.
+  db.run("ALTER TABLE portal_info_page_passes RENAME TO s6_passes_away");
+  try {
+    scripted = [() => passedResult()];
+    await runLearn(fx.newProject()).catch(() => null);
+    assert.equal(handedAll[0]?.infoPagePassUnavailable, true, "a passes read that throws hands the stand-in");
+  } finally { db.run("ALTER TABLE s6_passes_away RENAME TO portal_info_page_passes"); }
+  // A tracked-filings read error is not a reading: it throws, so the caller hands the stand-in.
+  const T = fx.newProject();
+  db.run("ALTER TABLE permit_check_targets RENAME TO s6_targets_away");
+  try {
+    assert.throws(() => IP.infoPagePriorProgress(db, T, sfjsp, "ahj"), /could not be read/);
+  } finally { db.run("ALTER TABLE s6_targets_away RENAME TO permit_check_targets"); }
 });
 await check("prior progress: a staged submission on the same side refuses; one on the other side does not", () => {
   const P = fx.newProject();

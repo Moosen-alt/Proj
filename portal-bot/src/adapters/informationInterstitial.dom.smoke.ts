@@ -472,7 +472,7 @@ console.log("\n[0] the interstitial's forward control: what passes, what never d
 console.log("\n[1a] the captured Permitting Information page (MULTIPART POST form), NO verified page: held, captured");
 let candidate1a: InfoPageCandidateCapture | undefined;
 {
-  const w = await runLearn("/post", () => null, { infoPagePriorProgress: false });
+  const w = await runLearn("/post", () => null, { infoPagePriorProgress: false, infoPagePassUnavailable: false });
   candidate1a = w.candidate;
   check("premise: the walk entered through 'Apply For A Permit' and chose the Solar tile",
     w.notes.some((n) => /^application entry: Apply For A Permit/.test(n)) && w.notes.includes(`permit type: ${SOLAR}`), JSON.stringify(w.notes));
@@ -560,7 +560,7 @@ console.log("\n[1b] the same page, VERIFIED from [1a]'s candidate: Next passes, 
     if (at === "/post/project") return { fills: [{ selectorIndex: idx(req, "Site Address"), value: ADDRESS, field: "street" }], atReview: false, advanceSelectorIndex: idx(req, "Next") };
     if (at === "/post/review") return { fills: [], atReview: true, finalSubmitSelectorIndex: idx(req, "Submit Application") };
     return null;
-  }, { infoPagePasses: entry ? [entry] : [], infoPagePriorProgress: false, infoPageProofValues: { street: ADDRESS, city: "Springfield", zip: "62701" },
+  }, { infoPagePasses: entry ? [entry] : [], infoPagePriorProgress: false, infoPagePassUnavailable: false, infoPageProofValues: { street: ADDRESS, city: "Springfield", zip: "62701" },
     // Round 5: the backend reserves each use at the admission; here it always reserves (the
     // reservation's own refusals are pinned in infoPagePass.dom.smoke [R] and backend infoPages.test).
     reserveInfoPagePass: () => [] });
@@ -586,7 +586,7 @@ console.log("\n[1b] the same page, VERIFIED from [1a]'s candidate: Next passes, 
 // ===========================================================================================
 console.log("\n[1c] an ordinary interstitial (review wording rendered after load): no candidate");
 {
-  const w = await runLearn("/late", () => null, { infoPagePriorProgress: false });
+  const w = await runLearn("/late", () => null, { infoPagePriorProgress: false, infoPagePassUnavailable: false });
   const posted = w.hits.some((h) => h.method === "POST" && h.url.startsWith("/late/sg"));
   check("[1c] premise: the learner took the page as an interstitial and pressed Next",
     interstitialEvents(w).some((e) => e.forward === "Next") && w.notes.includes("advance: Next"), JSON.stringify(interstitialEvents(w)));
