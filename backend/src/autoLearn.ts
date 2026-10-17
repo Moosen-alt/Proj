@@ -1183,7 +1183,7 @@ async function autoLearnPortalInner(
         ? noInfoPagePass
         : { passes: liveInfoPagePasses(db), priorProgress: infoPagePriorProgress(db, projectId, portalUrl, scopeType) };
     } catch { input = noInfoPagePass; }
-    try { infoPageCall.attemptStartId = recordInfoPageLearnStart(db, projectId, scopeType, attempt); }
+    try { infoPageCall.attemptStartId = recordInfoPageLearnStart(db, projectId, scopeType, attempt, portalUrl); }
     catch { return noInfoPagePass; }
     return input;
   };

@@ -76,7 +76,7 @@
 import { isFilingOrPaymentRequest, isPayRequestUrl, paymentDialogVerdict, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE } from "../../shared/src/portalSafety";
 import {
   digestInfoPageIdentity, infoPageAfterClickAckWording, infoPageAfterClickRefusals, infoPageDriftedEntries, infoPageNumberTokens, infoPageMatchRefusals, infoPageObservedRequest, infoPagePassEntry, infoPagePassRefusals,
-  infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, opensInfoPageCandidateWatch,
+  infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, isMatchClassRefusal, opensInfoPageCandidateWatch,
   type InfoPageAfterClickBaseline, type InfoPageAfterClickReading, type InfoPageDigest, type InfoPageExpectedRequest, type InfoPageIdentityMaterial, type InfoPageIdentityReading,
   type InfoPageObservedRequest, type InfoPagePrefixStep, type InfoPageRunState,
 } from "../../shared/src/infoPagePass";
@@ -1180,8 +1180,11 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         infoWatch = w;
         // INVALIDATION BEFORE THE CLICK (proposal §4): a verified page at this origin + path that
         // this read did not match exactly (signature, control, request, the steps before it). The
-        // click is held exactly as on main; the run reports each as an incident.
-        const drifted = infoPageDriftedEntries(digest, entries, prefix, admittedEntryIds);
+        // click is held exactly as on main; the run reports each as an incident. ONLY on a clean read
+        // (#366): a project with history may sit at a later position of the same interview, so its
+        // read is weak evidence that a shared verified page changed — it records the card, it never
+        // withdraws another tenant's pass (a non-matching page is never admitted either way).
+        const drifted = refusals.every(isMatchClassRefusal) ? infoPageDriftedEntries(digest, entries, prefix, admittedEntryIds) : [];
         return { opened: false, refusals, candidateWatch: true, ...(drifted.length ? { drifted } : {}) };
       }
       // HELD AT A VERIFIED PAGE: the page and its steps match a verified entry, but something else

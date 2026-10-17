@@ -9,7 +9,9 @@
 //       saw no POST.
 //   [A2] #366: the same with the project's HISTORY on this portal (priorProgress): the watch still
 //       opens and the card is recorded, held exactly as [A], nothing admitted, no use reserved.
-//       [A3]: history plus a value already written on this run: no watch, no card.
+//       [A3]: history plus a value already written on this run: no watch, no card. [A2b]: history
+//       plus a near miss of a verified page: the card, held, and NO drift incident (a clean run
+//       still reports it).
 //   [B] VERIFIED (the entry built from [A]'s candidate by verifiedInfoPageFromCandidate — the
 //       product's own path): the POST reaches the server ONCE carrying the submitter; one admission,
 //       exempted; page.url() at request time is still the information page (R5); a GA-like fetch
@@ -247,6 +249,30 @@ const devhubEntryAt = async (p: string, prefix?: InfoPageRunStep[]): Promise<Ver
 // INFO_PAGE_SMOKE_ONLY=A,B,D runs only those sections (a kill check's quick pass); default: all.
 const ONLY = String(process.env.INFO_PAGE_SMOKE_ONLY || "").split(",").map((x) => x.trim()).filter(Boolean);
 const want = (section: string): boolean => !ONLY.length || ONLY.includes(section);
+
+// ===========================================================================================
+// [A2b] #366, DRIFT ONLY ON A CLEAN READ: a project with history (its session may sit at a later
+// position of the same interview) reads a page at a verified page's origin + path that does not
+// match it. The card is recorded and the click held, but NO drift incident is raised: its read is
+// weak evidence, and a shared verified page is never withdrawn on it. The control: the same
+// near-miss read on a clean run still reports the drift (main's behaviour).
+// ===========================================================================================
+if (want("A")) {
+  console.log("\n[A2b] #366: history + a near-miss of a verified page → the card, held, and no drift incident");
+  const e = await devhubEntryAt("/A2b");
+  const near = e ? nearMissEntry(e, "textSha") : null;
+  const A2b = await go({ p: "/A2b", html: (p) => devhubReplica({ p }), entries: near ? [near] : [], run: (s) => cleanRun(devhubPrefix(s), { priorProgress: true }) });
+  check("[A2b] history + near miss: the watch opens and the card is recorded",
+    !!near && !!A2b.open && A2b.open.candidateWatch === true && !!A2b.candidate?.observed, JSON.stringify({ open: A2b.open, candidate: !!A2b.candidate }));
+  check("[A2b] …held exactly as on main (nothing reached the server, nothing admitted)", held(A2b), brief(A2b));
+  check("[A2b] …and NO drift incident: a read on a project with history never withdraws a shared verified page",
+    !!A2b.open && !(A2b.open.drifted && A2b.open.drifted.length), JSON.stringify(A2b.open?.drifted ?? null));
+  const e2 = await devhubEntryAt("/A2c");
+  const near2 = e2 ? nearMissEntry(e2, "textSha") : null;
+  const A2c = await go({ p: "/A2c", html: (p) => devhubReplica({ p }), entries: near2 ? [near2] : [] });
+  check("[A2b] control: the same near-miss read on a CLEAN run still reports the drift (main's behaviour)",
+    !!near2 && !!A2c.open && A2c.open.candidateWatch === true && !!A2c.open.drifted && A2c.open.drifted.some((d) => d.entryId === near2.id), JSON.stringify(A2c.open?.drifted ?? null));
+}
 
 // ===========================================================================================
 // [B] verified: exactly one request passes.

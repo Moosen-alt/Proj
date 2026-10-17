@@ -494,43 +494,85 @@ await check("prior progress (round 2, P5): a tracking number of this project ref
     db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", [`t-${P}`, P, portalUrl, "26-104455-RS", "2026-10-15", "2026-10-15"]);
     assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), true, what);
     assert.equal(IP.infoPagePriorProgress(db, P, url, "utility"), true, `${what}: the table has no side, so both`);
-    assert.ok(!JSON.stringify(IP.infoPagePriorProgressReasons(db, P, "ahj", url)).includes("104455"), "the number is masked in the reasons");
+    assert.ok(!JSON.stringify(IP.infoPagePriorProgressReasons(db, P, "ahj", [url])).includes("104455"), "the number is masked in the reasons");
   }
   assert.equal(IP.infoPagePriorProgress(db, fx.newProject(), "not a url", "ahj"), true);
 });
-await check("#365: a tracked number counts on ITS side only (rows written by the real ensureCheckTarget) — the utility's NEM application is not progress on the permit portal, a permit number is not progress on the utility's; the split legacy shape is read by trackKind; a number recorded on THIS portal counts on either side (rule 5 carve-out)", async () => {
+await check("#365: a tracked number counts on ITS side only, ruled by rule 5's own predicate — the utility's NEM application (PowerClerk, or no URL kept) is not progress on a city permit portal; contradictory, default, this-host, carve-out, unknown-host and no-portal rows still count; the card reads every portal it knows", async () => {
   const { getProjectDetail } = await import("../src/repository");
   const { ensureCheckTarget } = await import("../src/submittalTracks");
-  const url = `${ORIGIN}/permits/sfjsp?interviewID=Home`;
+  const { portalEntityEvidence } = await import("../src/portalRecipes");
+  const { hostFitsTrackAndEntity } = await import("../src/portalChannel");
+  // A vendor permit platform: rule 5 refuses it on the NEM track with or without entity evidence.
+  const permitUrl = "https://aca-oregon.accela.com/oregon/Default.aspx";
   const nemUrl = "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login"; // the utility's own portal
-  const N = fx.newProject();
-  ensureCheckTarget(db, getProjectDetail(db, N).project, {
-    targetType: "nem", permitType: "nem", applicationNumber: "APP-900417",
-    portalName: "Pacific Power NEM portal (PowerClerk)", portalUrl: "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login",
+  assert.equal(hostFitsTrackAndEntity("nem", portalEntityEvidence(db, { scope: "utility", state: "OR", name: "PGE" }), permitUrl, "kb").code, "track_conflict", "precondition: the permit portal is refused on the NEM track");
+  const nemTarget = (P: string, portalUrl: string, number = "APP-900417") => ensureCheckTarget(db, getProjectDetail(db, P).project, {
+    targetType: "nem", permitType: "nem", applicationNumber: number, portalName: "Utility NEM portal", portalUrl,
   });
-  assert.deepEqual(IP.infoPagePriorProgressReasons(db, N, "ahj", url).hard, [], "the NEM filing is progress on the permit side");
-  assert.equal(IP.infoPagePriorProgress(db, N, url, "ahj"), false);
+
+  // The utility's NEM application, recorded on its own portal: not progress on the permit side.
+  const N = fx.newProject();
+  nemTarget(N, nemUrl);
+  assert.deepEqual(IP.infoPagePriorProgressReasons(db, N, "ahj", [permitUrl]).hard, [], "the NEM filing is NOT progress on the permit side");
+  assert.equal(IP.infoPagePriorProgress(db, N, permitUrl, "ahj"), false);
   assert.equal(IP.infoPagePriorProgress(db, N, nemUrl, "utility"), true, "…and must stay progress on the utility side");
+  // THE LIVE SHAPE: the confirmation was captured with no URL kept (captureConfirmation writes blanks).
+  const Nb = fx.newProject();
+  nemTarget(Nb, "");
+  assert.equal(IP.infoPagePriorProgress(db, Nb, permitUrl, "ahj"), false, "a NEM number with no URL kept is not progress on a portal its track is refused on");
+  assert.equal(IP.infoPagePriorProgress(db, Nb, nemUrl, "utility"), true);
+  // A permit number: progress on the permit side, not on the utility's own portal.
   const B = fx.newProject();
   ensureCheckTarget(db, getProjectDetail(db, B).project, {
-    targetType: "permit", permitType: "building", applicationNumber: "26-104455-RS", portalName: "Development Hub PDX", portalUrl: `${ORIGIN}/records/1`,
+    targetType: "permit", permitType: "building", applicationNumber: "26-104455-RS", portalName: "Oregon ePermitting", portalUrl: permitUrl,
   });
-  assert.equal(IP.infoPagePriorProgress(db, B, url, "ahj"), true, "a permit number is progress on the permit side");
-  assert.equal(IP.infoPagePriorProgress(db, B, nemUrl, "utility"), false, "…and not on the utility's");
-  // A legacy row whose target_type sits on the column default but whose permit_type names the NEM
-  // filing: trackKind reads it as the utility's (a raw write — ensureCheckTarget never writes it).
+  assert.equal(IP.infoPagePriorProgress(db, B, permitUrl, "ahj"), true, "a permit number is progress on the permit side");
+  assert.equal(IP.infoPagePriorProgress(db, B, nemUrl, "utility"), false, "…and not on the utility's own portal");
+  // The legacy split shape (target_type on the column default, permit_type 'nem'): trackKind reads it
+  // as the utility's. A raw write — ensureCheckTarget never writes it.
   const L = fx.newProject();
   db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, target_type, permit_type, created_at, updated_at) VALUES (?, ?, '', 'APP-1', 'permit', 'nem', '2026-10-15', '2026-10-15')", [`tl-${L}`, L]);
-  assert.equal(IP.infoPagePriorProgress(db, L, url, "ahj"), false);
+  assert.equal(IP.infoPagePriorProgress(db, L, permitUrl, "ahj"), false);
   assert.equal(IP.infoPagePriorProgress(db, L, nemUrl, "utility"), true);
-  // Rule 5's carve-out: a utility that takes its application inside the city's own portal. A NEM
-  // number recorded on THIS portal's host was filed here, so it counts on the permit side too.
-  const C = fx.newProject();
-  ensureCheckTarget(db, getProjectDetail(db, C).project, {
-    targetType: "nem", permitType: "nem", applicationNumber: "IC-2026-77", portalName: "City portal (interconnection)", portalUrl: `${ORIGIN}/interconnection/apply`,
-  });
-  assert.equal(IP.infoPagePriorProgress(db, C, url, "ahj"), true, "a NEM number filed on this very portal is progress here");
-  assert.equal(IP.infoPagePriorProgress(db, C, "https://elsewhere.example.test/permits", "ahj"), false, "…and not on another portal");
+  // Contradictory columns ('nem' + a permit discipline, which a body field can write): neither side
+  // can be trusted, so it counts on both.
+  const X = fx.newProject();
+  db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, target_type, permit_type, created_at, updated_at) VALUES (?, ?, '', 'BLD-1', 'nem', 'building', '2026-10-15', '2026-10-15')", [`tx-${X}`, X]);
+  assert.equal(IP.infoPagePriorProgress(db, X, permitUrl, "ahj"), true, "contradictory row: counts on the permit side");
+  assert.equal(IP.infoPagePriorProgress(db, X, nemUrl, "utility"), true, "…and on the utility side");
+  // A NEM number recorded on THIS very host counts, whatever the predicate says of the host.
+  const H = fx.newProject();
+  db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, tracking_url, application_number, target_type, permit_type, created_at, updated_at) VALUES (?, ?, ?, '', 'IC-2026-77', 'nem', 'nem', '2026-10-15', '2026-10-15')", [`th-${H}`, H, "https://www.aca-oregon.accela.com/oregon/status"]);
+  assert.equal(IP.infoPagePriorProgress(db, H, permitUrl, "ahj"), true, "a NEM number recorded on this very host (www or not) is progress here");
+  // RULE 5'S CARVE-OUT with no URL kept: the utility's own VERIFIED record names the city's portal
+  // (same host and tenant), so its NEM may have been filed there — it counts; another tenant does not.
+  const MUNI = "Example Muni Power";
+  const muniPortal = "https://aca-prod.accela.com/EXAMPLEOR/Default.aspx";
+  const nowIso = new Date().toISOString();
+  db.run(
+    `INSERT INTO permit_utility_knowledge (id, profile_key, state, ahj, utility, portal_url, confidence, first_seen_at, last_learned_at, updated_at, verified_at, verified_by)
+     VALUES (?, ?, 'OR', '', ?, ?, 'verified', ?, ?, ?, ?, 'synthetic.reviewer@example.com')`,
+    ["kb-365-muni", `or||${MUNI.toLowerCase()}|kb-365-muni`, MUNI, muniPortal, nowIso, nowIso, nowIso, nowIso]);
+  assert.equal(hostFitsTrackAndEntity("nem", portalEntityEvidence(db, { scope: "utility", state: "OR", name: MUNI }), muniPortal, "kb").fits, true, "precondition: the carve-out opens the muni's verified portal");
+  const M = fx.newProject({ utility: MUNI });
+  nemTarget(M, "");
+  assert.equal(IP.infoPagePriorProgress(db, M, muniPortal, "ahj"), true, "carve-out: a NEM number with no URL kept counts on the portal the utility files inside");
+  assert.equal(IP.infoPagePriorProgress(db, M, "https://aca-prod.accela.com/OTHEROR/Default.aspx", "ahj"), false, "…and not on another tenant of that host");
+  // A host the predicate cannot judge (no entity evidence names it): the number counts.
+  assert.equal(IP.infoPagePriorProgress(db, Nb, "https://permits.nowhere.example.test/apply", "ahj"), true, "an unjudgeable host never hides the number");
+  // No portal given at all: every number counts.
+  assert.ok(IP.infoPagePriorProgressReasons(db, N, "ahj", []).hard.length > 0, "no portal: the number counts");
+  assert.ok(IP.infoPagePriorProgressReasons(db, N, "ahj", ["not a url", ""]).hard.length > 0, "unreadable portals: the number counts");
+  // THE CARD reads every portal it knows — the verified page's and each learn's own — and counts a
+  // number unless it is ruled off ALL of them, so it is never more permissive than the learner.
+  const K = fx.newProject();
+  nemTarget(K, "");
+  IP.recordInfoPageHeldVerified(db, K, "ahj", "run-k", [{ passId: "pass-k", where: permitUrl }]);
+  IP.recordInfoPageLearnStart(db, K, "ahj", 1, permitUrl);
+  assert.deepEqual(IP.listInfoPageProjectState(db, K)[0].hard, [], "every portal it knows rules the NEM track off: no hard reason on the card");
+  IP.recordInfoPageLearnStart(db, K, "ahj", 1, "https://permits.nowhere.example.test/apply");
+  assert.ok(IP.listInfoPageProjectState(db, K)[0].hard.length > 0, "a learn's own portal the predicate cannot judge: the card counts the number too");
 });
 
 // ── PRIOR PROGRESS, ROUND 2: through the real autoLearnPortal (the learner stubbed) ──────────────
@@ -558,7 +600,7 @@ await check("B1a / P1 / 'twice': a learn PASSED the verified page, filled fields
   assert.equal(JSON.parse(fx.audits("portal.info_page_passed").filter((a) => a.project_id === P)[0].details).scope, "ahj");
   await runLearn(P);
   assert.equal(handedOf(handed as LearnInput).priorProgress, true, "the SAME project's next learn is refused");
-  const why = IP.infoPagePriorProgressReasons(db, P, "ahj", sfjsp);
+  const why = IP.infoPagePriorProgressReasons(db, P, "ahj", [sfjsp]);
   assert.ok(why.learn.some((w) => /passed a verified information page/.test(w)), JSON.stringify(why));
   assert.ok(why.learn.some((w) => /may have entered data/.test(w)), JSON.stringify(why));
   assert.equal(IP.infoPagePriorProgress(db, P, sfjsp, "utility"), false, "the other side is untouched");
@@ -671,7 +713,7 @@ await check("ALLOW ONCE MORE: after a use the card shows it (canAllow); a named 
   assert.equal(st[0].passed.length, 1);
   assert.equal(st[0].canAllow, true, JSON.stringify(st[0]));
   IP.allowInfoPagePassOnceMore(db, P, "ahj", { by: "Pat Allower", userId: "" });
-  assert.deepEqual(IP.infoPagePriorProgressReasons(db, P, "ahj", sfjsp), { hard: [], learn: [] });
+  assert.deepEqual(IP.infoPagePriorProgressReasons(db, P, "ahj", [sfjsp]), { hard: [], learn: [] });
   assert.equal(IP.listInfoPageProjectState(db, P).length, 0, "nothing since the allowance");
   use();
   await runLearn(P);
@@ -717,10 +759,12 @@ await check("#365 + #366, THE LIVE PORTLAND SHAPE end to end: NEM filed first + 
   });
   scripted = [() => passedResult()];
   await runLearn(P); // an earlier learn that filled a field and failed: learn history on this side
-  const before = IP.infoPagePriorProgressReasons(db, P, "ahj", sfjsp);
+  const before = IP.infoPagePriorProgressReasons(db, P, "ahj", [sfjsp]);
   assert.deepEqual(before.hard, [], JSON.stringify(before));
   assert.ok(before.learn.length > 0, "the earlier learn is history");
-  // The capture learn: the backstop recorded the card despite the history (#366); the backend records it.
+  // The capture learn. The learner is STUBBED here, so the backstop's half of #366 (opening the watch
+  // despite the history) is simulated; it is pinned in real Chromium by infoPagePass.dom.smoke [A2] /
+  // [A2b]. What this pins is the backend half: the card is recorded, verified, held, allowed, passed.
   const c = capture(material((m) => { m.title = "Live Portland Shape Page"; }));
   await runLearn(P, c);
   assert.equal(handedOf(handed as LearnInput).priorProgress, true, "the capture learn was handed the history");

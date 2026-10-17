@@ -39,6 +39,8 @@
 // viewer's own org, on the pass's knowledge-base entry.
 import { DEFAULT_ORG_ID, type AppDb } from "./db";
 import { trackKind } from "./permitMonitor";
+import { hostFitsTrackAndEntity, portalHostOf, type PortalEntity } from "./portalChannel";
+import { portalEntityEvidence } from "./portalRecipes";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
 import { id as newId } from "./ids";
@@ -214,9 +216,11 @@ const maskDigits = (x: unknown): string => s(x).replace(/\d/g, "#");
 
 /** BEFORE EACH LEARN ATTEMPT TOUCHES THE PORTAL (autoLearn): on record first, so a learn that dies,
  *  throws or is interrupted is progress unless it ends clean. Returns the start's id. */
-export function recordInfoPageLearnStart(db: AppDb, projectId: string, scope: Side, attempt: number): string {
+export function recordInfoPageLearnStart(db: AppDb, projectId: string, scope: Side, attempt: number, portalUrl: string): string {
   const startId = newId();
-  addAuditLog(db, projectId, "system", "auto-learn", ACT_LEARN_STARTED, { startId, scope, attempt });
+  // The learn's own portal URL: the project card reads it back (listInfoPageProjectState), so the
+  // card judges the same portal the learner's own check did.
+  addAuditLog(db, projectId, "system", "auto-learn", ACT_LEARN_STARTED, { startId, scope, attempt, portalUrl: s(portalUrl).slice(0, 300) });
   return startId;
 }
 
@@ -256,6 +260,16 @@ export function recordInfoPageHeldVerified(db: AppDb, projectId: string, scope: 
   }
 }
 
+/** Whose filing a tracked row is (#365): "utility" or "ahj" only when its columns say so and agree —
+ *  trackKind, the one answer, plus a consistency check. A row on the columns' defaults (no
+ *  permit_type: legacy rows, raw writes) or with contradictory columns ('nem' + a permit discipline)
+ *  cannot say: null, and it counts on both sides. */
+function trackedRowSide(t: Row): Side | null {
+  const pt = s(t.permit_type).trim().toLowerCase();
+  if (trackKind(s(t.target_type), pt) === "nem") return pt === "" || pt === "nem" ? "utility" : null;
+  return pt !== "" ? "ahj" : null;
+}
+
 interface PriorProgressReasons {
   /** Never lifted by an allowance: a filing, a number, a draft, a stage that reached review, paused
    *  or was interrupted. */
@@ -272,8 +286,13 @@ interface PriorProgressReasons {
  * later server position where its Next files.
  *
  * HARD (a person can never lift these here — the page is then done by hand for this project):
- *   - any tracked application or permit number of this project, WHATEVER its portal URL (blank, this
- *     host or another: the table carries no side);
+ *   - a tracked application or permit number of this project (#365), unless the row is positively
+ *     the OTHER side's AND rule 5's own predicate (hostFitsTrackAndEntity) positively rules that
+ *     side's track off every portal in question (a track or platform conflict: the utility's NEM
+ *     cannot be filed on the city's DevHub). A row on the columns' defaults or with contradictory
+ *     columns, a number recorded on this very host, a carve-out utility whose own verified record
+ *     names this portal, an entity or host the predicate cannot judge, or no portal given at all:
+ *     it counts, as before;
  *   - a submission on this side in any status but "failed" (staged, awaiting a person, paused,
  *     submitted, approved, issued — and any status not known here);
  *   - a portal run on this side with a confirmation number, or in any status but queued / running
@@ -290,30 +309,49 @@ interface PriorProgressReasons {
  *     person's fix captured mid-learn.
  * A read error is a hard reason: an unknown never reassures.
  */
-/** A URL's host, lowercased; "" when it cannot be read. */
-const hostOfUrl = (u: string): string => { try { return new URL(u).host.toLowerCase(); } catch { return ""; } };
-
-export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scopeType: Side, portalUrl: string): PriorProgressReasons {
+export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scopeType: Side, portalUrls: ReadonlyArray<string>): PriorProgressReasons {
   const hard: string[] = [];
-  const here = hostOfUrl(portalUrl);
   const learn: string[] = [];
   const side: Side = scopeType === "utility" ? "utility" : "ahj";
   const nem = side === "utility";
   try {
+    // THE PORTAL(S) IN QUESTION: none readable, and every tracked number counts (an unknown never
+    // reassures). The card passes every portal it knows, the learner its own portal URL.
+    const urls = (Array.isArray(portalUrls) ? portalUrls : []).map((u) => s(u).trim()).filter((u) => portalHostOf(u) !== "");
+    const hosts = new Set(urls.map((u) => portalHostOf(u)));
+    // RULE 5'S OWN PREDICATE, asked once: could the OTHER side's track of this project have been
+    // filed on these portals? Only a positive conflict on EVERY one rules it off.
+    let ruledOff: boolean | null = null;
+    const otherTrackRuledOff = (): boolean => {
+      if (ruledOff !== null) return ruledOff;
+      ruledOff = false;
+      if (!urls.length) return false;
+      const p = db.get<Row>("SELECT state, ahj, utility FROM projects WHERE id = ?", [projectId]);
+      if (!p) return false;
+      const entity: PortalEntity | null = portalEntityEvidence(db, nem
+        ? { scope: "ahj", state: s(p.state), name: s(p.ahj) }
+        : { scope: "utility", state: s(p.state), name: s(p.utility) });
+      ruledOff = urls.every((u) => {
+        const fit = hostFitsTrackAndEntity(nem ? "permit" : "nem", entity, u, "kb");
+        return !fit.fits && (fit.code === "track_conflict" || fit.code === "platform_conflict");
+      });
+      return ruledOff;
+    };
     for (const t of db.query<Row>("SELECT application_number, permit_number, target_type, permit_type, portal_url, tracking_url FROM permit_check_targets WHERE project_id = ?", [projectId])) {
-      // A TRACKED NUMBER COUNTS ON ITS OWN SIDE (#365): the utility's NEM application, filed on its
-      // portal first, is not progress on the permit portal (and a permit number is not progress on
-      // the utility's). Whose filing it is comes from trackKind, the one answer. A row still on the
-      // columns' defaults (no permit_type, target_type 'permit' or blank: legacy rows, raw writes)
-      // cannot say, so it counts on both sides. And a number recorded on THIS portal's host counts
-      // whatever its side: a utility that takes its application inside the city's own portal (rule
-      // 5's carve-out) filed it here.
-      const kind = trackKind(s(t.target_type), s(t.permit_type));
-      const kindKnown = kind === "nem" || s(t.permit_type).trim() !== "";
-      const onThisPortal = here !== "" && (hostOfUrl(s(t.portal_url)) === here || hostOfUrl(s(t.tracking_url)) === here);
-      if (kindKnown && (kind === "nem") !== nem && !onThisPortal) continue;
       const n = s(t.application_number).trim() || s(t.permit_number).trim();
-      if (n) { hard.push(`a filing of this project is tracked by number (${maskDigits(n).slice(0, 24)})`); break; }
+      if (!n) continue;
+      // A TRACKED NUMBER OF THE OTHER SIDE (#365): the utility's NEM application, filed first on its
+      // own portal, is not progress on the city's permit portal — but only when the row is
+      // positively the other side's, it was not recorded on this very host, and rule 5's predicate
+      // rules that side's track off this portal (a carve-out utility that takes its application
+      // inside the city's portal filed it HERE, whatever URL the row kept).
+      const rowSide = trackedRowSide(t);
+      if (rowSide !== null && rowSide !== side) {
+        const recordedHere = [portalHostOf(s(t.portal_url)), portalHostOf(s(t.tracking_url))].some((h) => h !== "" && hosts.has(h));
+        if (!recordedHere && otherTrackRuledOff()) continue;
+      }
+      hard.push(`a filing of this project is tracked by number (${maskDigits(n).slice(0, 24)})`);
+      break;
     }
     for (const x of db.query<Row>("SELECT permit_type, status, application_number, permit_number, confirmation_number FROM submissions WHERE project_id = ?", [projectId])) {
       if ((s(x.permit_type) === "nem") !== nem) continue;
@@ -362,7 +400,7 @@ export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scope
  */
 export function infoPagePriorProgress(db: AppDb, projectId: string, portalUrl: string, scopeType: Side): boolean {
   try { const o = new URL(portalUrl).origin; if (!o || o === "null") return true; } catch { return true; }
-  const r = infoPagePriorProgressReasons(db, projectId, scopeType, portalUrl);
+  const r = infoPagePriorProgressReasons(db, projectId, scopeType, [portalUrl]);
   return r.hard.length > 0 || r.learn.length > 0;
 }
 
@@ -380,10 +418,16 @@ export function listInfoPageProjectState(db: AppDb, projectId: string): InfoPage
     const last = allowed.length ? allowed[allowed.length - 1] : null;
     const since = parsed.filter((r) => r.rid > (last?.rid ?? 0) && r.action !== ACT_ALLOWED_AGAIN && rowOnSide(r.d, side));
     if (!since.length) continue;
-    // The portal in question is the one the verified page lives on (the newest pass or hold here):
-    // the same host the next learn's own check reads.
-    const portal = s([...since].reverse().find((r) => s(r.d.where))?.d.where);
-    const reasons = infoPagePriorProgressReasons(db, projectId, side, portal);
+    // THE PORTAL(S) IN QUESTION: every verified page this side passed or was held at, and every
+    // learn's own portal URL on this side — a number counts unless it is ruled off ALL of them, so
+    // the card is never more permissive than the learner's own check (which reads its portal URL).
+    // None known: every number counts.
+    const portals = [
+      ...since.map((r) => s(r.d.where)),
+      ...db.query<{ details: string }>("SELECT details FROM audit_logs WHERE project_id = ? AND action = ?", [projectId, ACT_LEARN_STARTED])
+        .map((r) => parse<Row>(r.details, {})).filter((d) => rowOnSide(d, side)).map((d) => s(d.portalUrl)),
+    ];
+    const reasons = infoPagePriorProgressReasons(db, projectId, side, portals);
     out.push({
       scope: side,
       passed: since.filter((r) => r.action === ACT_PASSED).map((r) => ({ passId: s(r.d.passId), where: s(r.d.where), at: r.at })).slice(-5),

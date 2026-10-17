@@ -2138,6 +2138,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    *  objects, never their indexes, which a rolled-back walk reuses). */
   private infoPassAdmittedSteps = new WeakSet<RecipeStep>();
   private infoPageCandidate: InfoPageCandidateCapture | null = null;
+  /** #366: the watch opened although THIS project already made progress on this portal — verifying
+   *  the card helps other projects at once, but this one still needs "Allow once more". */
+  private infoPageCandidateWithHistory = false;
   private infoPagePassed: Array<{ passId: string; where: string }> = [];
   private infoPageIncidents: InfoPageIncident[] = [];
   private infoPageHeldVerified: Array<{ passId: string; where: string; why: string[] }> = [];
@@ -5485,7 +5488,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             return {
               ...fail(steps, this.portalName, changed.length
                 ? `HELD AT AN INFORMATION PAGE THAT CHANGED SINCE A PERSON VERIFIED IT (${changed[0].why.slice(0, 3).join("; ")}): ${held} That verification is withdrawn. A person can mark the page as it is now (project → Portal runs → Information page to verify).`
-                : `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: ${held} A person can mark this exact page once (project → Portal runs → Information page to verify); after that, runs pass it — only this page, and only before anything is entered on the run.`, null, pageCount, portalNotices),
+                : this.infoPageCandidateWithHistory
+                  // #366: an unknown never reads as reassurance — this project's own next run is held
+                  // at the verified page until a person allows it once more.
+                  ? `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: ${held} A person can mark this exact page once (project → Portal runs → Information page to verify); other projects' runs then pass it. THIS project already made progress on this portal, so its next run still stops at the verified page until a person who checked its application allows it once more (project → Portal runs), or the page is done by hand.`
+                  : `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: ${held} A person can mark this exact page once (project → Portal runs → Information page to verify); after that, runs pass it — only this page, and only before anything is entered on the run.`, null, pageCount, portalNotices),
               stopReason: "backstop_abort",
             };
           }
@@ -8934,6 +8941,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       this.infoPageHeldVerified.push({ passId: r.heldVerifiedEntryId, where, why: r.refusals.slice(0, 6) });
     }
     const pg = this.page;
+    if (r.candidateWatch && r.refusals.includes(INFO_PAGE_PRIOR_PROGRESS_REFUSAL)) this.infoPageCandidateWithHistory = true;
     if (!r.candidateWatch || !pg) return undefined;
     const shot = await this.withSecretMask("info page screenshot", (mask) => pg.screenshot({ fullPage: true, mask })).catch(() => undefined);
     return shot ? Buffer.from(shot).toString("base64") : undefined;
