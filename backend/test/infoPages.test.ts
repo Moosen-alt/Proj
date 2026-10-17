@@ -571,6 +571,27 @@ await check("#365: a tracked number of the OTHER side is skipped only on POSITIV
   const PB = fx.newProject({ utility: BOTH });
   nemTarget(PB, "");
   assert.equal(IP.infoPagePriorProgress(db, PB, permitUrl, "ahj"), true, "a utility naming its platform AND another portal: counts");
+  // A synthetic platform-only utility (the same name on its rows): positive evidence, skipped.
+  const PLAT = "Example Platform Power";
+  kbUtilityRow("kb-365-plat", PLAT, "https://exampleplatform.powerclerk.com/MvcAccount/Login", false);
+  const PP = fx.newProject({ utility: PLAT });
+  nemTarget(PP, "");
+  assert.equal(IP.infoPagePriorProgress(db, PP, permitUrl, "ahj"), false, "a utility whose own rows name only its platform: its NEM number is not progress on a permit portal");
+  // A row that matches only by the fuzzy entity score adds caution (its city portal counts the
+  // number) but never vouches for a platform.
+  const { sameEntity } = await import("../src/portalRecipes");
+  const FUZ = "Example Fuzzy Power";
+  kbUtilityRow("kb-365-fuz-a", FUZ, "https://examplefuzzy.powerclerk.com/MvcAccount/Login", false);
+  kbUtilityRow("kb-365-fuz-b", `${FUZ} Cooperative`, "https://permits.fuzzycity.gov/apply", false);
+  assert.ok(sameEntity("OR", FUZ, "OR", `${FUZ} Cooperative`), "precondition: the fuzzy entity score matches the two spellings");
+  const PF = fx.newProject({ utility: FUZ });
+  nemTarget(PF, "");
+  assert.equal(IP.infoPagePriorProgress(db, PF, permitUrl, "ahj"), true, "a fuzzily matched row naming a city portal adds caution: counts");
+  const FUZP = "Example Fuzzy Platform Power";
+  kbUtilityRow("kb-365-fuzp-b", `${FUZP} Cooperative`, "https://examplefuzzyp.powerclerk.com/MvcAccount/Login", false);
+  const PFP = fx.newProject({ utility: FUZP });
+  nemTarget(PFP, "");
+  assert.equal(IP.infoPagePriorProgress(db, PFP, permitUrl, "ahj"), true, "a platform named only by a fuzzily matched row never vouches: counts");
   // A utility with no records at all: no evidence where it files, so the number counts.
   const U = fx.newProject({ utility: "Example Unknown Power" });
   nemTarget(U, "");

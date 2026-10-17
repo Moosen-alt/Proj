@@ -41,6 +41,7 @@ import { DEFAULT_ORG_ID, type AppDb } from "./db";
 import { trackKind } from "./permitMonitor";
 import { isInformationalPageUrl, isUtilityPlatformUrl, portalHostOf, portalUrlsInText } from "./portalChannel";
 import { sameUtilityEntity } from "./utilityIdentity";
+import { sameEntity } from "./portalRecipes";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
 import { id as newId } from "./ids";
@@ -275,18 +276,28 @@ function trackedRowSide(t: Row): Side | null {
  *  utility-keyed KB rows of ANY confidence and its utility recipes — name at least one portal, and
  *  every portal they name is a utility interconnection platform (information pages ignored). A
  *  utility that names a city's portal anywhere (a carve-out utility, verified or only seeded: the
- *  operator may have filed it there by hand), any other portal, or nothing at all: false. */
+ *  operator may have filed it there by hand), any other portal, or nothing at all: false.
+ *  WHOSE records: only a STRONG match (a known identity, or the same name) is evidence FOR the
+ *  platform; a row that matches only by the fuzzy entity score (portalRecipes.sameEntity) can add
+ *  caution — a non-platform portal there counts the number — but never vouches for a platform. */
 function utilityFilesOnlyOnInterconnectionPlatform(db: AppDb, state: string, utility: string): boolean {
   if (!utility.trim()) return false;
   const st = state.trim().toUpperCase();
-  const mine = (r: Row) => sameUtilityEntity(state, s(r.utility), utility) && (!s(r.state).trim() || s(r.state).trim().toUpperCase() === st);
-  const urls = [
+  const norm = (x: string): string => x.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const inState = (r: Row) => !s(r.state).trim() || s(r.state).trim().toUpperCase() === st;
+  const strong = (r: Row) => inState(r) && (sameUtilityEntity(state, s(r.utility), utility) || norm(s(r.utility)) === norm(utility));
+  const weak = (r: Row) => !strong(r) && sameEntity(state, utility, s(r.state).trim() || state, s(r.utility));
+  const rows: Array<{ r: Row; urls: string[] }> = [
     ...db.query<Row>("SELECT state, utility, portal_url, portal_name FROM permit_utility_knowledge WHERE (ahj IS NULL OR ahj = '') AND utility != ''")
-      .filter(mine).flatMap((r) => [...portalUrlsInText(s(r.portal_url)), ...portalUrlsInText(s(r.portal_name))]),
+      .map((r) => ({ r, urls: [...portalUrlsInText(s(r.portal_url)), ...portalUrlsInText(s(r.portal_name))] })),
     ...db.query<Row>("SELECT state, utility, portal_url FROM portal_recipes WHERE scope_type = 'utility' AND portal_url IS NOT NULL AND portal_url != ''")
-      .filter(mine).map((r) => s(r.portal_url)),
-  ].filter((u) => portalHostOf(u) !== "" && !isInformationalPageUrl(u));
-  return urls.length > 0 && urls.every((u) => isUtilityPlatformUrl(u));
+      .map((r) => ({ r, urls: [s(r.portal_url)] })),
+  ];
+  const portals = (pick: (r: Row) => boolean) => rows.filter((x) => pick(x.r)).flatMap((x) => x.urls)
+    .filter((u) => portalHostOf(u) !== "" && !isInformationalPageUrl(u));
+  const own = portals(strong);
+  if (!own.length || !own.every((u) => isUtilityPlatformUrl(u))) return false;
+  return portals(weak).every((u) => isUtilityPlatformUrl(u));
 }
 
 /** A TRACKED NUMBER OF THIS PROJECT AS A HARD REASON (#365), or "" — the one answer for the hand-out
