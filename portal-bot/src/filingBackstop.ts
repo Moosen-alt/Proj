@@ -561,17 +561,22 @@ export function redirectKeepsMethod(status: number, method: string): boolean {
   return false;
 }
 
-/** Can the backstop re-send this body byte for byte? Chromium hands interception a multipart body
- *  whose FILE part came from an <input type=file> (a form upload, or a FormData built from
- *  input.files) with that part's bytes left out — re-sent, the upload would arrive empty. Such a
- *  body (and a multipart body with no readable boundary) cannot be replayed: it is handed on as on
- *  main. A constructed Blob / File (fetch body, FormData of a new File) carries its bytes. */
+/** Can the backstop re-send this body byte for byte? Chromium leaves a FILE the page picked through
+ *  <input type=file> out of what interception sees: a multipart body (a form upload, or a FormData
+ *  built from input.files) arrives with that part empty, and an XHR whose body IS such a file
+ *  arrives with no body at all — re-sent, the upload would arrive empty. Such a body cannot be
+ *  replayed and is handed on as on main: a multipart body with an empty file part (or no readable
+ *  boundary), and a missing body whose media type is not a form / JSON / text one (an XHR PUT of a
+ *  PDF). A missing body with no media type, or a form / JSON / text one, is an empty request and is
+ *  re-sent as one (KNOWN COST: an XHR of a picked file with no type reads the same way). A
+ *  constructed Blob / File (a fetch body, a FormData of a new File) carries its bytes. */
 export function bodyCanBeReplayed(contentType: string, body: Buffer | null | undefined): boolean {
-  if (!/^\s*multipart\/form-data/i.test(String(contentType || ""))) return true;
-  const b = /boundary=(?:"([^"]+)"|([^\s;]+))/i.exec(String(contentType));
+  const ct = String(contentType || "").trim();
+  if (!body || !body.length) return !ct || /^(application\/(x-www-form-urlencoded|json|xml|[\w.+-]+\+(json|xml))|text\/)/i.test(ct);
+  if (!/^multipart\/form-data/i.test(ct)) return true;
+  const b = /boundary=(?:"([^"]+)"|([^\s;]+))/i.exec(ct);
   const boundary = b ? (b[1] ?? b[2]) : "";
   if (!boundary) return false;
-  if (!body || !body.length) return true;
   const parts = body.toString("latin1").split(`--${boundary}`).slice(1);
   for (const part of parts) {
     if (part.startsWith("--")) break;

@@ -26,12 +26,18 @@ const field = (n: string, v: string) => `Content-Disposition: form-data; name="$
 const file = (n: string, fname: string, bytes: string) => `Content-Disposition: form-data; name="${n}"; filename="${fname}"\r\nContent-Type: application/pdf\r\n\r\n${bytes}`;
 const ct = `multipart/form-data; boundary=${B}`;
 check("a urlencoded form can be re-sent", bodyCanBeReplayed("application/x-www-form-urlencoded", Buffer.from("a=1")));
-check("a JSON body and no body can be re-sent", bodyCanBeReplayed("application/json", Buffer.from("{}")) && bodyCanBeReplayed("", null));
+check("a JSON body can be re-sent", bodyCanBeReplayed("application/json", Buffer.from("{}")));
 check("multipart of plain fields can be re-sent", bodyCanBeReplayed(ct, multipart([field("a", "1"), field("b", "")])));
 check("multipart with a file part that carries its bytes can be re-sent", bodyCanBeReplayed(ct, multipart([file("plans", "plans.pdf", "%PDF-1.4 synthetic"), field("a", "1")])));
 check("multipart whose file part Chromium left empty CANNOT be re-sent (an <input type=file> upload)", !bodyCanBeReplayed(ct, multipart([file("plans", "plans.pdf", ""), field("a", "1")])));
 check("…in any position", !bodyCanBeReplayed(ct, multipart([field("a", "1"), file("plans", "plans.pdf", "")])));
 check("…with a quoted boundary", !bodyCanBeReplayed(`multipart/form-data; boundary="${B}"`, multipart([file("f", "a.bin", "")])));
+check("no body and no media type is an empty request: re-sent as one", bodyCanBeReplayed("", null) && bodyCanBeReplayed("", Buffer.alloc(0)));
+check("no body with a form / JSON / text media type is an empty request: re-sent as one",
+  ["application/x-www-form-urlencoded; charset=UTF-8", "application/json", "application/vnd.api+json", "text/plain;charset=UTF-8"].every((t) => bodyCanBeReplayed(t, null)));
+check("no body with a file's media type CANNOT be re-sent (an XHR whose body is a picked file: Chromium shows none)",
+  ["application/pdf", "application/octet-stream", "image/jpeg"].every((t) => !bodyCanBeReplayed(t, null)));
+check("multipart with no body CANNOT be re-sent", !bodyCanBeReplayed(ct, null));
 check("multipart with no boundary CANNOT be re-sent (nothing to tell)", !bodyCanBeReplayed("multipart/form-data", Buffer.from("x")));
 check("multipart with a part missing its header break CANNOT be re-sent", !bodyCanBeReplayed(ct, Buffer.from(`--${B}\r\ngarbage--${B}--\r\n`, "latin1")));
 

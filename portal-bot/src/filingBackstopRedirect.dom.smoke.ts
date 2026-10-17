@@ -16,6 +16,7 @@
 //   put301      — a fetch PUT answered 301 (a PUT keeps its method) → /SubmitApplication
 //   loop        — 307 to itself: followed MAX_REDIRECT_HOPS times, then aborted (named, stopping)
 //   ownWriteFile— the run's own write on a review page: its autosave answered 307 → /SubmitApplication
+//   emptyFile   — a fetch POST with NO body (form media type) answered 307 → /SubmitApplication
 //   dies        — the server drops the connection: the request is ABORTED, never re-sent unjudged
 //   replay      — a recipe's "Next" that 307s to /payment: the replay STOPS, named
 // MUST-PASS:
@@ -23,6 +24,7 @@
 //   see303      — 303 → /next-step: the browser follows it as a GET
 //   ownWriteOk  — the run's own write on a review page, autosave 307 → /Project/Autosave2: passes
 //   upload      — an <input type=file> multipart upload arrives with its bytes (handed on as before)
+//   xhrPdf      — an XHR PUT whose body is a picked PDF arrives with its bytes (handed on as before)
 //   fixtureRoute— a route below the backstop (a smoke's own fixture) still answers the POST
 //
 // Run: npx tsx portal-bot/src/filingBackstopRedirect.dom.smoke.ts
@@ -56,6 +58,7 @@ const REDIRECTS: Record<string, [number, string]> = {
   "/step/xhrPay": [307, "/payment/charge"],
   "/step/put301": [301, "/SubmitApplication"],
   "/step/loop": [307, "/step/loop"],
+  "/step/emptyFile": [307, "/SubmitApplication"],
   "/step/ok307": [307, "/next-step"],
   "/step/see303": [303, "/next-step"],
   "/Project/AutosaveOk": [307, "/Project/Autosave2"],
@@ -138,6 +141,10 @@ try {
     check("MUST-EXCLUDE put301: a PUT keeps its method on a 301, so the hop is judged: nothing reaches /SubmitApplication", hitsOn("/SubmitApplication") === 0 && o.stopping.some((a) => a.where.endsWith("/SubmitApplication")), `${show(o)} act=${o.actResult}`);
   }
   {
+    const o = await run("xhr", (page) => page.evaluate(() => fetch("/step/emptyFile", { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" } }).then((r) => `status ${r.status}`, () => "rejected")));
+    check("MUST-EXCLUDE emptyFile: a POST with no body is re-sent as an empty request, so its 307 is judged: nothing reaches /SubmitApplication", hitsOn("/SubmitApplication") === 0 && hitsOn("/step/emptyFile") === 1 && o.stopping.some((a) => a.where.endsWith("/SubmitApplication")), `${show(o)} act=${o.actResult}`);
+  }
+  {
     const o = await run("loop", clickNext);
     const sent = o.hits.filter((h) => h.path === "/step/loop").length;
     check(`MUST-EXCLUDE loop: a 307 to itself is followed ${MAX_REDIRECT_HOPS} times, then aborted (named, stopping)`, sent === MAX_REDIRECT_HOPS + 1 && o.stopping.some((a) => /past \d+ hops/.test(a.why)), `sent=${sent} ${show(o)}`);
@@ -174,6 +181,17 @@ try {
     const up = o.hits.find((h) => h.path === "/upload");
     check("MUST-PASS upload: an <input type=file> upload reaches the server with its bytes (Chromium does not give interception the file, so it is handed on as before)",
       !!up && up.bytes > 200_000 && o.aborts.length === 0, `upload bytes=${up?.bytes} ${show(o)}`);
+  }
+  {
+    const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "bs358-")), "plans.pdf");
+    fs.writeFileSync(file, Buffer.alloc(150_000, 0x25));
+    const o = await run("upload", async (page) => {
+      await page.setInputFiles("input[type=file]", file);
+      return page.evaluate(() => new Promise<string>((r) => { const x = new XMLHttpRequest(); x.open("PUT", "/xhr-upload"); x.onloadend = () => r(`status ${x.status}`); x.send((document.querySelector("input[type=file]") as HTMLInputElement).files![0]); }));
+    });
+    const up = o.hits.find((h) => h.path === "/xhr-upload");
+    check("MUST-PASS xhrPdf: an XHR PUT whose body is a picked PDF reaches the server with its bytes (Chromium shows interception no body, so it is handed on as before)",
+      !!up && up.bytes === 150_000 && o.actResult === "status 200" && o.aborts.length === 0, `upload bytes=${up?.bytes} act=${o.actResult} ${show(o)}`);
   }
   {
     let fixtureAnswered = 0;
