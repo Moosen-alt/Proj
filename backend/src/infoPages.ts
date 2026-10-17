@@ -38,6 +38,7 @@
 // filed — check the portal for this project" — read on the project's card and, named within the
 // viewer's own org, on the pass's knowledge-base entry.
 import { DEFAULT_ORG_ID, type AppDb } from "./db";
+import { trackKind } from "./permitMonitor";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
 import { id as newId } from "./ids";
@@ -289,13 +290,28 @@ interface PriorProgressReasons {
  *     person's fix captured mid-learn.
  * A read error is a hard reason: an unknown never reassures.
  */
-export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scopeType: Side): PriorProgressReasons {
+/** A URL's host, lowercased; "" when it cannot be read. */
+const hostOfUrl = (u: string): string => { try { return new URL(u).host.toLowerCase(); } catch { return ""; } };
+
+export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scopeType: Side, portalUrl: string): PriorProgressReasons {
   const hard: string[] = [];
+  const here = hostOfUrl(portalUrl);
   const learn: string[] = [];
   const side: Side = scopeType === "utility" ? "utility" : "ahj";
   const nem = side === "utility";
   try {
-    for (const t of db.query<Row>("SELECT application_number, permit_number FROM permit_check_targets WHERE project_id = ?", [projectId])) {
+    for (const t of db.query<Row>("SELECT application_number, permit_number, target_type, permit_type, portal_url, tracking_url FROM permit_check_targets WHERE project_id = ?", [projectId])) {
+      // A TRACKED NUMBER COUNTS ON ITS OWN SIDE (#365): the utility's NEM application, filed on its
+      // portal first, is not progress on the permit portal (and a permit number is not progress on
+      // the utility's). Whose filing it is comes from trackKind, the one answer. A row still on the
+      // columns' defaults (no permit_type, target_type 'permit' or blank: legacy rows, raw writes)
+      // cannot say, so it counts on both sides. And a number recorded on THIS portal's host counts
+      // whatever its side: a utility that takes its application inside the city's own portal (rule
+      // 5's carve-out) filed it here.
+      const kind = trackKind(s(t.target_type), s(t.permit_type));
+      const kindKnown = kind === "nem" || s(t.permit_type).trim() !== "";
+      const onThisPortal = here !== "" && (hostOfUrl(s(t.portal_url)) === here || hostOfUrl(s(t.tracking_url)) === here);
+      if (kindKnown && (kind === "nem") !== nem && !onThisPortal) continue;
       const n = s(t.application_number).trim() || s(t.permit_number).trim();
       if (n) { hard.push(`a filing of this project is tracked by number (${maskDigits(n).slice(0, 24)})`); break; }
     }
@@ -346,7 +362,7 @@ export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scope
  */
 export function infoPagePriorProgress(db: AppDb, projectId: string, portalUrl: string, scopeType: Side): boolean {
   try { const o = new URL(portalUrl).origin; if (!o || o === "null") return true; } catch { return true; }
-  const r = infoPagePriorProgressReasons(db, projectId, scopeType);
+  const r = infoPagePriorProgressReasons(db, projectId, scopeType, portalUrl);
   return r.hard.length > 0 || r.learn.length > 0;
 }
 
@@ -364,7 +380,10 @@ export function listInfoPageProjectState(db: AppDb, projectId: string): InfoPage
     const last = allowed.length ? allowed[allowed.length - 1] : null;
     const since = parsed.filter((r) => r.rid > (last?.rid ?? 0) && r.action !== ACT_ALLOWED_AGAIN && rowOnSide(r.d, side));
     if (!since.length) continue;
-    const reasons = infoPagePriorProgressReasons(db, projectId, side);
+    // The portal in question is the one the verified page lives on (the newest pass or hold here):
+    // the same host the next learn's own check reads.
+    const portal = s([...since].reverse().find((r) => s(r.d.where))?.d.where);
+    const reasons = infoPagePriorProgressReasons(db, projectId, side, portal);
     out.push({
       scope: side,
       passed: since.filter((r) => r.action === ACT_PASSED).map((r) => ({ passId: s(r.d.passId), where: s(r.d.where), at: r.at })).slice(-5),

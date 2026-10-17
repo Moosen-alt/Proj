@@ -76,7 +76,7 @@
 import { isFilingOrPaymentRequest, isPayRequestUrl, paymentDialogVerdict, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE } from "../../shared/src/portalSafety";
 import {
   digestInfoPageIdentity, infoPageAfterClickAckWording, infoPageAfterClickRefusals, infoPageDriftedEntries, infoPageNumberTokens, infoPageMatchRefusals, infoPageObservedRequest, infoPagePassEntry, infoPagePassRefusals,
-  infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, isMatchClassRefusal,
+  infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, opensInfoPageCandidateWatch,
   type InfoPageAfterClickBaseline, type InfoPageAfterClickReading, type InfoPageDigest, type InfoPageExpectedRequest, type InfoPageIdentityMaterial, type InfoPageIdentityReading,
   type InfoPageObservedRequest, type InfoPagePrefixStep, type InfoPageRunState,
 } from "../../shared/src/infoPagePass";
@@ -1166,7 +1166,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         infoSlot = s;
         return { opened: true, entryId: entry.id, refusals: [], candidateWatch: false };
       }
-      if (reading.ok && digest && refusals.length > 0 && refusals.every(isMatchClassRefusal)) {
+      // #366: the project's history on this portal does not stop the CARD (only the pass) — a
+      // project that tried this portal before could otherwise never have its page verified.
+      if (reading.ok && digest && opensInfoPageCandidateWatch(refusals)) {
         // CAPTURED NOW, before the click (amendment pin 2): a BackstopAbort carries no page identity.
         const prefix = infoPagePrefixOf(run && Array.isArray(run.priorSteps) ? run.priorSteps : []);
         const capture: InfoPageCandidateTake = { digest, prefix, material: reading.material, observed: null };

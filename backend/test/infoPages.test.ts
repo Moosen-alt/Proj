@@ -494,9 +494,43 @@ await check("prior progress (round 2, P5): a tracking number of this project ref
     db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", [`t-${P}`, P, portalUrl, "26-104455-RS", "2026-10-15", "2026-10-15"]);
     assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), true, what);
     assert.equal(IP.infoPagePriorProgress(db, P, url, "utility"), true, `${what}: the table has no side, so both`);
-    assert.ok(!JSON.stringify(IP.infoPagePriorProgressReasons(db, P, "ahj")).includes("104455"), "the number is masked in the reasons");
+    assert.ok(!JSON.stringify(IP.infoPagePriorProgressReasons(db, P, "ahj", url)).includes("104455"), "the number is masked in the reasons");
   }
   assert.equal(IP.infoPagePriorProgress(db, fx.newProject(), "not a url", "ahj"), true);
+});
+await check("#365: a tracked number counts on ITS side only (rows written by the real ensureCheckTarget) — the utility's NEM application is not progress on the permit portal, a permit number is not progress on the utility's; the split legacy shape is read by trackKind; a number recorded on THIS portal counts on either side (rule 5 carve-out)", async () => {
+  const { getProjectDetail } = await import("../src/repository");
+  const { ensureCheckTarget } = await import("../src/submittalTracks");
+  const url = `${ORIGIN}/permits/sfjsp?interviewID=Home`;
+  const nemUrl = "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login"; // the utility's own portal
+  const N = fx.newProject();
+  ensureCheckTarget(db, getProjectDetail(db, N).project, {
+    targetType: "nem", permitType: "nem", applicationNumber: "APP-900417",
+    portalName: "Pacific Power NEM portal (PowerClerk)", portalUrl: "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login",
+  });
+  assert.deepEqual(IP.infoPagePriorProgressReasons(db, N, "ahj", url).hard, [], "the NEM filing is progress on the permit side");
+  assert.equal(IP.infoPagePriorProgress(db, N, url, "ahj"), false);
+  assert.equal(IP.infoPagePriorProgress(db, N, nemUrl, "utility"), true, "…and must stay progress on the utility side");
+  const B = fx.newProject();
+  ensureCheckTarget(db, getProjectDetail(db, B).project, {
+    targetType: "permit", permitType: "building", applicationNumber: "26-104455-RS", portalName: "Development Hub PDX", portalUrl: `${ORIGIN}/records/1`,
+  });
+  assert.equal(IP.infoPagePriorProgress(db, B, url, "ahj"), true, "a permit number is progress on the permit side");
+  assert.equal(IP.infoPagePriorProgress(db, B, nemUrl, "utility"), false, "…and not on the utility's");
+  // A legacy row whose target_type sits on the column default but whose permit_type names the NEM
+  // filing: trackKind reads it as the utility's (a raw write — ensureCheckTarget never writes it).
+  const L = fx.newProject();
+  db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, target_type, permit_type, created_at, updated_at) VALUES (?, ?, '', 'APP-1', 'permit', 'nem', '2026-10-15', '2026-10-15')", [`tl-${L}`, L]);
+  assert.equal(IP.infoPagePriorProgress(db, L, url, "ahj"), false);
+  assert.equal(IP.infoPagePriorProgress(db, L, nemUrl, "utility"), true);
+  // Rule 5's carve-out: a utility that takes its application inside the city's own portal. A NEM
+  // number recorded on THIS portal's host was filed here, so it counts on the permit side too.
+  const C = fx.newProject();
+  ensureCheckTarget(db, getProjectDetail(db, C).project, {
+    targetType: "nem", permitType: "nem", applicationNumber: "IC-2026-77", portalName: "City portal (interconnection)", portalUrl: `${ORIGIN}/interconnection/apply`,
+  });
+  assert.equal(IP.infoPagePriorProgress(db, C, url, "ahj"), true, "a NEM number filed on this very portal is progress here");
+  assert.equal(IP.infoPagePriorProgress(db, C, "https://elsewhere.example.test/permits", "ahj"), false, "…and not on another portal");
 });
 
 // ── PRIOR PROGRESS, ROUND 2: through the real autoLearnPortal (the learner stubbed) ──────────────
@@ -524,7 +558,7 @@ await check("B1a / P1 / 'twice': a learn PASSED the verified page, filled fields
   assert.equal(JSON.parse(fx.audits("portal.info_page_passed").filter((a) => a.project_id === P)[0].details).scope, "ahj");
   await runLearn(P);
   assert.equal(handedOf(handed as LearnInput).priorProgress, true, "the SAME project's next learn is refused");
-  const why = IP.infoPagePriorProgressReasons(db, P, "ahj");
+  const why = IP.infoPagePriorProgressReasons(db, P, "ahj", sfjsp);
   assert.ok(why.learn.some((w) => /passed a verified information page/.test(w)), JSON.stringify(why));
   assert.ok(why.learn.some((w) => /may have entered data/.test(w)), JSON.stringify(why));
   assert.equal(IP.infoPagePriorProgress(db, P, sfjsp, "utility"), false, "the other side is untouched");
@@ -637,7 +671,7 @@ await check("ALLOW ONCE MORE: after a use the card shows it (canAllow); a named 
   assert.equal(st[0].passed.length, 1);
   assert.equal(st[0].canAllow, true, JSON.stringify(st[0]));
   IP.allowInfoPagePassOnceMore(db, P, "ahj", { by: "Pat Allower", userId: "" });
-  assert.deepEqual(IP.infoPagePriorProgressReasons(db, P, "ahj"), { hard: [], learn: [] });
+  assert.deepEqual(IP.infoPagePriorProgressReasons(db, P, "ahj", sfjsp), { hard: [], learn: [] });
   assert.equal(IP.listInfoPageProjectState(db, P).length, 0, "nothing since the allowance");
   use();
   await runLearn(P);
@@ -672,6 +706,41 @@ await check("HELD AT A VERIFIED PAGE by prior progress: the learn reports it, th
   assert.equal(st[0].held.length, 1);
   assert.equal(st[0].passed.length, 0);
   assert.equal(st[0].canAllow, true);
+});
+await check("#365 + #366, THE LIVE PORTLAND SHAPE end to end: NEM filed first + an earlier learn → the card is still recorded → verified → the next learn is held at the verified page → nothing HARD stands in the way → allowed once more → the learn after passes once", async () => {
+  const { getProjectDetail } = await import("../src/repository");
+  const { ensureCheckTarget } = await import("../src/submittalTracks");
+  const P = fx.newProject();
+  ensureCheckTarget(db, getProjectDetail(db, P).project, {
+    targetType: "nem", permitType: "nem", applicationNumber: "APP-900417",
+    portalName: "Pacific Power NEM portal (PowerClerk)", portalUrl: "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login",
+  });
+  scripted = [() => passedResult()];
+  await runLearn(P); // an earlier learn that filled a field and failed: learn history on this side
+  const before = IP.infoPagePriorProgressReasons(db, P, "ahj", sfjsp);
+  assert.deepEqual(before.hard, [], JSON.stringify(before));
+  assert.ok(before.learn.length > 0, "the earlier learn is history");
+  // The capture learn: the backstop recorded the card despite the history (#366); the backend records it.
+  const c = capture(material((m) => { m.title = "Live Portland Shape Page"; }));
+  await runLearn(P, c);
+  assert.equal(handedOf(handed as LearnInput).priorProgress, true, "the capture learn was handed the history");
+  const open = cand(P).filter((r) => r.status === "open" && r.identity_sha256 === c.identitySha256);
+  assert.equal(open.length, 1, "the card was recorded on a project with history");
+  const passId = verifyFn(P, String(open[0].id), c.identitySha256).passId;
+  scripted = [() => passedResult({ stopReason: "backstop_abort", message: "HELD AT A VERIFIED INFORMATION PAGE: …", infoPageHeldVerified: [{ passId, where: sfjsp, why: ["this project already made progress on this portal"] }] })];
+  await runLearn(P);
+  const st = IP.listInfoPageProjectState(db, P);
+  assert.equal(st.length, 1);
+  assert.equal(st[0].held.length, 1);
+  assert.deepEqual(st[0].hard, [], "the NEM filing must not make the allowance impossible");
+  assert.equal(st[0].canAllow, true, JSON.stringify(st[0]));
+  IP.allowInfoPagePassOnceMore(db, P, "ahj", { by: "Pat Allower", userId: "" });
+  scripted = [(input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); return passedResult({ infoPagePassed: [{ passId, where: sfjsp }] }); }];
+  await runLearn(P);
+  assert.equal(handedOf(handedAll[0]).priorProgress, false, "allowed once more: the next learn may pass");
+  assert.ok((handedAll[0] as LearnInput).infoPagePasses!.some((e) => e.id === passId), "…and is handed the verified page");
+  await runLearn(P);
+  assert.equal(handedOf(handed as LearnInput).priorProgress, true, "…once");
 });
 await check("prior progress: a staged submission on the same side refuses; one on the other side does not", () => {
   const P = fx.newProject();

@@ -7,6 +7,9 @@
 //       WATCH; Next's multipart POST is HELD exactly as on main (review-lockdown, document,
 //       stopping); the watch observed {POST, the action, multipart, [[t_n…, sha('')]]}; the server
 //       saw no POST.
+//   [A2] #366: the same with the project's HISTORY on this portal (priorProgress): the watch still
+//       opens and the card is recorded, held exactly as [A], nothing admitted, no use reserved.
+//       [A3]: history plus a value already written on this run: no watch, no card.
 //   [B] VERIFIED (the entry built from [A]'s candidate by verifiedInfoPageFromCandidate — the
 //       product's own path): the POST reaches the server ONCE carrying the submitter; one admission,
 //       exempted; page.url() at request time is still the information page (R5); a GA-like fetch
@@ -37,7 +40,7 @@ import http from "node:http";
 import { chromium, type Page } from "playwright";
 import { INFO_PAGE_NO_RESERVATION, backstopFor, installFilingBackstop, isStoppingAbort, type FilingBackstop, type InfoPagePassOpen, type InfoPageReserve } from "./filingBackstop";
 import {
-  INFO_PAGE_IDENTITY_VERSION, infoPagePrefixOf, infoPageRequestRefusals, sha256Hex, verifiedInfoPageFromCandidate, type InfoPageRunState, type InfoPageRunStep,
+  INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_PRIOR_PROGRESS_REFUSAL, infoPagePrefixOf, infoPageRequestRefusals, sha256Hex, verifiedInfoPageFromCandidate, type InfoPageRunState, type InfoPageRunStep,
 } from "../../shared/src/infoPagePass";
 import type { VerifiedInfoPage } from "../../shared/src/types";
 import {
@@ -198,6 +201,31 @@ check("[A] the candidate's prefix is DevHub's [goto, application entry, permit t
 check("[A] the in-page identity was read at version " + INFO_PAGE_IDENTITY_VERSION + " with no fillable control and no mask (the toggle sits in a plain div)",
   !!A.candidate && A.candidate.digest.version === INFO_PAGE_IDENTITY_VERSION && A.candidate.digest.shape.fillableCount === 0 && A.candidate.digest.shape.masked === 0,
   JSON.stringify(A.candidate?.digest.shape));
+
+// ===========================================================================================
+// [A2] #366: the project made progress on this portal before (the live Portland job: its NEM was
+// filed first and earlier learns stopped here). The CARD is still recorded — the page is held
+// exactly as [A], nothing is admitted and no use is reserved: history refuses the pass, not the
+// evidence a person verifies. [A3]: anything from inside the run (a value already written) still
+// records nothing.
+// ===========================================================================================
+console.log("\n[A2] #366: a project with history on this portal still gets the card, and is held exactly as [A]");
+const reservesBeforeA2 = reserveCalls.length;
+const A2 = await go({ p: "/A2", html: (p) => devhubReplica({ p }), entries: [], run: (s) => cleanRun(devhubPrefix(s), { priorProgress: true }) });
+check("[A2] the door refuses for BOTH the history and no verified page, and still opens the watch (candidateWatch)",
+  !!A2.open && A2.open.opened === false && A2.open.candidateWatch === true && A2.open.refusals.length === 2
+  && A2.open.refusals.includes(INFO_PAGE_PRIOR_PROGRESS_REFUSAL) && A2.open.refusals.some((r) => /no verified information page matches/.test(r)),
+  JSON.stringify(A2.open));
+check("[A2] held exactly as on main: Next's POST never reached the server, nothing was admitted", held(A2), brief(A2));
+check("[A2] held by the review lockdown as a stopping document abort (main's hold)",
+  A2.aborts.some((a) => a.rule === "review-lockdown" && a.method === "POST" && /\/A2\/permits\/sfjsp$/.test(a.where) && a.resourceType === "document" && a.stopping), JSON.stringify(A2.aborts));
+check("[A2] no use was reserved (the pass was never opened)", reserveCalls.length === reservesBeforeA2, JSON.stringify(reserveCalls.slice(reservesBeforeA2)));
+check("[A2] the card was recorded: the held request observed, and it is exactly what the identity said the control sends",
+  !!A2.candidate?.observed && infoPageRequestRefusals(A2.candidate.digest.expected, A2.candidate.observed).length === 0,
+  JSON.stringify(A2.candidate?.observed ?? null));
+const A3 = await go({ p: "/A3", html: (p) => devhubReplica({ p }), entries: [], run: (s) => cleanRun(devhubPrefix(s), { priorProgress: true, writes: 1 }) });
+check("[A3] history AND a value already written on this run: no watch, no card, held",
+  !!A3.open && A3.open.opened === false && A3.open.candidateWatch === false && !A3.candidate && held(A3), JSON.stringify({ open: A3.open, candidate: !!A3.candidate }));
 check("[A] the tenant name is in the page text the identity read (amendment [8]: not in a landmark, not masked)",
   !!A.candidate && A.candidate.material.text.includes(ACCOUNT));
 

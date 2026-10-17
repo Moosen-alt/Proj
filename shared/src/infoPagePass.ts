@@ -587,9 +587,18 @@ export function infoPageBackstopRefusals(bs: InfoPageBackstopState | null | unde
   return out;
 }
 
-/** The refusal every NON-matching read begins with: the only class that opens a candidate watch. */
+/** The refusal every NON-matching read begins with: the class that opens a candidate watch. */
 export const INFO_PAGE_NO_MATCH = "no verified information page matches";
 export const isMatchClassRefusal = (r: string): boolean => r.startsWith(INFO_PAGE_NO_MATCH);
+
+/** DOES A REFUSED READ OPEN A CANDIDATE WATCH? (#366) Only when no verified page matched (a
+ *  match-class refusal is there) and every other refusal is the project's HISTORY on this portal.
+ *  A candidate is evidence for a person, never authority: the pass itself still refuses on that
+ *  history until a named person allows it once more, and "allow once more" needs a verified page,
+ *  which needs a card. Anything from inside THIS run (a write, a form page, a lock, a stopping
+ *  abort, a draft or signature, the page's shape or its request) still records nothing. */
+export const opensInfoPageCandidateWatch = (refusals: ReadonlyArray<string>): boolean =>
+  refusals.some(isMatchClassRefusal) && refusals.every((r) => isMatchClassRefusal(r) || r === INFO_PAGE_PRIOR_PROGRESS_REFUSAL);
 
 const sameBody = (a: ReadonlyArray<[string, string]> | null | undefined, b: ReadonlyArray<[string, string]> | null | undefined): boolean =>
   Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every(([n, v], i) => b[i][0] === n && b[i][1] === v);

@@ -31,7 +31,8 @@ import { fileURLToPath } from "node:url";
 import {
   INFO_PAGE_IDENTITY_VERSION, INFO_PAGE_NO_MATCH, INFO_PAGE_NO_PROGRESS, INFO_PAGE_PASS_CLOCK_SKEW_MS, INFO_PAGE_PASS_EXPIRED, INFO_PAGE_PASS_MAX_AGE_DAYS, INFO_PAGE_PASS_MAX_PROJECTS, digestInfoPageIdentity, infoPageAfterClickSentWording, infoPageJobValueKeys, infoPageJobValues, infoPagePassExpiryRefusals, infoPageProofNorm, infoPageLabeledCodes, infoPageProofOfProgressRefusals, infoPageProofStepRefusals, infoPageAfterClickRefusals, infoPageBackstopRefusals, infoPageDriftedEntries, infoPageEvidence, infoPageMatchRefusals,
   infoPageNumberTokens, infoPageAfterClickAckWording, infoPageObservedRequest, infoPagePassRefusals, infoPagePrefixOf, infoPageProjectValueRefusals, infoPageRequestRefusals, infoPageRunStateRefusals,
-  infoPageShapeRefusals, infoPageVerifyWarnings, isDigitRunValue, isMatchClassRefusal, isSecretLikeFieldName, mayPassInfoPage, parseFormBodyFields, verifiedInfoPageFromCandidate,
+  infoPageShapeRefusals, infoPageVerifyWarnings, isDigitRunValue, isMatchClassRefusal, isSecretLikeFieldName, mayPassInfoPage, opensInfoPageCandidateWatch, parseFormBodyFields, verifiedInfoPageFromCandidate,
+  INFO_PAGE_PRIOR_PROGRESS_REFUSAL,
   type InfoPageBackstopState, type InfoPageIdentityMaterial, type InfoPagePassContext, type InfoPageProofStep, type InfoPageRunState, type InfoPageRunStep,
 } from "../../shared/src/infoPagePass";
 import { classifySubmissionText, isInterstitialForwardLabel, portalSafetyFactory } from "../../shared/src/portalSafety";
@@ -292,6 +293,32 @@ const ctxWith = (o: Partial<{ run: InfoPageRunState; backstop: InfoPageBackstopS
   check("refused: no backstop at all", !mayPassInfoPage({ ...ctxWith(), backstop: null }));
   check("refused: no entries — and the refusal is match-class (a candidate may be recorded)",
     (() => { const r = infoPagePassRefusals(ctxWith({ entries: [] })); return r.length === 1 && isMatchClassRefusal(r[0]); })(), JSON.stringify(infoPagePassRefusals(ctxWith({ entries: [] }))));
+  // #366: the project's HISTORY on this portal stops the pass, never the card. Read off the real
+  // refusal builder, so a new run-state refusal can never slip into the candidate class unnoticed.
+  {
+    const watchFor = (o: Parameters<typeof ctxWith>[0]): { opens: boolean; refusals: string[] } => {
+      const refusals = infoPagePassRefusals(ctxWith(o));
+      return { opens: opensInfoPageCandidateWatch(refusals), refusals };
+    };
+    const history = { ...cleanRun(), priorProgress: true };
+    const cases: Array<[string, Parameters<typeof ctxWith>[0], boolean]> = [
+      ["no verified page, a clean run → a card", { entries: [] }, true],
+      ["#366: no verified page, the project made progress here before → STILL a card", { entries: [], run: history }, true],
+      ["a verified page matches but the project's history refuses → no card (held at a verified page)", { run: history }, false],
+      ["no verified page, the run already wrote a value → no card", { entries: [], run: { ...history, writes: 1 } }, false],
+      ["no verified page, a form page was already seen → no card", { entries: [], run: { ...history, formPageSeen: true } }, false],
+      ["no verified page, the run resumes a draft → no card", { entries: [], run: { ...history, draftResume: true } }, false],
+      ["no verified page, a step before this page is not an entry click → no card", { entries: [], run: { ...history, priorSteps: [...clone(PREFIX_STEPS), { action: "fill", note: "Site Address" }] } }, false],
+      ["no verified page, the backstop already stopped a request → no card", { entries: [], run: history, backstop: { ...liveBackstop(), stoppingAbort: true } }, false],
+      ["no verified page, the run locked review (4a) → no card", { entries: [], run: history, backstop: { ...liveBackstop(), locked: true } }, false],
+    ];
+    for (const [what, o, want] of cases) {
+      const w = watchFor(o);
+      check(`candidate watch: ${what}`, w.opens === want, JSON.stringify(w.refusals));
+    }
+    check("candidate watch: the history refusal alone (no match-class refusal) opens nothing", !opensInfoPageCandidateWatch([INFO_PAGE_PRIOR_PROGRESS_REFUSAL]));
+    check("candidate watch: no refusals opens nothing", !opensInfoPageCandidateWatch([]));
+  }
   const old = entryFor(devhub());
   old.identityVersion = INFO_PAGE_IDENTITY_VERSION - 1;
   check("refused: an entry of an older identity version", !mayPassInfoPage(ctxWith({ entries: [old] })));
