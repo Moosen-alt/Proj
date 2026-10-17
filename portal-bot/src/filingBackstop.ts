@@ -39,10 +39,17 @@
 //      person BEFORE its read-only housekeeping (the review read-back, screenshots), not after it.
 //      From that moment a state-changing request whose page saw a TRUSTED pointer / Enter / Space
 //      input within HUMAN_INPUT_MS passes rules 2 and 4 (the filing-URL rule and this lockdown):
-//      the person's own submit. How a person's request is told apart from automation's: the input
-//      watch (watchHumanInput) is armed only after the run's LAST input on the page, and the run
-//      makes no input after the hand-over (everything after it is reads) — so a trusted input the
-//      watch sees can only be the person's. A page script posting with no input meets the lockdown
+//      the person's own submit. How a person's request is told apart from automation's — a
+//      Playwright click or key press is a TRUSTED event in the page too, so two layers, either of
+//      which holds alone:
+//        (1) ORDERING: the input watch (watchHumanInput) is armed only after the run's LAST input on
+//            the page, the replay refuses any input of its own from that moment (recipeAdapter
+//            inputsClosed), and everything after it is reads (a source scan pins it);
+//        (2) THE FENCE: every input the run makes goes through withAutomationInput, and input the
+//            watch sees while a fenced action is in flight, or within AUTOMATION_INPUT_GRACE_MS after
+//            it, is never recorded as a person's.
+//      Only input that arrives AFTER the hand-over counts (an input just before it is not carried
+//      over), and only for the page that saw it. A page script posting with no input meets the lockdown
 //      exactly as before; payment (rule 1) and an open dismisser / Enter window (rule 3, the
 //      run's own action in flight) are never lifted. An abort that follows such an input is
 //      flagged humanInput, so the run can say "your click was held back — click again".
@@ -217,6 +224,11 @@ export interface FilingBackstop {
   handOverToHuman(why: string): boolean;
   /** Has the run handed the page over (and not been disposed)? */
   handedOver(): boolean;
+  /** #333 — THE FENCE: run `fn` (an input the run itself makes on `pg`: a click, a key press,
+   *  typing) so the input watch never records it as a person's — while it is in flight and for
+   *  AUTOMATION_INPUT_GRACE_MS after it (the trusted event lands in the page after the call
+   *  returns). Nested calls are counted. */
+  withAutomationInput<T>(pg: unknown, fn: () => Promise<T>): Promise<T>;
   /** Each request a person's own input let through after the hand-over: where it went (origin +
    *  path), whether it was a main-frame document request (a form submission), and how many aborts
    *  had been recorded before it (aborts after it are the page the person's click led to). */
@@ -288,6 +300,10 @@ const REGISTRY = new WeakMap<object, FilingBackstop>();
 /** #333: how long after a person's own input a state-changing request is theirs. A click's form
  *  POST follows its pointerdown by well under a second; a confirm() answered first takes longer. */
 const HUMAN_INPUT_MS = 4_000;
+/** #333: how long after a fenced automation input its trusted events may still reach the watch (the
+ *  CDP event is dispatched after the Playwright call's own round trip; measured well under 100 ms
+ *  on the replica, kept generous). */
+const AUTOMATION_INPUT_GRACE_MS = 1_500;
 /** The page binding the input watch reports through (one per context or page, never removed). */
 const HUMAN_INPUT_BINDING = "__solarBackstopHumanInput";
 /** The in-page watch. A string, not a function: tsx's __name wrapper does not exist in the page. */
@@ -299,6 +315,12 @@ const HUMAN_INPUT_SCRIPT = `(() => { const w = window; if (w.__solarBackstopHuma
  *  (a second run in the same window — a correction reopen — must not lose its watch). */
 const HUMAN_INPUT_EXPOSED = new WeakSet<object>();
 const HUMAN_INPUT_SINKS = new WeakMap<object, (page: unknown) => void>();
+
+/** #333 — run one of the run's own inputs on `page` inside its backstop's fence (no backstop: as is). */
+export async function withAutomationInput<T>(page: unknown, fn: () => Promise<T>): Promise<T> {
+  const bs = backstopFor(page);
+  return bs ? bs.withAutomationInput(page, fn) : fn();
+}
 
 /** The backstop installed on this page's run, or null (a page no run owns: human capture). */
 export function backstopFor(page: unknown): FilingBackstop | null {
@@ -686,6 +708,18 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     const t = humanInputAt.get(pg as object) ?? 0;
     return t > 0 && Date.now() - t <= HUMAN_INPUT_MS;
   };
+  // A PERSON'S INPUT THAT COUNTS for the hand-over: on this page, AFTER the hand-over (an input just
+  // before it is never carried over), and recent.
+  const humanInputSinceHandOver = (pg: unknown): boolean => {
+    if (!pg || typeof pg !== "object" || !handedOverAt) return false;
+    const t = humanInputAt.get(pg as object) ?? 0;
+    return t > handedOverAt && Date.now() - t <= HUMAN_INPUT_MS;
+  };
+  // THE FENCE (#333): per page, how many of the run's own inputs are in flight and when the last ended.
+  const automationDepth = new WeakMap<object, number>();
+  const automationEndedAt = new WeakMap<object, number>();
+  const automationFenced = (pg: object): boolean =>
+    (automationDepth.get(pg) ?? 0) > 0 || Date.now() - (automationEndedAt.get(pg) ?? 0) <= AUTOMATION_INPUT_GRACE_MS;
   // #344 — THE INFORMATION-PAGE PASS. Run-wide facts its predicate asks (the run wrote through an
   // own-write window; an approved final-submit slot was ever opened), its ONE slot, its candidate
   // watch, and what each admitted. Every closer below also closes these.
@@ -833,7 +867,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     // watch is armed only after the run's last input, and the run makes none after the hand-over)
     // and no run action is in flight (a dismisser / Enter window). It passes the filing-URL rule and
     // the review lockdown below; payment and the windows still apply.
-    const human = handedOverAt > 0 && !disposed && windows.size === 0 && recentHumanInput(requestPage);
+    const human = handedOverAt > 0 && !disposed && windows.size === 0 && humanInputSinceHandOver(requestPage);
     // R0 — THE INFORMATION-PAGE SLOT IS CONSUMED by the FIRST request that could be the verified
     // control's (#344): the bound page's own main-frame document navigation. Matched or not, the
     // slot is gone, and consuming it changes no rule's outcome: the request meets payment, the
@@ -1190,7 +1224,8 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       const host = ctx && typeof ctx.exposeBinding === "function" && typeof ctx.addInitScript === "function" ? ctx
         : typeof page.exposeBinding === "function" && typeof page.addInitScript === "function" ? page : null;
       if (!host) return false;
-      HUMAN_INPUT_SINKS.set(host, (pg) => { if (!disposed && pg && typeof pg === "object") humanInputAt.set(pg as object, Date.now()); });
+      // An input the run itself is making (the fence) is never a person's.
+      HUMAN_INPUT_SINKS.set(host, (pg) => { if (!disposed && pg && typeof pg === "object" && !automationFenced(pg as object)) humanInputAt.set(pg as object, Date.now()); });
       try {
         if (!HUMAN_INPUT_EXPOSED.has(host)) {
           await host.exposeBinding(HUMAN_INPUT_BINDING, (source: { page?: unknown }) => {
@@ -1222,6 +1257,16 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       return true;
     },
     handedOver() { return handedOverAt > 0 && !disposed; },
+    async withAutomationInput<T>(pg: unknown, fn: () => Promise<T>): Promise<T> {
+      const p = (pg && typeof pg === "object" ? pg : page) as object;
+      automationDepth.set(p, (automationDepth.get(p) ?? 0) + 1);
+      try {
+        return await fn();
+      } finally {
+        automationDepth.set(p, Math.max(0, (automationDepth.get(p) ?? 1) - 1));
+        automationEndedAt.set(p, Date.now());
+      }
+    },
     humanRequests,
     stoppingAborts() { return aborts.filter(isStoppingAbort); },
     async openInfoPagePass(pg: unknown, control: unknown, opts: { entries: ReadonlyArray<VerifiedInfoPage>; run: InfoPageRunState; reserve?: InfoPageReserve }): Promise<InfoPagePassOpen> {
