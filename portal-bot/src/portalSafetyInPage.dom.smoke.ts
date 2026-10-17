@@ -24,6 +24,7 @@ import path from "node:path";
 import { chromium, type Page } from "playwright";
 import {
   classifyRecordedClick,
+  isInterstitialForwardLabel,
   isPayFee,
   isSecretField,
   isSubmitIntent,
@@ -45,6 +46,14 @@ const page = (body: string): string => `<!doctype html><html><body style="font:1
 const HEADER = `<header><form role="search"><input type="search" name="globalSearch" placeholder="Search..."></form></header>`;
 const FORM_STEP = `<h2>Project</h2><label for="fn">Job description</label><input id="fn" type="text"><button type="button" id="next">Next</button>`;
 const SUMMARY_DL = `<dl><dt>Applicant</dt><dd>Desmond Yarrowby</dd><dt>Scope</dt><dd>7.2 kW roof PV</dd></dl>`;
+// #344 round 3: the whole-page WebForms shape (round 2's n14) with `content` in its main region.
+const aspxR3 = (content: string): string => page(`<form method="post" action="/x/Receipt.aspx" id="aspnetForm">
+<div id="header" class="site-header"><div class="logo">City Development Services</div>
+ <div class="lookup"><label for="ctl00_txtPermitNo">Permit #</label> <input name="ctl00$txtPermitNo" type="text" id="ctl00_txtPermitNo"> <label for="ctl00_txtAddr">Address</label> <input name="ctl00$txtAddr" type="text" id="ctl00_txtAddr"> <input type="submit" name="ctl00$btnFind" value="Find" id="ctl00_btnFind"></div>
+</div>
+<div id="content"><h1>Project Information</h1>${content}</div>
+<div id="footer" class="site-footer">City Development Services</div>
+</form>`);
 const PAGES: Record<string, string> = {
   // Step 2 of an Accela-shaped wizard: real inputs, and the advance is "Continue Application »".
   "/form": page(`${HEADER}<h2>Step 2: Project Information</h2>
@@ -155,6 +164,16 @@ const PAGES: Record<string, string> = {
     <a href="#" id="titled" title="Submit" onclick="return false"><span style="display:inline-block;width:20px;height:20px;background:#ccc"></span></a>
     <input type="submit" id="nx" value="Next">
     </form>`),
+  // #344 round 3 — CHROME BY NAME: an ASP.NET WebForms page wraps everything in ONE POST form; its
+  // header is a <div id="header"> (no landmark) carrying a permit LOOKUP (round 2's n14). The page
+  // after a verified click counts form evidence only outside every element whose id / class / role
+  // names a header, nav, footer, menu, toolbar, search or lookup.
+  "/r3-chrome-only": aspxR3(""),
+  "/r3-chrome-one": aspxR3(`<label for="site">Site Address</label> <input id="site" name="ctl00$Main$txtSite" type="text">`),
+  "/r3-chrome-two": aspxR3(`<label for="site">Site Address</label> <input id="site" name="ctl00$Main$txtSite" type="text"> <label for="unit">Unit</label> <input id="unit" name="ctl00$Main$txtUnit" type="text">`),
+  "/r3-topbar": page(`<div class="topbar"><form method="post" action="/lookup" class="quick"><label for="pn">Permit #</label> <input id="pn" name="permitNo" type="text"> <label for="ad">Address</label> <input id="ad" name="address" type="text"> <button type="submit">Find</button></form></div>
+    <div class="content"><h1>Request sent</h1><p>Your solar permit request was sent to the City.</p></div>`),
+  "/r3-navlist": page(`<form method="post" action="/x"><ul class="nav-menu"><li><input name="a1" type="text"></li><li><input name="a2" type="text"></li></ul><div id="page-content"><label for="z">Zip</label><input id="z" name="zip" type="text"></div></form>`),
   // A fee page: the card block, including a bare "Expiration Date" select.
   "/pay": page(`<form><h2>Fee Payment</h2>
     <label for="c1">Card Number:</label><input id="c1" type="text">
@@ -204,6 +223,34 @@ try {
     };
     check("Chromium's __portalSafety answers exactly as Node's shared module", JSON.stringify(inPage) === JSON.stringify(node),
       `page ${JSON.stringify(inPage)}\n         node ${JSON.stringify(node)}`);
+    // #344: the interstitial's forward-label answer moved into the factory — the page and Node give
+    // the same answers; and the information-page identity reader exists in the page.
+    const fwdLabels = [...labels, "Continue", "Proceed", "Get Started", "Save and Continue", "Next »", "Previous", "Continue Later", "Next Record", "Continue Draft"];
+    const fwdPage = await p.evaluate((ls: string[]) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ps = (globalThis as any).__portalSafety;
+      return { fwd: ls.map((l) => ps.isInterstitialForwardLabel(l)), identity: typeof ps.infoPageIdentityInPage, version: ps.INFO_PAGE_IDENTITY_VERSION };
+    }, fwdLabels);
+    check("#344: isInterstitialForwardLabel answers the same in Chromium and in Node; the page carries infoPageIdentityInPage (version 1)",
+      JSON.stringify(fwdPage.fwd) === JSON.stringify(fwdLabels.map((l) => isInterstitialForwardLabel(l))) && fwdPage.identity === "function" && fwdPage.version === 1,
+      JSON.stringify(fwdPage));
+    // #344 round 3 — CHROME BY NAME (the after-click reading's form evidence). Each count is the one
+    // only this rule gives: without it the header lookup's two boxes count (n14 reads 2, "one real
+    // field" reads 3, the top bar reads 2, the nav list reads 3).
+    const formFieldsOf = async (path: string): Promise<number> => {
+      await p.goto(`${base}${path}`);
+      await p.evaluate(PORTAL_SAFETY_IN_PAGE_SOURCE);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return p.evaluate(() => (globalThis as any).__portalSafety.infoPageAfterClickInPage().formFields as number);
+    };
+    const r3 = { only: await formFieldsOf("/r3-chrome-only"), one: await formFieldsOf("/r3-chrome-one"), two: await formFieldsOf("/r3-chrome-two"), topbar: await formFieldsOf("/r3-topbar"), nav: await formFieldsOf("/r3-navlist") };
+    check("#344 round 3: n14 — a whole-page POST form whose <div id=header> carries a permit lookup offers NO form evidence (0)", r3.only === 0, JSON.stringify(r3));
+    check("#344 round 3: the same page with ONE real field in its content counts 1 — the header lookup's boxes never count (2 fields needed)", r3.one === 1, JSON.stringify(r3));
+    check("#344 round 3 (positive control): two real fields in the content count 2 beside the header lookup", r3.two === 2, JSON.stringify(r3));
+    check("#344 round 3: n6 — a POST lookup form inside <div class=topbar> counts nothing", r3.topbar === 0, JSON.stringify(r3));
+    check("#344 round 3: fields inside a <ul class=nav-menu> do not count; the one in #page-content does (1)", r3.nav === 1, JSON.stringify(r3));
+    await p.goto(`${base}/form`);
+    await p.evaluate(PORTAL_SAFETY_IN_PAGE_SOURCE);
 
     // ---- 2. Read-only page detection ---------------------------------------------------------
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

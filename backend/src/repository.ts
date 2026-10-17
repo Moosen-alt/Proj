@@ -99,6 +99,7 @@ import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger"
 import { logger } from "./logger";
 import { disarmDraftCreatingSubmit, draftContinuationGaps, draftSubmitStampForReplay, openPortalDraftFor, recordPortalDraft, DRAFT_SUBMIT_UNEXPECTED_ACTION, type ObservedDraft } from "./portalDraft";
 import { claimSignatureRequestApproval, runningJobSignatureRequestApprovalId } from "./signatureRequestApproval";
+import { deleteProjectInfoPages } from "./infoPages";
 import { nemSignatureState, nemStageIsResume } from "./signatureTrack";
 import { siteKey } from "../../portal-bot/src/draftCreated";
 import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, type HostFit, type PortalUrlSource } from "./portalChannel";
@@ -1383,6 +1384,9 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     db.run("DELETE FROM portal_run_approvals WHERE project_id = ?", [projectId]);
     // Approve & request signatures approvals (migration v48, #308) carry the same FK.
     db.run("DELETE FROM portal_signature_request_approvals WHERE project_id = ?", [projectId]);
+    // Information-page candidates (migration v50, #344) carry the same FK; the pass a person
+    // verified on one of them is withdrawn with it (infoPages owns both tables).
+    deleteProjectInfoPages(db, projectId);
     db.run("DELETE FROM submissions WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM human_review_items WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM corrections WHERE project_id = ?", [projectId]);

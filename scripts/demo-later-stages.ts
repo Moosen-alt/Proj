@@ -349,9 +349,14 @@ if (argv.includes("--remove")) {
   // --reset did exactly that until it got the same treatment). Repeat until a pass is blocked
   // nowhere, then the project row — all inside ONE transaction, so a reference this cannot clear
   // throws and removes nothing rather than leaving a half-deleted project.
+  const { deleteProjectInfoPages } = await import("../backend/src/infoPages");
   try {
     db.transaction(() => {
       for (const { id } of ids) {
+        // A verified information page's pass (#344) has no project_id: the product's own cascade
+        // first, while the candidate it was verified on still exists (Helm's review of #349: the
+        // derived deletes alone left the pass dangling).
+        deleteProjectInfoPages(db, id);
         let blocked: string[] = [];
         for (let pass = 0; pass <= childTables.length; pass++) {
           blocked = [];

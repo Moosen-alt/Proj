@@ -236,8 +236,15 @@ if (RESET) {
       } catch { /* table absent on an old schema */ }
     }
   }
+  const { deleteProjectInfoPages } = await import("../backend/src/infoPages");
   try {
     db.transaction(() => {
+      // A VERIFIED INFORMATION PAGE'S PASS (#344) has no project_id: the derived deletes below would
+      // remove the candidate it was verified on and leave the pass dangling (Helm's review of #349).
+      // The product's own cascade first, while the candidates still exist: it withdraws (audited)
+      // every pass verified on a demo project's candidate, keeps the uses for the expiry count, and
+      // deletes the candidates.
+      for (const id of ids) deleteProjectInfoPages(db, id);
       let blocked: string[] = [];
       for (let pass = 0; pass <= statements.length; pass++) {
         blocked = [];

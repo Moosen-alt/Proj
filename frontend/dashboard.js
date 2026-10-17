@@ -512,6 +512,7 @@ async function loadProjects() {
   await fetchProjectPage(false);
   await loadKnowledgeBase();
   await loadPortalRecipes();
+  await loadInfoPagePasses();
   await loadAhjForms();
   await loadSignatures();
   await loadEmailTracker();
@@ -7796,6 +7797,234 @@ function renderCorrections() {
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// HUMAN-VERIFIED INFORMATION PAGES (#344, owner ruling 2026-10-15: option B). A learn the network
+// backstop held at an information page (rule 4b: the page's own words read as review; nothing had
+// been entered) offers that EXACT page here. A named person who marks it "an information page — OK
+// to advance" lets later runs pass that one page's forward request — only that page, only before
+// anything is entered on the run. The server re-checks every refusal; the button is disabled while
+// any applies. Everything shown is portal text: esc() all of it.
+// ---------------------------------------------------------------------------------------------
+function infoPageCandidateCardsHtml(candidates, projectId) {
+  const list = Array.isArray(candidates) ? candidates : [];
+  const open = list.filter((c) => c && c.status === "open");
+  const decided = list.filter((c) => c && c.status !== "open").slice(0, 5);
+  const li = (items) => items.map((x) => `<li>${esc(x)}</li>`).join("");
+  const cards = open.map((c) => {
+    const req = c.request || {};
+    const ev = c.evidence || {};
+    const refusals = Array.isArray(c.refusals) ? c.refusals : [];
+    const warnings = Array.isArray(c.warnings) ? c.warnings : [];
+    const shot = c.hasScreenshot
+      ? `<img src="/api/projects/${esc(encodeURIComponent(projectId))}/info-page-candidates/${esc(encodeURIComponent(c.id))}/screenshot" alt="The page as the run saw it (masked)" style="max-width:100%;border:1px solid var(--line, #ddd);margin:6px 0" loading="lazy">`
+      : `<p class="muted">No screenshot: re-run the learn so the page can be seen before it is verified.</p>`;
+    const forms = (Array.isArray(ev.forms) ? ev.forms : []).map((f) => `${esc(String(f.method || "").toUpperCase())} ${esc(f.actionWhere)} · ${esc(f.enctype)} · fields: ${esc((Array.isArray(f.fields) ? f.fields : []).map((x) => x[2] || `(${x[0]})`).join(", ") || "none")}`);
+    const headings = (Array.isArray(ev.headings) ? ev.headings : []).map((h) => `h${esc(h[0])}: ${esc(h[1])}`);
+    const frames = (Array.isArray(ev.frames) ? ev.frames : []).map((f) => `${esc(f[0])} ${esc(f[1])}`);
+    // Round 4: this exact page was verified before, and that verification EXPIRED (30 days / 10 projects).
+    const expired = c.expiredPass && typeof c.expiredPass === "object" ? c.expiredPass : null;
+    return `
+    <article class="item warning" data-info-candidate="${esc(c.id)}">
+      <div class="item-title"><span>Information page to verify</span><span class="badge warning">${expired ? "verification expired — a person re-verifies" : "held by the network backstop"}</span></div>
+      ${expired ? `<p style="font-size:12px" data-info-expired="${esc(expired.passId)}"><strong>Verification expired — a person re-verifies.</strong> This exact page was verified on ${esc(String(expired.verifiedAt || "").slice(0, 10))}; ${esc((Array.isArray(expired.why) ? expired.why : []).join("; "))}. Until a person verifies it again, runs stop here exactly as before it was verified.</p>` : ""}
+      <p>The run stopped at <strong>${esc(c.origin)}${esc(c.path)}</strong>${(c.queryKeys || []).length ? ` (query keys: ${esc(c.queryKeys.join(", "))})` : ""}: its <strong>${esc(c.controlLabel)}</strong> was held because the page's own words read as review. Nothing was sent.</p>
+      <p class="muted" style="font-size:12px">Held request: ${esc(req.method)} ${esc(req.where)} · ${esc(req.media)} · fields: ${esc((req.fieldNames || []).join(", ") || "none")} · seen ${esc(String(c.seenCount || 1))} time(s), first ${esc(String(c.firstSeenAt || "").slice(0, 10))}, last ${esc(String(c.lastSeenAt || "").slice(0, 10))}</p>
+      <p class="muted" style="font-size:12px">Reached by exactly these steps (a pass never applies after other ones): ${esc((Array.isArray(c.steps) ? c.steps : []).join(" → ") || "none recorded")}</p>
+      ${shot}
+      <details class="fold"><summary>The page's text, headings and forms</summary>
+        <pre style="white-space:pre-wrap;max-height:240px;overflow:auto;font-size:12px">${esc(ev.text || "")}</pre>
+        ${headings.length ? `<p class="muted" style="font-size:12px">Headings: ${headings.join(" · ")}</p>` : ""}
+        ${forms.length ? `<p class="muted" style="font-size:12px">Forms: ${forms.join(" | ")}</p>` : ""}
+        ${frames.length ? `<p class="muted" style="font-size:12px">Frames: ${frames.join(" · ")}</p>` : ""}
+      </details>
+      ${warnings.length ? `<p style="font-size:12px;margin:6px 0 2px"><strong>Look twice:</strong></p><ul style="font-size:12px;margin:0">${li(warnings)}</ul>` : ""}
+      ${refusals.length ? `<p style="font-size:12px;margin:6px 0 2px"><strong>Cannot be marked:</strong></p><ul style="font-size:12px;margin:0">${li(refusals)}</ul>` : ""}
+      <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button data-info-verify="${esc(c.id)}" data-identity="${esc(c.identitySha256)}" data-label="${esc(c.controlLabel)}"${refusals.length ? " disabled" : ""}>This is an information page — OK to advance</button>
+        <button class="secondary" data-info-dismiss="${esc(c.id)}">Not an information page</button>
+      </div>
+      <p class="muted" style="font-size:11px;margin-top:4px">Marking it lets automation press "${esc(c.controlLabel)}" on exactly this page, for every client, only on a run that has entered nothing. It never applies after a field is filled, on a resumed draft or signature, or if anything on the page changes.</p>
+    </article>`;
+  }).join("");
+  const done = decided.map((c) => `<p class="muted" style="font-size:12px">Information page ${esc(c.origin)}${esc(c.path)}: ${c.status === "verified" ? (c.passLive ? "verified" : "verified, since withdrawn") : "marked not an information page"} by ${esc(c.decidedBy || "a person")} ${esc(String(c.decidedAt || "").slice(0, 10))}.</p>`).join("");
+  return cards + done;
+}
+
+// #344 round 2 — A PASS ADMITS AT MOST ONCE PER PROJECT (and side): after this project passed a
+// verified page, or was held at one because of its earlier progress, its runs stop there as on main.
+// A named person who checked the application on the portal may allow it ONCE MORE; a filing, a
+// number, a draft or a paused / interrupted run (the "hard" reasons) can never be lifted here.
+function infoPageProjectStateHtml(states) {
+  const list = Array.isArray(states) ? states : [];
+  const li = (items) => items.map((x) => `<li>${esc(x)}</li>`).join("");
+  return list.map((st) => {
+    const side = st.scope === "utility" ? "interconnection (NEM)" : "permit";
+    const passed = (Array.isArray(st.passed) ? st.passed : []).map((p) => `passed ${esc(p.where)} on ${esc(String(p.at || "").slice(0, 10))}`);
+    const held = (Array.isArray(st.held) ? st.held : []).map((p) => `held at ${esc(p.where)} on ${esc(String(p.at || "").slice(0, 10))}`);
+    const hard = Array.isArray(st.hard) ? st.hard : [];
+    const learn = Array.isArray(st.learn) ? st.learn : [];
+    return `
+    <article class="item warning" data-info-state="${esc(st.scope)}">
+      <div class="item-title"><span>Verified information page — ${esc(side)} side</span><span class="badge warning">at most once per project</span></div>
+      <p style="font-size:12px">This project ${[...passed, ...held].join("; ") || "used a verified information page"}. A verified page lets automation through once per project: later runs of this project stop at that page, exactly as before it was verified.</p>
+      ${learn.length ? `<p style="font-size:12px;margin:6px 0 2px"><strong>Why later runs stop there:</strong></p><ul style="font-size:12px;margin:0">${li(learn)}</ul>` : ""}
+      ${hard.length ? `<p style="font-size:12px;margin:6px 0 2px"><strong>Cannot be allowed again here (do the page by hand):</strong></p><ul style="font-size:12px;margin:0">${li(hard)}</ul>` : ""}
+      ${st.lastAllowedAt ? `<p class="muted" style="font-size:11px">Last allowed once more by ${esc(st.lastAllowedBy || "a person")} on ${esc(String(st.lastAllowedAt).slice(0, 10))}.</p>` : ""}
+      <div style="margin-top:8px"><button data-info-allow="${esc(st.scope)}"${st.canAllow ? "" : " disabled"}>Allow once more for this project</button></div>
+      <p class="muted" style="font-size:11px;margin-top:4px">Only after you checked this project's application on the portal: nothing filed twice, no draft or request left half-done. The next run may pass the page once more; after that it stops there again.</p>
+    </article>`;
+  }).join("");
+}
+
+// #344 round 3 — THE VERIFIED PAGE MAY HAVE FILED: a pass this project used was withdrawn by an
+// after-click incident (the page it led to read like a receipt, or the run entered none of this job's
+// data there). Plain, first on the card, every value escaped.
+// Round 4 (rule 6): a GENERIC row (the incident was on another organisation's project) carries no
+// text, label or date — only that a verified page this project used may have filed.
+function infoPageFilingWarningsHtml(warnings) {
+  const list = Array.isArray(warnings) ? warnings : [];
+  return list.slice(0, 5).map((w) => w.generic === true ? `
+    <article class="item blocker" data-info-may-have-filed="${esc(w.passId)}">
+      <div class="item-title"><span>A verified information page this project used may have filed — check the portal</span><span class="badge">check the portal</span></div>
+      <p style="font-size:12px">Automation passed the verified information page ${esc(w.where)} on a run of this project, and that verification has since been withdrawn after an incident. Look this project up on the portal before anything is filed again: an application may already be on file.</p>
+    </article>` : `
+    <article class="item blocker" data-info-may-have-filed="${esc(w.passId)}">
+      <div class="item-title"><span>The verified page may have filed — check the portal for this project</span><span class="badge">check the portal</span></div>
+      <p style="font-size:12px">Automation passed the verified information page ${esc(w.where)}${w.controlLabel ? ` ("${esc(w.controlLabel)}")` : ""} on a run of this project. On ${esc(String(w.at || "").slice(0, 10))} a run that passed it met a page that did not prove to be an unfiled application, so the verification was withdrawn. Look this project up on the portal before anything is filed again: an application may already be on file.</p>
+      ${(Array.isArray(w.why) && w.why.length) ? `<p class="muted" style="font-size:11px">Why: ${w.why.map((x) => esc(x)).join("; ")}</p>` : ""}
+    </article>`).join("");
+}
+
+async function loadInfoPageCandidates(projectId) {
+  const wrap = $("infoPageCandidates");
+  if (!wrap || !projectId) return;
+  let data;
+  try { data = await api(`/api/projects/${encodeURIComponent(projectId)}/info-page-candidates`); } catch { return; }
+  if (state.selectedProjectId !== projectId || !$("infoPageCandidates")) return;
+  $("infoPageCandidates").innerHTML = infoPageFilingWarningsHtml(data.filingWarnings) + infoPageCandidateCardsHtml(data.candidates, projectId) + infoPageProjectStateHtml(data.projectState);
+  bindInfoPageCandidateButtons(projectId);
+}
+
+function bindInfoPageCandidateButtons(projectId) {
+  document.querySelectorAll("#infoPageCandidates button[data-info-verify]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const auth = await authForDecision();
+      const lede = `Automation will press "${button.dataset.label}" on exactly this page, for every client, only on a run that has entered nothing. It never applies after a field is filled, on a resumed draft or signature, or if anything on the page changes.\n\nMark it an information page — OK to advance?`;
+      const name = namedPersonConsent(auth, lede, "verified this information page", "an information page is verified by a named person");
+      if (name === null) return;
+      button.disabled = true;
+      try {
+        await api(`/api/projects/${encodeURIComponent(projectId)}/info-page-candidates/${encodeURIComponent(button.dataset.infoVerify)}/verify`,
+          { method: "POST", body: JSON.stringify({ identitySha256: button.dataset.identity, verifiedBy: name }) });
+        showMessage("Verified. The next run passes this exact page — only this page, and only before anything is entered.");
+        loadInfoPageCandidates(projectId);
+      } catch (err) {
+        showMessage(err.message, "error");
+        button.disabled = false;
+      }
+    });
+  });
+  document.querySelectorAll("#infoPageCandidates button[data-info-dismiss]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const auth = await authForDecision();
+      const name = namedPersonConsent(auth, "Mark this page NOT an information page? Runs keep stopping there, and it is not offered again.", "dismissed this information page", "a candidate is dismissed by a named person");
+      if (name === null) return;
+      button.disabled = true;
+      try {
+        await api(`/api/projects/${encodeURIComponent(projectId)}/info-page-candidates/${encodeURIComponent(button.dataset.infoDismiss)}/dismiss`,
+          { method: "POST", body: JSON.stringify({ dismissedBy: name }) });
+        loadInfoPageCandidates(projectId);
+      } catch (err) {
+        showMessage(err.message, "error");
+        button.disabled = false;
+      }
+    });
+  });
+  document.querySelectorAll("#infoPageCandidates button[data-info-allow]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const auth = await authForDecision();
+      const lede = "Allow the verified information page ONCE MORE for this project? Only if you checked this project's application on the portal: nothing would be filed twice and no request is left half-done. The next run may pass the page once; after that it stops there again.";
+      const name = namedPersonConsent(auth, lede, "allowed the information page once more", "a pass is allowed once more by a named person");
+      if (name === null) return;
+      button.disabled = true;
+      try {
+        await api(`/api/projects/${encodeURIComponent(projectId)}/info-page-allow-once-more`,
+          { method: "POST", body: JSON.stringify({ scope: button.dataset.infoAllow, allowedBy: name }) });
+        showMessage("Allowed once more. The next run of this project may pass the verified page once.");
+        loadInfoPageCandidates(projectId);
+      } catch (err) {
+        showMessage(err.message, "error");
+        button.disabled = false;
+      }
+    });
+  });
+}
+
+// The shared list (Knowledge modal): where each verified page lives, its control, its request's
+// field NAMES and when it was verified — never its text or a hash. A withdrawn pass is DELETED (the
+// audit log keeps its history), so every row here is a pass; one with no person's verification on
+// record is shown as such and is never handed to a run.
+function infoPagePassRowsHtml(passes) {
+  const list = Array.isArray(passes) ? passes : [];
+  if (!list.length) return `<p class="muted">No information page is verified. A run held at one offers it on the project's Portal runs.</p>`;
+  return list.map((p) => {
+    const req = p.request || {};
+    const live = p.live === true;
+    // Round 4: a verification is authority for 30 days and at most 10 projects; after that it EXPIRES.
+    const expired = Array.isArray(p.expired) ? p.expired : [];
+    return `
+    <article class="item ${live ? "info" : "warning"}">
+      <div class="item-title"><span>${esc(p.origin)}${esc(p.path)}</span><span class="badge">${live ? "live" : expired.length ? "verification expired — a person re-verifies" : "no verification on record — never used"}</span></div>
+      ${!live && expired.length ? `<p class="muted" style="font-size:12px">${esc(expired.join("; "))}. A run that reaches the page stops there and offers it on the project's card for a person to verify again.</p>` : ""}
+      <p class="muted" style="font-size:12px">Control: <strong>${esc(p.controlLabel)}</strong> (${esc(p.controlName)}) · request ${esc(req.method)} ${esc(req.where)} · ${esc(req.media)} · fields: ${esc((req.fieldNames || []).join(", ") || "none")} · identity ${esc(p.identityPrefix)}…</p>
+      <p class="muted" style="font-size:12px">Verified ${esc(String(p.verifiedAt || "").slice(0, 10))}</p>
+      <button class="secondary" data-info-withdraw="${esc(p.id)}" style="font-size:12px">Withdraw</button>
+    </article>`;
+  }).join("");
+}
+
+// #344 round 3 — on the pass's entry: each pass an after-click incident withdrew, and the projects
+// that used it (only those in your own organisation are named by the server).
+function infoPagePassFilingWarningsHtml(list) {
+  const items = Array.isArray(list) ? list : [];
+  return items.slice(0, 20).map((w) => {
+    const projects = Array.isArray(w.projects) ? w.projects : [];
+    return `
+    <article class="item blocker" data-info-pass-may-have-filed="${esc(w.passId)}">
+      <div class="item-title"><span>${esc(w.where)} — withdrawn after an incident</span><span class="badge">may have filed</span></div>
+      <p style="font-size:12px"><strong>The verified page may have filed — check the portal for this project</strong>${projects.length ? ":" : "."} ${projects.length ? projects.map((p) => `<strong>${esc(p.name || p.id)}</strong>${p.address ? ` (${esc(p.address)})` : ""}`).join(", ") : "No project of yours used it."}</p>
+      <p class="muted" style="font-size:11px">${w.controlLabel ? `Control "${esc(w.controlLabel)}" · ` : ""}${w.at ? `incident ${esc(String(w.at).slice(0, 10))}. ` : ""}The pass is deleted; a run that reaches the page again stops there and offers it to a person.</p>
+    </article>`;
+  }).join("");
+}
+
+async function loadInfoPagePasses() {
+  const wrap = $("infoPagePasses");
+  if (!wrap) return;
+  let data;
+  try { data = await api("/api/info-page-passes"); } catch (err) { wrap.innerHTML = `<p class="muted">${esc(err.message)}</p>`; return; }
+  const passes = data.passes || [];
+  wrap.innerHTML = infoPagePassFilingWarningsHtml(data.filingWarnings) + infoPagePassRowsHtml(passes);
+  if ($("infoPagePassesCount")) $("infoPagePassesCount").textContent = `${passes.filter((p) => p.live === true).length} live`;
+  wrap.querySelectorAll("button[data-info-withdraw]").forEach((button) => {
+    button.addEventListener("click", async () => {
+      const auth = await authForDecision();
+      const name = namedPersonConsent(auth, "Withdraw this verified information page? The pass is deleted (the audit log keeps it). Runs that START after this stop at the page again; a run already in progress keeps the pass it started with.", "withdrew this verified page", "a pass is withdrawn by a named person");
+      if (name === null) return;
+      const reason = String(window.prompt("Why is it withdrawn? (required, up to 200 characters)", "") || "").trim();
+      if (!reason) { showMessage("A reason is required to withdraw a verified page.", "warning"); return; }
+      button.disabled = true;
+      try {
+        await api(`/api/info-page-passes/${encodeURIComponent(button.dataset.infoWithdraw)}/withdraw`, { method: "POST", body: JSON.stringify({ withdrawnBy: name, reason: reason.slice(0, 200) }) });
+        loadInfoPagePasses();
+      } catch (err) {
+        showMessage(err.message, "error");
+        button.disabled = false;
+      }
+    });
+  });
+}
+
 function renderPortalRuns() {
   const runs = state.detail.portalRuns || [];
   const awaiting = runs.find((run) => run.status === "awaiting_human_submit");
@@ -7848,7 +8077,10 @@ function renderPortalRuns() {
   const prevFold = $("portalRuns").querySelector("details.runs-fold");
   const foldWasOpen = !!(prevFold && prevFold.open && $("portalRuns").dataset.projectId === (state.selectedProjectId || ""));
   if (pinnedWrap) {
-    pinnedWrap.innerHTML = pinned.map(runCard).join("");
+    // #344: the project's information pages waiting for a person go first (filled by
+    // loadInfoPageCandidates below; empty — and invisible — when there are none).
+    pinnedWrap.innerHTML = `<div id="infoPageCandidates" class="stack"></div>${pinned.map(runCard).join("")}`;
+    loadInfoPageCandidates(state.selectedProjectId);
     $("portalRuns").innerHTML = !runs.length
       ? `<p class="muted">No portal runs yet.</p>`
       : earlier.length
@@ -9394,6 +9626,7 @@ function openKnowledgeModal() {
   $("knowledgeModal").hidden = false;
   loadKnowledgeBase();
   loadPortalRecipes();
+  loadInfoPagePasses();
   if (window.lucide) window.lucide.createIcons();
 }
 function closeKnowledgeModal() { $("knowledgeModal").hidden = true; }
