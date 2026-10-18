@@ -1,7 +1,7 @@
-// #358: the two pure answers the backstop's forward() leans on — which redirects re-send the request
-// (and so must be judged as a fresh request before they are followed), and which bodies the backstop
-// can re-send byte for byte. The real-browser cells are in filingBackstopRedirect.dom.smoke.ts.
-import { bodyCanBeReplayed, redirectKeepsMethod } from "./filingBackstop";
+// #358: which redirects re-send the request (and so are judged as a fresh request before Chromium
+// follows them), and how a refused redirect reads. The real-browser cells are in
+// filingBackstopRedirect.dom.smoke.ts.
+import { backstopSentLine, describeBackstopAbort, isStoppingAbort, redirectKeepsMethod } from "./filingBackstop";
 
 let failures = 0;
 const check = (label: string, ok: boolean, detail = ""): void => {
@@ -9,7 +9,6 @@ const check = (label: string, ok: boolean, detail = ""): void => {
   else { failures++; console.error(`FAIL - ${label}${detail ? ` (${detail})` : ""}`); }
 };
 
-// Redirects (the Fetch standard).
 for (const m of ["POST", "PUT", "PATCH", "DELETE"]) {
   check(`307 keeps ${m}`, redirectKeepsMethod(307, m));
   check(`308 keeps ${m}`, redirectKeepsMethod(308, m));
@@ -19,27 +18,17 @@ check("301 / 302 turn a POST into a GET", !redirectKeepsMethod(301, "POST") && !
 check("301 / 302 keep a PUT and a DELETE", redirectKeepsMethod(301, "PUT") && redirectKeepsMethod(302, "DELETE"));
 check("a 200 and a 304 are not redirects", !redirectKeepsMethod(200, "POST") && !redirectKeepsMethod(304, "PUT"));
 
-// Bodies.
-const B = "----WebKitFormBoundarySynthetic1";
-const multipart = (parts: string[]): Buffer => Buffer.from(parts.map((p) => `--${B}\r\n${p}\r\n`).join("") + `--${B}--\r\n`, "latin1");
-const field = (n: string, v: string) => `Content-Disposition: form-data; name="${n}"\r\n\r\n${v}`;
-const file = (n: string, fname: string, bytes: string) => `Content-Disposition: form-data; name="${n}"; filename="${fname}"\r\nContent-Type: application/pdf\r\n\r\n${bytes}`;
-const ct = `multipart/form-data; boundary=${B}`;
-check("a urlencoded form can be re-sent", bodyCanBeReplayed("application/x-www-form-urlencoded", Buffer.from("a=1")));
-check("a JSON body can be re-sent", bodyCanBeReplayed("application/json", Buffer.from("{}")));
-check("multipart of plain fields can be re-sent", bodyCanBeReplayed(ct, multipart([field("a", "1"), field("b", "")])));
-check("multipart with a file part that carries its bytes can be re-sent", bodyCanBeReplayed(ct, multipart([file("plans", "plans.pdf", "%PDF-1.4 synthetic"), field("a", "1")])));
-check("multipart whose file part Chromium left empty CANNOT be re-sent (an <input type=file> upload)", !bodyCanBeReplayed(ct, multipart([file("plans", "plans.pdf", ""), field("a", "1")])));
-check("…in any position", !bodyCanBeReplayed(ct, multipart([field("a", "1"), file("plans", "plans.pdf", "")])));
-check("…with a quoted boundary", !bodyCanBeReplayed(`multipart/form-data; boundary="${B}"`, multipart([file("f", "a.bin", "")])));
-check("no body and no media type is an empty request: re-sent as one", bodyCanBeReplayed("", null) && bodyCanBeReplayed("", Buffer.alloc(0)));
-check("no body with a form / JSON / text media type is an empty request: re-sent as one",
-  ["application/x-www-form-urlencoded; charset=UTF-8", "application/json", "application/vnd.api+json", "text/plain;charset=UTF-8"].every((t) => bodyCanBeReplayed(t, null)));
-check("no body with a file's media type CANNOT be re-sent (an XHR whose body is a picked file: Chromium shows none)",
-  ["application/pdf", "application/octet-stream", "image/jpeg"].every((t) => !bodyCanBeReplayed(t, null)));
-check("multipart with no body CANNOT be re-sent", !bodyCanBeReplayed(ct, null));
-check("multipart with no boundary CANNOT be re-sent (nothing to tell)", !bodyCanBeReplayed("multipart/form-data", Buffer.from("x")));
-check("multipart with a part missing its header break CANNOT be re-sent", !bodyCanBeReplayed(ct, Buffer.from(`--${B}\r\ngarbage--${B}--\r\n`, "latin1")));
+const hop = { rule: "filing-url" as const, method: "POST", where: "http://127.0.0.1:9/SubmitApplication", why: "a filing endpoint, and no named approval covers this request (run)", resourceType: "document", redirect: { from: "http://127.0.0.1:9/step", status: 307, hop: 1 } };
+const line = describeBackstopAbort(hop);
+check("a refused redirect names its status, the request that reached the portal and the Location it was not followed to",
+  /REFUSED A 307 REDIRECT of POST http:\/\/127\.0\.0\.1:9\/step \(that request reached the portal\) to http:\/\/127\.0\.0\.1:9\/SubmitApplication/.test(line) && /not followed$/.test(line), line);
+check("…and never says it aborted the first request", !/BACKSTOP ABORTED/.test(line), line);
+check("a refused redirect stops the run", isStoppingAbort(hop));
+const sent = backstopSentLine(hop);
+check("a refused redirect's stop says the first request reached the portal and never \"Nothing was sent\"",
+  /The request to http:\/\/127\.0\.0\.1:9\/step reached the portal, which answered with a 307 redirect/.test(sent) && !/nothing was sent/i.test(sent), sent);
+check("an ordinary abort still says nothing was sent", backstopSentLine({ ...hop, redirect: undefined }) === "Nothing was sent.");
+check("a later hop says how many redirects in a row", /redirect 3 in a row/.test(describeBackstopAbort({ ...hop, redirect: { ...hop.redirect, hop: 3 } })));
 
 if (failures) { console.error(`\nfilingBackstopRedirect: ${failures} FAILED`); process.exit(1); }
 console.log("\nfilingBackstopRedirect: all checks passed");

@@ -69,11 +69,10 @@
 // named (replay: backstopStop; learner: at the next page boundary and in its result).
 //
 // Installed at the CONTEXT level when the page has one, so a filing that opens in a popup is
-// covered too. A GET is handed on with route.fallback() — never continue() — so a smoke's own
-// context.route fixture server still answers what this layer lets through. An ALLOWED
-// state-changing request is sent by the backstop itself (forward, #358) so that a 307 / 308 to
-// another URL is judged as a fresh request before it is followed — handed on with fallback() only
-// when a route below answers it or its body cannot be re-sent (see forward).
+// covered too, and handed on with route.fallback() — never continue() — so a smoke's own
+// context.route fixture server still answers what this layer lets through. A 307 / 308 of a request
+// it let through is judged again, at the response stage, before Chromium follows it (#358,
+// joinRedirectGuard).
 //
 // Known cost: Playwright disables the browser's HTTP cache while any route is installed.
 import { isFilingOrPaymentRequest, isPayRequestUrl, paymentDialogVerdict, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE } from "../../shared/src/portalSafety";
@@ -133,7 +132,14 @@ export interface BackstopAbort {
   /** What was in flight (the window's reason), or the filing-URL rule's reason. */
   why: string;
   resourceType: string;
+  /** #358: a REDIRECT the backstop refused to follow. `where` is the Location; the request to `from`
+   *  (origin + path) REACHED the portal, which answered `status`; `hop` counts the redirects. */
+  redirect?: { from: string; status: number; hop: number };
 }
+
+/** A redirect hop being judged (#358): which hop, what answered it, and the own-write / drain
+ *  exemption its first leg had (a hop is judged after that window may have closed). */
+interface RedirectHop { hop: number; from: string; status: number; ownWrite: boolean; drain: boolean }
 
 export interface FilingBackstop {
   readonly aborts: BackstopAbort[];
@@ -190,14 +196,15 @@ export interface FilingBackstop {
   openDrain(page: unknown, why: string): () => void;
   /** Where (origin + path) each request the drain let through went, in order. */
   readonly drainRequests: string[];
-  /** Allowed state-changing requests the backstop could not send (#358: the network failed, or the
-   *  send timed out) — ABORTED, never handed on unjudged. origin + path. */
-  readonly forwardFailures: ReadonlyArray<{ method: string; where: string; why: string }>;
   /** The run is at review: abort every state-changing request until dispose() hands the page to
    *  a person. Sticky. */
   lockReview(why: string): void;
   /** Aborts that stop the run: filing, payment, review lockdown. */
   stoppingAborts(): BackstopAbort[];
+  /** #358: a 307 / 308 of a request this run let through is judged before Chromium follows it (the
+   *  browser-level response pause joined). false only when the page has no Chromium browser to
+   *  pause (a double): its redirects are followed unjudged, as before. */
+  readonly redirectsJudged: boolean;
   /** A HUMAN-VERIFIED INFORMATION PAGE (#344): read `page`'s identity fresh on `control` (a
    *  Playwright locator resolving to ONE element in the main frame) and ask infoPagePassRefusals.
    *  Passing, ONE slot opens: that page's main-frame document POST equal to the verified control's
@@ -540,17 +547,19 @@ function pageOfRequest(request: any): any {
   } catch { return null; }
 }
 
-// A REDIRECT IS A FRESH REQUEST (#358). Handed on to the network, an allowed POST answered 307 / 308
-// is re-sent — body and all — to the Location by the browser's network stack, and Playwright never
+// A REDIRECT IS A FRESH REQUEST (#358). An allowed POST handed on to the network and answered 307 /
+// 308 is re-sent, body and all, to the Location by Chromium's network stack, and Playwright never
 // routes that second leg ("the handler will only be called for the first url"), so payment, the
-// filing-URL rule and the lockdown never saw where the data went. So the backstop sends an allowed
-// state-changing request itself (route.fetch, maxRedirects 0) and judges each method-keeping hop's
-// Location with the WHOLE handler, as a fresh request from the same page, before following it.
-/** Method-keeping hops followed after the first request; one more is aborted (stopping, named). */
+// filing-URL rule and the lockdown never saw where the data went. So one browser-level DevTools
+// session (joinRedirectGuard) pauses every RESPONSE before Chromium acts on it. A paused 3xx that
+// re-sends a state-changing request of a run (redirectKeepsMethod) is judged by that run's WHOLE
+// handler as a fresh request to the Location, from the same page, frame and resource type — then
+// Chromium follows it (Fetch.continueResponse) or the leg fails, named and stopping. Chromium keeps
+// doing the follow, so cookies, HSTS, CSP, redirect modes, the body and the committed URL stay its
+// own. A hop never takes the approved or the information-page slot, and keeps only the own-write or
+// drain exemption its first leg had.
+/** Method-keeping hops followed after the first request; one more is refused (stopping, named). */
 export const MAX_REDIRECT_HOPS = 3;
-/** One forwarded leg's budget (a large upload on a slow portal); a timeout is a failure (aborted). */
-const FORWARD_TIMEOUT_MS = 300_000;
-
 /** Does a redirect with this status re-send `method` (and its body) to the Location? The Fetch
  *  standard: 307 / 308 always; 301 / 302 for anything but POST (a PUT / DELETE keeps its method);
  *  303 never (it becomes a GET, which the browser follows as an ordinary GET). */
@@ -559,34 +568,6 @@ export function redirectKeepsMethod(status: number, method: string): boolean {
   if (status === 307 || status === 308) return true;
   if (status === 301 || status === 302) return m !== "POST";
   return false;
-}
-
-/** Can the backstop re-send this body byte for byte? Chromium leaves a FILE the page picked through
- *  <input type=file> out of what interception sees: a multipart body (a form upload, or a FormData
- *  built from input.files) arrives with that part empty, and an XHR whose body IS such a file
- *  arrives with no body at all — re-sent, the upload would arrive empty. Such a body cannot be
- *  replayed and is handed on as on main: a multipart body with an empty file part (or no readable
- *  boundary), and a missing body whose media type is not a form / JSON / text one (an XHR PUT of a
- *  PDF). A missing body with no media type, or a form / JSON / text one, is an empty request and is
- *  re-sent as one (KNOWN COST: an XHR of a picked file with no type reads the same way). A
- *  constructed Blob / File (a fetch body, a FormData of a new File) carries its bytes. */
-export function bodyCanBeReplayed(contentType: string, body: Buffer | null | undefined): boolean {
-  const ct = String(contentType || "").trim();
-  if (!body || !body.length) return !ct || /^(application\/(x-www-form-urlencoded|json|xml|[\w.+-]+\+(json|xml))|text\/)/i.test(ct);
-  if (!/^multipart\/form-data/i.test(ct)) return true;
-  const b = /boundary=(?:"([^"]+)"|([^\s;]+))/i.exec(ct);
-  const boundary = b ? (b[1] ?? b[2]) : "";
-  if (!boundary) return false;
-  const parts = body.toString("latin1").split(`--${boundary}`).slice(1);
-  for (const part of parts) {
-    if (part.startsWith("--")) break;
-    const cut = part.indexOf("\r\n\r\n");
-    if (cut < 0) return false;
-    const headers = part.slice(0, cut);
-    const content = part.slice(cut + 4).replace(/\r\n$/, "");
-    if (/;\s*filename\*?=/i.test(headers) && content.length === 0) return false;
-  }
-  return true;
 }
 
 /** The same request, as the hop to `url` the redirect asks for: same method, body, page, frame,
@@ -600,6 +581,64 @@ function asRedirectedTo(request: any, url: string): any {
       return typeof v === "function" ? v.bind(t) : v;
     },
   });
+}
+
+/** One paused response, as Fetch.requestPaused gives it at the response stage. */
+interface PausedResponse {
+  requestId: string;
+  networkId?: string;
+  request?: { url?: string; method?: string };
+  responseStatusCode?: number;
+  responseHeaders?: Array<{ name: string; value: string }>;
+}
+/** A run's answer for a paused response: null = not this run's request. */
+type PausedJudge = (e: PausedResponse) => Promise<"continue" | "fail" | null>;
+// ONE SESSION PER BROWSER, SHARED BY EVERY RUN ON IT (production opens a browser per run; the smokes
+// share one across contexts). Each paused response is offered to each run's judge; a response no
+// run owns continues untouched, at once.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const GUARDS = new WeakMap<object, { ready: Promise<any | null>; judges: Set<PausedJudge>; closed: boolean }>();
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function joinRedirectGuard(browser: any, judge: PausedJudge): Promise<(() => Promise<void>) | null> {
+  if (!browser || typeof browser !== "object" || typeof browser.newBrowserCDPSession !== "function") return null;
+  let g = GUARDS.get(browser);
+  if (!g) {
+    const judges = new Set<PausedJudge>();
+    const ready = (async () => {
+      const session = await browser.newBrowserCDPSession();
+      session.on("Fetch.requestPaused", (e: PausedResponse) => {
+        void (async () => {
+          let verdict: "continue" | "fail" | null = null;
+          for (const j of [...judges]) {
+            try { verdict = await j(e); } catch { verdict = "fail"; }
+            if (verdict) break;
+          }
+          if (verdict === "fail") await session.send("Fetch.failRequest", { requestId: e.requestId, errorReason: "BlockedByClient" }).catch(() => null);
+          else await session.send("Fetch.continueResponse", { requestId: e.requestId }).catch(() => null);
+        })();
+      });
+      await session.send("Fetch.enable", { patterns: [{ urlPattern: "*", requestStage: "Response" }] });
+      return session;
+    })().catch(() => null);
+    g = { ready, judges, closed: false };
+    GUARDS.set(browser, g);
+  }
+  const guard = g;
+  const session = await guard.ready;
+  if (!session) {
+    if (GUARDS.get(browser) === guard) GUARDS.delete(browser);
+    return null;
+  }
+  if (guard.closed) return joinRedirectGuard(browser, judge);
+  guard.judges.add(judge);
+  return async () => {
+    guard.judges.delete(judge);
+    if (guard.judges.size || guard.closed) return;
+    guard.closed = true;
+    if (GUARDS.get(browser) === guard) GUARDS.delete(browser);
+    await session.send("Fetch.disable").catch(() => null);
+    await session.detach().catch(() => null);
+  };
 }
 
 /** Install the backstop for one learn/replay run. null when the page cannot route (a unit-test
@@ -695,7 +734,6 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   const drains = new Map<number, { page: unknown; why: string }>();
   let nextDrain = 1;
   const drainRequests: string[] = [];
-  const forwardFailures: Array<{ method: string; where: string; why: string }> = [];
   let locked = "";
   let disposed = false;
   // #344 — THE INFORMATION-PAGE PASS. Run-wide facts its predicate asks (the run wrote through an
@@ -793,8 +831,27 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   } catch { /* no events (a double): live reads only */ }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  // `hop` > 0: a redirect's Location, judged as a fresh request (forward, #358).
-  const handler = async (route: any, request: any, hop = 0): Promise<void> => {
+  // THE RUN'S OWN REQUESTS THAT WENT (#358): each state-changing request the handler let through,
+  // keyed by method + URL, until its response pauses at the response stage (judgePaused) — with the
+  // own-write / drain exemption it had when it was judged.
+  const sentLegs: Array<{ key: string; request: any; hop: number; from: string; ownWrite: boolean; drain: boolean; at: number }> = [];
+  const legKey = (method: string, url: string): string => `${String(method || "").toUpperCase()} ${String(url || "").split("#")[0]}`;
+  const drainOn = (pg: unknown): boolean => !!pg && [...drains.values()].some((d) => d.page === pg);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const letThrough = async (route: any, request: any, via: RedirectHop | null): Promise<void> => {
+    if (!via) {
+      try {
+        const pg = pageOfRequest(request);
+        const now = Date.now();
+        for (let i = sentLegs.length - 1; i >= 0; i--) if (now - sentLegs[i].at > 600_000) sentLegs.splice(i, 1);
+        sentLegs.push({ key: legKey(request.method(), request.url()), request, hop: 0, from: "", ownWrite: ownWriteOn(pg), drain: drainOn(pg), at: now });
+      } catch { /* unreadable: its redirect cannot be judged as this run's (it continues, as on main) */ }
+    }
+    await route.fallback().catch(() => null);
+  };
+  // `via`: a redirect's Location, judged as a fresh request (#358, judgePaused). A hop never takes the
+  // approved or the information-page slot, and its own-write / drain exemption is its first leg's.
+  const handler = async (route: any, request: any, via: RedirectHop | null = null): Promise<void> => {
     let method = "";
     let url = "";
     try { method = String(request.method() || "").toUpperCase(); url = String(request.url() || ""); } catch { /* unreadable: fall through as not-GET */ }
@@ -838,7 +895,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     let resourceType = "";
     try { resourceType = String(request.resourceType() || ""); } catch { /* keep "" */ }
     const abort = async (rule: BackstopRule, why: string): Promise<void> => {
-      aborts.push({ rule, method: method || "?", where: whereOf(url), why, resourceType });
+      aborts.push({ rule, method: method || "?", where: whereOf(url), why, resourceType, ...(via ? { redirect: { from: via.from, status: via.status, hop: via.hop } } : {}) });
       await route.abort("blockedbyclient").catch(() => null);
     };
     // R0 — THE INFORMATION-PAGE SLOT IS CONSUMED by the FIRST request that could be the verified
@@ -847,7 +904,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     // filing-URL rule, the windows and the sticky lock (4a) below exactly as on main, and only 4(b)
     // can be lifted — only when R2-R5 all hold (URL, media, ordered body, the page's address).
     let infoAdmit: { entryId: string; refusals: string[]; tokens: string[]; ack: string[]; reserve: InfoPageReserve } | null = null;
-    if (infoSlotLive()) {
+    if (!via && infoSlotLive()) {
       const s = infoSlot!;
       const pg = pageOfRequest(request);
       let navigation = false;
@@ -881,7 +938,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     // The approved click's ONE request takes the slot (checked after the payment rule: a payment
     // never uses it) — and only a request from the clicked page that can BE the click's filing.
     let approved = false;
-    if (slotLive()) {
+    if (!via && slotLive()) {
       const pg = pageOfRequest(request);
       let navigation = false;
       try { navigation = !!request.isNavigationRequest(); } catch { /* unknown: not a navigation */ }
@@ -933,15 +990,17 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       let navigation = true;
       try { navigation = !!request.isNavigationRequest(); } catch { /* unknown: a navigation */ }
       const documentRequest = navigation || /^document$/i.test(resourceType);
-      let ownWrite = !documentRequest && ownWriteOn(pg);
-      if (!ownWrite && pg && !navigation && /^(xhr|fetch)$/i.test(resourceType) && [...drains.values()].some((d) => d.page === pg)) {
+      let ownWrite = !documentRequest && (via ? via.ownWrite : ownWriteOn(pg));
+      if (!ownWrite && pg && !navigation && /^(xhr|fetch)$/i.test(resourceType) && (via ? via.drain : drainOn(pg))) {
         let pageUrl = "";
         try { pageUrl = typeof pg.url === "function" ? String(pg.url() || "") : ""; } catch { pageUrl = ""; }
         const origin = originOf(url);
         ownWrite = origin !== "" && origin === originOf(pageUrl);
       }
       if (!ownWrite) {
-        await abort("review-lockdown", `PROOF OF PROGRESS — the page a verified information page led to has not taken this job's own data yet (${infoProof.state === "strayed" ? "it already tried to send it somewhere other than the interview's own form" : infoProof.state === "left" ? "the run left it first" : "nothing bound to the job was entered there"}), so nothing leaves it (${label})`);
+        await abort("review-lockdown", via
+          ? `PROOF OF PROGRESS — the portal answered a request sent after a verified information page's click with a ${via.status} redirect (that request reached the portal); nothing follows it before this job's own data is entered on the page the click led to (${label})`
+          : `PROOF OF PROGRESS — the page a verified information page led to has not taken this job's own data yet (${infoProof.state === "strayed" ? "it already tried to send it somewhere other than the interview's own form" : infoProof.state === "left" ? "the run left it first" : "nothing bound to the job was entered there"}), so nothing leaves it (${label})`);
         return;
       }
     }
@@ -959,8 +1018,8 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       let navigation = true;
       try { navigation = !!request.isNavigationRequest(); } catch { /* unknown: a navigation */ }
       const documentRequest = navigation || /^document$/i.test(resourceType);
-      let ownWrite = !documentRequest && ownWriteOn(pg);
-      if (!ownWrite && pg && !navigation && /^(xhr|fetch)$/i.test(resourceType) && [...drains.values()].some((d) => d.page === pg)) {
+      let ownWrite = !documentRequest && (via ? via.ownWrite : ownWriteOn(pg));
+      if (!ownWrite && pg && !navigation && /^(xhr|fetch)$/i.test(resourceType) && (via ? via.drain : drainOn(pg))) {
         let pageUrl = "";
         try { pageUrl = typeof pg.url === "function" ? String(pg.url() || "") : ""; } catch { pageUrl = ""; }
         const origin = originOf(url);
@@ -996,23 +1055,23 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         // terminal-reading page — PowerClerk's Terms checkbox at review, its per-field Autosave
         // POST — is that write's commit, not the page acting on its own. It passes; everything
         // else a terminal page posts is still aborted.
-        const own = pg ? [...ownWrites.values()].find((w) => w.page === pg) : undefined;
+        const own = via ? via.ownWrite : !!pg && ownWriteOn(pg);
         if (own) {
           ownWriteRequests.push(whereOf(url));
-          await forward(route, request, hop);
+          await letThrough(route, request, via);
           return;
         }
         // THE RUN'S OWN SAVE, STILL IN FLIGHT (dryrun-0928 B3): while drainOwnWrites holds the page, a
         // fetch / XHR to the page's OWN origin is the portal committing what the run wrote — never a
         // document request (a form submit), never another origin (a tracker), never a navigation.
-        const drain = pg ? [...drains.values()].find((d) => d.page === pg) : undefined;
+        const drain = via ? via.drain : drainOn(pg);
         if (drain && !navigation && /^(xhr|fetch)$/i.test(resourceType)) {
           let pageUrl = "";
           try { pageUrl = typeof pg.url === "function" ? String(pg.url() || "") : ""; } catch { pageUrl = ""; }
           const origin = originOf(url);
           if (origin !== "" && origin === originOf(pageUrl)) {
             drainRequests.push(whereOf(url));
-            await forward(route, request, hop);
+            await letThrough(route, request, via);
             return;
           }
         }
@@ -1049,7 +1108,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
           // are held from its first byte, not only after checkInfoPageAfterClick returns.
           infoProof = { page: pg, entryId: infoAdmit.entryId, state: "pending", checked: false };
           infoProofEndpoint = whereOf(url);
-          await forward(route, request, hop);
+          await letThrough(route, request, via);
           return;
         }
         // AN UNVERIFIED INFORMATION PAGE'S HELD REQUEST, OBSERVED (#344): the watch the click opened
@@ -1078,79 +1137,78 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     }
     // The slot's request was not one 4(b) would have held: it passes as on main (recorded).
     if (infoAdmit && infoAdmit.refusals.length === 0) infoPageAdmissions.push({ entryId: infoAdmit.entryId, where: whereOf(url), exempted: false });
-    await forward(route, request, hop);
-  };
-
-  // A ROUTE BELOW THIS ONE ANSWERS (a smoke's fixture server, a test's loopback-only guard, the demo
-  // recorder's fake portal, a second run's backstop on the same context): hand the request on with
-  // fallback() as before, so that route still decides — route.fetch would go straight to the network
-  // past it. Read from Playwright's handler list (no public API says what lies below); unreadable,
-  // or this handler not found in it, reads as "nothing below": the backstop sends it itself.
-  const lowerRouteTakes = (url: string): boolean => {
-    let routes: unknown;
-    try { routes = (target as { _routes?: unknown })._routes; } catch { return false; }
-    if (!Array.isArray(routes)) return false;
-    const i = routes.findIndex((r) => r && (r as { handler?: unknown }).handler === handler);
-    if (i < 0) return false;
-    return routes.slice(i + 1).some((r) => {
-      try { return typeof (r as { matches?: unknown })?.matches !== "function" || !!(r as { matches: (u: string) => boolean }).matches(url); } catch { return true; }
-    });
-  };
-  // THE ALLOWED REQUEST GOES OUT HERE (#358): sent by the backstop with maxRedirects 0. A
-  // method-keeping redirect (redirectKeepsMethod) is a NEW request to its Location: the whole
-  // handler judges it, from the same page / frame / resource type, with nothing the first leg
-  // consumed (the approved slot, the information-page slot) — then this follows it, at most
-  // MAX_REDIRECT_HOPS times. A redirect that turns into a GET (303; 301 / 302 of a POST) is handed to
-  // the browser as the response, which follows it as an ordinary GET. A failed send is ABORTED,
-  // never handed on unjudged. KNOWN COSTS: a followed 307 / 308 navigation shows the final page under
-  // the first URL; a judged hop of the approved filing meets the filing-URL rule like any other
-  // request. NOT COVERED (as on main, the redirect is the browser's): a body Chromium does not give
-  // interception (bodyCanBeReplayed — an <input type=file> upload) and a request a route below this
-  // one answers (lowerRouteTakes).
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const forward = async (route: any, request: any, hop: number): Promise<void> => {
-    let url = "";
-    let method = "";
-    try { url = String(request.url() || ""); method = String(request.method() || "").toUpperCase(); } catch { /* checked below */ }
-    if (hop === 0) {
-      let contentType = "";
-      let body: Buffer | null = null;
-      try { contentType = String(request.headers()["content-type"] || ""); } catch { contentType = ""; }
-      try { body = request.postDataBuffer(); } catch { body = null; }
-      if (lowerRouteTakes(url) || !bodyCanBeReplayed(contentType, body)) {
-        await route.fallback().catch(() => null);
-        return;
-      }
-    }
-    const fail = async (why: string): Promise<void> => {
-      forwardFailures.push({ method: method || "?", where: whereOf(url), why: why.slice(0, 160) });
-      await route.abort("failed").catch(() => null);
-    };
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    let res: any;
-    try { res = await route.fetch({ url, maxRedirects: 0, timeout: FORWARD_TIMEOUT_MS }); }
-    catch (e) { await fail(`the request could not be sent (${String((e as { message?: string })?.message ?? e).split("\n")[0]})`); return; }
-    let status = 0;
-    let location = "";
-    try { status = Number(res.status()); location = String(res.headers()["location"] || ""); } catch { /* fulfilled as is */ }
-    if (redirectKeepsMethod(status, method) && location) {
-      await Promise.resolve(res.dispose()).catch(() => null);
-      let next = "";
-      try { next = new URL(location, url).href; } catch { next = ""; }
-      const resourceType = (() => { try { return String(request.resourceType() || ""); } catch { return ""; } })();
-      const refuse = async (why: string): Promise<void> => {
-        aborts.push({ rule: "filing-url", method: method || "?", where: whereOf(next || url), why, resourceType });
-        await route.abort("blockedbyclient").catch(() => null);
-      };
-      if (!/^https?:\/\//i.test(next)) { await refuse(`a ${status} redirect to a Location the backstop cannot judge (${label})`); return; }
-      if (hop >= MAX_REDIRECT_HOPS) { await refuse(`a ${status} redirect past ${MAX_REDIRECT_HOPS} hops — the backstop follows no more (${label})`); return; }
-      await handler(route, asRedirectedTo(request, next), hop + 1);
-      return;
-    }
-    await route.fulfill({ response: res }).catch(() => null);
+    await letThrough(route, request, via);
   };
 
   await target.route("**/*", handler);
+  // THE RESPONSE STAGE (#358): a paused response of a request this run let through. A 3xx that
+  // re-sends a state-changing request is judged by the handler as a fresh request to its Location
+  // (asRedirectedTo, `via`): it passes (Chromium follows it) only where the handler would let that
+  // request through. Every other response of the chain ends it and continues at once. A response
+  // this run did not send is not its to judge (null). Matched by method + URL on the first pause,
+  // then by the chain's network id (the same for every leg of one redirect chain).
+  const chains = new Map<string, { request: any; hop: number; ownWrite: boolean; drain: boolean; at: number }>();
+  const judgePaused: PausedJudge = async (e) => {
+    if (disposed) return null;
+    const method = String(e.request?.method || "").toUpperCase();
+    const url = String(e.request?.url || "");
+    const net = String(e.networkId || "");
+    let chain = net ? chains.get(net) : undefined;
+    if (!chain) {
+      const i = sentLegs.findIndex((l) => l.key === legKey(method, url));
+      if (i < 0) return null;
+      const leg = sentLegs.splice(i, 1)[0];
+      chain = { request: leg.request, hop: leg.hop, ownWrite: leg.ownWrite, drain: leg.drain, at: leg.at };
+    }
+    if (net) chains.delete(net);
+    const status = Number(e.responseStatusCode || 0);
+    const location = String((e.responseHeaders || []).find((h) => /^location$/i.test(String(h?.name || "")))?.value || "");
+    if (/^(GET|HEAD|OPTIONS)$/.test(method) || !redirectKeepsMethod(status, method) || !location) return "continue";
+    const hop = chain.hop + 1;
+    const from = whereOf(url);
+    let resourceType = "";
+    try { resourceType = String(chain.request.resourceType() || ""); } catch { resourceType = ""; }
+    let next = "";
+    try { next = new URL(location, url).href.split("#")[0]; } catch { next = ""; }
+    const refuse = (where: string, why: string): "fail" => {
+      aborts.push({ rule: "filing-url", method: method || "?", where, why, resourceType, redirect: { from, status, hop } });
+      return "fail";
+    };
+    if (!/^https?:\/\//i.test(next)) {
+      const scheme = /^([a-z][a-z0-9+.-]*:)/i.exec(next || location.trim());
+      return refuse(next && scheme ? scheme[1].toLowerCase() : "(an unreadable Location)", `the Location cannot be judged (not an http(s) address) — not followed (${label})`);
+    }
+    if (hop > MAX_REDIRECT_HOPS) return refuse(whereOf(next), `more than ${MAX_REDIRECT_HOPS} redirects in a row — not followed (${label})`);
+    // The handler answers with fallback() (let through) or abort(); anything else is a refusal.
+    const outcome = { verdict: "fail" as "continue" | "fail" };
+    const hopRoute = {
+      fallback: async () => { outcome.verdict = "continue"; },
+      abort: async () => { outcome.verdict = "fail"; },
+    };
+    await handler(hopRoute, asRedirectedTo(chain.request, next), { hop, from, status, ownWrite: chain.ownWrite, drain: chain.drain });
+    const verdict = outcome.verdict;
+    if (verdict === "continue") {
+      const now = Date.now();
+      for (const [k, c] of chains) if (now - c.at > 600_000) chains.delete(k);
+      if (net) chains.set(net, { ...chain, hop, at: now });
+      else sentLegs.push({ key: legKey(method, next), request: chain.request, hop, from, ownWrite: chain.ownWrite, drain: chain.drain, at: now });
+    }
+    return verdict;
+  };
+  // A request a route below this one answered, or that failed before any response, never pauses.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const forgetLeg = (r: any): void => { const i = sentLegs.findIndex((l) => l.request === r); if (i >= 0) sentLegs.splice(i, 1); };
+  try {
+    if (ctx && typeof ctx.on === "function") {
+      ctx.on("requestfailed", forgetLeg);
+      unwatch.push(() => { try { ctx.off("requestfailed", forgetLeg); } catch { /* context gone */ } });
+    }
+  } catch { /* no events (a double) */ }
+  let leaveGuard: (() => Promise<void>) | null = null;
+  try {
+    const browser = ctx && typeof ctx.browser === "function" ? ctx.browser() : null;
+    leaveGuard = await joinRedirectGuard(browser, judgePaused);
+  } catch { leaveGuard = null; }
   const bs: FilingBackstop = {
     aborts,
     openWindow(rule, why) {
@@ -1247,7 +1305,6 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       return () => { drains.delete(id); };
     },
     drainRequests,
-    forwardFailures,
     approvedSlotOpen() { return slotLive(); },
     closeApprovedSlot() { closeSlot(); },
     lockReview(why: string) {
@@ -1255,6 +1312,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       if (!locked) locked = `the run is at review (${String(why || label).slice(0, 100)}) — nothing legitimate posts from here until a person takes the page`;
     },
     stoppingAborts() { return aborts.filter(isStoppingAbort); },
+    redirectsJudged: !!leaveGuard,
     async openInfoPagePass(pg: unknown, control: unknown, opts: { entries: ReadonlyArray<VerifiedInfoPage>; run: InfoPageRunState; reserve?: InfoPageReserve }): Promise<InfoPagePassOpen> {
       // A new open closes any earlier slot or watch (a candidate already observed is kept).
       closeInfo();
@@ -1388,6 +1446,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       drains.clear();
       locked = "";
       for (const u of unwatch.splice(0)) u();
+      if (leaveGuard) await leaveGuard();
+      sentLegs.length = 0;
+      chains.clear();
       await target.unroute("**/*", handler).catch(() => null);
     },
   };
@@ -1396,8 +1457,21 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   return bs;
 }
 
+/** What reached the portal, for a run's stop message: a refused REDIRECT (#358) followed a request
+ *  that did reach it — never "Nothing was sent" after a first leg went. */
+export function backstopSentLine(a: BackstopAbort): string {
+  return a.redirect
+    ? `The request to ${a.redirect.from} reached the portal, which answered with a ${a.redirect.status} redirect; the backstop did not let it go on to ${a.where}.`
+    : "Nothing was sent.";
+}
+
 /** One line per abort, for a run's warnings. */
 export function describeBackstopAbort(a: BackstopAbort): string {
+  if (a.redirect) {
+    const r = a.redirect;
+    const why = a.rule === "review-lockdown" ? `REVIEW-PAGE LOCKDOWN — ${a.why}` : a.rule === "filing-url" ? a.why : `fired while ${a.rule === "dismisser-window" ? "an overlay dismisser click" : "a bot Enter on a review/terminal page"} was in flight (${a.why})`;
+    return `BACKSTOP REFUSED A ${r.status} REDIRECT of ${a.method} ${r.from} (that request reached the portal) to ${a.where} (${a.resourceType || "request"}${r.hop > 1 ? `, redirect ${r.hop} in a row` : ""}): ${why}; not followed`;
+  }
   const what = a.rule === "filing-url" ? a.why
     : a.rule === "review-lockdown" ? `REVIEW-PAGE LOCKDOWN — ${a.why}`
       : `fired while ${a.rule === "dismisser-window" ? "an overlay dismisser click" : "a bot Enter on a review/terminal page"} was in flight (${a.why})`;
