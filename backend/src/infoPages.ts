@@ -39,7 +39,7 @@
 // viewer's own org, on the pass's knowledge-base entry.
 import { DEFAULT_ORG_ID, type AppDb } from "./db";
 import { trackKind } from "./permitMonitor";
-import { isInformationalPageUrl, isUtilityPlatformUrl, portalHostOf, portalUrlsInText, salesforceTenantKind } from "./portalChannel";
+import { isInformationalPageUrl, isPermitPortalUrl, isUtilityPlatformUrl, namedInterconnectionPlatforms, portalHostOf, portalUrlsInText, salesforceTenantKind } from "./portalChannel";
 import { utilityFilingKey } from "./utilityFilingLookup";
 import { sameUtilityEntity } from "./utilityIdentity";
 import { sameEntity } from "./portalRecipes";
@@ -276,12 +276,17 @@ function trackedRowSide(t: Row): Side | null {
 }
 const KNOWN_PERMIT_TRACKS = new Set(["building", "electrical", "combo", "permit", "mpu", "structural"]);
 
-/** A POSITIVE interconnection platform (Helm's review, blocker 1): a utility platform host — never a
- *  Salesforce tenant the classifier cannot place. isUtilityPlatformUrl fails closed for LAUNCHING on
- *  the permit track, so it reads an unknown tenant (a city's own my.site.com portal) as a utility's;
- *  as evidence that a filing was made ELSEWHERE that would fail open. */
+/** A POSITIVE interconnection platform (Helm's review, blocker 1; round 3: THE HOST ONLY): a host on
+ *  the utility platform list (PowerClerk, ConnectTheGrid, customerapplication.com, a utility's own
+ *  domain) — and NEVER a Salesforce Experience site. isUtilityPlatformUrl fails closed for LAUNCHING
+ *  on the permit track, so it reads an unknown tenant (a city's own my.site.com portal) as a
+ *  utility's; and salesforceTenantKind's "utility" rests on words that say nothing about who owns
+ *  the host — a utility word, suffix or brand anywhere in the label ("coopercity", "edisonnj",
+ *  "cityofelectriccity") or an interconnection word in the PATH (a carve-out NEM learn on the city's
+ *  own site at /s/interconnection-application). As evidence that a filing was made ELSEWHERE, either
+ *  would fail open: a Salesforce site is never one here. */
 function isPositiveInterconnectionPlatform(u: string): boolean {
-  return isUtilityPlatformUrl(u) && salesforceTenantKind(u) !== "unknown";
+  return isUtilityPlatformUrl(u) && salesforceTenantKind(u) === null;
 }
 
 /** POSITIVE EVIDENCE THAT THIS UTILITY'S NEM IS FILED ON ITS OWN PLATFORM (#365): its own records —
@@ -291,7 +296,11 @@ function isPositiveInterconnectionPlatform(u: string): boolean {
  *  operator may have filed it there by hand), any other portal, or nothing at all: false.
  *  WHOSE records: only a STRONG match (a known identity, or the same name) is evidence FOR the
  *  platform; a row that matches only by the fuzzy entity score (portalRecipes.sameEntity) can add
- *  caution — a non-platform portal there counts the number — but never vouches for a platform. */
+ *  caution — a non-platform portal there counts the number — but never vouches for a platform.
+ *  THE UTILITY FILING LOOKUP (round 3, items 2 and 4) can make the number count — a filing that
+ *  names no platform, a URL its source page names off the platform, a source page on a host in
+ *  question or on a permit vendor's — but is never the only record that vouches: a web-researched,
+ *  shared lookup alone, with no KB row or utility recipe of this utility naming a platform, counts. */
 function utilityFilesOnlyOnInterconnectionPlatform(db: AppDb, state: string, utility: string, hostsInQuestion: ReadonlySet<string>): boolean {
   if (!utility.trim()) return false;
   const st = state.trim().toUpperCase();
@@ -301,35 +310,59 @@ function utilityFilesOnlyOnInterconnectionPlatform(db: AppDb, state: string, uti
   const strong = (r: Row) => sameState(r) && (sameUtilityEntity(state, s(r.utility), utility) || norm(s(r.utility)) === norm(utility));
   const weak = (r: Row) => !strong(r) && sameEntity(state, utility, s(r.state).trim() || state, s(r.utility));
   const rows: Array<{ r: Row; urls: string[] }> = [
-    // portal_url read RAW (Helm's review, S4: portalUrlsInText's TLD list drops .online, .co, .city…);
-    // portal_name is free text, read for the links in it.
+    // portal_url read RAW (Helm's review, S4: portalUrlsInText's TLD list drops .online, .co, .city…)
+    // AND for the links in it (round 3, S4: a scheme-less value — "permits.x.gov/apply", which the KB
+    // route stores verbatim — has no host read raw, and a value holding two URLs would show only its
+    // first); portal_name is free text, read for the links in it.
     ...db.query<Row>("SELECT state, utility, portal_url, portal_name FROM permit_utility_knowledge WHERE (ahj IS NULL OR ahj = '') AND utility != ''")
-      .map((r) => ({ r, urls: [s(r.portal_url), ...portalUrlsInText(s(r.portal_name))] })),
+      .map((r) => ({ r, urls: [s(r.portal_url), ...portalUrlsInText(s(r.portal_url)), ...portalUrlsInText(s(r.portal_name))] })),
     ...db.query<Row>("SELECT state, utility, portal_url FROM portal_recipes WHERE scope_type = 'utility' AND portal_url IS NOT NULL AND portal_url != ''")
       .map((r) => ({ r, urls: [s(r.portal_url)] })),
   ];
   // WHERE THE PRODUCT SAYS THIS UTILITY TAKES ITS APPLICATION (Helm's review, blocker 2): the utility
   // filing lookup (migration v37) — the NEM track card shows its URL ahead of a seeded KB row, so it is
-  // the utility's own record, keyed by its exact name. Its portal and any portal it named but did not
-  // keep are strong evidence. A lookup that cannot be read: no evidence for a platform (counts).
+  // the utility's own record, keyed by its exact name. A lookup that cannot be read: no evidence for a
+  // platform (counts).
   let lookupUrls: string[];
+  let lookupSource = "";
   try {
     const row = db.get<Row>("SELECT payload_json FROM utility_filing_lookups WHERE profile_key = ?", [utilityFilingKey(state, utility)]);
     // A row that cannot be parsed throws: unknown, so no evidence for a platform (counts).
     const filing = row ? ((JSON.parse(s(row.payload_json) || "{}") as Row).filing as Row | undefined) : undefined;
-    const value = filing && typeof filing.value === "object" && filing.value ? (filing.value as Row) : null;
-    lookupUrls = [s(value?.url), s(filing?.claimed)].filter(Boolean);
+    const raw = filing && typeof filing === "object" ? filing.value : undefined;
+    // A filing value of a shape this code does not know: unknown, so it counts.
+    if (raw !== undefined && raw !== null && typeof raw !== "object") return false;
+    const value = raw && typeof raw === "object" ? (raw as Row) : null;
+    // (a) A FILING THAT NAMES NO PLATFORM IS EVIDENCE AGAINST ONE (round 3, B2). The lookup's door
+    //     (acceptFilingUrl → hostFitsTrackAndEntity on the NEM track) drops every permit-vendor URL
+    //     and keeps only the name: "City of Cedarvale Accela Citizen Access", url null. A filing whose
+    //     own URL is not a positive platform and whose name names none — the utility may take its
+    //     application on the city's portal: it counts. (A platform named with no tenant URL —
+    //     "PowerClerk", url null — is not evidence against it.)
+    if (value && !isPositiveInterconnectionPlatform(s(value.url)) && !namedInterconnectionPlatforms(s(value.name)).length) return false;
+    // (b) Its URL, and every URL its source page's own words name (the quote), are portals the
+    //     utility's page names: strong evidence.
+    lookupUrls = [s(value?.url), ...portalUrlsInText(s(filing?.quote))].filter(Boolean);
+    // The source page is where the answer was READ, not where it is filed (usually the utility's own
+    //     interconnection page): it reaches the own-host guard below, so a lookup read off the city's
+    //     own site counts the number there — and, on a permit vendor's host or a self-hosted permit
+    //     install (the city's Accela tenant), the strong set too.
+    lookupSource = s(filing?.sourceUrl).trim();
+    if (isPermitPortalUrl(lookupSource)) lookupUrls.push(lookupSource);
   } catch {
     return false;
   }
   const keep = (u: string) => portalHostOf(u) !== "" && !isInformationalPageUrl(u);
   const portals = (pick: (r: Row) => boolean) => rows.filter((x) => pick(x.r)).flatMap((x) => x.urls).filter(keep);
-  const own = [...portals(strong), ...lookupUrls.filter(keep)];
+  const records = portals(strong);
+  const own = [...records, ...lookupUrls.filter(keep)];
   const fuzzy = portals(weak);
-  // A portal this utility names (strong or fuzzy, platform or not) ON a portal in question: it may
-  // have filed here — never skipped.
-  if ([...own, ...fuzzy].some((u) => hostsInQuestion.has(portalHostOf(u)))) return false;
-  if (!own.length || !own.every((u) => isPositiveInterconnectionPlatform(u))) return false;
+  // A portal this utility names (strong or fuzzy, platform or not), or the page its lookup was read
+  // off, ON a portal in question: it may have filed here — never skipped.
+  if ([...own, ...fuzzy, lookupSource].some((u) => hostsInQuestion.has(portalHostOf(u)))) return false;
+  // THE LOOKUP NEVER VOUCHES ALONE (round 3, item 4): one of this utility's own KB rows or recipes
+  // must name a portal — and, with everything else it names, a platform.
+  if (!records.length || !own.every((u) => isPositiveInterconnectionPlatform(u))) return false;
   return fuzzy.every((u) => isPositiveInterconnectionPlatform(u));
 }
 
@@ -398,14 +431,16 @@ interface PriorProgressReasons {
  *
  * HARD (a person can never lift these here — the page is then done by hand for this project):
  *   - a tracked application or permit number of this project (trackedNumberHardReason, #365). A
- *     number of the OTHER side is skipped only on POSITIVE evidence that it was filed elsewhere: a
- *     NEM number when this utility's own records (KB rows of any confidence, its recipes) name a
- *     portal and every one is a utility interconnection platform (PowerClerk and kin — never a
- *     city's permit portal); a permit number when every portal in question is such a platform
- *     (permits are never filed there). A row on the columns' defaults or with contradictory columns,
- *     a number recorded on this very host, a utility that names any other portal or none, or no
- *     portal given: it counts, as before. Asked again at the admission on the page the request
- *     actually leaves from (reserveInfoPagePassUse);
+ *     number of the OTHER side is skipped only on POSITIVE, HOST-LEVEL evidence that it was filed
+ *     elsewhere: a NEM number when this utility's own records (KB rows of any confidence, its
+ *     recipes) name a portal and every one is a utility interconnection platform host (PowerClerk
+ *     and kin, a utility's own domain — never a city's permit portal, never a Salesforce site,
+ *     whatever its label or path), and its filing lookup names no other (the lookup never vouches
+ *     alone); a permit number when every portal in question is such a platform host (permits are
+ *     never filed there). A row on the columns' defaults or with contradictory columns, a number
+ *     recorded on this very host, a NEM row that kept a URL off the platform, a utility that names
+ *     any other portal or none, or no portal given: it counts, as main counts it. Asked again at the
+ *     admission on the page the request actually leaves from (reserveInfoPagePassUse);
  *   - a submission on this side in any status but "failed" (staged, awaiting a person, paused,
  *     submitted, approved, issued — and any status not known here);
  *   - a portal run on this side with a confirmation number, or in any status but queued / running
