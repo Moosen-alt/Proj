@@ -356,7 +356,10 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
     r.review.ok === true && r.review.data.humanSubmittedInReviewWindow === true && r.review.data.finalSubmitClicked === false, rbrief(r));
 }
 {
-  const r = await replay("B2", { onArmed: (page) => personClicks(page) });
+  // The click settles (its watch report and its held request) before the run can hand over: the watch
+  // stamps an input when its report reaches the run, so a click a few ms before the hand-over could
+  // otherwise count as after it — and a person's own click after the hand-over is let through.
+  const r = await replay("B2", { onArmed: async (page) => { await personClicks(page); await sleep(500); } });
   check("B2 the person clicks BEFORE the hand-over: held, nothing reached the portal", r.posts.length === 0, rbrief(r));
   check("B2 …the run is not failed, and it says plainly to click again", r.ok === true && (r.message.includes(HUMAN_CLICK_HELD_NOTE) || JSON.stringify(r.data).includes("YOUR CLICK WAS HELD BACK") || JSON.stringify(r.review.data).includes("YOUR CLICK WAS HELD BACK")), rbrief(r));
   check("B2 …and the error page a held click leaves is not 'where the run stopped' (never 'stopped before review')", r.pauseReason !== "stopped_before_review", rbrief(r));
