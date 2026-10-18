@@ -233,7 +233,12 @@ export async function sweepEmptyRequiredControls(
       while (cont && cont !== document.body && !members.every((r) => cont!.contains(r))) cont = cont.parentElement;
       if (!cont || cont === document.body) continue;
       const text = (cont.innerText || "").replace(/\s+/g, " ").trim();
-      if (!/\*/.test(text.slice(0, 200)) && !COMPLAINT.test(text)) continue;
+      // Required by the markup too (#362): a member's own `required` / aria-required, or its
+      // radiogroup's. A required "ready to submit?" group with no asterisk read as a clean page,
+      // and the stamped draft Submit was clicked past it.
+      const marked = members.some((r) => r.required || r.getAttribute("aria-required") === "true")
+        || !!members[0].closest('[role="radiogroup"][aria-required="true"]');
+      if (!marked && !/\*/.test(text.slice(0, 200)) && !COMPLAINT.test(text)) continue;
       push(text.replace(/\s*\*\s*/g, " ").trim(), "radio-group");
     }
 
