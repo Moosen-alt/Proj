@@ -38,7 +38,18 @@
 //                     required." (main gave that complaint to the wide slot above, by under a pixel);
 //                   heldOwnComplaint: the complaint sits under the held slot itself and no other empty
 //                     control is near — the held read-back discharges the empty BOX, never the portal's
-//                     complaint, which is reported unattributed.
+//                     complaint, which is reported unattributed;
+//                   heldDupAttachment: two uploaded slots captioned "Attachment *" (one sweep entry),
+//                     the complaint handed to the SECOND — its hand-off rides on the shared entry;
+//                   heldPlanSiteLine / heldDocumentsRow: the runner-up is the optional "Site photo",
+//                     also uploaded — read back as held, so the complaint is reported unattributed,
+//                     never as Site photo;
+//                   heldGridTiedRow: "Is the system grid-tied? *" in the held slot's row — a radio
+//                     group is never discharged as a held upload.
+//   MUST-EXCLUDE  A SELECT2 UTILITY LEFT BLANK (#327) — 0 POSTs, Utility named: Bootstrap 4
+//                 (select2Bs4Utility) and django-crispy-forms (select2CrispyUtility), a filled
+//                 Service address above. The 1 x 1 sliver's widget box is the whole form-group,
+//                 which ends past the complaint; it may only ever bring the sliver nearer.
 //
 // Run: npx tsx portal-bot/src/adapters/draftSubmitClick.dom.smoke.ts
 import "../smokeArtifactDirs";
@@ -81,11 +92,15 @@ const RECEIPT = page("Application Received", `<h1>Application Received</h1><p>Th
 // makes the slot read empty-but-held.
 const ERR = `color:#c00;position:absolute;font:14px/17px sans-serif;white-space:nowrap`;
 const HELD_SCRIPT = `<script>
-  document.getElementById('heldSlot').addEventListener('change', function () {
-    var f = this.files && this.files[0];
-    if (!f) return;
-    document.getElementById('heldList').textContent = 'Uploaded: ' + f.name;
-    this.value = '';
+  document.querySelectorAll('input[type=file]').forEach(function (slot) {
+    slot.addEventListener('change', function () {
+      var f = this.files && this.files[0];
+      if (!f) return;
+      var row = document.createElement('div');
+      row.textContent = 'Uploaded: ' + f.name;
+      document.getElementById('heldList').appendChild(row);
+      this.value = '';
+    });
   });
 </script>`;
 const HELD_LAYOUT: Record<string, string> = {
@@ -124,10 +139,72 @@ const HELD_LAYOUT: Record<string, string> = {
     <label for="heldSlot" style="position:absolute;left:8px;top:0">Plan set *</label>
     <input id="heldSlot" name="heldSlot" type="file" style="position:absolute;left:8px;top:20px;width:300px;height:26px;box-sizing:border-box">
     <span style="${ERR};left:8px;top:50px">This field is required.</span>`,
+  // TWO SLOTS SHARING A CAPTION (#327, should-fix 6). Both "Attachment *", both uploaded; Customer
+  // phone blank, its complaint on the SECOND slot's line and nearer that slot. The sweep reports
+  // one "Attachment" entry (the first slot's asterisk); the second slot's hand-off must ride on it.
+  heldDupAttachment: `
+    <label for="heldSlot" style="position:absolute;left:8px;top:0">Attachment *</label>
+    <input id="heldSlot" name="heldSlot" type="file" style="position:absolute;left:8px;top:20px;width:150px;height:26px;box-sizing:border-box">
+    <label for="custPhone" style="position:absolute;left:300px;top:0">Customer phone</label>
+    <input id="custPhone" name="custPhone" type="text" style="position:absolute;left:300px;top:20px;width:185px;height:21px;box-sizing:border-box">
+    <label for="heldSlot2" style="position:absolute;left:200px;top:46px;font-size:11px">Attachment *</label>
+    <input id="heldSlot2" name="heldSlot2" type="file" style="position:absolute;left:200px;top:60px;width:92px;height:26px;box-sizing:border-box">
+    <span style="${ERR};left:300px;top:72px">This field is required.</span>`,
+  // A HELD RUNNER-UP (#327, should-fix 7). "Plan set *" and the optional "Site photo", both
+  // uploaded; the complaint sits on their line just after Plan set, with Site photo the runner-up.
+  heldPlanSiteLine: `
+    <label for="heldSlot" style="position:absolute;left:8px;top:0">Plan set *</label>
+    <input id="heldSlot" name="heldSlot" type="file" style="position:absolute;left:8px;top:20px;width:150px;height:26px;box-sizing:border-box">
+    <span style="${ERR};left:164px;top:25px">This field is required.</span>
+    <label for="siteSlot" style="position:absolute;left:400px;top:0">Site photo</label>
+    <input id="siteSlot" name="siteSlot" type="file" style="position:absolute;left:400px;top:20px;width:150px;height:26px;box-sizing:border-box">`,
+  // ...and a documents row: both uploaded, a stale complaint left under Plan set.
+  heldDocumentsRow: `
+    <div style="display:flex;gap:24px">
+      <div style="width:260px"><label for="heldSlot">Plan set *</label><br><input id="heldSlot" name="heldSlot" type="file">
+        <div style="color:#c00">This field is required.</div></div>
+      <div style="width:260px"><label for="siteSlot">Site photo</label><br><input id="siteSlot" name="siteSlot" type="file"></div>
+    </div>`,
+  // A RADIO GROUP IN THE HELD SLOT'S ROW (#327, should-fix 8). The group is named by the row's text,
+  // which carries "Plan set", so it read as the held upload and was discharged with it.
+  heldGridTiedRow: `
+    <div style="display:flex;gap:12px;align-items:center">
+      <label for="heldSlot">Plan set *</label><input id="heldSlot" name="heldSlot" type="file">
+      <span>Is the system grid-tied? *</span>
+      <label><input type="radio" name="gridTied" value="yes"> Yes</label>
+      <label><input type="radio" name="gridTied" value="no"> No</label>
+    </div>`,
+};
+// A SELECT2 UTILITY (#327, blocking 2): select2 4 keeps the native <select> as a 1 x 1 clipped
+// sliver (select2-hidden-accessible) and draws its face as a SIBLING, so the sliver's nearest box is
+// the whole form-group: label, face, complaint and help text. Bootstrap 4's own metrics (16 px root,
+// line-height 1.5, 80 % feedback and help text, .25rem margins), inlined; no asterisk and no
+// `required`; a filled "Service address" above. Main named Utility; 9807442c judged the sliver by
+// that box alone, which ends 42.4 px (40.4 in the crispy wrapper) below the complaint's top — past
+// the -40 bound — and the complaint went to Service address and was dropped.
+const BS4 = `<style>
+  .bs4{font:16px/1.5 sans-serif;width:600px} .bs4 *,.bs4 *::before,.bs4 *::after{box-sizing:border-box}
+  .bs4 .form-group{margin-bottom:1rem} .bs4 label{display:inline-block;margin-bottom:.5rem}
+  .bs4 .form-control{display:block;width:100%;height:calc(1.5em + .75rem + 2px);padding:.375rem .75rem;font-size:1rem;line-height:1.5;border:1px solid #ced4da}
+  .bs4 .invalid-feedback{display:none;width:100%;margin-top:.25rem;font-size:80%;color:#dc3545} .bs4 .d-block{display:block!important}
+  .bs4 small{font-size:80%} .bs4 .form-text{display:block;margin-top:.25rem}
+  .bs4 .select2-container{display:inline-block;margin:0;position:relative;vertical-align:middle}
+  .bs4 .select2-selection--single{display:block;height:calc(1.5em + .75rem + 2px);border:1px solid #ced4da;padding:.375rem .75rem}
+  .select2-hidden-accessible{border:0!important;clip:rect(0 0 0 0)!important;clip-path:inset(50%)!important;height:1px!important;overflow:hidden!important;padding:0!important;position:absolute!important;width:1px!important;white-space:nowrap!important}
+</style>`;
+const S2_SELECT = `<select id="utilitySel" name="utilitySel" class="form-control select2-hidden-accessible is-invalid" tabindex="-1" aria-hidden="true"><option value=""></option><option value="u1">Sample Light Co</option></select>`;
+const S2_FACE = `<span class="select2 select2-container select2-container--bootstrap4" dir="ltr" style="width:100%"><span class="selection"><span class="select2-selection select2-selection--single" role="combobox" tabindex="0" aria-labelledby="select2-utilitySel-container"><span class="select2-selection__rendered" id="select2-utilitySel-container" role="textbox" aria-readonly="true"><span class="select2-selection__placeholder">Select a utility</span></span><span class="select2-selection__arrow" role="presentation"><b role="presentation"></b></span></span></span><span class="dropdown-wrapper" aria-hidden="true"></span></span>`;
+const S2_ADDRESS = `<div class="form-group"><label for="svcAddr">Service address</label><input id="svcAddr" name="svcAddr" class="form-control" value="5010 Fixture Ave"></div>`;
+const S2_HELP = `<small class="form-text text-muted">The utility that serves the meter.</small>`;
+const SELECT2_LAYOUT: Record<string, string> = {
+  // Bootstrap 4: label, select, face, .invalid-feedback, one .form-text line.
+  select2Bs4Utility: `${S2_ADDRESS}<div class="form-group"><label for="utilitySel">Utility</label>${S2_SELECT}${S2_FACE}<div class="invalid-feedback d-block">This field is required.</div>${S2_HELP}</div>`,
+  // django-crispy-forms: the error (a <strong> in a span) then the help, in a bare wrapper div.
+  select2CrispyUtility: `${S2_ADDRESS}<div id="div_id_utilitySel" class="form-group"><label for="utilitySel">Utility</label><div>${S2_SELECT}${S2_FACE}<span id="error_1_id_utilitySel" class="invalid-feedback d-block"><strong>This field is required.</strong></span>${S2_HELP}</div></div>`,
 };
 const heldBlock = (mode: string): string => HELD_LAYOUT[mode]
   ? `<div style="position:relative;height:120px;margin:12px 0">${HELD_LAYOUT[mode]}</div><div id="heldList" style="margin:8px 0"></div>${HELD_SCRIPT}`
-  : "";
+  : SELECT2_LAYOUT[mode] ? `${BS4}<div class="bs4">${SELECT2_LAYOUT[mode]}</div>` : "";
 const ERROR = page("Error", `<h1>Error</h1><p>An error has occurred. Please try again later.</p>`);
 
 const server = http.createServer((req, res) => {
@@ -157,8 +234,18 @@ const submitStep = (over: Partial<RecipeStep> = {}): RecipeStep => ({
 // The held-upload cases upload into the required slot before the review stop, which moves the
 // Submit to step index 5.
 const UPLOAD_STEP = { action: "upload", selector: { css: "#heldSlot" }, docType: "plan_set", viaFileChooser: false, note: "upload plan_set: Plan set" } as RecipeStep;
-const PLAN_SET = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "draft-held-")), "plan-set.pdf");
+const HELD_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "draft-held-"));
+const PLAN_SET = path.join(HELD_DIR, "plan-set.pdf");
 fs.writeFileSync(PLAN_SET, "%PDF-1.4\n%%EOF\n");
+const SITE_PHOTO = path.join(HELD_DIR, "site-photo.pdf");
+fs.writeFileSync(SITE_PHOTO, "%PDF-1.4\n%%EOF\n");
+const ATTACHMENT_2 = path.join(HELD_DIR, "attachment-two.pdf");
+fs.writeFileSync(ATTACHMENT_2, "%PDF-1.4\n%%EOF\n");
+const SITE_STEP = { action: "upload", selector: { css: "#siteSlot" }, docType: "site_photo", viaFileChooser: false, note: "upload site_photo: Site photo" } as RecipeStep;
+const ATTACH_STEPS = [
+  { action: "upload", selector: { css: "#heldSlot" }, docType: "plan_set", viaFileChooser: false, note: "upload plan_set: Attachment" } as RecipeStep,
+  { action: "upload", selector: { css: "#heldSlot2" }, docType: "other_attachment", viaFileChooser: false, note: "upload other_attachment: Attachment" } as RecipeStep,
+];
 const recipeFor = (mode: string, last: RecipeStep, before: RecipeStep[] = []): PortalRecipe => ({
   id: `draft-submit-${mode}`, scopeType: "utility", profileKey: "wa||twopart", state: "WA", ahj: "", utility: "Two-Part Utility",
   portalPlatform: "fixture", portalUrl: `${base}/m/${mode}/part1`, status: "complete", version: 1, createdBy: "smoke", createdAt: "", updatedAt: "", notes: "",
@@ -239,7 +326,9 @@ try {
     check("error: an error page after the click stops the run as the incident (not a draft)", submits(o) === 1 && o.r.pauseReason === "draft_submit_unexpected" && incidentOf(o)?.verdict === "not_a_draft" && o.r.finalSubmitClicked === false && !draftOf(o), brief(o));
   }
   // A REQUIRED FIELD LEFT BLANK BESIDE A HELD UPLOAD (#327): never a draft, and the blank is named.
-  const held = (mode: string) => stage(mode, submitStep(), { stamp: stamp(TENANT, 5), before: [UPLOAD_STEP], docs: { plan_set: PLAN_SET } });
+  const held = (mode: string, uploads: RecipeStep[] = [UPLOAD_STEP]) => stage(mode, submitStep(), {
+    stamp: stamp(TENANT, 4 + uploads.length), before: uploads, docs: { plan_set: PLAN_SET, site_photo: SITE_PHOTO, other_attachment: ATTACHMENT_2 },
+  });
   const notesOf = (o: Outcome): string[] => (Array.isArray(o.r.steps) ? (o.r.steps as Array<{ data?: { agingNotes?: unknown } }>) : [])
     .flatMap((st) => (Array.isArray(st?.data?.agingNotes) ? (st.data!.agingNotes as unknown[]).map(String) : []));
   const heldNote = (o: Outcome): string => notesOf(o).find((n) => /file box reads empty/.test(n)) ?? "";
@@ -254,6 +343,26 @@ try {
     check(`${mode}: the upload held (the page lists it, the box reads empty) — the fixture is the shape it claims`, /Plan set/.test(heldNote(o)), `${brief(o)} aging=${JSON.stringify(notesOf(o)).slice(0, 600)}`);
     check(`${mode}: ${field} is blank and the portal says so — the draft is NOT created (0 POSTs)`, submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
     check(`${mode}: the run names ${field} as the required field still empty`, re.test(refusalOf(o)), `refusal=${refusalOf(o)} | ${brief(o)}`);
+  }
+  // The held-upload follow-ups (#327 round 3): a shared caption, a held runner-up, a radio group in
+  // the held slot's row. Each 0 POSTs and the right blank named; `never` must not be named.
+  for (const [mode, uploads, slot, field, re, never] of [
+    ["heldDupAttachment", ATTACH_STEPS, /Attachment/, "Customer phone", /still empty on the page: .*Customer phone/, null],
+    ["heldPlanSiteLine", [UPLOAD_STEP, SITE_STEP], /Plan set/, "the portal's complaint (unattributed)", /still empty on the page: .*portal reports "This field is required\."/, /Site photo/],
+    ["heldDocumentsRow", [UPLOAD_STEP, SITE_STEP], /Plan set/, "the portal's complaint (unattributed)", /still empty on the page: .*portal reports "This field is required\."/, /Site photo/],
+    ["heldGridTiedRow", [UPLOAD_STEP], /Plan set/, "the grid-tied radio group", /still empty on the page: .*grid-tied/, null],
+  ] as Array<[string, RecipeStep[], RegExp, string, RegExp, RegExp | null]>) {
+    const o = await held(mode, uploads);
+    check(`${mode}: the upload held (the page lists it, the box reads empty) — the fixture is the shape it claims`, slot.test(heldNote(o)), `${brief(o)} aging=${JSON.stringify(notesOf(o)).slice(0, 600)}`);
+    check(`${mode}: ${field} is blank and the portal says so — the draft is NOT created (0 POSTs)`, submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
+    check(`${mode}: the run names ${field} as the required field still empty${never ? `, never ${never.source}` : ""}`, re.test(refusalOf(o)) && !(never && never.test(refusalOf(o))), `refusal=${refusalOf(o)} | ${brief(o)}`);
+  }
+  // A SELECT2 UTILITY LEFT BLANK (#327, blocking 2): no upload; the sliver's widget box (the whole
+  // form-group) must never push its complaint out of reach. 0 POSTs, Utility named.
+  for (const mode of ["select2Bs4Utility", "select2CrispyUtility"]) {
+    const o = await stage(mode, submitStep());
+    check(`${mode}: Utility (select2, blank, flagged under its face) — the draft is NOT created (0 POSTs)`, submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
+    check(`${mode}: the run names Utility as the required field still empty`, /still empty on the page: .*\bUtility\b/.test(refusalOf(o)), `refusal=${refusalOf(o)} | ${brief(o)}`);
   }
 } finally {
   server.close();

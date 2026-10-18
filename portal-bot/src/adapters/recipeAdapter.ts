@@ -94,7 +94,7 @@ import { exactUploadDocType, fileTypeAllowed, UPLOAD_LABEL_PATTERNS, uploadForbi
 import { reviewComparison, scrapeReviewScreen as scrapeReviewScreenShared, utilityIdentifiersEnteredBySteps, type ReviewMismatch } from "../reviewScreenScraper";
 import { sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
 import { openPortal } from "../browser";
-import { selectWithFallback, comboboxFaceInPage, lastComboboxPickedText } from "../comboboxFill";
+import { selectWithFallback, comboboxFaceInPage, type ComboboxPick } from "../comboboxFill";
 import {
   classifySubmissionText, finalSubmitEnvAllows, finalSubmitRefusals, isFinalSubmitControl, isPayFee, isPayNowDialogText, mayClickFinalSubmit,
   isRecipeShapeValid, isSignatureNameLabel, isSignatureRequestControl, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
@@ -244,8 +244,64 @@ const IDENTITY_CHECKED = new Set(["fill", "select", "check", "uncheck"]);
 /** A widget face showing no answer yet ("Please select...", "Choose one", "Nothing selected",
  *  "-- none --"): never evidence that a pick held (#327). */
 const FACE_PLACEHOLDER = /^\W*(please\s+)?(select|choose)\b|^\W*(nothing|none|not)\s+selected|^\W*no\s+selection|^\W*--/i;
+/** A widget face's words for EQUALITY with the option clicked (selectionHeld): case, whitespace
+ *  (nbsp too) and plain punctuation folded, the symbols that tell options apart kept — "≤ 10 kW"
+ *  and "> 10 kW" must not both read "10kw", nor "Solar + Storage" read as "Solar Storage". */
+const faceWords = (t: string): string =>
+  (t || "").toLowerCase().replace(/<=/g, "≤").replace(/>=/g, "≥")
+    .replace(/[^\p{L}\p{N}<>≤≥+\-−–—]/gu, "").replace(/[−–—]/g, "-").replace(/^-+|-+$/g, "");
+/** Does a clicked option answer the step? readbackMatches' containment either way, AND the same
+ *  with the symbols kept: "≤ 10 kW" does not answer "> 10 kW" (#327 review round 3). */
+const clickedAnswers = (clicked: string, want: string): boolean => {
+  const a = faceWords(clicked), b = faceWords(want);
+  return readbackMatches(clicked, want) && !!a && !!b && (a === b || a.includes(b) || b.includes(a));
+};
 /** A concealed backing input's key and own face, read before a pick (selectionHeld). */
 type BackingSnapshot = { key: string; face: string };
+/** In-page: does the control a rescue chose carry EXACTLY the recorded label and sit in EXACTLY
+ *  the recorded section (#327 review round 3)? Label and section are read by the same rules as
+ *  resolveBySection's `labelOf` / `sectionOf` — keep the two in step — and compared after the
+ *  same normalisation, with no containment: "Existing Model" is not "Model", "Existing
+ *  Inverter" is not "Inverter". An empty recorded or read section is not agreement. */
+const rescueMatchesRecordingInPage = (el: Element, arg: { label: string; section: string }): boolean => {
+  const clean = (t: string | null | undefined): string => (t || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  const norm = (t: string): string => clean(t).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const sectionOf = (node0: Element): string => {
+    const fs = node0.closest("fieldset");
+    const legend = fs ? fs.querySelector("legend") : null;
+    if (legend && clean(legend.textContent)) return clean(legend.textContent);
+    const container = node0.closest('section, [class*="panel"], [class*="card"], [class*="section"], [class*="form-section"], [class*="block"], [role="group"], [role="region"]');
+    if (container) {
+      const h = container.querySelector('legend, h1, h2, h3, h4, h5, h6, .panel-title, .card-title, .card-header, .section-title, .panel-heading');
+      if (h && clean(h.textContent)) return clean(h.textContent);
+    }
+    let node: Element | null = node0;
+    for (let hops = 0; node && hops < 6; hops++) {
+      let sib: Element | null = node.previousElementSibling;
+      while (sib) {
+        if (/^(H[1-6]|LEGEND)$/.test(sib.tagName) && clean(sib.textContent)) return clean(sib.textContent);
+        const inner = sib.querySelector ? sib.querySelector("h1, h2, h3, h4, h5, h6, legend") : null;
+        if (inner && clean(inner.textContent)) return clean(inner.textContent);
+        sib = sib.previousElementSibling;
+      }
+      node = node.parentElement;
+    }
+    return "";
+  };
+  const id = el.getAttribute("id");
+  const forLbl = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+  const label = clean(
+    el.getAttribute("aria-label")
+    || (forLbl ? forLbl.textContent : "")
+    || (el.closest("label") ? (el.closest("label") as HTMLElement).textContent : "")
+    || el.getAttribute("placeholder")
+    || "",
+  );
+  const wantL = norm(arg.label), wantS = norm(arg.section);
+  if (!wantL || !wantS) return false;
+  const sec = norm(sectionOf(el));
+  return !!sec && sec === wantS && norm(label) === wantL;
+};
 /** Steps that write project data. A missing control for one of these can legitimately mean
  *  "this portal did not ask that for this project" — unlike a missing button, which means
  *  the flow itself has drifted. */
@@ -531,6 +587,9 @@ export class RecipeAdapter extends BasePortalAdapter {
   private liveSignaturePause: string | null = null;
   private requiredFieldsSeen: string[] = [];
   private fieldsVerified: string[] = [];
+  /** The option the current select step's picker CLICKED (comboboxFill fills it per call). Per
+   *  adapter, never module-wide: two jobs replaying at once must not confirm each other (#327). */
+  private selectPick: ComboboxPick = { text: "" };
   private fieldsUnverified: string[] = [];
   /** Why each selector level was accepted or rejected, for the step currently resolving.
    *  Reported only when a step fails — see the note in resolveLocator. */
@@ -2761,7 +2820,8 @@ export class RecipeAdapter extends BasePortalAdapter {
 
   /** Is this concealed control an EMPTY SHADOW (#327): a native <select> with no option for the
    *  step's answer (or one of its certified make aliases) and no widget face of its own? Only
-   *  such a control may be passed over by the fingerprint redirect after a rescue. Generous
+   *  such a control may be passed over by the fingerprint redirect after a rescue. An option
+   *  whose VALUE equals the answer (a code: "TX", "PGE") counts as one for it. Generous
    *  towards "not a shadow" (containment either way, aliases), because that keeps main's
    *  redirect; unreadable = not a shadow. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2773,14 +2833,30 @@ export class RecipeAdapter extends BasePortalAdapter {
       if (node.tagName !== "SELECT") return "not-select";
       const n = (s: string): string => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
       const want = ws.map(n).filter(Boolean);
-      const real = Array.from((node as HTMLSelectElement).options)
+      const opts = Array.from((node as HTMLSelectElement).options);
+      const real = opts
         .map((o) => (o.textContent || "").replace(/\s+/g, " ").trim())
         .filter((t) => t && !/^\W*(please\s+)?(select|choose)\b|^\W*--/i.test(t))
         .map(n).filter(Boolean);
-      return real.some((t) => want.some((w) => t === w || t.includes(w) || w.includes(t))) ? "has-answer" : "empty";
+      // A code-valued option answers too (<option value="TX">Texas</option> for "TX",
+      // value="PGE" for "PGE"), as trySelect picks by value: the VALUE must equal the answer.
+      const values = opts.map((o) => n(o.getAttribute("value") ?? "")).filter(Boolean);
+      return real.some((t) => want.some((w) => t === w || t.includes(w) || w.includes(t)))
+        || values.some((v) => want.includes(v)) ? "has-answer" : "empty";
     }, wants).catch(() => "unreadable") as string;
     if (verdict !== "empty") return false;
     return (await el.evaluate(comboboxFaceInPage, "probe").catch(() => "unreadable")) === "";
+  }
+
+  /** Did a rescue land on the recorded question itself: the same label, in the same section,
+   *  both exact (rescueMatchesRecordingInPage)? Unreadable = no. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async rescueMatchesRecording(el: any, step: RecipeStep): Promise<boolean> {
+    if (!el || typeof el.evaluate !== "function") return false;
+    const label = String(step.fingerprint?.ariaLabel ?? step.selector?.label ?? "").trim();
+    const section = String(step.fingerprint?.section ?? "").trim();
+    if (!label || !section) return false;
+    return await el.evaluate(rescueMatchesRecordingInPage, { label, section }).catch(() => false) as boolean;
   }
 
   /** The name a person reads for a per-array step's control (used in the read-back's words). */
@@ -3600,10 +3676,23 @@ export class RecipeAdapter extends BasePortalAdapter {
         // So only an EMPTY SHADOW is passed over: a native <select> with no option for the
         // answer and no widget face of its own (PGE's opacity:0 "Model" holding only
         // "Select..."). Everything else keeps main's redirect.
+        //
+        // AND ONLY FOR A RESCUE THAT FOUND THE RECORDED QUESTION ITSELF. "Empty" and "no face"
+        // are read from the page, and both can be wrong: a select2 or Kendo list still
+        // cascading or loaded by ajax reads empty, and a widget whose wrapper is shared with
+        // its neighbours shows no face of its own. So the control the rescue chose must carry
+        // exactly the recorded label in exactly the recorded section (rescueMatchesRecording).
+        // "Existing Model", an "Existing Inverter" Model reached by a test hook, a "Mailing
+        // State" or "Utility Account Number" do not, and keep main's redirect — which lands the
+        // value, or reports the miss, but never writes a neighbour.
         const backOntoRejected = rescued && n === 1 && await this.looksOutOfReach(target)
+          && await this.rescueMatchesRecording(el0, step)
           && await this.isEmptyShadowSelect(target.first(), step);
         if (backOntoRejected) {
           this.resolveTrail.push(`  ...fingerprint #${String(fp.id || fp.name).slice(0, 40)} is the concealed control the rescue passed over — kept the rescue`);
+          this.driftWarnings.push(
+            `step "${recorded.slice(0, 44)}": the recorded control #${String(fp.id || fp.name).slice(0, 50)} is a concealed empty shadow — written into #${(got!.id || got!.name || "the visible control").slice(0, 50)}, the control with the same label in ${JSON.stringify(String(fp.section ?? "").slice(0, 30))}; re-record this step`,
+          );
         }
         if (n === 1 && !backOntoRejected && await this.insideArrayRow(target.first())) {
           const meant = await target.first().evaluate((el: Element) => {
@@ -4508,6 +4597,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         /** A concealed backing input's key and face BEFORE the pick, so the read-back can tell a
          *  pick that moved the key from a face that changed over a key that did not (#327). */
         let backingBefore = await this.backingSnapshot(scoped);
+        this.selectPick = { text: "" };
         // The page-side model rules can only read a NATIVE <select>. PowerClerk renders a
         // Vue combobox <input> on its spec pages, which exposes no <option> elements — and
         // treating "cannot read this control" as "no match" made the guard refuse every
@@ -4545,7 +4635,7 @@ export class RecipeAdapter extends BasePortalAdapter {
             await sleep(ADVANCE_SETTLE_MS);
           }
           if (picked) {
-            selected = await selectWithFallback(this.page, scoped, picked);
+            selected = await selectWithFallback(this.page, scoped, picked, this.selectPick);
             if (selected) landedAs = picked;
             if (selected && picked !== v) this.driftWarnings.push(`model "${v}" matched the portal's listing "${picked}"`);
           } else {
@@ -4589,7 +4679,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         // is an EMPTY or placeholder-only list, so gate on that.
         for (let attempt = 0; !selected && attempt < 3 && await this.optionsLookUnloaded(scoped); attempt++) {
           await sleep(800);
-          selected = await selectWithFallback(this.page, scoped, v);
+          selected = await selectWithFallback(this.page, scoped, v, this.selectPick);
           if (selected) this.driftWarnings.push(`select "${String(step.note ?? step.field ?? "")}" needed ${(attempt + 1) * 800}ms for its control to appear (cascade)`);
         }
         // A VOLATILE PRIMARY CAN RESOLVE TO THE WRONG CONTROL MID-RUN. The recorded css id
@@ -4698,7 +4788,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         if (selected) {
           const held = await this.selectionHeld(scoped, landedAs, backingBefore);
           if (held === false) {
-            const again = await selectWithFallback(this.page, scoped, landedAs).catch(() => false);
+            const again = await selectWithFallback(this.page, scoped, landedAs, this.selectPick).catch(() => false);
             if (again) await this.commitAndSettle(scoped);
             await this.waitForAutosaveCommitted();
             if ((await this.selectionHeld(scoped, landedAs, backingBefore)) !== true) {
@@ -7324,6 +7414,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  select). An unloaded or non-native control takes the old path unchanged. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async trySelect(loc: any, value: string, step: RecipeStep): Promise<{ selected: boolean; landedAs: string; how: "" | "meaning" | "known_negative" }> {
+    this.selectPick = { text: "" };
     const native = await this.isNativeSelect(loc);
     if (native && !(await this.optionsLookUnloaded(loc))) {
       // TEXT AND VALUE. selectOption(value) matches the option's VALUE attribute first, and a
@@ -7356,7 +7447,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         return { selected: false, landedAs: value, how: "known_negative" };
       }
     }
-    const selected = await selectWithFallback(this.page, loc, value);
+    const selected = await selectWithFallback(this.page, loc, value, this.selectPick);
     return { selected, landedAs: value, how: "" };
   }
 
@@ -7454,7 +7545,15 @@ export class RecipeAdapter extends BasePortalAdapter {
     const shown = await this.shownBy(scoped);
     if (!shown) return null;
     if (!shown.text.trim() && !shown.value.trim()) return false;
-    if (readbackMatches(shown.text, want) || (!!shown.value && readbackMatches(shown.value, want))) return true;
+    // A CONCEALED BACKING INPUT'S KEY IS NOT A FRAGMENT OF THE ANSWER. readbackMatches accepts
+    // containment either way, so a key "1" read back for "> 10 kW" matched ("10kw" contains
+    // "1") and a re-render that restored "≤ 10 kW" (key "1") verified (#327 review round 3).
+    // For such an input the value must SHOW the answer (equal, or the answer inside it), with
+    // the symbols kept; a native select or a visible input is judged exactly as before.
+    if (before) {
+      const sw = faceWords(shown.text), ww = faceWords(want);
+      if (sw && ww && (sw === ww || sw.includes(ww)) && readbackMatches(shown.text, want)) return true;
+    } else if (readbackMatches(shown.text, want) || (!!shown.value && readbackMatches(shown.value, want))) return true;
     // A WIDGET'S BACKING INPUT HOLDS THE OPTION'S KEY, NOT ITS TEXT (#327). Miami's Telerik Job
     // Category keeps <input id="JobCategoryID" style="display:none"> behind its face: picking
     // "STAND-ALONE" writes "5" there and "STAND-ALONE" on the face. Since fb9d5d56 added this
@@ -7471,15 +7570,27 @@ export class RecipeAdapter extends BasePortalAdapter {
     //     answer before the pick: a face that changed over an unchanged key still posts the
     //     old option.
     // A native select or a visible input is judged exactly as before.
+    //   - the option clicked must itself be an answer to the step (readbackMatches): a
+    //     trailing-token pass that clicked "Rule 21 - 7 kW or less" for "Schedule 7" is a
+    //     wrong pick, however faithfully the face then shows it;
+    //   - "equal" keeps the symbols that tell options apart: "≤ 10 kW" is not "> 10 kW".
+    //     Only case, whitespace (nbsp included), plain punctuation and a placeholder's edge
+    //     dashes ("-- None --") are folded; the placeholder test above is what refuses those.
+    //   - "moved" and "already held" are read from the input's OWN value, never from what
+    //     shownBy reports (for an empty role=combobox input that is the face's text), and an
+    //     input still empty after the pick has not taken it.
     if (!before || !(await this.isConcealedInput(scoped))) return false;
     const loc = scoped as { evaluate: (fn: unknown, arg?: unknown) => Promise<unknown> };
     const face = String(await loc.evaluate(comboboxFaceInPage, "own").catch(() => "") ?? "");
     if (!face || FACE_PLACEHOLDER.test(face)) return false;
-    const n = (t: string): string => t.toLowerCase().replace(/[^a-z0-9]/g, "");
-    const target = n(lastComboboxPickedText || want);
-    if (!target || n(face) !== target) return false;
-    const moved = before.key !== shown.text;
-    const alreadyHeld = !!before.key.trim() && n(before.face) === target;
+    const clicked = this.selectPick.text;
+    if (clicked && !clickedAnswers(clicked, want)) return false;
+    const target = faceWords(clicked || want);
+    if (!target || faceWords(face) !== target) return false;
+    const key = String(await loc.evaluate((el: Element) => (el as HTMLInputElement).value || "").catch(() => "") ?? "");
+    if (!key.trim()) return false;
+    const moved = before.key !== key;
+    const alreadyHeld = !!before.key.trim() && before.key === key && faceWords(before.face) === target;
     return moved || alreadyHeld;
   }
 
@@ -7784,8 +7895,20 @@ export class RecipeAdapter extends BasePortalAdapter {
     for (const name of found.requiredSeen) {
       if (!this.requiredFieldsSeen.includes(name)) this.requiredFieldsSeen.push(name);
     }
-    const held = await this.uploadSlotsHeld(found.empty.map((e) => e.name));
+    // ONLY A CONTROL'S OWN BLANK CAN BE A HELD UPLOAD (#327). A radio group is named by the text
+    // of the row that holds it, and a row that also holds the uploaded "Plan set" slot ("Plan set *
+    // [file] Is the system grid-tied? * Yes No") matched that slot's label and read as held: the
+    // unanswered group was discharged and the draft created. An unattributed complaint names no
+    // control at all. Neither is ever asked about, and neither is ever discharged.
+    const dischargeable = (e: EmptyRequired): boolean => e.why !== "radio-group" && e.why !== "unattributed-complaint";
+    // A RUNNER-UP CAN BE A HELD UPLOAD TOO. A complaint re-attributed from a held "Plan set *" to the
+    // optional "Site photo" beside it, which the run also uploaded, named an attached document as
+    // the blank. So the runner-up names are read back with the rest; a held one falls back to the
+    // unattributed complaint below.
+    const nexts = found.empty.flatMap((e) => (e.handed ?? []).map((h) => h.next)).filter(Boolean);
+    const held = await this.uploadSlotsHeld([...new Set([...found.empty.filter(dischargeable).map((e) => e.name), ...nexts])]);
     if (!held.size) return found;
+    const discharged = (e: EmptyRequired): boolean => dischargeable(e) && held.has(e.name);
     // A HELD UPLOAD DISCHARGES ITS OWN EMPTY BOX, NEVER THE PORTAL'S COMPLAINT (#327).
     //
     // The read-back proves the FILE is on the portal. It proves nothing about a "This field is
@@ -7794,10 +7917,12 @@ export class RecipeAdapter extends BasePortalAdapter {
     // the slot, and the draft-creating click went ahead with Customer phone blank. So a
     // complaint-derived blank on a held slot goes to the next-nearest empty control that is not
     // itself held, or, with none, is reported as the unattributed complaint it then is. Either
-    // way it stays a blank: a page the portal is refusing is never pass-through.
-    const empty = found.empty.filter((e) => !held.has(e.name));
+    // way it stays a blank: a page the portal is refusing is never pass-through. EVERY held
+    // entry's hand-offs, whatever it was reported for: two slots sharing a caption are one entry
+    // (asterisk, from the first), and the complaint the second was handed rides on it.
+    const empty = found.empty.filter((e) => !discharged(e));
     for (const e of found.empty) {
-      if (!held.has(e.name) || e.why !== "complaint") continue;
+      if (!discharged(e)) continue;
       for (const h of e.handed ?? []) {
         const toNext = !!h.next && !held.has(h.next);
         const name = toNext ? h.next : h.unattributed;

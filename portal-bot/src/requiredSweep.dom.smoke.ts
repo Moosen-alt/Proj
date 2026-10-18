@@ -29,6 +29,23 @@ const shell = (body: string): string =>
      .err{color:#c00;display:block} .form-group{margin:18px 0}
    </style></head><body>${body}</body></html>`;
 
+// Bootstrap 4 + select2 4 markup for the select2 pages (#327). Metrics as Bootstrap ships them.
+const bs4 = (body: string, width = 600): string =>
+  `<!doctype html><html><head><style>
+     html{font-size:16px} body{margin:0;padding:20px;font:16px/1.5 sans-serif} *,*::before,*::after{box-sizing:border-box}
+     form{width:${width}px} .form-group{margin-bottom:1rem} label{display:inline-block;margin-bottom:.5rem}
+     .form-control{display:block;width:100%;height:calc(1.5em + .75rem + 2px);padding:.375rem .75rem;font-size:1rem;line-height:1.5;border:1px solid #ced4da}
+     .invalid-feedback{display:none;width:100%;margin-top:.25rem;font-size:80%;color:#dc3545} .d-block{display:block!important}
+     small{font-size:80%} .form-text{display:block;margin-top:.25rem}
+     .select2-container{display:inline-block;margin:0;position:relative;vertical-align:middle}
+     .select2-selection--single{display:block;height:calc(1.5em + .75rem + 2px);border:1px solid #ced4da;padding:.375rem .75rem}
+     .select2-hidden-accessible{border:0!important;clip:rect(0 0 0 0)!important;clip-path:inset(50%)!important;height:1px!important;overflow:hidden!important;padding:0!important;position:absolute!important;width:1px!important;white-space:nowrap!important}
+   </style></head><body><form>${body}</form></body></html>`;
+const S2_SELECT = (cls = ""): string => `<select id="s2u" name="s2u" class="${cls}select2-hidden-accessible is-invalid" tabindex="-1" aria-hidden="true"><option value=""></option><option value="u1">Sample Light Co</option></select>`;
+const S2_FACE = (style = "width:100%"): string => `<span class="select2 select2-container select2-container--bootstrap4" dir="ltr" style="${style}"><span class="selection"><span class="select2-selection select2-selection--single" role="combobox" tabindex="0" aria-labelledby="select2-s2u-container"><span class="select2-selection__rendered" id="select2-s2u-container" role="textbox" aria-readonly="true"><span class="select2-selection__placeholder">Select a utility</span></span><span class="select2-selection__arrow" role="presentation"><b role="presentation"></b></span></span></span><span class="dropdown-wrapper" aria-hidden="true"></span></span>`;
+const S2_ADDRESS = `<div class="form-group"><label for="s2a">Service address</label><input id="s2a" name="s2a" class="form-control" value="5010 Fixture Ave"></div>`;
+const S2_HELP = `<small class="form-text text-muted">The utility that serves the meter.</small>`;
+
 const PAGES: Record<string, string> = {
   // ---- the live miss, shape 1: a complaint in a row that holds TWO controls ----------
   arrayRow: shell(`
@@ -217,6 +234,30 @@ const PAGES: Record<string, string> = {
     <label for="hp" style="position:absolute;left:300px;top:20px">Customer phone</label>
     <input id="hp" style="position:absolute;left:300px;top:40px;width:185px;height:21px;box-sizing:border-box" />`),
 
+  // ---- A SELECT2 SLIVER'S WIDGET BOX MAY ONLY BRING IT NEARER (#327) --------------------
+  // select2 keeps the native <select> as a 1 x 1 clipped sliver and draws its face as a SIBLING,
+  // so the sliver's nearest box is the whole form-group (or row, or fieldset): label above,
+  // complaint and help text below. Judged by that box alone (9807442c) the complaint fell out of
+  // reach and went to a filled neighbour, or nowhere. Bootstrap 4's own metrics, inlined (bs4).
+  //
+  // help2: two help lines under "This field is required.", a filled Service address above.
+  s2Help2: bs4(`${S2_ADDRESS}<div class="form-group"><label for="s2u">Utility</label>${S2_SELECT("form-control ")}${S2_FACE()}
+    <div class="invalid-feedback d-block">This field is required.</div>${S2_HELP}${S2_HELP}</div>`),
+  // captionIn / captionOut: a 450 px inline caption, so the row (the box) starts 450 px left of the
+  // face, past the 420 px column bound; the complaint inside the row, and just outside it.
+  s2CaptionIn: bs4(`${S2_ADDRESS}<div class="form-group"><label for="s2u" style="width:450px">Utility</label>${S2_SELECT()}${S2_FACE("width:300px")}
+    <div class="invalid-feedback d-block" style="margin-left:450px">This field is required.</div></div>`, 900),
+  s2CaptionOut: bs4(`${S2_ADDRESS}<div class="form-group" style="margin-bottom:0"><label for="s2u" style="width:450px">Utility</label>${S2_SELECT()}${S2_FACE("width:300px")}</div>
+    <div class="invalid-feedback d-block" style="margin-left:450px">This field is required.</div>`, 900),
+  // floatFieldset: the face floated in a wrapper that collapses to 0 px, so the box climbs to the
+  // radio fieldset round it (radios are not "controls" here); a filled field within 90 px above.
+  s2FloatFieldset: bs4(`${S2_ADDRESS}<fieldset style="border:1px solid #ccc;padding:0 8px 4px;margin:0">
+      <legend style="font-size:1rem;margin:0"><label for="s2u" style="margin:0">Utility</label></legend>
+      <div>${S2_SELECT("form-control ")}${S2_FACE("float:left;width:300px")}</div>
+      <div class="invalid-feedback d-block" style="clear:both">This field is required.</div>
+      <div>Battery storage? <label><input type="radio" name="bat" value="y" checked> Yes</label> <label><input type="radio" name="bat" value="n"> No</label></div>
+    </fieldset>`),
+
   // ---- a complaint no control can own must still be reported -------------------------
   orphanComplaint: shell(`
     <div class="err">Please select at least one option before continuing.</div>
@@ -310,6 +351,17 @@ const runner = await sweep("handedRunnerUp");
     slot?.why === "complaint" && slot.handed?.length === 1 && slot.handed[0].next === "Customer phone"
       && /^portal reports "This field is required\." \(field could not/.test(slot.handed[0].unattributed),
     JSON.stringify(runner));
+}
+
+for (const [key, what] of [
+  ["s2Help2", "two help lines under the complaint"],
+  ["s2CaptionIn", "a 450 px inline caption, the complaint inside the row"],
+  ["s2CaptionOut", "a 450 px inline caption, the complaint just outside the row"],
+  ["s2FloatFieldset", "a collapsed float wrapper inside a radio fieldset, a filled field within 90 px"],
+] as Array<[string, string]>) {
+  const got = await sweep(key);
+  check(`a blank select2 Utility (1 x 1 sliver, face a sibling) is named from its complaint: ${what} (#327)`,
+    got.some((r) => r.name === "Utility" && r.why === "complaint"), JSON.stringify(got));
 }
 
 const instr = await sweep("instructions");

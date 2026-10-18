@@ -29,11 +29,14 @@ import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE } from "../../shared
  *  pays). Diagnostic only; "" when none. */
 export let lastComboboxEnterRefusal = "";
 
-/** The text of the option the last custom-combobox fill CLICKED ("" when it clicked none, or when
- *  the last select went through a native selectOption). The replay's read-back compares a
- *  widget's face against THIS, not the recipe's answer: a containment pick ("Pacific Gas &
- *  Electric Company" for "Pacific Gas & Electric") is the option the face should then show (#327). */
-export let lastComboboxPickedText = "";
+/** What a fill reports about the option it CLICKED: `text` is that option's words ("" when it
+ *  clicked none, or when the select went through a native selectOption). Passed in by the
+ *  caller and filled by this call, never a module global: with JOB_CONCURRENCY>1 two adapters
+ *  fill at once, and a shared slot let one run's pick confirm the other's (#327). The replay's
+ *  read-back compares a widget's face against THIS, not the recipe's answer: a containment pick
+ *  ("Pacific Gas & Electric Company" for "Pacific Gas & Electric") is the option the face
+ *  should then show. */
+export type ComboboxPick = { text: string };
 
 const SEARCH_BOX_SELECTORS = [
   'input[role="combobox"]',
@@ -197,12 +200,12 @@ async function waitForOptions(page: any, budgetMs = 2500, ownScope?: any): Promi
 
 // Click a located option, scrolling it into view first (virtualized/long lists render
 // the row off-screen so a blind click misses). Returns true if the click went through.
-async function clickOption(loc: any): Promise<boolean> {
+async function clickOption(loc: any, pick?: ComboboxPick): Promise<boolean> {
   try {
     await loc.scrollIntoViewIfNeeded?.({ timeout: 1000 }).catch(() => {});
     const text = String(await loc.textContent?.({ timeout: 1000 }).catch(() => "") ?? "").replace(/\s+/g, " ").trim();
     await loc.click({ timeout: 5000 });
-    lastComboboxPickedText = text;
+    if (pick) pick.text = text;
     return true;
   } catch {
     return false;
@@ -416,10 +419,13 @@ export function comboboxFaceInPage(el: Element, mode: string): string {
     if (mode === "own") {
       // "own" — the text a person reads on THIS input's face, for the replay's read-back of a
       // concealed backing input (#327). Two things "text" does not do:
-      //   - A face inside a container that holds a DIFFERENT concealed input but not this one
-      //     is that other widget's (a Generator dropdown beside the Battery one): never ours.
-      //     A widget posting its key and its text in two hidden inputs of its own still reads,
-      //     because its container holds this input too.
+      //   - A face belongs to the concealed input NEAREST it in the tree (fewest hops through
+      //     their common ancestor), ties broken by how many siblings apart the two sit under
+      //     that ancestor; still tied = ambiguous, never ours. So the Generator dropdown beside
+      //     the Battery one is the Generator's even when its key input sits beside its face
+      //     rather than inside it, and a row of bare widgets reads as nobody's. A widget
+      //     posting its key and its text in two hidden inputs of its own still reads: the key
+      //     input sits next to the face.
       //   - Only the rendered words: an arrow/icon/caret span (Telerik's t-icon reads
       //     "select"), anything not rendered, and screen-reader-only text ("Selected:") are
       //     left out, so the face can be compared for EQUALITY with the option clicked.
@@ -430,13 +436,27 @@ export function comboboxFaceInPage(el: Element, mode: string): string {
         const s = getComputedStyle(n);
         return r.width <= 2 || r.height <= 2 || s.display === "none" || s.visibility === "hidden" || Number(s.opacity) === 0;
       };
-      const othersFace = (n: Element): boolean => {
-        for (let a: Element | null = n; a && a !== root; a = a.parentElement) {
-          if (!a.contains(el) && Array.from(a.querySelectorAll("input, select")).some(concealed)) return true;
+      const hidden = Array.from(document.querySelectorAll("input, select")).filter((n) => n === el || concealed(n));
+      const chain = (n: Element): Element[] => { const out: Element[] = []; for (let a: Element | null = n; a; a = a.parentElement) out.unshift(a); return out; };
+      const ours = (f: Element): boolean => {
+        const cf = chain(f);
+        let best: Element[] = [];
+        let bestDist = Infinity, bestGap = Infinity;
+        for (const c of hidden) {
+          const cc = chain(c);
+          let k = 0;
+          while (k < cf.length && k < cc.length && cf[k] === cc[k]) k++;
+          if (!k) continue;
+          const dist = (cf.length - k) + (cc.length - k);
+          const lca = cf[k - 1];
+          const kids = Array.from(lca.children);
+          const gap = cf[k] && cc[k] ? Math.abs(kids.indexOf(cf[k]) - kids.indexOf(cc[k])) : 0;
+          if (dist < bestDist || (dist === bestDist && gap < bestGap)) { best = [c]; bestDist = dist; bestGap = gap; }
+          else if (dist === bestDist && gap === bestGap) best.push(c);
         }
-        return false;
+        return best.length === 1 && best[0] === el;
       };
-      const face = cands.filter((n) => !othersFace(n))
+      const face = cands.filter((n) => ours(n))
         .find((n) => /form-select|\bselect\b|display|toggle|control|dropdown/i.test(n.className || "") || n.getAttribute("role") === "button");
       if (!face) continue;
       let out = "";
@@ -460,8 +480,8 @@ export function comboboxFaceInPage(el: Element, mode: string): string {
   return "";
 }
 
-export async function fillCustomCombobox(page: any, loc: any, value: string): Promise<boolean> {
-  lastComboboxPickedText = "";
+export async function fillCustomCombobox(page: any, loc: any, value: string, pick?: ComboboxPick): Promise<boolean> {
+  if (pick) pick.text = "";
   const v = (value ?? "").trim();
   if (!v) return false;
 
@@ -590,7 +610,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
   //     "4300" for "430" or a longer model that merely contains the typed token.
   try {
     const best = await bestOptionMatch(page, v, (ownPopup && await ownPopup.isVisible().catch(() => false)) ? ownPopup : undefined);
-    if (best && (await best.count().catch(() => 0)) && (await clickOption(best))) {
+    if (best && (await best.count().catch(() => 0)) && (await clickOption(best, pick))) {
       return true;
     }
   } catch { /* fall through */ }
@@ -608,7 +628,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
       await searchBox.fill("", { timeout: 2000 }).catch(() => {});
       await waitForOptions(page, 2500, (ownPopup && await ownPopup.isVisible().catch(() => false)) ? ownPopup : undefined);
       const best2 = await bestOptionMatch(page, v, (ownPopup && await ownPopup.isVisible().catch(() => false)) ? ownPopup : undefined);
-      if (best2 && (await best2.count().catch(() => 0)) && (await clickOption(best2))) {
+      if (best2 && (await best2.count().catch(() => 0)) && (await clickOption(best2, pick))) {
         return true;
       }
     }
@@ -617,7 +637,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
   // 3b. ARIA option matching the value (substring, case-insensitive).
   try {
     const opt = page.getByRole("option", { name: new RegExp(escapeRegExp(v), "i") }).first();
-    if (await opt.count().catch(() => 0) && (await clickOption(opt))) {
+    if (await opt.count().catch(() => 0) && (await clickOption(opt, pick))) {
       return true;
     }
   } catch { /* fall through */ }
@@ -625,7 +645,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
   // 3c. Otherwise click the first visible list row containing the value text.
   try {
     const row = optionRowsIn(await scopeOf(), page).filter({ hasText: new RegExp(escapeRegExp(v), "i") }).first();
-    if (await row.count().catch(() => 0) && (await clickOption(row))) {
+    if (await row.count().catch(() => 0) && (await clickOption(row, pick))) {
       return true;
     }
   } catch { /* fall through */ }
@@ -640,7 +660,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
     const lastToken = v.split(/\s+/).pop() ?? v;
     if (lastToken !== v && lastToken.length >= 1 && /\d/.test(lastToken)) {
       const row = optionRowsIn(await optionScope(page), page).filter({ hasText: new RegExp(`\\b${escapeRegExp(lastToken)}\\b`, "i") }).first();
-      if (await row.count().catch(() => 0) && (await clickOption(row))) {
+      if (await row.count().catch(() => 0) && (await clickOption(row, pick))) {
         return true;
       }
     }
@@ -652,7 +672,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
     const cnt = await allVisible.count().catch(() => 0);
     for (let i = 0; i < Math.min(cnt, 8); i++) {
       const el = allVisible.nth(i);
-      if (await el.isVisible().catch(() => false) && (await clickOption(el))) {
+      if (await el.isVisible().catch(() => false) && (await clickOption(el, pick))) {
         return true;
       }
     }
@@ -703,8 +723,8 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
  * something, or fillCustomCombobox reported a click — false when NOTHING was selected,
  * so callers can surface the miss instead of silently continuing.
  */
-export async function selectWithFallback(page: any, loc: any, value: string): Promise<boolean> {
-  lastComboboxPickedText = "";
+export async function selectWithFallback(page: any, loc: any, value: string, pick?: ComboboxPick): Promise<boolean> {
+  if (pick) pick.text = "";
   // Only a real <select> can take selectOption. Running it on a styled-div widget or a
   // (readonly, visually-hidden) input[role="combobox"] — PowerClerk's Vue filtered-select —
   // stalls the full actionability timeout TWICE before the combobox path even runs (the
@@ -715,7 +735,7 @@ export async function selectWithFallback(page: any, loc: any, value: string): Pr
   const tag: string | null = typeof loc.evaluate === "function"
     ? await loc.evaluate((el: Element) => (el.tagName || "").toLowerCase()).catch(() => null)
     : null;
-  if (tag !== null && tag !== "select") return fillCustomCombobox(page, loc, value);
+  if (tag !== null && tag !== "select") return fillCustomCombobox(page, loc, value, pick);
   // Short timeouts on the native attempts: a HIDDEN native <select> behind a styled
   // widget can never pass actionability, so the default timeout would stall twice
   // before the combobox path even runs.
@@ -750,5 +770,5 @@ export async function selectWithFallback(page: any, loc: any, value: string): Pr
   if (matchedValue) {
     try { await loc.selectOption(matchedValue, { timeout: 5000 }); return true; } catch { /* combobox */ }
   }
-  return fillCustomCombobox(page, loc, value);
+  return fillCustomCombobox(page, loc, value, pick);
 }

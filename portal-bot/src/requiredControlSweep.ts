@@ -86,9 +86,17 @@ export async function sweepEmptyRequiredControls(
     const out: Array<{ name: string; why: string; handed?: Array<{ next: string; unattributed: string }> }> = [];
     const requiredSeen: string[] = [];
     const tidy = (name: string): string => String(name || "").replace(/\s*\*\s*$/, "").replace(/\s+/g, " ").trim().slice(0, 70);
+    // ONE ENTRY PER NAME, BUT EVERY COMPLAINT IT WAS HANDED (#327). Two upload rows captioned
+    // "Attachment *" are one entry; when the second one is the slot a complaint went to, dropping
+    // its `handed` with the duplicate lost the complaint the moment the held read-back discharged
+    // "Attachment", and the PSE draft was created with Customer phone blank. So a same-name entry
+    // takes the newcomer's hand-offs too.
     const push = (name: string, why: string, handed?: Array<{ next: string; unattributed: string }>): void => {
       const clean = tidy(name);
-      if (clean && !out.some((o) => o.name === clean)) out.push(handed && handed.length ? { name: clean, why, handed } : { name: clean, why });
+      if (!clean) return;
+      const had = out.find((o) => o.name === clean);
+      if (!had) { out.push(handed && handed.length ? { name: clean, why, handed } : { name: clean, why }); return; }
+      if (handed && handed.length) had.handed = [...(had.handed ?? []), ...handed];
     };
     const orphanName = (c: HTMLElement): string => tidy(`portal reports "${(c.innerText || "").replace(/\s+/g, " ").trim().slice(0, 48)}" (field could not be identified)`);
 
@@ -105,24 +113,37 @@ export async function sweepEmptyRequiredControls(
         return visible(el);
       });
 
-    // A CONCEALED SLIVER IS MEASURED BY ITS WIDGET (#327). A bootstrap-select keeps the native
+    // A CONCEALED SLIVER IS ALSO MEASURED BY ITS WIDGET (#327). A bootstrap-select keeps the native
     // <select> as a 0.5 px, opacity-0 sliver at left:50% of the widget, so its own box puts it
     // half a widget to the right of where a person sees the field: a complaint under the widget's
     // left edge was never "under" it, and lost to whatever sat nearer on the complaint's line. A
-    // control that thin, or invisible and small, is measured by the nearest ancestor a person can
-    // see (at least 20 x 10 px) — but never by one that holds another visible control, which is a
+    // control that thin, or invisible and small, is ALSO judged by the nearest ancestor a person
+    // can see (at least 20 x 10 px) — never by one that holds another visible control, which is a
     // row or a form, not this control's widget.
-    const boxOf = (el: HTMLElement): DOMRect => {
+    //
+    // "ALSO", NOT "INSTEAD": THE WIDGET BOX MAY ONLY BRING A SLIVER NEARER. That ancestor is a
+    // guess at the widget, and for select2 it is a bad one: select2's face is the hidden select's
+    // SIBLING, so the nearest box is the whole form-group — the label above, and the complaint and
+    // help text below. Judged by that box alone, a Bootstrap 4 Utility (one help line under
+    // "This field is required.") ends 42 px below its own complaint, past the -40 bound, and the
+    // complaint went to the filled "Service address" above and was dropped: the PSE draft was
+    // created with Utility blank. So were a crispy-forms wrapper, two help lines, a 450 px inline
+    // caption (the box starts at the row's left edge, past the 420 px column bound) and a float
+    // wrapper that collapses and climbs to a radio fieldset. So a sliver is judged by its OWN rect
+    // and its widget box, and wherever it is measured (range, distance, beside, ownedBelow) the
+    // nearer of the two counts.
+    const rectsOf = (el: HTMLElement): DOMRect[] => {
       const r = el.getBoundingClientRect();
       const sliver = r.width < 4 || r.height < 4 || (Number(getComputedStyle(el).opacity) === 0 && (r.width < 20 || r.height < 10));
-      if (!sliver) return r;
+      if (!sliver) return [r];
       for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
         if (controls.some((o) => o !== el && p!.contains(o))) break;
         const pr = p.getBoundingClientRect();
-        if (pr.width >= 20 && pr.height >= 10) return pr;
+        if (pr.width >= 20 && pr.height >= 10) return [r, pr];
       }
-      return r;
+      return [r];
     };
+    const rects = new Map<HTMLElement, DOMRect[]>(controls.map((el) => [el, rectsOf(el)]));
 
     // ---- complaint messages, attributed by PROXIMITY --------------------------------
     // Leaf-most matching elements only: an ancestor whose text merely CONTAINS the message
@@ -174,12 +195,10 @@ export async function sweepEmptyRequiredControls(
       // textarea, a Bootstrap .form-control-file slot) must not cancel a real beside complaint —
       // without the cap requiredBlank's "Additional notes" misattribution comes back, and so does
       // the draft created under a wide held slot (draftSubmitClick heldAboveMeter).
-      const ownedBelow = controls.some((el) => {
-        if (!emptyish.has(el)) return false;
-        const er = boxOf(el);
+      const ownedBelow = controls.some((el) => emptyish.has(el) && rects.get(el)!.some((er) => {
         const dy = cr.top - er.bottom;
         return dy >= -2 && dy <= 90 && cr.left >= er.left - 12 && cr.left <= er.left + Math.min(48, Math.max(12, er.width / 3));
-      });
+      }));
       // AN EMPTY FIELD IS THE ONLY THING "THIS FIELD IS REQUIRED" CAN MEAN.
       //
       // Pure proximity gave the message to the wrong control and lost it: on PacifiCorp's
@@ -196,23 +215,27 @@ export async function sweepEmptyRequiredControls(
       for (const pass of [0, 1]) {
         for (const el of controls) {
           if (pass === 0 && !emptyish.has(el)) continue;
-          const er = boxOf(el);
-          // A validation message sits BELOW or beside its field, never far above it, and
-          // never in another column. Both bounds keep one complaint from claiming a page.
-          const dy = cr.top - er.bottom;
-          if (dy < -40 || dy > 90) continue;
-          if (Math.abs(cr.left - er.left) > 420) continue;
-          // BESIDE IS NOT FARTHER THAN BELOW (#327). A message on the SAME LINE, just after its
-          // field, overlaps it vertically, so |dy| charged it the field's whole height — and an
-          // empty box ending exactly where the message's line begins, far to the left, won by
-          // under a pixel: requiredBlank.dom.smoke's "This field is required." beside the empty
-          // inverter Manufacturer was blamed on the optional "Additional notes" box above it
-          // whenever the fonts wrapped that box onto the line above (since 3817c24d). Only a
-          // message to the RIGHT of the field counts as beside it; one that merely shares a
-          // line with a control further right is still measured as before. And never when an
-          // empty field holds the complaint under itself (ownedBelow, above).
-          const beside = !ownedBelow && cr.top < er.bottom && cr.bottom > er.top && cr.left >= er.right - 4;
-          const d = (beside ? 0 : Math.abs(dy)) + Math.abs(cr.left - er.left) / 8;
+          // The nearer of a sliver's own rect and its widget box (rectsOf, above).
+          let d = Infinity;
+          for (const er of rects.get(el)!) {
+            // A validation message sits BELOW or beside its field, never far above it, and
+            // never in another column. Both bounds keep one complaint from claiming a page.
+            const dy = cr.top - er.bottom;
+            if (dy < -40 || dy > 90) continue;
+            if (Math.abs(cr.left - er.left) > 420) continue;
+            // BESIDE IS NOT FARTHER THAN BELOW (#327). A message on the SAME LINE, just after its
+            // field, overlaps it vertically, so |dy| charged it the field's whole height — and an
+            // empty box ending exactly where the message's line begins, far to the left, won by
+            // under a pixel: requiredBlank.dom.smoke's "This field is required." beside the empty
+            // inverter Manufacturer was blamed on the optional "Additional notes" box above it
+            // whenever the fonts wrapped that box onto the line above (since 3817c24d). Only a
+            // message to the RIGHT of the field counts as beside it; one that merely shares a
+            // line with a control further right is still measured as before. And never when an
+            // empty field holds the complaint under itself (ownedBelow, above).
+            const beside = !ownedBelow && cr.top < er.bottom && cr.bottom > er.top && cr.left >= er.right - 4;
+            d = Math.min(d, (beside ? 0 : Math.abs(dy)) + Math.abs(cr.left - er.left) / 8);
+          }
+          if (d === Infinity) continue;
           if (d < bestD) {
             if (pass === 0) { next = best; nextD = bestD; }
             bestD = d; best = el;
