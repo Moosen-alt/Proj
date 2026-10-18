@@ -35,6 +35,14 @@ export interface EmptyRequired {
   name: string;
   /** How we know it was required — for the operator's report, and for arguing with it. */
   why: "attribute" | "asterisk" | "complaint" | "unattributed-complaint" | "radio-group";
+  /**
+   * `why: "complaint"` only (#327): one entry per complaint this control was handed. `next` is the
+   * next-nearest EMPTY control in range, named exactly as `name` would name it ("" when there is
+   * none); `unattributed` is the entry the sweep reports when no field can own the complaint. A
+   * caller that discharges this control (a held upload, recipeAdapter.sweepRequired) must not
+   * discharge the complaint with it: the portal's refusal is re-attributed or reported unowned.
+   */
+  handed?: Array<{ next: string; unattributed: string }>;
 }
 
 /**
@@ -75,12 +83,14 @@ export async function sweepEmptyRequiredControls(
     const ADVISORY = /^\s*(please note|note|notice|important|reminder|attention)\b[:,]?/i;
     const COMPLAINT = new RegExp(`${HARD.source}|${SOFT.source}`, "i");
     const PLACEHOLDER = /^(please\s+)?(select|choose)\b\.{0,3}$/i;
-    const out: Array<{ name: string; why: string }> = [];
+    const out: Array<{ name: string; why: string; handed?: Array<{ next: string; unattributed: string }> }> = [];
     const requiredSeen: string[] = [];
-    const push = (name: string, why: string): void => {
-      const clean = String(name || "").replace(/\s*\*\s*$/, "").replace(/\s+/g, " ").trim().slice(0, 70);
-      if (clean && !out.some((o) => o.name === clean)) out.push({ name: clean, why });
+    const tidy = (name: string): string => String(name || "").replace(/\s*\*\s*$/, "").replace(/\s+/g, " ").trim().slice(0, 70);
+    const push = (name: string, why: string, handed?: Array<{ next: string; unattributed: string }>): void => {
+      const clean = tidy(name);
+      if (clean && !out.some((o) => o.name === clean)) out.push(handed && handed.length ? { name: clean, why, handed } : { name: clean, why });
     };
+    const orphanName = (c: HTMLElement): string => tidy(`portal reports "${(c.innerText || "").replace(/\s+/g, " ").trim().slice(0, 48)}" (field could not be identified)`);
 
     const visible = (el: Element): boolean => {
       const r = el.getBoundingClientRect();
@@ -94,6 +104,25 @@ export async function sweepEmptyRequiredControls(
         if (["hidden", "submit", "button", "checkbox", "radio", "image", "reset"].includes(t)) return false;
         return visible(el);
       });
+
+    // A CONCEALED SLIVER IS MEASURED BY ITS WIDGET (#327). A bootstrap-select keeps the native
+    // <select> as a 0.5 px, opacity-0 sliver at left:50% of the widget, so its own box puts it
+    // half a widget to the right of where a person sees the field: a complaint under the widget's
+    // left edge was never "under" it, and lost to whatever sat nearer on the complaint's line. A
+    // control that thin, or invisible and small, is measured by the nearest ancestor a person can
+    // see (at least 20 x 10 px) — but never by one that holds another visible control, which is a
+    // row or a form, not this control's widget.
+    const boxOf = (el: HTMLElement): DOMRect => {
+      const r = el.getBoundingClientRect();
+      const sliver = r.width < 4 || r.height < 4 || (Number(getComputedStyle(el).opacity) === 0 && (r.width < 20 || r.height < 10));
+      if (!sliver) return r;
+      for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+        if (controls.some((o) => o !== el && p!.contains(o))) break;
+        const pr = p.getBoundingClientRect();
+        if (pr.width >= 20 && pr.height >= 10) return pr;
+      }
+      return r;
+    };
 
     // ---- complaint messages, attributed by PROXIMITY --------------------------------
     // Leaf-most matching elements only: an ancestor whose text merely CONTAINS the message
@@ -126,8 +155,31 @@ export async function sweepEmptyRequiredControls(
     }
 
     const claimed = new Set<HTMLElement>();
+    // Each complaint a control was handed, with the next-nearest empty control (see `handed`).
+    const handedTo = new Map<HTMLElement, Array<{ next: HTMLElement | null; unattributed: string }>>();
     for (const c of complaints) {
       const cr = c.getBoundingClientRect();
+      // A FIELD THAT HOLDS THE COMPLAINT UNDER ITSELF OUTRANKS ANY NEIGHBOUR'S "BESIDE" (#327).
+      //
+      // The beside rule below zeroes the vertical distance of a control the complaint sits just
+      // right of, on its own line. Without this bound it also handed "This field is required."
+      // UNDER an empty Customer phone to the upload slot ending to its left on the complaint's
+      // line — a slot the run had uploaded to, so the held-upload read-back discharged it, the
+      // complaint with it, and the PSE draft was created with Customer phone blank (main stopped).
+      // So when an EMPTY control sits directly above the complaint, aligned with it, holding the
+      // complaint inside its own box, nothing gets the beside discount and plain distance decides.
+      //
+      // "Aligned" is a window, not |dleft| <= 12: a complaint indented 20 to 40 px under its field
+      // is still that field's. And the window is CAPPED at 48 px: a full-width box above (a notes
+      // textarea, a Bootstrap .form-control-file slot) must not cancel a real beside complaint —
+      // without the cap requiredBlank's "Additional notes" misattribution comes back, and so does
+      // the draft created under a wide held slot (draftSubmitClick heldAboveMeter).
+      const ownedBelow = controls.some((el) => {
+        if (!emptyish.has(el)) return false;
+        const er = boxOf(el);
+        const dy = cr.top - er.bottom;
+        return dy >= -2 && dy <= 90 && cr.left >= er.left - 12 && cr.left <= er.left + Math.min(48, Math.max(12, er.width / 3));
+      });
       // AN EMPTY FIELD IS THE ONLY THING "THIS FIELD IS REQUIRED" CAN MEAN.
       //
       // Pure proximity gave the message to the wrong control and lost it: on PacifiCorp's
@@ -138,10 +190,13 @@ export async function sweepEmptyRequiredControls(
       // So: consider answered controls only if no unanswered one is in range.
       let best: HTMLElement | null = null;
       let bestD = Infinity;
+      // The runner-up among the EMPTY controls, so a caller that discharges `best` can re-attribute.
+      let next: HTMLElement | null = null;
+      let nextD = Infinity;
       for (const pass of [0, 1]) {
         for (const el of controls) {
           if (pass === 0 && !emptyish.has(el)) continue;
-          const er = el.getBoundingClientRect();
+          const er = boxOf(el);
           // A validation message sits BELOW or beside its field, never far above it, and
           // never in another column. Both bounds keep one complaint from claiming a page.
           const dy = cr.top - er.bottom;
@@ -154,21 +209,32 @@ export async function sweepEmptyRequiredControls(
           // inverter Manufacturer was blamed on the optional "Additional notes" box above it
           // whenever the fonts wrapped that box onto the line above (since 3817c24d). Only a
           // message to the RIGHT of the field counts as beside it; one that merely shares a
-          // line with a control further right is still measured as before.
-          const beside = cr.top < er.bottom && cr.bottom > er.top && cr.left >= er.right - 4;
+          // line with a control further right is still measured as before. And never when an
+          // empty field holds the complaint under itself (ownedBelow, above).
+          const beside = !ownedBelow && cr.top < er.bottom && cr.bottom > er.top && cr.left >= er.right - 4;
           const d = (beside ? 0 : Math.abs(dy)) + Math.abs(cr.left - er.left) / 8;
-          if (d < bestD) { bestD = d; best = el; }
+          if (d < bestD) {
+            if (pass === 0) { next = best; nextD = bestD; }
+            bestD = d; best = el;
+          } else if (pass === 0 && d < nextD) { nextD = d; next = el; }
         }
         if (best) break;
       }
-      if (best) { claimed.add(best); continue; }
+      if (best) {
+        claimed.add(best);
+        (handedTo.get(best) ?? handedTo.set(best, []).get(best)!).push({ next: emptyish.has(best) ? next : null, unattributed: orphanName(c) });
+        continue;
+      }
       // COULD NOT ATTRIBUTE IT — say so rather than drop it. The portal is refusing the
       // filing; not knowing which field is a reason to report harder, not to go quiet.
-      push(`portal reports "${(c.innerText || "").replace(/\s+/g, " ").trim().slice(0, 48)}" (field could not be identified)`, "unattributed-complaint");
+      push(orphanName(c), "unattributed-complaint");
     }
 
     // ---- requiredness and emptiness -------------------------------------------------
-    for (const el of controls) {
+    // How the page captions a control, and the name it is reported under. One reading, shared by
+    // the report and by `handed` (a complaint's runner-up must be named as the report names it,
+    // or a caller cannot tell it from a held slot).
+    const captionOf = (el: HTMLElement): { labelText: string; containerText: string } => {
       const id = el.getAttribute("id") || "";
       const forLbl = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
       const wrapLbl = el.closest("label");
@@ -188,6 +254,19 @@ export async function sweepEmptyRequiredControls(
       const container = el.closest('[class*="form-group"], [class*="field"], [class*="row"], li, tr, dd, p, div');
       const ownsOne = !!container && container.querySelectorAll("input, select, textarea").length === 1;
       const containerText = ownsOne ? ((container as HTMLElement).innerText || "").replace(/\s+/g, " ").trim() : "";
+      return { labelText, containerText };
+    };
+    const nameOf = (el: HTMLElement): string => {
+      const { labelText, containerText } = captionOf(el);
+      return labelText
+        || (containerText && containerText.length <= 90 ? containerText : "")
+        || el.getAttribute("aria-label")
+        || el.getAttribute("placeholder")
+        || el.getAttribute("name")
+        || "(unlabelled control)";
+    };
+    for (const el of controls) {
+      const { labelText, containerText } = captionOf(el);
       const asterisk = /\*/.test(labelText) || (containerText.length <= 160 && /\*/.test(containerText));
 
       const required = el.hasAttribute("required")
@@ -215,13 +294,8 @@ export async function sweepEmptyRequiredControls(
         : raw;
       if (raw && !PLACEHOLDER.test(shown) && !/^--/.test(shown)) continue;
 
-      const name = labelText
-        || (containerText && containerText.length <= 90 ? containerText : "")
-        || el.getAttribute("aria-label")
-        || el.getAttribute("placeholder")
-        || el.getAttribute("name")
-        || "(unlabelled control)";
-      push(name, claimed.has(el) ? "complaint" : el.hasAttribute("required") || el.getAttribute("aria-required") === "true" ? "attribute" : "asterisk");
+      const handed = (handedTo.get(el) ?? []).map((h) => ({ next: h.next ? tidy(nameOf(h.next)) : "", unattributed: h.unattributed }));
+      push(nameOf(el), claimed.has(el) ? "complaint" : el.hasAttribute("required") || el.getAttribute("aria-required") === "true" ? "attribute" : "asterisk", handed);
     }
 
     // ---- unanswered required radio GROUPS -------------------------------------------

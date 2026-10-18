@@ -24,10 +24,28 @@
 //                 draft_submit_unexpected, draftSubmitUnexpected.verdict "filed", finalSubmitClicked
 //                 false, NO record number captured, no draft reported.
 //   MUST-STOP     error: an error page after the click → paused draft_submit_unexpected, "not_a_draft".
+//   MUST-EXCLUDE  A REQUIRED FIELD LEFT BLANK BESIDE A HELD UPLOAD (#327) — 0 POSTs each, the blank
+//                 field NAMED. The run uploads to a required file slot; the portal takes the file,
+//                 lists it and clears the box (a browser never restores a file input's value), so
+//                 the required-blank sweep sees the slot empty and the held-upload read-back drops
+//                 it. A "This field is required." the sweep hands to that slot is dropped with it,
+//                 and the draft is then created with a required field blank:
+//                   heldLeftOfPhone: the complaint is UNDER Customer phone; the held slot ends to its
+//                     left on the complaint's own line (the beside rule zeroed the slot's distance);
+//                   heldBesideUtility: the same with a bootstrap-select "Utility", whose native select
+//                     is a 0.5 px, opacity-0 sliver at left:50% of its 300 px widget;
+//                   heldAboveMeter: a FULL-WIDTH held slot above "Meter location [select] This field is
+//                     required." (main gave that complaint to the wide slot above, by under a pixel);
+//                   heldOwnComplaint: the complaint sits under the held slot itself and no other empty
+//                     control is near — the held read-back discharges the empty BOX, never the portal's
+//                     complaint, which is reported unattributed.
 //
 // Run: npx tsx portal-bot/src/adapters/draftSubmitClick.dom.smoke.ts
 import "../smokeArtifactDirs";
+import fs from "node:fs";
 import http from "node:http";
+import os from "node:os";
+import path from "node:path";
 import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../../shared/src/types";
 import { stageWithRecipe } from "../index";
 import type { DraftCreatingStamp } from "../draftSubmitGate";
@@ -51,10 +69,65 @@ const PART1 = (mode: string): string => page("Interconnection Application Part 1
   <form method="post" action="/m/${mode}/p1/submit">
     <div><label for="appDate">Application Date</label><input id="appDate" name="appDate" type="text"></div>
     <div><label for="appType">Application Type</label><select id="appType" name="appType"><option value="">Select…</option><option>New Solar</option></select></div>
+    ${heldBlock(mode)}
     <button type="submit" id="btnSubmit">Submit</button>
   </form>`);
 const DRAFT_PAGE = page("Application", `<div class="alert alert-success">Your draft application NEM-90017 has been created. Please continue to Interconnection Application - Part 2 to complete your interconnection application and submit to PSE.</div><a href="/home">Return to Program Home</a>`);
 const RECEIPT = page("Application Received", `<h1>Application Received</h1><p>Thank you. Your application has been submitted.</p><p>Record Number: NEM-90017</p>`);
+// THE HELD-UPLOAD PAGES (#327). Absolute positions inside one positioned block, so the geometry
+// does not depend on the fonts a machine has. The slot is required by its asterisk (no
+// `required` attribute: the browser's own validation would then refuse the POST and hide whether
+// the run clicked); once the portal takes the file it lists it and clears the box, which is what
+// makes the slot read empty-but-held.
+const ERR = `color:#c00;position:absolute;font:14px/17px sans-serif;white-space:nowrap`;
+const HELD_SCRIPT = `<script>
+  document.getElementById('heldSlot').addEventListener('change', function () {
+    var f = this.files && this.files[0];
+    if (!f) return;
+    document.getElementById('heldList').textContent = 'Uploaded: ' + f.name;
+    this.value = '';
+  });
+</script>`;
+const HELD_LAYOUT: Record<string, string> = {
+  // Customer phone at left 300; its complaint 16 px under it, aligned with it; the held slot ends at
+  // 292 on the complaint's line.
+  heldLeftOfPhone: `
+    <label for="custPhone" style="position:absolute;left:300px;top:0">Customer phone</label>
+    <input id="custPhone" name="custPhone" type="text" style="position:absolute;left:300px;top:20px;width:185px;height:21px;box-sizing:border-box">
+    <label for="heldSlot" style="position:absolute;left:200px;top:32px;font-size:11px">Plan set *</label>
+    <input id="heldSlot" name="heldSlot" type="file" style="position:absolute;left:200px;top:52px;width:92px;height:26px;box-sizing:border-box">
+    <span style="${ERR};left:300px;top:57px">This field is required.</span>`,
+  // A bootstrap-select "Utility" 300 px wide: the face is a button, the native select a 0.5 px,
+  // opacity-0 sliver at left:50%. The complaint sits under the widget's left edge; the held slot ends
+  // at 292 on the complaint's line.
+  heldBesideUtility: `
+    <label for="utilitySel" style="position:absolute;left:300px;top:0">Utility</label>
+    <div class="btn-group bootstrap-select" style="position:absolute;left:300px;top:20px;width:300px;height:34px">
+      <button type="button" class="btn dropdown-toggle" title="Nothing selected" style="width:300px;height:34px;text-align:left">Nothing selected</button>
+      <select id="utilitySel" name="utilitySel" class="selectpicker" tabindex="-98" style="position:absolute;bottom:0;left:50%;display:block;width:0.5px;height:100%;padding:0;opacity:0;border:none">
+        <option value="">Nothing selected</option><option value="u1">Sample Light Co</option>
+      </select>
+    </div>
+    <label for="heldSlot" style="position:absolute;left:170px;top:34px;font-size:11px">Plan set *</label>
+    <input id="heldSlot" name="heldSlot" type="file" style="position:absolute;left:170px;top:54px;width:122px;height:26px;box-sizing:border-box">
+    <span style="${ERR};left:300px;top:58px">This field is required.</span>`,
+  // A full-width (960 px) Bootstrap .form-control-file slot, then "Meter location [select] This field
+  // is required." on the line under it.
+  heldAboveMeter: `
+    <label for="heldSlot" style="position:absolute;left:8px;top:0">Plan set *</label>
+    <input id="heldSlot" name="heldSlot" type="file" class="form-control-file" style="position:absolute;left:8px;top:20px;width:960px;height:30px;box-sizing:border-box">
+    <label for="meterLoc" style="position:absolute;left:8px;top:54px">Meter location</label>
+    <select id="meterLoc" name="meterLoc" style="position:absolute;left:120px;top:54px;width:190px;height:19px"><option value="">Please select...</option><option>Garage wall</option></select>
+    <span style="${ERR};left:314px;top:54px">This field is required.</span>`,
+  // The complaint under the held slot itself; nothing else on the page is empty.
+  heldOwnComplaint: `
+    <label for="heldSlot" style="position:absolute;left:8px;top:0">Plan set *</label>
+    <input id="heldSlot" name="heldSlot" type="file" style="position:absolute;left:8px;top:20px;width:300px;height:26px;box-sizing:border-box">
+    <span style="${ERR};left:8px;top:50px">This field is required.</span>`,
+};
+const heldBlock = (mode: string): string => HELD_LAYOUT[mode]
+  ? `<div style="position:relative;height:120px;margin:12px 0">${HELD_LAYOUT[mode]}</div><div id="heldList" style="margin:8px 0"></div>${HELD_SCRIPT}`
+  : "";
 const ERROR = page("Error", `<h1>Error</h1><p>An error has occurred. Please try again later.</p>`);
 
 const server = http.createServer((req, res) => {
@@ -81,13 +154,19 @@ const stamp = (tenantKey = TENANT, stepIndex = 4): DraftCreatingStamp => ({ step
 const submitStep = (over: Partial<RecipeStep> = {}): RecipeStep => ({
   action: "click", selector: { css: "#btnSubmit", text: "Submit" }, note: "final submit | creates a draft, not the filing (#302)", ...over,
 } as RecipeStep);
-const recipeFor = (mode: string, last: RecipeStep): PortalRecipe => ({
+// The held-upload cases upload into the required slot before the review stop, which moves the
+// Submit to step index 5.
+const UPLOAD_STEP = { action: "upload", selector: { css: "#heldSlot" }, docType: "plan_set", viaFileChooser: false, note: "upload plan_set: Plan set" } as RecipeStep;
+const PLAN_SET = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "draft-held-")), "plan-set.pdf");
+fs.writeFileSync(PLAN_SET, "%PDF-1.4\n%%EOF\n");
+const recipeFor = (mode: string, last: RecipeStep, before: RecipeStep[] = []): PortalRecipe => ({
   id: `draft-submit-${mode}`, scopeType: "utility", profileKey: "wa||twopart", state: "WA", ahj: "", utility: "Two-Part Utility",
   portalPlatform: "fixture", portalUrl: `${base}/m/${mode}/part1`, status: "complete", version: 1, createdBy: "smoke", createdAt: "", updatedAt: "", notes: "",
   steps: [
     { action: "goto", value: `${base}/m/${mode}/part1`, note: "open Part 1" } as RecipeStep,
     { action: "fill", selector: { css: "#appDate", label: "Application Date" }, value: "10/16/2026", note: "Application Date" } as RecipeStep,
     { action: "select", selector: { css: "#appType", label: "Application Type" }, value: "New Solar", note: "Application Type" } as RecipeStep,
+    ...before,
     { action: "stopForReview" } as RecipeStep,
     last,
   ],
@@ -95,13 +174,13 @@ const recipeFor = (mode: string, last: RecipeStep): PortalRecipe => ({
 
 let seq = 0;
 interface Outcome { r: Record<string, unknown>; posts: string[] }
-async function stage(mode: string, last: RecipeStep, opts: { env?: string; stamp?: DraftCreatingStamp | null; autoSubmit?: boolean; approve?: boolean } = {}): Promise<Outcome> {
+async function stage(mode: string, last: RecipeStep, opts: { env?: string; stamp?: DraftCreatingStamp | null; autoSubmit?: boolean; approve?: boolean; before?: RecipeStep[]; docs?: Record<string, string> } = {}): Promise<Outcome> {
   const prev = process.env.PORTAL_ALLOW_FINAL_SUBMIT;
   if (opts.env === undefined) delete process.env.PORTAL_ALLOW_FINAL_SUBMIT; else process.env.PORTAL_ALLOW_FINAL_SUBMIT = opts.env;
   const before = posts.length;
   try {
     const runId = `run-${mode}-${++seq}`;
-    const r = await stageWithRecipe(recipeFor(mode, last), { id: `p-${mode}` } as ProjectRecord, {}, {}, [], {
+    const r = await stageWithRecipe(recipeFor(mode, last, opts.before ?? []), { id: `p-${mode}` } as ProjectRecord, {}, opts.docs ?? {}, [], {
       headless: true, runId, draftSubmitStamp: opts.stamp === undefined ? stamp() : opts.stamp,
       autoSubmit: opts.autoSubmit === true, runApproval: opts.approve ? { approver: "A. Operator", runId } : null,
     });
@@ -158,6 +237,23 @@ try {
   {
     const o = await stage("error", submitStep());
     check("error: an error page after the click stops the run as the incident (not a draft)", submits(o) === 1 && o.r.pauseReason === "draft_submit_unexpected" && incidentOf(o)?.verdict === "not_a_draft" && o.r.finalSubmitClicked === false && !draftOf(o), brief(o));
+  }
+  // A REQUIRED FIELD LEFT BLANK BESIDE A HELD UPLOAD (#327): never a draft, and the blank is named.
+  const held = (mode: string) => stage(mode, submitStep(), { stamp: stamp(TENANT, 5), before: [UPLOAD_STEP], docs: { plan_set: PLAN_SET } });
+  const notesOf = (o: Outcome): string[] => (Array.isArray(o.r.steps) ? (o.r.steps as Array<{ data?: { agingNotes?: unknown } }>) : [])
+    .flatMap((st) => (Array.isArray(st?.data?.agingNotes) ? (st.data!.agingNotes as unknown[]).map(String) : []));
+  const heldNote = (o: Outcome): string => notesOf(o).find((n) => /file box reads empty/.test(n)) ?? "";
+  const refusalOf = (o: Outcome): string => notesOf(o).find((n) => /draft-creating submit left for a person/.test(n)) ?? "";
+  for (const [mode, field, re] of [
+    ["heldLeftOfPhone", "Customer phone", /still empty on the page: .*Customer phone/],
+    ["heldBesideUtility", "Utility", /still empty on the page: .*\bUtility\b/],
+    ["heldAboveMeter", "Meter location", /still empty on the page: .*Meter location/],
+    ["heldOwnComplaint", "the portal's complaint (unattributed)", /still empty on the page: .*portal reports "This field is required\."/],
+  ] as Array<[string, string, RegExp]>) {
+    const o = await held(mode);
+    check(`${mode}: the upload held (the page lists it, the box reads empty) — the fixture is the shape it claims`, /Plan set/.test(heldNote(o)), `${brief(o)} aging=${JSON.stringify(notesOf(o)).slice(0, 600)}`);
+    check(`${mode}: ${field} is blank and the portal says so — the draft is NOT created (0 POSTs)`, submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
+    check(`${mode}: the run names ${field} as the required field still empty`, re.test(refusalOf(o)), `refusal=${refusalOf(o)} | ${brief(o)}`);
   }
 } finally {
   server.close();

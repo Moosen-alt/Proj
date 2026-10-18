@@ -147,6 +147,76 @@ const PAGES: Record<string, string> = {
     <label for="uc" style="position:absolute;left:200px;top:90px">Fax</label>
     <input id="uc" style="position:absolute;left:200px;top:111px;width:185px;height:21px;box-sizing:border-box" />`),
 
+  // ---- A FIELD THAT HOLDS THE COMPLAINT UNDER ITSELF OUTRANKS A NEIGHBOUR'S "BESIDE" (#327) --
+  // The beside rule above must not hand a complaint UNDER its own field to an empty control
+  // that ends just left of it on the complaint's line. On the PSE Part 1 page that control was
+  // an upload slot the run had filled, the held-upload read-back discharged it, and the draft
+  // was created with Customer phone blank. All absolute, so the geometry is the pin.
+  //
+  // mirrorLeft: the complaint 16 px under Customer phone, aligned; the slot ends at 292.
+  mirrorLeft: shell(`
+    <label for="mp" style="position:absolute;left:300px;top:20px">Customer phone</label>
+    <input id="mp" style="position:absolute;left:300px;top:40px;width:185px;height:21px;box-sizing:border-box" />
+    <label for="ms" style="position:absolute;left:200px;top:52px;font-size:11px">Plan set</label>
+    <input id="ms" type="file" style="position:absolute;left:200px;top:72px;width:92px;height:26px;box-sizing:border-box" />
+    <span class="err" style="position:absolute;left:300px;top:77px;display:inline">This field is required.</span>`),
+
+  // indent40: the complaint INDENTED 40 px under its field (a plain |dleft| <= 12 test misses
+  // it), with an empty box ending just left of it on its line.
+  indent40: shell(`
+    <label for="ip" style="position:absolute;left:300px;top:20px">Customer phone</label>
+    <input id="ip" style="position:absolute;left:300px;top:40px;width:185px;height:21px;box-sizing:border-box" />
+    <label for="ir" style="position:absolute;left:240px;top:58px;font-size:11px">Reference</label>
+    <input id="ir" style="position:absolute;left:240px;top:72px;width:96px;height:24px;box-sizing:border-box" />
+    <span class="err" style="position:absolute;left:340px;top:75px;display:inline">This field is required.</span>`),
+
+  // twoComplaints: two columns, both empty and both flagged. The left one is a tall textarea, so
+  // the RIGHT field's complaint sits beside it on its line; the beside rule handed that complaint
+  // to the textarea (already reported for its own) and lost Customer email.
+  twoComplaints: shell(`
+    <label for="ta" style="position:absolute;left:150px;top:0">Project description *</label>
+    <textarea id="ta" style="position:absolute;left:150px;top:20px;width:140px;height:80px;box-sizing:border-box"></textarea>
+    <span class="err" style="position:absolute;left:150px;top:104px;display:inline">This field is required.</span>
+    <label for="te" style="position:absolute;left:300px;top:0">Customer email</label>
+    <input id="te" style="position:absolute;left:300px;top:20px;width:140px;height:21px;box-sizing:border-box" />
+    <span class="err" style="position:absolute;left:300px;top:61px;display:inline">This field is required.</span>`),
+
+  // bootstrapSelect: a 300 px bootstrap-select "Utility" — the face is a button, the native
+  // select a 0.5 px opacity-0 sliver at left:50% — flagged under its left edge, with an empty
+  // box ending just left of the complaint on its line.
+  bootstrapSelect: shell(`
+    <label for="bu" style="position:absolute;left:300px;top:20px">Utility</label>
+    <div class="btn-group bootstrap-select" style="position:absolute;left:300px;top:40px;width:300px;height:34px">
+      <button type="button" class="btn dropdown-toggle" title="Nothing selected" style="width:300px;height:34px;text-align:left">Nothing selected</button>
+      <select id="bu" class="selectpicker" tabindex="-98" style="position:absolute;bottom:0;left:50%;display:block;width:0.5px;height:100%;padding:0;opacity:0;border:none">
+        <option value="">Nothing selected</option><option value="u1">Sample Light Co</option>
+      </select>
+    </div>
+    <label for="br" style="position:absolute;left:170px;top:54px;font-size:11px">Reference</label>
+    <input id="br" style="position:absolute;left:170px;top:74px;width:122px;height:26px;box-sizing:border-box" />
+    <span class="err" style="position:absolute;left:300px;top:78px;display:inline">This field is required.</span>`),
+
+  // fullWidthAbove: a FULL-WIDTH (960 px) empty notes box right above "Meter location [select]
+  // This field is required." The aligned-above bound is capped at 48 px so this box does not
+  // cancel the beside complaint; uncapped (width / 3) it would, and main's misattribution to the
+  // box above — by one pixel here — comes back.
+  fullWidthAbove: shell(`
+    <label for="fn" style="position:absolute;left:8px;top:0">Additional notes</label>
+    <textarea id="fn" style="position:absolute;left:8px;top:20px;width:960px;height:30px;box-sizing:border-box"></textarea>
+    <label for="fm" style="position:absolute;left:8px;top:54px">Meter location</label>
+    <select id="fm" style="position:absolute;left:120px;top:54px;width:190px;height:19px"><option value="">Please select...</option></select>
+    <span class="err" style="position:absolute;left:314px;top:54px;display:inline">This field is required.</span>`),
+
+  // handedRunnerUp: a complaint truly under an empty upload slot. The entry carries the
+  // runner-up empty control and the unattributed fallback, so a caller that discharges the slot
+  // as a held upload (recipeAdapter.sweepRequired) can keep the complaint.
+  handedRunnerUp: shell(`
+    <label for="hs" style="position:absolute;left:8px;top:20px">Plan set</label>
+    <input id="hs" type="file" style="position:absolute;left:8px;top:40px;width:200px;height:26px;box-sizing:border-box" />
+    <span class="err" style="position:absolute;left:8px;top:70px;display:inline">This field is required.</span>
+    <label for="hp" style="position:absolute;left:300px;top:20px">Customer phone</label>
+    <input id="hp" style="position:absolute;left:300px;top:40px;width:185px;height:21px;box-sizing:border-box" />`),
+
   // ---- a complaint no control can own must still be reported -------------------------
   orphanComplaint: shell(`
     <div class="err">Please select at least one option before continuing.</div>
@@ -215,6 +285,32 @@ const under = await sweep("underWithNeighbourRight");
 check("...and a complaint UNDER its field is not handed to an empty control further right on its line",
   under.some((r) => /meter number/i.test(r.name)) && !under.some((r) => /fax/i.test(r.name)),
   JSON.stringify(under));
+
+const nameIs = (rows: Array<{ name: string }>, re: RegExp): boolean => rows.some((r) => re.test(r.name));
+const mirror = await sweep("mirrorLeft");
+check("a complaint UNDER Customer phone is Customer phone's, not the empty slot ending left of it on the complaint's line (#327)",
+  nameIs(mirror, /customer phone/i) && !nameIs(mirror, /plan set/i), JSON.stringify(mirror));
+const indent = await sweep("indent40");
+check("...and so is a complaint indented 40 px under its field",
+  nameIs(indent, /customer phone/i) && !nameIs(indent, /reference/i), JSON.stringify(indent));
+const two = await sweep("twoComplaints");
+check("two columns, two complaints: BOTH empty fields are named, the right one from its own complaint",
+  nameIs(two, /project description/i) && two.some((r) => /customer email/i.test(r.name) && r.why === "complaint") && two.length === 2,
+  JSON.stringify(two));
+const boot = await sweep("bootstrapSelect");
+check("a 300 px bootstrap-select (0.5 px opacity-0 native select at left:50%) flagged under its widget is named, not the box left of the complaint",
+  nameIs(boot, /^utility$/i) && !nameIs(boot, /reference/i), JSON.stringify(boot));
+const wide = await sweep("fullWidthAbove");
+check("a full-width empty box above does not cancel a complaint BESIDE its select (the 48 px cap)",
+  nameIs(wide, /meter location/i) && !nameIs(wide, /additional notes/i), JSON.stringify(wide));
+const runner = await sweep("handedRunnerUp");
+{
+  const slot = runner.find((r) => /plan set/i.test(r.name));
+  check("a complaint handed to a control carries the runner-up EMPTY control and the unattributed fallback",
+    slot?.why === "complaint" && slot.handed?.length === 1 && slot.handed[0].next === "Customer phone"
+      && /^portal reports "This field is required\." \(field could not/.test(slot.handed[0].unattributed),
+    JSON.stringify(runner));
+}
 
 const instr = await sweep("instructions");
 check("INSTRUCTIONAL 'please select all that apply' is not treated as a complaint",

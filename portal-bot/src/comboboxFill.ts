@@ -29,6 +29,12 @@ import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE } from "../../shared
  *  pays). Diagnostic only; "" when none. */
 export let lastComboboxEnterRefusal = "";
 
+/** The text of the option the last custom-combobox fill CLICKED ("" when it clicked none, or when
+ *  the last select went through a native selectOption). The replay's read-back compares a
+ *  widget's face against THIS, not the recipe's answer: a containment pick ("Pacific Gas &
+ *  Electric Company" for "Pacific Gas & Electric") is the option the face should then show (#327). */
+export let lastComboboxPickedText = "";
+
 const SEARCH_BOX_SELECTORS = [
   'input[role="combobox"]',
   'input[type="search"]',
@@ -194,7 +200,9 @@ async function waitForOptions(page: any, budgetMs = 2500, ownScope?: any): Promi
 async function clickOption(loc: any): Promise<boolean> {
   try {
     await loc.scrollIntoViewIfNeeded?.({ timeout: 1000 }).catch(() => {});
+    const text = String(await loc.textContent?.({ timeout: 1000 }).catch(() => "") ?? "").replace(/\s+/g, " ").trim();
     await loc.click({ timeout: 5000 });
+    lastComboboxPickedText = text;
     return true;
   } catch {
     return false;
@@ -373,6 +381,8 @@ export async function readClosedComboboxOptions(page: any, loc: any): Promise<st
  *   mode "probe" — the same walk, no click: "preferred" means the hidden control has a real face
  *                  a person could use (the replay's row resolver accepts it as usable).
  *   mode "text"  — the preferred face's text: what the widget SHOWS as selected ("" if none).
+ *   mode "own"   — like "text", but only THIS input's own face (not a neighbouring widget's),
+ *                  and only its rendered words (no icon/arrow text, no screen-reader-only text).
  *
  * Runs IN THE PAGE (loc.evaluate): self-contained, no module references.
  */
@@ -403,6 +413,47 @@ export function comboboxFaceInPage(el: Element, mode: string): string {
       return preferred ? "preferred" : "any";
     }
     if (mode === "text") return preferred ? String(preferred.innerText || preferred.textContent || "").replace(/\s+/g, " ").trim() : "";
+    if (mode === "own") {
+      // "own" — the text a person reads on THIS input's face, for the replay's read-back of a
+      // concealed backing input (#327). Two things "text" does not do:
+      //   - A face inside a container that holds a DIFFERENT concealed input but not this one
+      //     is that other widget's (a Generator dropdown beside the Battery one): never ours.
+      //     A widget posting its key and its text in two hidden inputs of its own still reads,
+      //     because its container holds this input too.
+      //   - Only the rendered words: an arrow/icon/caret span (Telerik's t-icon reads
+      //     "select"), anything not rendered, and screen-reader-only text ("Selected:") are
+      //     left out, so the face can be compared for EQUALITY with the option clicked.
+      const concealed = (n: Element): boolean => {
+        if (n === el || !/^(INPUT|SELECT)$/.test(n.tagName)) return false;
+        if ((n.getAttribute("type") || "").toLowerCase() === "hidden") return true;
+        const r = n.getBoundingClientRect();
+        const s = getComputedStyle(n);
+        return r.width <= 2 || r.height <= 2 || s.display === "none" || s.visibility === "hidden" || Number(s.opacity) === 0;
+      };
+      const othersFace = (n: Element): boolean => {
+        for (let a: Element | null = n; a && a !== root; a = a.parentElement) {
+          if (!a.contains(el) && Array.from(a.querySelectorAll("input, select")).some(concealed)) return true;
+        }
+        return false;
+      };
+      const face = cands.filter((n) => !othersFace(n))
+        .find((n) => /form-select|\bselect\b|display|toggle|control|dropdown/i.test(n.className || "") || n.getAttribute("role") === "button");
+      if (!face) continue;
+      let out = "";
+      const walker = document.createTreeWalker(face, NodeFilter.SHOW_TEXT);
+      for (let t = walker.nextNode(); t; t = walker.nextNode()) {
+        let skip = false;
+        for (let p = t.parentElement; p; p = p.parentElement) {
+          const s = getComputedStyle(p);
+          const r = p.getBoundingClientRect();
+          if (s.display === "none" || s.visibility === "hidden" || r.width <= 1 || r.height <= 1) { skip = true; break; }
+          if (p === face) break;
+          if (/icon|arrow|caret|sr-only|visually-hidden|screen-reader|offscreen/i.test(p.getAttribute("class") || "")) { skip = true; break; }
+        }
+        if (!skip) out += ` ${t.textContent || ""}`;
+      }
+      return out.replace(/\s+/g, " ").trim();
+    }
     return preferred ? "preferred" : "any";
   }
   if (mode === "click") (el as HTMLElement).click();
@@ -410,6 +461,7 @@ export function comboboxFaceInPage(el: Element, mode: string): string {
 }
 
 export async function fillCustomCombobox(page: any, loc: any, value: string): Promise<boolean> {
+  lastComboboxPickedText = "";
   const v = (value ?? "").trim();
   if (!v) return false;
 
@@ -652,6 +704,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
  * so callers can surface the miss instead of silently continuing.
  */
 export async function selectWithFallback(page: any, loc: any, value: string): Promise<boolean> {
+  lastComboboxPickedText = "";
   // Only a real <select> can take selectOption. Running it on a styled-div widget or a
   // (readonly, visually-hidden) input[role="combobox"] — PowerClerk's Vue filtered-select —
   // stalls the full actionability timeout TWICE before the combobox path even runs (the
