@@ -45,7 +45,7 @@ export interface GapFillOutcome {
    *  its label, id and name, and whether the answer came from the project's data or was an AI pick
    *  (gapFillWriteKind). A pick's element also carries data-al-unrec (UNRECORDED_WRITE_ATTR), so a
    *  replay can tell whether that control is still in front of a stamped draft click. */
-  attemptedControls: Array<{ label: string; id: string; name: string; kind: GapFillWriteKind }>;
+  attemptedControls: Array<{ label: string; id: string; name: string; kind: GapFillWriteKind; question: string; option: string }>;
   /** Planned fills rejected because they weren't grounded in real project data. */
   skippedUngrounded: string[];
   /** Required, empty fields the PROJECT GENUINELY LACKS — surfaced so the human can act. */
@@ -564,7 +564,12 @@ export async function gapFillCurrentPage(
       const claimed = await claimForWrite(loc, field);
       if (!claimed) continue;
       out.attempted.push(shown);
-      const entry: GapFillOutcome["attemptedControls"][number] = { label: shown, id: claimed.id, name: claimed.name, kind: "pick" };
+      // Its question (and a choice control's option word): what finds the control again if a
+      // re-render or a revisit gives it a new id (unrecordedPicksInFront).
+      const entry: GapFillOutcome["attemptedControls"][number] = {
+        label: shown, id: claimed.id, name: claimed.name, kind: "pick",
+        question: choice ? question : String(field.label ?? ""), option: choice ? own : "",
+      };
       out.attemptedControls.push(entry);   // a pick until what landed says otherwise
       let applied = false;
       try {

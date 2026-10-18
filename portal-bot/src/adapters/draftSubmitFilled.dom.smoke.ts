@@ -10,10 +10,12 @@
 // answered) got one POST each with the draft created — and, on a page where the dropdown's Yes turns
 // the Submit into a filing, one FILING POST with no approval.
 //
-// The record is keyed to the CONTROLS automation picked, not to "leaving the page" (Helm review of
-// 85424af5): a pick stops the click while its control is still in the document — an advance that
-// only reveals more of the same page, an in-page opener and a revisit all keep it — and a pick with
-// no control to point at (a re-assert) while its document is in front.
+// The record is keyed to the CONTROLS automation picked and their QUESTIONS, not to "leaving the
+// page" (Helm reviews of 85424af5 and 4081f12): a pick stops the click while it was made in this
+// document and view (an advance that only reveals more of the same page, an in-page opener, a
+// re-mount under a new id), or while a control with its id or name, or an answered control asking
+// its question, is in front (a revisit, even one that renders new ids). draftSubmitPins pins the
+// re-mount, renumbered-id, removed-dialog and reused-id shapes.
 //
 // Real Chromium through the real stage path (stageWithRecipe → runAdapter → RecipeAdapter with the
 // network backstop and the LLM gap-fill enabled) against synthetic Part 1 pages on 127.0.0.1 (never a

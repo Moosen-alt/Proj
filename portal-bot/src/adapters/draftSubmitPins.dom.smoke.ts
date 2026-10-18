@@ -36,13 +36,15 @@
 //          MUST-STOP (the recorded step that would have overwritten it does not land)
 //     SF8  sharedLabel (Part 1's own Email step wins over an earlier page's) and reloadOwn (a same-URL
 //          reload) MUST-PASS
-//     SF9  earlierPick: an unbound pick on an EARLIER page, then a real navigation to Part 1
+//     SF9  earlierPick: an unbound pick on an EARLIER page, then a real navigation to Part 1; reusedId: the
+//          same, and Part 1 reuses the pick's id for another question (MUST-PASS while the owner's
+//          card stands at "Submit page only"; WHOLE_APPLICATION flips both)
 //
 // Real Chromium through stageWithRecipe (the network backstop and the LLM gap-fill enabled), synthetic
 // pages on 127.0.0.1 (never a real portal; every name, company and address is fictional), a stub
 // planner. Every non-GET the server receives is counted, and every change event is beaconed back.
 //
-// Run: npx tsx portal-bot/src/adapters/draftSubmitPins.dom.smoke.ts [--only <mode>]
+// Run: npx tsx portal-bot/src/adapters/draftSubmitPins.dom.smoke.ts [--only <mode>,<prefix>*]
 import "../smokeArtifactDirs";
 import http from "node:http";
 import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../../shared/src/types";
@@ -84,6 +86,8 @@ interface Mode {
   /** The planner's answer for a field it is offered, or null. Defaults to defaultPlan. */
   plan?: (f: Field) => Omit<Fill, "selectorIndex"> | null;
   gap?: Record<string, string>;
+  /** The project's values for recorded steps bound by `field`. */
+  values?: Record<string, string>;
   /** No stamp and no Submit step: a permit run that ends at its review stop. */
   permit?: boolean;
 }
@@ -116,7 +120,7 @@ const remountScript = (oldId: string, newId: string, name: string | null): strin
 // THE STUB PLANNER, by default: a Yes/No select or a "Yes" radio gets Yes (bound to a project field
 // on a mode named bound*), the installer box gets the project's installer.
 const defaultPlan = (mode: string) => (f: Field): Omit<Fill, "selectorIndex"> | null => {
-  const bound = /^bound|^rnoidPart1|^selectLabelledBy$/.test(mode) ? { field: "agreesToTerms" } : {};
+  const bound = /^bound|^selectLabelledBy$/.test(mode) ? { field: "agreesToTerms" } : {};
   if (f.fieldType === "select" && (f.options ?? []).includes("Yes")) return { value: "Yes", ...bound };
   if (f.fieldType === "radio" && /^yes$/i.test(String(f.label ?? "").trim())) return { value: "Yes", ...bound };
   if (/installer company/i.test(String(f.label ?? ""))) return { value: "Acme Solar", field: "installerCompany" };
@@ -212,7 +216,7 @@ const MODES: Record<string, Mode> = {
   selectLabelledByEarly: { early: { html: `<div id="q1">${READY}</div><select id="readyS" name="readyS" aria-labelledby="q1">${opts(["Yes", "No"])}</select>${installerBox}` } },
   radioSpanEarlier: { early: { html: `<div class="row"><span>${READY}</span>${radios("readyR")}</div>${installerBox}` } },
   rnoidEarly2: { early: { html: `<div class="row"><span>${READY}</span>${idless("readyR")}</div><div class="row"><span>${GRID}</span>${idless("gridTied")}</div>${installerBox}` } },
-  rnoidPart1: { part1: () => `<div class="row"><span>${READY}</span>${idless("readyR")}</div><div class="row"><span>${GRID}</span>${idless("gridTied", "required")}</div>`, gap: { agreesToTerms: "Yes" } },
+  rnoidPart1: { part1: () => `<div class="row"><span>${READY}</span>${idless("readyR")}</div><div class="row"><span>${GRID}</span>${idless("gridTied", "required")}</div>` },
   miamiEarlier: {
     early: { html: `<div class="row"><span>${READY}</span><input type="radio" name="readyR" id="rdo" value="Yes"><label for="Yes">Yes</label><input type="radio" name="readyR" id="rdo" value="No"><label for="No">No</label></div>${installerBox}` },
   },
@@ -230,7 +234,7 @@ const MODES: Record<string, Mode> = {
   },
   // ---- SHOULD-FIX ------------------------------------------------------------------------
   spaPlain: {
-    doc: (base) => `<!doctype html><html><head><meta charset="utf-8"><title>Utility Portal</title></head><body>${BEACON("spaPlain")}<h1>Utility Interconnection Portal</h1><div id="app">
+    doc: (base) => `<!doctype html><html><head><meta charset="utf-8"><title>Utility Portal</title></head><body>${BEACON("spaPlain")}${NAV}<h1>Utility Interconnection Portal</h1><div id="app">
       ${sel("nmp1", "Net Metering Program", ["Yes", "No"])}<button type="button" id="btnProceed" onclick="go()">Proceed to Part 1</button></div>
       <script>function go() { document.getElementById('app').innerHTML = '<form method="post" action="${base.replace(/^https?:\/\/[^/]+/, "")}/m/spaPlain/p1/submit">' +
         '<div><label for="appDate">Application Date</label><input id="appDate" name="appDate" type="text"></div>' +
@@ -293,26 +297,37 @@ const MODES: Record<string, Mode> = {
     steps: () => [clickMore(), step({ action: "select", selector: { css: "#agree", label: AGREE }, value: "No", note: "terms" })],
   },
   contactAfterGap: {
-    part1: () => `<div><label for="cemail">Contact Email</label><input id="cemail" name="cemail" type="email" required></div>${reveal}`,
-    steps: () => [clickMore(), step({ action: "fill", selector: { css: "#cemail", label: "Contact Email" }, value: "office@acme.example", note: "contact: Contact Email" })],
-    plan: (f) => (labelIs(f, /contact email/i) ? { value: "someone@example.test" } : null),
+    // The pick: "Elm St" traces into the site address (so it is written) but is not the address.
+    part1: () => `<div><label for="cemail">Contact Email</label><input id="cemail" name="cemail" type="text" required></div>${reveal}`,
+    steps: () => [clickMore(), step({ action: "fill", selector: { css: "#cemail", label: "Contact Email" }, field: "installerEmail", note: "contact: Contact Email" })],
+    plan: (f) => (labelIs(f, /contact email/i) ? { value: "Elm St" } : null),
+    gap: { siteAddress: "1200 Elm St" },
+    values: { installerEmail: "office@acme.example" },
   },
   notLanded: {
     part1: () => sel("agree", AGREE, ["Yes", "No"], "required") + reveal,
-    steps: () => [clickMore(), step({ action: "select", selector: { css: "#agreeGone", label: "Terms (old)" }, value: "No", note: "terms" })],
+    // The recorded answer is not an option any more, so it never lands.
+    steps: () => [clickMore(), step({ action: "select", selector: { css: "#agree", label: AGREE }, value: "Maybe", note: "terms" })],
   },
   sharedLabel: {
-    early: { html: `<div><label for="emailEarly">Email</label><input id="emailEarly" type="email"></div>`, steps: [earlyFill("emailEarly", "Email", "early@acme.example")] },
+    early: { html: `<div><label for="emailEarly">Email</label><input id="emailEarly" type="email"></div>`, steps: [step({ action: "fill", selector: { css: "#emailEarly", label: "Email", fallbacks: [{ label: "Email" }] }, field: "homeownerEmail", note: "Email" })] },
     part1: () => `<div><label for="email">Email</label><input id="email" name="email" type="email" required></div>`,
     script: `<script>var b = false; document.getElementById('email').addEventListener('change', function () { if (b) return; b = true; var el = this; setTimeout(function () { el.value = ''; }, 150); });</script>`,
-    steps: () => [earlyFill("email", "Email", "part1@acme.example")],
+    steps: () => [step({ action: "fill", selector: { css: "#email", label: "Email", fallbacks: [{ label: "Email" }] }, field: "installerEmail", note: "Email" })],
+    values: { homeownerEmail: "early@acme.example", installerEmail: "part1@acme.example" },
   },
   reloadOwn: {
     part1: () => `<button type="button" id="btnSave" onclick="location.reload()">Save</button>`,
     steps: () => [step({ action: "click", selector: { css: "#btnSave", text: "Save" }, note: "Save" })],
   },
+  // An earlier page's pick, and Part 1 reuses its id for a different question the recording fills.
+  reusedId: {
+    early: { html: sel("agree", AGREE, ["Yes", "No"], "required") },
+    part1: () => sel("agree", "Interconnection Type", ["Net Metering", "Export Only"], "required"),
+    steps: () => [step({ action: "select", selector: { css: "#agree", label: "Interconnection Type" }, value: "Net Metering", note: "Interconnection Type" })],
+  },
   earlierPick: {
-    early: { html: sel("agreeEarly", AGREE, ["Yes", "No"]) },
+    early: { html: sel("agreeEarly", AGREE, ["Yes", "No"], "required") },
   },
 };
 
@@ -417,7 +432,7 @@ async function stage(mode: string): Promise<Outcome> {
   const stamp: DraftCreatingStamp = { stepIndex: recipe.steps.length - 1, tenantKey: TENANT, label: "Submit", healedAt: "2026-10-16T00:00:00.000Z" };
   const marks = [posts.length, gets.length, touchedLog.length];
   const t0 = Date.now();
-  const r = await stageWithRecipe(recipe, { id: `p-${mode}` } as ProjectRecord, {}, {}, [], {
+  const r = await stageWithRecipe(recipe, { id: `p-${mode}` } as ProjectRecord, MODES[mode].values ?? {}, {}, [], {
     headless: true, runId: `run-${mode}-${++seq}`, ...(MODES[mode].permit ? {} : { draftSubmitStamp: stamp }), autoSubmit: false, runApproval: null,
     gapFillPlanner: planner, gapFillFields: { ...GAP_FIELDS, ...(MODES[mode].gap ?? {}) },
   });
@@ -435,6 +450,7 @@ const msgOf = (r: Record<string, unknown>): string => {
 /** The first line the run card shows (backend pausedRunSentence reads the pausing step's message). */
 const cardLine = (r: Record<string, unknown>): string => String(stepsOf(r).find((s) => s?.pauseReason === r.pauseReason)?.message ?? "").split("\n")[0];
 const brief = (o: Outcome): string => `ms=${o.ms} posts=${JSON.stringify(o.posts.map((p) => `${p.path}?${p.body.slice(0, 120)}`))} gets=${JSON.stringify(o.gets.map((g) => g.path + g.query))} touched=${JSON.stringify(o.touched.map((t) => `${t.id || t.name}=${t.v}`))} ok=${String(o.r.ok)} pause=${String(o.r.pauseReason)} draft=${JSON.stringify(o.r.draftCreatedByReplay ?? null)} incident=${JSON.stringify(o.r.draftSubmitUnexpected ?? null)} offered=${JSON.stringify(offered.filter((f) => f.mode === o.mode).map((f) => `${f.type}:${f.label}|${f.group}`))} card=${cardLine(o.r).slice(0, 260)} msg=${msgOf(o.r).slice(-700)}`;
+const noIncident = (o: Outcome): boolean => o.r.pauseReason !== "draft_submit_unexpected" && !o.r.draftSubmitUnexpected && o.r.finalSubmitClicked === false;
 const notAnIncident = (o: Outcome): boolean => o.r.pauseReason !== "draft_submit_unexpected" && !o.r.draftSubmitUnexpected && !o.r.draftCreatedByReplay && o.r.finalSubmitClicked === false;
 const drafted = (o: Outcome): boolean => o.posts.length === 1 && /\/p1\/submit$/.test(o.posts[0].path) && (o.r.draftCreatedByReplay as { applicationNumber?: string } | null)?.applicationNumber === "NEM-90017" && o.r.finalSubmitClicked === false;
 /** A review stop: no request of any kind, no draft, no incident, paused before review. */
@@ -447,7 +463,7 @@ const readyKept = (o: Outcome, key: string): boolean => !wrote(o, new RegExp(`^$
 
 const only = (() => { const i = process.argv.indexOf("--only"); return i > 0 ? String(process.argv[i + 1] ?? "") : ""; })();
 const run = async (mode: string, fn: (o: Outcome) => void): Promise<void> => {
-  if (only && !mode.includes(only)) return;
+  if (only && !only.split(",").some((x) => mode === x || (x.endsWith("*") && mode.startsWith(x.slice(0, -1))))) return;
   fn(await stage(mode));
 };
 
@@ -479,14 +495,14 @@ try {
   }
   for (const mode of ["radioSpanEarlier", "selectLabelledByEarly", "rnoidEarly2", "miamiEarlier"] as const) {
     const key = mode === "selectLabelledByEarly" ? "readyS" : "readyR";
-    await run(mode, (o) => check(`${mode}: the ready-to-submit question on an EARLIER page is never answered — never touched, no request carries it`, readyKept(o, key) && notAnIncident(o) && !o.posts.some((p) => new RegExp(`${key}=`).test(p.body)), brief(o)));
+    await run(mode, (o) => check(`${mode}: the ready-to-submit question on an EARLIER page is never answered — never touched, no request carries it`, readyKept(o, key) && noIncident(o) && !o.posts.some((p) => new RegExp(`${key}=[^&]`).test(p.body)), brief(o)));
   }
   await run("rnoidPart1", (o) => {
     check("rnoidPart1: an id-less grid-tied Yes is written to ITS group, never to the ready group's Yes", readyKept(o, "readyR"), brief(o));
     check("rnoidPart1: ...and the stop names the grid-tied question, not the ready one (0 POSTs)", stoppedForPick(o, GRID) && !cardLine(o.r).includes("ready to submit"), brief(o));
   });
-  await run("misroute", (o) => check("misroute: an earlier page's \"Net Metering Program\" is never re-asserted into the ready select its label locator resolves to — never touched, 0 POSTs", !wrote(o, /^ready$/) && o.posts.length === 0 && notAnIncident(o), brief(o)));
-  await run("reassertBound", (o) => check('reassertBound: Part 1\'s own "Net Metering" step, its select re-rendered under a new id, is never re-asserted into the ready select — never touched, 0 POSTs', !wrote(o, /^ready$/) && o.posts.length === 0 && notAnIncident(o), brief(o)));
+  await run("misroute", (o) => check("misroute: an earlier page's \"Net Metering Program\" is never re-asserted into the ready select its label locator resolves to — never touched, no request carries it", readyKept(o, "ready") && noIncident(o), brief(o)));
+  await run("reassertBound", (o) => check('reassertBound: Part 1\'s own "Net Metering" step, its select re-rendered under a new id, is never re-asserted into the ready select — never touched, no POST carries it', readyKept(o, "ready") && noIncident(o), brief(o)));
   // SF2
   await run("spaPlain", (o) => check('spaPlain: a single-document "Proceed to Part 1" — view 1\'s recorded value re-asserted into Part 1 is a pick (0 POSTs, a named stop)', stoppedForPick(o, "Net Metering Program"), brief(o)));
   await run("revisitRe", (o) => check("revisitRe: a carried-over re-assert, then a revisit of Part 1 — still a pick (0 POSTs, a named stop)", stoppedForPick(o, "Preferred Contact Method"), brief(o)));
@@ -502,17 +518,21 @@ try {
     await run(mode, (o) => check(`${mode}: "finish" is not submit intent — the permit run writes ${id}=${v} and reaches review`, wrote(o, new RegExp(`^${id}$`), v) && o.r.ok === true && o.posts.length === 0, brief(o)));
   }
   // SF7
-  await run("overwritePick", (o) => check("overwritePick: a gap-fill pick the next recorded step overwrites with its own answer — one click, the draft carries the recorded No", drafted(o) && o.posts[0].body.includes("agree=No"), brief(o)));
-  await run("contactAfterGap", (o) => check("contactAfterGap: a contact box the recording fills after the gap-fill — one click, the draft carries the recorded email", drafted(o) && o.posts[0].body.includes("cemail=office%40acme.example"), brief(o)));
+  await run("overwritePick", (o) => check("overwritePick: a gap-fill pick the next recorded step overwrites with its own answer — one click, the draft carries the recorded No", wrote(o, /^agree$/, "Yes") && drafted(o) && o.posts[0].body.includes("agree=No"), brief(o)));
+  await run("contactAfterGap", (o) => check("contactAfterGap: a contact box the recording fills after the gap-fill — one click, the draft carries the recorded email", wrote(o, /^cemail$/, "Elm St") && drafted(o) && o.posts[0].body.includes("cemail=office%40acme.example"), brief(o)));
   await run("notLanded", (o) => check("notLanded: the recorded step that would overwrite the pick does not land — the pick stops the click (0 POSTs, a named stop)", stoppedForPick(o, "Do you agree"), brief(o)));
   // SF8
-  await run("sharedLabel", (o) => check("sharedLabel: Part 1's own Email step wins its re-rendered blank over an earlier page's Email — one click, the draft carries Part 1's", drafted(o) && o.posts[0].body.includes("email=part1%40acme.example"), brief(o)));
+  await run("sharedLabel", (o) => check("sharedLabel: Part 1's own Email step wins its re-rendered blank over an earlier page's Email — one click, the draft carries Part 1's", wrote(o, /^email$/, "part1@acme.example") && drafted(o) && o.posts[0].body.includes("email=part1%40acme.example"), brief(o)));
   await run("reloadOwn", (o) => check("reloadOwn: a same-URL reload after Save, Part 1's own value re-asserted — one click, the draft", drafted(o) && o.posts[0].body.includes("appDate=10%2F16%2F2026"), brief(o)));
   // SF9
   await run("earlierPick", (o) => check(WHOLE_APPLICATION
     ? "earlierPick: an unbound pick on an EARLIER page stops the stamped click (owner: whole application)"
     : "earlierPick: an unbound pick on an EARLIER page, then a real navigation to Part 1 — one click, the draft (owner card open: Submit page only)",
-  WHOLE_APPLICATION ? stoppedForPick(o, "Do you agree") : drafted(o), brief(o)));
+  wrote(o, /^agreeEarly$/, "Yes") && (WHOLE_APPLICATION ? stoppedForPick(o, "Do you agree") : drafted(o)), brief(o)));
+  await run("reusedId", (o) => check(WHOLE_APPLICATION
+    ? "reusedId: an earlier page's pick stops the stamped click (owner: whole application)"
+    : "reusedId: an earlier page's pick whose id Part 1 reuses for another question is not in front — one click, the draft",
+  wrote(o, /^agree$/, "Yes") && (WHOLE_APPLICATION ? stoppedForPick(o, "Do you agree") : drafted(o)), brief(o)));
 } finally {
   server.close();
 }

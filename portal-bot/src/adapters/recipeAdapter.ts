@@ -547,15 +547,18 @@ export class RecipeAdapter extends BasePortalAdapter {
    *     answered with no bound project field, or another page's recorded value re-asserted into a
    *     blank here. Read by clickDraftCreatingSubmit: the stamped draft click only happens on the
    *     page the stamp saw, and a page that needed an AI's pick is not that page.
-   *  KEYED TO THE CONTROL, NOT TO "LEAVING THE PAGE": a pick's element carries UNRECORDED_WRITE_ATTR,
-   *  and its id / name are kept. At the draft click, any control picked this run that is still in
-   *  the document (stamped, or by id / name — visible or hidden, and so a revisit too) refuses the
-   *  click. A pick with no control to point at (a re-assert) is tied to the DOCUMENT it was made in
-   *  (`doc`) and refuses while that document is still the one in front. A real navigation (a new
-   *  document) leaves them behind; an advance that only reveals more of the same page never does. */
+   *  KEYED TO THE CONTROL AND ITS QUESTION, NOT TO "LEAVING THE PAGE": a pick's element carries
+   *  UNRECORDED_WRITE_ATTR, and its id, name, question, document and view are kept. At the draft
+   *  click a pick is IN FRONT when its control is still stamped; or it was made in this document and
+   *  this view (a re-mount under a new id, a removed dialog — an advance that only reveals more of
+   *  the same page keeps the view); or a control with its id OR name is here and, in another
+   *  document, still asks its question (a revisit; an earlier page's reused id that asks something
+   *  else is not it); or an answered control asks its question (a revisit under new ids). So a
+   *  pick left on an EARLIER page is left behind by a real navigation unless Part 1 asks the same
+   *  question (the owner's "Submit page only" scope, pending his card). See unrecordedPicksInFront. */
   /** The stop's first words when the stamped draft click was refused for picks (#362). */
   private draftPickTell: string | null = null;
-  private unrecordedWrites: Array<{ kind: "data" | "pick"; label: string; id: string; name: string; doc: string }> = [];
+  private unrecordedWrites: Array<{ kind: "data" | "pick"; label: string; id: string; name: string; doc: string; view: number; question: string; option: string }> = [];
   /** WHICH VIEW EACH RECORDED WRITE RAN IN (#362): what tells a re-assert of THIS view's recorded
    *  value (a re-render, a reload after Save) from one carried over from another page. A new view
    *  begins when the URL path or the page heading changes, or when the controls on screen were
@@ -596,13 +599,16 @@ export class RecipeAdapter extends BasePortalAdapter {
     }).catch(() => "");
     return String(t || "") || "*";
   }
-  private async noteUnrecordedWrite(kind: "data" | "pick", what: string, control?: { id?: string; name?: string }): Promise<void> {
+  private async noteUnrecordedWrite(kind: "data" | "pick", what: string, control?: { id?: string; name?: string; question?: string; option?: string }): Promise<void> {
     const label = String(what || "").replace(/\s+/g, " ").trim().slice(0, 100) || "a control";
     const id = String(control?.id ?? "");
     const name = String(control?.name ?? "");
+    const question = String(control?.question ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
+    const option = String(control?.option ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
     const doc = await this.docToken();
+    const view = await this.observeView();
     if (this.unrecordedWrites.some((w) => w.kind === kind && w.label === label && w.id === id && w.name === name && w.doc === doc)) return;
-    this.unrecordedWrites.push({ kind, label, id, name, doc });
+    this.unrecordedWrites.push({ kind, label, id, name, doc, view, question, option });
   }
   /** Note a write to the control a locator resolves: keep its id / name, and stamp it when it is a
    *  pick. A control that cannot be read is tied to the document instead. */
@@ -625,17 +631,77 @@ export class RecipeAdapter extends BasePortalAdapter {
     const all = (): string[] => Array.from(new Set(picks.map((w) => w.label)));
     if (!this.page || typeof this.page.evaluate !== "function") return all();
     const doc = await this.docToken();
-    const main = await this.page.evaluate((a: { attr: string; writes: Array<{ label: string; id: string; name: string; doc: string }>; doc: string }) => {
+    // IN FRONT, PER PICK (Helm review of 4081f12, Blocking 1, "Submit page only"), any of:
+    //   - its control is still stamped (UNRECORDED_WRITE_ATTR rides the element itself);
+    //   - it was made in THIS document and THIS view (observeView) — even if its control was
+    //     re-created under a new id or removed (a re-mount, a synchronous re-render, a dialog that
+    //     copied its answer to a hidden input and closed); unreadable views fail closed;
+    //   - a control with its id OR its name is here: in this document always; in another document
+    //     (a revisit, a reused id) only when that control still asks the pick's question;
+    //   - an ANSWERED, visible control asks the pick's own question (its label, aria-label or
+    //     aria-labelledby; a checked radio: its option word under that question) — a revisit that
+    //     renders new ids.
+    // ONE ENTRY PER CONTROL (Helm nit): a stamp that is a noted pick's own control is that pick.
+    const view = await this.observeView();
+    const main = await this.page.evaluate((a: { attr: string; writes: Array<{ label: string; id: string; name: string; doc: string; view: number; question: string; option: string }>; doc: string; view: number }) => {
+      const norm = (t: string | null | undefined): string => String(t || "").replace(/[\s*:?]+/g, " ").trim().toLowerCase();
+      const vis = (el: Element): boolean => { const r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; };
+      const byIds = (ids: string | null): string => (ids || "").split(/\s+/).filter(Boolean).map((r) => document.getElementById(r)?.textContent || "").join(" ");
+      const labelsOf = (el: Element): string[] => {
+        const out: string[] = [];
+        const id = el.getAttribute("id");
+        if (id) for (const l of Array.from(document.querySelectorAll(`label[for="${CSS.escape(id)}"]`))) out.push(l.textContent || "");
+        const wrap = el.closest("label"); if (wrap) out.push(wrap.textContent || "");
+        out.push(el.getAttribute("aria-label") || "", byIds(el.getAttribute("aria-labelledby")));
+        return out.map(norm).filter(Boolean);
+      };
+      // The question a control asks: its labels; a radio/checkbox: its group's (legend, radiogroup
+      // name, or the text of the smallest container holding only its group).
+      const asks = (el: Element, q: string, option: string): boolean => {
+        const ty = (el.getAttribute("type") || "").toLowerCase();
+        if (ty === "radio" || ty === "checkbox") {
+          if (option && !labelsOf(el).some((l) => l === norm(option))) return false;
+          const nm = el.getAttribute("name");
+          for (let up = el.parentElement, k = 0; up && up !== document.body && k < 6; up = up.parentElement, k++) {
+            const legend = up.tagName === "FIELDSET" ? Array.from(up.children).find((c) => c.tagName === "LEGEND") : null;
+            const named = norm(up.getAttribute("aria-label")) || norm(byIds(up.getAttribute("aria-labelledby"))) || norm(legend?.textContent);
+            if (named) return named.includes(q);
+            const others = Array.from(up.querySelectorAll("input, select, textarea")).some((c) => c !== el && (!nm || c.getAttribute("name") !== nm));
+            if (others) return false;
+            if (norm((up as HTMLElement).innerText).includes(q)) return true;
+          }
+          return false;
+        }
+        return labelsOf(el).some((l) => l === q);
+      };
+      const answered = (el: Element): boolean => {
+        const i = el as HTMLInputElement;
+        const ty = (el.getAttribute("type") || "").toLowerCase();
+        if (ty === "radio" || ty === "checkbox") return i.checked;
+        if (el.tagName === "SELECT") { const s = el as HTMLSelectElement; return s.selectedIndex > 0 || (!!s.value && s.selectedIndex >= 0); }
+        return !!String(i.value || "").trim();
+      };
+      const controls = Array.from(document.querySelectorAll("input:not([type=hidden]), select, textarea"));
       const out: string[] = [];
-      for (const el of Array.from(document.querySelectorAll(`[${a.attr}]`))) out.push(el.getAttribute(a.attr) || "a control");
+      const stamped = Array.from(document.querySelectorAll(`[${a.attr}]`));
+      const claimed = new Set<Element>();
       for (const w of a.writes) {
-        const here = w.id ? !!document.getElementById(w.id)
-          : w.name ? document.getElementsByName(w.name).length > 0
-          : w.doc === "*" || a.doc === "*" || w.doc === a.doc;
-        if (here) out.push(w.label);
+        const q = norm(w.question);
+        const mine = stamped.filter((el) => (!!w.id && el.getAttribute("id") === w.id) || (!!w.name && el.getAttribute("name") === w.name));
+        mine.forEach((el) => claimed.add(el));
+        const sameDoc = w.doc === "*" || a.doc === "*" || w.doc === a.doc;
+        const sameView = sameDoc && (w.view < 0 || a.view < 0 || w.view === a.view);
+        const byKey = [
+          ...(w.id ? [document.getElementById(w.id)] : []),
+          ...(w.name ? Array.from(document.getElementsByName(w.name)) : []),
+        ].filter((el): el is HTMLElement => !!el);
+        const keyHere = byKey.length > 0 && (sameDoc || !q || byKey.some((el) => asks(el, q, w.option)));
+        const askedHere = !!q && controls.some((el) => vis(el) && answered(el) && asks(el, q, w.option));
+        if (mine.length || sameView || keyHere || askedHere) out.push(w.label);
       }
+      for (const el of stamped) if (!claimed.has(el)) out.push(el.getAttribute(a.attr) || "a control");
       return out;
-    }, { attr: UNRECORDED_WRITE_ATTR, writes: picks, doc }).catch(() => null) as string[] | null;
+    }, { attr: UNRECORDED_WRITE_ATTR, writes: picks, doc, view }).catch(() => null) as string[] | null;
     if (!main) return all();
     // ...and a stamp a gap-fill left inside a frame (a dialog the planner filled).
     const framed: string[] = [];
@@ -8037,7 +8103,7 @@ export class RecipeAdapter extends BasePortalAdapter {
             // A RECORDED VALUE FROM ANOTHER VIEW IS A PICK HERE (#362), on every attempt, landed or
             // not, named by the live control it is written into.
             if (carried) {
-              await this.noteUnrecordedWrite("pick", `re-assert into "${(target.label || blank).slice(0, 60)}" (the recorded "${String(rs.note ?? rs.field ?? "").slice(0, 40)}")`, target.control);
+              await this.noteUnrecordedWrite("pick", `re-assert into "${(target.label || blank).slice(0, 60)}" (the recorded "${String(rs.note ?? rs.field ?? "").slice(0, 40)}")`, { ...(target.control ?? {}), question: target.label || blank });
             }
             const done = await this.executeStep(rs, pastReview).catch(() => false);
             // BOTH OUTCOMES, or this becomes the sixth silent path in this file. A
