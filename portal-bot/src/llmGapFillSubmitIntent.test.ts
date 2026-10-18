@@ -154,10 +154,38 @@ await check("DATA OR PICK: a choice answered through a bound project field is da
   assert.deepEqual(bound.attemptedControls.map((c) => c.kind), ["data", "data"], JSON.stringify(bound.attemptedControls));
   assert.deepEqual(unbound.attemptedControls.map((c) => c.kind), ["pick", "data"], JSON.stringify(unbound.attemptedControls));
   // A binding to a field the project holds no value for is no data at all.
-  assert.equal(gapFillWriteKind({ fieldType: "select" }, "agreesToTerms", { agreesToTerms: " " }), "pick");
-  assert.equal(gapFillWriteKind({ fieldType: "radio" }, undefined, {}), "pick");
-  assert.equal(gapFillWriteKind({ fieldType: "checkbox" }, "hasBattery", { hasBattery: "No" }), "data");
-  assert.equal(gapFillWriteKind({ fieldType: "text" }, undefined, {}), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "select" }, "Yes", "agreesToTerms", { agreesToTerms: " " }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "radio", label: "Yes" }, "Yes", undefined, {}), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "checkbox" }, "No", "hasBattery", { hasBattery: "No" }), "data");
+  // Unbound free text is data only when it IS a project value (not just any text).
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "Acme Solar", undefined, { installerCompany: "Acme Solar" }), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "Sunrise Electric", undefined, { installerCompany: "Acme Solar" }), "pick");
+});
+
+await check("DATA OR PICK (Helm round 3, blocking 2): only the project's value RENDERED is data — never close to it", () => {
+  const sel = (options: string[]) => ({ fieldType: "select", options });
+  // Digit closeness is not the value: 405 is not 410.
+  assert.equal(gapFillWriteKind(sel(["405", "410"]), "410", "moduleWatts", { moduleWatts: "405" }, "410"), "pick");
+  assert.equal(gapFillWriteKind(sel(["405", "410"]), "405", "moduleWatts", { moduleWatts: "405" }, "405"), "data");
+  // A letter substring is not the model: IQ8M is not IQ8PLUS, and a prefix is not the model.
+  assert.equal(gapFillWriteKind(sel(["IQ8PLUS-72-2-US", "IQ8M-72-2-US"]), "IQ8PLUS-72-2-US", "inverterModel", { inverterModel: "IQ8M" }, "IQ8PLUS-72-2-US"), "pick");
+  assert.equal(gapFillWriteKind(sel(["IQ8", "IQ8M-72-2-US"]), "IQ8", "inverterModel", { inverterModel: "IQ8M-72-2-US" }, "IQ8"), "pick");
+  // The landed option, not the planner's word: an answer that lands somewhere else is a pick.
+  assert.equal(gapFillWriteKind(sel(["Yes", "Yes, grid-tied with battery backup", "No"]), "Yes", "gridTied", { gridTied: "Yes" }, "Yes, grid-tied with battery backup"), "pick");
+  assert.equal(gapFillWriteKind(sel(["Yes", "No"]), "Yes", "gridTied", { gridTied: "Yes" }, "Yes"), "data");
+  // A fuller rendering is data only when one option holds it; two options holding it is a pick.
+  assert.equal(gapFillWriteKind(sel(["Roof Mounted", "Ground"]), "Roof Mounted", "mountType", { mountType: "Roof" }, "Roof Mounted"), "data");
+  assert.equal(gapFillWriteKind(sel(["Roof Mounted", "Roof Integrated"]), "Roof Mounted", "mountType", { mountType: "Roof" }, "Roof Mounted"), "pick");
+  // A radio: the ticked option's own label is the bound value; ticking the other option is a pick.
+  assert.equal(gapFillWriteKind({ fieldType: "radio", label: "No" }, "Yes", "gridTied", { gridTied: "No" }), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "radio", label: "Yes" }, "Yes", "gridTied", { gridTied: "No" }), "pick");
+  // Bound text: "Yes" typed into a box bound to a name is not the name; a word inside a long digest is not data.
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "Yes", "installerCompany", { installerCompany: "Acme Solar" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "battery", undefined, { designNotesDigest: "Roof mount, 12 modules, no battery, main panel upgrade" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "Yes", undefined, { agreesToTerms: "Yes" }), "pick");
+  // A date renders the same day; a phone renders the same digits.
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "10/18/2026", "installDate", { installDate: "2026-10-18" }), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "(555) 010-1234", "contactPhone", { contactPhone: "555-010-1234" }), "data");
 });
 
 await check("A radio pick is named by its question, not by its option word alone", async () => {
@@ -176,6 +204,17 @@ await check("MUST PASS: the predicate is portalSafety's reading — submit wordi
   assert.equal(gapFillMayAnswer(AGREE, "Yes"), true);
   assert.equal(gapFillMayAnswer("Submittal Type", "Residential"), true);
   assert.equal(gapFillMayAnswer("Next step", "Submit application"), false);
+  // Readiness shapes, wherever they sit (label, question, option).
+  assert.equal(gapFillMayAnswer({ label: "Yes", questions: ["I am ready to submit"] }), false);
+  assert.equal(gapFillMayAnswer({ label: "Action", options: ["Save as draft", "Submit Net Metering Application"] }), false);
+  assert.equal(gapFillMayAnswer({ label: "Confirm submission" }), false);
+  assert.equal(gapFillMayAnswer({ label: "Sign and file" }), false);
+  // SF6: "finish" is not "finalize" — permit vocabulary still answers.
+  assert.equal(gapFillMayAnswer("Estimated Finish Date", "12/01/2026"), true);
+  assert.equal(gapFillMayAnswer({ label: "Rail finish", options: ["Mill Finish", "Black"] }, "Mill Finish"), true);
+  assert.equal(gapFillMayAnswer({ label: "Roof finish", options: ["Composition shingle", "Tile", "Metal"] }), true);
+  assert.equal(gapFillMayAnswer("Submittal Type", "Residential"), true);
+  assert.equal(gapFillMayAnswer("Filing fee tier", "Tier 1"), true);
 });
 
 await check("MUST PASS: every write the gap-fill tries is reported in attempted (what the draft click reads)", async () => {

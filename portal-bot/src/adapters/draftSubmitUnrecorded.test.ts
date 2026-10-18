@@ -9,7 +9,7 @@
 //   npx tsx portal-bot/src/adapters/draftSubmitUnrecorded.test.ts
 import assert from "node:assert/strict";
 import type { PortalRecipe, RecipeStep } from "../../../shared/src/types";
-import { RecipeAdapter } from "./recipeAdapter";
+import { RecipeAdapter, draftPickStopTell } from "./recipeAdapter";
 import { draftTenantKey, type DraftCreatingStamp } from "../draftSubmitGate";
 import type { LearnPlanRequest, LearnPlanResponse, RawField } from "./autoLearnAdapter";
 
@@ -20,7 +20,7 @@ const check = async (label: string, fn: () => Promise<void> | void): Promise<voi
 };
 
 const URL_NOW = "http://127.0.0.1/m/unit/part1";
-const AGREE = "Do you agree to the terms of the Net Metering (kWh) Agreement?";
+const AGREE = "Do you agree to the terms of the Interconnection Agreement?";
 const submit = { action: "click", selector: { css: "#btnSubmit", text: "Submit" }, note: "final submit | creates a draft, not the filing (#302)" } as unknown as RecipeStep;
 const recipe = {
   id: "draft-unit", scopeType: "utility", profileKey: "wa||twopart", state: "WA", ahj: "", utility: "Two-Part Utility",
@@ -68,7 +68,9 @@ function fakePage(evaluate: () => Promise<unknown>) {
     locator: (css: string) => loc(css),
     getByLabel: (label: string) => loc(label),
     getByRole: (_role: string, o?: { name?: string }) => loc(String(o?.name ?? "")),
-    getByText: (t: string) => loc(t),
+    // A text search finds nothing (a regex is the challenge scan): so the double reads as a page with
+    // no captcha, and a click would get past every check before the stamped control's own label.
+    getByText: (t: string | RegExp) => (typeof t === "string" ? loc(t) : { ...loc(String(t)), count: async () => 0, isVisible: async () => false }),
     getByPlaceholder: (t: string) => loc(t),
     getByTestId: (t: string) => loc(t),
   };
@@ -85,7 +87,7 @@ async function drive(evaluate: () => Promise<unknown>) {
   const fake = fakePage(evaluate);
   (adapter as unknown as { page: unknown }).page = fake.page;
   const out = await (adapter as unknown as { clickDraftCreatingSubmit: (i: number) => Promise<{ kind: string; refusals?: string[] }> }).clickDraftCreatingSubmit(1);
-  return { out, ...fake, notes: (adapter as unknown as { reviewHandoffNotes: string[] }).reviewHandoffNotes };
+  return { out, ...fake, notes: (adapter as unknown as { reviewHandoffNotes: string[] }).reviewHandoffNotes, tell: (adapter as unknown as { draftPickTell: string | null }).draftPickTell };
 }
 
 await check("MUST-STOP: a gap-fill select that wrote and then threw still refuses the stamped Submit, naming the control", async () => {
@@ -95,6 +97,8 @@ await check("MUST-STOP: a gap-fill select that wrote and then threw still refuse
   assert.ok((r.out.refusals ?? []).some((x) => /recorded steps never fill/.test(x) && x.includes("gap-fill: Do you agree")), JSON.stringify(r.out));
   assert.deepEqual(r.clicks, [], "nothing was clicked");
   assert.ok(r.notes.some((n) => /AUTOMATION PICKED ANSWERS/.test(n)), `the person is told: ${JSON.stringify(r.notes)}`);
+  // ...and the stop message's first words (the run card) are set: one pick, counted once.
+  assert.equal(r.tell, draftPickStopTell("Submit", [`gap-fill: ${AGREE}`]), String(r.tell));
 });
 
 await check("MUST-STOP: a page that throws on every read refuses the same way (fail closed)", async () => {
@@ -102,6 +106,20 @@ await check("MUST-STOP: a page that throws on every read refuses the same way (f
   assert.equal(r.out.kind, "refused", JSON.stringify(r.out));
   assert.ok((r.out.refusals ?? []).some((x) => /recorded steps never fill/.test(x)), JSON.stringify(r.out));
   assert.deepEqual(r.clicks, [], "nothing was clicked");
+});
+
+// NOT VACUOUS: the same double with nothing picked gets PAST the pick check (and the challenge scan)
+// and is refused only further on, at the stamped control's own label, which the double cannot read.
+await check("CONTROL: with nothing picked the same page is not refused for picks, nor for a challenge", async () => {
+  const adapter = new RecipeAdapter(recipe, {}, {}, { draftSubmitStamp: stamp });
+  adapter.enableLlmGapFill(async () => ({ fills: [], atReview: false }), {});
+  const fake = fakePage(async () => undefined);
+  (adapter as unknown as { page: unknown }).page = fake.page;
+  const out = await (adapter as unknown as { clickDraftCreatingSubmit: (i: number) => Promise<{ kind: string; refusals?: string[] }> }).clickDraftCreatingSubmit(1);
+  assert.deepEqual(fake.writes, []);
+  assert.equal(out.kind, "refused", JSON.stringify(out));
+  assert.ok(!(out.refusals ?? []).some((x) => /recorded steps never fill|challenge/.test(x)), JSON.stringify(out));
+  assert.ok((out.refusals ?? []).some((x) => /the control on the page reads/.test(x)), JSON.stringify(out));
 });
 
 console.log(failures === 0

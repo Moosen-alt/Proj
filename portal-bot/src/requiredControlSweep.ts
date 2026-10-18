@@ -236,10 +236,36 @@ export async function sweepEmptyRequiredControls(
       // Required by the markup too (#362): a member's own `required` / aria-required, or its
       // radiogroup's. A required "ready to submit?" group with no asterisk read as a clean page,
       // and the stamped draft Submit was clicked past it.
-      const marked = members.some((r) => r.required || r.getAttribute("aria-required") === "true")
-        || !!members[0].closest('[role="radiogroup"][aria-required="true"]');
+      // Only a group a person could answer (Helm review of 4081f12, SF3): a member enabled and the
+      // group rendered. A hidden or disabled group's markup says nothing about THIS page.
+      const shownEl = (el: Element): boolean => {
+        if (!visible(el)) return false;
+        const cs = getComputedStyle(el);
+        return cs.visibility !== "hidden" && cs.display !== "none";
+      };
+      const answerable = members.some((r) => !r.disabled && !r.closest("fieldset[disabled]"))
+        && (members.some((r) => shownEl(r) || Array.from(r.labels ?? []).some((l) => shownEl(l))) && shownEl(cont));
+      const marked = answerable && (members.some((r) => r.required || r.getAttribute("aria-required") === "true")
+        || !!members[0].closest('[role="radiogroup"][aria-required="true"]'));
       if (!marked && !/\*/.test(text.slice(0, 200)) && !COMPLAINT.test(text)) continue;
       push(text.replace(/\s*\*\s*/g, " ").trim(), "radio-group");
+    }
+
+    // ---- an unticked REQUIRED checkbox (#362, Helm review of 4081f12, SF5) ------------
+    // "I am ready to submit [ ] *" with the box unticked is a blank like any other: without this
+    // a refused ready-to-submit box read as a clean page, and the stamped draft Submit was clicked
+    // into the portal's own refusal (an incident, not a review stop). Markup-required only
+    // (`required` / aria-required), visible and enabled — never an asterisk guess, so an optional
+    // "email me updates" box is not a blank.
+    for (const cb of Array.from(document.querySelectorAll("input[type=checkbox]")) as HTMLInputElement[]) {
+      if (cb.checked || cb.disabled || cb.closest("fieldset[disabled]")) continue;
+      if (!(cb.required || cb.getAttribute("aria-required") === "true")) continue;
+      const lbls = Array.from(cb.labels ?? []);
+      if (!visible(cb) && !lbls.some((l) => visible(l))) continue;
+      const name = (lbls.map((l) => (l.textContent || "").replace(/\s+/g, " ").trim()).find(Boolean)
+        || cb.getAttribute("aria-label") || cb.getAttribute("name") || "(unlabelled checkbox)");
+      if (!requiredSeen.includes(name.slice(0, 70))) requiredSeen.push(name.slice(0, 70));
+      push(name, "attribute");
     }
 
     return { empty: out.slice(0, 14), requiredSeen: requiredSeen.slice(0, 120) };

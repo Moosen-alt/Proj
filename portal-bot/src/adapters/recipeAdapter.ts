@@ -110,10 +110,10 @@ import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describe
 const DRIFT_SETTLE_MS = Math.max(2000, Number(process.env.RECIPE_DRIFT_SETTLE_MS ?? 15000));
 import { redactCaptureText, readbackMatches, detectChallengeFrame, frameSelectorFor, hasNumericValidationError, RETRY_BACKOFF_MS, sleep, smartWait, toBareNumber, waitForElement, waitForInteractiveControls } from "../safeAction";
 import { findFilingStatus } from "../statusFinder";
-import { UNRECORDED_WRITE_ATTR } from "../llmGapFill";
+import { UNRECORDED_WRITE_ATTR, gapFillMayAnswer, isSubmitIntentField } from "../llmGapFill";
 import { performLogin, portalErrorPage } from "./loginFlow";
 import { chooseCorrectionForm, correctionFormSelector, isRefusal, scanProjectForms, type ProjectFormRow } from "./correctionForm";
-import { type ExtractedField, EXTRACT_SEL, extractFieldsInPage, toExtractedField, dismissPageModals, clearPageOverlays, equipmentMakeCandidates, pageFingerprintOf, collectValidationErrorsFrom, acaApplyEntryFrom, advanceSignatureOf } from "./autoLearnAdapter";
+import { type ExtractedField, type RawField, EXTRACT_SEL, extractFieldsInPage, toExtractedField, dismissPageModals, clearPageOverlays, equipmentMakeCandidates, pageFingerprintOf, collectValidationErrorsFrom, acaApplyEntryFrom, advanceSignatureOf } from "./autoLearnAdapter";
 import { tagUploadControls, visibleBodyText } from "./autoLearnAdapter";
 import { portalSaysNotServed } from "../../../shared/src/portalNotServed";
 
@@ -487,6 +487,20 @@ const ROW_FIELD_HOOKS: Record<string, { role: string; name: string }> = {
   array1Tracking: { role: "tracking-select", name: "Tracking" },
 };
 
+/** THE FIRST WORDS OF A STOP FOR PICKS (#362, Helm review of 4081f12, SF1). The run card and the
+ *  project's stage line read the first line of the stop message (backend pausedRunSentence, behind
+ *  "stopped before review — "), and the dashboard's why-line cuts it at 240 characters, so this
+ *  sentence leads the message and stays within 200: what was NOT clicked, how many answers
+ *  automation picked, which (labels only, never values beyond the option word), and what to do. */
+export function draftPickStopTell(stampLabel: string, picks: string[]): string {
+  const head = `NOT CLICKED "${String(stampLabel || "Submit").replace(/\s+/g, " ").trim().slice(0, 30)}": automation picked ${picks.length} answer(s) with no project data behind them (`;
+  const tail = ") — check them, then click it yourself.";
+  const room = Math.max(24, 200 - head.length - tail.length);
+  let brief = picks.map((p) => String(p).replace(/\s+/g, " ").trim()).join("; ");
+  if (brief.length > room) brief = `${brief.slice(0, room - 1).trimEnd()}…`;
+  return `${head}${brief}${tail}`;
+}
+
 export class RecipeAdapter extends BasePortalAdapter {
   portalName: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -539,12 +553,37 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  click. A pick with no control to point at (a re-assert) is tied to the DOCUMENT it was made in
    *  (`doc`) and refuses while that document is still the one in front. A real navigation (a new
    *  document) leaves them behind; an advance that only reveals more of the same page never does. */
+  /** The stop's first words when the stamped draft click was refused for picks (#362). */
+  private draftPickTell: string | null = null;
   private unrecordedWrites: Array<{ kind: "data" | "pick"; label: string; id: string; name: string; doc: string }> = [];
-  /** The step index the page in front began at (a seen advance or a recorded goto), and the document
-   *  each recorded fill/select step last ran in: what tells a re-assert of THIS page's recorded value
-   *  from one carried over from an earlier page (#362). */
-  private pageStartStepIdx = 0;
-  private recordedStepDoc = new Map<number, string>();
+  /** WHICH VIEW EACH RECORDED WRITE RAN IN (#362): what tells a re-assert of THIS view's recorded
+   *  value (a re-render, a reload after Save) from one carried over from another page. A new view
+   *  begins when the URL path or the page heading changes, or when the controls on screen were
+   *  REPLACED (fewer than half of the last ones still there — a single-document app's "Proceed to
+   *  Part 1"). A reveal adds controls and keeps the view; a same-URL, same-heading reload with the
+   *  same controls keeps it too. -1 = unreadable, which never matches (a re-assert then counts as
+   *  carried over: the safe direction). */
+  private viewSeq = 0;
+  private lastView: { key: string; ids: string[] } | null = null;
+  private recordedStepView = new Map<number, number>();
+  private async observeView(): Promise<number> {
+    if (!this.page || typeof this.page.evaluate !== "function") return -1;
+    const read = await this.page.evaluate(() => {
+      const vis = (el: Element): boolean => { const r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; };
+      const h = document.querySelector("h1, h2, legend");
+      const ids = Array.from(document.querySelectorAll("input:not([type=hidden]), select, textarea"))
+        .filter(vis).map((el) => el.getAttribute("id") || el.getAttribute("name") || "").filter(Boolean).slice(0, 300);
+      return { key: `${location.pathname}${location.search}|${(h?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120)}`, ids };
+    }).catch(() => null) as { key: string; ids: string[] } | null;
+    if (!read || typeof read.key !== "string" || !Array.isArray(read.ids)) return -1;
+    const last = this.lastView;
+    if (last) {
+      const kept = last.ids.filter((i) => read.ids.includes(i)).length;
+      if (read.key !== last.key || (last.ids.length > 0 && kept * 2 < last.ids.length)) this.viewSeq++;
+    }
+    this.lastView = read;
+    return this.viewSeq;
+  }
   /** The main document's token: set once on its <html>, so a new document reads a new one. "*" when
    *  it cannot be read — which then matches every document (fail closed). */
   private async docToken(): Promise<string> {
@@ -2417,9 +2456,11 @@ export class RecipeAdapter extends BasePortalAdapter {
     const stop = !pastReview && !this.stoppedAtPayment ? await this.whereTheRunStopped(review.confirmed) : null;
     if (stop) {
       this.stoppedBeforeReview = stop.message;
-      return { ...ok(`Replayed ${executed} recorded step(s); ${stop.message}${review.summary}`, { ...data, stoppedBeforeReview: stop.where }), pauseReason: "stopped_before_review" };
+      // THE PICKS FIRST (#362): the run card and the stage line read this message's first line (the
+      // backend's pausedRunSentence), so what automation picked leads it, before the where-it-stopped.
+      return { ...ok(`${this.draftPickTell ? `${this.draftPickTell} ` : ""}Replayed ${executed} recorded step(s); ${stop.message}${review.summary}`, { ...data, stoppedBeforeReview: stop.where }), pauseReason: "stopped_before_review" };
     }
-    return ok(`Replayed ${executed} recorded step(s); stopped at review.${review.summary}`, data);
+    return ok(`${this.draftPickTell ? `${this.draftPickTell} ` : ""}Replayed ${executed} recorded step(s); stopped at review.${review.summary}`, data);
   }
 
   /** WHERE DID THE RUN STOP, IF NOT AT REVIEW? (runs-finish item 3, the part that needs no wizard-
@@ -4146,13 +4187,40 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  review lockdown's live reading let it through. Its filing/payment rules and the run's own
    *  review lock (set at stopForReview) are untouched. Clicks, presses and gotos get no window. */
   private async executeStep(step: RecipeStep, pastReview: boolean): Promise<boolean> {
-    // Which document each recorded write ran in (#362: a re-assert from another page is unrecorded).
+    // Which view each recorded write ran in (#362: a re-assert from another page is a pick).
     if (RecipeAdapter.WRITE_ACTIONS.has(step.action) && !this.inPolicyRetry) {
       const idx = this.recipe.steps.indexOf(step);
-      if (idx >= 0) this.recordedStepDoc.set(idx, await this.docToken());
+      if (idx >= 0) this.recordedStepView.set(idx, await this.observeView());
     }
-    if (!RecipeAdapter.WRITE_ACTIONS.has(step.action) || !this.backstop) return this.executeStepInner(step, pastReview);
-    return withOwnWriteWindow(this.page, `recorded ${step.action}${step.note ? ` (${String(step.note).slice(0, 50)})` : ""}`, () => this.executeStepInner(step, pastReview));
+    if (!RecipeAdapter.WRITE_ACTIONS.has(step.action)) return this.executeStepInner(step, pastReview);
+    const done = !this.backstop ? await this.executeStepInner(step, pastReview)
+      : await withOwnWriteWindow(this.page, `recorded ${step.action}${step.note ? ` (${String(step.note).slice(0, 50)})` : ""}`, () => this.executeStepInner(step, pastReview));
+    if (done && !this.inPolicyRetry) await this.recordingOverwrotePick(step);
+    return done;
+  }
+
+  /** A PICK THE RECORDING THEN ANSWERS IS NO LONGER A PICK (#362). The mid-page gap-fill can answer
+   *  a control a later recorded step fills with its own value; once that step has landed on the
+   *  same element (for a radio or checkbox, the same group), the answer on the page is the
+   *  recording's. A step that did not land leaves the pick standing. */
+  private async recordingOverwrotePick(step: RecipeStep): Promise<void> {
+    if (!this.unrecordedWrites.some((w) => w.kind === "pick" && (w.id || w.name))) return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const loc: any = await this.resolveLocator(step.selector, String(step.note ?? "")).catch(() => null);
+    if (!loc || typeof loc.evaluate !== "function") return;
+    const ctl = await loc.evaluate((el: Element, attr: string) => {
+      el.removeAttribute(attr);
+      const ty = ((el as HTMLInputElement).type || "").toLowerCase();
+      return { id: el.getAttribute("id") || "", name: el.getAttribute("name") || "", choice: ty === "radio" || ty === "checkbox" };
+    }, UNRECORDED_WRITE_ATTR, { timeout: 1500 }).catch(() => null) as { id: string; name: string; choice: boolean } | null;
+    if (!ctl) return;
+    if (ctl.choice && ctl.name && typeof this.page?.evaluate === "function") {
+      await this.page.evaluate((a: { attr: string; name: string }) => {
+        for (const el of Array.from(document.getElementsByName(a.name))) el.removeAttribute(a.attr);
+      }, { attr: UNRECORDED_WRITE_ATTR, name: ctl.name }).catch(() => null);
+    }
+    this.unrecordedWrites = this.unrecordedWrites.filter((w) => !(w.kind === "pick" && (
+      (ctl.id && w.id === ctl.id) || (ctl.name && w.name === ctl.name && (ctl.choice || !w.id)))));
   }
   private static readonly WRITE_ACTIONS: ReadonlySet<string> = new Set(["fill", "select", "check", "uncheck", "upload"]);
 
@@ -4376,8 +4444,6 @@ export class RecipeAdapter extends BasePortalAdapter {
         const target = this.resolveValue(step);
         const why = `recipe goto${step.note ? ` (${String(step.note).slice(0, 40)})` : ""}`;
         await this.withProgress("goto", `Opening ${String(step.note ?? "the recipe's page").slice(0, 40)}`, () => this.guardedGoto(target, why, { waitUntil: "domcontentloaded", timeout: 30000 }));
-        // A recorded goto opens a fresh page (#362: what a re-assert counts as "this page").
-        this.pageStartStepIdx = this.currentStepIdx;
         const landedOnError = await this.recoverFromPortalErrorPage(target, why);
         await smartWait(this.page);
         // A recorded goto lands on a fresh section that a Vue/SPA portal may still be mounting.
@@ -5747,10 +5813,12 @@ export class RecipeAdapter extends BasePortalAdapter {
     if (inFront.length) {
       const shown = inFront.slice(0, 6).join(", ");
       const more = inFront.length > 6 ? ` and ${inFront.length - 6} more` : "";
-      // THE PERSON IS TOLD, not only the run log: reviewHandoffNotes rides the stop message.
-      const tell = `AUTOMATION PICKED ANSWERS WITH NO PROJECT DATA BEHIND THEM on the page in front of "${stamp.label.slice(0, 40)}" (${shown}${more}): it did NOT click it — check those answers, then click it yourself.`;
+      // THE PERSON IS TOLD, not only the run log: the stop message LEADS with it (the run card reads
+      // its first line, cut short), and reviewHandoffNotes carries the full list.
+      this.draftPickTell = draftPickStopTell(stamp.label, inFront);
+      const tell = `AUTOMATION PICKED ANSWERS WITH NO PROJECT DATA BEHIND THEM before "${stamp.label.slice(0, 40)}" (${shown}${more}): it did NOT click it — check those answers, then click it yourself.`;
       if (!this.reviewHandoffNotes.includes(tell)) this.reviewHandoffNotes.push(tell);
-      return { kind: "refused", refusals: [`automation picked ${inFront.length} answer(s) on this page with no project data behind them, which the recorded steps never fill (${shown}${more}) — a person checks them and clicks Submit`] };
+      return { kind: "refused", refusals: [`automation picked ${inFront.length} answer(s) with no project data behind them, which the recorded steps never fill (${shown}${more}) — a person checks them and clicks Submit`] };
     }
     const empty = await this.emptyRequiredControls().catch(() => [] as string[]);
     if (empty.length) return { kind: "refused", refusals: [`required field(s) still empty on the page: ${empty.slice(0, 4).join(", ")}`] };
@@ -6115,12 +6183,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // interactive control to mount before the next fill so we never type onto an unmounted page
     // (best-effort; never skips — the retry/reload loop still recovers a genuine miss).
     await waitForInteractiveControls(this.page);
-    const moved = await this.assertAdvanced(step, beforeUrl, beforeFp, beforeEffect);
-    // A NEW PAGE BEGINS HERE (#362: what a re-assert counts as "this page"). Only an advance seen to
-    // move, never a contact dialog's step. A reveal read as a move only makes a later re-assert of
-    // this page's value count as carried over — the safe direction.
-    const dialogStep = !!step.selector?.frame || isContactOpener(`${step.selector?.name ?? ""} ${step.selector?.text ?? ""} ${step.selector?.label ?? ""} ${step.note ?? ""}`);
-    if (moved && this.isAdvancingClick(step) && !dialogStep) this.pageStartStepIdx = this.currentStepIdx + 1;
+    await this.assertAdvanced(step, beforeUrl, beforeFp, beforeEffect);
     return true;
   }
 
@@ -6245,11 +6308,9 @@ export class RecipeAdapter extends BasePortalAdapter {
   /** How long an advance check waits for vanished controls to come back (or the page to move). */
   static VANISHED_CONTROLS_WAIT_MS = 6000;
 
-  /** true when the page was seen to move; false when it did not (an in-page action) or could not be
-   *  read. Throws on a confirmed block. */
-  private async assertAdvanced(step: RecipeStep, beforeUrl: string, beforeFp: string, beforeEffect = ""): Promise<boolean> {
+  private async assertAdvanced(step: RecipeStep, beforeUrl: string, beforeFp: string, beforeEffect = ""): Promise<void> {
     // No identity means a mock/no-DOM page (the unit-test doubles) — assert nothing.
-    if (!beforeFp) return false;
+    if (!beforeFp) return;
     const urlNow = (): string => (typeof this.page.url === "function" ? String(this.page.url() ?? "") : "");
     const moved = async (): Promise<boolean> => {
       if (urlNow() && urlNow() !== beforeUrl) return true;
@@ -6273,7 +6334,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // FAST PATH 1 — it moved. One identity read, no waiting. This is the common case and it
     // must stay free: an earlier ordering settled first and put 5s on every click, which is
     // the opposite of what "fast once learned" needs.
-    if (await moved()) return true;
+    if (await moved()) return;
 
     // FAST PATH 2 — it did not move and the portal is not complaining. NOT every recorded
     // click is an advance: "Calculate", "Add Array", "Add New" contact and saves all
@@ -6309,7 +6370,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       const afterEffect = beforeEffect ? await this.pageEffect() : "";
       if (afterEffect && afterEffect !== beforeEffect) {
         this.agingNotes.push(`click "${String(step.note ?? "click").slice(0, 44)}" acted on the page without advancing it — the in-page action the recipe recorded`);
-        return false;
+        return;
       }
       // ONLY CLAIM THE FINDING WE ACTUALLY MADE. If the before-snapshot never came back —
       // an evaluate the portal interrupted, a page mid-navigation — then nothing was
@@ -6320,7 +6381,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       this.driftWarnings.push(measured
         ? `click "${String(step.note ?? "click").slice(0, 44)}" changed nothing on the page — no value, row or option moved, so it was either a no-op control or an advance the portal silently refused`
         : `click "${String(step.note ?? "click").slice(0, 44)}" left the page unchanged and the page could not be re-read to tell an in-page action from an advance that silently did nothing`);
-      return false;
+      return;
     }
 
     // The portal is refusing. Give a slow SPA a moment in case the complaint is stale and
@@ -6328,14 +6389,14 @@ export class RecipeAdapter extends BasePortalAdapter {
     // more — an announcement modal ate every click of a diagnostic probe for fourteen
     // iterations without it ever noticing.
     await this.timed("advance-settle", async () => { for (let i = 0; i < ADVANCE_SETTLE_TRIES && !(await moved()); i++) await sleep(ADVANCE_SETTLE_MS); });
-    if (await moved()) return true;
+    if (await moved()) return;
     await this.timed("advance-overlays", async () => { await this.dismissModalsGuarded(); await clearPageOverlays(this.page).catch(() => null); });
     const again = await this.resolveLocator(step.selector).catch(() => null);
     if (again && typeof again.click === "function") await this.timed("advance-retry-click", () => this.guardedClick(again, "retry an advance that did not move", { timeout: 8000 }).catch(() => null));
     await this.timed("advance-settle", async () => { for (let i = 0; i < ADVANCE_SETTLE_TRIES && !(await moved()); i++) await sleep(ADVANCE_SETTLE_MS); });
     if (await moved()) {
       this.driftWarnings.push(`advance "${String(step.note ?? "click").slice(0, 44)}" needed an overlay dismissed before it took`);
-      return true;
+      return;
     }
 
     // Still refused. Report the PORTAL'S OWN words — "Meter Number: This field is required."
@@ -7928,35 +7989,55 @@ export class RecipeAdapter extends BasePortalAdapter {
 
   /** One pass of the re-assert. See reassertBlanksOnce for why there is more than one. */
   private async reassertPass(pastReview: boolean): Promise<string[]> {
-    let blanks = await this.emptyRequiredControls();
+    const swept = await this.sweepRequired();
+    const named = (f: { name: string; why: string }): string => (f.why === "complaint" || f.why === "unattributed-complaint"
+      ? `${f.name} — the portal flagged this field`
+      : f.name);
+    let blanks = swept.empty.map(named);
     if (blanks.length && !this.inPolicyRetry) {
       const norm = (t: string): string => t.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
       const bare = (b: string): string => b.replace(/ — the portal flagged this field$/, "");
-      // NEVER INTO A BLANK THAT READS AS SUBMITTING (#362): an earlier page's "Net Metering" = Yes
-      // matched "Are you ready to submit your Net Metering (kWh) application?" by label, and the
-      // stamped draft Submit then filed. Left blank, a person answers it.
-      const open = blanks.filter((b) => !isSubmitIntent(bare(b)));
-      const matchOf = (rs: RecipeStep): string => {
-        const name = norm(String(rs.note ?? rs.selector?.label ?? ""));
-        if (!name) return "";
-        return open.find((b) => {
-          const nb = norm(bare(b));
-          return nb === name || (nb.length > 6 && name.includes(nb)) || (name.length > 6 && nb.includes(name));
-        }) ?? "";
+      const sameName = (a: string, b: string): boolean => {
+        const na = norm(a); const nb = norm(b);
+        return !!na && !!nb && (na === nb || (nb.length > 6 && na.includes(nb)) || (na.length > 6 && nb.includes(na)));
       };
-      const refills = this.recipe.steps.filter((rs) => (rs.action === "fill" || rs.action === "select") && !!matchOf(rs)).slice(0, REASSERT_MAX_FIELDS);
+      // A RADIO-GROUP BLANK IS NEVER RE-RUN (#362): its "name" is the row's whole text, and another
+      // page's select matched it and waited out its timeout, again and again. Still reported.
+      const open = swept.empty.filter((e) => e.why !== "radio-group").map(named);
+      const matchOf = (rs: RecipeStep): string => {
+        const name = String(rs.note ?? rs.selector?.label ?? "");
+        if (!norm(name)) return "";
+        return open.find((b) => sameName(name, bare(b))) ?? "";
+      };
+      const view = await this.observeView();
+      const ownView = (rs: RecipeStep): boolean => view >= 0 && this.recordedStepView.get(this.recipe.steps.indexOf(rs)) === view;
+      const matched = this.recipe.steps.filter((rs) => (rs.action === "fill" || rs.action === "select") && !!matchOf(rs));
+      // THIS VIEW'S OWN STEP WINS ITS BLANK: another page's step sharing the label is not also re-run.
+      const ownBlanks = new Set(matched.filter(ownView).map(matchOf));
+      const refills = matched.filter((rs) => ownView(rs) || !ownBlanks.has(matchOf(rs))).slice(0, REASSERT_MAX_FIELDS);
       if (refills.length) {
         this.inPolicyRetry = true;   // reuses the re-entry guard: no retry of a retry
         try {
-          const doc = await this.docToken();
           for (const rs of refills) {
-            // A RECORDED VALUE FROM ANOTHER PAGE IS AN UNRECORDED WRITE HERE (#362), on every attempt,
-            // landed or not, named by the live control it lands in. This page's own re-rendered
-            // recorded fields stay what they were: re-asserts of a recorded step.
-            const idx = this.recipe.steps.indexOf(rs);
-            const ranDoc = this.recordedStepDoc.get(idx);
-            if (idx < this.pageStartStepIdx || !ranDoc || (ranDoc !== doc && ranDoc !== "*")) {
-              await this.noteUnrecordedWrite("pick", `re-assert into "${bare(matchOf(rs)).slice(0, 60)}" (the recorded "${String(rs.note ?? rs.field ?? "").slice(0, 40)}")`);
+            const blank = bare(matchOf(rs));
+            const carried = !ownView(rs);
+            // NEVER INTO A BLANK THAT READS AS SUBMITTING (#362): an earlier page's "Net Metering" =
+            // Yes matched "Are you ready to submit your Net Metering (kWh) application?" by label,
+            // and the stamped draft Submit then filed. Left blank, a person answers it.
+            if (carried && isSubmitIntentField(blank)) continue;
+            // THE CONTROL THE STEP WILL WRITE, RESOLVED FIRST: it must be the matched blank (a
+            // recorded label locator is a substring match and can land on another control), it must
+            // be on the page now (a step whose control is gone waits out its whole timeout), and a
+            // carried-over value never goes into a control whose question reads as submitting.
+            const target = await this.reassertTargetOf(rs, blank, carried);
+            if (target.skip) {
+              this.driftWarnings.push(`"${String(rs.note ?? rs.field ?? "").slice(0, 40)}" was not re-asserted into "${blank.slice(0, 40)}": ${target.skip}`);
+              continue;
+            }
+            // A RECORDED VALUE FROM ANOTHER VIEW IS A PICK HERE (#362), on every attempt, landed or
+            // not, named by the live control it is written into.
+            if (carried) {
+              await this.noteUnrecordedWrite("pick", `re-assert into "${(target.label || blank).slice(0, 60)}" (the recorded "${String(rs.note ?? rs.field ?? "").slice(0, 40)}")`, target.control);
             }
             const done = await this.executeStep(rs, pastReview).catch(() => false);
             // BOTH OUTCOMES, or this becomes the sixth silent path in this file. A
@@ -7977,6 +8058,28 @@ export class RecipeAdapter extends BasePortalAdapter {
       }
     }
     return blanks;
+  }
+
+  /** What a re-assert of `rs` would write (#362): skip it unless its own locator resolves NOW to
+   *  the matched blank, by the extractor's reading of that element (label, and for a carried-over
+   *  value, no question that reads as submitting). A page double that cannot be read keeps main's
+   *  behaviour. */
+  private async reassertTargetOf(rs: RecipeStep, blank: string, carried: boolean): Promise<{ skip?: string; label?: string; control?: { id: string; name: string } }> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const loc: any = await this.resolveLocator(rs.selector, String(rs.note ?? "")).catch(() => null);
+    if (!loc) return { skip: "its control is not on this page" };
+    if (typeof loc.evaluateAll !== "function") return {};
+    const raws = await loc.evaluateAll(extractFieldsInPage).catch(() => null) as RawField[] | null;
+    if (!Array.isArray(raws) || raws.length === 0) return { skip: "its control is not on this page" };
+    const raw = raws[0];
+    const norm = (t: string): string => String(t || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const nl = norm(raw.label); const nb = norm(blank);
+    const same = !!nl && !!nb && (nl === nb || (nb.length > 6 && nl.includes(nb)) || (nl.length > 6 && nb.includes(nl)));
+    if (!same) return { skip: `its locator resolves to "${String(raw.label || "another control").slice(0, 50)}", not that blank` };
+    if (carried && !gapFillMayAnswer({ label: raw.label, groupPrompt: raw.groupPrompt, options: raw.options, questions: raw.questions })) {
+      return { skip: "that control reads as submitting the application — a person answers it" };
+    }
+    return { label: String(raw.label || ""), control: { id: raw.id || "", name: raw.name || "" } };
   }
 
   private async emptyRequiredControls(): Promise<string[]> {

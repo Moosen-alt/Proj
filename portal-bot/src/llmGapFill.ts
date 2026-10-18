@@ -2,6 +2,7 @@ import {
   EXTRACT_SEL,
   extractFieldsInPage,
   toExtractedField,
+  equipmentMakeCandidates,
   isPayFee,
   isSensitiveLabel,
   type ExtractedField,
@@ -12,7 +13,6 @@ import {
 import { buildLocator } from "./adapters/loginFlow";
 import { selectWithFallback } from "./comboboxFill";
 import { redactStatusText } from "./safeAction";
-import { isSubmitIntent } from "../../shared/src/portalSafety";
 
 // ---------------------------------------------------------------------------
 // LLM-assisted gap-fill (hybrid staging).
@@ -121,6 +121,12 @@ export function isGrounded(
   if (field.fieldType === "checkbox" || field.fieldType === "radio") {
     if (!/^(true|false|yes|no|on|off|1|0)$/i.test(v)) return false;
     const bound = mappedKey ? projectFields[mappedKey] : "";
+    // TICKING A RADIO CHOOSES ITS OPTION (#362): "Yes" on the No radio with gridTied=Yes ticked No,
+    // and "Yes" on the No radio with gridTied=No was refused. The ticked option's own label is the
+    // answer, so that is what the project's value is compared with.
+    if (bound && field.fieldType === "radio" && /^(true|yes|on|1)$/i.test(v)) {
+      return tracesTo(field.label, bound) || boolAgrees(field.label, bound);
+    }
     if (bound) return tracesTo(v, bound) || boolAgrees(v, bound);
     return true;
   }
@@ -195,18 +201,31 @@ function boolAgrees(a: string, b: string): boolean {
 // application?" is a control whose Yes turns the page's Submit into a filing: the gap-fill prompt
 // says a required Yes/No MUST be answered, and a planner obeying it filed with no approval. So a
 // control is never offered to the planner, and never written, when its label, its group's question
-// (a radio's own label is only "Yes"), or any of a select's options reads as submit intent
-// (portalSafety isSubmitIntent, the one reading) — "Yes" lands on "Yes, submit my application now"
-// by containment — and an answer that itself reads as submitting is never typed. Left blank, it is
-// a required field a person answers. Exported for tests.
+// (a radio's own label is only "Yes"), any of its questions (ExtractedField.questions), or any of a
+// select's options reads as submit intent — "Yes" lands on "Yes, submit my application now" by
+// containment — and an answer that itself reads as submitting is never typed. Left blank, it is a
+// required field a person answers.
+//
+// FIELD TEXT IS NOT A BUTTON. portalSafety's isSubmitIntent judges a CLICK: a bare "Finish" or
+// "Submit" button commits. On a field it over-reads — "Estimated Finish Date", a "Mill Finish"
+// option, "Submit Date" are ordinary data — so a field's text counts only in a READINESS shape:
+// ready / want / agree to submit, submit (your|the|this) application or request, submit now,
+// finalize, re-submit, confirm or complete the submission, sign and file. Exported for tests.
+const SUBMIT_FIELD_TEXT =
+  /\b(ready|want|wish|like|agree|intend|elect|choose)\s+to\s+(re-?)?(submit|file|send)\b|\b(re-?)?(submit|file|send|finali[sz]e)\s+(now\b|(my|the|your|this|our|an?)?\s*(net\s+metering\s+|interconnection\s+|final\s+)?(\([^)]*\)\s*)?(application|request|submission|form|filing)\b)|\bfinali[sz]e\b|\bre-?submit\b|\b(confirm|complete)\s+(the\s+|my\s+|your\s+)?submission\b|\bsign\s*(and|&)\s*(file|submit)\b|^\s*(yes\s*[,–—-]?\s*)?(submit|file)\s*(now)?\s*[.!]?\s*$/i;
+export function isSubmitIntentField(text: string | null | undefined): boolean {
+  const t = String(text ?? "").replace(/\s+/g, " ").trim();
+  return !!t && SUBMIT_FIELD_TEXT.test(t);
+}
 export function gapFillMayAnswer(
-  field: { label?: string | null; groupPrompt?: string | null; options?: string[] | null } | string | null | undefined,
+  field: { label?: string | null; groupPrompt?: string | null; options?: string[] | null; questions?: string[] | null } | string | null | undefined,
   value?: string | null,
 ): boolean {
   const f = typeof field === "string" || field == null ? { label: field ?? "" } : field;
-  if (isSubmitIntent(f.label) || isSubmitIntent(f.groupPrompt)) return false;
-  if ((f.options ?? []).some((o) => isSubmitIntent(o))) return false;
-  if (value != null && isSubmitIntent(value)) return false;
+  if (isSubmitIntentField(f.label) || isSubmitIntentField(f.groupPrompt)) return false;
+  if ((f.questions ?? []).some((q) => isSubmitIntentField(q))) return false;
+  if ((f.options ?? []).some((o) => isSubmitIntentField(o))) return false;
+  if (value != null && isSubmitIntentField(value)) return false;
   return true;
 }
 
@@ -214,20 +233,82 @@ export function gapFillMayAnswer(
 export const UNRECORDED_WRITE_ATTR = "data-al-unrec";
 
 export type GapFillWriteKind = "data" | "pick";
-// DATA OR PICK (#362, owner ruling 2026-10-18 "Data is enough"). Called only for a fill isGrounded
-// accepted. "data": the planner bound it to a project field that holds a value (isGrounded then
-// checked the answer traces to it), or free text that traces to a project value. "pick": a
-// checkbox, radio or select answered with no bound project field — isGrounded accepts it because the
-// portal offered that option, which says the answer is ALLOWED, never that it is TRUE for this
-// project. Only a pick stops the stamped draft click. Exported for tests.
+const BOOLISH = /^(true|false|yes|no|on|off|1|0|y|n|none)$/i;
+const words = (v: string): string[] => String(v ?? "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+/** Does `hay` hold every word of `needle`, in order and contiguous? ("Roof Mounted" holds "Roof".) */
+function holdsWholeWords(hay: string, needle: string): boolean {
+  const h = words(hay); const n = words(needle);
+  if (!n.length || n.length > h.length) return false;
+  for (let i = 0; i + n.length <= h.length; i++) if (n.every((w, k) => h[i + k] === w)) return true;
+  return false;
+}
+function sameDay(a: string, b: string): boolean {
+  if (!/\d/.test(a) || !/\d/.test(b)) return false;
+  const da = new Date(a); const db = new Date(b);
+  return !Number.isNaN(da.getTime()) && !Number.isNaN(db.getTime()) && da.toISOString().slice(0, 10) === db.toISOString().slice(0, 10);
+}
+/** THE PROJECT'S VALUE, RENDERED — never close to it. Equal after normalisation, the same day
+ *  written another way, the same digits in another punctuation (a phone, an account format: no
+ *  letters on either side), or the project's whole value as whole words inside a fuller answer. */
+function isRenderingOf(answer: string, projectValue: string): boolean {
+  const a = String(answer ?? "").trim(); const p = String(projectValue ?? "").trim();
+  if (!a || !p) return false;
+  if (normalize(a) === normalize(p)) return true;
+  if (sameDay(a, p)) return true;
+  if (!/[a-z]/i.test(a) && !/[a-z]/i.test(p)) {
+    const da = a.replace(/\D/g, ""); const dp = p.replace(/\D/g, "");
+    if (da.length >= 4 && da === dp) return true;
+  }
+  return normalize(p).length >= 4 && !BOOLISH.test(p) && holdsWholeWords(a, p);
+}
+
+// DATA OR PICK (#362, owner ruling 2026-10-18 "Data is enough"). Data only when the answer that
+// LANDS is the project's value (Helm review of 4081f12, Blocking 2):
+//   - a select: the option it lands on is the bound value rendered (isRenderingOf; a yes/no value
+//     only by equality — "Yes" is not "Yes, grid-tied with battery backup"), a make alias of it,
+//     or the `${key}Certified` value. Several options holding the value is a pick.
+//   - a radio: the ticked option's own label is the bound value (boolAgrees or equality).
+//   - a checkbox: the toggle agrees with the bound value (boolAgrees).
+//   - text: the bound value rendered; with no binding, a rendering of a project value at least four
+//     characters long that is not a bare yes/no.
+// Never digit closeness (405 vs 410), a letter substring (IQ8M vs IQ8PLUS, a model prefix), or a
+// word inside a long project value (the design-notes digest). Anything else is a pick: an answer
+// the portal ALLOWS, which says nothing about whether it is TRUE for this project. Only a pick stops
+// the stamped draft click. `landed` is the option text the select now shows (read back after the
+// write), when known. Exported for tests.
 export function gapFillWriteKind(
-  field: { fieldType?: string },
+  field: { fieldType?: string; label?: string; options?: string[] },
+  value: string,
   mappedKey: string | undefined,
   projectFields: Record<string, string>,
+  landed?: string | null,
 ): GapFillWriteKind {
-  if (mappedKey && String(projectFields[mappedKey] ?? "").trim()) return "data";
-  const choice = field.fieldType === "checkbox" || field.fieldType === "radio" || field.fieldType === "select";
-  return choice ? "pick" : "data";
+  const bound = mappedKey ? String(projectFields[mappedKey] ?? "").trim() : "";
+  const v = String(value ?? "").trim();
+  if (field.fieldType === "checkbox") return bound && boolAgrees(v, bound) ? "data" : "pick";
+  if (field.fieldType === "radio") {
+    if (!/^(true|yes|on|1)$/i.test(v)) return "pick";
+    const own = String(field.label ?? "").trim();
+    return bound && (boolAgrees(own, bound) || normalize(own) === normalize(bound)) ? "data" : "pick";
+  }
+  if (field.fieldType === "select") {
+    if (!bound) return "pick";
+    const at = String(landed ?? v).trim();
+    const certified = mappedKey ? String(projectFields[`${mappedKey}Certified`] ?? "").trim() : "";
+    const candidates = [bound, ...(certified ? [certified] : []), ...equipmentMakeCandidates(bound)];
+    const lands = (o: string): boolean => BOOLISH.test(bound)
+      ? normalize(o) === normalize(bound) || boolAgrees(o, bound)
+      : candidates.some((c) => isRenderingOf(o, c));
+    if (!lands(at)) return "pick";
+    // An exact option is unambiguous; a fuller rendering is data only when it is the only one.
+    if (candidates.some((c) => normalize(at) === normalize(c))) return "data";
+    const holding = (field.options ?? []).filter((o) => lands(o));
+    return holding.length <= 1 ? "data" : "pick";
+  }
+  if (bound) return isRenderingOf(v, bound) ? "data" : "pick";
+  const values = Object.values(projectFields).map((x) => String(x ?? "").trim())
+    .filter((x) => normalize(x).length >= 4 && !BOOLISH.test(x));
+  return values.some((x) => isRenderingOf(v, x)) ? "data" : "pick";
 }
 
 /** The #id the extractor saw for this field, when it saw one. */
@@ -238,41 +319,79 @@ function extractedIdOf(field: ExtractedField): string {
   };
   return fromCss(field.selector?.css) || (field.selector?.fallbacks ?? []).map((fb) => fromCss(fb.css)).find(Boolean) || "";
 }
+const cssStr = (v: string): string => v.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+/** Is this field's label only its id / name (nothing a person reads)? */
+function labelIsOnlyIdent(field: ExtractedField): boolean {
+  const l = String(field.label ?? "").trim();
+  return !l || l === field.fingerprint?.id || l === field.fingerprint?.name || l === field.group;
+}
 
-/** IS THE CONTROL THE LOCATOR RESOLVED THE ONE THE EXTRACTOR SAW, AND MAY IT BE ANSWERED? (#362)
- *  getByLabel(label).first() is a substring match: "Net Metering" resolves to an earlier "Are you
- *  ready to submit your Net Metering application?" select. So the resolved element's id must be the
- *  extracted one when there was one, and its OWN label (label[for], wrapping label, aria-label, and
- *  for a radio/checkbox its legend / radiogroup name) must pass gapFillMayAnswer. A passing PICK
- *  is stamped (UNRECORDED_WRITE_ATTR) BEFORE the write, so a write that throws half-way still marks
- *  it. null = refused (or unreadable); a locator that cannot be evaluated (a test double) passes
- *  with no stamp. */
+/** THE CONTROL THE EXTRACTOR SAW, AND ONLY IT (#362, Helm review of 4081f12, Blocking 3). A label
+ *  locator is a substring match ("Yes" lands on the first Yes of the page, "Net Metering" on "Are
+ *  you ready to submit your Net Metering…"), and an id can repeat (Miami's radio pairs share one).
+ *  So: `[id=…]` only when exactly one element carries it; an id-less radio / checkbox by its group
+ *  name and its own exact label, the one member that reads so; otherwise main's locator, which
+ *  claimForWrite then checks is the control the extractor saw. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function claimForWrite(loc: any, field: ExtractedField, label: string, kind: GapFillWriteKind): Promise<{ id: string; name: string } | null> {
-  if (typeof loc?.evaluate !== "function") return { id: extractedIdOf(field), name: "" };
-  const read = await loc.evaluate((el: Element) => {
-    const clean = (t: string | null | undefined): string => String(t || "").replace(/\s+/g, " ").trim();
-    const id = el.getAttribute("id") || "";
-    const parts: string[] = [];
-    if (id) parts.push(clean(document.querySelector(`label[for="${id.replace(/"/g, '\\"')}"]`)?.textContent));
-    parts.push(clean(el.closest("label")?.textContent), clean(el.getAttribute("aria-label")));
-    const type = ((el as HTMLInputElement).type || "").toLowerCase();
-    if (type === "radio" || type === "checkbox") {
-      parts.push(clean(el.closest("fieldset")?.querySelector("legend")?.textContent));
-      const rg = el.closest('[role="radiogroup"], [role="group"]');
-      if (rg) parts.push(clean(rg.getAttribute("aria-label")), ...(rg.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean).map((r) => clean(document.getElementById(r)?.textContent)));
+async function locateExtracted(page: any, field: ExtractedField): Promise<any | null> {
+  const frame = field.selector?.frame;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const scope: any = frame ? (typeof page.frameLocator === "function" ? page.frameLocator(`iframe[name="${cssStr(frame)}"]`) : null) : page;
+  if (scope && typeof scope.locator === "function") {
+    const id = extractedIdOf(field);
+    if (id) {
+      const byId = scope.locator(`[id="${cssStr(id)}"]`);
+      const n = typeof byId?.count === "function" ? await byId.count().catch(() => 0) : 0;
+      if (n === 1) return byId.first();
     }
-    const options = el.tagName === "SELECT" ? Array.from((el as HTMLSelectElement).options).map((o) => clean(o.textContent)) : [];
-    return { id, name: el.getAttribute("name") || "", labels: parts.filter(Boolean), options };
-  }).catch(() => null) as { id: string; name: string; labels: string[]; options: string[] } | null;
-  if (!read) return null;
+    const nm = field.group || field.fingerprint?.name || "";
+    if ((field.fieldType === "radio" || field.fieldType === "checkbox") && nm) {
+      const grp = scope.locator(`input[type="${field.fieldType}"][name="${cssStr(nm)}"]`);
+      if (typeof grp?.evaluateAll === "function") {
+        const raws = await grp.evaluateAll(extractFieldsInPage).catch(() => null) as RawField[] | null;
+        const n = await grp.count().catch(() => -1);
+        if (Array.isArray(raws) && raws.length === n) {
+          const want = normalize(field.label);
+          const hits = raws.map((r, i) => (normalize(r.label) === want ? i : -1)).filter((i) => i >= 0);
+          return hits.length === 1 ? grp.nth(hits[0]) : null;
+        }
+      }
+    }
+  }
+  return buildLocator(page, field.selector);
+}
+
+/** MAY THIS ELEMENT BE WRITTEN, RIGHT NOW? (#362) The guard runs on the element actually about to
+ *  be written, immediately before the write, with the extractor's own reading of it (the same
+ *  extractFieldsInPage, run on that one element): its id must be the extracted one when there was
+ *  one, its label the extracted label (unless that label was only an id / name — main's
+ *  behaviour), and none of its label, questions or options may read as submit intent. null =
+ *  refused, or unreadable. A locator that cannot be evaluated (a test double) passes. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function claimForWrite(loc: any, field: ExtractedField): Promise<{ id: string; name: string } | null> {
+  if (typeof loc?.evaluateAll !== "function") return { id: extractedIdOf(field), name: field.group || field.fingerprint?.name || "" };
+  const raws = await loc.evaluateAll(extractFieldsInPage).catch(() => null) as RawField[] | null;
+  if (!Array.isArray(raws) || raws.length !== 1) return null;
+  const raw = raws[0];
   const want = extractedIdOf(field);
-  if (want && read.id !== want) return null;
-  if (read.labels.some((l) => !gapFillMayAnswer(l)) || !gapFillMayAnswer({ options: read.options })) return null;
-  if (kind === "data") return { id: read.id, name: read.name };
-  const stamped = await loc.evaluate((el: Element, a: { attr: string; label: string }) => { el.setAttribute(a.attr, a.label); return true; },
-    { attr: UNRECORDED_WRITE_ATTR, label }).catch(() => false);
-  return stamped ? { id: read.id, name: read.name } : null;
+  if (want && raw.id !== want) return null;
+  if (raw.fieldType !== field.fieldType) return null;
+  if (!labelIsOnlyIdent(field) && normalize(raw.label) !== normalize(field.label)) return null;
+  if (!gapFillMayAnswer({ label: raw.label, groupPrompt: raw.groupPrompt, options: raw.options, questions: raw.questions })) return null;
+  return { id: raw.id || "", name: raw.name || "" };
+}
+
+/** What the control now shows after the write: a select's chosen option text. "" when unread. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function landedText(loc: any, field: ExtractedField, value: string): Promise<string | null> {
+  if (field.fieldType !== "select") return value;
+  if (typeof loc?.evaluate !== "function") return value;
+  const t = await loc.evaluate((el: Element) => {
+    const s = el as HTMLSelectElement;
+    if (s.tagName === "SELECT") return (s.options[s.selectedIndex]?.textContent || "").trim();
+    return ((el as HTMLInputElement).value || el.textContent || "").trim();
+  }, undefined, { timeout: 1500 }).catch(() => null);
+  return typeof t === "string" ? t : null;
 }
 
 // Best-effort: neutralize the transparent loading scrims / onboarding popovers that
@@ -389,10 +508,8 @@ export async function gapFillCurrentPage(
     // Keep only the still-empty controls (don't overwrite the adapter's deterministic fills).
     const empties: Array<{ field: ExtractedField; loc: unknown }> = [];
     for (const field of candidates) {
-      // THE CONTROL THE EXTRACTOR SAW (#362): by its #id when it has one — a label locator is a
-      // substring match that can resolve to a neighbour.
-      const exactId = extractedIdOf(field);
-      const loc = buildLocator(page, exactId ? { css: `[id="${exactId.replace(/"/g, '\\"')}"]`, frame: field.selector?.frame } : field.selector);
+      // THE CONTROL THE EXTRACTOR SAW (#362): see locateExtracted.
+      const loc = await locateExtracted(page, field);
       if (!loc) continue;
       if ((await isFieldEmpty(loc, field.fieldType)) === true) empties.push({ field, loc });
     }
@@ -440,14 +557,29 @@ export async function gapFillCurrentPage(
       }
       // A radio / checkbox is named by its QUESTION too: "Yes" alone tells a person nothing.
       const own = field.label || field.fieldType;
-      const shown = field.groupPrompt && (field.fieldType === "radio" || field.fieldType === "checkbox") ? `${field.groupPrompt.slice(0, 80)}: ${own}` : own;
-      const kind = gapFillWriteKind(field, fill.field, projectFields);
-      const claimed = await claimForWrite(loc, field, shown, kind);
+      const choice = field.fieldType === "radio" || field.fieldType === "checkbox";
+      const question = field.groupPrompt || (field.questions ?? []).find((q) => q && q !== own) || "";
+      const shown = choice && question ? `${question.slice(0, 80)}: ${own}` : own;
+      // The guard, on the element about to be written, immediately before the write.
+      const claimed = await claimForWrite(loc, field);
       if (!claimed) continue;
       out.attempted.push(shown);
-      out.attemptedControls.push({ label: shown, id: claimed.id, name: claimed.name, kind });
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const applied = await applyGrounded(page, loc as any, field, fill.value);
+      const entry: GapFillOutcome["attemptedControls"][number] = { label: shown, id: claimed.id, name: claimed.name, kind: "pick" };
+      out.attemptedControls.push(entry);   // a pick until what landed says otherwise
+      let applied = false;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        applied = await applyGrounded(page, loc as any, field, fill.value);
+      } finally {
+        // WHAT LANDED decides data or pick (gapFillWriteKind); unread = pick. A pick's element is
+        // stamped so a replay can find it again.
+        const landed = await landedText(loc, field, fill.value);
+        entry.kind = landed == null ? "pick" : gapFillWriteKind(field, fill.value, fill.field, projectFields, landed);
+        if (entry.kind === "pick" && typeof (loc as { evaluate?: unknown })?.evaluate === "function") {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          await (loc as any).evaluate((el: Element, a: { attr: string; label: string }) => { el.setAttribute(a.attr, a.label); }, { attr: UNRECORDED_WRITE_ATTR, label: shown }, { timeout: 1500 }).catch(() => null);
+        }
+      }
       if (applied) out.filled.push(field.label || field.fieldType);
     }
 

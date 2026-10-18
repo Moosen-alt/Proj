@@ -148,6 +148,14 @@ export interface ExtractedField {
    *  accessible name, or a group label tied to no single option. Read by the gap-fill's
    *  submit-intent guard; never sent to a planner. */
   groupPrompt?: string;
+  /** EVERY text that may be this control's question (#362), from every source rather than the
+   *  first: each enclosing fieldset legend, its own and its group's aria-labelledby / aria-label,
+   *  its label (a choice control's own option word excluded), and the text around it in the
+   *  smallest container holding only it (or only its group): a row's <th> or first cell, a
+   *  leading span / p / strong, a .control-label — plus a text-only element just before that
+   *  container. Headings and option words are never part of it. Read by the gap-fill's
+   *  submit-intent guard on the element about to be written; never sent to a planner. */
+  questions?: string[];
   /** True when the control cannot be operated right now — :disabled (which also covers a
    *  control inside <fieldset disabled>), aria-disabled="true", or a `disabled` class token.
    *  Carried because A DISABLED NEXT IS A GATE, NOT AN ABSENCE: a wizard step whose Next
@@ -1325,6 +1333,8 @@ export interface RawField {
   disabled?: boolean;
   /** See ExtractedField.groupPrompt. */
   groupPrompt?: string;
+  /** See ExtractedField.questions. */
+  questions?: string[];
   /** A choice tile (markChoiceTilesInPage): a card clicked as a whole, labelled by its title.
    *  Its selector is the title TEXT — getByRole finds nothing on a plain container. */
   tile?: boolean;
@@ -1451,6 +1461,85 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
     const text = (el.textContent || "").trim();
     if (text) return text;
     return "";
+  }
+
+  // THE OPTION WORDS OF A CHOICE GROUP (#362): the labels of every radio / checkbox sharing this
+  // one's name (just its own for an unnamed one). Never a question.
+  function optionWordsOf(el: Element): string[] {
+    const ty = (el.getAttribute("type") || "").toLowerCase();
+    if (el.tagName.toLowerCase() !== "input" || (ty !== "radio" && ty !== "checkbox")) return [];
+    const nm = el.getAttribute("name");
+    const root = el.getRootNode() as Document | ShadowRoot;
+    const members = nm ? Array.from(root.querySelectorAll(`input[name="${CSS.escape(nm)}"]`)) : [el];
+    // Its label, its value and a <label for> right AFTER it (Miami's radios share one id, and their
+    // labels point at "Yes"/"No", so labelFor cannot tie them): every one is an option's own word.
+    // Never the element before the first option: that is where the group's question label sits.
+    const words: string[] = [];
+    for (const m of members) {
+      words.push(labelFor(m), m.getAttribute("value") || "");
+      const sib = m.nextElementSibling;
+      if (sib && sib.tagName === "LABEL" && sib.hasAttribute("for") && !sib.querySelector("input, select, textarea")) words.push(sib.textContent || "");
+    }
+    return words.map((w) => w.replace(/\s+/g, " ").trim()).filter(Boolean);
+  }
+
+  // THE CONTROL'S QUESTION FROM EVERY SOURCE (#362) — see ExtractedField.questions. One reading
+  // for the extractor and for the gap-fill's last check before a write (claimForWrite runs this
+  // function on the element itself), so the two can never disagree.
+  function questionsOf(el: Element, kind: string, ownLabel: string): string[] {
+    const clean = (t: string | null | undefined): string => String(t || "").replace(/\s+/g, " ").trim();
+    const out: string[] = [];
+    const add = (t: string | null | undefined): void => {
+      const c = clean(t).slice(0, 300);
+      if (c && !out.includes(c)) out.push(c);
+    };
+    const root = el.getRootNode() as Document | ShadowRoot;
+    const byId = (r: string): Element | null => (typeof root.getElementById === "function" ? root.getElementById(r) : null) || document.getElementById(r);
+    const byIds = (ids: string | null): string => (ids || "").split(/\s+/).filter(Boolean)
+      .map((r) => clean(byId(r)?.textContent)).filter(Boolean).join(" ");
+    const choice = kind === "radio" || kind === "checkbox";
+    const words = new Set(optionWordsOf(el).map((w) => w.toLowerCase()));
+    // Every enclosing fieldset's legend (a section-title legend does not hide a question legend).
+    for (let fs = el.closest("fieldset"); fs; fs = fs.parentElement ? fs.parentElement.closest("fieldset") : null) {
+      add(Array.from(fs.children).find((c) => c.tagName === "LEGEND")?.textContent);
+    }
+    add(byIds(el.getAttribute("aria-labelledby")));
+    add(el.getAttribute("aria-label"));
+    const grp = el.closest('[role="radiogroup"], [role="group"]');
+    if (grp) { add(byIds(grp.getAttribute("aria-labelledby"))); add(grp.getAttribute("aria-label")); }
+    if (!choice) add(ownLabel);
+    // The smallest container holding only this control (a choice control: only its group).
+    const nm = choice ? el.getAttribute("name") : null;
+    const ours = (c: Element): boolean => c === el || (!!nm && c.getAttribute("name") === nm);
+    const CONTROLS = "input:not([type=hidden]), select, textarea, button, [role=button], [role=combobox], [role=listbox]";
+    let box: Element = el;
+    for (let up = el.parentElement; up && up !== document.body && up.tagName !== "FORM"; up = up.parentElement) {
+      if (!Array.from(up.querySelectorAll(CONTROLS)).every(ours)) break;
+      box = up;
+    }
+    if (box !== el) {
+      const parts: string[] = [];
+      const walker = document.createTreeWalker(box, NodeFilter.SHOW_TEXT);
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        const host = n.parentElement;
+        if (!host || host.closest("h1, h2, h3, h4, h5, h6, option, script, style, legend")) continue;
+        const t = clean(n.textContent);
+        if (!t || words.has(t.toLowerCase()) || (choice && t === ownLabel)) continue;
+        parts.push(t);
+      }
+      // A container of prose is not a question (instructions that mention submitting): a caption
+      // is short, as the required sweep reads one (≤160 there; 200 here for a long question).
+      const joined = parts.join(" ");
+      if (joined.length <= 200) add(joined);
+    }
+    // A text-only element just before that container ("<p>Question?</p><select>").
+    let sib = box.previousElementSibling;
+    for (let k = 0; sib && k < 2; k++, sib = sib.previousElementSibling) {
+      if (sib.querySelector(CONTROLS) || /^H[1-6]$/.test(sib.tagName)) break;
+      const t = clean(sib.textContent);
+      if (t && t.length <= 200) { add(t); break; }
+    }
+    return out;
   }
 
   // Derive the SECTION a field lives under — its fieldset legend / enclosing card-or-panel
@@ -1773,17 +1862,21 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       if (!groupPrompt) {
         const box = el.closest("fieldset, .form-group, [class*='form-group'], [class*='field'], .row, [class*='row']");
         const lbls = box ? Array.from(box.querySelectorAll("label, .control-label, .field-label")) : [];
+        // An OPTION'S OWN WORD is never the question: Miami's <label for="No">No</label> names an
+        // id that does not exist, so the for= test alone let "No" become the question.
+        const words = new Set(optionWordsOf(el).map((w) => w.toLowerCase()));
         for (const l of lbls) {
           if (l.querySelector("input, select, textarea")) continue;
           const f = l.getAttribute("for");
           const tgt = f ? document.getElementById(f) : null;
           if (tgt && /^(radio|checkbox)$/i.test((tgt as HTMLInputElement).type || "")) continue;
           const t = clean(l.textContent);
-          if (t && t !== label) { groupPrompt = t; break; }
+          if (t && t !== label && !words.has(t.toLowerCase())) { groupPrompt = t; break; }
         }
       }
       groupPrompt = groupPrompt.slice(0, 200);
     }
+    const questions = fieldType === "button" || fieldType === "file" ? [] : questionsOf(el, fieldType, label);
 
     out.push({
       label, fieldType, options, role, name, placeholder, id, text, href,
@@ -1792,6 +1885,7 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       section: sectionFor(el) || undefined,
       testCss,
       groupPrompt: groupPrompt || undefined,
+      questions: questions.length ? questions : undefined,
       ariaLabel: el.getAttribute("aria-label")?.trim() || undefined,
       inActiveScope: scopeEl ? scopeEl.contains(el) : undefined,
       offstage: scopeEl ? !!el.closest('[aria-hidden="true"], [inert]') : undefined,
@@ -1916,6 +2010,7 @@ export function toExtractedField(raw: RawField): ExtractedField {
   }
   if (raw.fieldType === "radio" && raw.name) field.group = raw.name;
   if (raw.groupPrompt) field.groupPrompt = raw.groupPrompt;
+  if (raw.questions?.length) field.questions = [...raw.questions];
   return field;
 }
 

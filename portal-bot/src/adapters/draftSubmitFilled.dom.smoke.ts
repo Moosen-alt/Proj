@@ -77,7 +77,8 @@ const check = (label: string, ok: boolean, detail = ""): void => {
   else { failures++; console.error(`  FAIL - ${label}\n         ${detail}`); }
 };
 
-const AGREE = "Do you agree to the terms of the Net Metering (kWh) Agreement?";
+// No "Net Metering (kWh)" in it: PR #353's kWh standing answer would answer it on a merged tree.
+const AGREE = "Do you agree to the terms of the Interconnection Agreement?";
 const READY = "Are you ready to submit your Net Metering (kWh) application?";
 const posts: Array<{ mode: string; path: string; body: string }> = [];
 const gets: Array<{ mode: string; path: string; query: string }> = [];
@@ -140,7 +141,8 @@ const extra = (mode: string): string => {
     case "opener": return `${yesNo(mode, "agree", AGREE)}<button type="button" id="btnAcct" onclick="document.getElementById('acct').style.display='block'">Select from Account</button><div id="acct" style="display:none"><label for="pref">Preferred contact</label><input id="pref" name="pref" type="text"></div>`;
     case "revisit": return `${yesNo(mode, "agree", AGREE)}<button type="submit" id="btnNext" formmethod="get" formaction="/m/${mode}/part2">Next</button>`;
     case "arrays1": case "arrays2": return ARRAYS;
-    case "reassertEmail": return `<div><label for="email">Email</label><input id="email" name="email" type="email" required></div>`;
+    // A select literal, so the re-assert's write LANDS (a beacon proves it).
+    case "reassertEmail": return `<div><label for="email">Email</label><select id="email" name="email" required onchange="fetch('/m/${mode}/touched?id=email')"><option value="">Select…</option><option>office@acme.example</option><option>other@acme.example</option></select></div>`;
     case "reassertReady": return yesNo(mode, "ready", READY, { beacon: true });
     case "radioLegend": return `${readyRadios("legend")}${installerBox}`;
     case "radioGroup": return `${readyRadios("group")}${installerBox}`;
@@ -167,7 +169,7 @@ const PART1 = (mode: string): string => {
 };
 // An EARLIER page, before Part 1 (method=get: its answers ride the query to Part 1).
 const EARLY = (mode: string): string => {
-  const extras = mode === "reassertEmail" ? `<div><label for="contactEmail">Email</label><input id="contactEmail" name="contactEmail" type="email"></div>`
+  const extras = mode === "reassertEmail" ? `<div><label for="contactEmail">Email</label><select id="contactEmail" name="contactEmail"><option value="">Select…</option><option>office@acme.example</option><option>other@acme.example</option></select></div>`
     : mode === "reassertReady" ? `<div><label for="netMetering">Net Metering</label><select id="netMetering" name="netMetering"><option value="">Select…</option><option>Yes</option><option>No</option></select></div>`
     : mode === "radioEarlier" ? `${readyRadios("legend", false)}${installerBox}`
     : installerBox;
@@ -265,7 +267,7 @@ const part1Steps = (mode: string): RecipeStep[] => {
 const EARLY_MODES = new Set(["earlierPage", "gotoEarlier", "reassertEmail", "reassertReady", "radioEarlier"]);
 const earlySteps = (mode: string): RecipeStep[] => {
   const out: RecipeStep[] = [step({ action: "goto", value: `${base}/m/${mode}/early`, note: "open the first page" })];
-  if (mode === "reassertEmail") out.push(step({ action: "fill", selector: { css: "#contactEmail", label: "Email", fallbacks: [{ label: "Email" }] }, value: "office@acme.example", note: "Email" }));
+  if (mode === "reassertEmail") out.push(step({ action: "select", selector: { css: "#contactEmail", label: "Email", fallbacks: [{ label: "Email" }] }, value: "office@acme.example", note: "Email" }));
   if (mode === "reassertReady") out.push(step({ action: "select", selector: { css: "#netMetering", label: "Net Metering", fallbacks: [{ label: "Net Metering" }] }, value: "Yes", note: "Net Metering" }));
   out.push(step({ action: "fill", selector: { css: "#contactName", label: "Contact Name" }, value: "Pat Example", note: "Contact Name" }));
   if (mode === "gotoEarlier") {
@@ -322,7 +324,13 @@ const brief = (o: Outcome): string => `posts=${JSON.stringify(o.posts.map((p) =>
 const submits = (o: Outcome): number => o.posts.filter((p) => /\/p1\/submit$/.test(p.path)).length;
 const notAnIncident = (o: Outcome): boolean => o.r.pauseReason !== "draft_submit_unexpected" && !o.r.draftSubmitUnexpected && !o.r.draftCreatedByReplay && o.r.finalSubmitClicked === false;
 const drafted = (o: Outcome): boolean => submits(o) === 1 && (o.r.draftCreatedByReplay as { applicationNumber?: string } | null)?.applicationNumber === "NEM-90017" && o.r.finalSubmitClicked === false;
-const named = (o: Outcome, words: string): boolean => msgOf(o.r).includes(words) && /recorded steps never fill/.test(msgOf(o.r));
+const named = (o: Outcome, words: string): boolean => msgOf(o.r).includes(words) && /recorded steps never fill/.test(msgOf(o.r)) && leads(o);
+// THE RUN CARD LEADS WITH IT (SF1): the pausing step's first line, which the backend shows.
+const cardLine = (r: Record<string, unknown>): string => {
+  const steps = Array.isArray(r.steps) ? (r.steps as Array<{ message?: unknown; pauseReason?: unknown }>) : [];
+  return String(steps.find((s) => s?.pauseReason === r.pauseReason)?.message ?? "").split("\n")[0];
+};
+const leads = (o: Outcome): boolean => /^NOT CLICKED "Submit": automation picked \d+ answer\(s\) with no project data behind them/.test(cardLine(o.r)) && o.r.pauseReason === "stopped_before_review";
 // SHOWN TO THE PERSON: the stop's own message (reviewHandoffNotes), not only the run log.
 const handoffOf = (r: Record<string, unknown>): string => {
   const steps = Array.isArray(r.steps) ? (r.steps as Array<{ data?: { reviewHandoffNotes?: unknown } }>) : [];
@@ -338,6 +346,7 @@ try {
     check("filled: the gap-fill answered the unrecorded select, and the stamped Submit was NOT clicked (0 POSTs)", submits(o) === 0 && o.posts.length === 0, brief(o));
     check("filled: the stop is a review stop, not an incident: no draft, no incident, nothing clicked", notAnIncident(o), brief(o));
     check("filled: the stop names the control automation filled", named(o, AGREE.slice(0, 40)), brief(o));
+    check("filled: one control picked is counted and named once (\"picked 1 answer(s)\")", /automation picked 1 answer\(s\)/.test(cardLine(o.r)) && /automation picked 1 answer\(s\)/.test(msgOf(o.r)), brief(o));
     check("filled: the person is told in the stop message which answer automation added", told(o, AGREE.slice(0, 40)), brief(o));
     check("filled: the answer stays on the page for a person (the gap-fill reports it filled)", gapFilled(o.r).some((l) => l.includes(AGREE.slice(0, 40))), brief(o));
   }
@@ -354,7 +363,7 @@ try {
   }
   {
     const o = await stage("unboundRadio");
-    check("unboundRadio: a required Yes/No radio group the stub picked with no project field — 0 POSTs, a named review stop", submits(o) === 0 && notAnIncident(o) && named(o, "gap-fill: Is the system grid-tied?: Yes"), brief(o));
+    check("unboundRadio: a required Yes/No radio group the stub picked with no project field — 0 POSTs, a named review stop", o.posts.length === 0 && notAnIncident(o) && named(o, "gap-fill: Is the system grid-tied?: Yes"), brief(o));
     const b = await stage("boundRadio");
     check("boundRadio: the same group answered through a bound project field (data) — one click, the draft", drafted(b), brief(b));
     const s2 = await stage("boundSelect");
@@ -363,12 +372,13 @@ try {
   {
     const o = await stage("arrays2");
     check("arrays2: a two-array project on a one-array recording (Add Array + row 2 from the project's arrays) — one click, the draft", drafted(o), brief(o));
+    check("arrays2: ...and row 2 landed (the draft carries both arrays' quantities)", o.posts.some((p) => /(^|&)qty1=10(&|$)/.test(p.body) && /(^|&)qty2=6(&|$)/.test(p.body)), brief(o));
     const o1 = await stage("arrays1");
     check("arrays1: a one-array project on the same repeater page clicks once and reads as the draft", drafted(o1), brief(o1));
   }
   {
     const o = await stage("reassertEmail");
-    check('reassertEmail: an earlier page\'s recorded "Email" re-asserted into Part 1\'s Email blank — 0 POSTs, a stop naming the live control', submits(o) === 0 && notAnIncident(o) && named(o, 're-assert into "Email"'), brief(o));
+    check('reassertEmail: an earlier page\'s recorded "Email" re-asserted into Part 1\'s Email blank — 0 POSTs, a stop naming the live control', o.posts.length === 0 && notAnIncident(o) && named(o, 're-assert into "Email"') && touched(o, "email"), brief(o));
     const r = await stage("reassertReady");
     check('reassertReady: an earlier page\'s recorded "Net Metering" = Yes is never re-asserted into the ready-to-submit select (never touched, 0 POSTs)', submits(r) === 0 && notAnIncident(r) && !touched(r, "ready"), brief(r));
     const rr = await stage("rerender");
@@ -378,11 +388,11 @@ try {
     const o = await stage("submitIntent");
     // The page's other required gap (Installer Company) makes the planner call real.
     check("submitIntent: a control reading as submit intent is never offered to the gap-fill planner", o.offered.some((f) => /installer company/i.test(f.label)) && !o.offered.some((f) => f.label.includes("ready to submit")), brief(o));
-    check("submitIntent: never answered, so the stamped Submit is not clicked (0 POSTs) and nothing reads as filed", submits(o) === 0 && notAnIncident(o) && !gapFilled(o.r).some((l) => /ready to submit/i.test(l)), brief(o));
+    check("submitIntent: never answered, so the stamped Submit is not clicked (0 POSTs) and nothing reads as filed", o.posts.length === 0 && notAnIncident(o) && !gapFilled(o.r).some((l) => /ready to submit/i.test(l)), brief(o));
   }
   for (const mode of ["radioLegend", "radioGroup", "radioAria"] as const) {
     const o = await stage(mode);
-    check(`${mode}: the ready-to-submit question as a Yes/No radio group — no member offered to the planner, 0 POSTs`, noRadioOffered(o) && submits(o) === 0 && notAnIncident(o), brief(o));
+    check(`${mode}: the ready-to-submit question as a Yes/No radio group — no member offered to the planner, 0 POSTs`, noRadioOffered(o) && o.posts.length === 0 && notAnIncident(o), brief(o));
   }
   {
     const o = await stage("radioEarlier");
@@ -403,7 +413,7 @@ try {
   {
     const o = await stage("substring");
     check('substring: the gap-fill\'s "Net Metering" answer lands on its own select, never on "…ready to submit your Net Metering…"', !touched(o, "ready") && gapFilled(o.r).includes("Net Metering"), brief(o));
-    check("substring: the stop names the control actually written, and nothing is clicked (0 POSTs)", submits(o) === 0 && notAnIncident(o) && named(o, "gap-fill: Net Metering") && !/gap-fill: Are you ready/.test(msgOf(o.r)), brief(o));
+    check("substring: the stop names the control actually written, and nothing is clicked (0 POSTs)", o.posts.length === 0 && notAnIncident(o) && named(o, "gap-fill: Net Metering") && !/gap-fill: Are you ready/.test(msgOf(o.r)), brief(o));
   }
   {
     const o = await stage("earlierPage");
