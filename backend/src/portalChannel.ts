@@ -823,6 +823,10 @@ const NAMED_PERMIT_PLATFORMS: Array<{ name: string; pattern: RegExp }> = [
   { name: "SolarAPP+", pattern: /\bsolarapp(?!lic)|\bsolar\s?app\s?\+/i },
   { name: "a permit portal", pattern: /\bpermit(?:s|ting)?\s+(?:portal|system|website|center|centre)\b|\be-?permit(?:s|ting)\b|\bepermit\b/i },
   { name: "a city or county portal", pattern: /\b(?:city|county|town|village|borough|township|parish|municipal)(?:'s)?\s+(?:own\s+|online\s+)?portal\b/i },
+  // A city's permit OFFICE named in plain words ("City of Portland Development Services", "the Building
+  // Division") — where a carve-out utility's customers file, whatever system the office runs (#369
+  // round 4: it beats the known-tenant exemption exactly as a vendor's name does).
+  { name: "a city or county permit office", pattern: /\b(?:bureau\s+of\s+)?development\s+services\b|\bbuilding\s+(?:and\s+safety\s+)?(?:division|department|dept\b|office)\b|\bpermit(?:s|ting)?\s+(?:office|counter|division|department)\b|\bplanning\s+and\s+(?:building|development)\b/i },
 ];
 
 /** The permit platforms (or a city's permit portal) these words name ("City of Cedarvale Accela

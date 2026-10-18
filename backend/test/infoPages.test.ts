@@ -1264,7 +1264,11 @@ await check("#365, THE ROUND-3 SKEPTICS ON #369 (round 4): Portland's pass survi
   for (const w of ["City of Cedarvale Accela Citizen Access", "Cedarvale EnerGov Citizen Self Service", "Cedarvale Citizenserve Portal", "SolarAPP+", "City permit portal",
     "Apply on the City's portal.", "Customers inside Cedarvale city limits submit through the City of Cedarvale Accela Citizen Access portal; all other customers use PowerClerk.",
     "Accela", "Cedarvale ePermits", "eTRAKiT",
-    "Apply through the city portal."]) assert.ok(namedPermitPlatforms(w).length, `names a permit platform: ${w}`); // (the round-2 lookup fixture's shared quote)
+    "Apply through the city portal.",
+    // a permit OFFICE in plain words (round 4)
+    "City of Portland Development Services", "Customers inside Portland city limits apply through City of Portland Development Services online.",
+    "the Bureau of Development Services", "Apply through the Building Division.", "the city's Building and Safety Department", "the county permit office"])
+    assert.ok(namedPermitPlatforms(w).length, `names a permit platform: ${w}`); // ("Apply through the city portal." is the round-2 lookup fixture's shared quote)
   for (const w of ["Pacific Power Customer Generation Portal", "PowerClerk (utility interconnection)", "Customer Generation Online Application",
     "Submit your solar application through PowerClerk", "Attach the approved city building permit", "City of Portland customers use the PowerClerk portal",
     "Apply through the Pacific Power Customer Generation Portal.", "Apply online through PowerClerk, the Pacific Power Customer Generation Portal.",
@@ -1320,6 +1324,12 @@ await check("#365, THE ROUND-3 SKEPTICS ON #369 (round 4): Portland's pass survi
   // …but words naming a permit vendor beat it: counts.
   await lookupThrough(PP, { value: { name: "PowerClerk", url: null }, sourceUrl: pacificSrc, quote: "Customers inside Cedarvale city limits apply on the City of Cedarvale Accela Citizen Access; all others use PowerClerk." }, [pacificSrc]);
   await counts(project(PP), devhub, "the known tenant's lookup naming a permit vendor");
+  // …and so do plain words naming the city's permit OFFICE (round 4, the round-3 re-check's X1): the
+  // lookup says Portland customers file with the city, not on the tenant — counts on DevHub and on
+  // another permit host. Main counts here.
+  await lookupThrough(PP, { value: { name: "City of Portland Development Services", url: null }, sourceUrl: pacificSrc, quote: "Customers inside Portland city limits apply through City of Portland Development Services online." }, [pacificSrc]);
+  await counts(project(PP), devhub, "X1 the known tenant's lookup naming the city's permit office in plain words, on DevHub");
+  await counts(project(PP), permitUrl, "X1 …and on another permit host");
   db.run("DELETE FROM utility_filing_lookups WHERE profile_key = ?", [ufl.utilityFilingKey("OR", PP)]);
 
   // ── A URL THE DOOR DROPPED IS STORED AND READ BY HOST (MAJOR 3).
