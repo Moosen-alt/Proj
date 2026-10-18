@@ -794,6 +794,44 @@ export function namedInterconnectionPlatforms(named: string | Array<string | nul
   return NAMED_INTERCONNECTION_PLATFORMS.filter((p) => p.pattern.test(text)).map((p) => p.name);
 }
 
+// ── A NAMED PERMIT PLATFORM (#365 / PR #369, review round 4) ──────────────────────────────
+// The other half of the question above, asked of words: does a record (a utility filing lookup's
+// name and quote, a utility KB row's portal name / platform / submission method) NAME a permit-
+// software vendor's product, or a city's / county's permit portal? A utility's own words saying it
+// takes applications there are caution that its NEM number may have been filed there. Read ONLY as
+// caution (infoPages: the number then counts) — never to route, resolve or launch anything.
+// Product names only, each anchored, so a utility's prose does not read as one: never "solar app"
+// (it is the start of "solar application"), never "city view", never "city of <name> … portal"
+// ("City of Portland customers use the PowerClerk portal"). The vendors are PERMIT_PLATFORM_HOSTS'
+// and portalPlatformRules' families.
+const NAMED_PERMIT_PLATFORMS: Array<{ name: string; pattern: RegExp }> = [
+  { name: "Accela Citizen Access", pattern: /\baccela\b|\bcitizens?\s?access\b/i },
+  { name: "Tyler EnerGov", pattern: /\benergov|\bcitizen\s?self[-\s]?service\b/i },
+  { name: "Citizenserve", pattern: /\bcitizen\s?serve\b/i },
+  { name: "eTRAKiT", pattern: /\be-?trakit/i },
+  { name: "CityView", pattern: /\bcityview\b/i },
+  { name: "iWorQ", pattern: /\biworq\b/i },
+  { name: "OpenGov / ViewPoint", pattern: /\bopen\s?gov\b|\bviewpoint\s?cloud\b/i },
+  { name: "SmartGov", pattern: /\bsmart\s?gov\b/i },
+  { name: "MyGovernmentOnline", pattern: /\bmy\s?government\s?online\b|\bmygov\b/i },
+  { name: "ProjectDox", pattern: /\bproject\s?dox\b|\bavolve\b/i },
+  { name: "Cloudpermit", pattern: /\bcloud\s?permit\b/i },
+  { name: "Clariti", pattern: /\bclariti\b/i },
+  { name: "GovWell", pattern: /\bgov\s?well\b/i },
+  { name: "BS&A Online", pattern: /\bbs&a\b|\bbsa\s?online\b/i },
+  { name: "Cityworks", pattern: /\bcityworks\b/i },
+  { name: "SolarAPP+", pattern: /\bsolarapp(?!lic)|\bsolar\s?app\s?\+/i },
+  { name: "a permit portal", pattern: /\bpermit(?:s|ting)?\s+(?:portal|system|website|center|centre)\b|\be-?permit(?:s|ting)\b|\bepermit\b/i },
+  { name: "a city or county portal", pattern: /\b(?:city|county|town|village|borough|township|parish|municipal)(?:'s)?\s+(?:own\s+|online\s+)?portal\b/i },
+];
+
+/** The permit platforms (or a city's permit portal) these words name ("City of Cedarvale Accela
+ *  Citizen Access" → ["Accela Citizen Access"]); [] when they name none. Caution only. */
+export function namedPermitPlatforms(named: string | Array<string | null | undefined> | null | undefined): string[] {
+  const text = (Array.isArray(named) ? named : [named]).map((s) => String(s ?? "")).join(" \n ");
+  return NAMED_PERMIT_PLATFORMS.filter((p) => p.pattern.test(text)).map((p) => p.name);
+}
+
 /** Why this URL is NOT confirmed as the application portal when the research / lookup names an
  *  interconnection platform it is not on — or "" (no platform named, not a URL, or on the named
  *  platform's domain). Judged inside hostFitsTrackAndEntity (its `namedPlatform` option), so every
