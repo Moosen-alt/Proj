@@ -94,7 +94,7 @@ await check("MUST-STOP: a gap-fill select that wrote and then threw still refuse
   assert.equal(r.out.kind, "refused", JSON.stringify(r.out));
   assert.ok((r.out.refusals ?? []).some((x) => /recorded steps never fill/.test(x) && x.includes("gap-fill: Do you agree")), JSON.stringify(r.out));
   assert.deepEqual(r.clicks, [], "nothing was clicked");
-  assert.ok(r.notes.some((n) => /AUTOMATION ADDED ANSWERS/.test(n)), `the person is told: ${JSON.stringify(r.notes)}`);
+  assert.ok(r.notes.some((n) => /AUTOMATION PICKED ANSWERS/.test(n)), `the person is told: ${JSON.stringify(r.notes)}`);
 });
 
 await check("MUST-STOP: a page that throws on every read refuses the same way (fail closed)", async () => {

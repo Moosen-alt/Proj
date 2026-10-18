@@ -10,7 +10,7 @@
 //
 //   npx tsx portal-bot/src/llmGapFillSubmitIntent.test.ts
 import assert from "node:assert/strict";
-import { gapFillCurrentPage, gapFillMayAnswer } from "./llmGapFill";
+import { gapFillCurrentPage, gapFillMayAnswer, gapFillWriteKind } from "./llmGapFill";
 import type { LearnPlanRequest, LearnPlanResponse, RawField } from "./adapters/autoLearnAdapter";
 
 let failures = 0;
@@ -141,6 +141,32 @@ await check("MUST PASS: a write that throws after it reached the page is still r
   assert.ok(writes.length >= 1, `the write reached the page: ${JSON.stringify(writes)}`);
   assert.deepEqual(out.attempted, [AGREE]);
   assert.equal(out.attemptedControls[0]?.id, "agree");
+});
+
+await check("DATA OR PICK: a choice answered through a bound project field is data; the same choice unbound is a pick", async () => {
+  const run = async (mapped: string | undefined) => {
+    const { page } = fakePage([yesNo("agree", AGREE), { label: "Installer Company", fieldType: "text", id: "inst", required: true } as RawField]);
+    const planner = async (): Promise<LearnPlanResponse> => ({ fills: [{ selectorIndex: 0, value: "Yes", ...(mapped ? { field: mapped } : {}) }, { selectorIndex: 1, value: "Acme Solar" }], atReview: false });
+    return gapFillCurrentPage(page, planner, { agreesToTerms: "Yes", installerCompany: "Acme Solar" });
+  };
+  const bound = await run("agreesToTerms");
+  const unbound = await run(undefined);
+  assert.deepEqual(bound.attemptedControls.map((c) => c.kind), ["data", "data"], JSON.stringify(bound.attemptedControls));
+  assert.deepEqual(unbound.attemptedControls.map((c) => c.kind), ["pick", "data"], JSON.stringify(unbound.attemptedControls));
+  // A binding to a field the project holds no value for is no data at all.
+  assert.equal(gapFillWriteKind({ fieldType: "select" }, "agreesToTerms", { agreesToTerms: " " }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "radio" }, undefined, {}), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "checkbox" }, "hasBattery", { hasBattery: "No" }), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, undefined, {}), "data");
+});
+
+await check("A radio pick is named by its question, not by its option word alone", async () => {
+  const radio = (id: string, label: string): RawField => ({ label, fieldType: "radio", id, name: "gridTied", groupPrompt: "Is the system grid-tied?", required: true } as RawField);
+  const { page } = fakePage([radio("gY", "Yes"), radio("gN", "No")]);
+  const planner = async (): Promise<LearnPlanResponse> => ({ fills: [{ selectorIndex: 0, value: "Yes" }], atReview: false });
+  const out = await gapFillCurrentPage(page, planner, {});
+  assert.deepEqual(out.attempted, ["Is the system grid-tied?: Yes"]);
+  assert.equal(out.attemptedControls[0]?.kind, "pick");
 });
 
 await check("MUST PASS: the predicate is portalSafety's reading — submit wording out, ordinary wording in", () => {

@@ -1,37 +1,38 @@
 // THE STAMPED DRAFT CLICK ONLY HAPPENS ON THE PAGE THE STAMP SAW (#362).
 //
-// Owner ruling 2026-10-17 ("Stop for me"): before the stamped draft-creating Submit (#330/#354, the
-// CLAUDE.md rule 1 carve-out), if automation filled anything on that page the recorded steps never
-// fill, it fills it and STOPS like a review stop — the answers stay on the page, a person checks them
-// and clicks Submit, the stamp is kept, and it is not an incident. Found re-checking PR #353: a stub
+// Owner rulings 2026-10-17 ("Stop for me") and 2026-10-18 ("Data is enough, the whole idea is to
+// keep it pretty autonomous"): before the stamped draft-creating Submit (#330/#354, the CLAUDE.md
+// rule 1 carve-out), an extra answer straight from this project's data goes ahead, but if automation
+// PICKED an answer the recorded steps never give with no project data behind it, it fills it and
+// STOPS like a review stop — the answers stay on the page, a person checks them and clicks Submit,
+// the stamp is kept, and it is not an incident. Found re-checking PR #353: a stub
 // planner doing what the gap-fill prompt says (acknowledgments AGREE, a required Yes/No MUST be
 // answered) got one POST each with the draft created — and, on a page where the dropdown's Yes turns
 // the Submit into a filing, one FILING POST with no approval.
 //
-// The record is keyed to the CONTROLS automation wrote, not to "leaving the page" (Helm review of
-// 85424af5): a write stops the click while its control is still in the document — an advance that
-// only reveals more of the same page, an in-page opener and a revisit all keep it — and a write with
-// no control to point at (a contact dialog, an array row, a re-assert) while its document is in front.
+// The record is keyed to the CONTROLS automation picked, not to "leaving the page" (Helm review of
+// 85424af5): a pick stops the click while its control is still in the document — an advance that
+// only reveals more of the same page, an in-page opener and a revisit all keep it — and a pick with
+// no control to point at (a re-assert) while its document is in front.
 //
 // Real Chromium through the real stage path (stageWithRecipe → runAdapter → RecipeAdapter with the
 // network backstop and the LLM gap-fill enabled) against synthetic Part 1 pages on 127.0.0.1 (never a
 // real portal; every person, company and address is fictional). Every non-GET the SERVER receives is
 // counted. The planner is a stub that answers every control it is offered (a Yes/No select or radio
-// with Yes, a text box from the project), as the gap-fill prompt asks.
+// with Yes, a text box from the project), as the gap-fill prompt asks; on a "bound…" page it names
+// the project field behind its Yes.
 //
-//   MUST-STOP (0 POSTs, a review stop — no draft, no incident — that names what was written)
+//   MUST-STOP (0 POSTs, a review stop — no draft, no incident — that names what was picked)
 //     filled          an unrecorded required select ("Do you agree to the terms…") the stub answers Yes
+//                     with no project field behind it (an AI pick)
+//     unboundRadio    a required Yes/No radio group ("Is the system grid-tied?") picked the same way
 //     inPage          the gap-fill answers it before an in-page click that reveals a control
 //     nextReveal      …before a type=button "advance: Next" that only shows section B in place
 //     continueReveal  …before a human-captured "Continue" (no advance: prefix) that does the same
 //     nextInPage      …before a "Next" that changes nothing
 //     opener          …before an "advance: Select from Account" that reveals an inline box
 //     revisit         …then Next to Part 2 and a recorded goto back to Part 1, the answer saved
-//     arrays2         a two-array project on a one-array recording: the unrecorded Add Array + row 2
 //     reassertEmail   an earlier page's recorded "Email" re-asserted into Part 1's own Email blank
-//     upload          an unrecorded upload slot (a single-line diagram) the replay attaches
-//     contact         a contact dialog (iframe) prefilled with another identity, corrected before its
-//                     Continue — the stop names the box, never a typed value
 //     substring       the gap-fill's "Net Metering" answer lands on its own select, never on the
 //                     "…ready to submit your Net Metering…" select a label locator would resolve
 //   MUST-EXCLUDE (never written, so the stamped Submit is not clicked)
@@ -44,6 +45,13 @@
 //     gotoEarlier     the same, left by a recorded goto to Part 1
 //     clean           gap-fill enabled with nothing to answer
 //     arrays1         a one-array project on the same repeater page
+//     arrays2         a two-array project on a one-array recording: the unrecorded Add Array + row 2
+//                     come from the project's arrays (data)
+//     upload          an unrecorded upload slot (a single-line diagram) attached from the project's files
+//     contact         a contact dialog (iframe) prefilled with another identity, corrected to the
+//                     project's contact before its Continue — no typed value in any message
+//     boundSelect     the "filled" select answered Yes through a bound project field
+//     boundRadio      the "unboundRadio" group answered Yes through a bound project field
 //     rerender        Part 1's OWN recorded field blanked by a re-render, re-asserted from its own step
 //     radioEarlier    the ready-to-submit radio group on an EARLIER page is never answered either
 //
@@ -90,6 +98,7 @@ const readyRadios = (shape: "legend" | "group" | "aria", required = true): strin
   : shape === "group"
     ? `<div class="form-group"><label class="control-label">${READY}</label><input type="radio" id="rY" name="readyR" value="Yes" required><label for="rY">Yes</label><input type="radio" id="rN" name="readyR" value="No"><label for="rN">No</label></div>`
     : `<div role="radiogroup" aria-labelledby="rq"><span id="rq">${READY}</span><label><input type="radio" name="readyR" value="Yes" required> Yes</label><label><input type="radio" name="readyR" value="No"> No</label></div>`).replace(required ? /$^/ : / required/g, "");
+const GRID_RADIOS = `<fieldset><legend>Is the system grid-tied?</legend><input type="radio" id="gY" name="gridTied" value="Yes" required><label for="gY">Yes</label><input type="radio" id="gN" name="gridTied" value="No"><label for="gN">No</label></fieldset>`;
 const reveal = (btnId: string, text: string): string => `<button type="button" id="${btnId}" onclick="document.getElementById('secB').style.display='block'">${text}</button><div id="secB" style="display:none"><label for="sysSize">System Size (kW)</label><input id="sysSize" name="sysSize" type="text"></div>`;
 const ARRAYS = `<div id="arrays"></div><button id="addArray" type="button">Add Array</button>
   <script>
@@ -121,7 +130,8 @@ const DIALOG = page("Contact", `<h2>Contractor Contact Information</h2>
 // The unrecorded controls each mode puts on the Part 1 page.
 const extra = (mode: string): string => {
   switch (mode) {
-    case "filled": return yesNo(mode, "agree", AGREE);
+    case "filled": case "boundSelect": return yesNo(mode, "agree", AGREE);
+    case "unboundRadio": case "boundRadio": return GRID_RADIOS;
     case "inPage": return `${yesNo(mode, "agree", AGREE)}<button type="button" id="btnMore" onclick="document.getElementById('more').style.display='block'">Show contact preferences</button><div id="more" style="display:none"><label for="pref">Preferred contact</label><input id="pref" name="pref" type="text"></div>`;
     case "submitIntent": return `${yesNo(mode, "ready", READY)}${installerBox}`;
     case "nextReveal": return `${yesNo(mode, "agree", AGREE)}${reveal("btnNext", "Next")}`;
@@ -210,15 +220,16 @@ fs.writeFileSync(SLD, "%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n");
 const offered: Array<{ type: string; label: string; group: string }> = [];
 const planner = async (req: LearnPlanRequest): Promise<LearnPlanResponse> => {
   const fills: LearnPlanResponse["fills"] = [];
+  const bound = /\/m\/bound/.test(String(req.url ?? ""));
   req.fields.forEach((f, i) => {
     offered.push({ type: f.fieldType, label: String(f.label ?? ""), group: String(f.groupPrompt ?? "") });
-    if (f.fieldType === "select" && (f.options ?? []).includes("Yes")) fills.push({ selectorIndex: i, value: "Yes" });
-    else if (f.fieldType === "radio" && /^yes$/i.test(String(f.label ?? "").trim())) fills.push({ selectorIndex: i, value: "Yes" });
+    if (f.fieldType === "select" && (f.options ?? []).includes("Yes")) fills.push({ selectorIndex: i, value: "Yes", ...(bound ? { field: "agreesToTerms" } : {}) });
+    else if (f.fieldType === "radio" && /^yes$/i.test(String(f.label ?? "").trim())) fills.push({ selectorIndex: i, value: "Yes", ...(bound ? { field: "gridTied" } : {}) });
     else if (/installer company/i.test(String(f.label ?? ""))) fills.push({ selectorIndex: i, value: "Acme Solar", field: "installerCompany" });
   });
   return { fills, atReview: false };
 };
-const GAP_FIELDS = { installerCompany: "Acme Solar" };
+const GAP_FIELDS = { installerCompany: "Acme Solar", agreesToTerms: "Yes", gridTied: "Yes" };
 
 const step = (s: Record<string, unknown>): RecipeStep => s as unknown as RecipeStep;
 const submitStep = step({ action: "click", selector: { css: "#btnSubmit", text: "Submit" }, note: "final submit | creates a draft, not the filing (#302)" });
@@ -317,7 +328,7 @@ const handoffOf = (r: Record<string, unknown>): string => {
   const steps = Array.isArray(r.steps) ? (r.steps as Array<{ data?: { reviewHandoffNotes?: unknown } }>) : [];
   return [r.reviewHandoffNotes, ...steps.map((s) => s?.data?.reviewHandoffNotes)].flatMap((n) => (Array.isArray(n) ? n.map(String) : [])).join(" ");
 };
-const told = (o: Outcome, words: string): boolean => /AUTOMATION ADDED ANSWERS/.test(handoffOf(o.r)) && handoffOf(o.r).includes(words) && msgOf(o.r).includes("AUTOMATION ADDED ANSWERS");
+const told = (o: Outcome, words: string): boolean => /AUTOMATION PICKED ANSWERS/.test(handoffOf(o.r)) && handoffOf(o.r).includes(words) && msgOf(o.r).includes("AUTOMATION PICKED ANSWERS");
 const touched = (o: Outcome, id: string): boolean => o.gets.some((g) => /\/touched$/.test(g.path) && g.query.includes(`id=${id}`));
 const noRadioOffered = (o: Outcome): boolean => !o.offered.some((f) => f.type === "radio") && o.offered.some((f) => /installer company/i.test(f.label));
 
@@ -342,8 +353,16 @@ try {
     check(`${mode}: ${what} after the gap-fill does not clear what it wrote — 0 POSTs, a named review stop`, submits(o) === 0 && o.posts.length === 0 && notAnIncident(o) && named(o, AGREE.slice(0, 40)), brief(o));
   }
   {
+    const o = await stage("unboundRadio");
+    check("unboundRadio: a required Yes/No radio group the stub picked with no project field — 0 POSTs, a named review stop", submits(o) === 0 && notAnIncident(o) && named(o, "gap-fill: Is the system grid-tied?: Yes"), brief(o));
+    const b = await stage("boundRadio");
+    check("boundRadio: the same group answered through a bound project field (data) — one click, the draft", drafted(b), brief(b));
+    const s2 = await stage("boundSelect");
+    check("boundSelect: the \"filled\" select answered through a bound project field (data) — one click, the draft", drafted(s2), brief(s2));
+  }
+  {
     const o = await stage("arrays2");
-    check("arrays2: a two-array project on a one-array recording (unrecorded Add Array + row 2) — 0 POSTs, a named stop", submits(o) === 0 && notAnIncident(o) && named(o, "PV array rows beyond the recorded one"), brief(o));
+    check("arrays2: a two-array project on a one-array recording (Add Array + row 2 from the project's arrays) — one click, the draft", drafted(o), brief(o));
     const o1 = await stage("arrays1");
     check("arrays1: a one-array project on the same repeater page clicks once and reads as the draft", drafted(o1), brief(o1));
   }
@@ -373,13 +392,13 @@ try {
   }
   {
     const o = await stage("upload");
-    check("upload: an unrecorded upload slot the replay attaches stops the click — 0 POSTs, a stop naming the slot", submits(o) === 0 && notAnIncident(o) && named(o, "upload: Single-Line Diagram"), brief(o));
+    check("upload: an unrecorded upload slot attached from the project's files (data) — one click, the draft", drafted(o) && o.posts.some((p) => p.body.includes("single-line-diagram.pdf")), brief(o));
   }
   {
     const o = await stage("contact");
     const m = msgOf(o.r);
-    check("contact: a contact dialog corrected before its Continue stops the click — 0 POSTs, a stop naming the box", submits(o) === 0 && notAnIncident(o) && named(o, "contact: Email"), brief(o));
-    check("contact: the stop carries labels only, never a typed or prefilled value", !m.includes("office@acme.example") && !m.includes("pat.homeowner@example.test") && !m.includes("Acme Solar LLC"), brief(o));
+    check("contact: a contact dialog corrected to the project's contact (data) — one click, the draft", drafted(o), brief(o));
+    check("contact: no message carries a typed or prefilled value", !m.includes("office@acme.example") && !m.includes("pat.homeowner@example.test") && !m.includes("Acme Solar LLC"), brief(o));
   }
   {
     const o = await stage("substring");

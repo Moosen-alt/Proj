@@ -42,9 +42,10 @@ export interface GapFillOutcome {
    *  may still have written to the page, so "what automation wrote here" is read from this. */
   attempted: string[];
   /** The control behind each attempted write, as the page named it when it was written (#362):
-   *  its label, id and name. The element itself also carries data-al-unrec (UNRECORDED_WRITE_ATTR),
-   *  so a replay can tell whether that control is still in front of a stamped draft click. */
-  attemptedControls: Array<{ label: string; id: string; name: string }>;
+   *  its label, id and name, and whether the answer came from the project's data or was an AI pick
+   *  (gapFillWriteKind). A pick's element also carries data-al-unrec (UNRECORDED_WRITE_ATTR), so a
+   *  replay can tell whether that control is still in front of a stamped draft click. */
+  attemptedControls: Array<{ label: string; id: string; name: string; kind: GapFillWriteKind }>;
   /** Planned fills rejected because they weren't grounded in real project data. */
   skippedUngrounded: string[];
   /** Required, empty fields the PROJECT GENUINELY LACKS — surfaced so the human can act. */
@@ -209,8 +210,25 @@ export function gapFillMayAnswer(
   return true;
 }
 
-/** The attribute a gap-fill write leaves on the element it wrote (its value: the label). */
+/** The attribute an AI pick leaves on the element it wrote (its value: the label). */
 export const UNRECORDED_WRITE_ATTR = "data-al-unrec";
+
+export type GapFillWriteKind = "data" | "pick";
+// DATA OR PICK (#362, owner ruling 2026-10-18 "Data is enough"). Called only for a fill isGrounded
+// accepted. "data": the planner bound it to a project field that holds a value (isGrounded then
+// checked the answer traces to it), or free text that traces to a project value. "pick": a
+// checkbox, radio or select answered with no bound project field — isGrounded accepts it because the
+// portal offered that option, which says the answer is ALLOWED, never that it is TRUE for this
+// project. Only a pick stops the stamped draft click. Exported for tests.
+export function gapFillWriteKind(
+  field: { fieldType?: string },
+  mappedKey: string | undefined,
+  projectFields: Record<string, string>,
+): GapFillWriteKind {
+  if (mappedKey && String(projectFields[mappedKey] ?? "").trim()) return "data";
+  const choice = field.fieldType === "checkbox" || field.fieldType === "radio" || field.fieldType === "select";
+  return choice ? "pick" : "data";
+}
 
 /** The #id the extractor saw for this field, when it saw one. */
 function extractedIdOf(field: ExtractedField): string {
@@ -225,12 +243,12 @@ function extractedIdOf(field: ExtractedField): string {
  *  getByLabel(label).first() is a substring match: "Net Metering" resolves to an earlier "Are you
  *  ready to submit your Net Metering application?" select. So the resolved element's id must be the
  *  extracted one when there was one, and its OWN label (label[for], wrapping label, aria-label, and
- *  for a radio/checkbox its legend / radiogroup name) must pass gapFillMayAnswer. A passing control
+ *  for a radio/checkbox its legend / radiogroup name) must pass gapFillMayAnswer. A passing PICK
  *  is stamped (UNRECORDED_WRITE_ATTR) BEFORE the write, so a write that throws half-way still marks
  *  it. null = refused (or unreadable); a locator that cannot be evaluated (a test double) passes
  *  with no stamp. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function claimForWrite(loc: any, field: ExtractedField, label: string): Promise<{ id: string; name: string } | null> {
+async function claimForWrite(loc: any, field: ExtractedField, label: string, kind: GapFillWriteKind): Promise<{ id: string; name: string } | null> {
   if (typeof loc?.evaluate !== "function") return { id: extractedIdOf(field), name: "" };
   const read = await loc.evaluate((el: Element) => {
     const clean = (t: string | null | undefined): string => String(t || "").replace(/\s+/g, " ").trim();
@@ -251,6 +269,7 @@ async function claimForWrite(loc: any, field: ExtractedField, label: string): Pr
   const want = extractedIdOf(field);
   if (want && read.id !== want) return null;
   if (read.labels.some((l) => !gapFillMayAnswer(l)) || !gapFillMayAnswer({ options: read.options })) return null;
+  if (kind === "data") return { id: read.id, name: read.name };
   const stamped = await loc.evaluate((el: Element, a: { attr: string; label: string }) => { el.setAttribute(a.attr, a.label); return true; },
     { attr: UNRECORDED_WRITE_ATTR, label }).catch(() => false);
   return stamped ? { id: read.id, name: read.name } : null;
@@ -419,11 +438,14 @@ export async function gapFillCurrentPage(
         out.skippedUngrounded.push(field.label || field.fieldType);
         continue;
       }
-      const shown = field.label || field.fieldType;
-      const claimed = await claimForWrite(loc, field, shown);
+      // A radio / checkbox is named by its QUESTION too: "Yes" alone tells a person nothing.
+      const own = field.label || field.fieldType;
+      const shown = field.groupPrompt && (field.fieldType === "radio" || field.fieldType === "checkbox") ? `${field.groupPrompt.slice(0, 80)}: ${own}` : own;
+      const kind = gapFillWriteKind(field, fill.field, projectFields);
+      const claimed = await claimForWrite(loc, field, shown, kind);
       if (!claimed) continue;
       out.attempted.push(shown);
-      out.attemptedControls.push({ label: shown, id: claimed.id, name: claimed.name });
+      out.attemptedControls.push({ label: shown, id: claimed.id, name: claimed.name, kind });
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const applied = await applyGrounded(page, loc as any, field, fill.value);
       if (applied) out.filled.push(field.label || field.fieldType);
