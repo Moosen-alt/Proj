@@ -102,7 +102,25 @@ import {
 } from "../../../shared/src/portalSafety";
 import { commitField, installSettleProbe, waitForSettled } from "../settle";
 import { siteOfUrl } from "../siteOf";
-import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, type FilingBackstop } from "../filingBackstop";
+import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, withAutomationInput, describeBackstopAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, isStoppingAbort, type FilingBackstop } from "../filingBackstop";
+
+/** #333: what the person is told when their own click on the review page came before the run had
+ *  handed it over (the backstop held it; nothing was sent). */
+/** #333: the run could not hand the review page over (its input watch could not be armed), so the
+ *  review lockdown holds until the stage finishes — said plainly, never silently. */
+export const NOT_HANDED_OVER_NOTE = "THE RUN COULD NOT HAND THE REVIEW PAGE OVER TO YOU: the review lockdown holds until the stage has finished, so click submit only after it says it has finished (an earlier click can be held back, and nothing would be sent).";
+/** #333: why the run's own input is refused once it has started handing the page over. */
+const INPUT_CLOSED = "the run has stopped at review and is handing the page to a person — it makes no input of its own on the page from here";
+
+export const HUMAN_CLICK_HELD_NOTE = "YOUR CLICK WAS HELD BACK: you clicked on the review page before the run had handed it over to you, so that request was stopped and nothing was sent. If the window shows an error page, go Back to the review page; then click submit again — the run has let go of the page now.";
+/** #333 round 3 (skeptic r2b): a request the person sent from the handed-over page went through, and
+ *  the click detector did not see it as the portal's final submit (an unknown label, a fetch submit).
+ *  It may have been the filing: never "click submit" or "nothing was filed" to someone who may have. */
+export const PERSON_REQUEST_WENT_NOTE = "A REQUEST YOU SENT FROM THE REVIEW PAGE WENT THROUGH while the stage was finishing (automation clicked nothing). If it was the submit, the filing went: check the portal and enter its record number with the capture form — do not stage this track again before you have. If it was not, finish in the open window.";
+/** #333 round 2 (skeptic r2 F5): the person filed from the review window while the stage finished —
+ *  on the record in the hand-off notes (the project's next-step panel), whether or not the
+ *  completion page's number can be read. */
+export const HUMAN_SUBMITTED_NOTE = "YOU SUBMITTED FROM THE REVIEW WINDOW while the stage was finishing (automation clicked nothing). The record number is read off the completion page and recorded only when it is read confidently — if the project does not show it, enter it with the capture form. Do not stage this track again: it has been filed.";
 
 // How long the drift precheck waits for an async-rendered form to paint before concluding
 // the replay is on the wrong page. PowerClerk's Ameren form reports zero inputs for several
@@ -943,6 +961,20 @@ export class RecipeAdapter extends BasePortalAdapter {
 
   private backstop: FilingBackstop | null = null;
   private backstopReported = 0;
+  /** #333 — set the moment the input watch is armed (before the hand-over): from then on the run's own
+   *  guarded clicks, presses and steps refuse, so a trusted input the watch sees can only be a
+   *  person's. Never cleared on a run. */
+  private inputsClosed = "";
+  /** #333: after the hand-over, a person's own main-frame form request went (their submit, or a
+   *  postback they made) — the run's end page is theirs now, not where the run "stopped". */
+  private personMovedOn = false;
+  /** #333 round 2 — the address of the page the run handed over (no #fragment). */
+  private handOverUrl = "";
+  /** #333 round 3 — a request the person's own input sent went through after the hand-over. */
+  private personRequestWent = false;
+  /** #333 round 3 — the backstop the run handed over: its record of the person's requests is read
+   *  when the run reports (stopAtReview), after the run has let it go (its record stays). */
+  private handedOverBackstop: FilingBackstop | null = null;
   /** What the person taking the review page must know before submitting (B3 / B14) — carried into
    *  stopAtReview's hand-off message and data. */
   private reviewHandoffNotes: string[] = [];
@@ -975,6 +1007,30 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  filing/payment request (the filing-URL rule), else "". A window abort (a dismisser click or
    *  a terminal-page Enter fired a state-changing request — often a consent XHR) is reported and
    *  the run goes on: nothing was sent. */
+  /** #333 — the abort index at the first request a person's input sent OFF the page (their own
+   *  document submit or navigation): what follows is the page their own action led to. */
+  private firstHumanDocument(): number {
+    const r = (this.backstop?.humanRequests ?? []).find((h) => h.document);
+    return r ? r.abortsBefore : Infinity;
+  }
+
+  /** #333 — a person's click held back BEFORE the hand-over (a stopping abort flagged humanInput).
+   *  After it, a flagged abort is the person's own payment (rule 1 never lifts): not "click again". */
+  private heldHumanClick(): boolean {
+    const bs = this.backstop;
+    if (!bs) return false;
+    const first = this.firstHumanDocument();
+    return bs.aborts.some((a, i) => isStoppingAbort(a) && !!a.humanInput && !!a.beforeHandOver && i < first);
+  }
+
+  /** The run's page address without its #fragment ("" when unreadable). */
+  private pageUrlNoHash(): string {
+    try {
+      const p = this.page as { url?: () => string } | null;
+      return typeof p?.url === "function" ? String(p.url() ?? "").split("#")[0] : "";
+    } catch { return ""; }
+  }
+
   private backstopStop(): string {
     const bs = this.backstop;
     if (!bs) return "";
@@ -983,7 +1039,18 @@ export class RecipeAdapter extends BasePortalAdapter {
       this.guardRefusals.push(line);
       this.driftWarnings.push(line);
     }
-    const stopping = bs.stoppingAborts();
+    // #333 — NEITHER OF THESE IS THE PAGE ACTING BY ITSELF: an abort that followed a person's own
+    // input (their click came before the run handed the page over: nothing was sent, and they are
+    // told to click again), and anything after a request a person's input sent past the hand-over
+    // (the page their own submit led to). Neither fails a run that reached review.
+    // Only a request that LEFT the page counts (skeptic round 1): a person's harmless click whose
+    // background fetch went must not hide a page script that tries to file afterwards.
+    const firstHuman = this.firstHumanDocument();
+    const stopping = bs.aborts.filter((a, i) => isStoppingAbort(a) && !a.humanInput && i < firstHuman);
+    if (this.heldHumanClick()) {
+      if (!this.reviewHandoffNotes.includes(HUMAN_CLICK_HELD_NOTE)) this.reviewHandoffNotes.push(HUMAN_CLICK_HELD_NOTE);
+      if (!this.driftWarnings.includes(HUMAN_CLICK_HELD_NOTE)) this.driftWarnings.push(HUMAN_CLICK_HELD_NOTE);
+    }
     if (!stopping.length) return "";
     const first = stopping[0];
     return first.rule === "review-lockdown"
@@ -1051,6 +1118,30 @@ export class RecipeAdapter extends BasePortalAdapter {
         { finalSubmitClicked: false, draftSubmitClickedByAutomation: true },
       );
     }
+    // A request the person sent may land after the run's tail read it, and before the run let the page
+    // go: the handed-over backstop's record is read again now (round 3).
+    if ((this.handedOverBackstop?.humanRequests.length ?? 0) > 0) this.personRequestWent = true;
+    // THE PERSON SUBMITTED (OR MOVED ON) FROM THE REVIEW WINDOW WHILE THE RUN WAS FINISHING (#333).
+    // Automation clicked nothing; the run staged the page and handed it over, and the person's own
+    // click went. Never "failed", never "click submit" to someone who already has.
+    if (this.personMovedOn || this.humanSubmit) {
+      const filed = !!this.humanSubmit;
+      // On the record (skeptic r2 F5): the hand-off notes reach the project's next-step panel, so the
+      // fact that the person filed survives a completion page whose number cannot be read.
+      if (filed && !this.reviewHandoffNotes.includes(HUMAN_SUBMITTED_NOTE)) this.reviewHandoffNotes.push(HUMAN_SUBMITTED_NOTE);
+      if (!filed && this.personRequestWent && !this.reviewHandoffNotes.includes(PERSON_REQUEST_WENT_NOTE)) this.reviewHandoffNotes.push(PERSON_REQUEST_WENT_NOTE);
+      return ok(
+        `${this.portalName}: the recipe staged the review screen and handed it to you, and you ${filed ? "submitted" : "moved on"} from the review window while the run was finishing — automation clicked nothing. `
+          + (filed
+            ? "The completion page is being read: its record number is recorded on the project only when it is read confidently — if the project does not show it, enter it with the capture form."
+            : "If that was the submit, the filing went: check the portal and enter its record number with the capture form; if not, finish in the open window.")
+          + " No fee payment was automated. AUTOMATION HAS STOPPED.",
+        { finalSubmitClicked: false, humanSubmittedInReviewWindow: filed, ...(this.reviewHandoffNotes.length ? { reviewHandoffNotes: [...this.reviewHandoffNotes] } : {}) },
+      );
+    }
+    // A request the person sent went through and the click detector did not see a final submit
+    // (round 3): on the record, and never "click submit manually" as if nothing had happened.
+    if (this.personRequestWent && !this.reviewHandoffNotes.includes(PERSON_REQUEST_WENT_NOTE)) this.reviewHandoffNotes.push(PERSON_REQUEST_WENT_NOTE);
     // WHAT THE PERSON MUST KNOW BEFORE SUBMITTING (dryrun-0928 B3 / B14): answers the portal may
     // not have saved, and the portal's own background calls the lockdown held back on this page.
     const notes = this.reviewHandoffNotes;
@@ -1061,6 +1152,12 @@ export class RecipeAdapter extends BasePortalAdapter {
       return ok(
         `${HUMAN_REVIEW_MESSAGE} The recipe did NOT stage ${this.portalName} at its review screen — it ${this.stoppedBeforeReview}${handoff} AUTOMATION HAS STOPPED.`,
         { finalSubmitClicked: false, stoppedBeforeReview: true, ...handoffData },
+      );
+    }
+    if (this.personRequestWent) {
+      return ok(
+        `${this.portalName}: the recipe staged the review screen and handed it to you, and a request you sent from it went through while the run was finishing — automation clicked nothing. If that was the submit, the filing went: check the portal and enter its record number with the capture form. If not, verify every field and uploaded file, handle any MFA/fee, then click submit.${handoff} AUTOMATION HAS STOPPED.`,
+        { finalSubmitClicked: false, personRequestWent: true, ...handoffData },
       );
     }
     return ok(
@@ -1081,11 +1178,54 @@ export class RecipeAdapter extends BasePortalAdapter {
    */
   async armSubmitWatch(onSubmitObserved: (clickedLabel?: string) => void): Promise<boolean> {
     if (!this.page) return false;
-    return armHumanCaptureOnPage(this.page, (step) => {
-      // The detector emits one submitObserved step when the final submit is clicked; every
-      // other captured step belongs to the learn path and is ignored here.
-      if (String(step.note || "").includes(HUMAN_SUBMIT_OBSERVED_NOTE)) onSubmitObserved(step.value || undefined);
+    // A submit the person made after the hand-over, before the runner asked (#333), is handed on now.
+    const seen = this.humanSubmit;
+    this.submitObservers.push(onSubmitObserved);
+    const armed = await this.armOwnSubmitWatch();
+    if (seen) { try { onSubmitObserved(seen.label); } catch { /* an observer never breaks the run */ } }
+    return armed;
+  }
+
+  /** #333 — THE PERSON'S OWN SUBMIT, SEEN ONCE, whoever asks (the hand-over arms it; the runner's
+   *  armSubmitWatch later registers on the same watch — the page binding can be exposed only once). */
+  private humanSubmit: { label?: string } | null = null;
+  private submitObservers: Array<(clickedLabel?: string) => void> = [];
+  private submitWatch: Promise<boolean> | null = null;
+  private noteHumanSubmit(label?: string): void {
+    if (this.humanSubmit) return;
+    this.humanSubmit = { label };
+    for (const fn of this.submitObservers) { try { fn(label); } catch { /* an observer never breaks the run */ } }
+  }
+  private armOwnSubmitWatch(): Promise<boolean> {
+    if (this.submitWatch) return this.submitWatch;
+    const page = this.page;
+    if (!page) return Promise.resolve(false);
+    // ONLY THE CLICK DETECTOR SAYS "THE PERSON SUBMITTED" (#333 skeptic r2b). A page-text signal — a
+    // completion-looking page after a person's request — failed both ways: a step page reading "once
+    // your application is submitted…" after the person's own Previous click read as a filing (with a
+    // draft's id), and real completion pages with a "* required field" legend did not. What a page
+    // says is never what made the filing; a request the person sent is said plainly instead
+    // (PERSON_REQUEST_WENT_NOTE), and the number is theirs to enter.
+    // The click detector the learn path already uses: one submitObserved step when the FINAL submit
+    // is clicked; every other captured step belongs to the learn path and is ignored here.
+    this.submitWatch = armHumanCaptureOnPage(page, (step) => {
+      if (String(step.note || "").includes(HUMAN_SUBMIT_OBSERVED_NOTE)) this.noteHumanSubmit(step.value || undefined);
     }).catch(() => false);
+    return this.submitWatch;
+  }
+
+  /** #333 — HAND THE REVIEW PAGE TO THE PERSON, before the run's read-only housekeeping. The backstop
+   *  lets their own click through from here (filingBackstop handOverToHuman), and the submit watch is
+   *  armed now, not after the run returns: a filing made in the run's last seconds is captured. */
+  private async handOverReviewPage(): Promise<boolean> {
+    const bs = this.backstop;
+    if (!bs || !bs.handOverToHuman(`replay staged ${this.recipe.id} to review`)) return false;
+    // The page handed over: a person who acted and left it moved on (runAll's report).
+    this.handOverUrl = this.pageUrlNoHash();
+    this.handedOverBackstop = bs;
+    const armed = this.armOwnSubmitWatch();
+    await Promise.race([armed, sleep(3000)]);
+    return true;
   }
 
   async captureSubmissionConfirmation(): Promise<PortalStepResult> {
@@ -2307,8 +2447,36 @@ export class RecipeAdapter extends BasePortalAdapter {
     // aborted and stops the run, named. ...BUT NOT BEFORE THE PORTAL HAS SAVED WHAT THE RUN WROTE
     // (dryrun-0928 B3): PowerClerk batches a page's answers into one save seconds after the first
     // change; the final-submit refusal and stopForReview exits both arrive here with it pending.
+    // #333 — FROM HERE THE RUN MAKES NO INPUT ON THIS PAGE, so a person's own click can be told from
+    // it: the backstop's input watch is armed now (a guided-manual run only — an approved run clicks
+    // its own final submit and is never handed over).
+    const handingOver = !this.options.autoSubmit && !this.finalSubmitClicked && !!this.backstop;
+    let handedOver = false;
+    if (handingOver) {
+      // THE RUN'S OWN INPUT ENDS HERE (#333): its guarded clicks, presses and steps refuse from now on,
+      // so the input watch armed next can only ever record a person's input.
+      this.inputsClosed = `${INPUT_CLOSED} (${this.recipe.id})`;
+      const handOverArmed = await this.backstop!.watchHumanInput().catch(() => false);
+      // THE HAND-OVER (#333, owner ruling 2026-10-14) — BEFORE the drain and the read-only
+      // housekeeping below (skeptic r2 F2): a person who clicks while the portal is still saving the
+      // run's last answer is let through and their request recorded as theirs — the drain's and the
+      // own-write window's own-save exemptions never take it. The page's own scripts posting with no
+      // click still meet the lockdown below until fillApplication returns.
+      handedOver = handOverArmed && await this.handOverReviewPage();
+    }
     await this.drainBeforeReviewLock();
     this.backstop?.lockReview(`replay stopped at review (${this.recipe.id})`);
+    if (handingOver) {
+      // Told only once the run's own save has drained — not an invitation to click while the portal
+      // reads "Saving…" (an eager click is still let through, and recorded).
+      if (handedOver) this.progress("wait", "Staged to review — the page is yours to verify and submit", 0);
+      else {
+        // Fail closed AND say so, now and in the hand-off: the lockdown holds until the stage finishes.
+        if (!this.reviewHandoffNotes.includes(NOT_HANDED_OVER_NOTE)) this.reviewHandoffNotes.push(NOT_HANDED_OVER_NOTE);
+        if (!this.driftWarnings.includes(NOT_HANDED_OVER_NOTE)) this.driftWarnings.push(NOT_HANDED_OVER_NOTE);
+        this.progress("wait", NOT_HANDED_OVER_NOTE, 0);
+      }
+    }
     const review = await this.verifyReviewScreen(project);
     const data = {
       executed, skipped, finalSubmitClicked: false, gapFill: this.gapFillReport,
@@ -2322,7 +2490,22 @@ export class RecipeAdapter extends BasePortalAdapter {
     // attachments page with 0 of 5 project values found, and was recorded ready-to-submit. A run
     // that ends on a page the shared reading says is NOT the review page, showing none of the
     // project's values, pauses for a person, named — never "staged to the review screen".
-    const stop = !pastReview && !this.stoppedAtPayment ? await this.whereTheRunStopped(review.confirmed) : null;
+    // A page the person already moved on from (their own submit or postback went) is not where the
+    // run stopped: the run did reach it and handed it over.
+    // Moved on (skeptic r2 F3): their own request left the page (a document submit or postback),
+    // their own submit was seen, or they acted after the hand-over and the page is no longer the one
+    // handed over (a fetch submit that then loads its completion page; a GET to "My Records"). A
+    // harmless touch that only rode along with the run's own autosave is none of these. And a click
+    // of theirs HELD BACK before the hand-over can leave Chromium's error page in the window: that is
+    // not where the run stopped either (F6) — that page only (round 3).
+    const bsNow = this.backstop;
+    const hereNow = this.pageUrlNoHash();
+    const personMovedOn = (bsNow?.humanRequests ?? []).some((r) => r.document) || !!this.humanSubmit
+      || (!!bsNow && this.handOverUrl !== "" && hereNow !== "" && hereNow !== this.handOverUrl && bsNow.personActedSinceHandOver(this.page));
+    this.personMovedOn = personMovedOn;
+    this.personRequestWent = (bsNow?.humanRequests ?? []).length > 0;
+    const onHeldErrorPage = this.heldHumanClick() && /^chrome-error:/i.test(hereNow);
+    const stop = !pastReview && !this.stoppedAtPayment && !personMovedOn && !onHeldErrorPage ? await this.whereTheRunStopped(review.confirmed, this.personRequestWent) : null;
     if (stop) {
       this.stoppedBeforeReview = stop.message;
       return { ...ok(`Replayed ${executed} recorded step(s); ${stop.message}${review.summary}`, { ...data, stoppedBeforeReview: stop.where }), pauseReason: "stopped_before_review" };
@@ -2336,7 +2519,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  say "not review" — a page that cannot be read (a unit-test double) keeps today's report.
    *  Otherwise: the page is readable, is not the review page, and shows none of the project's
    *  values — the run stopped before review, and says where in the page's own words. */
-  private async whereTheRunStopped(confirmed: number): Promise<{ where: string; message: string } | null> {
+  private async whereTheRunStopped(confirmed: number, personRequestWent = false): Promise<{ where: string; message: string } | null> {
     if (confirmed > 0) return null;
     const at = await this.pageSafetyContext();
     if (at.reviewPage !== false) return null;
@@ -2359,7 +2542,11 @@ export class RecipeAdapter extends BasePortalAdapter {
       where,
       message: `STOPPED on "${where}" — NOT the review page (the page does not read as the portal's review step, and none of the project's values are on it), so the application is NOT staged at review.`
         + `${refused.length ? ` The portal says: ${refused.join(" | ")}.` : ""}`
-        + ` Next: in the portal, finish that page (check every attachment is listed and nothing is flagged required), continue to the review page, verify every field there, then submit. Nothing was filed.`,
+        // A request the person sent went through after the hand-over (round 3): it may have been the
+        // filing — never "Nothing was filed" (PERSON_REQUEST_WENT_NOTE rides in the hand-off).
+        + (personRequestWent
+          ? ` A request you sent from the page went through while the stage was finishing — check the portal before anything else.`
+          : ` Next: in the portal, finish that page (check every attachment is listed and nothing is flagged required), continue to the review page, verify every field there, then submit. Nothing was filed.`),
     };
   }
 
@@ -4051,6 +4238,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  review lockdown's live reading let it through. Its filing/payment rules and the run's own
    *  review lock (set at stopForReview) are untouched. Clicks, presses and gotos get no window. */
   private async executeStep(step: RecipeStep, pastReview: boolean): Promise<boolean> {
+    if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (step ${String(step.note || step.action)})`);
     if (!RecipeAdapter.WRITE_ACTIONS.has(step.action) || !this.backstop) return this.executeStepInner(step, pastReview);
     return withOwnWriteWindow(this.page, `recorded ${step.action}${step.note ? ` (${String(step.note).slice(0, 50)})` : ""}`, () => this.executeStepInner(step, pastReview));
   }
@@ -4094,14 +4282,14 @@ export class RecipeAdapter extends BasePortalAdapter {
         exactCount = await exact.count().catch(() => 0);
       }
       if (exactCount === 1) {
-        await exact.first().check({ timeout: 10000 });
+        await withAutomationInput(this.page, () => exact.first().check({ timeout: 10000 }));
         this.driftWarnings.push(`record type "${wanted}" selected by label (positional fallback refused)`);
         return true;
       }
       const loose = this.page.getByRole("checkbox", { name: wanted, exact: false });
       const looseCount = exactCount > 1 ? exactCount : await loose.count().catch(() => 0);
       if (looseCount === 1) {
-        await loose.first().check({ timeout: 10000 });
+        await withAutomationInput(this.page, () => loose.first().check({ timeout: 10000 }));
         this.driftWarnings.push(`record type "${wanted}" selected by label (positional fallback refused)`);
         return true;
       }
@@ -4325,8 +4513,8 @@ export class RecipeAdapter extends BasePortalAdapter {
         if (maskedStep) {
           if (typeof scoped!.focus === "function") await scoped!.focus().catch(() => null);
           await scoped!.fill("").catch(() => null);
-          if (typeof scoped!.pressSequentially === "function") await scoped!.pressSequentially(v, { delay: 35 }).catch(() => null);
-          else if (typeof scoped!.type === "function") await scoped!.type(v, { delay: 35 }).catch(() => null);
+          if (typeof scoped!.pressSequentially === "function") await withAutomationInput(this.page, () => scoped!.pressSequentially!(v, { delay: 35 })).catch(() => null);
+          else if (typeof scoped!.type === "function") await withAutomationInput(this.page, () => scoped!.type!(v, { delay: 35 })).catch(() => null);
           else await scoped!.fill(v, { timeout: FILL_TIMEOUT_MS });
         } else {
           // BOUNDED. Replay does NOT go through the learner's applyFill, so the visibility
@@ -4379,7 +4567,7 @@ export class RecipeAdapter extends BasePortalAdapter {
           if (maskedStep && typeof scoped!.pressSequentially === "function") {
             if (typeof scoped!.focus === "function") await scoped!.focus().catch(() => null);
             await scoped!.fill("").catch(() => null);
-            await scoped!.pressSequentially(v, { delay: 35 }).catch(() => null);
+            await withAutomationInput(this.page, () => scoped!.pressSequentially!(v, { delay: 35 })).catch(() => null);
           } else {
             await scoped!.fill(v, { timeout: FILL_TIMEOUT_MS }).catch(() => null);
           }
@@ -4712,7 +4900,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         // the recorded id was unusable) — force must follow !usable alone, or the check
         // waits out its full actionability timeout on an element that can never be visible.
         try {
-          await target!.check({ force: !usable });
+          await withAutomationInput(this.page, () => target!.check({ force: !usable }));
         } catch (err) {
           // "CLICKING THE CHECKBOX DID NOT CHANGE ITS STATE" IS NOT A MISSING CONTROL.
           //
@@ -4742,7 +4930,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       }
       case "uncheck":
         await waitForElement(scoped);
-        await scoped!.uncheck();
+        await withAutomationInput(this.page, () => scoped!.uncheck());
         return true;
       case "press":
         await waitForElement(scoped);
@@ -5500,6 +5688,7 @@ export class RecipeAdapter extends BasePortalAdapter {
 
   /** Every click in replay. Refused → throws ReplayGuardRefusal (named), nothing clicked. */
   private async guardedClick(target: unknown, why: string, opts?: { timeout?: number; force?: boolean }, flags: { passThrough?: boolean; finalSubmitApproved?: boolean; draftCreatingApproved?: boolean } = {}): Promise<void> {
+    if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (${why})`);
     const reason = await this.guardAction({ kind: "click", target, why, ...flags });
     if (reason) throw new ReplayGuardRefusal(reason);
     // THE APPROVED FINAL SUBMIT (and its confirm dialog) is the one click whose FILING request
@@ -5511,11 +5700,21 @@ export class RecipeAdapter extends BasePortalAdapter {
     // portal's "submit" endpoint too (the backstop's filing-URL rule would abort it otherwise), and
     // it is checked after the click by the page it produced, not by its URL.
     if (flags.finalSubmitApproved || flags.draftCreatingApproved) this.backstop?.allowApprovedFiling(20_000, { page: this.page });
-    await (target as { click: (o?: unknown) => Promise<void> }).click(opts);
+    // #333 — THE FENCE: the run's own click is never recorded as a person's input.
+    await withAutomationInput(this.inputPageOf(target), () => (target as { click: (o?: unknown) => Promise<void> }).click(opts));
+  }
+
+  /** The page a target acts on (a locator in a popup acts on the popup), else the run's page. */
+  private inputPageOf(target: unknown): unknown {
+    try {
+      const p = target && typeof (target as { page?: unknown }).page === "function" ? (target as { page: () => unknown }).page() : null;
+      return p && typeof p === "object" ? p : this.page;
+    } catch { return this.page; }
   }
 
   /** Every key press in replay. Enter/Space are clicks on the focused control. */
   private async guardedPress(target: unknown, key: string, why: string): Promise<void> {
+    if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (${why})`);
     const focused = /^(enter|numpadenter|space| )$/i.test(key) && this.page && typeof this.page.locator === "function"
       ? (target && typeof (target as { evaluate?: unknown }).evaluate === "function" ? target : this.page.locator(":focus"))
       : target;
@@ -5528,11 +5727,11 @@ export class RecipeAdapter extends BasePortalAdapter {
       const ctx = await this.pageSafetyContext();
       if (ctx.reviewPage === true || (ctx.readOnlyPage === true && !!ctx.filingControl)) {
         await withBackstopWindow(this.page, "enter-window", `${why} on a ${ctx.reviewPage ? "review" : "read-only terminal"} page`,
-          () => (target as { press: (k: string) => Promise<void> }).press(key));
+          () => withAutomationInput(this.inputPageOf(target), () => (target as { press: (k: string) => Promise<void> }).press(key)));
         return;
       }
     }
-    await (target as { press: (k: string) => Promise<void> }).press(key);
+    await withAutomationInput(this.inputPageOf(target), () => (target as { press: (k: string) => Promise<void> }).press(key));
   }
 
   /** The overlay dismisser, with every click it makes routed through guardAction. It was the one
@@ -7159,7 +7358,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         // Masked boxes validate KEYSTROKES (the learner's typeMasked).
         const typed = b.kind === "zip" ? want.replace(/\D/g, "").slice(0, 5) || want : want;
         await loc.fill("", { timeout: FILL_TIMEOUT_MS }).catch(() => null);
-        ok = await loc.pressSequentially(typed, { delay: 25 }).then(() => true).catch(() => false);
+        ok = await withAutomationInput(this.page, () => loc.pressSequentially(typed, { delay: 25 })).then(() => true).catch(() => false);
       } else {
         ok = await loc.fill(want, { timeout: FILL_TIMEOUT_MS }).then(() => true).catch(() => false);
       }
