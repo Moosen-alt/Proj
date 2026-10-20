@@ -2297,10 +2297,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   /** #344 — the backend's answer: has this project already made progress on this portal origin?
    *  Unknown (not given) is TRUE: an unknown never reassures. */
   private infoPagePriorProgress: boolean;
+  /** #366: no reading was given (the backend's fail-closed stand-in, or no backend at all). */
+  private infoPagePassUnavailable: boolean;
   /** The "advance:" steps an information-page pass of THIS run admitted (critique [9]: the step
    *  objects, never their indexes, which a rolled-back walk reuses). */
   private infoPassAdmittedSteps = new WeakSet<RecipeStep>();
   private infoPageCandidate: InfoPageCandidateCapture | null = null;
+  /** #366: the watch opened although THIS project already made progress on this portal — verifying
+   *  the card helps other projects at once, but this one still needs "Allow once more". */
+  private infoPageCandidateWithHistory = false;
   private infoPagePassed: Array<{ passId: string; where: string }> = [];
   private infoPageIncidents: InfoPageIncident[] = [];
   private infoPageHeldVerified: Array<{ passId: string; where: string; why: string[] }> = [];
@@ -2546,6 +2551,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
        *  held untouched, a run that reached review / paused / was interrupted, a number, a draft or a
        *  filing). Not given = true (refuses). */
       infoPagePriorProgress?: boolean;
+      /** #366: the backend handed this attempt no reading at all. Not given = true (a caller with no
+       *  backend, or a forward that was dropped): no pass, no card. Only an explicit false — the
+       *  backend's real reading — opens either. */
+      infoPagePassUnavailable?: boolean;
       /** #344 round 5: the backend's reservation of a use (infoPages.reserveInfoPagePassUse), awaited
        *  by the network backstop at the admission of a verified page's one request. Refusals; empty =
        *  reserved. A refusal, a throw or none given holds the request exactly as on main. */
@@ -2571,6 +2580,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     this.signatureRequestApproval = options.signatureRequestApproval ?? null;
     this.infoPagePasses = Object.freeze((options.infoPagePasses ?? []).map((e) => Object.freeze(JSON.parse(JSON.stringify(e)) as VerifiedInfoPage)));
     this.infoPagePriorProgress = options.infoPagePriorProgress !== false;
+    // Helm's review (S6): unavailable unless the caller says otherwise — a dropped forward from the
+    // backend fails closed (no pass, no card), never open.
+    this.infoPagePassUnavailable = options.infoPagePassUnavailable !== false;
     this.onInfoPagePassed = typeof options.onInfoPagePassed === "function" ? options.onInfoPagePassed : undefined;
     this.reserveInfoPagePass = typeof options.reserveInfoPagePass === "function" ? options.reserveInfoPagePass : undefined;
     this.infoPageProofValues = Object.freeze(((): Record<string, string> => {
@@ -5648,7 +5660,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             return {
               ...fail(steps, this.portalName, changed.length
                 ? `HELD AT AN INFORMATION PAGE THAT CHANGED SINCE A PERSON VERIFIED IT (${changed[0].why.slice(0, 3).join("; ")}): ${held} That verification is withdrawn. A person can mark the page as it is now (project → Portal runs → Information page to verify).`
-                : `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: ${held} A person can mark this exact page once (project → Portal runs → Information page to verify); after that, runs pass it — only this page, and only before anything is entered on the run.`, null, pageCount, portalNotices),
+                : this.infoPageCandidateWithHistory
+                  // #366: an unknown never reads as reassurance — this project's own next run is held
+                  // at the verified page until a person allows it once more.
+                  ? `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: ${held} A person can mark this exact page once (project → Portal runs → Information page to verify); other projects' runs then pass it. THIS project already made progress on this portal, so its next run still stops at the verified page: a person who checked its application may be able to allow it once more (project → Portal runs; the card says whether), or the page is done by hand.`
+                  : `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: ${held} A person can mark this exact page once (project → Portal runs → Information page to verify); after that, runs pass it — only this page, and only before anything is entered on the run.`, null, pageCount, portalNotices),
               stopReason: "backstop_abort",
             };
           }
@@ -9068,6 +9084,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       gapFills: 0,
       priorProgress: this.infoPagePriorProgress,
       projectValues: [...this.infoPageProjectValues],
+      passUnavailable: this.infoPagePassUnavailable,
     };
     let r: InfoPagePassOpen;
     // Round 5: the backstop awaits the backend's reservation at the admission itself.
@@ -9097,6 +9114,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       this.infoPageHeldVerified.push({ passId: r.heldVerifiedEntryId, where, why: r.refusals.slice(0, 6) });
     }
     const pg = this.page;
+    if (r.candidateWatch && r.refusals.includes(INFO_PAGE_PRIOR_PROGRESS_REFUSAL)) this.infoPageCandidateWithHistory = true;
     if (!r.candidateWatch || !pg) return undefined;
     const shot = await this.withSecretMask("info page screenshot", (mask) => pg.screenshot({ fullPage: true, mask })).catch(() => undefined);
     return shot ? Buffer.from(shot).toString("base64") : undefined;
@@ -9137,6 +9155,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         observed: take.observed,
         evidence: infoPageEvidence(take.material, scrub),
         ...(shot ? { screenshotBase64: shot } : {}),
+        ...(this.infoPageCandidateWithHistory ? { capturedWithHistory: true } : {}),
       };
       if (!this.infoPageCandidate || (!this.infoPageCandidate.observed && capture.observed)) this.infoPageCandidate = capture;
       this.debug?.event({ type: "info_page_candidate", page: pageCount, identity: take.digest.identitySha256.slice(0, 12), held: !!take.observed, screenshot: !!shot });
