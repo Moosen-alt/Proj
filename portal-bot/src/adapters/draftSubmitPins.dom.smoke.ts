@@ -38,7 +38,23 @@
 //          reload) MUST-PASS
 //     SF9  earlierPick: an unbound pick on an EARLIER page, then a real navigation to Part 1; reusedId: the
 //          same, and Part 1 reuses the pick's id for another question (MUST-PASS while the owner's
-//          card stands at "Submit page only"; WHOLE_APPLICATION flips both)
+//          card stands at "Submit page only"; WHOLE_APPLICATION flips both); reusedIdBare, the same with
+//          no recorded write on Part 1
+//   ROUND 5 (Helm review of 381204a)
+//     A1   revisitTh, revisitAriaLabel: a revisit under new ids reads the pick's question back (MUST-STOP)
+//     A2   prgSameView: two documents at one URL path, one heading, a shared header (MUST-STOP)
+//     A3   reanchorClear, fpReanchorClear: a re-anchored step clears nothing it did not write (MUST-STOP)
+//     B4   battSameDay: "Encharge 3" is not "Powerwall 3" (MUST-STOP)
+//     C5/6 b_helpBtnSelect, b_titleSelect (Part 1 and *Early): never answered; miamiNo MUST-PASS
+//     C7   reassertBound (now REQUIRED), ownReassertReady, rbReq: an own re-assert never writes READY
+//     C8   misrouteFallbackCss(Early): a re-assert writes only the element it checked
+//     view churn: dialogBig, headingRerender, spaPersist MUST-STOP; postback, toastOwnT,
+//          dialogCloseOwnT MUST-PASS
+//     checkboxes: revisitChkVol, revisitChkStable, noKeyCheckbox, sharedNameCb, batteryNoSkip MUST-STOP
+//     data or pick: countYes, modulesLone MUST-STOP; kw76, amps200, watts MUST-PASS
+//     submit wording: boundRfs, boundBeSubmitted, boundSubmitTo, boundConfirmSubmit MUST-STOP; permit
+//          helpText, helpSelect, instrBefore, p_wantSubmitDocsYes MUST-PASS
+//     cbStall: an earlier page's select is never re-run into a required agreement checkbox
 //
 // Real Chromium through stageWithRecipe (the network backstop and the LLM gap-fill enabled), synthetic
 // pages on 127.0.0.1 (never a real portal; every name, company and address is fictional), a stub
@@ -82,7 +98,7 @@ interface Mode {
   /** An earlier page: its extra controls and its recorded steps (before its Next). */
   early?: { html: string; steps?: RecipeStep[] };
   /** The whole Part 1 document instead of the standard one (a single-document app). */
-  doc?: (base: string) => string;
+  doc?: (base: string, url?: URL) => string;
   /** The planner's answer for a field it is offered, or null. Defaults to defaultPlan. */
   plan?: (f: Field) => Omit<Fill, "selectorIndex"> | null;
   gap?: Record<string, string>;
@@ -120,7 +136,7 @@ const remountScript = (oldId: string, newId: string, name: string | null): strin
 // THE STUB PLANNER, by default: a Yes/No select or a "Yes" radio gets Yes (bound to a project field
 // on a mode named bound*), the installer box gets the project's installer.
 const defaultPlan = (mode: string) => (f: Field): Omit<Fill, "selectorIndex"> | null => {
-  const bound = /^bound|^selectLabelledBy$/.test(mode) ? { field: "agreesToTerms" } : {};
+  const bound = /^bound|^b_|^selectLabelledBy$/.test(mode) ? { field: "agreesToTerms" } : {};
   if (f.fieldType === "select" && (f.options ?? []).includes("Yes")) return { value: "Yes", ...bound };
   if (f.fieldType === "radio" && /^yes$/i.test(String(f.label ?? "").trim())) return { value: "Yes", ...bound };
   if (/installer company/i.test(String(f.label ?? ""))) return { value: "Acme Solar", field: "installerCompany" };
@@ -226,7 +242,9 @@ const MODES: Record<string, Mode> = {
     plan: () => null,
   },
   reassertBound: {
-    part1: () => `${sel("ready", "Are you ready to submit your Net Metering application?", ["Yes", "No"])}<div id="nmBox">${sel("nm", "Net Metering", ["Yes", "No"], "required")}</div>`,
+    // Round 5 (Helm review of 381204a, C7): the ready select is REQUIRED, so it is a blank the
+    // re-assert's substring match can reach.
+    part1: () => `${sel("ready", "Are you ready to submit your Net Metering application?", ["Yes", "No"], "required")}<div id="nmBox">${sel("nm", "Net Metering", ["Yes", "No"], "required")}</div>`,
     script: `<script>var done = false; document.getElementById('nmBox').addEventListener('change', function () { if (done) return; done = true;
       setTimeout(function () { document.getElementById('nmBox').innerHTML = '<label for="nm-2">Net Metering</label><select id="nm-2" name="nm" required>${opts(["Yes", "No"]).replace(/'/g, "\\'")}</select>'; }, 150); });</script>`,
     steps: () => [step({ action: "select", selector: { css: "#nm", label: "Net Metering", fallbacks: [{ label: "Net Metering" }] }, value: "Yes", note: "Net Metering" })],
@@ -329,6 +347,229 @@ const MODES: Record<string, Mode> = {
   earlierPick: {
     early: { html: sel("agreeEarly", AGREE, ["Yes", "No"], "required") },
   },
+  // The same, with no recorded write on Part 1: only "does the reused id readably ask something
+  // else" keeps it out of the click (Helm review of 381204a).
+  reusedIdBare: {
+    early: { html: sel("agree", AGREE, ["Yes", "No"], "required") },
+    part1: () => sel("agree", "Interconnection Type", ["Net Metering", "Export Only"], "", "Net Metering"),
+  },
+
+  // ==== ROUND 5 (Helm review of 381204a) ===================================================
+  // A1 — another document's match reads the pick's whole question back the extractor's way
+  revisitTh: {
+    part1: (visit, saved) => `<table><tr><th>${GRID}</th><td>${["Yes", "No"].map((v) => `<input type="radio" id="g${visit}${v[0]}" name="grid-v${visit}" value="${v}" required${saved.grid === v ? " checked" : ""}><label for="g${visit}${v[0]}">${v}</label>`).join("")}</td></tr></table>${nextBtn("revisitTh")}`,
+    steps: (base) => nextToPart2(base, "revisitTh"),
+  },
+  revisitAriaLabel: {
+    part1: (visit, saved) => `<div><select id="agree-r${visit}" name="agree-r${visit}" aria-label="${AGREE}" required>${opts(["Yes", "No"], saved.agree ?? "")}</select></div>${nextBtn("revisitAriaLabel")}`,
+    steps: (base) => nextToPart2(base, "revisitAriaLabel"),
+  },
+  // A2 — two documents at one URL path, one heading and a shared header control
+  prgSameView: {
+    doc: (_base, url) => {
+      const head = `<h1>Utility Interconnection Portal</h1><div><label for="q">Search</label><input id="q" name="q" type="text"></div>`;
+      return url?.searchParams.get("step") !== "2"
+        ? page("prgSameView", "Utility Portal", `${head}<form method="get" action="/m/prgSameView/part1"><input type="hidden" name="step" value="2"><div><label for="emailA">Email</label><input id="emailA" name="emailA" type="email"></div><button type="submit" id="btnNext">Next</button></form>`)
+        : page("prgSameView", "Utility Portal", `${head}<form method="post" action="/m/prgSameView/p1/submit"><div><label for="emailB">Email</label><input id="emailB" name="emailB" type="email" required></div><button type="submit" id="btnSubmit">Submit</button></form>`);
+    },
+    steps: () => [step({ action: "fill", selector: { css: "#emailA", label: "Email", fallbacks: [{ label: "Email" }] }, field: "homeownerEmail", note: "Email" }),
+      step({ action: "click", selector: { css: "#btnNext", text: "Next" }, note: "advance: Next" })],
+    values: { homeownerEmail: "early@acme.example" },
+    plan: () => null,
+  },
+  // A3 — a re-anchored recorded step clears nothing it did not write
+  reanchorClear: {
+    part1: () => sel("agree", AGREE, ["Yes", "No"], "required") + reveal + sel("ctype", "Interconnection Type", ["Net Metering", "Export Only"], "required"),
+    steps: () => [clickMore(), step({ action: "select", selector: { css: "#agree", label: "Interconnection Type" }, value: "Net Metering", note: "Interconnection Type" })],
+  },
+  fpReanchorClear: {
+    part1: () => sel("agree", AGREE, ["Yes", "No"], "required") + reveal + sel("ctype", "Interconnection Type", ["Net Metering", "Export Only"], "required"),
+    steps: () => [clickMore(), step({ action: "select", selector: { css: "#agree" }, fingerprint: { id: "agree" }, value: "Net Metering", note: "Interconnection Type" })],
+  },
+  // B4 — another battery model is not "the same day"
+  battSameDay: {
+    part1: () => sel("batt", "Battery Model", ["Powerwall 3", "Encharge 3"], "required"),
+    plan: (f) => (labelIs(f, /battery model/i) ? { value: "Encharge 3", field: "batteryModel" } : null),
+    gap: { batteryModel: "Powerwall 3" },
+  },
+  // C5/C6 — a help button in the row, and a question only in a title: never answered
+  b_helpBtnSelect: { part1: () => `<div class="row"><span>${READY}</span><button type="button" id="help1">?</button><select id="readyS" name="readyS" required>${opts(["Yes", "No"])}</select></div>${installerBox}` },
+  b_helpBtnSelectEarly: { early: { html: `<div class="row"><span>${READY}</span><button type="button" id="help1">?</button><select id="readyS" name="readyS">${opts(["Yes", "No"])}</select></div>${installerBox}` } },
+  b_titleSelect: { part1: () => `<div><select id="readyS" name="readyS" title="${READY}" required>${opts(["Yes", "No"])}</select></div>${installerBox}` },
+  b_titleSelectEarly: { early: { html: `<div><select id="readyS" name="readyS" title="${READY}">${opts(["Yes", "No"])}</select></div>${installerBox}` } },
+  miamiNo: {
+    part1: () => `<div class="row"><span>Is a battery included?</span><label for="Yes">Yes</label><input type="radio" name="batt" id="rdo" value="Yes" required><label for="No">No</label><input type="radio" name="batt" id="rdo" value="No" required></div>`,
+    plan: (f) => (f.fieldType === "radio" && labelIs(f, /^no$/i) ? { value: "Yes", field: "hasBattery" } : null),
+    gap: { hasBattery: "No" },
+  },
+  // C7 — an own re-assert is checked for submit intent too
+  ownReassertReady: {
+    part1: () => `${sel("ready", "Are you ready to submit your Net Metering application?", ["Yes", "No"], "required")}<div id="nmBox">${sel("nm", "Net Metering", ["Yes", "No"])}</div>`,
+    script: `<script>var gone = false; document.getElementById('nmBox').addEventListener('change', function () { if (gone) return; gone = true;
+      setTimeout(function () { document.getElementById('nmBox').innerHTML = '<p>Net Metering: Yes</p>'; }, 150); });</script>`,
+    steps: () => [step({ action: "select", selector: { css: "#nm", label: "Net Metering", fallbacks: [{ label: "Net Metering" }] }, value: "Yes", note: "Net Metering" })],
+    plan: () => null,
+  },
+  rbReq: {
+    // Part 1's own label-only step lands on Net Metering first; a later "Show more" re-renders it
+    // below the ready select, which its label then reaches first.
+    part1: () => `<div id="nmBox">${sel("nm", "Net Metering", ["Yes", "No"], "required")}</div>${sel("ready", "Are you ready to submit your Net Metering application?", ["Yes", "No"], "required")}<div id="nmBox2"></div>
+      <button type="button" id="btnMore" onclick="moveNm()">Show more</button>`,
+    script: `<script>function moveNm() { document.getElementById('nmBox').remove();
+      document.getElementById('nmBox2').innerHTML = '<label for="nm-2">Net Metering</label><select id="nm-2" name="nm" required>${opts(["Yes", "No"]).replace(/'/g, "\\'")}</select>'; }</script>`,
+    steps: () => [step({ action: "select", selector: { label: "Net Metering", fallbacks: [{ label: "Net Metering" }] }, value: "Yes", note: "Net Metering" }), clickMore()],
+    plan: () => null,
+  },
+  // C8 — a re-assert writes only the element it checked (no label fallback onto READY)
+  misrouteFallbackCss: {
+    early: { html: sel("nm", "Net Metering", ["Yes", "No"]), steps: [earlySel("nm", "Net Metering", "Yes")] },
+    part1: () => `${sel("ready", "Are you ready to submit your Net Metering application?", ["Yes", "No"])}<div><label for="nm">Net Metering</label><select id="nm" name="nm" required>${opts(["Opt In", "Opt Out"])}</select></div>`,
+    plan: () => null,
+  },
+  misrouteFallbackCssEarly: {
+    early: {
+      html: `<div id="v1">${sel("nm", "Net Metering", ["Yes", "No"])}<button type="button" id="btnProceed" onclick="go()">Proceed</button></div>
+        <script>function go() { document.getElementById('v1').innerHTML = '${(sel("ready", "Are you ready to submit your Net Metering application?", ["Yes", "No"]) + `<div><label for="nm">Net Metering</label><select id="nm" name="nm" required>${opts(["Opt In", "Opt Out"])}</select></div>`).replace(/'/g, "\\'")}'; }</script>`,
+      steps: [earlySel("nm", "Net Metering", "Yes"), step({ action: "click", selector: { css: "#btnProceed", text: "Proceed" }, note: "Proceed" })],
+    },
+    plan: () => null,
+  },
+  // VIEW CHURN — a pick is not dropped by a dialog closing or a heading changing; an own value is
+  // not called a pick after a postback or a toast; a persistent header does not make a replaced
+  // form's carried value its own
+  dialogBig: {
+    part1: () => `<button type="button" id="btnOpen" onclick="openDlg()">Add details</button><div id="dlgHost"></div><input type="hidden" name="agreeSaved" id="agreeSaved">`,
+    script: `<script>function openDlg() { var x = ''; for (var i = 0; i < 8; i++) x += '<label for="d' + i + '">Detail ' + i + '</label><input id="d' + i + '" name="d' + i + '" type="text">';
+      document.getElementById('dlgHost').innerHTML = '<div id="dlg" role="dialog">' + x +
+      '<label for="agree">${AGREE}</label><select id="agree" name="agree" required>${opts(["Yes", "No"]).replace(/'/g, "\\'")}</select>' +
+      '<button type="button" id="dlgSave" onclick="saveDlg()">Save</button></div>'; }
+      function saveDlg() { document.getElementById('agreeSaved').value = document.getElementById('agree').value; document.getElementById('dlg').remove(); }</script>`,
+    steps: () => [step({ action: "click", selector: { css: "#btnOpen", text: "Add details" }, note: "details: Add details" }),
+      step({ action: "fill", selector: { css: "#appDate", label: "Application Date" }, value: "10/17/2026", note: "Application Date" }),
+      step({ action: "click", selector: { css: "#dlgSave", text: "Save" }, note: "advance: Save" })],
+  },
+  headingRerender: {
+    part1: () => `<div id="agreeBox"><table><tr><th>${AGREE}</th><td><select id="agree" name="agree" aria-label="${AGREE}" required>${opts(["Yes", "No"])}</select></td></tr></table></div>`,
+    script: `<script>var n = 0; document.getElementById('agreeBox').addEventListener('change', function (e) {
+      var old = e.target; if (old.tagName !== 'SELECT') return; var v = old.value; n++;
+      var c = old.cloneNode(true); c.id = 'agree-h' + n; c.removeAttribute('name'); c.removeAttribute('aria-label'); c.removeAttribute('${"data-al-unrec"}'); c.value = v; old.replaceWith(c);
+      document.querySelector('h1').textContent = 'Interconnection Application Part 1 (saved)'; });</script>`,
+  },
+  spaPersist: {
+    doc: (base) => `<!doctype html><html><head><meta charset="utf-8"><title>Utility Portal</title></head><body>${BEACON("spaPersist")}${NAV}
+      <div id="hdr"><label for="hq">Search</label><input id="hq" type="text"><label for="hl">Language</label><select id="hl"><option>English</option><option>Español</option></select><label for="hz">Zoom</label><input id="hz" type="text"><label for="hn">Notes</label><input id="hn" type="text"></div>
+      <h1>Utility Interconnection Portal</h1><div id="app">
+      ${sel("nmp1", "Net Metering Program", ["Yes", "No"])}<button type="button" id="btnProceed" onclick="go()">Proceed to Part 1</button></div>
+      <script>function go() { document.getElementById('app').innerHTML = '<form method="post" action="${base.replace(/^https?:\/\/[^/]+/, "")}/m/spaPersist/p1/submit">' +
+        '<div><label for="nmp2">Net Metering Program</label><select id="nmp2" name="nmp" required>${opts(["Yes", "No"]).replace(/'/g, "\\'")}</select></div>' +
+        '<button type="submit" id="btnSubmit">Submit</button></form>'; }</script></body></html>`,
+    steps: () => [earlySel("nmp1", "Net Metering Program", "Yes"), step({ action: "click", selector: { css: "#btnProceed", text: "Proceed to Part 1" }, note: "Proceed to Part 1" })],
+    plan: () => null,
+  },
+  postback: {
+    part1: () => `<button type="button" id="btnSave" onclick="location.search = '?saved=1'">Save</button>`,
+    steps: () => [step({ action: "click", selector: { css: "#btnSave", text: "Save" }, note: "Save" })],
+  },
+  toastOwnT: {
+    part1: () => `<div id="toast"></div><button type="button" id="btnSave" onclick="document.getElementById('toast').innerHTML = '<h2>Saved</h2>'; document.querySelector('h1').textContent = 'Part 1 (saved)'; document.getElementById('appDate').value = '';">Save</button>`,
+    steps: () => [step({ action: "click", selector: { css: "#btnSave", text: "Save" }, note: "Save" })],
+  },
+  dialogCloseOwnT: {
+    part1: () => `<button type="button" id="btnOpen" onclick="var x = ''; for (var i = 0; i < 6; i++) x += '<input id=&quot;e' + i + '&quot; type=&quot;text&quot;>'; document.getElementById('dlgHost').innerHTML = '<div id=&quot;dlg&quot; role=&quot;dialog&quot;><h2>Details</h2>' + x + '</div>';">Add details</button>
+      <button type="button" id="btnClose" onclick="document.getElementById('dlgHost').innerHTML = ''; setTimeout(function () { document.getElementById('appDate').value = ''; }, 100);">Close</button><div id="dlgHost"></div>`,
+    steps: () => [step({ action: "click", selector: { css: "#btnOpen", text: "Add details" }, note: "details: Add details" }), step({ action: "click", selector: { css: "#btnClose", text: "Close" }, note: "details: Close" })],
+  },
+  // A CHOICE PICK WITH NO KEY, a revisit of a checkbox, the overwrite-clear of a checkbox
+  revisitChkVol: {
+    part1: (visit, saved) => `<div><input type="checkbox" id="cb-v${visit}" name="cb-v${visit}" required${saved.cb ? " checked" : ""}><label for="cb-v${visit}">I agree to the interconnection terms</label></div>${nextBtn("revisitChkVol")}`,
+    steps: (base) => nextToPart2(base, "revisitChkVol"),
+    plan: (f) => (f.fieldType === "checkbox" ? { value: "on" } : null),
+  },
+  revisitChkStable: {
+    part1: (_v, saved) => `<div><input type="checkbox" id="cb" name="cb" required${saved.cb ? " checked" : ""}><label for="cb">I agree to the interconnection terms</label></div>${nextBtn("revisitChkStable")}`,
+    steps: (base) => nextToPart2(base, "revisitChkStable"),
+    plan: (f) => (f.fieldType === "checkbox" ? { value: "on" } : null),
+  },
+  noKeyCheckbox: {
+    part1: () => `<div id="boxA"><label><input type="checkbox" required> I agree to the interconnection terms</label></div>
+      <button type="button" id="btnCont" onclick="var c = document.querySelector('#boxA input').checked; document.getElementById('boxA').innerHTML = '<label><input type=&quot;checkbox&quot; required> I agree to the interconnection terms</label>'; document.querySelector('#boxA input').checked = c; document.getElementById('secB').style.display = 'block';">Continue</button>
+      <div id="secB" style="display:none"><label for="sysSize">System Size (kW)</label><input id="sysSize" name="sysSize" type="text"></div>`,
+    steps: () => [step({ action: "click", selector: { css: "#btnCont", text: "Continue" }, note: "advance: Continue" }), sysSize],
+    plan: (f) => (f.fieldType === "checkbox" ? { value: "on" } : null),
+  },
+  sharedNameCb: {
+    part1: () => `<div><input type="checkbox" id="svcA" name="svc" value="a" required><label for="svcA">I agree to the interconnection terms</label></div>
+      <div><input type="checkbox" id="svcB" name="svc" value="b"><label for="svcB">Email me updates</label></div>${reveal}`,
+    steps: () => [clickMore(), step({ action: "check", selector: { css: "#svcB", label: "Email me updates" }, note: "Email me updates" })],
+    plan: (f) => (f.fieldType === "checkbox" && labelIs(f, /interconnection terms/) ? { value: "on" } : null),
+  },
+  batteryNoSkip: {
+    part1: () => `<div><input type="checkbox" id="battDecl" name="battDecl" required><label for="battDecl">This system includes battery storage</label></div>${reveal}`,
+    steps: () => [clickMore(), step({ action: "check", selector: { css: "#battDecl", label: "This system includes battery storage" }, note: "This system includes battery storage" })],
+    plan: (f) => (f.fieldType === "checkbox" ? { value: "on" } : null),
+    values: { hasBattery: "No" },
+  },
+  // DATA OR PICK, smaller holes
+  countYes: {
+    part1: () => sel("battQ", "Is a battery included?", ["Yes", "No"], "required"),
+    plan: (f) => (labelIs(f, /battery included/i) ? { value: "Yes", field: "inverterCount" } : null),
+    gap: { inverterCount: "1" },
+  },
+  modulesLone: {
+    part1: () => sel("module", "Module Model", ["ZXM7-SH108-405/M"], "required"),
+    plan: (f) => (labelIs(f, /module model/i) ? { value: "ZXM7-SH108-405/M", field: "moduleModel" } : null),
+    gap: { moduleModel: "ZXM7-SH108-410/M" },
+  },
+  kw76: {
+    part1: () => `<div><label for="kw">System Size (kW)</label><input id="kw" name="kw" type="text" required></div>`,
+    plan: (f) => (labelIs(f, /system size/i) ? { value: "7.6 kW", field: "systemSizeKw" } : null),
+    gap: { systemSizeKw: "7.6" },
+  },
+  amps200: {
+    part1: () => sel("panel", "Main Panel Rating", ["100 Amps", "200 Amps"], "required"),
+    plan: (f) => (labelIs(f, /main panel/i) ? { value: "200 Amps", field: "mainPanelAmps" } : null),
+    gap: { mainPanelAmps: "200" },
+  },
+  watts: {
+    part1: () => `<div><label for="acw">Inverter AC Rating (W)</label><input id="acw" name="acw" type="text" required></div>`,
+    plan: (f) => (labelIs(f, /ac rating/i) ? { value: "7600 W", field: "systemSizeKw" } : null),
+    gap: { systemSizeKw: "7.6 kW" },
+  },
+  // SUBMIT WORDING — refused unless it only names a fact
+  boundRfs: { part1: () => sel("rfs", "Is this application ready for submittal?", ["Yes", "No"], "required") + installerBox },
+  boundBeSubmitted: { part1: () => sel("rfs", "Should this application be submitted now?", ["Yes", "No"], "required") + installerBox },
+  boundSubmitTo: { part1: () => sel("rfs", "Submit to the utility?", ["Yes", "No"], "required") + installerBox },
+  boundConfirmSubmit: { part1: () => sel("rfs", "Do you confirm this request should be submitted?", ["Yes", "No"], "required") + installerBox },
+  helpText: {
+    permit: true,
+    part1: () => `<div><label for="lic">Contractor License Number</label><input id="lic" name="lic" type="text" required><small>You will submit your application on the next page.</small></div>`,
+    plan: (f) => (labelIs(f, /license number/i) ? { value: "C10-123456", field: "licenseNumber" } : null),
+    gap: { licenseNumber: "C10-123456" },
+  },
+  helpSelect: {
+    permit: true,
+    part1: () => `<div><label for="mount">Mounting</label><select id="mount" name="mount" required>${opts(["Roof", "Ground"])}</select><small>Submit your application after the review page.</small></div>`,
+    plan: (f) => (labelIs(f, /mounting/i) ? { value: "Roof", field: "mountType" } : null),
+    gap: { mountType: "Roof" },
+  },
+  instrBefore: {
+    permit: true,
+    part1: () => `<div><p>When you are ready to submit, click Submit below.</p><label for="mount">Mounting</label><select id="mount" name="mount" required>${opts(["Roof", "Ground"])}</select></div>`,
+    plan: (f) => (labelIs(f, /mounting/i) ? { value: "Roof", field: "mountType" } : null),
+    gap: { mountType: "Roof" },
+  },
+  p_wantSubmitDocsYes: {
+    permit: true,
+    part1: () => `<fieldset><legend>Do you want to submit additional documents?</legend>${radios("docs", "required")}</fieldset>`,
+    plan: (f) => (f.fieldType === "radio" && labelIs(f, /^yes$/i) ? { value: "Yes", field: "additionalDocs" } : null),
+    gap: { additionalDocs: "Yes" },
+  },
+  // THE AGREEMENT CHECKBOX STALL — an earlier page's select is never re-run into a checkbox blank
+  cbStall: {
+    early: { html: sel("agreeEarly", "I agree to the terms", ["Yes", "No"]), steps: [earlySel("agreeEarly", "I agree to the terms", "Yes")] },
+    part1: () => `<div><input type="checkbox" id="terms" name="terms" required><label for="terms">I agree to the terms</label></div>`,
+    plan: () => null,
+  },
 };
 
 // ---- the server ----------------------------------------------------------------------------
@@ -348,7 +589,7 @@ const PART1 = (mode: string): string => {
   return page(mode, "Interconnection Application Part 1", `
   <h1>Interconnection Application Part 1 (Preliminary Validation)</h1>
   <form method="post" action="/m/${mode}/p1/submit">
-    <div><label for="appDate">Application Date</label><input id="appDate" name="appDate" type="text" value="${v.appDate ?? ""}"${mode === "advRerender" || mode === "reloadOwn" ? " required" : ""}></div>
+    <div><label for="appDate">Application Date</label><input id="appDate" name="appDate" type="text" value="${v.appDate ?? ""}"${["advRerender", "reloadOwn", "postback", "toastOwnT", "dialogCloseOwnT"].includes(mode) ? " required" : ""}></div>
     ${m.part1 ? m.part1(visit, v) : ""}
     ${m.permit ? "" : `<button type="submit" id="btnSubmit">Submit</button>`}
   </form>${m.script ?? ""}`);
@@ -381,10 +622,10 @@ const server = http.createServer((req, res) => {
   gets.push({ mode, path: url.pathname, query: url.search });
   // A GET navigation's answers are what the portal "saved" (a volatile agree-vN id saves as agree).
   if (url.searchParams.size) {
-    const kept = Object.fromEntries(Array.from(url.searchParams.entries()).map(([k, val]) => [/^agree-v\d+$/.test(k) ? "agree" : k, val]));
+    const kept = Object.fromEntries(Array.from(url.searchParams.entries()).map(([k, val]) => [/^agree-[vr]\d+$/.test(k) ? "agree" : /^cb-v\d+$/.test(k) ? "cb" : /^grid-v\d+$/.test(k) ? "grid" : k, val]));
     saved[mode] = { ...(saved[mode] ?? {}), ...kept };
   }
-  if (rest === "part1") { send(MODES[mode]?.doc ? MODES[mode].doc!(base) : PART1(mode)); return; }
+  if (rest === "part1") { send(MODES[mode]?.doc ? MODES[mode].doc!(base, url) : PART1(mode)); return; }
   if (rest === "part2") { send(page(mode, "Part 1 continued", "<h1>System Details</h1><p>Nothing to enter here.</p>")); return; }
   if (rest === "early") { send(EARLY(mode)); return; }
   send(page(mode, "Program Home", "<h1>Program Home</h1>"));
@@ -533,6 +774,65 @@ try {
     ? "reusedId: an earlier page's pick stops the stamped click (owner: whole application)"
     : "reusedId: an earlier page's pick whose id Part 1 reuses for another question is not in front — one click, the draft",
   wrote(o, /^agree$/, "Yes") && (WHOLE_APPLICATION ? stoppedForPick(o, "Do you agree") : drafted(o)), brief(o)));
+  await run("reusedIdBare", (o) => check(WHOLE_APPLICATION
+    ? "reusedIdBare: an earlier page's pick stops the stamped click (owner: whole application)"
+    : "reusedIdBare: an earlier page's pick whose id Part 1 reuses for another question, no recorded write there — one click, the draft",
+  wrote(o, /^agree$/, "Yes") && (WHOLE_APPLICATION ? stoppedForPick(o, "Do you agree") : drafted(o)), brief(o)));
+
+  // ==== ROUND 5 (Helm review of 381204a) ===================================================
+  // A1
+  await run("revisitTh", (o) => check("revisitTh: a th-labelled radio pick, then a revisit of Part 1 under new ids — the pick still stops the click", stoppedForPick(o, GRID), brief(o)));
+  await run("revisitAriaLabel", (o) => check("revisitAriaLabel: an aria-label select pick, then a revisit under new ids — the pick still stops the click", stoppedForPick(o, "Do you agree"), brief(o)));
+  // A2
+  await run("prgSameView", (o) => check("prgSameView: an earlier document's recorded Email at the same URL, one heading, a shared header — re-asserted into Part 1 it is a pick (0 POSTs, a named stop)", stoppedForPick(o, "Email"), brief(o)));
+  // A3
+  for (const mode of ["reanchorClear", "fpReanchorClear"] as const) {
+    await run(mode, (o) => check(`${mode}: a recorded step re-anchored onto another control does not clear the pick on the control its selector names — 0 POSTs, a named stop`, wrote(o, /^agree$/, "Yes") && stoppedForPick(o, "Do you agree"), brief(o)));
+  }
+  // B4
+  await run("battSameDay", (o) => check('battSameDay: "Encharge 3" for the project\'s "Powerwall 3" is a pick, not the same day — 0 POSTs, a named stop', stoppedForPick(o, "Battery Model"), brief(o)));
+  // C5, C6
+  for (const mode of ["b_helpBtnSelect", "b_titleSelect"] as const) {
+    await run(mode, (o) => check(`${mode}: the ready question (behind a help button / only in a title) is never answered on Part 1 — never touched, nothing carries it, 0 POSTs`, readyKept(o, "readyS") && o.posts.length === 0 && notAnIncident(o), brief(o)));
+  }
+  for (const mode of ["b_helpBtnSelectEarly", "b_titleSelectEarly"] as const) {
+    await run(mode, (o) => check(`${mode}: ...nor on an earlier page — never touched, no request carries it`, readyKept(o, "readyS") && noIncident(o), brief(o)));
+  }
+  await run("miamiNo", (o) => check("miamiNo: Miami's shared-id radios, the No through hasBattery=No — written to No, one click, the draft carries batt=No", drafted(o) && o.posts[0].body.includes("batt=No"), brief(o)));
+  // C7
+  await run("ownReassertReady", (o) => check("ownReassertReady: Part 1's own \"Net Metering\", its control gone, is never re-asserted into the required ready select — never touched, 0 POSTs", readyKept(o, "ready") && o.posts.length === 0 && notAnIncident(o), brief(o)));
+  await run("rbReq", (o) => check("rbReq: a label-only \"Net Metering\" step, its select re-rendered, is never re-asserted into the required ready select its label reaches first — never touched, 0 POSTs", readyKept(o, "ready") && o.posts.length === 0 && notAnIncident(o), brief(o)));
+  // C8
+  await run("misrouteFallbackCss", (o) => check("misrouteFallbackCss: a carried select whose value Part 1's blank does not offer never lands on the ready select by a label fallback — never touched, 0 POSTs", readyKept(o, "ready") && o.posts.length === 0 && notAnIncident(o), brief(o)));
+  await run("misrouteFallbackCssEarly", (o) => check("misrouteFallbackCssEarly: ...nor on an earlier page — never touched, no request carries it", readyKept(o, "ready") && noIncident(o), brief(o)));
+  // VIEW CHURN
+  await run("dialogBig", (o) => check("dialogBig: a big dialog's pick, copied to a hidden input and the dialog removed — still stops the click", stoppedForPick(o, "Do you agree"), brief(o)));
+  await run("headingRerender", (o) => check("headingRerender: a th-labelled pick re-created under a new id while the heading text changes — still stops the click", stoppedForPick(o, "Do you agree"), brief(o)));
+  await run("spaPersist", (o) => check("spaPersist: a persistent header over a replaced form — view 1's recorded value re-asserted into Part 1 is a pick (0 POSTs, a named stop)", stoppedForPick(o, "Net Metering Program"), brief(o)));
+  for (const mode of ["postback", "toastOwnT", "dialogCloseOwnT"] as const) {
+    await run(mode, (o) => check(`${mode}: Part 1's own value blanked by a same-page event (a query-string postback / a "Saved" toast and heading change / a dialog closing) — re-asserted as its own, one click, the draft`, drafted(o) && o.posts[0].body.includes("appDate=10%2F16%2F2026"), brief(o)));
+  }
+  // CHECKBOXES
+  await run("revisitChkVol", (o) => check("revisitChkVol: a ticked terms box, then a revisit that renders it under a new id — read by its own sentence, the pick still stops the click", stoppedForPick(o, "interconnection terms"), brief(o)));
+  await run("revisitChkStable", (o) => check("revisitChkStable: the same box under the same id on a revisit (another document) — the pick still stops the click", stoppedForPick(o, "interconnection terms"), brief(o)));
+  await run("noKeyCheckbox", (o) => check("noKeyCheckbox: a ticked box with no id or name, re-rendered by a Continue — the pick still stops the click", stoppedForPick(o, "interconnection terms"), brief(o)));
+  await run("sharedNameCb", (o) => check("sharedNameCb: a recorded tick of another box with the same name does not clear the pick — 0 POSTs, a named stop", stoppedForPick(o, "interconnection terms"), brief(o)));
+  await run("batteryNoSkip", (o) => check("batteryNoSkip: a recorded battery tick skipped for a no-battery project does not clear the pick on that box — 0 POSTs, a named stop", stoppedForPick(o, "battery storage"), brief(o)));
+  // DATA OR PICK
+  await run("countYes", (o) => check('countYes: "Yes" through a count of 1 is a pick — 0 POSTs, a named stop', stoppedForPick(o, "battery included"), brief(o)));
+  await run("modulesLone", (o) => check("modulesLone: the only module offered, -405/M, for the project's -410/M is a pick — 0 POSTs, a review stop", stopped(o), brief(o)));
+  for (const [mode, body] of [["kw76", "kw=7.6+kW"], ["amps200", "panel=200+Amps"], ["watts", "acw=7600+W"]] as const) {
+    await run(mode, (o) => check(`${mode}: the project's number with a unit word (or exactly x1000) is data — one click, the draft carries ${body}`, drafted(o) && o.posts[0].body.includes(body), brief(o)));
+  }
+  // SUBMIT WORDING
+  for (const mode of ["boundRfs", "boundBeSubmitted", "boundSubmitTo", "boundConfirmSubmit"] as const) {
+    await run(mode, (o) => check(`${mode}: a submit question in other words is never answered (bound planner) — never touched, nothing carries it, 0 POSTs`, readyKept(o, "rfs") && o.posts.length === 0 && notAnIncident(o), brief(o)));
+  }
+  for (const [mode, id, v] of [["helpText", "lic", "C10-123456"], ["helpSelect", "mount", "Roof"], ["instrBefore", "mount", "Roof"], ["p_wantSubmitDocsYes", "docsY", "Yes"]] as const) {
+    await run(mode, (o) => check(`${mode}: help or instruction text that mentions submitting, or a documents question, is not submit intent — the permit run writes ${id} and reaches review`, wrote(o, new RegExp(`^${id}$`), v === "Yes" ? undefined : v) && o.r.ok === true && o.posts.length === 0, brief(o)));
+  }
+  // THE AGREEMENT CHECKBOX STALL
+  await run("cbStall", (o) => check("cbStall: an earlier page's select is never re-run into a required agreement checkbox — a quick review stop, never ticked", stopped(o) && o.ms < 30_000 && !wrote(o, /^terms$/), brief(o)));
 } finally {
   server.close();
 }

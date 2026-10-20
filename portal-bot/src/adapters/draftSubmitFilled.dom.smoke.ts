@@ -13,9 +13,10 @@
 // The record is keyed to the CONTROLS automation picked and their QUESTIONS, not to "leaving the
 // page" (Helm reviews of 85424af5 and 4081f12): a pick stops the click while it was made in this
 // document and view (an advance that only reveals more of the same page, an in-page opener, a
-// re-mount under a new id), or while a control with its id or name, or an answered control asking
-// its question, is in front (a revisit, even one that renders new ids). draftSubmitPins pins the
-// re-mount, renumbered-id, removed-dialog and reused-id shapes.
+// re-mount under a new id), or while a control with its id or name that does not readably ask
+// something else, or an answered control asking its question, is in front (a revisit: by its id or
+// name, or under new ids when Part 1 asks the same question the extractor's way). draftSubmitPins
+// pins the re-mount, renumbered-id, removed-dialog, revisit and reused-id shapes.
 //
 // Real Chromium through the real stage path (stageWithRecipe → runAdapter → RecipeAdapter with the
 // network backstop and the LLM gap-fill enabled) against synthetic Part 1 pages on 127.0.0.1 (never a

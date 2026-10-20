@@ -45,7 +45,7 @@ export interface GapFillOutcome {
    *  its label, id and name, and whether the answer came from the project's data or was an AI pick
    *  (gapFillWriteKind). A pick's element also carries data-al-unrec (UNRECORDED_WRITE_ATTR), so a
    *  replay can tell whether that control is still in front of a stamped draft click. */
-  attemptedControls: Array<{ label: string; id: string; name: string; kind: GapFillWriteKind; question: string; option: string }>;
+  attemptedControls: Array<{ label: string; id: string; name: string; kind: GapFillWriteKind; question: string; option: string; questions: string[] }>;
   /** Planned fills rejected because they weren't grounded in real project data. */
   skippedUngrounded: string[];
   /** Required, empty fields the PROJECT GENUINELY LACKS — surfaced so the human can act. */
@@ -206,16 +206,36 @@ function boolAgrees(a: string, b: string): boolean {
 // containment — and an answer that itself reads as submitting is never typed. Left blank, it is a
 // required field a person answers.
 //
-// FIELD TEXT IS NOT A BUTTON. portalSafety's isSubmitIntent judges a CLICK: a bare "Finish" or
-// "Submit" button commits. On a field it over-reads — "Estimated Finish Date", a "Mill Finish"
-// option, "Submit Date" are ordinary data — so a field's text counts only in a READINESS shape:
-// ready / want / agree to submit, submit (your|the|this) application or request, submit now,
-// finalize, re-submit, confirm or complete the submission, sign and file. Exported for tests.
-const SUBMIT_FIELD_TEXT =
-  /\b(ready|want|wish|like|agree|intend|elect|choose)\s+to\s+(re-?)?(submit|file|send)\b|\b(re-?)?(submit|file|send|finali[sz]e)\s+(now\b|(my|the|your|this|our|an?)?\s*(net\s+metering\s+|interconnection\s+|final\s+)?(\([^)]*\)\s*)?(application|request|submission|form|filing)\b)|\bfinali[sz]e\b|\bre-?submit\b|\b(confirm|complete)\s+(the\s+|my\s+|your\s+)?submission\b|\bsign\s*(and|&)\s*(file|submit)\b|^\s*(yes\s*[,–—-]?\s*)?(submit|file)\s*(now)?\s*[.!]?\s*$/i;
+// FIELD TEXT IS NOT A BUTTON, BUT SUBMIT WORDING IS REFUSED BY DEFAULT (Helm review of 381204a).
+// portalSafety's isSubmitIntent judges a CLICK. On a field, a carve-out list of readiness shapes
+// missed "Is this ready for submittal?", "Should this application be submitted now?", "Submit to
+// the utility?". So it is inverted: field text that says submit / submission / submitted /
+// submittal, files or sends an application, finalizes one, or signs and files is refused — unless
+// that wording sits only inside a DATA-NOUN shape, which asks for a fact, not a decision: "Date
+// Submitted", "Submittal Type", "Submitted by", "Who will submit", "File Name", "Filing fee",
+// "Do you want to submit additional documents?". "Estimated Finish Date", "Mill Finish" and a bare
+// "Finalize" carry no submit wording and still answer. Spanish "enviar / presentar (la) solicitud"
+// is refused too. Exported for tests.
+const DATA_NOUN_SUBMIT = new RegExp([
+  String.raw`\b(date|time|day|method|mode|type|number|no\.?|id|reference)\s+(of\s+)?(re-?)?(submitted|submission|submittal|submit)\b`,
+  String.raw`\b(re-?)?(submitted|submission|submittal|submit)\s+(date|time|day|method|mode|type|number|no\.?|#|id|reference|by|on|via|package|requirements?|checklist|status)\b`,
+  String.raw`\bwho\s+(will|is\s+going\s+to|shall)\s+submit\b`,
+  String.raw`\b(want|wish|like|need|have)\s+to\s+(submit|upload|send)\s+(any\s+|the\s+|your\s+|additional\s+|more\s+|other\s+|supporting\s+|revised\s+)*(documents?|photos?|pictures?|plans?|corrections?|attachments?|files?|drawings?|revisions?)\b`,
+  String.raw`\bfil(e|ing)\s+(name|type|size|format|number|no\.?|fee|fees|date|upload)\b`,
+].join("|"), "gi");
+const SUBMIT_WORDING = new RegExp([
+  String.raw`\b(re-?)?(submit|submits|submitting|submitted|submission|submissions|submittal)\b`,
+  String.raw`\b(file|send|sending)\s+(now\b|((my|the|your|this|our|an?)\s+)?((?!(for|to|with|in|of|on|from|about|by|a|an|the)\b)[\w()-]+\s+){0,3}(application|request)\b)`,
+  String.raw`\bfiling\s+(of\s+)?(the|my|your|this|our)\s+([\w()-]+\s+){0,3}application\b`,
+  String.raw`\bfinali[sz](e|ing)\s+(now\b|(my|the|your|this|our|an?)\s+)`,
+  String.raw`\bsign\s*(and|&)\s*(file|send)\b`,
+  String.raw`\b(enviar|env[ií]e|presentar|presente|someter)\b[^.?!]{0,40}\bsolicitud\b`,
+  String.raw`\blisto\s+para\s+(enviar|presentar)\b`,
+].join("|"), "i");
 export function isSubmitIntentField(text: string | null | undefined): boolean {
   const t = String(text ?? "").replace(/\s+/g, " ").trim();
-  return !!t && SUBMIT_FIELD_TEXT.test(t);
+  if (!t) return false;
+  return SUBMIT_WORDING.test(t.replace(DATA_NOUN_SUBMIT, " "));
 }
 export function gapFillMayAnswer(
   field: { label?: string | null; groupPrompt?: string | null; options?: string[] | null; questions?: string[] | null } | string | null | undefined,
@@ -234,6 +254,8 @@ export const UNRECORDED_WRITE_ATTR = "data-al-unrec";
 
 export type GapFillWriteKind = "data" | "pick";
 const BOOLISH = /^(true|false|yes|no|on|off|1|0|y|n|none)$/i;
+/** A bound value that IS a yes/no (Helm review of 381204a): a digit is a count, never Yes. */
+const WORD_BOOL = /^(true|false|yes|no|on|off|y|n|none)$/i;
 const words = (v: string): string[] => String(v ?? "").toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
 /** Does `hay` hold every word of `needle`, in order and contiguous? ("Roof Mounted" holds "Roof".) */
 function holdsWholeWords(hay: string, needle: string): boolean {
@@ -242,10 +264,31 @@ function holdsWholeWords(hay: string, needle: string): boolean {
   for (let i = 0; i + n.length <= h.length; i++) if (n.every((w, k) => h[i + k] === w)) return true;
   return false;
 }
+// A DAY, ONLY WHEN THE TEXT IS SHAPED AS A DATE (#362, Helm review of 381204a, B4). `new Date()`
+// reads "Encharge 3" and "Powerwall 3" as the same day, "7" as "7.1", "Sonnen Eco 10" as
+// "LG RESU 10". So a day is read only from a whole date shape: ISO (2026-10-18, a time after it),
+// m/d/yyyy or m/d/yy, "Oct 18, 2026" / "October 18 2026", "18-Oct-2026" / "18 October 2026". It is
+// parsed by hand, so it is the same calendar day in every timezone.
+const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+function dayOf(text: string): string | null {
+  const t = String(text ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+  const ymd = (y: number, m: number, d: number): string | null =>
+    m >= 1 && m <= 12 && d >= 1 && d <= 31 ? `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}` : null;
+  const year = (y: string): number => (y.length === 2 ? 2000 + Number(y) : Number(y));
+  const mon = (w: string): number => { const i = MONTHS.indexOf(w.slice(0, 3)); return i < 0 ? 0 : i + 1; };
+  let m = /^(\d{4})-(\d{1,2})-(\d{1,2})(?:[t ][\d:.]+(?:z|[+-]\d{2}:?\d{2})?)?$/.exec(t);
+  if (m) return ymd(Number(m[1]), Number(m[2]), Number(m[3]));
+  m = /^(\d{1,2})\/(\d{1,2})\/(\d{4}|\d{2})$/.exec(t);
+  if (m) return ymd(year(m[3]), Number(m[1]), Number(m[2]));
+  m = /^([a-z]{3,9})\.? (\d{1,2}),? (\d{4})$/.exec(t);
+  if (m && mon(m[1])) return ymd(Number(m[3]), mon(m[1]), Number(m[2]));
+  m = /^(\d{1,2})[- ]([a-z]{3,9})\.?[- ](\d{4}|\d{2})$/.exec(t);
+  if (m && mon(m[2])) return ymd(year(m[3]), mon(m[2]), Number(m[1]));
+  return null;
+}
 function sameDay(a: string, b: string): boolean {
-  if (!/\d/.test(a) || !/\d/.test(b)) return false;
-  const da = new Date(a); const db = new Date(b);
-  return !Number.isNaN(da.getTime()) && !Number.isNaN(db.getTime()) && da.toISOString().slice(0, 10) === db.toISOString().slice(0, 10);
+  const da = dayOf(a); const db = dayOf(b);
+  return !!da && da === db;
 }
 /** THE PROJECT'S VALUE, RENDERED — never close to it. Equal after normalisation, the same day
  *  written another way, the same digits in another punctuation (a phone, an account format: no
@@ -255,11 +298,42 @@ function isRenderingOf(answer: string, projectValue: string): boolean {
   if (!a || !p) return false;
   if (normalize(a) === normalize(p)) return true;
   if (sameDay(a, p)) return true;
+  if (sameQuantity(a, p)) return true;
   if (!/[a-z]/i.test(a) && !/[a-z]/i.test(p)) {
     const da = a.replace(/\D/g, ""); const dp = p.replace(/\D/g, "");
     if (da.length >= 4 && da === dp) return true;
   }
-  return normalize(p).length >= 4 && !BOOLISH.test(p) && holdsWholeWords(a, p);
+  if (normalize(p).length < 4 || BOOLISH.test(p) || !holdsWholeWords(a, p)) return false;
+  // A FULLER RENDERING, NOT PROSE ABOUT IT (Helm review of 381204a): at most three words beyond the
+  // value, and none of them a negation ("Not Acme Solar" is not Acme Solar).
+  const extra = words(a).filter((w) => !words(p).includes(w));
+  return words(a).length - words(p).length <= 3 && !extra.some((w) => NEGATION.test(w));
+}
+const NEGATION = /^(not|no|non|without|never|except|excluding|excluded|nor|none)$/i;
+// THE SAME QUANTITY, NEVER A CLOSE ONE (Helm review of 381204a): "7.6 kW" is the project's 7.6,
+// "200 Amps" its 200, "7600 W" its 7.6 kW. The same number with at most one unit word on either
+// side, or exactly ×1000 between a kilo unit (or none) and its base unit. Never a tolerance.
+const KILO: Record<string, string> = { kw: "w", kva: "va", kwh: "wh", kv: "v" };
+const UNIT_WORDS: Record<string, string> = {
+  kw: "kw", kilowatt: "kw", kilowatts: "kw", w: "w", watt: "w", watts: "w", kva: "kva", va: "va",
+  kwh: "kwh", wh: "wh", a: "a", amp: "a", amps: "a", ampere: "a", amperes: "a", v: "v", volt: "v", volts: "v", kv: "kv",
+};
+function quantityOf(text: string): { n: number; unit: string } | null {
+  const m = /^\s*(\d+(?:\.\d+)?|\.\d+)\s*([a-z]+)?\.?\s*$/i.exec(String(text ?? "").replace(/,(?=\d{3}\b)/g, ""));
+  if (!m) return null;
+  const unit = m[2] ? UNIT_WORDS[m[2].toLowerCase()] : "";
+  if (unit === undefined) return null;
+  return { n: Number(m[1]), unit };
+}
+function sameQuantity(a: string, b: string): boolean {
+  const qa = quantityOf(a); const qb = quantityOf(b);
+  if (!qa || !qb || !Number.isFinite(qa.n) || !Number.isFinite(qb.n)) return false;
+  if (!qa.unit && !qb.unit) return false;   // two bare numbers: the digit rule above decides
+  const eq = (x: number, y: number): boolean => Math.round(x * 1e6) === Math.round(y * 1e6);
+  if (eq(qa.n, qb.n) && (!qa.unit || !qb.unit || qa.unit === qb.unit)) return true;
+  const kiloOf = (big: { n: number; unit: string }, small: { n: number; unit: string }): boolean =>
+    !!big.unit && Object.values(KILO).includes(big.unit) && (!small.unit || KILO[small.unit] === big.unit) && eq(small.n * 1000, big.n);
+  return kiloOf(qa, qb) || kiloOf(qb, qa);
 }
 
 // DATA OR PICK (#362, owner ruling 2026-10-18 "Data is enough"). Data only when the answer that
@@ -285,11 +359,11 @@ export function gapFillWriteKind(
 ): GapFillWriteKind {
   const bound = mappedKey ? String(projectFields[mappedKey] ?? "").trim() : "";
   const v = String(value ?? "").trim();
-  if (field.fieldType === "checkbox") return bound && boolAgrees(v, bound) ? "data" : "pick";
+  if (field.fieldType === "checkbox") return bound && WORD_BOOL.test(bound) && boolAgrees(v, bound) ? "data" : "pick";
   if (field.fieldType === "radio") {
     if (!/^(true|yes|on|1)$/i.test(v)) return "pick";
     const own = String(field.label ?? "").trim();
-    return bound && (boolAgrees(own, bound) || normalize(own) === normalize(bound)) ? "data" : "pick";
+    return bound && ((WORD_BOOL.test(bound) && boolAgrees(own, bound)) || normalize(own) === normalize(bound)) ? "data" : "pick";
   }
   if (field.fieldType === "select") {
     if (!bound) return "pick";
@@ -297,12 +371,18 @@ export function gapFillWriteKind(
     const certified = mappedKey ? String(projectFields[`${mappedKey}Certified`] ?? "").trim() : "";
     const candidates = [bound, ...(certified ? [certified] : []), ...equipmentMakeCandidates(bound)];
     const lands = (o: string): boolean => BOOLISH.test(bound)
-      ? normalize(o) === normalize(bound) || boolAgrees(o, bound)
+      ? normalize(o) === normalize(bound) || (WORD_BOOL.test(bound) && boolAgrees(o, bound))
       : candidates.some((c) => isRenderingOf(o, c));
     if (!lands(at)) return "pick";
-    // An exact option is unambiguous; a fuller rendering is data only when it is the only one.
-    if (candidates.some((c) => normalize(at) === normalize(c))) return "data";
-    const holding = (field.options ?? []).filter((o) => lands(o));
+    // An exact option is unambiguous — when only one option reads so (duplicate option text is not
+    // one answer); a fuller rendering is data only when it is the only option holding the value.
+    // A custom combobox whose options were never captured (PowerClerk's Manufacturer / Model) has
+    // nothing to compare with: only an exact candidate is data there.
+    const opts = field.options ?? [];
+    const exact = (o: string): boolean => candidates.some((c) => normalize(o) === normalize(c));
+    if (exact(at)) return opts.filter((o) => normalize(o) === normalize(at)).length <= 1 ? "data" : "pick";
+    if (!opts.length) return "pick";
+    const holding = opts.filter((o) => lands(o));
     return holding.length <= 1 ? "data" : "pick";
   }
   if (bound) return isRenderingOf(v, bound) ? "data" : "pick";
@@ -334,6 +414,10 @@ function labelIsOnlyIdent(field: ExtractedField): boolean {
  *  claimForWrite then checks is the control the extractor saw. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function locateExtracted(page: any, field: ExtractedField): Promise<any | null> {
+  // A control named only by its id / name (nothing a person reads) keeps main's locator: an
+  // `[id=…]` built for it answered a READY select whose question was not read (Helm review of
+  // 381204a, C6), where main never wrote it.
+  if (labelIsOnlyIdent(field)) return buildLocator(page, field.selector);
   const frame = field.selector?.frame;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const scope: any = frame ? (typeof page.frameLocator === "function" ? page.frameLocator(`iframe[name="${cssStr(frame)}"]`) : null) : page;
@@ -368,8 +452,8 @@ async function locateExtracted(page: any, field: ExtractedField): Promise<any | 
  *  behaviour), and none of its label, questions or options may read as submit intent. null =
  *  refused, or unreadable. A locator that cannot be evaluated (a test double) passes. */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function claimForWrite(loc: any, field: ExtractedField): Promise<{ id: string; name: string } | null> {
-  if (typeof loc?.evaluateAll !== "function") return { id: extractedIdOf(field), name: field.group || field.fingerprint?.name || "" };
+async function claimForWrite(loc: any, field: ExtractedField): Promise<{ id: string; name: string; questions: string[] } | null> {
+  if (typeof loc?.evaluateAll !== "function") return { id: extractedIdOf(field), name: field.group || field.fingerprint?.name || "", questions: questionsOfRaw(field) };
   const raws = await loc.evaluateAll(extractFieldsInPage).catch(() => null) as RawField[] | null;
   if (!Array.isArray(raws) || raws.length !== 1) return null;
   const raw = raws[0];
@@ -378,7 +462,23 @@ async function claimForWrite(loc: any, field: ExtractedField): Promise<{ id: str
   if (raw.fieldType !== field.fieldType) return null;
   if (!labelIsOnlyIdent(field) && normalize(raw.label) !== normalize(field.label)) return null;
   if (!gapFillMayAnswer({ label: raw.label, groupPrompt: raw.groupPrompt, options: raw.options, questions: raw.questions })) return null;
-  return { id: raw.id || "", name: raw.name || "" };
+  return { id: raw.id || "", name: raw.name || "", questions: questionsOfRaw(raw) };
+}
+
+/** EVERY QUESTION A CONTROL IS READ UNDER (#362): the extractor's questions, the group's prompt, and
+ *  its own label unless that is a radio's option word or only its id / name. Exported for the
+ *  draft click's "is this pick still in front of it" read (recipeAdapter). */
+export function questionsOfRaw(f: { fieldType?: string; label?: string; groupPrompt?: string; questions?: string[]; id?: string; name?: string }): string[] {
+  const out: string[] = [];
+  const add = (t: string | null | undefined): void => {
+    const c = String(t ?? "").replace(/\s+/g, " ").trim();
+    if (c && !out.includes(c)) out.push(c);
+  };
+  for (const q of f.questions ?? []) add(q);
+  add(f.groupPrompt);
+  const l = String(f.label ?? "").trim();
+  if (f.fieldType !== "radio" && l && l !== f.id && l !== f.name) add(l);
+  return out.slice(0, 16);
 }
 
 /** What the control now shows after the write: a select's chosen option text. "" when unread. */
@@ -548,7 +648,7 @@ export async function gapFillCurrentPage(
     for (const fill of plan.fills ?? []) {
       const slot = offered[fill.selectorIndex];
       if (!slot) continue;
-      const { field, loc } = slot;
+      const { field } = slot;
       if (isPayFee(field.label) || isSensitiveLabel(field.label)) continue;
       if (!gapFillMayAnswer(field, fill.value)) continue;
       if (!isGrounded(field, fill.value, fill.field, projectFields)) {
@@ -560,6 +660,10 @@ export async function gapFillCurrentPage(
       const choice = field.fieldType === "radio" || field.fieldType === "checkbox";
       const question = field.groupPrompt || (field.questions ?? []).find((q) => q && q !== own) || "";
       const shown = choice && question ? `${question.slice(0, 80)}: ${own}` : own;
+      // RE-LOCATED RIGHT BEFORE ITS WRITE (Helm review of 381204a): on a per-render-id portal an
+      // earlier write's re-render renumbers the ids read before it.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const loc: any = (await locateExtracted(page, field).catch(() => null)) ?? slot.loc;
       // The guard, on the element about to be written, immediately before the write.
       const claimed = await claimForWrite(loc, field);
       if (!claimed) continue;
@@ -569,6 +673,9 @@ export async function gapFillCurrentPage(
       const entry: GapFillOutcome["attemptedControls"][number] = {
         label: shown, id: claimed.id, name: claimed.name, kind: "pick",
         question: choice ? question : String(field.label ?? ""), option: choice ? own : "",
+        // Every question it was read under, whole (Helm review of 381204a, A1); a checkbox's own
+        // sentence is its question too.
+        questions: claimed.questions,
       };
       out.attemptedControls.push(entry);   // a pick until what landed says otherwise
       let applied = false;

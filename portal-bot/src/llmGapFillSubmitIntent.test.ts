@@ -188,6 +188,64 @@ await check("DATA OR PICK (Helm round 3, blocking 2): only the project's value R
   assert.equal(gapFillWriteKind({ fieldType: "text" }, "(555) 010-1234", "contactPhone", { contactPhone: "555-010-1234" }), "data");
 });
 
+await check("DATA OR PICK (Helm round 4): days only from dates, numbers with units, counts are not yes, no prose", () => {
+  const sel = (options?: string[]) => ({ fieldType: "select", ...(options ? { options } : {}) });
+  // B4: a battery model is not a day — V8's lenient Date read "Encharge 3" as "Powerwall 3".
+  assert.equal(gapFillWriteKind(sel(["Powerwall 3", "Encharge 3"]), "Encharge 3", "batteryModel", { batteryModel: "Powerwall 3" }, "Encharge 3"), "pick");
+  assert.equal(gapFillWriteKind(sel(["LG RESU 10", "Sonnen Eco 10"]), "Sonnen Eco 10", "batteryModel", { batteryModel: "LG RESU 10" }, "Sonnen Eco 10"), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "7", "systemSizeKw", { systemSizeKw: "7.1" }), "pick");
+  // Real dates still render the same day, in every timezone (parsed by hand).
+  for (const d of ["10/18/2026", "Oct 18, 2026", "October 18 2026", "18-Oct-2026", "2026-10-18T09:00:00Z"]) {
+    assert.equal(gapFillWriteKind({ fieldType: "text" }, d, "installDate", { installDate: "2026-10-18" }), "data", d);
+  }
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "10/19/2026", "installDate", { installDate: "2026-10-18" }), "pick");
+  // The same number with a unit word, or exactly x1000 — never a tolerance.
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "7.6 kW", "systemSizeKw", { systemSizeKw: "7.6" }), "data");
+  assert.equal(gapFillWriteKind(sel(["100 Amps", "200 Amps"]), "200 Amps", "mainPanelAmps", { mainPanelAmps: "200" }, "200 Amps"), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "7600 W", "systemSizeKw", { systemSizeKw: "7.6 kW" }), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "7600 W", "systemSizeKw", { systemSizeKw: "7.6" }), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "7.7 kW", "systemSizeKw", { systemSizeKw: "7.6" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "7600 A", "systemSizeKw", { systemSizeKw: "7.6 kW" }), "pick");
+  // A count is not a yes: "1" agrees with Yes only when the bound value is itself a word.
+  assert.equal(gapFillWriteKind(sel(["Yes", "No"]), "Yes", "inverterCount", { inverterCount: "1" }, "Yes"), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "checkbox" }, "on", "inverterCount", { inverterCount: "1" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "radio", label: "Yes" }, "Yes", "inverterCount", { inverterCount: "1" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "checkbox" }, "on", "hasBattery", { hasBattery: "Yes" }), "data");
+  // Prose that merely contains a project value, or negates it, is not the value.
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "Not Acme Solar", undefined, { installerCompany: "Acme Solar" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "We use Acme Solar for every install in this county", undefined, { installerCompany: "Acme Solar" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "Acme Solar LLC", undefined, { installerCompany: "Acme Solar" }), "data");
+  // A combobox whose options were never captured: only an exact candidate is data (comboHolds).
+  assert.equal(gapFillWriteKind(sel(), "Enphase IQ8M-72-2-US", "inverterModel", { inverterModel: "IQ8M-72-2-US" }, "Enphase IQ8M-72-2-US"), "pick");
+  assert.equal(gapFillWriteKind(sel(), "IQ8M-72-2-US", "inverterModel", { inverterModel: "IQ8M-72-2-US" }, "IQ8M-72-2-US"), "data");
+  // Duplicate option text is not one exact answer.
+  assert.equal(gapFillWriteKind(sel(["IQ8M", "IQ8M", "IQ8A"]), "IQ8M", "inverterModel", { inverterModel: "IQ8M" }, "IQ8M"), "pick");
+  // K5: the lone module offered is still not the project's module (no digit closeness).
+  assert.equal(gapFillWriteKind(sel(["ZXM7-SH108-405/M"]), "ZXM7-SH108-405/M", "moduleModel", { moduleModel: "ZXM7-SH108-410/M" }, "ZXM7-SH108-405/M"), "pick");
+  // K16: a make alias and the `${key}Certified` value are data.
+  assert.equal(gapFillWriteKind(sel(["Altenergy Power System", "Enphase Energy"]), "Altenergy Power System", "inverterMake", { inverterMake: "APsystems" }, "Altenergy Power System"), "data");
+  assert.equal(gapFillWriteKind(sel(["Enphase Energy", "SolarEdge Technologies"]), "Enphase Energy", "inverterMake", { inverterMake: "Enphase" }, "Enphase Energy"), "data");
+  assert.equal(gapFillWriteKind(sel(["ZXM7-SH108-410/M", "ZXM7-SH108-415/M"]), "ZXM7-SH108-410/M", "moduleModel", { moduleModel: "ZXM7 410", moduleModelCertified: "ZXM7-SH108-410/M" }, "ZXM7-SH108-410/M"), "data");
+});
+
+await check("SUBMIT WORDING (Helm round 4): refused unless it only names a fact — both ways", () => {
+  const refused = [
+    "Is this application ready for submittal?", "Should this application be submitted now?", "Submit to the utility?",
+    "Do you confirm this request should be submitted?", "Okay to submit?", "Proceed to submit", "Are you ready to submit your application?",
+    "Confirm submission", "Sign and file", "Resubmit", "Finalize your application", "File the application now",
+    "Send this Net Metering application to the utility?", "¿Desea enviar la solicitud?", "Presentar solicitud", "Listo para enviar",
+    "¿Está listo para presentar la solicitud?",
+  ];
+  const answered = [
+    "Date Submitted", "Submittal Type", "Submitted by", "Submission Date", "Date of submission", "Who will submit the application?",
+    "File Name", "Filing fee tier", "Do you want to submit additional documents?", "Want to submit photos of the roof?",
+    "Do you need to submit revised plans?", "Estimated Finish Date", "Mill Finish", "Finalize", "Roof finish",
+    "Attach a file for this application", "Interconnection Application Part 1", "Application type", AGREE,
+  ];
+  for (const t of refused) assert.equal(gapFillMayAnswer(t), false, `answered: ${t}`);
+  for (const t of answered) assert.equal(gapFillMayAnswer(t), true, `refused: ${t}`);
+});
+
 await check("A radio pick is named by its question, not by its option word alone", async () => {
   const radio = (id: string, label: string): RawField => ({ label, fieldType: "radio", id, name: "gridTied", groupPrompt: "Is the system grid-tied?", required: true } as RawField);
   const { page } = fakePage([radio("gY", "Yes"), radio("gN", "No")]);

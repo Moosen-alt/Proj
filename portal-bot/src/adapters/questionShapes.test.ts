@@ -51,6 +51,17 @@ const SHAPES: Record<string, string> = {
          <div class="form-group"><label class="control-label">Is the system grid-tied?</label>${yesNo("grid")}</div>`,
   legend: `<fieldset><legend>${READY}</legend>${yesNo("readyR")}</fieldset><fieldset><legend>Is the system grid-tied?</legend>${yesNo("grid")}</fieldset>`,
   aria: `<div role="radiogroup" aria-label="${READY}">${yesNo("readyR")}</div><div role="radiogroup" aria-label="Is the system grid-tied?">${yesNo("grid")}</div>`,
+  // Round 5 (Helm review of 381204a, C5): a help / Clear button in the row is not an answer and
+  // does not hide the question; a legend nested anywhere in the fieldset, for a select too; and
+  // aria-describedby on the control.
+  helpButtonRadios: `<div class="row"><span>${READY}</span><button type="button">?</button>${yesNo("readyR")}</div>
+         <div class="row"><span>Is the system grid-tied?</span><button type="button">?</button>${yesNo("grid")}</div>`,
+  helpButtonSelect: `<div class="row"><span>${READY}</span><button type="button">Clear</button><select id="readyS"><option>Select…</option><option>Yes</option><option>No</option></select></div>
+         <div class="row"><span>Mounting</span><button type="button">Clear</button><select id="mount"><option>Select…</option><option>Roof</option><option>Ground</option></select></div>`,
+  nestedLegendSelect: `<fieldset><div class="hd"><legend>${READY}</legend></div><select id="readyS"><option>Select…</option><option>Yes</option><option>No</option></select></fieldset>
+         <fieldset><div class="hd"><legend>Mounting</legend></div><select id="mount"><option>Select…</option><option>Roof</option><option>Ground</option></select></fieldset>`,
+  describedBy: `<div id="d1">${READY}</div><select id="readyS" aria-describedby="d1"><option>Select…</option><option>Yes</option><option>No</option></select>
+         <div id="d2">Mounting</div><select id="mount" aria-describedby="d2"><option>Select…</option><option>Roof</option><option>Ground</option></select>`,
 };
 
 const browser = await chromium.launch();
@@ -89,6 +100,17 @@ await check("a container of prose that mentions submitting is not a question", a
   assert.ok(f && !guarded(f), JSON.stringify(f));
 });
 
+await check("help text after a control, and an instruction above a select with its own label, are not its question", async () => {
+  const raws = await extract(`<div><label for="lic">Contractor License Number</label><input id="lic" type="text"><small>You will submit your application on the next page.</small></div>
+    <div><label for="mnt">Mounting</label><select id="mnt"><option>Roof</option><option>Ground</option></select><small>Submit your application after the review page.</small></div>
+    <div><p>When you are ready to submit, click Submit below.</p><label for="mnt2">Mounting</label><select id="mnt2"><option>Roof</option><option>Ground</option></select></div>
+    <div><label for="txt">Notes</label><input id="txt" type="text"><script>var submitNow = "ready to submit your application";</script></div>`);
+  for (const id of ["lic", "mnt", "mnt2", "txt"]) {
+    const f = raws.find((x) => x.id === id);
+    assert.ok(f && !guarded(f), `${id}: ${JSON.stringify(f && { label: f.label, questions: f.questions })}`);
+  }
+});
+
 // ---- the sweep: what is a blank in front of the stamped draft Submit ----------------------
 const blanks = async (html: string): Promise<string[]> => {
   await page.setContent(`<!doctype html><html><body><form>${html}</form></body></html>`);
@@ -100,12 +122,20 @@ await check("SF5: a required unticked 'I am ready to submit' checkbox is a blank
   assert.deepEqual(await blanks(box("required checked")), []);
   assert.deepEqual(await blanks(box("")), []);
   assert.deepEqual(await blanks(box("required disabled")), []);
+  // Boxes sharing a name are one group: one ticked member answers it; unanswered, it is one blank.
+  const pair = (a: string, b: string) => `<input type="checkbox" id="s1" name="svc" value="a" required ${a}><label for="s1">Solar</label><input type="checkbox" id="s2" name="svc" value="b" required ${b}><label for="s2">Storage</label>`;
+  assert.deepEqual(await blanks(pair("", "checked")), []);
+  assert.equal((await blanks(pair("", ""))).length, 1);
 });
 await check("SF3: a required radio group is a blank only when a person could answer it", async () => {
   const grp = (wrap: string, extra = "required") => `<div ${wrap}><div>Is the system grid-tied?</div>${yesNo("grid", extra)}</div>`;
   assert.ok((await blanks(grp(""))).length === 1, "an answerable required group is a blank");
   assert.deepEqual(await blanks(grp('style="display:none"')), [], "a hidden group is not");
   assert.deepEqual(await blanks(grp('style="visibility:hidden"')), [], "an invisible group is not");
+  // Label-wrapped radios (the label is what renders): hidden with their group, still not a blank.
+  const wrapped = (wrap: string) => `<div ${wrap}><div>Is the system grid-tied?</div>${["Yes", "No"].map((v) => `<label><input type="radio" name="gw" value="${v}" required> ${v}</label>`).join("")}</div>`;
+  assert.ok((await blanks(wrapped(""))).length === 1, "an answerable label-wrapped group is a blank");
+  assert.deepEqual(await blanks(wrapped('style="display:none"')), [], "a hidden label-wrapped group is not");
   assert.deepEqual(await blanks(grp("", "required disabled")), [], "a disabled group is not");
   assert.deepEqual(await blanks(`<div><div>Is the system grid-tied?</div>${yesNo("grid", "required checked")}</div>`), [], "an answered group is not");
   // main's own reasons (an asterisk) are untouched by the answerable test.

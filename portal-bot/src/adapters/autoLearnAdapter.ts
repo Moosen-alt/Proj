@@ -1335,6 +1335,9 @@ export interface RawField {
   groupPrompt?: string;
   /** See ExtractedField.questions. */
   questions?: string[];
+  /** A probe mark the draft click's pick read put on the element (data-al-pq), echoed back so its
+   *  reading can be tied to the element (#362). Nothing else sets or reads it. */
+  probe?: string;
   /** A choice tile (markChoiceTilesInPage): a card clicked as a whole, labelled by its title.
    *  Its selector is the title TEXT — getByRole finds nothing on a plain container. */
   tile?: boolean;
@@ -1486,6 +1489,15 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
   // THE CONTROL'S QUESTION FROM EVERY SOURCE (#362) — see ExtractedField.questions. One reading
   // for the extractor and for the gap-fill's last check before a write (claimForWrite runs this
   // function on the element itself), so the two can never disagree.
+  //   - every legend of every enclosing fieldset, nested anywhere in it (not a nested fieldset's);
+  //   - aria-labelledby, aria-label and aria-describedby, on the control and on its group;
+  //   - a non-choice control's own label;
+  //   - a choice control or a select (never a free-text box: its question is its label, aria and
+  //     legend): the text BEFORE it in the smallest container whose only ANSWER controls are this
+  //     one or its group — a help, info or Clear button in the row is not an answer and does not
+  //     end the climb — each part (≤200) and the parts joined (≤200); then one text-only element
+  //     just before that container. Never text after the control (help, a hint), never script,
+  //     style, template, a heading, a button's own words, or an option's own word.
   function questionsOf(el: Element, kind: string, ownLabel: string): string[] {
     const clean = (t: string | null | undefined): string => String(t || "").replace(/\s+/g, " ").trim();
     const out: string[] = [];
@@ -1498,44 +1510,60 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
     const byIds = (ids: string | null): string => (ids || "").split(/\s+/).filter(Boolean)
       .map((r) => clean(byId(r)?.textContent)).filter(Boolean).join(" ");
     const choice = kind === "radio" || kind === "checkbox";
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    const listish = kind === "select" || el.tagName === "SELECT" || role === "combobox" || role === "listbox";
     const words = new Set(optionWordsOf(el).map((w) => w.toLowerCase()));
-    // Every enclosing fieldset's legend (a section-title legend does not hide a question legend).
     for (let fs = el.closest("fieldset"); fs; fs = fs.parentElement ? fs.parentElement.closest("fieldset") : null) {
-      add(Array.from(fs.children).find((c) => c.tagName === "LEGEND")?.textContent);
+      for (const lg of Array.from(fs.querySelectorAll("legend"))) if (lg.closest("fieldset") === fs) add(lg.textContent);
     }
     add(byIds(el.getAttribute("aria-labelledby")));
     add(el.getAttribute("aria-label"));
+    add(byIds(el.getAttribute("aria-describedby")));
     const grp = el.closest('[role="radiogroup"], [role="group"]');
-    if (grp) { add(byIds(grp.getAttribute("aria-labelledby"))); add(grp.getAttribute("aria-label")); }
+    if (grp) { add(byIds(grp.getAttribute("aria-labelledby"))); add(grp.getAttribute("aria-label")); add(byIds(grp.getAttribute("aria-describedby"))); }
     if (!choice) add(ownLabel);
-    // The smallest container holding only this control (a choice control: only its group).
+    if (!choice && !listish) return out;
+    // A select with its OWN label is asked by that label: an instruction above it ("When you are
+    // ready to submit, click Submit below") is not its question.
+    if (!choice) {
+      const id = el.getAttribute("id");
+      const ownLbl = (id && document.querySelector(`label[for="${CSS.escape(id)}"]`)) || el.closest("label");
+      if ((ownLbl && clean(ownLbl.textContent)) || clean(el.getAttribute("aria-label")) || byIds(el.getAttribute("aria-labelledby"))) return out;
+    }
+    // The smallest container holding only this control's answers (a choice control: its group).
     const nm = choice ? el.getAttribute("name") : null;
     const ours = (c: Element): boolean => c === el || (!!nm && c.getAttribute("name") === nm);
-    const CONTROLS = "input:not([type=hidden]), select, textarea, button, [role=button], [role=combobox], [role=listbox]";
+    const ANSWERS = 'input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]):not([type=image]), select, textarea, [role=combobox], [role=listbox], [role=radio], [role=checkbox]';
     let box: Element = el;
     for (let up = el.parentElement; up && up !== document.body && up.tagName !== "FORM"; up = up.parentElement) {
-      if (!Array.from(up.querySelectorAll(CONTROLS)).every(ours)) break;
+      if (!Array.from(up.querySelectorAll(ANSWERS)).every(ours)) break;
       box = up;
     }
+    const SKIP = "h1, h2, h3, h4, h5, h6, option, script, style, template, noscript, legend, button, [role=button], select";
     if (box !== el) {
+      const first = Array.from(box.querySelectorAll(ANSWERS)).find(ours) || el;
       const parts: string[] = [];
       const walker = document.createTreeWalker(box, NodeFilter.SHOW_TEXT);
       for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        // Only text BEFORE the control: what follows it is help, a hint or an option's word.
+        if (!(first.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_PRECEDING)) continue;
         const host = n.parentElement;
-        if (!host || host.closest("h1, h2, h3, h4, h5, h6, option, script, style, legend")) continue;
+        if (!host || host.closest(SKIP)) continue;
         const t = clean(n.textContent);
         if (!t || words.has(t.toLowerCase()) || (choice && t === ownLabel)) continue;
         parts.push(t);
       }
       // A container of prose is not a question (instructions that mention submitting): a caption
       // is short, as the required sweep reads one (≤160 there; 200 here for a long question).
+      for (const p of parts) if (p.length <= 200) add(p);
       const joined = parts.join(" ");
       if (joined.length <= 200) add(joined);
     }
     // A text-only element just before that container ("<p>Question?</p><select>").
     let sib = box.previousElementSibling;
     for (let k = 0; sib && k < 2; k++, sib = sib.previousElementSibling) {
-      if (sib.querySelector(CONTROLS) || /^H[1-6]$/.test(sib.tagName)) break;
+      if (sib.matches("script, style, template, noscript")) { k--; continue; }
+      if (sib.querySelector(ANSWERS) || /^H[1-6]$/.test(sib.tagName)) break;
       const t = clean(sib.textContent);
       if (t && t.length <= 200) { add(t); break; }
     }
@@ -1886,6 +1914,7 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       testCss,
       groupPrompt: groupPrompt || undefined,
       questions: questions.length ? questions : undefined,
+      probe: el.getAttribute("data-al-pq") || undefined,
       ariaLabel: el.getAttribute("aria-label")?.trim() || undefined,
       inActiveScope: scopeEl ? scopeEl.contains(el) : undefined,
       offstage: scopeEl ? !!el.closest('[aria-hidden="true"], [inert]') : undefined,

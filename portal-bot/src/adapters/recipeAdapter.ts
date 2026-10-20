@@ -92,7 +92,7 @@ import { attachmentTypeFor, isDocumentTypeList } from "./attachmentTypes";
 import { cleanRecordLink, readApplicationLedgerInPage, type LedgerEntry } from "./submissionLedger";
 import { exactUploadDocType, fileTypeAllowed, UPLOAD_LABEL_PATTERNS, uploadForbidsSubstitute } from "./autoLearnAdapter";
 import { reviewComparison, scrapeReviewScreen as scrapeReviewScreenShared, utilityIdentifiersEnteredBySteps, type ReviewMismatch } from "../reviewScreenScraper";
-import { sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
+import { SWEPT_BLANK_ATTR, sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
 import { openPortal } from "../browser";
 import { selectWithFallback, comboboxFaceInPage } from "../comboboxFill";
 import {
@@ -110,7 +110,7 @@ import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describe
 const DRIFT_SETTLE_MS = Math.max(2000, Number(process.env.RECIPE_DRIFT_SETTLE_MS ?? 15000));
 import { redactCaptureText, readbackMatches, detectChallengeFrame, frameSelectorFor, hasNumericValidationError, RETRY_BACKOFF_MS, sleep, smartWait, toBareNumber, waitForElement, waitForInteractiveControls } from "../safeAction";
 import { findFilingStatus } from "../statusFinder";
-import { UNRECORDED_WRITE_ATTR, gapFillMayAnswer, isSubmitIntentField } from "../llmGapFill";
+import { UNRECORDED_WRITE_ATTR, gapFillMayAnswer, isSubmitIntentField, questionsOfRaw } from "../llmGapFill";
 import { performLogin, portalErrorPage } from "./loginFlow";
 import { chooseCorrectionForm, correctionFormSelector, isRefusal, scanProjectForms, type ProjectFormRow } from "./correctionForm";
 import { type ExtractedField, type RawField, EXTRACT_SEL, extractFieldsInPage, toExtractedField, dismissPageModals, clearPageOverlays, equipmentMakeCandidates, pageFingerprintOf, collectValidationErrorsFrom, acaApplyEntryFrom, advanceSignatureOf } from "./autoLearnAdapter";
@@ -487,6 +487,20 @@ const ROW_FIELD_HOOKS: Record<string, { role: string; name: string }> = {
   array1Tracking: { role: "tracking-select", name: "Tracking" },
 };
 
+/** The recorded control of a write step as an id css (#362): its `#id` selector, an `[id=…]` one, or
+ *  its fingerprint id. "" when the step names no id — then only its own document and view make a
+ *  re-assert of it this page's own. */
+/** The attribute a re-assert puts on the one control it checked (#362, Helm review of 381204a, C8):
+ *  the step then runs through a selector for that element alone. */
+const REASSERT_PIN_ATTR = "data-al-reassert";
+const isPinnedReassert = (step: RecipeStep): boolean => String(step.selector?.css ?? "").startsWith(`[${REASSERT_PIN_ATTR}=`);
+function recordedControlCss(step: RecipeStep): string {
+  const css = String(step.selector?.css ?? "").trim();
+  if (/^#[A-Za-z_][\w:.-]*$/.test(css) || /^\[id="[^"]+"\]$/.test(css)) return css;
+  const id = String(step.fingerprint?.id ?? "").trim();
+  return id ? `[id="${id.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"]` : "";
+}
+
 /** THE FIRST WORDS OF A STOP FOR PICKS (#362, Helm review of 4081f12, SF1). The run card and the
  *  project's stage line read the first line of the stop message (backend pausedRunSentence, behind
  *  "stopped before review — "), and the dashboard's why-line cuts it at 240 characters, so this
@@ -548,41 +562,50 @@ export class RecipeAdapter extends BasePortalAdapter {
    *     blank here. Read by clickDraftCreatingSubmit: the stamped draft click only happens on the
    *     page the stamp saw, and a page that needed an AI's pick is not that page.
    *  KEYED TO THE CONTROL AND ITS QUESTION, NOT TO "LEAVING THE PAGE": a pick's element carries
-   *  UNRECORDED_WRITE_ATTR, and its id, name, question, document and view are kept. At the draft
-   *  click a pick is IN FRONT when its control is still stamped; or it was made in this document and
-   *  this view (a re-mount under a new id, a removed dialog — an advance that only reveals more of
-   *  the same page keeps the view); or a control with its id OR name is here and, in another
-   *  document, still asks its question (a revisit; an earlier page's reused id that asks something
-   *  else is not it); or an answered control asks its question (a revisit under new ids). So a
-   *  pick left on an EARLIER page is left behind by a real navigation unless Part 1 asks the same
-   *  question (the owner's "Submit page only" scope, pending his card). See unrecordedPicksInFront. */
+   *  UNRECORDED_WRITE_ATTR, and its id, name, every question it was read under, document and view
+   *  are kept. At the draft click a pick is IN FRONT when its control is still stamped; or it was
+   *  made in this document and this view (a re-mount under a new id, a removed dialog — an advance
+   *  that only reveals more of the same page keeps the view); or a control with its id OR name is
+   *  here and, in another document, does not readably ask something else (a revisit; an earlier
+   *  page's reused id that asks another question is not it); or an answered control asks its
+   *  question (a revisit under new ids). So a pick left on an EARLIER page is left behind by a real
+   *  navigation unless Part 1 asks the same question (the owner's "Submit page only" scope, pending
+   *  his card). See unrecordedPicksInFront. */
   /** The stop's first words when the stamped draft click was refused for picks (#362). */
   private draftPickTell: string | null = null;
-  private unrecordedWrites: Array<{ kind: "data" | "pick"; label: string; id: string; name: string; doc: string; view: number; question: string; option: string }> = [];
-  /** WHICH VIEW EACH RECORDED WRITE RAN IN (#362): what tells a re-assert of THIS view's recorded
-   *  value (a re-render, a reload after Save) from one carried over from another page. A new view
-   *  begins when the URL path or the page heading changes, or when the controls on screen were
-   *  REPLACED (fewer than half of the last ones still there — a single-document app's "Proceed to
-   *  Part 1"). A reveal adds controls and keeps the view; a same-URL, same-heading reload with the
-   *  same controls keeps it too. -1 = unreadable, which never matches (a re-assert then counts as
-   *  carried over: the safe direction). */
+  private unrecordedWrites: Array<{ kind: "data" | "pick"; label: string; id: string; name: string; doc: string; view: number; question: string; option: string; questions: string[] }> = [];
+  /** WHICH VIEW (#362). Within one document a new view begins only when the URL PATH changes or the
+   *  controls on screen were REPLACED: most of the last ones gone AND most of the ones now showing
+   *  new (a single-document app's "Proceed to Part 1"). Never on heading text or `location.search`
+   *  alone (a re-render, a postback, a "Saved" toast), never when controls only appear (a reveal,
+   *  a dialog opening) or only go (a dialog closing). -1 = unreadable, which never matches. */
   private viewSeq = 0;
-  private lastView: { key: string; ids: string[] } | null = null;
-  private recordedStepView = new Map<number, number>();
+  private lastView: { path: string; ids: string[] } | null = null;
+  /** Where each recorded write ran (#362, Helm review of 381204a, A2): its document, its view, its
+   *  URL path and the recorded control (an id css), so a re-assert can tell THIS page's own value
+   *  from one carried over from a page with the same URL. */
+  private recordedStepView = new Map<number, { doc: string; view: number; path: string; ctl: string }>();
+  /** The element the current recorded step actually wrote (executeStepInner), or null when it wrote
+   *  nothing (a no-battery skip, a fee tier, a control not offered) — what recordingOverwrotePick
+   *  clears, never the control the step's selector names now. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private writtenTarget: any = null;
+  private reassertSeq = 0;
   private async observeView(): Promise<number> {
     if (!this.page || typeof this.page.evaluate !== "function") return -1;
     const read = await this.page.evaluate(() => {
       const vis = (el: Element): boolean => { const r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; };
-      const h = document.querySelector("h1, h2, legend");
       const ids = Array.from(document.querySelectorAll("input:not([type=hidden]), select, textarea"))
         .filter(vis).map((el) => el.getAttribute("id") || el.getAttribute("name") || "").filter(Boolean).slice(0, 300);
-      return { key: `${location.pathname}${location.search}|${(h?.textContent || "").replace(/\s+/g, " ").trim().slice(0, 120)}`, ids };
-    }).catch(() => null) as { key: string; ids: string[] } | null;
-    if (!read || typeof read.key !== "string" || !Array.isArray(read.ids)) return -1;
+      return { path: location.pathname, ids };
+    }).catch(() => null) as { path: string; ids: string[] } | null;
+    if (!read || typeof read.path !== "string" || !Array.isArray(read.ids)) return -1;
     const last = this.lastView;
     if (last) {
-      const kept = last.ids.filter((i) => read.ids.includes(i)).length;
-      if (read.key !== last.key || (last.ids.length > 0 && kept * 2 < last.ids.length)) this.viewSeq++;
+      const lost = last.ids.filter((i) => !read.ids.includes(i)).length;
+      const fresh = read.ids.filter((i) => !last.ids.includes(i)).length;
+      const replaced = last.ids.length > 0 && read.ids.length > 0 && lost * 2 > last.ids.length && fresh * 2 > read.ids.length;
+      if (read.path !== last.path || replaced) this.viewSeq++;
     }
     this.lastView = read;
     return this.viewSeq;
@@ -599,16 +622,19 @@ export class RecipeAdapter extends BasePortalAdapter {
     }).catch(() => "");
     return String(t || "") || "*";
   }
-  private async noteUnrecordedWrite(kind: "data" | "pick", what: string, control?: { id?: string; name?: string; question?: string; option?: string }): Promise<void> {
+  private async noteUnrecordedWrite(kind: "data" | "pick", what: string, control?: { id?: string; name?: string; question?: string; option?: string; questions?: string[] }): Promise<void> {
     const label = String(what || "").replace(/\s+/g, " ").trim().slice(0, 100) || "a control";
     const id = String(control?.id ?? "");
     const name = String(control?.name ?? "");
-    const question = String(control?.question ?? "").replace(/\s+/g, " ").trim().slice(0, 200);
-    const option = String(control?.option ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+    const clean = (t: unknown): string => String(t ?? "").replace(/\s+/g, " ").trim();
+    const question = clean(control?.question);
+    const option = clean(control?.option).slice(0, 200);
+    // EVERY QUESTION, WHOLE (Helm review of 381204a, A1): what reads the pick back on a revisit.
+    const questions = Array.from(new Set([question, ...(control?.questions ?? []).map(clean)].filter(Boolean))).slice(0, 16);
     const doc = await this.docToken();
     const view = await this.observeView();
     if (this.unrecordedWrites.some((w) => w.kind === kind && w.label === label && w.id === id && w.name === name && w.doc === doc)) return;
-    this.unrecordedWrites.push({ kind, label, id, name, doc, view, question, option });
+    this.unrecordedWrites.push({ kind, label, id, name, doc, view, question, option, questions });
   }
   /** Note a write to the control a locator resolves: keep its id / name, and stamp it when it is a
    *  pick. A control that cannot be read is tied to the document instead. */
@@ -624,56 +650,34 @@ export class RecipeAdapter extends BasePortalAdapter {
     await this.noteUnrecordedWrite(kind, label, ctl ?? undefined);
   }
   /** Which PICKS are still in front of the draft click (see unrecordedWrites). Unreadable = every
-   *  pick of the run (fail closed). Data-backed writes never count. */
+   *  pick of the run (fail closed). Data-backed writes never count. One entry per pick: two
+   *  controls sharing a label are two picks, and a stamp cloned onto a re-render of a noted pick's
+   *  own control is that pick. */
   private async unrecordedPicksInFront(): Promise<string[]> {
     const picks = this.unrecordedWrites.filter((w) => w.kind === "pick");
     if (!picks.length) return [];
-    const all = (): string[] => Array.from(new Set(picks.map((w) => w.label)));
+    const all = (): string[] => picks.map((w) => w.label);
     if (!this.page || typeof this.page.evaluate !== "function") return all();
     const doc = await this.docToken();
-    // IN FRONT, PER PICK (Helm review of 4081f12, Blocking 1, "Submit page only"), any of:
-    //   - its control is still stamped (UNRECORDED_WRITE_ATTR rides the element itself);
+    // IN FRONT, PER PICK (Helm reviews of 4081f12 and 381204a, "Submit page only"), any of:
+    //   - its control is still stamped (UNRECORDED_WRITE_ATTR rides the element itself, so this
+    //     holds even where its id, name and question are all unreadable);
     //   - it was made in THIS document and THIS view (observeView) — even if its control was
-    //     re-created under a new id or removed (a re-mount, a synchronous re-render, a dialog that
-    //     copied its answer to a hidden input and closed); unreadable views fail closed;
+    //     re-created under a new id or removed (a re-mount, a re-render, a dialog that copied its
+    //     answer and closed). A pick with no id, name or question: made in this document;
     //   - a control with its id OR its name is here: in this document always; in another document
-    //     (a revisit, a reused id) only when that control still asks the pick's question;
-    //   - an ANSWERED, visible control asks the pick's own question (its label, aria-label or
-    //     aria-labelledby; a checked radio: its option word under that question) — a revisit that
-    //     renders new ids.
-    // ONE ENTRY PER CONTROL (Helm nit): a stamp that is a noted pick's own control is that pick.
+    //     (a revisit, a reload) unless that control READABLY asks something else — unknown counts
+    //     as in front;
+    //   - an ANSWERED, visible control asks the pick's own question (a revisit under new ids; a
+    //     checked radio also by its option word; a checkbox by its own sentence).
+    // "Asks" is the extractor's own reading (questionsOf, through extractFieldsInPage), compared
+    // whole with every question the pick was read under — the same reading the guard used.
     const view = await this.observeView();
-    const main = await this.page.evaluate((a: { attr: string; writes: Array<{ label: string; id: string; name: string; doc: string; view: number; question: string; option: string }>; doc: string; view: number }) => {
-      const norm = (t: string | null | undefined): string => String(t || "").replace(/[\s*:?]+/g, " ").trim().toLowerCase();
+    const PQ = "data-al-pq";
+    type Info = { id: string; name: string; type: string; answered: boolean; visible: boolean; stamp: string | null };
+    const scan = await this.page.evaluate((a: { attr: string; pq: string; writes: Array<{ id: string; name: string }> }) => {
+      for (const el of Array.from(document.querySelectorAll(`[${a.pq}]`))) el.removeAttribute(a.pq);
       const vis = (el: Element): boolean => { const r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; };
-      const byIds = (ids: string | null): string => (ids || "").split(/\s+/).filter(Boolean).map((r) => document.getElementById(r)?.textContent || "").join(" ");
-      const labelsOf = (el: Element): string[] => {
-        const out: string[] = [];
-        const id = el.getAttribute("id");
-        if (id) for (const l of Array.from(document.querySelectorAll(`label[for="${CSS.escape(id)}"]`))) out.push(l.textContent || "");
-        const wrap = el.closest("label"); if (wrap) out.push(wrap.textContent || "");
-        out.push(el.getAttribute("aria-label") || "", byIds(el.getAttribute("aria-labelledby")));
-        return out.map(norm).filter(Boolean);
-      };
-      // The question a control asks: its labels; a radio/checkbox: its group's (legend, radiogroup
-      // name, or the text of the smallest container holding only its group).
-      const asks = (el: Element, q: string, option: string): boolean => {
-        const ty = (el.getAttribute("type") || "").toLowerCase();
-        if (ty === "radio" || ty === "checkbox") {
-          if (option && !labelsOf(el).some((l) => l === norm(option))) return false;
-          const nm = el.getAttribute("name");
-          for (let up = el.parentElement, k = 0; up && up !== document.body && k < 6; up = up.parentElement, k++) {
-            const legend = up.tagName === "FIELDSET" ? Array.from(up.children).find((c) => c.tagName === "LEGEND") : null;
-            const named = norm(up.getAttribute("aria-label")) || norm(byIds(up.getAttribute("aria-labelledby"))) || norm(legend?.textContent);
-            if (named) return named.includes(q);
-            const others = Array.from(up.querySelectorAll("input, select, textarea")).some((c) => c !== el && (!nm || c.getAttribute("name") !== nm));
-            if (others) return false;
-            if (norm((up as HTMLElement).innerText).includes(q)) return true;
-          }
-          return false;
-        }
-        return labelsOf(el).some((l) => l === q);
-      };
       const answered = (el: Element): boolean => {
         const i = el as HTMLInputElement;
         const ty = (el.getAttribute("type") || "").toLowerCase();
@@ -681,37 +685,86 @@ export class RecipeAdapter extends BasePortalAdapter {
         if (el.tagName === "SELECT") { const s = el as HTMLSelectElement; return s.selectedIndex > 0 || (!!s.value && s.selectedIndex >= 0); }
         return !!String(i.value || "").trim();
       };
-      const controls = Array.from(document.querySelectorAll("input:not([type=hidden]), select, textarea"));
-      const out: string[] = [];
-      const stamped = Array.from(document.querySelectorAll(`[${a.attr}]`));
-      const claimed = new Set<Element>();
-      for (const w of a.writes) {
-        const q = norm(w.question);
-        const mine = stamped.filter((el) => (!!w.id && el.getAttribute("id") === w.id) || (!!w.name && el.getAttribute("name") === w.name));
-        mine.forEach((el) => claimed.add(el));
-        const sameDoc = w.doc === "*" || a.doc === "*" || w.doc === a.doc;
-        const sameView = sameDoc && (w.view < 0 || a.view < 0 || w.view === a.view);
-        const byKey = [
-          ...(w.id ? [document.getElementById(w.id)] : []),
-          ...(w.name ? Array.from(document.getElementsByName(w.name)) : []),
-        ].filter((el): el is HTMLElement => !!el);
-        const keyHere = byKey.length > 0 && (sameDoc || !q || byKey.some((el) => asks(el, q, w.option)));
-        const askedHere = !!q && controls.some((el) => vis(el) && answered(el) && asks(el, q, w.option));
-        if (mine.length || sameView || keyHere || askedHere) out.push(w.label);
-      }
-      for (const el of stamped) if (!claimed.has(el)) out.push(el.getAttribute(a.attr) || "a control");
-      return out;
-    }, { attr: UNRECORDED_WRITE_ATTR, writes: picks, doc, view }).catch(() => null) as string[] | null;
-    if (!main) return all();
+      const els: Element[] = [];
+      const keyOf = (el: Element): number => {
+        let k = els.indexOf(el);
+        if (k < 0) { k = els.length; els.push(el); el.setAttribute(a.pq, String(k)); }
+        return k;
+      };
+      const isControl = (el: Element): boolean => /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName) || !!el.getAttribute("role");
+      const byKey = a.writes.map((w) => Array.from(new Set([
+        ...(w.id ? Array.from(document.querySelectorAll(`[id="${CSS.escape(w.id)}"]`)) : []),
+        ...(w.name ? Array.from(document.getElementsByName(w.name)) : []),
+      ])).filter(isControl).slice(0, 20).map(keyOf));
+      const shown = (el: Element): boolean => vis(el) || Array.from((el as HTMLInputElement).labels ?? []).some(vis);
+      const answeredKs = Array.from(document.querySelectorAll("input:not([type=hidden]), select, textarea"))
+        .filter((el) => shown(el) && answered(el)).slice(0, 300).map(keyOf);
+      const stampedKs = Array.from(document.querySelectorAll(`[${a.attr}]`)).map(keyOf);
+      const info = els.map((el) => ({
+        id: el.getAttribute("id") || "", name: el.getAttribute("name") || "",
+        type: ((el as HTMLInputElement).type || el.tagName || "").toLowerCase(),
+        answered: answered(el), visible: shown(el), stamp: el.getAttribute(a.attr),
+      }));
+      return { byKey, answeredKs, stampedKs, info };
+    }, { attr: UNRECORDED_WRITE_ATTR, pq: PQ, writes: picks.map((w) => ({ id: w.id, name: w.name })) })
+      .catch(() => null) as { byKey: number[][]; answeredKs: number[]; stampedKs: number[]; info: Info[] } | null;
+    if (!scan || !Array.isArray(scan.info) || !Array.isArray(scan.byKey)) return all();
+    // The extractor's reading of every probed element, tied back by its probe mark.
+    const rawOf = new Map<number, RawField>();
+    if (typeof this.page.locator === "function") {
+      const raws = await this.page.locator(`[${PQ}]`).evaluateAll(extractFieldsInPage).catch(() => null) as RawField[] | null;
+      for (const r of Array.isArray(raws) ? raws : []) if (r && r.probe != null) rawOf.set(Number(r.probe), r);
+    }
+    await this.page.evaluate((pq: string) => { for (const el of Array.from(document.querySelectorAll(`[${pq}]`))) el.removeAttribute(pq); }, PQ).catch(() => null);
+    const norm = (t: string | null | undefined): string => String(t || "").replace(/[\s*:?]+/g, " ").trim().toLowerCase();
+    // THREE-VALUED (Helm review of 381204a, A1): "yes" it asks the pick's question; "no" it readably
+    // asks something else; "unknown" — no question stored, or none readable on the live control.
+    const asks = (k: number, w: (typeof picks)[number]): "yes" | "no" | "unknown" => {
+      const pq = w.questions.map(norm).filter(Boolean);
+      const inf = scan.info[k];
+      if (!pq.length || !inf) return "unknown";
+      if ((inf.id && pq.includes(norm(inf.id))) || (inf.name && pq.includes(norm(inf.name)))) return "yes";
+      const raw = rawOf.get(k);
+      if (!raw) return "unknown";
+      const live = questionsOfRaw(raw).map(norm).filter((q) => q && q !== norm(inf.id) && q !== norm(inf.name));
+      if (!live.length) return "unknown";
+      return pq.some((q) => live.includes(q)) ? "yes" : "no";
+    };
+    const optionOk = (k: number, w: (typeof picks)[number]): boolean => {
+      const inf = scan.info[k];
+      if (inf?.type !== "radio" || !w.option) return true;
+      const raw = rawOf.get(k);
+      return !!raw && norm(raw.label) === norm(w.option);
+    };
+    const out: string[] = [];
+    const claimed = new Set<number>();
+    picks.forEach((w, i) => {
+      const keyed = scan.byKey[i] ?? [];
+      const mine = keyed.filter((k) => scan.stampedKs.includes(k));
+      mine.forEach((k) => claimed.add(k));
+      const sameDoc = w.doc === "*" || doc === "*" || w.doc === doc;
+      const keyless = !w.id && !w.name && !w.questions.length;
+      const sameView = sameDoc && (keyless || w.view < 0 || view < 0 || w.view === view);
+      const keyHere = keyed.length > 0 && (sameDoc || keyed.some((k) => asks(k, w) !== "no"));
+      const askedHere = scan.answeredKs.some((k) => !!scan.info[k]?.visible && asks(k, w) === "yes" && optionOk(k, w));
+      if (mine.length || sameView || keyHere || askedHere) out.push(w.label);
+    });
+    // A stamp no noted pick claims (a re-render cloned it under a new id): counted unless it is a
+    // pick already counted under the same label.
+    for (const k of scan.stampedKs) {
+      if (claimed.has(k)) continue;
+      const lbl = scan.info[k]?.stamp || "a control";
+      if (!out.includes(lbl)) out.push(lbl);
+      claimed.add(k);
+    }
     // ...and a stamp a gap-fill left inside a frame (a dialog the planner filled).
-    const framed: string[] = [];
     const frames = typeof this.page.frames === "function" ? this.page.frames() : [];
     for (const fr of Array.isArray(frames) ? frames : []) {
       if (typeof this.page.mainFrame === "function" && fr === this.page.mainFrame()) continue;
       const got = await fr.evaluate((attr: string) => Array.from(document.querySelectorAll(`[${attr}]`)).map((el) => el.getAttribute(attr) || "a control"), UNRECORDED_WRITE_ATTR).catch(() => [] as string[]);
-      framed.push(...(Array.isArray(got) ? got : []));
+      for (const lbl of Array.isArray(got) ? got : []) if (!out.includes(lbl)) out.push(lbl);
     }
-    return Array.from(new Set([...main, ...framed]));
+    return out;
   }
   private stoppedAtPayment = false;
   /** Set by a fill step whose control the in-page reading marks as a signature box when this
@@ -4256,37 +4309,55 @@ export class RecipeAdapter extends BasePortalAdapter {
     // Which view each recorded write ran in (#362: a re-assert from another page is a pick).
     if (RecipeAdapter.WRITE_ACTIONS.has(step.action) && !this.inPolicyRetry) {
       const idx = this.recipe.steps.indexOf(step);
-      if (idx >= 0) this.recordedStepView.set(idx, await this.observeView());
+      if (idx >= 0) {
+        const view = await this.observeView();
+        this.recordedStepView.set(idx, { doc: await this.docToken(), view, path: this.lastView?.path ?? "", ctl: recordedControlCss(step) });
+      }
     }
     if (!RecipeAdapter.WRITE_ACTIONS.has(step.action)) return this.executeStepInner(step, pastReview);
+    this.writtenTarget = null;
     const done = !this.backstop ? await this.executeStepInner(step, pastReview)
       : await withOwnWriteWindow(this.page, `recorded ${step.action}${step.note ? ` (${String(step.note).slice(0, 50)})` : ""}`, () => this.executeStepInner(step, pastReview));
-    if (done && !this.inPolicyRetry) await this.recordingOverwrotePick(step);
+    const written = this.writtenTarget;
+    this.writtenTarget = null;
+    if (done && !this.inPolicyRetry) await this.recordingOverwrotePick(written);
     return done;
   }
 
   /** A PICK THE RECORDING THEN ANSWERS IS NO LONGER A PICK (#362). The mid-page gap-fill can answer
-   *  a control a later recorded step fills with its own value; once that step has landed on the
-   *  same element (for a radio or checkbox, the same group), the answer on the page is the
-   *  recording's. A step that did not land leaves the pick standing. */
-  private async recordingOverwrotePick(step: RecipeStep): Promise<void> {
+   *  a control a later recorded step fills with its own value; once that step has landed, the
+   *  answer on that control is the recording's. Read from the element the step ACTUALLY wrote
+   *  (Helm review of 381204a, A3) — never the control its selector names now (a re-anchored step
+   *  wrote another one) — and nothing when it wrote nothing (a no-battery skip, a fee tier, not
+   *  offered). In this document only. A radio clears its group (by name); a checkbox only itself
+   *  (its id, or its name and option); any other control its id, or its name when the pick had no
+   *  id. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async recordingOverwrotePick(written: any): Promise<void> {
+    if (!written || typeof written.evaluate !== "function") return;
     if (!this.unrecordedWrites.some((w) => w.kind === "pick" && (w.id || w.name))) return;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const loc: any = await this.resolveLocator(step.selector, String(step.note ?? "")).catch(() => null);
-    if (!loc || typeof loc.evaluate !== "function") return;
-    const ctl = await loc.evaluate((el: Element, attr: string) => {
-      el.removeAttribute(attr);
+    const target = typeof written.first === "function" ? written.first() : written;
+    const ctl = await target.evaluate((el: Element, attr: string) => {
       const ty = ((el as HTMLInputElement).type || "").toLowerCase();
-      return { id: el.getAttribute("id") || "", name: el.getAttribute("name") || "", choice: ty === "radio" || ty === "checkbox" };
-    }, UNRECORDED_WRITE_ATTR, { timeout: 1500 }).catch(() => null) as { id: string; name: string; choice: boolean } | null;
+      const name = el.getAttribute("name") || "";
+      if (ty === "radio" && name) for (const m of Array.from(document.getElementsByName(name))) m.removeAttribute(attr);
+      el.removeAttribute(attr);
+      const lbl = Array.from((el as HTMLInputElement).labels ?? []).map((l) => (l.textContent || "").replace(/\s+/g, " ").trim()).find(Boolean) || "";
+      return { id: el.getAttribute("id") || "", name, type: ty, label: lbl };
+    }, UNRECORDED_WRITE_ATTR, { timeout: 1500 }).catch(() => null) as { id: string; name: string; type: string; label: string } | null;
     if (!ctl) return;
-    if (ctl.choice && ctl.name && typeof this.page?.evaluate === "function") {
-      await this.page.evaluate((a: { attr: string; name: string }) => {
-        for (const el of Array.from(document.getElementsByName(a.name))) el.removeAttribute(a.attr);
-      }, { attr: UNRECORDED_WRITE_ATTR, name: ctl.name }).catch(() => null);
-    }
-    this.unrecordedWrites = this.unrecordedWrites.filter((w) => !(w.kind === "pick" && (
-      (ctl.id && w.id === ctl.id) || (ctl.name && w.name === ctl.name && (ctl.choice || !w.id)))));
+    const doc = await this.docToken();
+    const norm = (t: string): string => t.replace(/\s+/g, " ").trim().toLowerCase();
+    const hit = (w: (typeof this.unrecordedWrites)[number]): boolean => {
+      if (w.kind !== "pick") return false;
+      if (!(w.doc === "*" || doc === "*" || w.doc === doc)) return false;
+      if (ctl.type === "radio") return (!!ctl.id && w.id === ctl.id) || (!!ctl.name && w.name === ctl.name);
+      if (ctl.type === "checkbox") {
+        return (!!ctl.id && w.id === ctl.id) || (!ctl.id && !w.id && !!ctl.name && w.name === ctl.name && !!w.option && norm(w.option) === norm(ctl.label));
+      }
+      return (!!ctl.id && w.id === ctl.id) || (!!ctl.name && w.name === ctl.name && !w.id);
+    };
+    this.unrecordedWrites = this.unrecordedWrites.filter((w) => !hit(w));
   }
   private static readonly WRITE_ACTIONS: ReadonlySet<string> = new Set(["fill", "select", "check", "uncheck", "upload"]);
 
@@ -4417,7 +4488,9 @@ export class RecipeAdapter extends BasePortalAdapter {
     // "Model" selects differ only by "Inverter Clone System" versus "PV ArrayDelete Array",
     // and that string has been sitting in every such step's fingerprint since the day it was
     // learned. Consulted last, because a working selector needs no rescue.
-    if (!isToggle && await this.looksOutOfReach(scoped)) {
+    // A PINNED RE-ASSERT (#362) writes the one element it checked, or nothing: no rescue.
+    const pinned = isPinnedReassert(step);
+    if (!pinned && !isToggle && await this.looksOutOfReach(scoped)) {
       // THE PORTAL'S OWN NAME FOR THE CONTROL FIRST. A test hook is stable across renders and
       // says which side it belongs to; a recorded id is neither.
       // A RESCUE THAT HANDS BACK AN UNUSABLE CONTROL IS NOT A RESCUE.
@@ -4482,7 +4555,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // filed the RIGHT ANSWER IN THE WRONG BOX on a live interconnection application, with
     // nothing reported. So confirm the control's own label still agrees with what was
     // recorded before touching it, and re-anchor by label when it does not.
-    if (IDENTITY_CHECKED.has(step.action)) {
+    if (IDENTITY_CHECKED.has(step.action) && !pinned) {
       const anchored = await this.reanchorIfWrongControl(step, scoped);
       if (anchored === "abort") return false;
       if (anchored) scoped = anchored;
@@ -4631,6 +4704,7 @@ export class RecipeAdapter extends BasePortalAdapter {
           // The retry held: verified after all.
           if (!this.fieldsVerified.includes(fieldName)) this.fieldsVerified.push(fieldName);
         }
+        this.writtenTarget = scoped;
         return true;
       }
       case "select": {
@@ -4889,6 +4963,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         const selName = String(step.note ?? step.field ?? step.action).slice(0, 60);
         if (selected) { if (!this.fieldsVerified.includes(selName)) this.fieldsVerified.push(selName); }
         else if (!this.fieldsUnverified.includes(selName)) this.fieldsUnverified.push(selName);
+        if (selected) this.writtenTarget = scoped;
         // Propagate the miss: a select that landed NOTHING must not report success.
         return selected;
       }
@@ -4972,11 +5047,13 @@ export class RecipeAdapter extends BasePortalAdapter {
         // PacifiCorp recipe was the answer the review lockdown then aborted. Inside this step's
         // own-write window, so the save it waits for is let through.
         await this.waitForAutosaveCommitted();
+        this.writtenTarget = target;
         return true;
       }
       case "uncheck":
         await waitForElement(scoped);
         await scoped!.uncheck();
+        this.writtenTarget = scoped;
         return true;
       case "press":
         await waitForElement(scoped);
@@ -8067,17 +8144,21 @@ export class RecipeAdapter extends BasePortalAdapter {
         const na = norm(a); const nb = norm(b);
         return !!na && !!nb && (na === nb || (nb.length > 6 && na.includes(nb)) || (na.length > 6 && nb.includes(na)));
       };
-      // A RADIO-GROUP BLANK IS NEVER RE-RUN (#362): its "name" is the row's whole text, and another
-      // page's select matched it and waited out its timeout, again and again. Still reported.
-      const open = swept.empty.filter((e) => e.why !== "radio-group").map(named);
+      // A RADIO-GROUP OR CHECKBOX BLANK IS NEVER RE-RUN (#362): a radio group's "name" is the row's
+      // whole text, and another page's select matched it and waited out its timeout, again and
+      // again; another page's select re-run against a required agreement checkbox toggled it five
+      // times (Helm review of 381204a). Still reported.
+      const open = swept.empty.filter((e) => e.why !== "radio-group" && e.why !== "checkbox").map(named);
+      // AN EXACT BLANK BEFORE A SUBSTRING ONE (Helm review of 381204a, C7): "Net Metering" is the
+      // "Net Metering" blank when there is one, never "Are you ready to submit your Net Metering…".
       const matchOf = (rs: RecipeStep): string => {
         const name = String(rs.note ?? rs.selector?.label ?? "");
         if (!norm(name)) return "";
-        return open.find((b) => sameName(name, bare(b))) ?? "";
+        return open.find((b) => norm(name) === norm(bare(b))) ?? open.find((b) => sameName(name, bare(b))) ?? "";
       };
-      const view = await this.observeView();
-      const ownView = (rs: RecipeStep): boolean => view >= 0 && this.recordedStepView.get(this.recipe.steps.indexOf(rs)) === view;
       const matched = this.recipe.steps.filter((rs) => (rs.action === "fill" || rs.action === "select") && !!matchOf(rs));
+      const own = await this.ownRecordedSteps(matched);
+      const ownView = (rs: RecipeStep): boolean => own.has(rs);
       // THIS VIEW'S OWN STEP WINS ITS BLANK: another page's step sharing the label is not also re-run.
       const ownBlanks = new Set(matched.filter(ownView).map(matchOf));
       const refills = matched.filter((rs) => ownView(rs) || !ownBlanks.has(matchOf(rs))).slice(0, REASSERT_MAX_FIELDS);
@@ -8087,15 +8168,18 @@ export class RecipeAdapter extends BasePortalAdapter {
           for (const rs of refills) {
             const blank = bare(matchOf(rs));
             const carried = !ownView(rs);
-            // NEVER INTO A BLANK THAT READS AS SUBMITTING (#362): an earlier page's "Net Metering" =
-            // Yes matched "Are you ready to submit your Net Metering (kWh) application?" by label,
-            // and the stamped draft Submit then filed. Left blank, a person answers it.
-            if (carried && isSubmitIntentField(blank)) continue;
-            // THE CONTROL THE STEP WILL WRITE, RESOLVED FIRST: it must be the matched blank (a
-            // recorded label locator is a substring match and can land on another control), it must
-            // be on the page now (a step whose control is gone waits out its whole timeout), and a
-            // carried-over value never goes into a control whose question reads as submitting.
-            const target = await this.reassertTargetOf(rs, blank, carried);
+            // NEVER INTO A BLANK THAT READS AS SUBMITTING (#362), own value or carried (Helm review of
+            // 381204a, C7): an earlier page's "Net Metering" = Yes matched "Are you ready to submit
+            // your Net Metering (kWh) application?" by label, and the stamped draft Submit then
+            // filed; Part 1's own "Net Metering" did the same by substring. Left blank, a person
+            // answers it.
+            if (isSubmitIntentField(blank)) continue;
+            // THE CONTROL THE STEP WILL WRITE, RESOLVED FIRST AND WRITTEN ONLY THROUGH ITSELF: it must
+            // be the control the sweep called that blank, it must be on the page now (a step whose
+            // control is gone waits out its whole timeout), and no question of it may read as
+            // submitting. The write then goes through that one element (C8), so no fallback, rescue
+            // or heal can re-resolve it onto another control.
+            const target = await this.reassertTargetOf(rs, blank);
             if (target.skip) {
               this.driftWarnings.push(`"${String(rs.note ?? rs.field ?? "").slice(0, 40)}" was not re-asserted into "${blank.slice(0, 40)}": ${target.skip}`);
               continue;
@@ -8103,9 +8187,11 @@ export class RecipeAdapter extends BasePortalAdapter {
             // A RECORDED VALUE FROM ANOTHER VIEW IS A PICK HERE (#362), on every attempt, landed or
             // not, named by the live control it is written into.
             if (carried) {
-              await this.noteUnrecordedWrite("pick", `re-assert into "${(target.label || blank).slice(0, 60)}" (the recorded "${String(rs.note ?? rs.field ?? "").slice(0, 40)}")`, { ...(target.control ?? {}), question: target.label || blank });
+              await this.noteUnrecordedWrite("pick", `re-assert into "${(target.label || blank).slice(0, 60)}" (the recorded "${String(rs.note ?? rs.field ?? "").slice(0, 40)}")`, { ...(target.control ?? {}), question: target.label || blank, questions: target.questions });
             }
-            const done = await this.executeStep(rs, pastReview).catch(() => false);
+            const step = target.pinned ? { ...rs, selector: target.pinned, fingerprint: undefined } as RecipeStep : rs;
+            const done = await this.executeStep(step, pastReview).catch(() => false);
+            if (target.pinned) await this.unpinReassert(target.pinned);
             // BOTH OUTCOMES, or this becomes the sixth silent path in this file. A
             // re-assert that fails says something different from one that was never
             // attempted, and today proved repeatedly that the difference is the whole
@@ -8126,26 +8212,76 @@ export class RecipeAdapter extends BasePortalAdapter {
     return blanks;
   }
 
-  /** What a re-assert of `rs` would write (#362): skip it unless its own locator resolves NOW to
-   *  the matched blank, by the extractor's reading of that element (label, and for a carried-over
-   *  value, no question that reads as submitting). A page double that cannot be read keeps main's
-   *  behaviour. */
-  private async reassertTargetOf(rs: RecipeStep, blank: string, carried: boolean): Promise<{ skip?: string; label?: string; control?: { id: string; name: string } }> {
+  /** WHICH RECORDED STEPS ARE THIS PAGE'S OWN (#362, Helm review of 381204a, A2 and the view-churn
+   *  should-fix): decided by the document and the control the recorded write landed on. A step with
+   *  a recorded id is this page's own while that control is on the page now — in this document and
+   *  view, or in a new document at the same URL path (a reload after Save, a postback, a session
+   *  timeout). A step with no recorded id: recorded in this document and this view. Two documents
+   *  at one URL with a shared header, or a persistent header over a replaced form, are not one
+   *  page: an earlier page's step whose control is gone is carried over. Unreadable = none (every
+   *  re-assert then counts as carried: the safe direction). */
+  private async ownRecordedSteps(steps: RecipeStep[]): Promise<Set<RecipeStep>> {
+    const own = new Set<RecipeStep>();
+    const view = await this.observeView();
+    if (view < 0) return own;
+    const doc = await this.docToken();
+    const path = this.lastView?.path ?? "";
+    const recs = steps.map((rs) => ({ rs, rec: this.recordedStepView.get(this.recipe.steps.indexOf(rs)) }));
+    const probe = Array.from(new Set(recs.filter((r) => r.rec && r.rec.ctl).map((r) => r.rec!.ctl)));
+    const present = probe.length && typeof this.page?.evaluate === "function"
+      ? await this.page.evaluate((list: string[]) => list.filter((css) => { try { return !!document.querySelector(css); } catch { return false; } }), probe).catch(() => [] as string[]) as string[]
+      : [];
+    for (const { rs, rec } of recs) {
+      if (!rec || rec.view < 0 || doc === "*" || rec.doc === "*") continue;
+      const here = !!rec.ctl && present.includes(rec.ctl);
+      // No recorded id: its own document and view. An id: that control is still here, in this
+      // document and view, or in a new document at the same URL path.
+      if (!rec.ctl ? rec.doc === doc && rec.view === view : here && (rec.doc === doc ? rec.view === view : rec.path === path)) own.add(rs);
+    }
+    return own;
+  }
+
+  /** What a re-assert of `rs` would write (#362): skip it unless its own locator resolves NOW to the
+   *  very control the sweep named that blank (SWEPT_BLANK_ATTR), by the extractor's reading of that
+   *  element no question of which reads as submitting. The element is then tagged, and `pinned` is
+   *  a selector for it alone. A page double that cannot be read keeps main's behaviour. */
+  private async reassertTargetOf(rs: RecipeStep, blank: string): Promise<{ skip?: string; label?: string; control?: { id: string; name: string }; questions?: string[]; pinned?: RecipeSelector }> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const loc: any = await this.resolveLocator(rs.selector, String(rs.note ?? "")).catch(() => null);
     if (!loc) return { skip: "its control is not on this page" };
-    if (typeof loc.evaluateAll !== "function") return {};
-    const raws = await loc.evaluateAll(extractFieldsInPage).catch(() => null) as RawField[] | null;
-    if (!Array.isArray(raws) || raws.length === 0) return { skip: "its control is not on this page" };
-    const raw = raws[0];
+    if (typeof loc.evaluateAll !== "function" || typeof loc.first !== "function") return {};
+    const one = loc.first();
+    const tag = `ra${++this.reassertSeq}`;
+    const tagIt = (): Promise<string | null | undefined> => one.evaluate((el: Element, a: { pin: string; tag: string; blank: string }) => {
+      el.setAttribute(a.pin, a.tag);
+      return el.getAttribute(a.blank);
+    }, { pin: REASSERT_PIN_ATTR, tag, blank: SWEPT_BLANK_ATTR }, { timeout: 1500 }).catch(() => undefined) as Promise<string | null | undefined>;
+    let swept = await tagIt();
+    if (swept === undefined) return { skip: "its control is not on this page" };
+    // An earlier re-assert's re-render can drop the sweep's mark: sweep once more and read again.
+    if (!swept) { await this.sweepRequired(); swept = await tagIt(); }
+    if (swept === undefined) return { skip: "its control is not on this page" };
+    const pinned: RecipeSelector = { css: `[${REASSERT_PIN_ATTR}="${tag}"]`, ...(rs.selector?.frame ? { frame: rs.selector.frame } : {}) };
     const norm = (t: string): string => String(t || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-    const nl = norm(raw.label); const nb = norm(blank);
-    const same = !!nl && !!nb && (nl === nb || (nb.length > 6 && nl.includes(nb)) || (nl.length > 6 && nb.includes(nl)));
-    if (!same) return { skip: `its locator resolves to "${String(raw.label || "another control").slice(0, 50)}", not that blank` };
-    if (carried && !gapFillMayAnswer({ label: raw.label, groupPrompt: raw.groupPrompt, options: raw.options, questions: raw.questions })) {
+    const raws = await one.evaluateAll(extractFieldsInPage).catch(() => null) as RawField[] | null;
+    const raw = Array.isArray(raws) && raws.length === 1 ? raws[0] : null;
+    if (!raw) { await this.unpinReassert(pinned); return { skip: "its control could not be read" }; }
+    if (!swept || norm(swept) !== norm(blank)) {
+      await this.unpinReassert(pinned);
+      return { skip: `its locator resolves to "${String(raw.label || "another control").slice(0, 50)}", not that blank` };
+    }
+    if (!gapFillMayAnswer({ label: raw.label, groupPrompt: raw.groupPrompt, options: raw.options, questions: raw.questions })) {
+      await this.unpinReassert(pinned);
       return { skip: "that control reads as submitting the application — a person answers it" };
     }
-    return { label: String(raw.label || ""), control: { id: raw.id || "", name: raw.name || "" } };
+    return { label: String(raw.label || ""), control: { id: raw.id || "", name: raw.name || "" }, questions: questionsOfRaw(raw), pinned };
+  }
+  private async unpinReassert(pinned: RecipeSelector): Promise<void> {
+    const m = /="([^"]+)"\]$/.exec(String(pinned.css ?? ""));
+    if (!m || typeof this.page?.evaluate !== "function") return;
+    await this.page.evaluate((a: { pin: string; tag: string }) => {
+      for (const el of Array.from(document.querySelectorAll(`[${a.pin}="${a.tag}"]`))) el.removeAttribute(a.pin);
+    }, { pin: REASSERT_PIN_ATTR, tag: m[1] }).catch(() => null);
   }
 
   private async emptyRequiredControls(): Promise<string[]> {
