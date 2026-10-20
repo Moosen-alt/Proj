@@ -102,7 +102,7 @@ import {
 } from "../../../shared/src/portalSafety";
 import { commitField, installSettleProbe, waitForSettled } from "../settle";
 import { siteOfUrl } from "../siteOf";
-import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, type FilingBackstop } from "../filingBackstop";
+import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopSentLine, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, type FilingBackstop } from "../filingBackstop";
 
 // How long the drift precheck waits for an async-rendered form to paint before concluding
 // the replay is on the wrong page. PowerClerk's Ameren form reports zero inputs for several
@@ -1159,7 +1159,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // ...and a fetch the window admitted is not the filing when the clicked page's OWN form submission
     // (a state-changing document request, not a payment) was then aborted as a filing (autosubmit-close-2
     // skeptic s4ValidateSubmit: fetch('/api/validate-submit') took the window, the form's POST was aborted).
-    const formPostAborted = bs.aborts.some((x) => x.rule === "filing-url" && /^document$/i.test(String(x.resourceType || ""))
+    const formPostAborted = bs.aborts.some((x) => x.rule === "filing-url" && !x.redirect && /^document$/i.test(String(x.resourceType || ""))
       && !/^(GET|HEAD)$/i.test(String(x.method || "")) && !/fee-payment/i.test(String(x.why || "")));
     const isFiling = (a: { filing: boolean; navigation: boolean }): boolean => a.filing && (a.navigation || !formPostAborted);
     const sent = bs.approvedAdmissions.some(isFiling) || bs.approvedNavigations.length > 0;
@@ -1178,15 +1178,20 @@ export class RecipeAdapter extends BasePortalAdapter {
     }
     const dialogs = bs.approvedDialogs.filter((d) => d.action === "accepted");
     if (dialogs.length) notes.push(`accepted the click's own ${dialogs.map((d) => `${d.type} ("${d.message.slice(0, 60)}")`).join(", ")}`);
-    const others = bs.aborts;
+    // THE ADMITTED REQUEST'S OWN REDIRECT (#358): it went (sent stays true) and the portal answered it
+    // with a redirect the backstop did not follow — named as that, not as "another request".
+    const admittedWhere = new Set(bs.approvedAdmissions.map((a) => a.where));
+    const ownRedirects = bs.aborts.filter((x) => x.redirect && x.redirect.hop === 1 && admittedWhere.has(x.redirect.from));
+    for (const x of ownRedirects) notes.push(`the portal answered the approved click's request with a ${x.redirect!.status} redirect to ${x.where}, and the backstop did not follow it (${describeBackstopAbort(x)})`);
+    const others = bs.aborts.filter((x) => !ownRedirects.includes(x));
     if (others.length) {
       notes.push(`the network backstop aborted ${others.length} other state-changing request(s) during/after it (${describeBackstopAbort(others[0])}) — only one request in the approved click's slot was admitted`);
     }
     const line = `APPROVED FINAL SUBMIT: ${notes.join("; ")}.`;
-    if ((others.length || !sent) && !this.driftWarnings.includes(line)) this.driftWarnings.push(line);
+    if ((others.length || ownRedirects.length || !sent) && !this.driftWarnings.includes(line)) this.driftWarnings.push(line);
     const data = {
       ...(r.data ?? {}), approvedRequests: [...bs.approvedRequests], approvedNavigations: [...bs.approvedNavigations],
-      finalSubmitRequestSent: sent, backstopAborts: others.length, driftWarnings: this.driftWarnings, guardRefusals: this.guardRefusals,
+      finalSubmitRequestSent: sent, backstopAborts: others.length + ownRedirects.length, driftWarnings: this.driftWarnings, guardRefusals: this.guardRefusals,
     };
     return { ...r, message: `${String(r.message ?? "")} ${line}`.trim(), data };
   }
@@ -1236,6 +1241,9 @@ export class RecipeAdapter extends BasePortalAdapter {
     const stopping = bs.stoppingAborts();
     if (!stopping.length) return "";
     const first = stopping[0];
+    // A REFUSED REDIRECT (#358): the run's own request went and the portal redirected it somewhere the
+    // backstop would not let a request go. It is not a recipe step acting as a filing control.
+    if (first.redirect) return `STOPPED BY THE NETWORK BACKSTOP: the portal answered a request of this run with a ${first.redirect.status} redirect, and the backstop did not follow it — ${describeBackstopAbort(first)}. ${backstopSentLine(first)} Check on the portal what it did with that request before the next run.`;
     return first.rule === "review-lockdown"
       ? `STOPPED BY THE NETWORK BACKSTOP: the page tried to send a state-changing request while the run was at review, and it was aborted — ${describeBackstopAbort(first)}. Nothing was sent. At review nothing legitimate posts until a person takes the page; a step of this recipe (or a page script) acted on the review page.`
       : `STOPPED BY THE NETWORK BACKSTOP: the page tried to file or pay with no named approval for this run, and the request was aborted — ${describeBackstopAbort(first)}. Nothing was sent. A step of this recipe (or a page script it triggered) is a filing control the word gates did not recognise; review the recipe before the next run.`;
