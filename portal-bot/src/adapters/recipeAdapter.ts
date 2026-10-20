@@ -246,62 +246,38 @@ const IDENTITY_CHECKED = new Set(["fill", "select", "check", "uncheck"]);
 const FACE_PLACEHOLDER = /^\W*(please\s+)?(select|choose)\b|^\W*(nothing|none|not)\s+selected|^\W*no\s+selection|^\W*--/i;
 /** A widget face's words for EQUALITY with the option clicked (selectionHeld): case, whitespace
  *  (nbsp too) and plain punctuation folded, the symbols that tell options apart kept — "≤ 10 kW"
- *  and "> 10 kW" must not both read "10kw", nor "Solar + Storage" read as "Solar Storage". */
+ *  and "> 10 kW" must not both read "10kw", nor "Solar + Storage" read as "Solar Storage".
+ *  In order, on the raw text (#327 round 4): every dash (U+2010/2011, minus, en, em) reads "-";
+ *  a dash BETWEEN two letters or digits is a separator ("IQ8PLUS-72-2-US" is "IQ8PLUS 72 2 US");
+ *  "/" and "." are kept only between two digits ("1/0 AWG" is not "10 AWG", "7.6 kW" is not
+ *  "76 kW", while "Enphase Energy Inc." is "Enphase Energy Inc"); edge dashes go ("-- None --"),
+ *  except a lone leading minus on a number ("-5°" is not "5°"). */
 const faceWords = (t: string): string =>
   (t || "").toLowerCase().replace(/<=/g, "≤").replace(/>=/g, "≥")
-    .replace(/[^\p{L}\p{N}<>≤≥+\-−–—]/gu, "").replace(/[−–—]/g, "-").replace(/^-+|-+$/g, "");
+    .replace(/[\u2010\u2011−–—]/g, "-")
+    .replace(/([\p{L}\p{N}])-(?=[\p{L}\p{N}])/gu, "$1 ")
+    .replace(/(?<!\p{N})[/.]|[/.](?!\p{N})/gu, "")
+    .replace(/[^\p{L}\p{N}<>≤≥+\-/.]/gu, "")
+    .replace(/-+$/u, "")
+    .replace(/^-+/u, (m: string, _at: number, all: string) => (m === "-" && /^\p{N}/u.test(all.slice(1)) ? m : ""));
+/** The numbers a text carries, by value ("7.60" is 7.6). */
+const numbersIn = (t: string): number[] => ((t || "").match(/\d+(?:\.\d+)?/g) ?? []).map(Number);
 /** Does a clicked option answer the step? readbackMatches' containment either way, AND the same
- *  with the symbols kept: "≤ 10 kW" does not answer "> 10 kW" (#327 review round 3). */
+ *  with the symbols kept: "≤ 10 kW" does not answer "> 10 kW" (#327 review round 3). A
+ *  containment that CHANGES A NUMBER is no answer: "Schedule 1" sits inside "Schedule 10" but
+ *  does not answer it, while "7.6" still answers "7.60 kW" — every number on the shorter side
+ *  must be, by value, a number on the longer one (#327 round 4). */
 const clickedAnswers = (clicked: string, want: string): boolean => {
   const a = faceWords(clicked), b = faceWords(want);
-  return readbackMatches(clicked, want) && !!a && !!b && (a === b || a.includes(b) || b.includes(a));
+  if (!readbackMatches(clicked, want) || !a || !b) return false;
+  if (a === b) return true;
+  if (!a.includes(b) && !b.includes(a)) return false;
+  const [short, long] = a.length <= b.length ? [clicked, want] : [want, clicked];
+  const theirs = numbersIn(long);
+  return numbersIn(short).every((n) => theirs.includes(n));
 };
 /** A concealed backing input's key and own face, read before a pick (selectionHeld). */
 type BackingSnapshot = { key: string; face: string };
-/** In-page: does the control a rescue chose carry EXACTLY the recorded label and sit in EXACTLY
- *  the recorded section (#327 review round 3)? Label and section are read by the same rules as
- *  resolveBySection's `labelOf` / `sectionOf` — keep the two in step — and compared after the
- *  same normalisation, with no containment: "Existing Model" is not "Model", "Existing
- *  Inverter" is not "Inverter". An empty recorded or read section is not agreement. */
-const rescueMatchesRecordingInPage = (el: Element, arg: { label: string; section: string }): boolean => {
-  const clean = (t: string | null | undefined): string => (t || "").replace(/\s+/g, " ").trim().slice(0, 80);
-  const norm = (t: string): string => clean(t).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-  const sectionOf = (node0: Element): string => {
-    const fs = node0.closest("fieldset");
-    const legend = fs ? fs.querySelector("legend") : null;
-    if (legend && clean(legend.textContent)) return clean(legend.textContent);
-    const container = node0.closest('section, [class*="panel"], [class*="card"], [class*="section"], [class*="form-section"], [class*="block"], [role="group"], [role="region"]');
-    if (container) {
-      const h = container.querySelector('legend, h1, h2, h3, h4, h5, h6, .panel-title, .card-title, .card-header, .section-title, .panel-heading');
-      if (h && clean(h.textContent)) return clean(h.textContent);
-    }
-    let node: Element | null = node0;
-    for (let hops = 0; node && hops < 6; hops++) {
-      let sib: Element | null = node.previousElementSibling;
-      while (sib) {
-        if (/^(H[1-6]|LEGEND)$/.test(sib.tagName) && clean(sib.textContent)) return clean(sib.textContent);
-        const inner = sib.querySelector ? sib.querySelector("h1, h2, h3, h4, h5, h6, legend") : null;
-        if (inner && clean(inner.textContent)) return clean(inner.textContent);
-        sib = sib.previousElementSibling;
-      }
-      node = node.parentElement;
-    }
-    return "";
-  };
-  const id = el.getAttribute("id");
-  const forLbl = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
-  const label = clean(
-    el.getAttribute("aria-label")
-    || (forLbl ? forLbl.textContent : "")
-    || (el.closest("label") ? (el.closest("label") as HTMLElement).textContent : "")
-    || el.getAttribute("placeholder")
-    || "",
-  );
-  const wantL = norm(arg.label), wantS = norm(arg.section);
-  if (!wantL || !wantS) return false;
-  const sec = norm(sectionOf(el));
-  return !!sec && sec === wantS && norm(label) === wantL;
-};
 /** Steps that write project data. A missing control for one of these can legitimately mean
  *  "this portal did not ask that for this project" — unlike a missing button, which means
  *  the flow itself has drifted. */
@@ -2818,47 +2794,6 @@ export class RecipeAdapter extends BasePortalAdapter {
     return { ...s, selector: { ...first, fallbacks: rest }, note: `${s.note ?? s.field ?? ""} [array ${n}]` };
   }
 
-  /** Is this concealed control an EMPTY SHADOW (#327): a native <select> with no option for the
-   *  step's answer (or one of its certified make aliases) and no widget face of its own? Only
-   *  such a control may be passed over by the fingerprint redirect after a rescue. An option
-   *  whose VALUE equals the answer (a code: "TX", "PGE") counts as one for it. Generous
-   *  towards "not a shadow" (containment either way, aliases), because that keeps main's
-   *  redirect; unreadable = not a shadow. */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private async isEmptyShadowSelect(el: any, step: RecipeStep): Promise<boolean> {
-    if (!el || typeof el.evaluate !== "function") return false;
-    const v = step.action === "select" ? this.resolveValue(step) : "";
-    const wants = v ? (this.isManufacturerStep(step) ? equipmentMakeCandidates(v) : [v]) : [];
-    const verdict = await el.evaluate((node: Element, ws: string[]) => {
-      if (node.tagName !== "SELECT") return "not-select";
-      const n = (s: string): string => (s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-      const want = ws.map(n).filter(Boolean);
-      const opts = Array.from((node as HTMLSelectElement).options);
-      const real = opts
-        .map((o) => (o.textContent || "").replace(/\s+/g, " ").trim())
-        .filter((t) => t && !/^\W*(please\s+)?(select|choose)\b|^\W*--/i.test(t))
-        .map(n).filter(Boolean);
-      // A code-valued option answers too (<option value="TX">Texas</option> for "TX",
-      // value="PGE" for "PGE"), as trySelect picks by value: the VALUE must equal the answer.
-      const values = opts.map((o) => n(o.getAttribute("value") ?? "")).filter(Boolean);
-      return real.some((t) => want.some((w) => t === w || t.includes(w) || w.includes(t)))
-        || values.some((v) => want.includes(v)) ? "has-answer" : "empty";
-    }, wants).catch(() => "unreadable") as string;
-    if (verdict !== "empty") return false;
-    return (await el.evaluate(comboboxFaceInPage, "probe").catch(() => "unreadable")) === "";
-  }
-
-  /** Did a rescue land on the recorded question itself: the same label, in the same section,
-   *  both exact (rescueMatchesRecordingInPage)? Unreadable = no. */
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private async rescueMatchesRecording(el: any, step: RecipeStep): Promise<boolean> {
-    if (!el || typeof el.evaluate !== "function") return false;
-    const label = String(step.fingerprint?.ariaLabel ?? step.selector?.label ?? "").trim();
-    const section = String(step.fingerprint?.section ?? "").trim();
-    if (!label || !section) return false;
-    return await el.evaluate(rescueMatchesRecordingInPage, { label, section }).catch(() => false) as boolean;
-  }
-
   /** The name a person reads for a per-array step's control (used in the read-back's words). */
   private rowFieldName(s: RecipeStep): string {
     return ROW_FIELD_HOOKS[String(s.field ?? "")]?.name || this.stepLabel(s) || String(s.note ?? s.field ?? "");
@@ -3543,7 +3478,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    * worse ones — the exact mistake that broke a working replay earlier today.
    */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  private async reanchorIfWrongControl(step: RecipeStep, scoped: any, rescued = false): Promise<any | "abort" | null> {
+  private async reanchorIfWrongControl(step: RecipeStep, scoped: any): Promise<any | "abort" | null> {
     const recorded = String(step.selector?.label || step.note || "").trim();
     if (!recorded || !scoped || typeof scoped.count !== "function") return null;
     // Nothing resolved at all is a different problem (a genuine miss); leave it alone.
@@ -3661,40 +3596,7 @@ export class RecipeAdapter extends BasePortalAdapter {
           ? this.page.locator(`[id="${String(fp.id).replace(/["\\]/g, "\\$&")}"]`)
           : this.page.locator(`[name="${String(fp.name).replace(/["\\]/g, "\\$&")}"]`);
         const n = await target.count().catch(() => 0);
-        // NOT BACK ONTO THE CONTROL THE RESCUE JUST REJECTED (#327). When the recorded id now
-        // names a CONCEALED shadow (PGE's inverter "Model": opacity:0 behind the real select),
-        // the hook/section rescue above replaced it with the visible control of the recorded
-        // section. The fingerprint id is that same stale id, so this redirect sent the write
-        // straight back into the concealed box — the visible Model stayed "Select..." and the
-        // step missed. Since b05a9a5e (MF5) sectionDisambiguation.dom.smoke was red for that.
-        // A redirect onto a control a person CAN act on (MF5's owner/applicant boxes) is kept.
-        //
-        // AND A CONCEALED TARGET IS NOT ALWAYS A STALE SHADOW. A select2's real <select>, a
-        // styled Model select that still carries the model list, a list still cascading in:
-        // all concealed, all the control the step meant — and for those the rescue is the one
-        // that landed on a neighbour ("Existing Inverter" Model, "Utility Account Number").
-        // So only an EMPTY SHADOW is passed over: a native <select> with no option for the
-        // answer and no widget face of its own (PGE's opacity:0 "Model" holding only
-        // "Select..."). Everything else keeps main's redirect.
-        //
-        // AND ONLY FOR A RESCUE THAT FOUND THE RECORDED QUESTION ITSELF. "Empty" and "no face"
-        // are read from the page, and both can be wrong: a select2 or Kendo list still
-        // cascading or loaded by ajax reads empty, and a widget whose wrapper is shared with
-        // its neighbours shows no face of its own. So the control the rescue chose must carry
-        // exactly the recorded label in exactly the recorded section (rescueMatchesRecording).
-        // "Existing Model", an "Existing Inverter" Model reached by a test hook, a "Mailing
-        // State" or "Utility Account Number" do not, and keep main's redirect — which lands the
-        // value, or reports the miss, but never writes a neighbour.
-        const backOntoRejected = rescued && n === 1 && await this.looksOutOfReach(target)
-          && await this.rescueMatchesRecording(el0, step)
-          && await this.isEmptyShadowSelect(target.first(), step);
-        if (backOntoRejected) {
-          this.resolveTrail.push(`  ...fingerprint #${String(fp.id || fp.name).slice(0, 40)} is the concealed control the rescue passed over — kept the rescue`);
-          this.driftWarnings.push(
-            `step "${recorded.slice(0, 44)}": the recorded control #${String(fp.id || fp.name).slice(0, 50)} is a concealed empty shadow — written into #${(got!.id || got!.name || "the visible control").slice(0, 50)}, the control with the same label in ${JSON.stringify(String(fp.section ?? "").slice(0, 30))}; re-record this step`,
-          );
-        }
-        if (n === 1 && !backOntoRejected && await this.insideArrayRow(target.first())) {
+        if (n === 1 && await this.insideArrayRow(target.first())) {
           const meant = await target.first().evaluate((el: Element) => {
             const id = el.getAttribute("id");
             const forLbl = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
@@ -4321,9 +4223,6 @@ export class RecipeAdapter extends BasePortalAdapter {
     // "Model" selects differ only by "Inverter Clone System" versus "PV ArrayDelete Array",
     // and that string has been sitting in every such step's fingerprint since the day it was
     // learned. Consulted last, because a working selector needs no rescue.
-    // `rescued` tells the identity check below that the recorded control was passed over
-    // BECAUSE a person could not act on it, so it must not be handed straight back (#327).
-    let rescued = false;
     if (!isToggle && await this.looksOutOfReach(scoped)) {
       // THE PORTAL'S OWN NAME FOR THE CONTROL FIRST. A test hook is stable across renders and
       // says which side it belongs to; a recorded id is neither.
@@ -4342,10 +4241,10 @@ export class RecipeAdapter extends BasePortalAdapter {
       const usable = async (loc: unknown): Promise<boolean> =>
         !!loc && await this.isTrulyVisible(loc as never).catch(() => false);
       const byHook = await this.resolveByTestHook(step);
-      if (await usable(byHook) && await this.insideArrayRow(byHook)) { scoped = byHook as never; rescued = true; }
+      if (await usable(byHook) && await this.insideArrayRow(byHook)) scoped = byHook as never;
       else if (step.fingerprint?.section) {
         const bySection = await this.resolveBySection(step);
-        if (await usable(bySection) && await this.insideArrayRow(bySection)) { scoped = bySection as never; rescued = true; }
+        if (await usable(bySection) && await this.insideArrayRow(bySection)) scoped = bySection as never;
         else if (bySection || byHook) {
           this.resolveTrail.push(`  ...rescue: ${byHook ? "the test hook" : "the section"} resolved a control that is STILL concealed — the portal puts its hook on the hidden native input; kept the original`);
         }
@@ -4390,7 +4289,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // nothing reported. So confirm the control's own label still agrees with what was
     // recorded before touching it, and re-anchor by label when it does not.
     if (IDENTITY_CHECKED.has(step.action)) {
-      const anchored = await this.reanchorIfWrongControl(step, scoped, rescued);
+      const anchored = await this.reanchorIfWrongControl(step, scoped);
       if (anchored === "abort") return false;
       if (anchored) scoped = anchored;
     }
@@ -7573,25 +7472,38 @@ export class RecipeAdapter extends BasePortalAdapter {
     //   - the option clicked must itself be an answer to the step (readbackMatches): a
     //     trailing-token pass that clicked "Rule 21 - 7 kW or less" for "Schedule 7" is a
     //     wrong pick, however faithfully the face then shows it;
-    //   - "equal" keeps the symbols that tell options apart: "≤ 10 kW" is not "> 10 kW".
-    //     Only case, whitespace (nbsp included), plain punctuation and a placeholder's edge
-    //     dashes ("-- None --") are folded; the placeholder test above is what refuses those.
+    //   - "equal" keeps the symbols that tell options apart: "≤ 10 kW" is not "> 10 kW", nor
+    //     "1/0 AWG" "10 AWG", nor "-5°" "5°" (faceWords, above: case, whitespace, plain
+    //     punctuation, a separating dash and a placeholder's edge dashes are folded; the
+    //     placeholder test is what refuses "-- None --").
     //   - "moved" and "already held" are read from the input's OWN value, never from what
-    //     shownBy reports (for an empty role=combobox input that is the face's text), and an
-    //     input still empty after the pick has not taken it.
+    //     shownBy reports (for an empty role=combobox input that is the face's text).
+    //   - A KEY THAT IS THE OPTION'S TEXT (a Telerik-style widget whose face the walk does not
+    //     know), or an input the widget NEVER writes (PowerClerk's filtered select, empty before
+    //     and after) whose own face shows the option clicked, held the pick (#327 round 4): a
+    //     shorter certified name, "Enphase Energy" for "Enphase Energy Inc.", was FAILED there.
+    //   - When the key did NOT move, the face counts only when it sits right beside the input
+    //     (comboboxFaceInPage "adjacent"): a bare Battery key before "Generator [Yes]" in a
+    //     captioned row read the Generator's face as its own.
     if (!before || !(await this.isConcealedInput(scoped))) return false;
     const loc = scoped as { evaluate: (fn: unknown, arg?: unknown) => Promise<unknown> };
     const face = String(await loc.evaluate(comboboxFaceInPage, "own").catch(() => "") ?? "");
-    if (!face || FACE_PLACEHOLDER.test(face)) return false;
     const clicked = this.selectPick.text;
     if (clicked && !clickedAnswers(clicked, want)) return false;
+    const key = String(await loc.evaluate((el: Element) => (el as HTMLInputElement).value || "").catch(() => "") ?? "");
+    if (clicked && !FACE_PLACEHOLDER.test(face)) {
+      const picked = faceWords(clicked);
+      if (key.trim() && faceWords(key) === picked) return true;
+      if (!before.key.trim() && !key.trim() && face && faceWords(face) === picked
+        && faceWords(String(await loc.evaluate(comboboxFaceInPage, "adjacent").catch(() => "") ?? "")) === picked) return true;
+    }
+    if (!face || FACE_PLACEHOLDER.test(face)) return false;
     const target = faceWords(clicked || want);
     if (!target || faceWords(face) !== target) return false;
-    const key = String(await loc.evaluate((el: Element) => (el as HTMLInputElement).value || "").catch(() => "") ?? "");
     if (!key.trim()) return false;
-    const moved = before.key !== key;
-    const alreadyHeld = !!before.key.trim() && before.key === key && faceWords(before.face) === target;
-    return moved || alreadyHeld;
+    if (before.key !== key) return true;
+    if (!before.key.trim() || faceWords(before.face) !== target) return false;
+    return faceWords(String(await loc.evaluate(comboboxFaceInPage, "adjacent").catch(() => "") ?? "")) === target;
   }
 
   /** A widget's concealed backing <input> (display:none, opacity:0, a 1px sliver, type=hidden)? */
@@ -7895,12 +7807,16 @@ export class RecipeAdapter extends BasePortalAdapter {
     for (const name of found.requiredSeen) {
       if (!this.requiredFieldsSeen.includes(name)) this.requiredFieldsSeen.push(name);
     }
-    // ONLY A CONTROL'S OWN BLANK CAN BE A HELD UPLOAD (#327). A radio group is named by the text
+    // ONLY A FILE BOX'S OWN BLANK CAN BE A HELD UPLOAD (#327). A radio group is named by the text
     // of the row that holds it, and a row that also holds the uploaded "Plan set" slot ("Plan set *
     // [file] Is the system grid-tied? * Yes No") matched that slot's label and read as held: the
-    // unanswered group was discharged and the draft created. An unattributed complaint names no
-    // control at all. Neither is ever asked about, and neither is ever discharged.
-    const dischargeable = (e: EmptyRequired): boolean => e.why !== "radio-group" && e.why !== "unattributed-complaint";
+    // unanswered group was discharged and the draft created. uploadSlotsHeld matches names by
+    // containment, so a required "Plan set revision *" text box under the slot, or a text box
+    // captioned exactly "Plan set *", read as held too. So the sweep marks an entry `file` only
+    // when every control under its name is an <input type=file>, and only those are ever asked
+    // about or discharged (a whitelist: an unattributed complaint, a radio row, a checkbox and a
+    // text box never are).
+    const dischargeable = (e: EmptyRequired): boolean => e.file === true;
     // A RUNNER-UP CAN BE A HELD UPLOAD TOO. A complaint re-attributed from a held "Plan set *" to the
     // optional "Site photo" beside it, which the run also uploaded, named an attached document as
     // the blank. So the runner-up names are read back with the rest; a held one falls back to the

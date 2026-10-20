@@ -77,7 +77,7 @@ const NAV = `<header><a href="/home">Program Home</a> <a href="/logout">Sign Out
 const page = (title: string, body: string): string => `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${NAV}<main>${body}</main></body></html>`;
 const PART1 = (mode: string): string => page("Interconnection Application Part 1", `
   <h1>Interconnection Application Part 1 (Preliminary Validation)</h1>
-  <form method="post" action="/m/${mode}/p1/submit">
+  <form method="post" action="/m/${mode}/p1/submit" novalidate>
     <div><label for="appDate">Application Date</label><input id="appDate" name="appDate" type="text"></div>
     <div><label for="appType">Application Type</label><select id="appType" name="appType"><option value="">Select…</option><option>New Solar</option></select></div>
     ${heldBlock(mode)}
@@ -88,8 +88,9 @@ const RECEIPT = page("Application Received", `<h1>Application Received</h1><p>Th
 // THE HELD-UPLOAD PAGES (#327). Absolute positions inside one positioned block, so the geometry
 // does not depend on the fonts a machine has. The slot is required by its asterisk (no
 // `required` attribute: the browser's own validation would then refuse the POST and hide whether
-// the run clicked); once the portal takes the file it lists it and clears the box, which is what
-// makes the slot read empty-but-held.
+// the run clicked; the form is `novalidate` too, for the cases with `required` radios); once the
+// portal takes the file it lists it and clears the box, which is what makes the slot read
+// empty-but-held.
 const ERR = `color:#c00;position:absolute;font:14px/17px sans-serif;white-space:nowrap`;
 const HELD_SCRIPT = `<script>
   document.querySelectorAll('input[type=file]').forEach(function (slot) {
@@ -174,6 +175,37 @@ const HELD_LAYOUT: Record<string, string> = {
       <label><input type="radio" name="gridTied" value="yes"> Yes</label>
       <label><input type="radio" name="gridTied" value="no"> No</label>
     </div>`,
+  // A HELD UPLOAD DISCHARGES ONLY A FILE BOX (#327 round 4, should-fix 5). A required text box
+  // whose caption carries the slot's name — "Plan set revision *" in the slot's row, the same box
+  // under the slot, a box captioned exactly "Plan set *" — is a blank, not the held upload.
+  heldRevisionInRow: `
+    <div style="display:flex;gap:12px;align-items:center">
+      <label for="heldSlot">Plan set *</label><input id="heldSlot" name="heldSlot" type="file">
+      <label for="planRev">Plan set revision *</label><input id="planRev" name="planRev" type="text">
+    </div>`,
+  heldRevisionBelow: `
+    <label for="heldSlot" style="position:absolute;left:8px;top:0">Plan set *</label>
+    <input id="heldSlot" name="heldSlot" type="file" style="position:absolute;left:8px;top:20px;width:300px;height:26px;box-sizing:border-box">
+    <label for="planRev" style="position:absolute;left:8px;top:54px">Plan set revision *</label>
+    <input id="planRev" name="planRev" type="text" style="position:absolute;left:8px;top:74px;width:185px;height:21px;box-sizing:border-box">`,
+  heldSameNameBox: `
+    <label for="heldSlot" style="position:absolute;left:8px;top:0">Plan set *</label>
+    <input id="heldSlot" name="heldSlot" type="file" style="position:absolute;left:8px;top:20px;width:300px;height:26px;box-sizing:border-box">
+    <label for="planNote" style="position:absolute;left:8px;top:54px">Plan set *</label>
+    <input id="planNote" name="planNote" type="text" style="position:absolute;left:8px;top:74px;width:185px;height:21px;box-sizing:border-box">`,
+  // A RADIO GROUP THE SWEEP CANNOT NAME, its complaint on the held slot's line (#327 round 4,
+  // should-fix 6): unmarked, then with `required` radios (the form is novalidate, so the browser
+  // does not refuse the POST for the run).
+  heldRadioOnLine: `
+    <label for="heldSlot" style="position:absolute;left:8px;top:0">Plan set *</label>
+    <input id="heldSlot" name="heldSlot" type="file" style="position:absolute;left:8px;top:20px;width:150px;height:26px;box-sizing:border-box">
+    <span style="${ERR};left:164px;top:25px">This field is required.</span>
+    <div style="position:absolute;left:400px;top:0">Battery storage?<br><label><input type="radio" name="bat" value="y"> Yes</label> <label><input type="radio" name="bat" value="n"> No</label></div>`,
+  heldRequiredRadioOnLine: `
+    <label for="heldSlot" style="position:absolute;left:8px;top:0">Plan set *</label>
+    <input id="heldSlot" name="heldSlot" type="file" style="position:absolute;left:8px;top:20px;width:150px;height:26px;box-sizing:border-box">
+    <span style="${ERR};left:164px;top:25px">This field is required.</span>
+    <div style="position:absolute;left:400px;top:0">Battery storage?<br><label><input type="radio" name="bat" value="y" required> Yes</label> <label><input type="radio" name="bat" value="n" required> No</label></div>`,
 };
 // A SELECT2 UTILITY (#327, blocking 2): select2 4 keeps the native <select> as a 1 x 1 clipped
 // sliver (select2-hidden-accessible) and draws its face as a SIBLING, so the sliver's nearest box is
@@ -200,8 +232,24 @@ const SELECT2_LAYOUT: Record<string, string> = {
   // Bootstrap 4: label, select, face, .invalid-feedback, one .form-text line.
   select2Bs4Utility: `${S2_ADDRESS}<div class="form-group"><label for="utilitySel">Utility</label>${S2_SELECT}${S2_FACE}<div class="invalid-feedback d-block">This field is required.</div>${S2_HELP}</div>`,
   // django-crispy-forms: the error (a <strong> in a span) then the help, in a bare wrapper div.
-  select2CrispyUtility: `${S2_ADDRESS}<div id="div_id_utilitySel" class="form-group"><label for="utilitySel">Utility</label><div>${S2_SELECT}${S2_FACE}<span id="error_1_id_utilitySel" class="invalid-feedback d-block"><strong>This field is required.</strong></span>${S2_HELP}</div></div>`,
+  // The filled Service address sits within 90 px of the complaint (its group's bottom margin
+  // dropped), so a filled neighbour in reach can claim it: the 0-POST check, not only the naming
+  // check, guards the sliver's widget box (#327 round 4 nit).
+  select2CrispyUtility: `${S2_ADDRESS.replace('class="form-group"', 'class="form-group" style="margin-bottom:0"')}<div id="div_id_utilitySel" class="form-group"><label for="utilitySel">Utility</label><div>${S2_SELECT}${S2_FACE}<span id="error_1_id_utilitySel" class="invalid-feedback d-block"><strong>This field is required.</strong></span>${S2_HELP}</div></div>`,
 };
+// A FILLED select2 Utility with no per-field wrapper, a direct child of its fieldset (or a card),
+// beside a blank the sweep cannot see — an unmarked Yes/No, an unticked checkbox, an empty Kendo
+// DropDownList (its <select> is display:none) — with "This field is required." at the foot, 137 px
+// below Utility's own rect. Judged by its widget box (the fieldset), 6eed71c9 handed the complaint
+// to the filled Utility and dropped it: the draft was created. Main stops it as unattributed.
+const S2_FILLED_SELECT = S2_SELECT.replace(' is-invalid', "").replace('<option value="u1">', '<option value="u1" selected>');
+const S2_FILLED_FACE = S2_FACE.replace('<span class="select2-selection__placeholder">Select a utility</span>', "Sample Light Co");
+const S2_NOTE = `<p style="height:60px;margin:8px 0">Battery details are asked on the next page.</p>`;
+const S2_FOOT = `<div class="invalid-feedback d-block">This field is required.</div>`;
+const KENDO_DDL = `<span class="k-widget k-dropdown" style="display:inline-block;width:240px;border:1px solid #ccc"><span class="k-dropdown-wrap"><span class="k-input">Select a rate</span><span class="k-select"><span class="k-icon k-i-arrow-60-down"></span></span></span><select id="rateSel" name="rateSel" data-role="dropdownlist" style="display:none"><option value=""></option><option value="r7">Schedule 7</option></select></span>`;
+SELECT2_LAYOUT.s2FieldsetRadio = `<fieldset style="border:1px solid #ccc;padding:0 8px 4px"><legend>Utility information</legend><label for="utilitySel">Utility</label>${S2_FILLED_SELECT}${S2_FILLED_FACE}${S2_NOTE}<div>Battery storage? <label><input type="radio" name="bat" value="y"> Yes</label> <label><input type="radio" name="bat" value="n"> No</label></div>${S2_FOOT}</fieldset>`;
+SELECT2_LAYOUT.s2FieldsetCheckbox = `<fieldset style="border:1px solid #ccc;padding:0 8px 4px"><legend>Utility information</legend><label for="utilitySel">Utility</label>${S2_FILLED_SELECT}${S2_FILLED_FACE}${S2_NOTE}<div><label><input type="checkbox" name="agree"> I agree to the interconnection terms</label></div>${S2_FOOT}</fieldset>`;
+SELECT2_LAYOUT.s2CardKendo = `<div class="card"><div class="card-body" style="border:1px solid #ccc;padding:8px"><label for="utilitySel">Utility</label>${S2_FILLED_SELECT}${S2_FILLED_FACE}${S2_NOTE}<div><label>Rate schedule</label> ${KENDO_DDL}</div>${S2_FOOT}</div></div>`;
 const heldBlock = (mode: string): string => HELD_LAYOUT[mode]
   ? `<div style="position:relative;height:120px;margin:12px 0">${HELD_LAYOUT[mode]}</div><div id="heldList" style="margin:8px 0"></div>${HELD_SCRIPT}`
   : SELECT2_LAYOUT[mode] ? `${BS4}<div class="bs4">${SELECT2_LAYOUT[mode]}</div>` : "";
@@ -357,12 +405,36 @@ try {
     check(`${mode}: ${field} is blank and the portal says so — the draft is NOT created (0 POSTs)`, submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
     check(`${mode}: the run names ${field} as the required field still empty${never ? `, never ${never.source}` : ""}`, re.test(refusalOf(o)) && !(never && never.test(refusalOf(o))), `refusal=${refusalOf(o)} | ${brief(o)}`);
   }
+  // A held upload discharges only a file box (#327 round 4, should-fix 5): 0 POSTs, the box named.
+  for (const [mode, field, re] of [
+    ["heldRevisionInRow", "Plan set revision", /still empty on the page: .*Plan set revision/],
+    ["heldRevisionBelow", "Plan set revision", /still empty on the page: .*Plan set revision/],
+    ["heldSameNameBox", "the text box captioned \"Plan set *\"", /still empty on the page: .*Plan set/],
+  ] as Array<[string, string, RegExp]>) {
+    const o = await held(mode);
+    check(`${mode}: ${field} is blank beside the held upload — the draft is NOT created (0 POSTs)`, submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
+    check(`${mode}: the run names ${field} as the required field still empty`, re.test(refusalOf(o)), `refusal=${refusalOf(o)} | ${brief(o)}`);
+  }
+  // A radio group the sweep cannot name, its complaint on the held slot's line (#327 round 4,
+  // should-fix 6): the complaint is reported unattributed, never as the held Plan set.
+  for (const mode of ["heldRadioOnLine", "heldRequiredRadioOnLine"]) {
+    const o = await held(mode);
+    check(`${mode}: the upload held — the fixture is the shape it claims`, /Plan set/.test(heldNote(o)), `${brief(o)} aging=${JSON.stringify(notesOf(o)).slice(0, 600)}`);
+    check(`${mode}: an unanswered radio group flagged on the held slot's line — the draft is NOT created (0 POSTs), the run stops before review`, submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false && o.r.pauseReason === "stopped_before_review", brief(o));
+    check(`${mode}: the run names the portal's complaint (unattributed), never Plan set`, /still empty on the page: .*portal reports "This field is required\."/.test(refusalOf(o)) && !/Plan set/.test(refusalOf(o)), `refusal=${refusalOf(o)} | ${brief(o)}`);
+  }
   // A SELECT2 UTILITY LEFT BLANK (#327, blocking 2): no upload; the sliver's widget box (the whole
   // form-group) must never push its complaint out of reach. 0 POSTs, Utility named.
   for (const mode of ["select2Bs4Utility", "select2CrispyUtility"]) {
     const o = await stage(mode, submitStep());
     check(`${mode}: Utility (select2, blank, flagged under its face) — the draft is NOT created (0 POSTs)`, submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
     check(`${mode}: the run names Utility as the required field still empty`, /still empty on the page: .*\bUtility\b/.test(refusalOf(o)), `refusal=${refusalOf(o)} | ${brief(o)}`);
+  }
+  // A FILLED select2 never absorbs a complaint for a blank the sweep cannot see (#327 round 4).
+  for (const mode of ["s2FieldsetRadio", "s2FieldsetCheckbox", "s2CardKendo"]) {
+    const o = await stage(mode, submitStep());
+    check(`${mode}: a blank beside a filled select2 Utility, flagged at the foot — the draft is NOT created (0 POSTs)`, submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
+    check(`${mode}: the run names the portal's complaint (unattributed), never Utility`, /still empty on the page: .*portal reports "This field is required\."/.test(refusalOf(o)) && !/\bUtility\b/.test(refusalOf(o)), `refusal=${refusalOf(o)} | ${brief(o)}`);
   }
 } finally {
   server.close();

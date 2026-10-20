@@ -43,6 +43,13 @@ export interface EmptyRequired {
    * discharge the complaint with it: the portal's refusal is re-attributed or reported unowned.
    */
   handed?: Array<{ next: string; unattributed: string }>;
+  /**
+   * True only when EVERY control reported under this name is an `<input type=file>` (#327 round
+   * 4). The one thing a held upload may discharge: a text box captioned like the slot ("Plan set
+   * revision *", or exactly "Plan set *"), a checkbox or a radio row is never a file box, so one
+   * such control under the name clears the mark.
+   */
+  file?: boolean;
 }
 
 /**
@@ -83,20 +90,22 @@ export async function sweepEmptyRequiredControls(
     const ADVISORY = /^\s*(please note|note|notice|important|reminder|attention)\b[:,]?/i;
     const COMPLAINT = new RegExp(`${HARD.source}|${SOFT.source}`, "i");
     const PLACEHOLDER = /^(please\s+)?(select|choose)\b\.{0,3}$/i;
-    const out: Array<{ name: string; why: string; handed?: Array<{ next: string; unattributed: string }> }> = [];
+    const out: Array<{ name: string; why: string; handed?: Array<{ next: string; unattributed: string }>; file?: boolean }> = [];
     const requiredSeen: string[] = [];
     const tidy = (name: string): string => String(name || "").replace(/\s*\*\s*$/, "").replace(/\s+/g, " ").trim().slice(0, 70);
     // ONE ENTRY PER NAME, BUT EVERY COMPLAINT IT WAS HANDED (#327). Two upload rows captioned
     // "Attachment *" are one entry; when the second one is the slot a complaint went to, dropping
     // its `handed` with the duplicate lost the complaint the moment the held read-back discharged
     // "Attachment", and the PSE draft was created with Customer phone blank. So a same-name entry
-    // takes the newcomer's hand-offs too.
-    const push = (name: string, why: string, handed?: Array<{ next: string; unattributed: string }>): void => {
+    // takes the newcomer's hand-offs too — and stays a FILE entry only while every control under
+    // the name is a file box.
+    const push = (name: string, why: string, handed?: Array<{ next: string; unattributed: string }>, file = false): void => {
       const clean = tidy(name);
       if (!clean) return;
       const had = out.find((o) => o.name === clean);
-      if (!had) { out.push(handed && handed.length ? { name: clean, why, handed } : { name: clean, why }); return; }
+      if (!had) { out.push({ name: clean, why, ...(handed && handed.length ? { handed } : {}), ...(file ? { file } : {}) }); return; }
       if (handed && handed.length) had.handed = [...(had.handed ?? []), ...handed];
+      if (!file) delete had.file;
     };
     const orphanName = (c: HTMLElement): string => tidy(`portal reports "${(c.innerText || "").replace(/\s+/g, " ").trim().slice(0, 48)}" (field could not be identified)`);
 
@@ -132,6 +141,13 @@ export async function sweepEmptyRequiredControls(
     // wrapper that collapses and climbs to a radio fieldset. So a sliver is judged by its OWN rect
     // and its widget box, and wherever it is measured (range, distance, beside, ownedBelow) the
     // nearer of the two counts.
+    //
+    // FOR AN EMPTY CONTROL ONLY. A FILLED select2 with no per-field wrapper climbs to the whole
+    // fieldset, and that box held "This field is required." at the fieldset's foot — for an
+    // unticked checkbox or an unmarked Yes/No this sweep cannot see. Pass 1 handed the complaint
+    // to the filled Utility, a filled claimant drops it, and the stamped PSE draft was created
+    // where main reports the complaint unattributed. So pass 1 (filled controls) measures each by
+    // its own rect, exactly main's rule, and never drops a complaint main reports.
     const rectsOf = (el: HTMLElement): DOMRect[] => {
       const r = el.getBoundingClientRect();
       const sliver = r.width < 4 || r.height < 4 || (Number(getComputedStyle(el).opacity) === 0 && (r.width < 20 || r.height < 10));
@@ -215,9 +231,10 @@ export async function sweepEmptyRequiredControls(
       for (const pass of [0, 1]) {
         for (const el of controls) {
           if (pass === 0 && !emptyish.has(el)) continue;
-          // The nearer of a sliver's own rect and its widget box (rectsOf, above).
+          // The nearer of a sliver's own rect and its widget box (rectsOf, above) — for an EMPTY
+          // control only. A FILLED one (pass 1) is judged by its own rect, exactly main's rule.
           let d = Infinity;
-          for (const er of rects.get(el)!) {
+          for (const er of (pass === 0 ? rects.get(el)! : rects.get(el)!.slice(0, 1))) {
             // A validation message sits BELOW or beside its field, never far above it, and
             // never in another column. Both bounds keep one complaint from claiming a page.
             const dy = cr.top - er.bottom;
@@ -318,7 +335,8 @@ export async function sweepEmptyRequiredControls(
       if (raw && !PLACEHOLDER.test(shown) && !/^--/.test(shown)) continue;
 
       const handed = (handedTo.get(el) ?? []).map((h) => ({ next: h.next ? tidy(nameOf(h.next)) : "", unattributed: h.unattributed }));
-      push(nameOf(el), claimed.has(el) ? "complaint" : el.hasAttribute("required") || el.getAttribute("aria-required") === "true" ? "attribute" : "asterisk", handed);
+      const isFile = el.tagName === "INPUT" && (el.getAttribute("type") || "").toLowerCase() === "file";
+      push(nameOf(el), claimed.has(el) ? "complaint" : el.hasAttribute("required") || el.getAttribute("aria-required") === "true" ? "attribute" : "asterisk", handed, isFile);
     }
 
     // ---- unanswered required radio GROUPS -------------------------------------------

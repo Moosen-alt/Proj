@@ -43,6 +43,8 @@ const bs4 = (body: string, width = 600): string =>
    </style></head><body><form>${body}</form></body></html>`;
 const S2_SELECT = (cls = ""): string => `<select id="s2u" name="s2u" class="${cls}select2-hidden-accessible is-invalid" tabindex="-1" aria-hidden="true"><option value=""></option><option value="u1">Sample Light Co</option></select>`;
 const S2_FACE = (style = "width:100%"): string => `<span class="select2 select2-container select2-container--bootstrap4" dir="ltr" style="${style}"><span class="selection"><span class="select2-selection select2-selection--single" role="combobox" tabindex="0" aria-labelledby="select2-s2u-container"><span class="select2-selection__rendered" id="select2-s2u-container" role="textbox" aria-readonly="true"><span class="select2-selection__placeholder">Select a utility</span></span><span class="select2-selection__arrow" role="presentation"><b role="presentation"></b></span></span></span><span class="dropdown-wrapper" aria-hidden="true"></span></span>`;
+const S2_SELECT_FILLED = `<select id="s2u" name="s2u" class="form-control select2-hidden-accessible" tabindex="-1" aria-hidden="true"><option value=""></option><option value="u1" selected>Sample Light Co</option></select>`;
+const S2_FACE_FILLED = S2_FACE("width:300px").replace('<span class="select2-selection__placeholder">Select a utility</span>', "Sample Light Co");
 const S2_ADDRESS = `<div class="form-group"><label for="s2a">Service address</label><input id="s2a" name="s2a" class="form-control" value="5010 Fixture Ave"></div>`;
 const S2_HELP = `<small class="form-text text-muted">The utility that serves the meter.</small>`;
 
@@ -258,6 +260,26 @@ const PAGES: Record<string, string> = {
       <div>Battery storage? <label><input type="radio" name="bat" value="y" checked> Yes</label> <label><input type="radio" name="bat" value="n"> No</label></div>
     </fieldset>`),
 
+  // FILLED: the same float markup with Utility FILLED, then a note and a blank this sweep cannot
+  // see (an unmarked Yes/No, or an unticked checkbox), and the complaint at the fieldset's foot,
+  // more than 90 px below Utility's own rect. The filled select2's widget box is the fieldset;
+  // judged by it, pass 1 handed the complaint to Utility, a filled claimant drops it, and the page
+  // read as clean (6eed71c9). Main reports it unattributed; so must this (review round 4).
+  s2FloatFilledRadio: bs4(`${S2_ADDRESS}<fieldset style="border:1px solid #ccc;padding:0 8px 4px;margin:0">
+      <legend style="font-size:1rem;margin:0"><label for="s2u" style="margin:0">Utility</label></legend>
+      <div>${S2_SELECT_FILLED}${S2_FACE_FILLED}</div>
+      <p style="height:60px;margin:8px 0">Battery details are asked on the next page.</p>
+      <div>Battery storage? <label><input type="radio" name="bat" value="y"> Yes</label> <label><input type="radio" name="bat" value="n"> No</label></div>
+      <div class="invalid-feedback d-block">This field is required.</div>
+    </fieldset>`),
+  s2FloatFilledCheckbox: bs4(`${S2_ADDRESS}<fieldset style="border:1px solid #ccc;padding:0 8px 4px;margin:0">
+      <legend style="font-size:1rem;margin:0"><label for="s2u" style="margin:0">Utility</label></legend>
+      <div>${S2_SELECT_FILLED}${S2_FACE_FILLED}</div>
+      <p style="height:60px;margin:8px 0">Battery details are asked on the next page.</p>
+      <div><label><input type="checkbox" name="agree"> I agree to the interconnection terms</label></div>
+      <div class="invalid-feedback d-block">This field is required.</div>
+    </fieldset>`),
+
   // ---- a complaint no control can own must still be reported -------------------------
   orphanComplaint: shell(`
     <div class="err">Please select at least one option before continuing.</div>
@@ -362,6 +384,15 @@ for (const [key, what] of [
   const got = await sweep(key);
   check(`a blank select2 Utility (1 x 1 sliver, face a sibling) is named from its complaint: ${what} (#327)`,
     got.some((r) => r.name === "Utility" && r.why === "complaint"), JSON.stringify(got));
+}
+
+for (const [key, what] of [
+  ["s2FloatFilledRadio", "an unmarked Yes/No"],
+  ["s2FloatFilledCheckbox", "an unticked checkbox"],
+] as Array<[string, string]>) {
+  const got = await sweep(key);
+  check(`a FILLED select2 Utility's widget box never absorbs a complaint at the fieldset's foot (${what} the sweep cannot see): reported unattributed, never Utility (#327)`,
+    got.some((r) => /^portal reports "This field is required\."/.test(r.name)) && !got.some((r) => r.name === "Utility"), JSON.stringify(got));
 }
 
 const instr = await sweep("instructions");

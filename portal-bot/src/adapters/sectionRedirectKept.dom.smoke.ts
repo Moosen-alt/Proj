@@ -9,6 +9,12 @@
 // the rescue is the one that landed on a NEIGHBOUR, and main's redirect was what put the value
 // back where it belongs. Every case below asserts which control holds the value and that the
 // neighbour is untouched.
+//
+// PR #372 (review round 4) took the section-Model keep back out: "same label, same section"
+// did not identify one field (cloned blocks, sub-headings, widgets whose list arrives late),
+// and each attempt to narrow it was broken by a new layout. So replay behaves as main here,
+// sectionDisambiguation stays red, and #380 carries the keep. These checks pin main's
+// redirect so that work cannot write a neighbour; #380 adds its MUST LAND cases.
 //   npx tsx portal-bot/src/adapters/sectionRedirectKept.dom.smoke.ts
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -276,11 +282,6 @@ const PAGES: Record<string, string> = {
   pgeHookedExisting: shell(PGE() + `<fieldset><legend>Existing Inverter</legend><label for="ex-model">Model</label>
     <select id="ex-model" data-test-role="existing-inverter-model-select"><option>Select...</option><option>${IQ8}</option></select></fieldset>`),
   pgeExistingAhead: shell(PGE().replace('<label for="inv-model-real">', `${EXISTING_SAME}\n    <label for="inv-model-real">`)),
-  // MUST LAND in the real Model: the Existing Inverter Model WITHOUT a hook (the section
-  // rescue reads the exact recorded section), and "Existing Model" AFTER the real Model.
-  pgeExistingNoHook: shell(PGE() + `<fieldset><legend>Existing Inverter</legend><label for="ex-model">Model</label>
-    <select id="ex-model"><option>Select...</option><option>${IQ8}</option></select></fieldset>`),
-  pgeExistingAfter: shell(PGE("", EXISTING_SAME)),
 };
 
 const server = http.createServer((req, res) => {
@@ -424,18 +425,6 @@ for (const key of ["pgeHookedExisting", "pgeExistingAhead"]) {
     assert.ok(reportedModel(r), `verified=${JSON.stringify(r.data.fieldsVerified)} skipped=${JSON.stringify(r.data.skipped)}`);
   });
 }
-// MUST LAND: the rescue found the recorded label in the recorded section.
-for (const key of ["pgeExistingNoHook", "pgeExistingAfter"]) {
-  const r = await run(key, [step("inverterModel", "Model", "pcInputBase34", "Inverter Clone System")], { inverterModel: IQ8 });
-  const real = await r.read("inv-model-real"), other = await r.read("ex-model"), arr = await r.read("mod-model");
-  check(`MUST LAND ${key}: the inverter Model gets the model, the neighbour and the PV array's Model stay "Select..."`, () => {
-    assert.equal(real, IQ8, `the inverter Model reads ${JSON.stringify(real)}`);
-    assert.equal(other, "Select...", `the neighbour holds ${JSON.stringify(other)}`);
-    assert.equal(arr, "Select...", `the PV array's Model holds ${JSON.stringify(arr)}`);
-    assert.ok((r.data.driftWarnings ?? []).some((w) => /concealed empty shadow/.test(w)), `the kept rescue is not in driftWarnings: ${JSON.stringify(r.data.driftWarnings)}`);
-  });
-}
-
 await browser.close();
 server.close();
 if (failures) { console.error(`\n${failures} section-redirect check(s) FAILED.`); process.exit(1); }
