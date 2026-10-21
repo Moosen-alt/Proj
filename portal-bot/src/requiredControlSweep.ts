@@ -34,7 +34,7 @@ import type { Page } from "playwright";
 export interface EmptyRequired {
   name: string;
   /** How we know it was required — for the operator's report, and for arguing with it. */
-  why: "attribute" | "asterisk" | "complaint" | "unattributed-complaint" | "radio-group";
+  why: "attribute" | "asterisk" | "complaint" | "unattributed-complaint" | "radio-group" | "checkbox";
   /**
    * `why: "complaint"` only (#327): one entry per complaint this control was handed. `next` is the
    * next-nearest EMPTY control in range, named exactly as `name` would name it ("" when there is
@@ -52,6 +52,11 @@ export interface EmptyRequired {
   file?: boolean;
 }
 
+/** The attribute the sweep leaves on each blank control it names (#362): its value is the blank's
+ *  name. What a re-assert checks it is about to write the very control the sweep called that blank
+ *  (one namer for both, never two readings of a label). Cleared at the start of every sweep. */
+export const SWEPT_BLANK_ATTR = "data-al-blank";
+
 /**
  * Every visible required control still empty on the current page.
  *
@@ -63,7 +68,8 @@ export async function sweepEmptyRequiredControls(
   page: Page,
 ): Promise<{ empty: EmptyRequired[]; requiredSeen: string[] }> {
   if (!page || typeof page.evaluate !== "function") return { empty: [], requiredSeen: [] };
-  const swept = await page.evaluate(() => {
+  const swept = await page.evaluate((BLANK: string) => {
+    for (const el of Array.from(document.querySelectorAll(`[${BLANK}]`))) el.removeAttribute(BLANK);
     // TWO GRADES OF COMPLAINT, BECAUSE ONE OF THEM IS ALSO ORDINARY PROSE.
     //
     // "This field is required" is a portal refusing a filing. "Please select an option" is
@@ -98,10 +104,12 @@ export async function sweepEmptyRequiredControls(
     // its `handed` with the duplicate lost the complaint the moment the held read-back discharged
     // "Attachment", and the PSE draft was created with Customer phone blank. So a same-name entry
     // takes the newcomer's hand-offs too — and stays a FILE entry only while every control under
-    // the name is a file box.
-    const push = (name: string, why: string, handed?: Array<{ next: string; unattributed: string }>, file = false): void => {
+    // the name is a file box. The control's blank tag (SWEPT_BLANK_ATTR) is set from the same
+    // `tidy` call as the entry's name: the re-assert compares the two.
+    const push = (name: string, why: string, el?: Element, handed?: Array<{ next: string; unattributed: string }>, file = false): void => {
       const clean = tidy(name);
       if (!clean) return;
+      if (el && !el.hasAttribute(BLANK)) el.setAttribute(BLANK, clean);
       const had = out.find((o) => o.name === clean);
       if (!had) { out.push({ name: clean, why, ...(handed && handed.length ? { handed } : {}), ...(file ? { file } : {}) }); return; }
       if (handed && handed.length) had.handed = [...(had.handed ?? []), ...handed];
@@ -336,7 +344,7 @@ export async function sweepEmptyRequiredControls(
 
       const handed = (handedTo.get(el) ?? []).map((h) => ({ next: h.next ? tidy(nameOf(h.next)) : "", unattributed: h.unattributed }));
       const isFile = el.tagName === "INPUT" && (el.getAttribute("type") || "").toLowerCase() === "file";
-      push(nameOf(el), claimed.has(el) ? "complaint" : el.hasAttribute("required") || el.getAttribute("aria-required") === "true" ? "attribute" : "asterisk", handed, isFile);
+      push(nameOf(el), claimed.has(el) ? "complaint" : el.hasAttribute("required") || el.getAttribute("aria-required") === "true" ? "attribute" : "asterisk", el, handed, isFile);
     }
 
     // ---- unanswered required radio GROUPS -------------------------------------------
@@ -357,12 +365,55 @@ export async function sweepEmptyRequiredControls(
       while (cont && cont !== document.body && !members.every((r) => cont!.contains(r))) cont = cont.parentElement;
       if (!cont || cont === document.body) continue;
       const text = (cont.innerText || "").replace(/\s+/g, " ").trim();
-      if (!/\*/.test(text.slice(0, 200)) && !COMPLAINT.test(text)) continue;
+      // Required by the markup too (#362): a member's own `required` / aria-required, or its
+      // radiogroup's. A required "ready to submit?" group with no asterisk read as a clean page,
+      // and the stamped draft Submit was clicked past it.
+      // Only a group a person could answer (Helm review of 4081f12, SF3): a member enabled and the
+      // group rendered. A hidden or disabled group's markup says nothing about THIS page.
+      const shownEl = (el: Element): boolean => {
+        if (!visible(el)) return false;
+        const cs = getComputedStyle(el);
+        return cs.visibility !== "hidden" && cs.display !== "none";
+      };
+      const answerable = members.some((r) => !r.disabled && !r.closest("fieldset[disabled]"))
+        && (members.some((r) => shownEl(r) || Array.from(r.labels ?? []).some((l) => shownEl(l))) && shownEl(cont));
+      const marked = answerable && (members.some((r) => r.required || r.getAttribute("aria-required") === "true")
+        || !!members[0].closest('[role="radiogroup"][aria-required="true"]'));
+      if (!marked && !/\*/.test(text.slice(0, 200)) && !COMPLAINT.test(text)) continue;
       push(text.replace(/\s*\*\s*/g, " ").trim(), "radio-group");
     }
 
+    // ---- an unticked REQUIRED checkbox (#362, Helm review of 4081f12, SF5) ------------
+    // "I am ready to submit [ ] *" with the box unticked is a blank like any other: without this
+    // a refused ready-to-submit box read as a clean page, and the stamped draft Submit was clicked
+    // into the portal's own refusal (an incident, not a review stop). Markup-required only
+    // (`required` / aria-required), visible and enabled — never an asterisk guess, so an optional
+    // "email me updates" box is not a blank. Boxes sharing a name are ONE group (Helm review of
+    // 381204a): one ticked member answers it, and an unanswered group is one blank, not one per box.
+    // Its own kind, "checkbox": a re-assert never re-runs another page's step into one.
+    const allBoxes = Array.from(document.querySelectorAll("input[type=checkbox]")) as HTMLInputElement[];
+    const groupDone = new Set<string>();
+    for (const box of allBoxes) {
+      const gname = box.getAttribute("name") || "";
+      const mates = gname ? allBoxes.filter((b) => b.getAttribute("name") === gname) : [box];
+      if (mates.length > 1) {
+        if (groupDone.has(gname)) continue;
+        groupDone.add(gname);
+        if (mates.some((b) => b.checked)) continue;
+      }
+      const cb = mates.find((b) => !b.checked && !b.disabled && !b.closest("fieldset[disabled]")
+        && (b.required || b.getAttribute("aria-required") === "true")
+        && (visible(b) || Array.from(b.labels ?? []).some((l) => visible(l))));
+      if (!cb) continue;
+      const lbls = Array.from(cb.labels ?? []);
+      const name = (lbls.map((l) => (l.textContent || "").replace(/\s+/g, " ").trim()).find(Boolean)
+        || cb.getAttribute("aria-label") || cb.getAttribute("name") || "(unlabelled checkbox)");
+      if (!requiredSeen.includes(name.slice(0, 70))) requiredSeen.push(name.slice(0, 70));
+      push(name, "checkbox", cb);
+    }
+
     return { empty: out.slice(0, 14), requiredSeen: requiredSeen.slice(0, 120) };
-  }).catch(() => ({ empty: [], requiredSeen: [] })) as { empty: EmptyRequired[]; requiredSeen: string[] };
+  }, SWEPT_BLANK_ATTR).catch(() => ({ empty: [], requiredSeen: [] })) as { empty: EmptyRequired[]; requiredSeen: string[] };
 
   // NORMALISE BEFORE RETURNING. The .catch above absorbs a page that throws, but not a page
   // that RESOLVES with something else — a stub, a page mid-navigation, an evaluate the portal

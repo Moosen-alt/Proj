@@ -285,6 +285,21 @@ const PAGES: Record<string, string> = {
     <div class="err">Please select at least one option before continuing.</div>
     <div style="height:600px"></div>
     <div class="form-group"><label for="z">Notes</label><input id="z" value="ok" /></div>`),
+
+  // ---- #362 SF3/SF5: required radio groups and checkboxes, both directions -------------
+  // A required group a person can answer is a blank; the same group hidden or disabled is not
+  // (it said nothing about THIS page, and stopped permit replays where main went ahead).
+  radioRequired: shell(`<div class="form-group"><div>Is the system grid-tied?</div>
+    <input type="radio" name="g" id="gY" required><label for="gY">Yes</label>
+    <input type="radio" name="g" id="gN" required><label for="gN">No</label></div>`),
+  radioHidden: shell(`<div class="form-group" style="display:none"><div>Is the system grid-tied?</div>
+    <input type="radio" name="g" id="gY" required><label for="gY">Yes</label>
+    <input type="radio" name="g" id="gN" required><label for="gN">No</label></div>`),
+  radioDisabled: shell(`<div class="form-group"><div>Is the system grid-tied?</div>
+    <input type="radio" name="g" id="gY" required disabled><label for="gY">Yes</label>
+    <input type="radio" name="g" id="gN" required disabled><label for="gN">No</label></div>`),
+  checkboxRequired: shell(`<div class="form-group"><input type="checkbox" id="rdy" required><label for="rdy">I am ready to submit</label></div>`),
+  checkboxOptional: shell(`<div class="form-group"><input type="checkbox" id="upd"><label for="upd">Email me updates</label></div>`),
 };
 
 const server = http.createServer((req, res) => {
@@ -454,6 +469,14 @@ check("a satisfied page proves it LOOKED: two asterisked fields, zero blank",
   legendSeen.length === 2, `expected Email and Phone counted as required-and-satisfied, got ${JSON.stringify(legendSeen)}`);
 check("...and the LEGEND SENTENCE itself is not counted as a required field",
   !legendSeen.some((n) => /asterisk|all information|is required/i.test(n)), JSON.stringify(legendSeen));
+
+// #362 SF3/SF5 — both directions.
+check("a required radio group a person can answer is a blank", (await sweep("radioRequired")).length === 1);
+check("...the same group hidden is not", (await sweep("radioHidden")).length === 0);
+check("...nor disabled", (await sweep("radioDisabled")).length === 0);
+check("a required unticked 'I am ready to submit' checkbox is a blank",
+  (await sweep("checkboxRequired")).some((e) => /ready to submit/i.test(e.name)));
+check("...an optional unticked checkbox is not", (await sweep("checkboxOptional")).length === 0);
 
 await browser.close();
 server.close();
