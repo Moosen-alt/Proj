@@ -2977,7 +2977,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     return size < 0 || size <= cap;
   }
 
-  private resolveUpload(field: ExtractedField, required = true, accept = ""): { docType: string; file: string } | null {
+  private resolveUpload(field: ExtractedField, required = true, accept = "", exactOnly = false): { docType: string; file: string } | null {
     const label = field.label || "";
     const cap = this.uploadMaxBytes();
     // A candidate must fit the size cap AND be a type this control accepts. Folding the type
@@ -2993,6 +2993,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // by a plan-set fallback, in either upload mode. Record only the exact type
     // so learning cannot teach replay to repeat a substitute indefinitely.
     const namedType = UPLOAD_LABEL_PATTERNS.find(({ re }) => re.test(label))?.docType;
+    // THE REVIEW PAGE TAKES ONLY THE DOCUMENT ITS SLOT NAMES (#383): no substitute, no fallback
+    // tier, no combined-mode plan set — a slot we cannot match exactly is left for the person.
+    if (exactOnly) return namedType && fits(namedType) ? { docType: namedType, file: this.docsByType[namedType] } : null;
     if (uploadForbidsSubstitute(label)) {
       if (namedType && fits(namedType)) return { docType: namedType, file: this.docsByType[namedType] };
       this.debug?.event({ type: "upload_no_substitute", label: label.slice(0, 60) });
@@ -3085,8 +3088,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   }
 
   // Resolve a docType for an upload control by its label only (no ExtractedField wrapper).
-  private resolveUploadByLabel(label: string, required = true, accept = ""): { docType: string; file: string } | null {
-    return this.resolveUpload({ selector: {}, label, fieldType: "file" }, required, accept);
+  private resolveUploadByLabel(label: string, required = true, accept = "", exactOnly = false): { docType: string; file: string } | null {
+    return this.resolveUpload({ selector: {}, label, fieldType: "file" }, required, accept, exactOnly);
   }
 
   // Capture a full-page PNG of the current page as base64 for VISION-ASSISTED PLANNING, so the
@@ -3267,9 +3270,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     } catch { return []; }
   }
 
+  // `reviewPage` (#383): the page reads as review, so the pass is ATTACH-ONLY — a native file
+  // input whose label names a document we hold, set directly. Nothing is clicked (a custom
+  // Browse widget needs a click, and on a review page a click is how a portal files), no
+  // substitute document is filed, and every required slot left empty is reported.
   private async performUploads(
     steps: RecipeStep[],
     alreadyFilledLabels: string[],
+    opts: { reviewPage?: boolean } = {},
   ): Promise<{ filled: string[]; missingRequired: string[]; attached: number }> {
     const filled: string[] = [];
     const missingRequired: string[] = [];
@@ -3315,7 +3323,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     let pathKey = "";
     try { pathKey = new URL(String(this.page.url?.() ?? "")).pathname.toLowerCase(); } catch { pathKey = ""; }
     for (const slot of slots) {
-      const resolved = this.resolveUploadByLabel(slot.label, !!slot.required, slot.accept || "");
+      if (opts.reviewPage && slot.kind !== "input") {
+        this.debug?.event({ type: "upload_review_widget_left", label: (slot.label || "").slice(0, 80) });
+        if (slot.required) missingRequired.push(`${slot.label || "Required document"} (on the review page — attach it by hand; automation clicks no upload widget there)`);
+        continue;
+      }
+      const resolved = this.resolveUploadByLabel(slot.label, !!slot.required, slot.accept || "", !!opts.reviewPage);
       if (!resolved) {
         // No document for this control — never fake it. Report it if the portal requires it.
         if (slot.required) missingRequired.push(slot.label || "Required document");
@@ -3379,9 +3392,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         async () => {
           if (slot.kind === "input") {
             // Native input — set files directly even when visually hidden behind a button.
+            // The run's OWN write: the portal's async upload request that follows is this
+            // attach committing, and must not meet the review lockdown's live reading (rule
+            // 4b) on a page that reads as review — PowerClerk's attachments sit on exactly
+            // that page (#383). Payment, the filing-URL rule and the sticky lock still apply.
             const loc = this.page!.locator(selector.css!);
             this.options.beforeUpload?.(resolved.docType, resolved.file);
-            await loc.setInputFiles(uploadPayload ?? resolved.file);
+            await withOwnWriteWindow(this.page, `learner upload (${resolved.docType})`, () => loc.setInputFiles(uploadPayload ?? resolved.file));
           } else {
             // Custom widget — the real <input> is created on click, so intercept the
             // browser's file-chooser dialog (works for ANY uploader, no DOM coupling).
@@ -7095,19 +7112,23 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //     "Browse"/"Upload"/"Choose File" widgets whose real input is created only on click
       //     (driven via the browser's filechooser event). Required slots with no matching
       //     document are reported (never faked) so the human can complete them.
-      // A REVIEW/confirm screen is a read-only summary of what was already staged — it
-      // lists the attachments rather than accepting new ones. Uploading there re-attaches
-      // a document that is already committed and then re-runs the attachment Save on a
-      // page that has nothing to commit (operator-observed on ACA's Step 3: Review).
-      if (isReviewPage || plan.atReview) {
-        this.debug?.event({ type: "upload_skipped_on_review", page: pageCount });
-      } else {
-        this.debug?.event({ type: "upload_phase_start", page: pageCount });
+      // A REVIEW/confirm screen USUALLY lists the attachments rather than accepting new ones,
+      // and uploading there once re-attached a committed document and re-ran the attachment
+      // Save (operator-observed on ACA's Step 3: Review). But PowerClerk's FINAL page carries
+      // both the review text and the attachments — live on PacifiCorp NEM the pass was
+      // skipped there and the meter photo never went in (#383). So on a review page the pass
+      // still runs, ATTACH-ONLY (performUploads' reviewPage): a native file input whose label
+      // names a document we hold, nothing clicked, no substitute, no attachment Save — and the
+      // run stops at review afterwards exactly as before, naming any required slot left empty.
+      // ACA's unlabeled attachment rows name no document, so they are still left alone.
+      {
+        const reviewUpload = isReviewPage || plan.atReview === true;
+        this.debug?.event({ type: "upload_phase_start", page: pageCount, ...(reviewUpload ? { attachOnly: true } : {}) });
         const seenSlotLabels = new Set<string>(await this.uploadSlotLabels());
         const up = await this.withPhaseTimeout(
           "uploads",
           150_000,
-          () => this.performUploads(steps, alreadyFilledLabels),
+          () => this.performUploads(steps, alreadyFilledLabels, { reviewPage: reviewUpload }),
           { filled: [] as string[], missingRequired: [] as string[], attached: 0 },
         );
         this.debug?.event({ type: "upload_phase_done", page: pageCount, attached: up.attached, missing: up.missingRequired.length });
@@ -7131,7 +7152,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           const late = await this.withPhaseTimeout(
             "uploads_late",
             90_000,
-            () => this.performUploads(steps, alreadyFilledLabels),
+            () => this.performUploads(steps, alreadyFilledLabels, { reviewPage: reviewUpload }),
             { filled: [] as string[], missingRequired: [] as string[], attached: 0 },
           );
           up.attached += late.attached;
@@ -7141,7 +7162,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         for (const m of up.missingRequired) if (!missingRequiredDocs.includes(m)) missingRequiredDocs.push(m);
         // ACA commits attachments only on the section's own Save (Continue Application
         // leaves them pending) — and each pending row needs its Description + Type first.
-        if (up.attached > 0 && this.isAcaPage(url, fields) && acaAttachmentSaves < 3) {
+        // Never on a review page: the Save is a click, and the attach-only pass clicks nothing.
+        if (up.attached > 0 && !reviewUpload && this.isAcaPage(url, fields) && acaAttachmentSaves < 3) {
           acaAttachmentSaves++;
           const saved = await this.withPhaseTimeout(
             "attachment_save",
