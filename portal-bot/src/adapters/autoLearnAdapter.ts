@@ -7695,7 +7695,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
 
       // d3d) EVERY PV ARRAY ITS OWN ROW (#382) — after every other pass on the page, so nothing
       //      else re-plans the rows this adds; before the persist settle, so their autosaves land.
-      if (!plan.atReview && !isDashboard && this.page) {
+      //      Never on a page that reads as review: no Add Array click or row write lands there.
+      if (!isReviewPage && !plan.atReview && !isDashboard && this.page) {
         try {
           const rowsOut = await this.fillRemainingArrayRows(steps.slice(Math.min(pageStepsFrom, steps.length)));
           pageFillCount += rowsOut.added;
