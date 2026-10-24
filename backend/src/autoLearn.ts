@@ -1404,6 +1404,12 @@ async function autoLearnPortalInner(
         moduleQty: projectFields.moduleQty || projectFields.modQty || "",
         tilt: projectFields.tilt || projectFields.arrayTilt || projectFields.roofPitch || "",
         azimuth: projectFields.azimuth || projectFields.arrayAzimuth || "",
+        // #382 — EVERY ROOF PLANE's OWN ROW. A PV Array repeater gets one row per array: the
+        // learn binds row 1 to array1* and fills rows 2..N from array{N}* with the replay's own
+        // row code, which also reads the certified module model and the system total.
+        ...Object.fromEntries(Object.entries(projectFields).filter(([k]) => /^array\d+(ModuleQuantity|ModuleManufacturer|ModuleModel|Tilt|Azimuth)$/.test(k))),
+        moduleModelCertified: projectFields.moduleModelCertified || "",
+        totalModuleQuantity: projectFields.totalModuleQuantity || "",
         // Battery/ESS repeaters on NEM apps (storage sections ask make/model/qty).
         batteryMake: projectFields.batteryMake || projectFields.battMake || "",
         batteryModel: projectFields.batteryModel || projectFields.battModel || "",
