@@ -32,6 +32,8 @@ import { usStateCode } from "./permitPath";
 import { provablyDifferentUtility, sameUtilityEntity } from "./utilityIdentity";
 import { sameAgencyName } from "./permitProcessLookup";
 import { labelWords } from "../../shared/src/portalSafety";
+// A cycle (portalDraft imports this module); safe because it is only called inside a function.
+import { disarmDraftCreatingSubmit } from "./portalDraft";
 import { firstEmail, looksLikeEmail } from "../../shared/src/emailAddress";
 import { contactKeyRole } from "../../shared/src/contactRoles";
 import { mountAdjective, mountKindForProject } from "./codeReviewRules";
@@ -977,7 +979,15 @@ export function savePortalRecipeSteps(
   // sweep must still be able to hand the portal back its 'complete' status.
   const snapshot = parseJson<RecipeStep[]>(
     s(db.get<Row>("SELECT prev_steps_json FROM portal_recipes WHERE id = ?", [recipeId])?.prev_steps_json) || "[]", []);
-  const incoming = steps ?? [];
+  // THE DRAFT-CREATING STAMP IS NEVER A STEP FIELD (#330): it lives in portal_recipe_draft_submits,
+  // written only by portalDraft.ts. A save that sends the old key has it stripped, so no recipe data
+  // can ever look like that authority.
+  const incoming = (steps ?? []).map((st) => {
+    if (!st || typeof st !== "object" || !Object.prototype.hasOwnProperty.call(st, "draftCreatingSubmit")) return st;
+    const { draftCreatingSubmit: _stripped, ...rest } = st as RecipeStep & { draftCreatingSubmit?: unknown };
+    void _stripped;
+    return rest as RecipeStep;
+  });
   const shallower = status !== "complete" && recipeDepth(snapshot) > recipeDepth(incoming);
   // A SHARED RECIPE NEVER CARRIES ONE COMPANY'S IDENTITY AS A LITERAL (leak sweep 2026-09-28) — the
   // invariant lives here, where every writer passes, and applies to whichever steps are kept.
@@ -1004,6 +1014,10 @@ export function savePortalRecipeSteps(
        notes = ?, updated_at = ? WHERE id = ?`,
     [asJson(finalSteps), status, recipeStructureSignature(finalSteps), status, notes, nowIso(), recipeId],
   );
+  // ANY SAVE TURNS A KNOWN DRAFT-CREATING SUBMIT OFF (#330), even one that writes the same steps
+  // back: the stamp is evidence about the steps a draft was SEEN with, and a save is a person or a
+  // learn asserting new ones. A person's click that is again seen to make a draft re-arms it.
+  disarmDraftCreatingSubmit(db, recipeId, { why: "the recipe's steps were saved" });
   return getPortalRecipe(db, recipeId);
 }
 

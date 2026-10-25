@@ -97,8 +97,9 @@ import { readAndRecordPortalFees } from "./portalFeeReadings";
 import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential } from "./portalCredentials";
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
 import { logger } from "./logger";
-import { draftContinuationGaps, openPortalDraftFor, recordPortalDraft, type ObservedDraft } from "./portalDraft";
+import { disarmDraftCreatingSubmit, draftContinuationGaps, draftSubmitStampForReplay, openPortalDraftFor, recordPortalDraft, DRAFT_SUBMIT_UNEXPECTED_ACTION, type ObservedDraft } from "./portalDraft";
 import { claimSignatureRequestApproval, runningJobSignatureRequestApprovalId } from "./signatureRequestApproval";
+import { deleteProjectInfoPages } from "./infoPages";
 import { nemSignatureState, nemStageIsResume } from "./signatureTrack";
 import { siteKey } from "../../portal-bot/src/draftCreated";
 import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, type HostFit, type PortalUrlSource } from "./portalChannel";
@@ -1383,6 +1384,9 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     db.run("DELETE FROM portal_run_approvals WHERE project_id = ?", [projectId]);
     // Approve & request signatures approvals (migration v48, #308) carry the same FK.
     db.run("DELETE FROM portal_signature_request_approvals WHERE project_id = ?", [projectId]);
+    // Information-page candidates (migration v50, #344) carry the same FK; the pass a person
+    // verified on one of them is withdrawn with it (infoPages owns both tables).
+    deleteProjectInfoPages(db, projectId);
     db.run("DELETE FROM submissions WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM human_review_items WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM corrections WHERE project_id = ?", [projectId]);
@@ -9331,8 +9335,23 @@ export async function prepareSubmission(
       }
       const boundRecipe = { ...recipe, steps: replayBinding.steps };
       const boundValues = { ...replayFieldValues, ...replayBinding.fieldValues };
+      // A KNOWN DRAFT-CREATING SUBMIT MAY BE CLICKED BY THE REPLAY ITSELF (#330, owner ruling 2026-10-16).
+      // The stamp is SERVER-OWNED (portal_recipe_draft_submits; no recipe save can write it) and is
+      // passed only when the steps this replay READ are exactly the steps the draft was seen with
+      // (draftSubmitStampForReplay compares the whole recipe's signature) — any edit since turns it
+      // off. NEM only, because only the NEM track's next stage continues a draft (openPortalDraftFor):
+      // on any other track the next stage would replay the start again and make a second application.
+      // And only on this entity's OWN recipe: a borrowed recipe's stamp is another entity's evidence.
+      // The stamped step must also be the LAST step the binding kept. portal-bot's draftSubmitGate
+      // decides each click; this is never an approval to file.
+      const ownStamp = track === "nem" && !borrowed ? draftSubmitStampForReplay(db, recipe.id, recipe.steps ?? []) : null;
+      const boundStampIdx = ownStamp ? replayBinding.originalIndex.indexOf(ownStamp.stepIndex) : -1;
+      const draftSubmitStamp = ownStamp && boundStampIdx >= 0 && boundStampIdx === replayBinding.steps.length - 1
+        ? { ...ownStamp, stepIndex: boundStampIdx }
+        : null;
+      const replayOptions = { ...stageOptions, draftSubmitStamp };
       ledgerStagingLaunch(`staging replay (${track ?? "permit"} track, run ${runId})`, String(recipe.portalUrl || credentialUrl || ""));
-      result = await recipeStageRunner(boundRecipe, stagedProject, boundValues, docsByType, files, stageOptions);
+      result = await recipeStageRunner(boundRecipe, stagedProject, boundValues, docsByType, files, replayOptions);
 
       // A BOT WALL MUST NOT BLOCK A FILING — RETRY WITH A REAL WINDOW.
       //
@@ -9348,7 +9367,12 @@ export async function prepareSubmission(
       // were actually headless, and only when the operator has not switched it off. The retry
       // result is kept only if it got further, so a second refusal cannot erase the first
       // result's diagnostics.
-      if (!result.ok && looksBotBlocked(stageFailureText(result)) && stageOptions.headless !== false
+      // NEVER after the replay's own draft-creating click (#330): that click may have reached the
+      // portal, so a second browser would start the application again, and the incident it raised
+      // must stay this run's result (recorded and disarmed below), never be replaced by a retry's.
+      const draftClickReachedPortal = Boolean((result as { draftSubmitUnexpected?: unknown }).draftSubmitUnexpected
+        || (result as { draftCreatedByReplay?: unknown }).draftCreatedByReplay);
+      if (!result.ok && !draftClickReachedPortal && looksBotBlocked(stageFailureText(result)) && stageOptions.headless !== false
           && process.env.PORTAL_HEADED_RETRY !== "0") {
         logger.info("portal", "portal refused a headless browser at staging — retrying with a real window", {
           projectId, portal: portalLabel,
@@ -9357,7 +9381,7 @@ export async function prepareSubmission(
           ledgerStagingLaunch(`staging replay (${track ?? "permit"} track, run ${runId}) — headed retry, a second browser; may leave a second draft`, String(recipe.portalUrl || credentialUrl || ""));
           const headedResult = await recipeStageRunner(
             boundRecipe, stagedProject, boundValues, docsByType, files,
-            { ...stageOptions, headless: false },
+            { ...replayOptions, headless: false },
           );
           const before = Array.isArray((result as { steps?: unknown[] }).steps) ? (result as { steps: unknown[] }).steps.length : 0;
           const after = Array.isArray((headedResult as { steps?: unknown[] }).steps) ? (headedResult as { steps: unknown[] }).steps.length : 0;
@@ -9418,6 +9442,31 @@ export async function prepareSubmission(
           projectId, track: "nem", runId, recipeId: null, source: "replay",
           draft: { applicationNumber: existingDraft.applicationNumber, nextForm: "", evidence: String(existingDraft.why ?? ""), strength: "status" },
         });
+      }
+      // THE REPLAY CLICKED A KNOWN DRAFT-CREATING SUBMIT ITSELF (#330). A draft-created page after it:
+      // the draft is written down exactly as a person's click would have written it (the next stage
+      // continues it), and NOTHING is filed. Any other page: the incident — audited, the recipe's
+      // stamp comes off so no replay clicks that step again until a person's click of it is again
+      // seen to make a draft, and the track is not read as filed (the run is a pause, never a
+      // submission; no record number is taken from it).
+      const draftByReplay = (result as { draftCreatedByReplay?: ObservedDraft }).draftCreatedByReplay ?? null;
+      if (draftByReplay) {
+        recordPortalDraft(db, { projectId, track: track ?? "permit", draft: draftByReplay, runId, recipeId: null, source: "replay" });
+        addAuditLog(db, projectId, "portal_bot", "portal staging", "portal.draft_submit_clicked", {
+          track: track ?? "permit", runId, recipeId: recipe.id, label: String(draftByReplay.clickedLabel ?? "").slice(0, 80),
+          applicationNumber: String(draftByReplay.applicationNumber ?? "").slice(0, 40), tenant: String(draftByReplay.tenantKey ?? "").slice(0, 200),
+        });
+      }
+      const draftIncident = (result as { draftSubmitUnexpected?: Record<string, unknown> }).draftSubmitUnexpected ?? null;
+      if (draftIncident) {
+        addAuditLog(db, projectId, "portal_bot", "portal staging", DRAFT_SUBMIT_UNEXPECTED_ACTION, {
+          track: track ?? "permit", runId, recipeId: recipe.id, ...draftIncident,
+        });
+        disarmDraftCreatingSubmit(db, recipe.id, { projectId, runId, why: `the page after the replay's click read as ${String(draftIncident.verdict ?? "not a draft")}` });
+        logger.warn("portal", "a known draft-creating submit produced an unexpected page — run stopped, recipe disarmed, nothing recorded as filed", {
+          projectId, track, runId, verdict: String(draftIncident.verdict ?? ""),
+        });
+        result = { ...result, finalSubmitClicked: false, finalSubmitClickedByAutomation: false, capturedPermitNumber: "", capturedConfirmationNumber: "" };
       }
       const replayFailed = result && result.ok === false && !(typeof result.pauseReason === "string" && result.pauseReason) && !existingDraft;
       // THE PORTAL SAID THIS ADDRESS IS NOT SERVED THERE (portal-truth D5). The replay stopped with

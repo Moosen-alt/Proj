@@ -3953,6 +3953,169 @@ export interface RecipeStep {
 
 export type PortalRecipeStatus = "recording" | "complete" | "needs_rerecord";
 
+// ---------------------------------------------------------------------------------------------
+// HUMAN-VERIFIED INFORMATION PAGES (#344, option B). A named person marks one exact page "an
+// information page — OK to advance"; the network backstop then lets that page's ONE forward request
+// through rule 4(b), and only before anything is entered (shared/src/infoPagePass.ts). The gate's
+// own context types live beside its predicate; these are the rows and what crosses into the bot.
+// ---------------------------------------------------------------------------------------------
+
+/** A verified page as the bot receives it (shared knowledge: hashes, names and structure only). */
+export interface VerifiedInfoPage {
+  id: string;
+  identityVersion: number;
+  identitySha256: string;
+  origin: string;
+  path: string;
+  queryKeys: string[];
+  components: { pageSha: string; titleSha: string; structureSha: string; textSha: string; controlSha: string; requestSha: string };
+  controlTag: string;
+  controlType: string;
+  controlName: string;
+  controlLabel: string;
+  /** What the verified control sends: the body as [name, sha256(value)] in order. */
+  request: { method: string; where: string; actionSha256: string; media: string; body: Array<[string, string]> };
+  /** The exact steps that led to the page: [action, note, goto origin+path+sorted query keys]. */
+  prefix: Array<[string, string, string]>;
+  verifiedAt: string;
+}
+
+/** What a learn hands back when the backstop held an unverified information page (LearnResult). */
+export interface InfoPageCandidateCapture {
+  identityVersion: number;
+  identitySha256: string;
+  origin: string;
+  path: string;
+  controlLabel: string;
+  /** infoPagePass InfoPageDigest (JSON-safe). */
+  digest: unknown;
+  prefix: Array<[string, string, string]>;
+  /** infoPagePass InfoPageObservedRequest: the held request. */
+  observed: unknown;
+  /** infoPagePass InfoPageEvidence: no field value; the text scrubbed. */
+  evidence: unknown;
+  /** The masked full-page screenshot, base64 PNG; absent when it could not be taken safely. */
+  screenshotBase64?: string;
+}
+
+/** A candidate row as the dashboard reads it (project-scoped evidence; never screenshot bytes). */
+export interface InfoPageCandidateRecord {
+  id: string;
+  projectId: string;
+  learnRunId: string;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  seenCount: number;
+  origin: string;
+  path: string;
+  queryKeys: string[];
+  identityVersion: number;
+  identitySha256: string;
+  controlLabel: string;
+  controlName: string;
+  request: { method: string; where: string; media: string; fieldNames: string[] };
+  /** The steps that led to the page, exactly as a pass binds them (a goto by its origin + path +
+   *  query KEYS, a click by its recorded note) — what the person verifies along with the page. */
+  steps: string[];
+  evidence: { title: string; headings: Array<[string, string]>; forms: Array<{ method: string; enctype: string; actionWhere: string; fields: Array<[string, string, string]> }>; frames: Array<[string, string]>; controlLabels: string[]; text: string };
+  hasScreenshot: boolean;
+  status: "open" | "dismissed" | "verified";
+  decidedBy: string;
+  decidedAt: string;
+  passId: string;
+  /** A verified candidate whose pass still exists (false once it was withdrawn or an incident
+   *  removed it). */
+  passLive: boolean;
+  /** Why "OK to advance" is refused (computed server-side; non-empty disables the button). */
+  refusals: string[];
+  /** What to look at twice (never blocks). */
+  warnings: string[];
+  /** #344 round 4: this exact page's verification EXPIRED (INFO_PAGE_PASS_MAX_AGE_DAYS /
+   *  INFO_PAGE_PASS_MAX_PROJECTS) — the run was held as on main; a person re-verifies on this card
+   *  (the verify replaces the expired pass). null = none. */
+  expiredPass: { passId: string; verifiedAt: string; why: string[] } | null;
+}
+
+/** A shared pass as GET /api/info-page-passes lists it (critique [5]: no component or value hashes,
+ *  no verifier identity, no project id). */
+/** #344 round 2 — one side of a project's information-page state, for its card: the verified pages
+ *  it passed or was held at since a person last allowed it, why later runs stop there, and whether a
+ *  person may allow the pass once more (only with nothing HARD in the way). */
+export interface InfoPageProjectSideState {
+  scope: "ahj" | "utility";
+  passed: Array<{ passId: string; where: string; at: string }>;
+  held: Array<{ passId: string; where: string; at: string }>;
+  /** Never lifted here: a filing, a number, a draft, a staged / paused / interrupted run. */
+  hard: string[];
+  /** This project's earlier learns on this side: lifted by "Allow once more for this project". */
+  learn: string[];
+  canAllow: boolean;
+  lastAllowedBy: string;
+  lastAllowedAt: string;
+}
+
+export interface InfoPagePassRecord {
+  id: string;
+  origin: string;
+  path: string;
+  queryKeys: string[];
+  controlLabel: string;
+  controlName: string;
+  request: { method: string; where: string; media: string; fieldNames: string[] };
+  identityPrefix: string;
+  verifiedAt: string;
+  /** A person's verification is on record for this row and has not expired
+   *  (infoPages.liveInfoPagePasses): only such a row is ever handed to a run. A withdrawn pass is
+   *  deleted, so it is not listed at all. */
+  live: boolean;
+  /** #344 round 4: why the verification expired (30 days / 10 projects — the limit reached, never a
+   *  count); empty = within both limits. */
+  expired: string[];
+}
+
+/**
+ * AN INCIDENT ON A VERIFIED INFORMATION PAGE (#344, proposal §4), reported by a learn and acted on
+ * by the backend (infoPages.recordInfoPagePassIncidents: audited, the pass WITHDRAWN):
+ *   before — the page at the pass's host + path read differently (signature, control, the steps
+ *            before it, or the request); the backstop held the click exactly as on main;
+ *   after  — the page the verified click led to did not read as "not filed" (a receipt, a filed
+ *            status, the review page, an error, no form, unreadable); the run stopped and nothing is
+ *            recorded as filed.
+ */
+export interface InfoPageIncident {
+  passId: string;
+  phase: "before" | "after";
+  why: string[];
+  /** origin + path of the page (never a query). */
+  where: string;
+}
+
+/** #344 round 3 — on a PROJECT's card: a pass this project used was withdrawn by an after-click
+ *  incident (a receipt-like page, or the run entered none of the job's data on the page it led to) —
+ *  the verified page may have filed for this project. */
+export interface InfoPageFilingWarning {
+  passId: string;
+  /** origin + path of the verified information page. */
+  where: string;
+  controlLabel: string;
+  at: string;
+  why: string[];
+  /** #344 round 4 (rule 6): the incident happened on another org's project — this row carries no
+   *  text, no label, no time ("A verified information page this project used may have filed — check
+   *  the portal"). */
+  generic: boolean;
+}
+
+/** #344 round 3 — on the pass's KNOWLEDGE-BASE entry: the same warning, with every project that used
+ *  the pass named — only those inside the viewer's own org (rule 6). */
+export interface InfoPagePassFilingWarning {
+  passId: string;
+  where: string;
+  controlLabel: string;
+  at: string;
+  projects: Array<{ id: string; name: string; address: string }>;
+}
+
 export interface PortalRecipeLoginStep {
   /** Selector for the username/email field. */
   usernameSel?: RecipeSelector;

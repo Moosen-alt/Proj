@@ -2313,6 +2313,96 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       addColumnIfMissing(db, "portal_recipes", "flagged_at", "TEXT");
     },
   },
+  // v50 sits here, beside the portal-run trust tables (v35), rather than at the end of the list:
+  // parallel PRs appending at the end collide (see v43 / v46). ORDERING: v49 belongs to PR #354
+  // (portal_recipe_draft_submits). The runner applies only versions above MAX(schema_meta.version),
+  // so #354 must land first — a database that ran v50 would never run a v49 merged after it (the
+  // PR that lands second renumbers otherwise).
+  {
+    version: 50,
+    name: "portal_info_pages",
+    up: (db) => {
+      // HUMAN-VERIFIED INFORMATION PAGES (#344, owner ruling 2026-10-15: option B). Hard rule 1's
+      // network backstop holds every request off a page that reads as review (4b); Portland
+      // DevHub's "Permitting Information" page says "A Permit Tech will review your submission", so
+      // its Next is held before anything is entered. A NAMED PERSON may mark that exact page once;
+      // the backstop then lets its ONE forward request through 4(b) only (shared/src/infoPagePass.ts).
+      //
+      // portal_info_page_candidates — TENANT EVIDENCE, a child of the project (reaches an org through
+      // projects.org_id; no org_id column, CLAUDE.md tenancy). Written by a learn that was held at
+      // an unverified information page: the identity digest (hashes, names, structure), the exact
+      // prefix, the held request (hashes), the scrubbed page text and the masked screenshot.
+      //
+      // portal_info_page_passes — THE SERVER-OWNED RECORD, shared knowledge like portal_recipes (the
+      // owner: the page is the same for every tenant). Hashes, names and structure only: never page
+      // text, a screenshot, a hidden value or a project id. CREATED ONLY by a person's verify and
+      // never updated; WITHDRAWN BY DELETE (a person, an incident a run reports, or the deletion of
+      // the project it was verified on) — all in backend/src/infoPages.ts, history in audit_logs.
+      // Never written by a learn, an import, research, a replay, a recipe save or a migration
+      // (rule 3). A row counts only while its source candidate records the verification
+      // (infoPages.liveInfoPagePasses). One pass per page identity.
+      //
+      // Both tables and every index are created HERE, never lazily in a read path.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS portal_info_page_candidates (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          learn_run_id TEXT NOT NULL DEFAULT '',
+          first_seen_at TEXT NOT NULL,
+          last_seen_at TEXT NOT NULL,
+          seen_count INTEGER NOT NULL DEFAULT 1,
+          origin TEXT NOT NULL,
+          path TEXT NOT NULL,
+          identity_version INTEGER NOT NULL,
+          identity_sha256 TEXT NOT NULL,
+          digest_json TEXT NOT NULL,
+          prefix_json TEXT NOT NULL DEFAULT '[]',
+          evidence_json TEXT NOT NULL,
+          observed_json TEXT NOT NULL,
+          screenshot_png BLOB,
+          status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open', 'dismissed', 'verified')),
+          decided_by TEXT NOT NULL DEFAULT '',
+          decided_by_user_id TEXT NOT NULL DEFAULT '',
+          decided_at TEXT NOT NULL DEFAULT '',
+          pass_id TEXT NOT NULL DEFAULT '',
+          FOREIGN KEY (project_id) REFERENCES projects(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_info_page_cand_live ON portal_info_page_candidates(project_id, identity_sha256) WHERE status <> 'verified';
+        CREATE INDEX IF NOT EXISTS idx_info_page_cand_project ON portal_info_page_candidates(project_id, status);
+        CREATE TABLE IF NOT EXISTS portal_info_page_passes (
+          id TEXT PRIMARY KEY,
+          origin TEXT NOT NULL,
+          path TEXT NOT NULL,
+          query_keys_json TEXT NOT NULL DEFAULT '[]',
+          identity_version INTEGER NOT NULL,
+          identity_sha256 TEXT NOT NULL,
+          page_sha256 TEXT NOT NULL,
+          title_sha256 TEXT NOT NULL,
+          structure_sha256 TEXT NOT NULL,
+          text_sha256 TEXT NOT NULL,
+          control_sha256 TEXT NOT NULL,
+          request_sha256 TEXT NOT NULL,
+          control_label TEXT NOT NULL,
+          control_name TEXT NOT NULL,
+          control_tag TEXT NOT NULL,
+          control_type TEXT NOT NULL,
+          request_method TEXT NOT NULL,
+          request_where TEXT NOT NULL,
+          request_action_sha256 TEXT NOT NULL,
+          request_media TEXT NOT NULL,
+          request_body_json TEXT NOT NULL,
+          prefix_json TEXT NOT NULL,
+          summary_json TEXT NOT NULL,
+          verified_at TEXT NOT NULL,
+          verified_by TEXT NOT NULL,
+          verified_by_user_id TEXT NOT NULL DEFAULT '',
+          source_candidate_id TEXT NOT NULL
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_info_page_pass_identity ON portal_info_page_passes(identity_sha256);
+        CREATE INDEX IF NOT EXISTS idx_info_page_pass_origin ON portal_info_page_passes(origin, path);
+      `);
+    },
+  },
   {
     version: 36,
     name: "permit_process_lookups",
@@ -2582,6 +2672,36 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       `);
     },
   },
+  {
+    version: 49,
+    name: "portal_recipe_draft_submits",
+    up: (db) => {
+      // A KNOWN DRAFT-CREATING SUBMIT (#330; owner ruling 2026-10-16 "Yes to PSE"). The record that
+      // lets a replay click a recipe's healed Part 1 Submit itself. SERVER-OWNED, never in steps_json:
+      // a recipe save (PUT /api/portal-recipes/:id/steps), a re-record restore or a self-heal can
+      // never write, move or revive it. Only portalDraft.ts writes a row (the heal, and the arm on a
+      // person's click seen to make a draft) and only disarmDraftCreatingSubmit deletes one.
+      // steps_sig is recipeStepsSignature of the WHOLE recipe the draft was seen with: a replay gets
+      // the stamp only when the steps it replays are exactly those (any edit turns it off). An empty
+      // tenant_key is "healed, not yet stamped" (the heal's page had no readable tenant). selector_sig
+      // fingerprints the healed step's own selector, so a re-aimed last step with the same label is
+      // never re-armed from this record (portalDraft healRecordFor). One row per
+      // recipe; portal_recipes is shared knowledge, so no org_id (CLAUDE.md). No foreign key: a deleted
+      // recipe's id is never reused, so its orphan row is never read, and a key would block the delete.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS portal_recipe_draft_submits (
+          recipe_id TEXT PRIMARY KEY,
+          step_index INTEGER NOT NULL,
+          steps_sig TEXT NOT NULL,
+          tenant_key TEXT NOT NULL DEFAULT '',
+          label TEXT NOT NULL,
+          selector_sig TEXT NOT NULL DEFAULT '',
+          healed_at TEXT NOT NULL,
+          armed_at TEXT NOT NULL DEFAULT ''
+        );
+      `);
+    },
+  },
 ];
 
 /** v47 was edited in place while #218 was open (Helm's review at 0116f98a): a DB that ran an earlier
@@ -2634,6 +2754,14 @@ export function dedupeKnowledgeNotes(db: AppDb): number {
  *  that an older pinned server still runs (it would otherwise migrate it under that server). */
 export function latestSchemaVersion(): number {
   return VERSIONED_MIGRATIONS.reduce((max, m) => Math.max(max, m.version), 0);
+}
+
+/** Every versioned migration's version and name, in declaration order. Read-only: what the
+ *  contiguity guard (backend/test/migrationVersions.test.ts) checks — runVersionedMigrations applies
+ *  only versions above MAX(schema_meta.version), so a gap filled by a later merge is never applied
+ *  to a database that already ran the version above it. */
+export function versionedMigrationVersions(): Array<{ version: number; name: string }> {
+  return VERSIONED_MIGRATIONS.map((m) => ({ version: m.version, name: m.name }));
 }
 
 /** MAX(schema_meta.version) of an already-open handle, 0 when the table is missing. */

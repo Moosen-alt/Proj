@@ -1106,6 +1106,17 @@
           </div>
         </details>
 
+        <details id="infoPagePassesAccordion" class="kb-accordion" style="margin-top:10px">
+          <summary class="kb-summary">
+            <span>Verified information pages (network backstop)</span>
+            <span id="infoPagePassesCount" class="muted" style="font-size:12px;font-weight:400"></span>
+          </summary>
+          <p class="muted" style="font-size:12px;margin:6px 0">An information page is one a person marked "OK to advance" after a run stopped there (the page's own words read as review, so the network backstop held its Next). Automation then presses that one page's control — only that exact page, reached by the same steps, only on a run that has entered nothing. A pass is withdrawn (deleted; the audit log keeps it) by a person, or automatically when a run finds the page changed or the page after it does not read as an unfiled form. Withdrawing stops runs that start afterwards; a run already in progress keeps the pass it started with.</p>
+          <div id="infoPagePasses" class="stack" style="margin-top:8px">
+            <p class="muted">Loading…</p>
+          </div>
+        </details>
+
         <details id="ahjFormsAccordion" class="kb-accordion" style="margin-top:10px">
           <summary class="kb-summary">
             <span>AHJ Forms (official permit PDFs)</span>

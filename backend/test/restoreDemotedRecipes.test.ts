@@ -202,6 +202,9 @@ await check("(m5) MUST-EXCLUDE: the CLI dry run on a copy at an OLDER schema lea
   // older pinned server looks like to this code).
   const lower = new Database(copy);
   const newest = (lower.prepare("SELECT MAX(version) AS v FROM schema_meta").get() as { v: number }).v;
+  // The version below it, as recorded — not newest - 1: version numbers can have a gap while
+  // parallel PRs land out of order (#344's v50 sits above #354's v49).
+  const previous = (lower.prepare("SELECT MAX(version) AS v FROM schema_meta WHERE version < ?").get(newest) as { v: number }).v;
   const removed = lower.prepare("SELECT * FROM schema_meta WHERE version = ?").get(newest) as { version: number; name: string; applied_at: string };
   lower.prepare("DELETE FROM schema_meta WHERE version = ?").run(newest);
   lower.close();
@@ -209,7 +212,7 @@ await check("(m5) MUST-EXCLUDE: the CLI dry run on a copy at an OLDER schema lea
     env: { ...process.env, AUTOPILOT_DB_PATH: copy, ANTHROPIC_API_KEY: "" }, cwd: REPO, encoding: "utf8",
   });
   const before = signature();
-  assert.equal(before.maxVersion, newest - 1, "setup: the copy was not lowered");
+  assert.equal(before.maxVersion, previous, "setup: the copy was not lowered");
   const dry = run();
   assert.equal(dry.status, 0, `dry run failed:\n${dry.stdout}\n${dry.stderr}`);
   assert.match(dry.stdout, /DRY RUN/);

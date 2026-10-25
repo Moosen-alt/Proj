@@ -3,11 +3,11 @@ import { preferredRowLabel, rankAddressVersions, type SiteIdentity } from "../ad
 import { imageToPdfBytes, pdfNameFor, shouldConvertToPdf } from "../imageToPdf";
 import path from "path";
 import type { Page, Frame, Locator } from "playwright";
-import type { ProjectRecord, RecipeSelector, RecipeStep, StepFingerprint } from "../../../shared/src/types";
+import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep, StepFingerprint } from "../../../shared/src/types";
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, type PortalContext, type PortalStepResult } from "../adapter";
 import { openPortal } from "../browser";
 import { selectWithFallback, readClosedComboboxOptions } from "../comboboxFill";
-import { detectChallengeFrame, frameSelectorFor, maskId, readbackMatches, redactStatusText, safeAction, sleep, smartWait, waitForElement, waitForInteractiveControls } from "../safeAction";
+import { detectChallengeFrame, frameSelectorFor, maskId, readbackMatches, redactCaptureText, redactStatusText, safeAction, sleep, smartWait, waitForElement, waitForInteractiveControls } from "../safeAction";
 import { applyFormatHint } from "../formatHint";
 import { scrapeReviewScreen as scrapeReviewScreenShared } from "../reviewScreenScraper";
 import { performLogin, lastRevealTrail, loginFormPresent, holdForPerson } from "./loginFlow";
@@ -49,9 +49,13 @@ export interface ContinueDraft {
    *  Submit; not signed, or unreadable, it stops on the record page and names why. */
   awaitingSignature?: boolean;
 }
-import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
+import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isInterstitialForwardLabel as sharedIsInterstitialForwardLabel, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
 import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
+// Types only (erased): the information-page door is reached duck-typed on the installed backstop.
+import type { FilingBackstop, InfoPageCandidateTake, InfoPagePassOpen } from "../filingBackstop";
+import { INFO_PAGE_PRIOR_PROGRESS_REFUSAL, infoPageEvidence, infoPageProofOfProgressRefusals, infoPageProofStepRefusals, type InfoPageProofStep, type InfoPageRunState, type InfoPageRunStep } from "../../../shared/src/infoPagePass";
+import type { InfoPageCandidateCapture, InfoPageIncident, VerifiedInfoPage } from "../../../shared/src/types";
 import { hostOfUrl, sameCredentialScope } from "../siteOf";
 import { attachmentTypeFor, isDocumentTypeList, isPlanSetDocType } from "./attachmentTypes";
 import {
@@ -140,6 +144,19 @@ export interface ExtractedField {
    *  post-reveal re-scan — this key lets it recognize (and never re-answer) a group that
    *  already has a recorded answer, which would silently flip the selection. */
   group?: string;
+  /** A radio's / checkbox's GROUP QUESTION (#362): its own label is the option word ("Yes"), and
+   *  the question ("Are you ready to submit…?") lives in the fieldset legend, the radiogroup's
+   *  accessible name, or a group label tied to no single option. Read by the gap-fill's
+   *  submit-intent guard; never sent to a planner. */
+  groupPrompt?: string;
+  /** EVERY text that may be this control's question (#362), from every source rather than the
+   *  first: each enclosing fieldset legend, its own and its group's aria-labelledby / aria-label,
+   *  its label (a choice control's own option word excluded), and the text around it in the
+   *  smallest container holding only it (or only its group): a row's <th> or first cell, a
+   *  leading span / p / strong, a .control-label — plus a text-only element just before that
+   *  container. Headings and option words are never part of it. Read by the gap-fill's
+   *  submit-intent guard on the element about to be written; never sent to a planner. */
+  questions?: string[];
   /** True when the control cannot be operated right now — :disabled (which also covers a
    *  control inside <fieldset disabled>), aria-disabled="true", or a `disabled` class token.
    *  Carried because A DISABLED NEXT IS A GATE, NOT AN ABSENCE: a wizard step whose Next
@@ -265,6 +282,19 @@ export interface LearnResult {
    *  Submit), never requested (the signature step was staged again), or still awaited / unreadable
    *  (the walk stopped and says why). */
   signatureCheck?: SignatureCheck;
+  /** AN INFORMATION PAGE NO PERSON HAS VERIFIED (#344): the backstop would hold (and held) its
+   *  forward request; captured at the click for a person to verify (project -> Portal runs). */
+  infoPageCandidate?: InfoPageCandidateCapture;
+  /** Each human-verified information page this walk passed (one request each, rule 4(b) only). */
+  infoPagePassed?: Array<{ passId: string; where: string }>;
+  /** INCIDENTS on verified information pages (#344, proposal §4): the page drifted before the click
+   *  (held exactly as on main), or the page after the verified click did not read as an unfiled
+   *  form (the walk stopped, stopReason "info_page_incident"). The backend withdraws each pass. */
+  infoPageIncidents?: InfoPageIncident[];
+  /** VERIFIED information pages this walk was HELD at only because the backend said this project
+   *  already made progress on this portal (round 2): the page matched, nothing was sent. A person may
+   *  allow the pass once more for the project (project -> Portal runs). */
+  infoPageHeldVerified?: Array<{ passId: string; where: string; why: string[] }>;
 }
 
 // Live progress signal emitted while learning a portal, so the UI can show a real
@@ -328,6 +358,10 @@ const PAY_FEE = /\b(pay\s*(and|&)\s*submit|pay fees?|pay fee|pay now|submit\s*(&
  *  Three allows a legitimate re-render plus one retry; Miami's Property Search was walked
  *  SEVEN times, which bought nothing and spent the whole budget. */
 const REPEAT_PAGE_LIMIT = 3;
+/** #382 — after the late equipment pass fills a control, how long a debounced autosave gets to
+ *  land and render what it unlocks (a PowerClerk row's Model after its make) before the next
+ *  re-scrape. Only paid when that pass actually filled something. */
+const LATE_EQUIP_REVEAL_GRACE_MS = 2_000;
 
 const SUBMIT_INTENT = /\b(continue application|submit application|file application|submit|finish|finalize|confirm submission|place order|complete submission)\b/i;
 /** A login-worded control ("Sign In", "Log in", "Login", "Log On"). Never a walk advance while its
@@ -954,24 +988,11 @@ function isPanelAdvanceLabel(label: string | undefined): boolean {
   return ADVANCE_ONLY.test(t);
 }
 
-/** THE PLAIN WAY FORWARD ON AN INFORMATION INTERSTITIAL (#341). The WHOLE label is a bare forward
- *  word — Next / Continue / Proceed / Begin / Start / Get Started — optionally arrowed or "Save and
- *  …" (review 1: a label that merely STARTS with one, "Next Record", "Continue Draft", is not it).
- *  Never a backward or exit control (Previous / Back / Cancel / Exit / Save and Exit / Continue
- *  Later), never anything the shared final-submit reading or the pay list claims. Read only on a
- *  page the walk has already proved is an interstitial (see c2i). */
-// WHOLE LABEL ONLY: the bare forward word, arrowed or "Save and …". A word after it names WHAT
-// the click continues ("Next Record", "Continue Draft", "Continue Renewal", "Proceed with
-// Deletion"), and that is somebody's record or an action on it, never the page's way forward.
-const INTERSTITIAL_FORWARD = /^\s*(save\s+and\s+)?(next|continue|proceed|begin|start|get\s+started)\s*[»›>→]*\s*$/i;
-const BACKWARD_OR_EXIT = /\b(previous|prev|back|cancel|exit|close|later|quit)\b/i;
-export function isInterstitialForwardLabel(label: string | undefined): boolean {
-  const t = String(label ?? "").replace(/\s+/g, " ").trim();
-  if (!t || t.length > 40) return false;
-  if (BACKWARD_OR_EXIT.test(t)) return false;
-  if (isPayFee(t) || isFinalSubmitControl(t)) return false;
-  return INTERSTITIAL_FORWARD.test(t);
-}
+/** THE PLAIN WAY FORWARD ON AN INFORMATION INTERSTITIAL (#341). Read only on a page the walk has
+ *  already proved is an interstitial (see c2i). One answer since #344: it lives in the shared
+ *  portalSafety factory (the information-page pass reads it too) and is re-exported here, where
+ *  the smokes have always read it. */
+export const isInterstitialForwardLabel = sharedIsInterstitialForwardLabel;
 
 /** RE-ADMISSION: is this label shaped like a page's WAY FORWARD at all? Union of the
  *  advance wording and the submit wording, minus a paginator. Submits count HERE because a
@@ -1360,6 +1381,13 @@ export interface RawField {
   offstage?: boolean;
   /** True when the control is not operable right now. See ExtractedField.disabled. */
   disabled?: boolean;
+  /** See ExtractedField.groupPrompt. */
+  groupPrompt?: string;
+  /** See ExtractedField.questions. */
+  questions?: string[];
+  /** A probe mark the draft click's pick read put on the element (data-al-pq), echoed back so its
+   *  reading can be tied to the element (#362). Nothing else sets or reads it. */
+  probe?: string;
   /** A choice tile (markChoiceTilesInPage): a card clicked as a whole, labelled by its title.
    *  Its selector is the title TEXT — getByRole finds nothing on a plain container. */
   tile?: boolean;
@@ -1486,6 +1514,110 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
     const text = (el.textContent || "").trim();
     if (text) return text;
     return "";
+  }
+
+  // THE OPTION WORDS OF A CHOICE GROUP (#362): the labels of every radio / checkbox sharing this
+  // one's name (just its own for an unnamed one). Never a question.
+  function optionWordsOf(el: Element): string[] {
+    const ty = (el.getAttribute("type") || "").toLowerCase();
+    if (el.tagName.toLowerCase() !== "input" || (ty !== "radio" && ty !== "checkbox")) return [];
+    const nm = el.getAttribute("name");
+    const root = el.getRootNode() as Document | ShadowRoot;
+    const members = nm ? Array.from(root.querySelectorAll(`input[name="${CSS.escape(nm)}"]`)) : [el];
+    // Its label, its value and a <label for> right AFTER it (Miami's radios share one id, and their
+    // labels point at "Yes"/"No", so labelFor cannot tie them): every one is an option's own word.
+    // Never the element before the first option: that is where the group's question label sits.
+    const words: string[] = [];
+    for (const m of members) {
+      words.push(labelFor(m), m.getAttribute("value") || "");
+      const sib = m.nextElementSibling;
+      if (sib && sib.tagName === "LABEL" && sib.hasAttribute("for") && !sib.querySelector("input, select, textarea")) words.push(sib.textContent || "");
+    }
+    return words.map((w) => w.replace(/\s+/g, " ").trim()).filter(Boolean);
+  }
+
+  // THE CONTROL'S QUESTION FROM EVERY SOURCE (#362) — see ExtractedField.questions. One reading
+  // for the extractor and for the gap-fill's last check before a write (claimForWrite runs this
+  // function on the element itself), so the two can never disagree.
+  //   - every legend of every enclosing fieldset, nested anywhere in it (not a nested fieldset's);
+  //   - aria-labelledby, aria-label and aria-describedby, on the control and on its group;
+  //   - a non-choice control's own label;
+  //   - a choice control or a select (never a free-text box: its question is its label, aria and
+  //     legend): the text BEFORE it in the smallest container whose only ANSWER controls are this
+  //     one or its group — a help, info or Clear button in the row is not an answer and does not
+  //     end the climb — each part (≤200) and the parts joined (≤200); then one text-only element
+  //     just before that container. Never text after the control (help, a hint), never script,
+  //     style, template, a heading, a button's own words, or an option's own word.
+  function questionsOf(el: Element, kind: string, ownLabel: string): string[] {
+    const clean = (t: string | null | undefined): string => String(t || "").replace(/\s+/g, " ").trim();
+    const out: string[] = [];
+    const add = (t: string | null | undefined): void => {
+      const c = clean(t).slice(0, 300);
+      if (c && !out.includes(c)) out.push(c);
+    };
+    const root = el.getRootNode() as Document | ShadowRoot;
+    const byId = (r: string): Element | null => (typeof root.getElementById === "function" ? root.getElementById(r) : null) || document.getElementById(r);
+    const byIds = (ids: string | null): string => (ids || "").split(/\s+/).filter(Boolean)
+      .map((r) => clean(byId(r)?.textContent)).filter(Boolean).join(" ");
+    const choice = kind === "radio" || kind === "checkbox";
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    const listish = kind === "select" || el.tagName === "SELECT" || role === "combobox" || role === "listbox";
+    const words = new Set(optionWordsOf(el).map((w) => w.toLowerCase()));
+    for (let fs = el.closest("fieldset"); fs; fs = fs.parentElement ? fs.parentElement.closest("fieldset") : null) {
+      for (const lg of Array.from(fs.querySelectorAll("legend"))) if (lg.closest("fieldset") === fs) add(lg.textContent);
+    }
+    add(byIds(el.getAttribute("aria-labelledby")));
+    add(el.getAttribute("aria-label"));
+    add(byIds(el.getAttribute("aria-describedby")));
+    const grp = el.closest('[role="radiogroup"], [role="group"]');
+    if (grp) { add(byIds(grp.getAttribute("aria-labelledby"))); add(grp.getAttribute("aria-label")); add(byIds(grp.getAttribute("aria-describedby"))); }
+    if (!choice) add(ownLabel);
+    if (!choice && !listish) return out;
+    // A select with its OWN label is asked by that label: an instruction above it ("When you are
+    // ready to submit, click Submit below") is not its question.
+    if (!choice) {
+      const id = el.getAttribute("id");
+      const ownLbl = (id && document.querySelector(`label[for="${CSS.escape(id)}"]`)) || el.closest("label");
+      if ((ownLbl && clean(ownLbl.textContent)) || clean(el.getAttribute("aria-label")) || byIds(el.getAttribute("aria-labelledby"))) return out;
+    }
+    // The smallest container holding only this control's answers (a choice control: its group).
+    const nm = choice ? el.getAttribute("name") : null;
+    const ours = (c: Element): boolean => c === el || (!!nm && c.getAttribute("name") === nm);
+    const ANSWERS = 'input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]):not([type=image]), select, textarea, [role=combobox], [role=listbox], [role=radio], [role=checkbox]';
+    let box: Element = el;
+    for (let up = el.parentElement; up && up !== document.body && up.tagName !== "FORM"; up = up.parentElement) {
+      if (!Array.from(up.querySelectorAll(ANSWERS)).every(ours)) break;
+      box = up;
+    }
+    const SKIP = "h1, h2, h3, h4, h5, h6, option, script, style, template, noscript, legend, button, [role=button], select";
+    if (box !== el) {
+      const first = Array.from(box.querySelectorAll(ANSWERS)).find(ours) || el;
+      const parts: string[] = [];
+      const walker = document.createTreeWalker(box, NodeFilter.SHOW_TEXT);
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        // Only text BEFORE the control: what follows it is help, a hint or an option's word.
+        if (!(first.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_PRECEDING)) continue;
+        const host = n.parentElement;
+        if (!host || host.closest(SKIP)) continue;
+        const t = clean(n.textContent);
+        if (!t || words.has(t.toLowerCase()) || (choice && t === ownLabel)) continue;
+        parts.push(t);
+      }
+      // A container of prose is not a question (instructions that mention submitting): a caption
+      // is short, as the required sweep reads one (≤160 there; 200 here for a long question).
+      for (const p of parts) if (p.length <= 200) add(p);
+      const joined = parts.join(" ");
+      if (joined.length <= 200) add(joined);
+    }
+    // A text-only element just before that container ("<p>Question?</p><select>").
+    let sib = box.previousElementSibling;
+    for (let k = 0; sib && k < 2; k++, sib = sib.previousElementSibling) {
+      if (sib.matches("script, style, template, noscript")) { k--; continue; }
+      if (sib.querySelector(ANSWERS) || /^H[1-6]$/.test(sib.tagName)) break;
+      const t = clean(sib.textContent);
+      if (t && t.length <= 200) { add(t); break; }
+    }
+    return out;
   }
 
   // Derive the SECTION a field lives under — its fieldset legend / enclosing card-or-panel
@@ -1789,6 +1921,40 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       requiredByAsterisk = labelHasAsterisk(forLbl?.textContent) || labelHasAsterisk(wrapLbl?.textContent);
     }
     const required = (el as HTMLInputElement).required || el.getAttribute("aria-required") === "true" || requiredByAsterisk || undefined;
+    // THE GROUP'S OWN QUESTION (#362), in order: the fieldset legend; the radiogroup/group's
+    // aria-labelledby / aria-label; then a label in the group's container tied to no single option
+    // (no for=, or a for= naming no choice control, and not wrapping one) or a .control-label.
+    let groupPrompt = "";
+    if (fieldType === "radio" || fieldType === "checkbox") {
+      const clean = (t: string | null | undefined): string => String(t || "").replace(/\s+/g, " ").trim();
+      const legend = el.closest("fieldset")?.querySelector("legend");
+      groupPrompt = clean(legend?.textContent);
+      if (!groupPrompt) {
+        const rg = el.closest('[role="radiogroup"], [role="group"]');
+        if (rg) {
+          const by = (rg.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean)
+            .map((ref) => clean(document.getElementById(ref)?.textContent)).filter(Boolean).join(" ");
+          groupPrompt = by || clean(rg.getAttribute("aria-label"));
+        }
+      }
+      if (!groupPrompt) {
+        const box = el.closest("fieldset, .form-group, [class*='form-group'], [class*='field'], .row, [class*='row']");
+        const lbls = box ? Array.from(box.querySelectorAll("label, .control-label, .field-label")) : [];
+        // An OPTION'S OWN WORD is never the question: Miami's <label for="No">No</label> names an
+        // id that does not exist, so the for= test alone let "No" become the question.
+        const words = new Set(optionWordsOf(el).map((w) => w.toLowerCase()));
+        for (const l of lbls) {
+          if (l.querySelector("input, select, textarea")) continue;
+          const f = l.getAttribute("for");
+          const tgt = f ? document.getElementById(f) : null;
+          if (tgt && /^(radio|checkbox)$/i.test((tgt as HTMLInputElement).type || "")) continue;
+          const t = clean(l.textContent);
+          if (t && t !== label && !words.has(t.toLowerCase())) { groupPrompt = t; break; }
+        }
+      }
+      groupPrompt = groupPrompt.slice(0, 200);
+    }
+    const questions = fieldType === "button" || fieldType === "file" ? [] : questionsOf(el, fieldType, label);
 
     out.push({
       label, fieldType, options, role, name, placeholder, id, text, href,
@@ -1796,6 +1962,9 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       required: required || undefined,
       section: sectionFor(el) || undefined,
       testCss,
+      groupPrompt: groupPrompt || undefined,
+      questions: questions.length ? questions : undefined,
+      probe: el.getAttribute("data-al-pq") || undefined,
       ariaLabel: el.getAttribute("aria-label")?.trim() || undefined,
       inActiveScope: scopeEl ? scopeEl.contains(el) : undefined,
       offstage: scopeEl ? !!el.closest('[aria-hidden="true"], [inert]') : undefined,
@@ -1919,6 +2088,8 @@ export function toExtractedField(raw: RawField): ExtractedField {
     };
   }
   if (raw.fieldType === "radio" && raw.name) field.group = raw.name;
+  if (raw.groupPrompt) field.groupPrompt = raw.groupPrompt;
+  if (raw.questions?.length) field.questions = [...raw.questions];
   return field;
 }
 
@@ -2170,6 +2341,50 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   /** What the signature-request step staged, once the walk reached it (#308). */
   private signatureStep: SignatureStepOutcome | undefined;
   private signatureCheck: SignatureCheck | undefined;
+  /** #344 — see the infoPagePasses option: the human-verified information pages, frozen at
+   *  construction (a withdrawal applies from the next run). */
+  private infoPagePasses: ReadonlyArray<VerifiedInfoPage>;
+  /** #344 — the backend's answer: has this project already made progress on this portal origin?
+   *  Unknown (not given) is TRUE: an unknown never reassures. */
+  private infoPagePriorProgress: boolean;
+  /** The "advance:" steps an information-page pass of THIS run admitted (critique [9]: the step
+   *  objects, never their indexes, which a rolled-back walk reuses). */
+  private infoPassAdmittedSteps = new WeakSet<RecipeStep>();
+  private infoPageCandidate: InfoPageCandidateCapture | null = null;
+  private infoPagePassed: Array<{ passId: string; where: string }> = [];
+  private infoPageIncidents: InfoPageIncident[] = [];
+  private infoPageHeldVerified: Array<{ passId: string; where: string; why: string[] }> = [];
+  /** #344 round 2 — told AT ONCE of every admission (the backend writes the use down before anything
+   *  else can happen: a learn that throws later still has it on record). */
+  private onInfoPagePassed: ((p: { passId: string; where: string }) => void) | undefined;
+  /** #344 round 5 — the backend's RESERVATION of a use, asked by the network backstop at the admission
+   *  itself (the verification's limits checked again there). None = no use can be reserved: every
+   *  verified page is held exactly as on main (fail closed). */
+  private reserveInfoPagePass: ((p: { passId: string; where: string }) => ReadonlyArray<string> | Promise<ReadonlyArray<string>>) | undefined;
+  /** The project's own values (street, name, parcel, system size): a page that shows them before
+   *  anything was entered is a summary, never an information page. */
+  private infoPageProjectValues: string[] = [];
+  /** #344 round 3/4 — THIS JOB'S OWN VALUES, key → value (the backend's infoPageJobValues): only a
+   *  fill / select / check bound to one of these keys, whose control HOLDS that value after the fill,
+   *  proves the page after a verified click took the job's data. Not given = none (every such page
+   *  is an incident: fail closed). Memory only: never logged, never on a step. */
+  private infoPageProofValues: Readonly<Record<string, string>>;
+  /** #344 round 3 — PROOF OF PROGRESS pending: armed when the page a verified click led to read as an
+   *  unfiled form; settled when a step bound to the job's own data is PROVED there (`step`, the
+   *  object — a rolled-back walk can never pass another step off as it), or at the walk's end as an
+   *  incident. Round 4: `candidates` are the fills / selects / checks applied on that page; each is
+   *  read back (what its control holds, whether it is chrome) just before the run leaves the page,
+   *  and only one that passes the shared predicate then lifts the hold. */
+  private infoProof: { passes: Array<{ passId: string; where: string }>; page: number; step: RecipeStep | null; left: boolean; candidates: RecipeStep[] } | null = null;
+  /** Q4: the proof settled as the walk left that page — kept so a SAME INTERVIEW stray the backstop
+   *  held on the way out (state "strayed") is still the pass's incident at the walk's end. */
+  private infoProofSettled: AutoLearnAdapter["infoProof"] = null;
+  /** What each fill / select / check entered (memory only, never on the step): the proof needs to
+   *  know the value was not empty or trivial. Secrets are never kept here. */
+  private infoProofValues = new WeakMap<RecipeStep, string>();
+  /** Round 4 — what the proved step's control HELD when it was read back, and whether it was chrome
+   *  (memory only): the walk's end re-judges the proof with the same facts. */
+  private infoProofReads = new WeakMap<RecipeStep, { held: string[]; chrome: boolean }>();
   /** Lines for the person at review that come from the PAGE, not the run (#302: PSE's red
    *  "file as a modification on the original record" notice). */
   private pageReviewNotes: string[] = [];
@@ -2372,6 +2587,28 @@ export class AutoLearnAdapter extends BasePortalAdapter {
        *  still decides at the click. Never PORTAL_ALLOW_FINAL_SUBMIT: it files nothing. */
       signatureRequestApproval?: SignatureRequestApproval | null;
       runId?: string;
+      /** HUMAN-VERIFIED INFORMATION PAGES (#344): the backend's live passes (infoPages.ts
+       *  liveInfoPagePasses). Only the network backstop reads them, at the interstitial's forward
+       *  click (openInfoPagePass). None = every information page is held exactly as before. */
+      infoPagePasses?: ReadonlyArray<VerifiedInfoPage>;
+      /** #344: the backend's answer to "has this project already made progress on this portal?"
+       *  (backend infoPages.infoPagePriorProgress: an earlier admitted pass, a learn that did not end
+       *  held untouched, a run that reached review / paused / was interrupted, a number, a draft or a
+       *  filing). Not given = true (refuses). */
+      infoPagePriorProgress?: boolean;
+      /** #344 round 5: the backend's reservation of a use (infoPages.reserveInfoPagePassUse), awaited
+       *  by the network backstop at the admission of a verified page's one request. Refusals; empty =
+       *  reserved. A refusal, a throw or none given holds the request exactly as on main. */
+      reserveInfoPagePass?: (p: { passId: string; where: string }) => ReadonlyArray<string> | Promise<ReadonlyArray<string>>;
+      /** #344 round 2: called synchronously for every information page the backstop admitted, the
+       *  moment the click is settled (the backend records the use before the walk goes on). */
+      onInfoPagePassed?: (p: { passId: string; where: string }) => void;
+      /** #344 round 3/4: THIS JOB'S OWN VALUES, key → value (backend autoLearn infoPageJobValues:
+       *  values a blank project of the same company does not resolve under any key — never a policy
+       *  default, a company constant, an internal id or a secret). After a verified information
+       *  page, the page it led to must HOLD one of them, in a control bound to its key, before the
+       *  run leaves it. Not given = none: every admitted pass then ends as an incident (fail closed). */
+      infoPageProofValues?: Readonly<Record<string, string>>;
     } = {},
   ) {
     super();
@@ -2382,6 +2619,17 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     this.siteIdentity = options.siteIdentity;
     this.continueDraft = options.continueDraft;
     this.signatureRequestApproval = options.signatureRequestApproval ?? null;
+    this.infoPagePasses = Object.freeze((options.infoPagePasses ?? []).map((e) => Object.freeze(JSON.parse(JSON.stringify(e)) as VerifiedInfoPage)));
+    this.infoPagePriorProgress = options.infoPagePriorProgress !== false;
+    this.onInfoPagePassed = typeof options.onInfoPagePassed === "function" ? options.onInfoPagePassed : undefined;
+    this.reserveInfoPagePass = typeof options.reserveInfoPagePass === "function" ? options.reserveInfoPagePass : undefined;
+    this.infoPageProofValues = Object.freeze(((): Record<string, string> => {
+      const v = options.infoPageProofValues;
+      const out: Record<string, string> = {};
+      if (!v || typeof v !== "object" || Array.isArray(v)) return out;
+      for (const [k, x] of Object.entries(v)) if (typeof x === "string" || typeof x === "number") out[String(k)] = String(x);
+      return out;
+    })());
     this.runId = String(options.runId ?? "");
     this.allowFinalSubmit = options.allowFinalSubmit === true;
     this.hasBattery = options.hasBattery;
@@ -2422,6 +2670,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     context: string,
     fallbackSide?: "inverter" | "module",
     bareSelect = false,
+    /** The page shows PV Array repeater rows (arrayRowsInPage, the replay's own row predicate). */
+    arrayRowPage = false,
   ): { key: string; candidates: string[]; side: "inverter" | "module" | null } | null {
     const l = (context || "").toLowerCase();
     const isModel = /\bmodel\b/.test(l);
@@ -2494,9 +2744,19 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     const explicitlyPv = /module|pv ?array|solar|photovoltaic/.test(l);
     if (EQUIPMENT_NEGATIVE_GUARD.test(l) && !explicitlyPv) return null;
 
+    // #382 — A PV ARRAY ROW IS ARRAY 1's ROW. On a page of PV Array repeater rows, the row a fresh
+    // application renders is where the learn meets the first roof plane, so its Qty / Tilt /
+    // Azimuth bind array1*: the replay re-reads array1* as array N in row N, and the learn fills
+    // rows 2..N from the same keys (fillRemainingArrayRows). The project-wide total ("moduleQty")
+    // in row 1 filed the whole system as one plane. Without per-array data, without rows on the
+    // page, or for a control whose context does not name the array, nothing changes.
+    const arrayRow = arrayRowPage && /pv ?array|\barray\b/.test(l);
+    const rowKey = (k: string): string | null => (arrayRow && (this.equipment[k] || "").trim() ? k : null);
+
     // Array-geometry fields are side-agnostic — fill straight from project data.
     if (isTilt || isAzimuth || isTracking) {
-      const key = isTilt ? "tilt" : isAzimuth ? "azimuth" : "tracking";
+      const key = (isTilt && rowKey("array1Tilt")) || (isAzimuth && rowKey("array1Azimuth"))
+        || (isTilt ? "tilt" : isAzimuth ? "azimuth" : "tracking");
       const value = (this.equipment[key] || "").trim();
       return value ? { key, candidates: [value], side: null } : null;
     }
@@ -2509,7 +2769,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     if (!side) return null;
     const key = side === "inverter"
       ? (isQty ? "inverterQty" : isModel ? "inverterModel" : "inverterMake")
-      : (isQty ? "moduleQty" : isModel ? "moduleModel" : "moduleMake");
+      : (isQty ? (rowKey("array1ModuleQuantity") ?? "moduleQty") : isModel ? "moduleModel" : "moduleMake");
     const value = (this.equipment[key] || "").trim();
     if (!value) return null;
     const candidates = [value];
@@ -2600,6 +2860,59 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     return false;
   }
 
+  /** How many PV Array repeater rows the page shows — the replay's own row predicate
+   *  (arrayRowsInPage), imported lazily (recipeAdapter imports this module). 0 when unreadable. */
+  private async pageArrayRowCount(): Promise<number> {
+    if (!this.page || typeof this.page.evaluate !== "function") return 0;
+    try {
+      const { arrayRowsInPage } = await import("./recipeAdapter");
+      return Number(await this.page.evaluate(arrayRowsInPage, "mark").catch(() => 0)) || 0;
+    } catch { return 0; }
+  }
+
+  /** The project's PV array count: array1ModuleQuantity, array2…, as the replay counts them. */
+  private projectArrayCount(): number {
+    let n = 0;
+    for (let i = 1; i <= 12; i++) {
+      if ((this.equipment[`array${i}ModuleQuantity`] || "").trim()) n = i;
+      else break;
+    }
+    return n || 1;
+  }
+
+  /**
+   * #382 — EVERY ROOF PLANE GETS ITS OWN ROW IN THE LEARN TOO. Live (PacifiCorp NEM, 2026-10-21,
+   * four arrays 9 / 5 / 5 / 2) the learn filled the one row a fresh application renders and never
+   * clicked "Add Array"; the owner added rows 2–4 by hand, and those clicks were recorded.
+   *
+   * The rows are NOT a second copy of the row logic: the row steps this page recorded (the
+   * per-array ones, nothing else) go to a RecipeAdapter on this same page, whose
+   * fillRemainingArrayRows adds a row per remaining array and fills each inside its own row, then
+   * proves every row against ITS array (row 1 included) — exactly what a replay of this recipe
+   * does. Nothing it writes is recorded: rows 2..N are the project's data, and a replay derives
+   * them from the project's arrays the same way (a recorded "Add Array" never replays). A row that
+   * will not hold, or arrays the portal would not take a row for, are this run's misses.
+   */
+  private async fillRemainingArrayRows(pageSteps: RecipeStep[]): Promise<{ added: number; stop: string | null; review: string[] }> {
+    const none = { added: 0, stop: null, review: [] as string[] };
+    const arrays = this.projectArrayCount();
+    if (!this.page || arrays < 2) return none;
+    const perArray = (s: RecipeStep): boolean => /^array1[A-Z]/.test(String(s.field ?? "")) || s.field === "moduleMake" || s.field === "moduleModel";
+    const rowSteps = pageSteps.filter((s) => (s.action === "fill" || s.action === "select") && perArray(s));
+    if (!rowSteps.some((s) => /^array1[A-Z]/.test(String(s.field ?? "")))) return none;
+    const before = await this.pageArrayRowCount();
+    if (before < 1) return none;
+    const { RecipeAdapter } = await import("./recipeAdapter");
+    const rows = new RecipeAdapter(
+      { id: "learn-array-rows", steps: rowSteps, portalUrl: String(this.page.url?.() ?? "") } as unknown as PortalRecipe,
+      { ...this.equipment }, {}, { autoSubmit: false },
+    );
+    const r = await rows.fillRemainingArrayRows(this.page);
+    const review = r.warnings.filter((w) => /REVIEW BEFORE SUBMIT|not added|NOT filed/i.test(w));
+    this.debug?.event({ type: "array_rows", arrays, rowsBefore: before, rowsAfter: r.rows, stop: (r.stop ?? "").slice(0, 300), warnings: r.warnings.slice(0, 8).map((w) => w.slice(0, 200)) });
+    return { added: Math.max(0, r.rows - before), stop: r.stop, review };
+  }
+
   /** Fill unresolved equipment manufacturer/model/quantity + array-geometry fields
    *  from project data. Returns how many were filled; appends recipe steps + labels
    *  like other passes. Fills in DOM order so a manufacturer select's AJAX postback
@@ -2632,6 +2945,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // Ordinal of bare combined selects seen within a spec-flavored section — see
     // the side heuristic below.
     let specBareSelectSeen = 0;
+    // #382 — does this page render PV Array repeater rows? Asked once, of the replay's own row
+    // predicate, so "a row" means the same thing to the learn and to the replay.
+    const arrayRowPage = (await this.pageArrayRowCount()) > 0;
     for (let i = 0; i < fields.length; i++) {
       const field = fields[i];
       // Unlabeled / generic-labeled SELECTS stay in the pass: the PowerClerk
@@ -2671,7 +2987,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       if (bareSelect && !fallbackSide && specSection) {
         fallbackSide = specBareSelectSeen === 0 ? "inverter" : "module";
       }
-      const resolved = this.equipmentValueFor(context, fallbackSide, bareSelect);
+      const resolved = this.equipmentValueFor(context, fallbackSide, bareSelect, arrayRowPage);
       if (bareSelect && specSection) specBareSelectSeen++;
       if (!resolved) continue;
       // A combined bare select never seeds proximity inheritance — its side may
@@ -3594,6 +3910,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     const body = await this.page.locator("body").innerText({ timeout: 5000 }).catch(() => "");
     return this.scrubSecrets(String(body ?? ""));
   }
+  /** The left-open page's URL ("" without one) — the draft-created page's tenant (#330). */
+  readCurrentPageUrl(): string {
+    try { return this.page && typeof this.page.url === "function" ? String(this.page.url() ?? "") : ""; } catch { return ""; }
+  }
 
   // PATCH-BY-DEMONSTRATION: arm the (still-open, headed) page so anything the human
   // fixes by hand at the review handoff — a missed dropdown, an unmapped field — is
@@ -3633,9 +3953,27 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         meterNumber: String(project.meterNumber ?? "").trim(),
       };
       this.debug?.setScrubber((text) => this.scrubSecrets(text));
+      // #344: the project's own values — a page that shows them before anything was entered is a
+      // summary, never an information page (the backstop refuses a pass and a candidate there).
+      {
+        const street = String(project.projectAddress ?? "").split(",")[0].trim();
+        const kw = typeof project.systemSizeDcKw === "number" && project.systemSizeDcKw > 0 ? `${project.systemSizeDcKw} kW` : "";
+        const apn = String(((project as { parserSnapshot?: Record<string, unknown> }).parserSnapshot ?? {}).apn ?? "").trim();
+        this.infoPageProjectValues = [street, String(project.homeownerName ?? "").trim(), apn, kw].filter((v) => v.length >= 4);
+      }
       result = await this.learnImpl(context, project);
+      // #344 round 3 — PROOF OF PROGRESS: a verified information page's click led to a page the walk
+      // left, ended, stopped or found nothing fillable on without entering this job's own data there
+      // — the incident, settled here (every exit of the walk), before the backstop is disposed.
+      result = this.settleInfoPageProof(result, backstop);
       // The message quotes the portal (validation errors, notices) — a portal can echo an account.
       result = { ...result, message: this.scrubSecrets(result.message) };
+      // #344: the unverified information page this walk held (for a person to verify), and every
+      // verified one it passed (each use of the relaxation is on record).
+      if (this.infoPageCandidate) result = { ...result, infoPageCandidate: this.infoPageCandidate };
+      if (this.infoPagePassed.length) result = { ...result, infoPagePassed: [...this.infoPagePassed] };
+      if (this.infoPageIncidents.length) result = { ...result, infoPageIncidents: this.infoPageIncidents.map((i) => ({ ...i, why: i.why.map((w) => this.scrubSecrets(w)) })) };
+      if (this.infoPageHeldVerified.length) result = { ...result, infoPageHeldVerified: this.infoPageHeldVerified.map((h) => ({ ...h, why: h.why.map((w) => this.scrubSecrets(w)) })) };
       // Hand-off first (the route comes off), then every abort up to that moment is counted.
       await backstop?.dispose().catch(() => null);
       // WHAT THE PERSON TAKING THE REVIEW PAGE MUST KNOW (dryrun-0928 B3 + B14), in the hand-off itself:
@@ -3670,7 +4008,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         result = {
           ...result,
           ...(filing.length ? { ok: false, stopReason: result.stopReason || "backstop_abort" } : {}),
-          message: `${filing.length && result.stopReason !== "backstop_abort" ? "STOPPED BY THE NETWORK BACKSTOP — the page tried to file or pay (or post from the review page) during the learn; the recorded steps must be reviewed before any replay. " : ""}${result.message} [${lines.join(" | ").slice(0, 600)}]`,
+          // (An information-page incident's own message already leads: the proof hold's abort is its cause.)
+          message: `${filing.length && result.stopReason !== "backstop_abort" && result.stopReason !== "info_page_incident" ? "STOPPED BY THE NETWORK BACKSTOP — the page tried to file or pay (or post from the review page) during the learn; the recorded steps must be reviewed before any replay. " : ""}${result.message} [${lines.join(" | ").slice(0, 600)}]`,
         };
       }
       return result;
@@ -5409,12 +5748,39 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         break;
       }
       pageCount++;
+      // Where this page's recorded steps begin (#382: the PV Array row steps it records).
+      const pageStepsFrom = steps.length;
       // THE BACKSTOP ABORTED A FILING, A PAYMENT OR A REVIEW-PAGE POST: stop here, named. Walking
       // on would drive the same page (and its filing control) again. learn() reports every abort.
       {
         const stopping = backstopFor(this.page)?.stoppingAborts() ?? [];
         if (stopping.length) {
           this.debug?.event({ type: "backstop_stop", page: pageCount, message: describeBackstopAbort(stopping[0]) });
+          // AN INFORMATION PAGE NO PERSON HAS VERIFIED (#344): the hold is the same; the message says
+          // what a person can do about it. stopReason stays "backstop_abort".
+          const cand = this.infoPageCandidate;
+          if (cand && cand.observed) {
+            const req = cand.observed as { method?: string; where?: string };
+            const held = `the network backstop held "${String(cand.controlLabel).slice(0, 40)}" (${String(req.method ?? "POST")} ${String(req.where ?? `${cand.origin}${cand.path}`)}). Nothing was sent.`;
+            // A page a person HAD verified, now read differently (proposal §4): the incident withdraws
+            // that verification; the page as it is now is the fresh candidate.
+            const changed = this.infoPageIncidents.filter((i) => i.phase === "before");
+            return {
+              ...fail(steps, this.portalName, changed.length
+                ? `HELD AT AN INFORMATION PAGE THAT CHANGED SINCE A PERSON VERIFIED IT (${changed[0].why.slice(0, 3).join("; ")}): ${held} That verification is withdrawn. A person can mark the page as it is now (project → Portal runs → Information page to verify).`
+                : `HELD AT AN INFORMATION PAGE NO PERSON HAS VERIFIED: ${held} A person can mark this exact page once (project → Portal runs → Information page to verify); after that, runs pass it — only this page, and only before anything is entered on the run.`, null, pageCount, portalNotices),
+              stopReason: "backstop_abort",
+            };
+          }
+          // A VERIFIED PAGE HELD BECAUSE THIS PROJECT ALREADY MADE PROGRESS ON THIS PORTAL (round 2: a
+          // pass admits at most once per project). The hold is main's; the message says what a person
+          // can do about it.
+          if (this.infoPageHeldVerified.length) {
+            return {
+              ...fail(steps, this.portalName, `HELD AT A VERIFIED INFORMATION PAGE: ${describeBackstopAbort(stopping[0])}. Nothing was sent. The page is one a person verified, but this project already made progress on this portal (an earlier run passed this page, may have entered data, reached review, or a number, draft or filing is on record), so automation does not pass it again. Check this project's application on the portal; a person can then allow the pass once more for this project (project → Portal runs).`, null, pageCount, portalNotices),
+              stopReason: "backstop_abort",
+            };
+          }
           return { ...fail(steps, this.portalName, `Stopped by the network backstop: ${describeBackstopAbort(stopping[0])}. Nothing was sent; the step (or page script) that fired it must be reviewed.`, null, pageCount, portalNotices), stopReason: "backstop_abort" };
         }
       }
@@ -7140,7 +7506,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // whatever the computation then reveals (e.g. an export-capacity question).
         const MAX_RESCAN_PASSES = 7;
         let computedThisPage = false;
-        let lateEquipTried = false;
+        // The reveal the late equipment pass last looked at (null = not yet). #382: a PV Array row
+        // reveals its controls one save at a time (Manufacturer after Qty, Model after the make), and
+        // each arrives under a label the page already "filled" — so the pass looks again whenever
+        // the set of revealed controls has changed, and never twice at the same set.
+        let lateEquipSig: string | null = null;
         let lastRevealSig = "";
         for (let rescanPass = 0; rescanPass < MAX_RESCAN_PASSES; rescanPass++) {
           let revealedThisPass = 0;
@@ -7197,14 +7567,21 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             if (newFillable.length === 0) {
               // A cascade can reveal a SECOND section reusing bare labels the first
               // section already "filled" ("Manufacturer"/"Model") — those are invisible
-              // to the label-based newFillable filter, so give the equipment pass ONE
-              // look before giving up (once per page: it self-guards via value-held
-              // skip + fail memory, but pages whose values can't be read back must
-              // not loop here).
-              if (!lateEquipTried) {
-                lateEquipTried = true;
+              // to the label-based newFillable filter, so give the equipment pass a
+              // look before giving up — once per set of revealed controls (it self-guards
+              // via value-held skip + fail memory, but pages whose values can't be read
+              // back must not loop here; MAX_RESCAN_PASSES bounds it too).
+              if (lateEquipSig !== lastRevealSig) {
+                lateEquipSig = lastRevealSig;
                 const lateEquip = await this.fillEquipmentSelects(postFields, alreadyFilledLabels, steps);
-                if (lateEquip > 0) { pageFillCount += lateEquip; continue; }
+                if (lateEquip > 0) {
+                  pageFillCount += lateEquip;
+                  // A DEBOUNCED autosave is invisible to the settle (nothing is on the wire for a
+                  // beat after the pick), and the control it unlocks renders only after it lands —
+                  // let it, or the next scrape sees the same page and the cascade ends one short.
+                  await sleep(LATE_EQUIP_REVEAL_GRACE_MS);
+                  continue;
+                }
               }
               // No more cascade reveals. Before giving up, click any Calculate/Update-Totals
               // button once and loop again so the values it computes (and any field it then
@@ -7360,6 +7737,20 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           pageFillCount++;
           appliedThisPage.push(bd.applied);
         }
+      }
+
+      // d3d) EVERY PV ARRAY ITS OWN ROW (#382) — after every other pass on the page, so nothing
+      //      else re-plans the rows this adds; before the persist settle, so their autosaves land.
+      //      Never on a page that reads as review: no Add Array click or row write lands there.
+      if (!isReviewPage && !plan.atReview && !isDashboard && this.page) {
+        try {
+          const rowsOut = await this.fillRemainingArrayRows(steps.slice(Math.min(pageStepsFrom, steps.length)));
+          pageFillCount += rowsOut.added;
+          for (const m of [...(rowsOut.stop ? [rowsOut.stop] : []), ...rowsOut.review]) {
+            if (!fillVerifyMisses.includes(m)) fillVerifyMisses.push(m);
+            if (!missesDidNotHold.includes(m)) missesDidNotHold.push(m);
+          }
+        } catch { /* best-effort: row 1 stands as the learn filled it */ }
       }
 
       // d1) PERSIST SETTLE (ADAPTIVE). Portals like PowerClerk autosave each page's fields via
@@ -7632,6 +8023,28 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         }
         // Whose dialog the next page opens (a section opener), or none (a main-page advance).
         this.noteContactClick(advanceField, url);
+        // #344 round 3 — PROOF OF PROGRESS, BEFORE THE RUN LEAVES THE PAGE a verified click led to:
+        // no step bound to this job's own data recorded there = the incident, here, before the
+        // advance is pressed (the backstop would hold its request anyway). learn() reports it.
+        // ROUND 4: decided HERE, after the fills, their blurs, the re-assert pass and the settle
+        // above — each candidate's control is read back now, and only one that HOLDS the job's own
+        // value for its key (outside the page's chrome) lifts the hold (noteInfoPageProof).
+        if (this.infoProof && !this.infoProof.step) await this.proveInfoPage(steps);
+        if (this.infoProof && !(this.infoProof.step && steps.includes(this.infoProof.step))) {
+          this.debug?.event({ type: "info_page_proof_missing", page: pageCount, advance: String(advanceField.label ?? "").slice(0, 40) });
+          return {
+            ...fail(steps, this.portalName, `the walk was about to press "${String(advanceField.label ?? "").slice(0, 40)}" without having entered any of this job's own data on the page.`, null, pageCount, portalNotices),
+            stopReason: "info_page_incident",
+          };
+        }
+        // …and with the proof RECORDED, the walk leaves that page now: the proof is settled here, so a
+        // later rollback of some other section's steps (an Accela contact bail) can never turn a
+        // proved page into a false incident at the walk's end.
+        if (this.infoProof) {
+          this.debug?.event({ type: "info_page_proof_settled", page: pageCount, field: String(this.infoProof.step?.field ?? "").slice(0, 40) });
+          this.infoProofSettled = this.infoProof;
+          this.infoProof = null;
+        }
         // An interstitial's forward control is clicked once per page (c2i'): remembered now, as
         // the click is made, so a return to the same page stops instead of clicking it again.
         if (interstitialAdvanceKey) this.navClicksByPath.add(interstitialAdvanceKey);
@@ -7642,6 +8055,19 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           selector: advanceField.selector,
           note: `advance: ${advanceField.label || "next"}`,
         });
+        // #344 — A HUMAN-VERIFIED INFORMATION PAGE: on the interstitial's forward click only (c2i'),
+        // the network backstop is asked ONCE, immediately before the click, whether a person
+        // verified this exact page (openInfoPagePass, reached duck-typed on the installed backstop —
+        // a backstop without the door holds the click exactly as before). The run state it judges
+        // is the steps BEFORE this one. The flag lives here, outside the retry closure: a retried
+        // click closes whatever the first attempt opened and meets 4(b) exactly as on main.
+        const advStep = steps[steps.length - 1];
+        const advPrior = steps.slice(0, steps.length - 1);
+        const infoDoor = backstopFor(this.page) as (Partial<FilingBackstop> & { infoPageAdmissions?: FilingBackstop["infoPageAdmissions"] }) | null;
+        const infoAdmissionsBefore = infoDoor && Array.isArray(infoDoor.infoPageAdmissions) ? infoDoor.infoPageAdmissions.length : 0;
+        let infoPassTried = false;
+        let infoShot: string | undefined;
+        let infoAdmitted: Array<{ passId: string; where: string }> = [];
         const advBeforeUrl = typeof this.page.url === "function" ? String(this.page.url() ?? "") : "";
         const advBeforeFp = await this.pageFingerprint();
         const advBeforeSig = await advanceSignatureOf(this.page);
@@ -7672,21 +8098,32 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           );
           (advTimer as { unref?: () => void }).unref?.();
         });
-        const res = await Promise.race([
-          safeAction(
-            "advance",
-            async () => {
-              const loc = await this.locator(advanceField.selector);
-              if (!loc) throw new Error("advance selector unresolved");
-              const gen = this.clickGeneration;
-              await this.clickResilient(loc);
-              if (this.clickGeneration !== gen) return; // retired mid-click; the walk owns the page
-              await this.waitAfterClick(advBeforeUrl, advBeforeFp, advTabsBefore);
-            },
-            { required: true },
-          ),
-          advBudget,
-        ]);
+        let res: { ok: boolean; field?: string; message?: string; timedOut?: boolean };
+        try {
+          res = await Promise.race([
+            safeAction(
+              "advance",
+              async () => {
+                const loc = await this.locator(advanceField.selector);
+                if (!loc) throw new Error("advance selector unresolved");
+                if (infoPassTried) {
+                  if (infoDoor && typeof infoDoor.closeInfoPagePass === "function") infoDoor.closeInfoPagePass();
+                } else if (interstitialAdvanceKey && infoDoor && typeof infoDoor.openInfoPagePass === "function") {
+                  infoPassTried = true;
+                  infoShot = await this.askInfoPagePass(infoDoor as FilingBackstop, loc, advPrior, pageCount, signatureDone);
+                }
+                const gen = this.clickGeneration;
+                await this.clickResilient(loc);
+                if (this.clickGeneration !== gen) return; // retired mid-click; the walk owns the page
+                await this.waitAfterClick(advBeforeUrl, advBeforeFp, advTabsBefore);
+              },
+              { required: true },
+            ),
+            advBudget,
+          ]);
+        } finally {
+          if (infoPassTried && infoDoor) infoAdmitted = this.settleInfoPagePass(infoDoor as FilingBackstop, advStep, infoAdmissionsBefore, infoShot, pageCount);
+        }
         if (advTimer) clearTimeout(advTimer);
         if ((res as { timedOut?: boolean }).timedOut) {
           this.clickGeneration++; // retire the click still in flight before anything else
@@ -7696,6 +8133,33 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             label: String(advanceField.label ?? "").slice(0, 60),
             ms: Date.now() - advStarted,
           });
+        }
+        // #344 §4 — AFTER A VERIFIED INFORMATION PAGE'S CLICK the page it led to must read as an
+        // UNFILED FORM (the backstop's checkInfoPageAfterClick: text, a fillable field, not the
+        // review / terminal page, neither filed nor an error). Otherwise this is an INCIDENT: the
+        // run stops here, the backend withdraws the pass, and nothing is recorded as filed (ok:false,
+        // no review reached, no final submit). Asked whatever the click's own outcome — a click
+        // that timed out after its request was admitted is judged the same way.
+        if (infoAdmitted.length) {
+          const door = infoDoor as Partial<FilingBackstop> | null;
+          const after = door && typeof door.checkInfoPageAfterClick === "function"
+            ? await door.checkInfoPageAfterClick(this.page).catch((e: unknown) => ({ ok: false, refusals: [`the page after the click could not be read (${String((e as { message?: string })?.message ?? e).slice(0, 80)})`] }))
+            : { ok: false, refusals: ["the network backstop cannot read the page after the click"] };
+          this.debug?.event({ type: after.ok ? "info_page_after_click_ok" : "info_page_incident", page: pageCount, phase: "after", refusals: after.refusals.slice(0, 6).map((x) => this.scrubSecrets(x).slice(0, 160)) });
+          if (!after.ok) {
+            for (const a of infoAdmitted) this.infoPageIncidents.push({ passId: a.passId, phase: "after", why: after.refusals.slice(0, 6), where: a.where });
+            return {
+              ...fail(steps, this.portalName, `STOPPED AFTER A VERIFIED INFORMATION PAGE: the network backstop let "${String(advanceField.label ?? "").slice(0, 40)}" through on the page a person verified, and the page it led to ${after.refusals.slice(0, 3).map((r) => r.replace(/^the page after the click /, "")).join("; ")}. Nothing more was sent, nothing is recorded as filed, and that verification is withdrawn. The verified page may have filed — check the portal for this project before any run continues.`, null, pageCount, portalNotices),
+              stopReason: "info_page_incident",
+            };
+          }
+          // ROUND 3 — PROOF OF PROGRESS: the page read as an unfiled form; it must now TAKE THIS JOB'S
+          // OWN DATA before the run leaves it. The backstop holds everything but the run's own writes
+          // until a fill / select / check bound to one of the job's values is recorded there
+          // (applyFill reports it); leaving, ending or stopping first is the incident (learn()'s
+          // settleInfoPageProof).
+          this.infoProof = { passes: [...infoAdmitted], page: pageCount, step: null, left: false, candidates: [] };
+          this.debug?.event({ type: "info_page_proof_pending", page: pageCount });
         }
         if (!res.ok) {
           return fail(steps, this.portalName, `Failed to click the advance button on page ${pageCount}: ${res.message ?? "unknown"}`, null, pageCount, portalNotices);
@@ -8722,6 +9186,119 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     return { ...(walk(text) as Omit<LearnPlanRequest, "screenshotBase64">), screenshotBase64 };
   }
 
+  /**
+   * #344 — ASK THE NETWORK BACKSTOP whether a person verified this information page, immediately
+   * before its forward click (the learner's ONE call). The run state is the steps before this click
+   * and the walk's own flags; only the backstop decides (infoPagePassRefusals). When no verified
+   * page matches and only that refused, the backstop captured the page (identity, prefix, text) and
+   * watches the click's request; the masked screenshot is taken HERE, still before the click.
+   * Returns that screenshot (base64), or undefined.
+   */
+  private async askInfoPagePass(door: FilingBackstop, loc: Locator, prior: RecipeStep[], pageCount: number, signatureDone: boolean): Promise<string | undefined> {
+    const priorSteps: InfoPageRunStep[] = prior.map((s) => ({
+      action: String(s.action ?? ""), note: s.note, value: s.action === "goto" ? s.value : undefined, admitted: this.infoPassAdmittedSteps.has(s),
+    }));
+    const cd = this.continueDraft;
+    const run: InfoPageRunState = {
+      priorSteps,
+      formPageSeen: this.formPageSeen,
+      continuedDraft: !!this.continuedDraft,
+      draftResume: !!(cd && (cd.applicationNumber || cd.required || cd.awaitingSignature)),
+      signatureCheck: !!this.signatureCheck,
+      signatureStep: !!this.signatureStep,
+      signatureDone,
+      // The learner's recorded writes are steps (the whitelist refuses them); its unrecorded writes
+      // go through withOwnWriteWindow (the backstop's run-wide everWrote).
+      writes: 0,
+      gapFills: 0,
+      priorProgress: this.infoPagePriorProgress,
+      projectValues: [...this.infoPageProjectValues],
+    };
+    let r: InfoPagePassOpen;
+    // Round 5: the backstop awaits the backend's reservation at the admission itself.
+    const reserveFn = this.reserveInfoPagePass;
+    const reserve = reserveFn ? (entryId: string, where: string) => reserveFn({ passId: entryId, where }) : undefined;
+    try {
+      r = await door.openInfoPagePass(this.page, loc, { entries: this.infoPagePasses, run, reserve });
+    } catch (e) {
+      r = { opened: false, refusals: [`the pass could not be asked (${String((e as { message?: string })?.message ?? e).slice(0, 80)})`], candidateWatch: false };
+    }
+    this.debug?.event({
+      type: r.opened ? "info_page_pass_open" : "info_page_refused", page: pageCount, entryId: r.entryId, candidateWatch: r.candidateWatch,
+      refusals: r.refusals.slice(0, 8).map((x) => this.scrubSecrets(String(x)).slice(0, 160)),
+    });
+    // INVALIDATION BEFORE THE CLICK (proposal §4): a page a person verified at this host + path now
+    // reads differently. The click is held exactly as on main; each such pass is an incident the
+    // backend audits and withdraws, and the page as it is now becomes the fresh candidate.
+    for (const d of Array.isArray(r.drifted) ? r.drifted : []) {
+      this.infoPageIncidents.push({ passId: d.entryId, phase: "before", why: d.why.slice(0, 6), where: d.where });
+      this.debug?.event({ type: "info_page_incident", page: pageCount, phase: "before", passId: d.entryId, why: d.why.slice(0, 6) });
+    }
+    // HELD AT A VERIFIED PAGE ONLY BECAUSE OF THIS PROJECT'S PRIOR PROGRESS (round 2): the click is
+    // held exactly as on main; the run says so, and a person may allow the pass once more.
+    if (!r.opened && r.heldVerifiedEntryId && r.refusals.includes(INFO_PAGE_PRIOR_PROGRESS_REFUSAL)) {
+      let where = "";
+      try { const u = new URL(String(this.page?.url() ?? "")); where = `${u.origin}${u.pathname}`; } catch { where = ""; }
+      this.infoPageHeldVerified.push({ passId: r.heldVerifiedEntryId, where, why: r.refusals.slice(0, 6) });
+    }
+    const pg = this.page;
+    if (!r.candidateWatch || !pg) return undefined;
+    const shot = await this.withSecretMask("info page screenshot", (mask) => pg.screenshot({ fullPage: true, mask })).catch(() => undefined);
+    return shot ? Buffer.from(shot).toString("base64") : undefined;
+  }
+
+  /** #344 — after the forward click: close the backstop's info-page slot / watch, keep the captured
+   *  candidate (its evidence scrubbed: no field value, secrets and long digit runs masked), and
+   *  record each verified page the click passed (the step object, so a rolled-back walk can never
+   *  pass an unadmitted step off as admitted). Returns what this click passed (the caller then
+   *  judges the page it led to). */
+  private settleInfoPagePass(door: FilingBackstop, advStep: RecipeStep, admissionsBefore: number, shot: string | undefined, pageCount: number): Array<{ passId: string; where: string }> {
+    try { if (typeof door.closeInfoPagePass === "function") door.closeInfoPagePass(); } catch { /* the slot has its own closers */ }
+    let take: InfoPageCandidateTake | null = null;
+    try { take = typeof door.takeInfoPageCandidate === "function" ? door.takeInfoPageCandidate() : null; } catch { take = null; }
+    if (take) {
+      const scrub = (s: string): string => redactCaptureText(this.scrubSecrets(s), 20_000);
+      // Helm's review of #349: the digest's LABELS are page text too — every button's label
+      // (shape.controlLabels) and the forward control's (shape.controlLabel, control.label) — and are
+      // kept in the candidate's digest_json: scrubbed exactly as the evidence text is. (A label that
+      // scrubbing changed then never matches the live page: fail closed. "Next" is unchanged.)
+      const digest = {
+        ...take.digest,
+        control: { ...take.digest.control, label: scrub(String(take.digest.control.label ?? "")) },
+        shape: {
+          ...take.digest.shape,
+          controlLabel: scrub(String(take.digest.shape.controlLabel ?? "")),
+          controlLabels: (Array.isArray(take.digest.shape.controlLabels) ? take.digest.shape.controlLabels : []).map((l) => scrub(String(l ?? ""))),
+        },
+      };
+      const capture: InfoPageCandidateCapture = {
+        identityVersion: take.digest.version,
+        identitySha256: take.digest.identitySha256,
+        origin: take.digest.origin,
+        path: take.digest.path,
+        controlLabel: scrub(take.digest.control.label).slice(0, 80),
+        digest,
+        prefix: take.prefix.map((s) => [s[0], s[1], s[2]] as [string, string, string]),
+        observed: take.observed,
+        evidence: infoPageEvidence(take.material, scrub),
+        ...(shot ? { screenshotBase64: shot } : {}),
+      };
+      if (!this.infoPageCandidate || (!this.infoPageCandidate.observed && capture.observed)) this.infoPageCandidate = capture;
+      this.debug?.event({ type: "info_page_candidate", page: pageCount, identity: take.digest.identitySha256.slice(0, 12), held: !!take.observed, screenshot: !!shot });
+    }
+    const admitted = Array.isArray(door.infoPageAdmissions) ? door.infoPageAdmissions.slice(admissionsBefore).filter((a) => a.exempted) : [];
+    if (admitted.length) {
+      this.infoPassAdmittedSteps.add(advStep);
+      for (const a of admitted) {
+        this.infoPagePassed.push({ passId: a.entryId, where: a.where });
+        // ON RECORD AT ONCE (round 2): the backend writes the use before the walk goes on.
+        try { this.onInfoPagePassed?.({ passId: a.entryId, where: a.where }); } catch { /* the result still carries it */ }
+      }
+      this.debug?.event({ type: "info_page_pass", page: pageCount, passes: admitted.map((a) => ({ passId: a.entryId, where: a.where })) });
+    }
+    return admitted.map((a) => ({ passId: a.entryId, where: a.where }));
+  }
+
   /** A screenshot that may leave the process (vision planner, review verifier, bundle PNG) with
    *  every rendering of a known secret MASKED: the boxes this run typed one into, plus any element
    *  whose value or text carries one (a review page echoes it). `take` receives the mask. When the
@@ -8824,7 +9401,114 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     fillReq: { value: string; field?: string },
     sensitive: boolean,
   ): Promise<RecipeStep | null> {
-    return withOwnWriteWindow(this.page, `learner ${field.fieldType || "field"} write (${String(field.label ?? "").slice(0, 40)})`, () => this.applyFillInner(field, fillReq, sensitive));
+    const step = await withOwnWriteWindow(this.page, `learner ${field.fieldType || "field"} write (${String(field.label ?? "").slice(0, 40)})`, () => this.applyFillInner(field, fillReq, sensitive));
+    // #344 round 3: what was entered (memory only; never a secret), and — round 4 — a CANDIDATE for
+    // the proof that the page after a verified information page took this job's own data. Nothing is
+    // decided here: what the control HOLDS is read just before the run leaves the page.
+    if (step && !sensitive && step.sensitive !== true) this.infoProofValues.set(step, String(fillReq.value ?? ""));
+    if (step && this.infoProof && !this.infoProof.step && !this.infoProof.left && this.infoProof.candidates.length < 24) this.infoProof.candidates.push(step);
+    return step;
+  }
+
+  /** #344 round 4 — READ BACK each candidate step's control on the page a verified click led to, just
+   *  before the run leaves it (after the fills, their blurs, the re-assert pass and the settle): what
+   *  it HOLDS now and whether it is the page's chrome (portalSafety infoPageProofControlInPage, the
+   *  after-click reading's own container rule). The first that passes the shared predicate is the
+   *  proof (noteInfoPageProof). Unreadable = not proof. */
+  private async proveInfoPage(steps: RecipeStep[]): Promise<void> {
+    const p = this.infoProof;
+    if (!p || p.step || p.left || !this.page || typeof this.page.evaluate !== "function") return;
+    const own = this.infoPageProofValues;
+    const candidates = p.candidates.filter((s) => steps.includes(s) && typeof s.field === "string" && Object.prototype.hasOwnProperty.call(own, s.field));
+    if (!candidates.length) return;
+    await this.page.evaluate(PORTAL_SAFETY_IN_PAGE_SOURCE).catch(() => null);
+    for (const s of candidates) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const loc = (await this.locator(s.selector).catch(() => null)) as any;
+      let read: { held: string[]; chrome: boolean } | null = null;
+      if (loc && typeof loc.evaluate === "function") {
+        const r = await loc.evaluate((el: Element, g: string) => {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const ps = (globalThis as any)[g];
+          return ps && typeof ps.infoPageProofControlInPage === "function" ? ps.infoPageProofControlInPage(el) : null;
+        }, PORTAL_SAFETY_GLOBAL).catch(() => null) as { held?: unknown; chrome?: unknown } | null;
+        if (r && Array.isArray(r.held) && typeof r.chrome === "boolean") read = { held: r.held.map((x) => String(x ?? "")), chrome: r.chrome };
+      }
+      if (read) this.infoProofReads.set(s, read);
+      if (this.noteInfoPageProof(s)) return;
+      if (this.infoProof?.left) return;
+    }
+  }
+
+  /** #344 round 3/4 — THE ONE LIFT: a candidate step on the page a verified click led to whose
+   *  control, read back, HOLDS this job's own value for its key outside the page's chrome
+   *  (infoPageProofStepRefusals over what was read): tell the backstop, which lifts its hold only
+   *  while the run is still on that page's document. True = proved. */
+  private noteInfoPageProof(step: RecipeStep): boolean {
+    const p = this.infoProof;
+    if (!p) return false;
+    const refusals = infoPageProofStepRefusals(this.infoProofStepOf(step), this.infoPageProofValues);
+    this.debug?.event({ type: "info_page_proof_read", page: p.page, field: String(step.field ?? "").slice(0, 40), refusals: refusals.slice(0, 4).map((x) => x.slice(0, 160)) });
+    if (refusals.length) return false;
+    const door = backstopFor(this.page) as Partial<FilingBackstop> | null;
+    const given = !!door && typeof door.infoPageProofGiven === "function" && door.infoPageProofGiven();
+    if (given) p.step = step;
+    else p.left = true;
+    this.debug?.event({ type: given ? "info_page_proof" : "info_page_proof_too_late", page: p.page, field: String(step.field ?? "").slice(0, 40) });
+    return given;
+  }
+
+  private infoProofStepOf(step: RecipeStep): InfoPageProofStep {
+    const read = this.infoProofReads.get(step);
+    return {
+      action: String(step.action ?? ""), field: step.field, note: step.note, value: this.infoProofValues.get(step) ?? "", sensitive: step.sensitive === true,
+      ...(read ? { held: read.held, chrome: read.chrome } : {}),
+    };
+  }
+
+  /**
+   * #344 round 3 — PROOF OF PROGRESS AT THE WALK'S END (every exit funnels here, before the backstop
+   * is disposed): a verified information page's click led to a page that read as an unfiled form,
+   * and the walk left it, ended, stopped or found "nothing fillable" without recording a fill /
+   * select / check bound to this job's own data there. That is an INCIDENT exactly like the
+   * after-click one: each pass it used is reported (phase "after": the backend withdraws it and warns
+   * every project that used it), the sticky lock is armed while the run is still on that page, the
+   * walk fails (stopReason "info_page_incident"), and nothing is recorded as filed (no review, no
+   * final submit). A walk whose proof is on record is returned unchanged.
+   */
+  private settleInfoPageProof(result: LearnResult, backstop: FilingBackstop | null): LearnResult {
+    const state = backstop && typeof backstop.infoPageProofState === "function" ? backstop.infoPageProofState() : "none";
+    // Q4: the proof was given, but the page then sent its form somewhere other than the interview's
+    // own endpoint (the backstop's SAME INTERVIEW rule held it) — a receipt's form: the same incident.
+    const strayed = state === "strayed";
+    const p = this.infoProof ?? (strayed ? this.infoProofSettled : null);
+    if (!p) return result;
+    const steps = Array.isArray(result.steps) ? result.steps : [];
+    const recorded = !!p.step && steps.includes(p.step)
+      && infoPageProofOfProgressRefusals([this.infoProofStepOf(p.step)], this.infoPageProofValues).length === 0;
+    if (recorded && !strayed) return result;
+    this.infoProof = null;
+    this.infoProofSettled = null;
+    const left = p.left || state === "left";
+    if (backstop && !left) { try { backstop.lockReview("a verified information page led to a page that took none of this job's data"); } catch { /* disposed */ } }
+    const why = [
+      strayed
+        ? "the page the verified click led to took this job's data, then sent it somewhere other than the interview's own form (the backstop held it) — not the next step of this application"
+        : `${infoPageProofOfProgressRefusals([], this.infoPageProofValues)[0]} — the run ${left ? "left that page" : result.stopReason === "info_page_incident" ? "was about to leave that page" : "ended"} first`,
+    ];
+    for (const a of p.passes) this.infoPageIncidents.push({ passId: a.passId, phase: "after", why, where: a.where });
+    this.debug?.event({ type: "info_page_incident", page: p.page, phase: "after", kind: "no_progress", left, why });
+    const prior = String(result.message ?? "").replace(/^STOPPED AFTER A VERIFIED INFORMATION PAGE:\s*/, "").slice(0, 240);
+    return {
+      ...result,
+      ok: false,
+      steps: steps.filter((s) => s.isFinalSubmit !== true),
+      finalSubmitRecorded: false,
+      reachedReview: false,
+      pauseReason: null,
+      stopReason: "info_page_incident",
+      message: `STOPPED AFTER A VERIFIED INFORMATION PAGE: the network backstop let one request through on the page a person verified; the page it led to read as a form, but ${strayed ? "it then tried to send this job's data somewhere other than the interview's own form (held: nothing reached the server) — so it was not the next step of this job's application" : `the run ${left ? "left it" : "did not continue past it"} without entering any of this job's own data there (no fill, select or check bound to a project value whose control kept that value) — so nothing showed it was this job's application`}. It may have been a receipt: the verified page may have filed — check the portal for this project. Nothing is recorded as filed, and that verification is withdrawn. (The walk said: ${prior})`,
+    };
   }
 
   private async applyFillInner(
