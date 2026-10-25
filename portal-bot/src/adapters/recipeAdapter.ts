@@ -1894,7 +1894,11 @@ export class RecipeAdapter extends BasePortalAdapter {
       // The gap-fill those two run next sees what was typed; a control it knows but this job has no
       // value for stops the run here, by name. (An ADVANCING click asks the same question further
       // down, only once the extra-advance guard has decided the page is really being left.)
-      if (!pastReview && (step.action === "stopForReview" || isFinalSubmitStep(step))) {
+      // AND IN FRONT OF A STAMPED DRAFT-CREATING SUBMIT, in both recipe shapes (Helm review of PR
+      // #353, item 2): the auto-learner records PSE's Part 1 Submit with no stopForReview before it,
+      // so that click step itself is where the page is answered — before clickDraftCreatingSubmit
+      // reads it. A known control with no value stops here by name, before any click.
+      if (!pastReview && (step.action === "stopForReview" || isFinalSubmitStep(step) || this.draftCreatingStepAt(stepIdx) >= 0)) {
         const unrecorded = await this.timed("unrecorded-required", () => this.answerUnrecordedRequired());
         if (unrecorded.filled.length) { prevWasInput = true; wroteToThisPage = true; }
         if (unrecorded.missing.length) {
@@ -2588,6 +2592,7 @@ export class RecipeAdapter extends BasePortalAdapter {
           clickedLabel: d.clickedLabel, tenantKey: d.tenantKey,
         },
         gapFill: this.gapFillReport, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, slowSteps, requiredStillEmpty: this.requiredStillEmpty, unresolvedFields: this.unresolvedFields, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, requiredFieldsSeen: this.requiredFieldsSeen, pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath,
+        unrecordedAnswered: this.unrecordedAnswered,
       });
     }
 
@@ -8534,8 +8539,16 @@ export class RecipeAdapter extends BasePortalAdapter {
           note: f.label.replace(/\s+/g, " ").trim().slice(0, 120),
           ...(ans.kind === "bound" ? { field: ans.key } : { value: ans.value }),
         } as RecipeStep;
-        const done = await this.executeStep(step, false).catch(() => false);
         const shown = f.label.replace(/\s+/g, " ").trim().slice(0, 60);
+        // NOTED AS DATA, ON EVERY ATTEMPT (Helm review of PR #353, item 1, under the owner's
+        // 2026-10-18 "Data is enough" as #373 built it): a bound answer is this project's value, a
+        // standing / policy answer is the operator's own standing data — never an AI's pick, so it
+        // never stops the stamped draft click, and it is on the run's record of what automation wrote
+        // that no recorded step wrote. Noted BEFORE the write: a write that fails part-way may still
+        // have landed.
+        await this.noteUnrecordedWrite("data", ans.kind === "bound" ? `${ans.key}: ${shown}` : `standing answer: ${shown}`,
+          { id: rawId, name: String(raw?.name ?? ""), question: f.label });
+        const done = await this.executeStep(step, false).catch(() => false);
         if (done) {
           out.filled.push(shown);
           if (!this.unrecordedAnswered.includes(shown)) this.unrecordedAnswered.push(shown);

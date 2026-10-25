@@ -318,6 +318,57 @@ check("a control that could not be pinned to one element stops with the replay's
   assert.ok(!/add the value and stage again/.test(msg), `the value is on file — the remedy is the browser: ${msg}`);
 });
 
+// SUBMIT INTENT GETS NO STANDING ANSWER (Helm review of PR #353, item 3). Each of these matches a
+// standing rule (kWh netting, UL 1741, public school, knife-blade, export capacity) and read "Yes"/"No".
+check("MUST-EXCLUDE: a question about submitting gets no answer, whatever standing rule it also matches", () => {
+  const wordings = [
+    "Are you ready to submit your Net Metering (kWh) application?",
+    "Submit as final? (UL 1741 certified inverters only)",
+    "Is this application complete and ready? (net kWh)",
+    "Is the knife blade disconnect information final?",
+    "Is your public school project application ready to be submitted?",
+    "Do you propose to limit the export capacity of this system and submit now?",
+  ];
+  for (const label of wordings) {
+    assert.ok(policyDefaultAnswerFor(label, "nem") !== "", `not vacuous: a standing rule matches "${label}"`);
+    assert.equal(answerForUnrecordedControl({ label, fieldType: "select", options: YES_NO }, { exportLimiting: "Yes" }, "nem"), null, label);
+  }
+});
+
+// A NEGATED STATEMENT GETS NO STANDING ANSWER (item 4): the rules answer the plain question.
+check("MUST-EXCLUDE: a negation in the sentence a rule matched gets no answer", () => {
+  const negated = [
+    "I certify this is NOT a public school project.",
+    "This system does not use kWh netting.",
+    "The inverters are not UL 1741 certified.",
+    "The AC disconnect is never a knife blade type.",
+    "Confirm the AC disconnect(s) are not within the states required distance from the utility meter.",
+    "If you do not plan to, say so: do you propose to limit the export capacity of this system?",
+    "The disconnect isn't within 10 feet of the meter.",
+    "None of the inverters are lab-certified.",
+  ];
+  for (const label of negated) {
+    const plain = answerForUnrecordedControl({ label: label.replace(/\b(NOT|not|never|isn't|None of)\s*/g, ""), fieldType: "select", options: YES_NO }, STD, "nem");
+    assert.ok(plain !== null, `not vacuous: without the negation "${label}" gets an answer`);
+    assert.equal(answerForUnrecordedControl({ label, fieldType: "select", options: YES_NO }, { ...STD, disconnectWithin10ft: "Yes", exportLimiting: "No" }, "nem"), null, label);
+  }
+});
+
+check("MUST-PASS: a negation OUTSIDE the matched sentence, or a comparison, does not block the answer", () => {
+  // A preamble's "not" says nothing about the question that follows it.
+  assert.equal(valueOf(answerForUnrecordedControl({ label: `Do not leave this blank. ${KNIFE}`, fieldType: "select", options: YES_NO }, {}, "nem")), "Yes");
+  // Ameren's knife-blade wording: "no less than 5\" by 7\"" is a size, not a negation.
+  const ameren = "Ameren requires a Manual, External Knife-Blade Type Disconnect OR a Circuit Breaker in a Secured Compartment/Enclosure along with signage no less than 5\" by 7\". Will your system meet this requirement?";
+  assert.equal(valueOf(answerForUnrecordedControl({ label: ameren, fieldType: "select", options: YES_NO }, {}, "nem")), "Yes");
+  assert.equal(valueOf(answerForUnrecordedControl({ label: KNIFE, fieldType: "select", options: YES_NO }, {}, "nem")), "Yes");
+  assert.equal(valueOf(answerForUnrecordedControl({ label: DIST, fieldType: "select", options: YES_NO }, STD, "nem")), "Yes");
+});
+
+check("\\bnet: \"internet wh…\" is not the kWh-netting question", () => {
+  assert.equal(policyDefaultAnswerFor("Do you have internet wholesale service at this address?", "nem"), "");
+  assert.equal(policyDefaultAnswerFor("Net kWh election", "nem"), "Yes");
+});
+
 if (failures) { console.error(`\n${failures} unrecordedControls check(s) FAILED.`); process.exit(1); }
 console.log("\nAll unrecordedControls checks passed.");
 process.exit(0);

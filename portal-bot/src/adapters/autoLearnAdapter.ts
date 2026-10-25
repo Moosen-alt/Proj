@@ -516,7 +516,8 @@ export const POLICY_RADIO_DEFAULTS: ReadonlyArray<PolicyRadioRule> = Object.free
   // the application is submitted, so this is a commercial decision encoded as a default, not
   // a mechanical one. enforce=false, so anything already answered — by a human or from
   // project data — always wins.
-  { question: /net\s*k?wh|kwh\s*netting|net\s*metering\s*\(k?wh\)/i, answer: "Yes" },
+  // `\bnet`: "internet wh…" is not net kWh (Helm review of PR #353).
+  { question: /\bnet\s*k?wh|kwh\s*netting|net\s*metering\s*\(k?wh\)/i, answer: "Yes" },
   { question: /monetiz/i, answer: "Yes" },
   // Ameren Illinois: "requires a Manual, External Knife-Blade Type Disconnect OR a Circuit
   // Breaker in a Secured Compartment/Enclosure … along with signage … no less than 5\" by 7\"
@@ -561,10 +562,16 @@ export function policyProfileFor(scopeType: string | null | undefined, env: Node
  *  scope is "none". `enforce` is the learner's correction of a planner's other pick; a caller that
  *  only ever answers an EMPTY control has nothing to correct, so it does not apply. */
 export function policyDefaultAnswerFor(question: string, scope: PolicyScope): "Yes" | "No" | "" {
-  if (scope === "none") return "";
+  return policyDefaultRuleFor(question, scope)?.answer ?? "";
+}
+
+/** The POLICY_RADIO_DEFAULTS rule that answers a question in this scope, or null — what
+ *  policyDefaultAnswerFor reads, for a caller that also needs the rule's own regex (the replay's
+ *  negation check reads the sentence the rule matched). */
+export function policyDefaultRuleFor(question: string, scope: PolicyScope): PolicyRadioRule | null {
+  if (scope === "none") return null;
   const text = String(question ?? "");
-  const hit = POLICY_RADIO_DEFAULTS.find((p) => (p.scope ?? "nem") === scope && p.question.test(text));
-  return hit ? hit.answer : "";
+  return POLICY_RADIO_DEFAULTS.find((p) => (p.scope ?? "nem") === scope && p.question.test(text)) ?? null;
 }
 
 /** The policy scope a replay runs under: the learn's own profile (policyProfileFor) for the recipe's

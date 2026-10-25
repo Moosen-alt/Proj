@@ -30,8 +30,10 @@
 // stage before a browser opens when the job has not answered (recipeReplayBinding
 // openPerJobQuestions) — this module does not touch that; it only answers a control the recipe could
 // not have asked about, and only when it is EMPTY.
-import { operatorPolicyAnswer, perJobAnswerKeyFor, perJobControlOfField } from "../../shared/src/perJobQuestions";
-import { isSensitiveLabel, POLICY_RADIO_DEFAULTS, policyDefaultAnswerFor, type PolicyScope } from "./adapters/autoLearnAdapter";
+import { operatorPolicyAnswer, perJobAnswerKeyFor, perJobControlOfField, perJobRuleFor } from "../../shared/src/perJobQuestions";
+import { isSubmitIntent } from "../../shared/src/portalSafety";
+import { isSensitiveLabel, POLICY_RADIO_DEFAULTS, policyDefaultRuleFor, type PolicyScope } from "./adapters/autoLearnAdapter";
+import { isSubmitIntentField } from "./llmGapFill";
 
 export type DisconnectPartKey = "disconnectMake" | "disconnectModel" | "disconnectMakeModel";
 
@@ -184,6 +186,42 @@ function policyQuestionJobKeyFor(question: string): string | null {
   return POLICY_QUESTION_JOB_KEYS.find((p) => p.question.test(text))?.key ?? null;
 }
 
+/**
+ * A QUESTION ABOUT SUBMITTING IS NEVER ANSWERED HERE (Helm review of PR #353, item 3). "Are you ready
+ * to submit your Net Metering (kWh) application?" matched the kWh-netting rule and got its standing
+ * "Yes"; "Submit as final? (UL 1741 certified inverters only)" matched UL 1741 and got "Yes". A
+ * standing answer to a policy question is not a person's decision to file. So: the shared submit
+ * predicate (portalSafety isSubmitIntent), the gap-fill's own (isSubmitIntentField — the one #373's
+ * picks are refused by), and the wordings neither carries ("final", "ready to be submitted",
+ * "complete and ready"). Such a control gets no answer: it stays empty, and the run stops on it by
+ * name (the sweep's required-still-empty, or the stamped draft click's refusal).
+ */
+const SUBMIT_INTENT_EXTRA = /\bfinal\b|\bready\s+(?:to\s+be|for)\s+submi|\bcomplete\s+and\s+ready\b/i;
+export function readsAsSubmitIntent(label: string): boolean {
+  const t = String(label ?? "").replace(/\s+/g, " ").trim();
+  if (!t) return false;
+  return isSubmitIntent(t, null) || isSubmitIntentField(t) || SUBMIT_INTENT_EXTRA.test(t);
+}
+
+/**
+ * A NEGATED STATEMENT GETS NO STANDING ANSWER (Helm review of PR #353, item 4). The rules are written
+ * for the question in its plain form: "public school project" → "No" is right for "Is this a public
+ * school project?" and wrong for "I certify this is NOT a public school project". So when not / no /
+ * never / none (or a "-n't", or "cannot") sits in the SENTENCE the rule matched, the control gets no
+ * answer and the run stops on it by name. The sentence, not the label: a label is often a preamble
+ * and a question, and a "no" in the preamble says nothing about the question. A rule whose match
+ * spans sentences is read against the whole label. "No less than 5\" by 7\"" (the knife-blade
+ * signage wording) and a "Yes/No" hint are comparisons and options, not negations.
+ */
+const NEGATION = /\b(?:not|no|never|none|cannot)\b|\b\w+n['’]t\b/i;
+const NOT_A_NEGATION = /\bno\s+(?:less|more|later|earlier|greater|fewer|smaller|larger|longer|shorter)\s+than\b|\byes\s*\/\s*no\b/gi;
+export function negatedWhereMatched(label: string, rule: RegExp): boolean {
+  const text = String(label ?? "").replace(/\s+/g, " ").trim();
+  const sentences = text.split(/(?<=[.?!])\s+/).filter(Boolean);
+  const hit = sentences.filter((sen) => rule.test(sen));
+  return (hit.length ? hit : [text]).some((sen) => NEGATION.test(sen.replace(NOT_A_NEGATION, " ")));
+}
+
 const optNorm = (s: string): string => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 /** The control's own option for an answer ("Yes" → "Yes"), or "" when it offers none — a policy
  *  answer is never typed into a dropdown that does not offer it. */
@@ -214,6 +252,8 @@ export function answerForUnrecordedControl(
   const isText = type === "text" || (type === "other" && options.length === 0);
   if (!isDropdown && !isText) return null;
   if (isText && isSensitiveLabel(label)) return null;
+  // NEVER A STANDING ANSWER TO "SUBMIT?" (item 3): no answer, so the run stops on it by name.
+  if (readsAsSubmitIntent(label)) return null;
 
   // A DISCONNECT PART binds to the AC disconnect's keys only when its label says nothing but
   // AC-disconnect words (readDisconnectPart's allow-list); any other is recognized, never bound,
@@ -225,6 +265,10 @@ export function answerForUnrecordedControl(
   if (isDropdown) {
     const perJob = perJobAnswerKeyFor(label, { control: perJobControlOfField({ fieldType: type, options }), answer: "", options });
     if (perJob) {
+      // A NEGATED STATEMENT (item 4): neither the job's answer nor the standing one — both answer
+      // the plain question. No answer; the run stops on it by name.
+      const rule = perJobRuleFor(label);
+      if (rule && negatedWhereMatched(label, rule.re)) return null;
       const own = String(fieldValues?.[perJob] ?? "").trim();
       if (own) return { kind: "bound", key: perJob, value: own };
       // THE STANDING ANSWER IS LOOKED UP BY THE KEY, never re-derived from the wording (PR #353 round
@@ -237,8 +281,11 @@ export function answerForUnrecordedControl(
       if (standing) return { kind: "policy", value: standing, why: "the operator's standing answer (this job recorded none)" };
       return { kind: "bound", key: perJob, value: "" };
     }
-    const standing = policyDefaultAnswerFor(label, scope);
-    if (standing) {
+    const rule = policyDefaultRuleFor(label, scope);
+    const standing = rule?.answer ?? "";
+    if (rule && standing) {
+      // A NEGATED STATEMENT (item 4): no answer, the run stops on it by name.
+      if (negatedWhereMatched(label, rule.question)) return null;
       // THE JOB'S OWN ANSWER FIRST, when the job carries one (POLICY_QUESTION_JOB_KEYS): bound to its
       // key, so the step selects the job's value. `value` is the control's own option for it, the gate
       // for typing at all: a job value the dropdown does not offer is "" — never the standing answer
