@@ -482,8 +482,8 @@ let candidate1a: InfoPageCandidateCapture | undefined;
   check("the learner says so (interstitial_not_review) and names Next as the way forward",
     interstitialEvents(w).some((e) => e.forward === "Next"), JSON.stringify(interstitialEvents(w)));
   check("no lockReview was armed anywhere on this run", w.locks.length === 0, JSON.stringify(w.locks));
-  check("uploads were not skipped 'on review' (it is not the review page)",
-    !w.events.some((e) => e.type === "upload_skipped_on_review"), JSON.stringify(w.events.filter((e) => e.type === "upload_skipped_on_review")));
+  check("uploads did not run attach-only 'on review' (it is not the review page)",
+    !w.events.some((e) => e.type === "upload_phase_start" && e.attachOnly === true), JSON.stringify(w.events.filter((e) => e.type === "upload_phase_start")));
   check("the walk recorded 'advance: Next' (and never Previous)",
     w.notes.includes("advance: Next") && !w.notes.some((n) => /previous/i.test(n)), JSON.stringify(w.notes));
   check("nothing was recorded as a final submit", w.finals.length === 0, JSON.stringify(w.finals));
