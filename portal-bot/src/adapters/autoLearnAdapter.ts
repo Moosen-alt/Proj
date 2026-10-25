@@ -51,7 +51,7 @@ export interface ContinueDraft {
 }
 import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isInterstitialForwardLabel as sharedIsInterstitialForwardLabel, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
 import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
-import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
+import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopSentLine, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
 // Types only (erased): the information-page door is reached duck-typed on the installed backstop.
 import type { FilingBackstop, InfoPageCandidateTake, InfoPagePassOpen } from "../filingBackstop";
 import { INFO_PAGE_PRIOR_PROGRESS_REFUSAL, infoPageEvidence, infoPageProofOfProgressRefusals, infoPageProofStepRefusals, type InfoPageProofStep, type InfoPageRunState, type InfoPageRunStep } from "../../../shared/src/infoPagePass";
@@ -5748,11 +5748,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // can do about it.
           if (this.infoPageHeldVerified.length) {
             return {
-              ...fail(steps, this.portalName, `HELD AT A VERIFIED INFORMATION PAGE: ${describeBackstopAbort(stopping[0])}. Nothing was sent. The page is one a person verified, but this project already made progress on this portal (an earlier run passed this page, may have entered data, reached review, or a number, draft or filing is on record), so automation does not pass it again. Check this project's application on the portal; a person can then allow the pass once more for this project (project → Portal runs).`, null, pageCount, portalNotices),
+              ...fail(steps, this.portalName, `HELD AT A VERIFIED INFORMATION PAGE: ${describeBackstopAbort(stopping[0])}. ${backstopSentLine(stopping[0])} The page is one a person verified, but this project already made progress on this portal (an earlier run passed this page, may have entered data, reached review, or a number, draft or filing is on record), so automation does not pass it again. Check this project's application on the portal; a person can then allow the pass once more for this project (project → Portal runs).`, null, pageCount, portalNotices),
               stopReason: "backstop_abort",
             };
           }
-          return { ...fail(steps, this.portalName, `Stopped by the network backstop: ${describeBackstopAbort(stopping[0])}. Nothing was sent; the step (or page script) that fired it must be reviewed.`, null, pageCount, portalNotices), stopReason: "backstop_abort" };
+          return { ...fail(steps, this.portalName, stopping[0].redirect
+            ? `Stopped by the network backstop: the portal answered a request of this run with a ${stopping[0].redirect.status} redirect it would not follow — ${describeBackstopAbort(stopping[0])}. ${backstopSentLine(stopping[0])} Check on the portal what it did with that request.`
+            : `Stopped by the network backstop: ${describeBackstopAbort(stopping[0])}. Nothing was sent; the step (or page script) that fired it must be reviewed.`, null, pageCount, portalNotices), stopReason: "backstop_abort" };
         }
       }
       // Reset per-page label tracking so the planner sees a clean slate on each page —
