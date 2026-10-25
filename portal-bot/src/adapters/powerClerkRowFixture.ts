@@ -308,8 +308,11 @@ export type Committed = { rows: Array<Record<string, string>>; invMfr?: string; 
 /** Serve the fixture, open a browser context, and return a runner that drives the REAL replay
  *  path (RecipeAdapter.fillApplication) on `pathname` with `fields`. */
 export async function startRowFixture(chromium: { launch: () => Promise<Browser> }): Promise<{
-  run: (pathname: string, fields: Record<string, string>) => Promise<{ r: Awaited<ReturnType<RecipeAdapter["fillApplication"]>>; committed: Committed; filed: boolean; url: string }>;
+  run: (pathname: string, fields: Record<string, string>, recipeFor?: (url: string) => PortalRecipe) => Promise<{ r: Awaited<ReturnType<RecipeAdapter["fillApplication"]>>; committed: Committed; filed: boolean; url: string }>;
   close: () => Promise<void>;
+  /** The fixture's origin and browser context, for a smoke that drives something other than a replay. */
+  base: string;
+  context: BrowserContext;
 }> {
   const server = http.createServer((q, r) => {
     const url = String(q.url ?? "");
@@ -322,10 +325,10 @@ export async function startRowFixture(chromium: { launch: () => Promise<Browser>
   const browser = await chromium.launch();
   const context: BrowserContext = await browser.newContext();
   await context.addInitScript("globalThis.__name = globalThis.__name || function (fn) { return fn; };");
-  const run = async (pathname: string, fields: Record<string, string>) => {
+  const run = async (pathname: string, fields: Record<string, string>, recipeFor: (url: string) => PortalRecipe = recipe) => {
     const p = await context.newPage();
     await p.goto(`${base}${pathname}`);
-    const a = new RecipeAdapter(recipe(`${base}${pathname}`), fields, {}, { autoSubmit: false });
+    const a = new RecipeAdapter(recipeFor(`${base}${pathname}`), fields, {}, { autoSubmit: false });
     (a as unknown as { page: unknown }).page = p;
     const r = await a.fillApplication({} as never);
     await p.waitForTimeout(1500); // let the last debounced autosaves land
@@ -333,7 +336,7 @@ export async function startRowFixture(chromium: { launch: () => Promise<Browser>
     const filed = await p.evaluate(() => (window as unknown as { __filed?: boolean }).__filed === true);
     return { r, committed, filed, url: p.url() };
   };
-  return { run, close: async () => { await browser.close(); server.close(); } };
+  return { run, close: async () => { await browser.close(); server.close(); }, base, context };
 }
 
 // ---- Shared by the #348 review's variant smokes (two arrays each). ----

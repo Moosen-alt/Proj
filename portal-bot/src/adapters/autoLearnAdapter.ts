@@ -3,7 +3,7 @@ import { preferredRowLabel, rankAddressVersions, type SiteIdentity } from "../ad
 import { imageToPdfBytes, pdfNameFor, shouldConvertToPdf } from "../imageToPdf";
 import path from "path";
 import type { Page, Frame, Locator } from "playwright";
-import type { ProjectRecord, RecipeSelector, RecipeStep, StepFingerprint } from "../../../shared/src/types";
+import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep, StepFingerprint } from "../../../shared/src/types";
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, type PortalContext, type PortalStepResult } from "../adapter";
 import { openPortal } from "../browser";
 import { selectWithFallback, readClosedComboboxOptions } from "../comboboxFill";
@@ -357,6 +357,10 @@ const PAY_FEE = /\b(pay\s*(and|&)\s*submit|pay fees?|pay fee|pay now|submit\s*(&
  *  Three allows a legitimate re-render plus one retry; Miami's Property Search was walked
  *  SEVEN times, which bought nothing and spent the whole budget. */
 const REPEAT_PAGE_LIMIT = 3;
+/** #382 — after the late equipment pass fills a control, how long a debounced autosave gets to
+ *  land and render what it unlocks (a PowerClerk row's Model after its make) before the next
+ *  re-scrape. Only paid when that pass actually filled something. */
+const LATE_EQUIP_REVEAL_GRACE_MS = 2_000;
 
 const SUBMIT_INTENT = /\b(continue application|submit application|file application|submit|finish|finalize|confirm submission|place order|complete submission)\b/i;
 /** A login-worded control ("Sign In", "Log in", "Login", "Log On"). Never a walk advance while its
@@ -2620,6 +2624,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     context: string,
     fallbackSide?: "inverter" | "module",
     bareSelect = false,
+    /** The page shows PV Array repeater rows (arrayRowsInPage, the replay's own row predicate). */
+    arrayRowPage = false,
   ): { key: string; candidates: string[]; side: "inverter" | "module" | null } | null {
     const l = (context || "").toLowerCase();
     const isModel = /\bmodel\b/.test(l);
@@ -2692,9 +2698,19 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     const explicitlyPv = /module|pv ?array|solar|photovoltaic/.test(l);
     if (EQUIPMENT_NEGATIVE_GUARD.test(l) && !explicitlyPv) return null;
 
+    // #382 — A PV ARRAY ROW IS ARRAY 1's ROW. On a page of PV Array repeater rows, the row a fresh
+    // application renders is where the learn meets the first roof plane, so its Qty / Tilt /
+    // Azimuth bind array1*: the replay re-reads array1* as array N in row N, and the learn fills
+    // rows 2..N from the same keys (fillRemainingArrayRows). The project-wide total ("moduleQty")
+    // in row 1 filed the whole system as one plane. Without per-array data, without rows on the
+    // page, or for a control whose context does not name the array, nothing changes.
+    const arrayRow = arrayRowPage && /pv ?array|\barray\b/.test(l);
+    const rowKey = (k: string): string | null => (arrayRow && (this.equipment[k] || "").trim() ? k : null);
+
     // Array-geometry fields are side-agnostic — fill straight from project data.
     if (isTilt || isAzimuth || isTracking) {
-      const key = isTilt ? "tilt" : isAzimuth ? "azimuth" : "tracking";
+      const key = (isTilt && rowKey("array1Tilt")) || (isAzimuth && rowKey("array1Azimuth"))
+        || (isTilt ? "tilt" : isAzimuth ? "azimuth" : "tracking");
       const value = (this.equipment[key] || "").trim();
       return value ? { key, candidates: [value], side: null } : null;
     }
@@ -2707,7 +2723,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     if (!side) return null;
     const key = side === "inverter"
       ? (isQty ? "inverterQty" : isModel ? "inverterModel" : "inverterMake")
-      : (isQty ? "moduleQty" : isModel ? "moduleModel" : "moduleMake");
+      : (isQty ? (rowKey("array1ModuleQuantity") ?? "moduleQty") : isModel ? "moduleModel" : "moduleMake");
     const value = (this.equipment[key] || "").trim();
     if (!value) return null;
     const candidates = [value];
@@ -2798,6 +2814,59 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     return false;
   }
 
+  /** How many PV Array repeater rows the page shows — the replay's own row predicate
+   *  (arrayRowsInPage), imported lazily (recipeAdapter imports this module). 0 when unreadable. */
+  private async pageArrayRowCount(): Promise<number> {
+    if (!this.page || typeof this.page.evaluate !== "function") return 0;
+    try {
+      const { arrayRowsInPage } = await import("./recipeAdapter");
+      return Number(await this.page.evaluate(arrayRowsInPage, "mark").catch(() => 0)) || 0;
+    } catch { return 0; }
+  }
+
+  /** The project's PV array count: array1ModuleQuantity, array2…, as the replay counts them. */
+  private projectArrayCount(): number {
+    let n = 0;
+    for (let i = 1; i <= 12; i++) {
+      if ((this.equipment[`array${i}ModuleQuantity`] || "").trim()) n = i;
+      else break;
+    }
+    return n || 1;
+  }
+
+  /**
+   * #382 — EVERY ROOF PLANE GETS ITS OWN ROW IN THE LEARN TOO. Live (PacifiCorp NEM, 2026-10-21,
+   * four arrays 9 / 5 / 5 / 2) the learn filled the one row a fresh application renders and never
+   * clicked "Add Array"; the owner added rows 2–4 by hand, and those clicks were recorded.
+   *
+   * The rows are NOT a second copy of the row logic: the row steps this page recorded (the
+   * per-array ones, nothing else) go to a RecipeAdapter on this same page, whose
+   * fillRemainingArrayRows adds a row per remaining array and fills each inside its own row, then
+   * proves every row against ITS array (row 1 included) — exactly what a replay of this recipe
+   * does. Nothing it writes is recorded: rows 2..N are the project's data, and a replay derives
+   * them from the project's arrays the same way (a recorded "Add Array" never replays). A row that
+   * will not hold, or arrays the portal would not take a row for, are this run's misses.
+   */
+  private async fillRemainingArrayRows(pageSteps: RecipeStep[]): Promise<{ added: number; stop: string | null; review: string[] }> {
+    const none = { added: 0, stop: null, review: [] as string[] };
+    const arrays = this.projectArrayCount();
+    if (!this.page || arrays < 2) return none;
+    const perArray = (s: RecipeStep): boolean => /^array1[A-Z]/.test(String(s.field ?? "")) || s.field === "moduleMake" || s.field === "moduleModel";
+    const rowSteps = pageSteps.filter((s) => (s.action === "fill" || s.action === "select") && perArray(s));
+    if (!rowSteps.some((s) => /^array1[A-Z]/.test(String(s.field ?? "")))) return none;
+    const before = await this.pageArrayRowCount();
+    if (before < 1) return none;
+    const { RecipeAdapter } = await import("./recipeAdapter");
+    const rows = new RecipeAdapter(
+      { id: "learn-array-rows", steps: rowSteps, portalUrl: String(this.page.url?.() ?? "") } as unknown as PortalRecipe,
+      { ...this.equipment }, {}, { autoSubmit: false },
+    );
+    const r = await rows.fillRemainingArrayRows(this.page);
+    const review = r.warnings.filter((w) => /REVIEW BEFORE SUBMIT|not added|NOT filed/i.test(w));
+    this.debug?.event({ type: "array_rows", arrays, rowsBefore: before, rowsAfter: r.rows, stop: (r.stop ?? "").slice(0, 300), warnings: r.warnings.slice(0, 8).map((w) => w.slice(0, 200)) });
+    return { added: Math.max(0, r.rows - before), stop: r.stop, review };
+  }
+
   /** Fill unresolved equipment manufacturer/model/quantity + array-geometry fields
    *  from project data. Returns how many were filled; appends recipe steps + labels
    *  like other passes. Fills in DOM order so a manufacturer select's AJAX postback
@@ -2830,6 +2899,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // Ordinal of bare combined selects seen within a spec-flavored section — see
     // the side heuristic below.
     let specBareSelectSeen = 0;
+    // #382 — does this page render PV Array repeater rows? Asked once, of the replay's own row
+    // predicate, so "a row" means the same thing to the learn and to the replay.
+    const arrayRowPage = (await this.pageArrayRowCount()) > 0;
     for (let i = 0; i < fields.length; i++) {
       const field = fields[i];
       // Unlabeled / generic-labeled SELECTS stay in the pass: the PowerClerk
@@ -2869,7 +2941,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       if (bareSelect && !fallbackSide && specSection) {
         fallbackSide = specBareSelectSeen === 0 ? "inverter" : "module";
       }
-      const resolved = this.equipmentValueFor(context, fallbackSide, bareSelect);
+      const resolved = this.equipmentValueFor(context, fallbackSide, bareSelect, arrayRowPage);
       if (bareSelect && specSection) specBareSelectSeen++;
       if (!resolved) continue;
       // A combined bare select never seeds proximity inheritance — its side may
@@ -5630,6 +5702,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         break;
       }
       pageCount++;
+      // Where this page's recorded steps begin (#382: the PV Array row steps it records).
+      const pageStepsFrom = steps.length;
       // THE BACKSTOP ABORTED A FILING, A PAYMENT OR A REVIEW-PAGE POST: stop here, named. Walking
       // on would drive the same page (and its filing control) again. learn() reports every abort.
       {
@@ -7386,7 +7460,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // whatever the computation then reveals (e.g. an export-capacity question).
         const MAX_RESCAN_PASSES = 7;
         let computedThisPage = false;
-        let lateEquipTried = false;
+        // The reveal the late equipment pass last looked at (null = not yet). #382: a PV Array row
+        // reveals its controls one save at a time (Manufacturer after Qty, Model after the make), and
+        // each arrives under a label the page already "filled" — so the pass looks again whenever
+        // the set of revealed controls has changed, and never twice at the same set.
+        let lateEquipSig: string | null = null;
         let lastRevealSig = "";
         for (let rescanPass = 0; rescanPass < MAX_RESCAN_PASSES; rescanPass++) {
           let revealedThisPass = 0;
@@ -7443,14 +7521,21 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             if (newFillable.length === 0) {
               // A cascade can reveal a SECOND section reusing bare labels the first
               // section already "filled" ("Manufacturer"/"Model") — those are invisible
-              // to the label-based newFillable filter, so give the equipment pass ONE
-              // look before giving up (once per page: it self-guards via value-held
-              // skip + fail memory, but pages whose values can't be read back must
-              // not loop here).
-              if (!lateEquipTried) {
-                lateEquipTried = true;
+              // to the label-based newFillable filter, so give the equipment pass a
+              // look before giving up — once per set of revealed controls (it self-guards
+              // via value-held skip + fail memory, but pages whose values can't be read
+              // back must not loop here; MAX_RESCAN_PASSES bounds it too).
+              if (lateEquipSig !== lastRevealSig) {
+                lateEquipSig = lastRevealSig;
                 const lateEquip = await this.fillEquipmentSelects(postFields, alreadyFilledLabels, steps);
-                if (lateEquip > 0) { pageFillCount += lateEquip; continue; }
+                if (lateEquip > 0) {
+                  pageFillCount += lateEquip;
+                  // A DEBOUNCED autosave is invisible to the settle (nothing is on the wire for a
+                  // beat after the pick), and the control it unlocks renders only after it lands —
+                  // let it, or the next scrape sees the same page and the cascade ends one short.
+                  await sleep(LATE_EQUIP_REVEAL_GRACE_MS);
+                  continue;
+                }
               }
               // No more cascade reveals. Before giving up, click any Calculate/Update-Totals
               // button once and loop again so the values it computes (and any field it then
@@ -7606,6 +7691,20 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           pageFillCount++;
           appliedThisPage.push(bd.applied);
         }
+      }
+
+      // d3d) EVERY PV ARRAY ITS OWN ROW (#382) — after every other pass on the page, so nothing
+      //      else re-plans the rows this adds; before the persist settle, so their autosaves land.
+      //      Never on a page that reads as review: no Add Array click or row write lands there.
+      if (!isReviewPage && !plan.atReview && !isDashboard && this.page) {
+        try {
+          const rowsOut = await this.fillRemainingArrayRows(steps.slice(Math.min(pageStepsFrom, steps.length)));
+          pageFillCount += rowsOut.added;
+          for (const m of [...(rowsOut.stop ? [rowsOut.stop] : []), ...rowsOut.review]) {
+            if (!fillVerifyMisses.includes(m)) fillVerifyMisses.push(m);
+            if (!missesDidNotHold.includes(m)) missesDidNotHold.push(m);
+          }
+        } catch { /* best-effort: row 1 stands as the learn filled it */ }
       }
 
       // d1) PERSIST SETTLE (ADAPTIVE). Portals like PowerClerk autosave each page's fields via

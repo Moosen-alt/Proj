@@ -524,6 +524,27 @@ const ROW_FIELD_HOOKS: Record<string, { role: string; name: string }> = {
   array1Tracking: { role: "tracking-select", name: "Tracking" },
 };
 
+/** The PV-array adder's own words — the same wording addAnotherArrayRow looks for. "array" stays
+ *  required: a bare "Add Row" could belong to any repeater on the page. */
+const ARRAY_ADDER_WORDS = /^\+?\s*add\s*(another\s*)?(pv\s*)?array$/i;
+
+/**
+ * #382 — IS THIS RECORDED STEP A CLICK ON THE PV-ARRAY ADDER? Live (PacifiCorp, 2026-10-21) the
+ * owner clicked "Add Array" twice by hand at review, patch-by-demonstration recorded both clicks,
+ * and every later replay would add exactly two rows whatever the project's array count. How many
+ * rows a project needs is its own data (its arrays), so a recorded adder click is never replayed:
+ * the rows come from afterArrayBlock, one per array. Read from the click's own name, text, label
+ * or note ("human-patch: Add Array", "advance: Add Array"), or its PowerClerk test hook.
+ */
+export function isArrayAdderClick(step: RecipeStep | undefined): boolean {
+  if (!step || step.action !== "click" || step.isFinalSubmit) return false;
+  const sel = step.selector ?? {};
+  const words = [sel.name, sel.text, sel.label, ...(sel.fallbacks ?? []).flatMap((f) => [f.name, f.text, f.label]),
+    String(step.note ?? "").replace(/^(human-patch|advance|click)\s*:?\s*/i, "")];
+  if (words.some((w) => ARRAY_ADDER_WORDS.test(String(w ?? "").replace(/\s+/g, " ").trim()))) return true;
+  return [sel.css, ...(sel.fallbacks ?? []).map((f) => f.css)].some((c) => /data-test-role=["']?add-array-btn\b/i.test(String(c ?? "")));
+}
+
 /** The recorded control of a write step as an id css (#362): its `#id` selector, an `[id=…]` one, or
  *  its fingerprint id. "" when the step names no id — then only its own document and view make a
  *  re-assert of it this page's own. */
@@ -868,8 +889,8 @@ export class RecipeAdapter extends BasePortalAdapter {
   private arrayBlockEnd = -1;
   /** The post-pass held-check runs exactly once, after the last array pass. */
   private arrayVerifyDone = false;
-  /** #339 — ROW MODE: a multi-array project on a page whose PV Array rows are countable (each
-   *  owns a "Delete Array" marker). Per-array steps then run INSIDE their own row container,
+  /** #339 — ROW MODE: a page whose PV Array rows are countable (each owns a "Delete Array"
+   *  marker) — for every project, one array or several (#382). Per-array steps then run INSIDE their own row container,
    *  never by a page-wide nth. null until the first per-array step decides it. */
   private arrayRowMode: boolean | null = null;
   /** The row (1-based) every resolution is scoped to while a row is being filled; 0 = page. */
@@ -1790,6 +1811,15 @@ export class RecipeAdapter extends BasePortalAdapter {
       }
       const recordedStep = this.recipe.steps[stepIdx];
       this.currentStepIdx = stepIdx;
+      // #382 — A RECORDED "ADD ARRAY" CLICK IS NEVER REPLAYED. It adds a fixed number of rows (the
+      // learn project's), whatever this project has; the rows this project needs are added after
+      // the array block, one per array (afterArrayBlock), and only there.
+      if (isArrayAdderClick(recordedStep)) {
+        const why = `recorded "Add Array" click (step ${stepIdx + 1}) not replayed — the project's ${this.projectArrayCount()} array(s) decide how many rows are added`;
+        if (!this.driftWarnings.includes(why)) this.driftWarnings.push(why);
+        trace.push({ i: stepIdx, action: "click", note: String(recordedStep.note ?? "Add Array").slice(0, 52), outcome: "not replayed (rows come from the project's arrays)", page: await currentPageLabel() });
+        continue;
+      }
       const inArrayBlock = this.arrayBlockStart >= 0
         && stepIdx >= this.arrayBlockStart && stepIdx <= this.arrayBlockEnd;
       // ON A REPEAT PASS, ONLY THE PER-ARRAY STEPS RUN AGAIN. The block's bounds are
@@ -2740,6 +2770,16 @@ export class RecipeAdapter extends BasePortalAdapter {
       // electrical contractor's number the generic key held on this track.
       const lic = licenceKeyForLabel(step.field, String(step.selector?.label || step.selector?.name || step.selector?.text || step.note || ""));
       if (lic) return lic.key ? String(this.fieldValues[lic.key] ?? "") : "";
+      // #382 — A ROW FILES ITS OWN ARRAY'S MODULE. The recorded row binds moduleMake / moduleModel
+      // (the first array's); a plan set whose roof planes carry different modules gives array N
+      // its own make/model (array{N}ModuleManufacturer / array{N}ModuleModel), and row N files
+      // that. The same module as array 1 falls through to the shared path (its certified name).
+      if (this.arrayPass > 1 && (step.field === "moduleMake" || step.field === "moduleModel")) {
+        const part = step.field === "moduleMake" ? "Manufacturer" : "Model";
+        const own = String(this.fieldValues[`array${this.arrayPass}Module${part}`] ?? "").trim();
+        const first = String(this.fieldValues[`array1Module${part}`] ?? this.fieldValues[step.field] ?? "").trim();
+        if (own && own.toLowerCase() !== first.toLowerCase()) return own;
+      }
       // PREFER THE PORTAL'S OWN STRING for equipment models. The backend resolves
       // "<field>Certified" from the CEC list — the same list the portal builds its dropdown
       // from — so "DS3-L" arrives as "DS3-L {240V}" and "Q.TRON BLK M-G2.C1+/AC" as the
@@ -2937,18 +2977,23 @@ export class RecipeAdapter extends BasePortalAdapter {
   // #339 — ROW MODE: each array is written INSIDE ITS OWN ROW, then proved there.
   // ---------------------------------------------------------------------------
 
-  /** Decide once, at the first per-array step: a project with more than one array, on a page
-   *  whose rows are countable. Anything else keeps the recorded-selector path unchanged — a
-   *  single-array project (the common case) and a portal with no "Delete Array" marker. */
+  /** Decide once, at the first per-array step: a page whose rows are countable. A portal with
+   *  no "Delete Array" marker keeps the recorded-selector path unchanged.
+   *
+   *  #382 — A SINGLE-ARRAY PROJECT IS ONE ROW, FILLED AS A ROW. Its recorded row steps point at
+   *  learn-time ids (#pcInputBase57) and bare labels ranked against the learn page; on the
+   *  captured PacifiCorp markup, where a fresh row renders only its Qty, the module make's
+   *  recorded step resolved to the INVERTER's "Manufacturer" (#pcInputBase54 by then) — the
+   *  same wrong-control write #339 fixed for row 2+ — and the row never filled. One row is
+   *  looked for once (no wait: an unpainted row keeps the recorded path, as before); several
+   *  arrays look a few times, as the row may still be painting. */
   private async useArrayRowMode(): Promise<boolean> {
     if (this.arrayRowMode === null) {
       let rows = 0;
-      if (this.projectArrayCount() > 1) {
-        // The row may still be painting when the block is reached; look a few times.
-        for (let k = 0; k < 6 && rows === 0; k++) {
-          rows = await this.markArrayRows();
-          if (!rows) await sleep(500);
-        }
+      const looks = this.projectArrayCount() > 1 ? 6 : 1;
+      for (let k = 0; k < looks && rows === 0; k++) {
+        rows = await this.markArrayRows();
+        if (!rows && k + 1 < looks) await sleep(500);
       }
       this.arrayRowMode = rows >= 1;
       if (this.arrayRowMode) this.rowArrays = [[1]];
@@ -2991,6 +3036,57 @@ export class RecipeAdapter extends BasePortalAdapter {
       await this.verifyEquipmentSelectsHeld();
     }
     return stop ? { repeat: false, stop } : { repeat: false };
+  }
+
+  /**
+   * #382 — THE LEARNER'S DOOR TO THE ROW LOGIC. A learn walks a FRESH application, which renders
+   * one PV Array row, so it records one row's steps — and before this it left every other roof
+   * plane for a person: live (PacifiCorp NEM, 2026-10-21, arrays of 9 / 5 / 5 / 2) the learner
+   * filled row 1 and never clicked "Add Array"; the owner added rows 2–4 by hand.
+   *
+   * The learner builds a RecipeAdapter on its OWN page from the row steps it just recorded (the
+   * per-array steps; nothing else) and calls this. Rows are then added and filled by the replay's
+   * own code — the same adder (addAnotherArrayRow), the same fill inside the Nth row container
+   * (fillArrayRow), the same row-by-row read-back with its one repair (verifyArrayRowsByRow), the
+   * same merge when the portal refuses a row — so a learn and a replay cannot disagree about what
+   * a row is or what it holds. Rows already on the page count (a learn that re-plans the same page
+   * adds none twice); the read-back proves every row, row 1 included, against ITS array. Nothing
+   * here becomes a recipe step: a replay adds rows 2..N from the project's arrays the same way.
+   * `page` is the learner's own page (a RecipeAdapter built for this has not opened one). Never
+   * throws; `stop` is the read-back's named stop (a row that will not hold its own array).
+   */
+  async fillRemainingArrayRows(page?: unknown): Promise<{ arrays: number; rows: number; stop: string | null; warnings: string[]; stillWrong: string[] }> {
+    if (page && !this.page) this.page = page;
+    const want = this.projectArrayCount();
+    const steps = this.recipe.steps ?? [];
+    const perArray = steps.map((s, i) => ({ s, i })).filter(({ s }) => this.isPerArrayStep(s));
+    const done = async (stop: string | null) => ({
+      arrays: want, rows: await this.countArrayRows().catch(() => 0), stop,
+      warnings: [...this.driftWarnings], stillWrong: [...this.requiredStillEmpty],
+    });
+    if (want < 2 || !perArray.length || !perArray.some(({ s }) => /^array1[A-Z]/.test(String(s.field ?? "")))) return done(null);
+    this.arrayBlockStart = perArray[0].i;
+    this.arrayBlockEnd = perArray[perArray.length - 1].i;
+    try {
+      if (!(await this.useArrayRowMode())) {
+        this.driftWarnings.push(`project has ${want} arrays but no PV Array row could be counted on this page — rows 2..${want} were not added`);
+        return done(null);
+      }
+      // THE ROWS ALREADY THERE ARE ROWS: start the add from the page's own count.
+      const onPage = Math.min(await this.countArrayRows(), want);
+      for (let r = 2; r <= onPage; r++) this.rowArrays.push([r]);
+      this.arrayPass = Math.max(1, onPage);
+      for (let guard = 0; guard <= want; guard++) {
+        const next = await this.afterArrayBlock();
+        if (next.stop) return done(next.stop);
+        if (!next.repeat) break;
+        await this.fillArrayRow(this.arrayPass);
+      }
+      return done(null);
+    } catch (err) {
+      // Rows that were not proven are not "filled": say so as a stop, never as a quiet success.
+      return done(`PV array rows were not completed: ${err instanceof Error ? err.message.slice(0, 160) : String(err).slice(0, 160)}`);
+    }
   }
 
   /** The block's per-array steps in the order a row unlocks itself: Qty, then the module
