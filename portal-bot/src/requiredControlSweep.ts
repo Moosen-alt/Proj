@@ -58,6 +58,31 @@ export interface EmptyRequired {
 export const SWEPT_BLANK_ATTR = "data-al-blank";
 
 /**
+ * IS THIS CONTROL STILL UNANSWERED? — THE ONE READING (PR #353 round 2).
+ *
+ * "Filled" must mean filled. A native select resting on its placeholder reports that option's
+ * text as .value, and a custom combobox is an input whose .value IS the placeholder — both read
+ * as non-empty and blessed unanswered controls. So: no value, or what the control SHOWS is a
+ * placeholder ("Select...", "Please choose", anything starting "--", whatever its value attribute
+ * says — "<option value="0">-- Select --</option>" is unanswered).
+ *
+ * The sweep below and every caller that asks about ONE control (the replay's answer to a required
+ * control its recipe never recorded) read the same function — a second copy disagreed: a
+ * "-- Select --" with a value was empty to the sweep and answered to the replay, so nothing filled it.
+ *
+ * SELF-CONTAINED ON PURPOSE: the page runs this very function text (the sweep embeds its source; a
+ * caller passes it to locator.evaluate), so it has no outer references, no nested functions and its
+ * regexes inline.
+ */
+export function controlReadsUnanswered(el: Element): boolean {
+  const raw = String((el as HTMLInputElement).value || "").trim();
+  const isSelect = String(el.tagName || "").toLowerCase() === "select";
+  const opt = isSelect ? (el as HTMLSelectElement).options[(el as HTMLSelectElement).selectedIndex] : null;
+  const shown = isSelect ? String((opt && opt.textContent) || "").trim() : raw;
+  return !raw || /^(please\s+)?(select|choose)\b\.{0,3}$/i.test(shown) || /^--/.test(shown);
+}
+
+/**
  * Every visible required control still empty on the current page.
  *
  * Deliberately conservative about FALSE positives: a warning that fires on a correctly
@@ -68,8 +93,62 @@ export async function sweepEmptyRequiredControls(
   page: Page,
 ): Promise<{ empty: EmptyRequired[]; requiredSeen: string[] }> {
   if (!page || typeof page.evaluate !== "function") return { empty: [], requiredSeen: [] };
-  const swept = await page.evaluate((BLANK: string) => {
-    for (const el of Array.from(document.querySelectorAll(`[${BLANK}]`))) el.removeAttribute(BLANK);
+  // The page runs the sweep with THE answered-reading (controlReadsUnanswered) handed in as source —
+  // the same function text a single-control caller evaluates. The __name shim first: tsx/esbuild
+  // wraps the sweep's inner arrow functions in __name(…) calls the page does not define.
+  const swept = await page.evaluate(
+    `globalThis.__name = globalThis.__name || function (fn) { return fn; };\n(${sweepInPage.toString()})(${controlReadsUnanswered.toString()}, ${JSON.stringify(SWEPT_BLANK_ATTR)})`,
+  ).catch(() => ({ empty: [], requiredSeen: [] })) as { empty: EmptyRequired[]; requiredSeen: string[] };
+
+  // NORMALISE BEFORE RETURNING. The .catch above absorbs a page that throws, but not a page
+  // that RESOLVES with something else — a stub, a page mid-navigation, an evaluate the portal
+  // interrupted. This is a diagnostic: the worst it may ever do is report nothing. Iterating
+  // an undefined here would abort a filing that was otherwise going fine, which is the only
+  // outcome worse than a missing warning.
+  return {
+    empty: Array.isArray(swept?.empty) ? swept.empty : [],
+    requiredSeen: Array.isArray(swept?.requiredSeen) ? swept.requiredSeen : [],
+  };
+}
+
+/** The attribute pinEmptyRequiredControl stamps on the one control it pins. */
+export const PINNED_CONTROL_ATTR = "data-al-unrec";
+
+/**
+ * PIN THE ONE EMPTY REQUIRED CONTROL THE SWEEP NAMES `name` — by the sweep's own reading, not by
+ * re-resolving the name (PR #353 round 3).
+ *
+ * The replay's answer to a required control its recipe never recorded wrote by LABEL: an ordinal
+ * among same-label controls, resolved through a case-insensitive SUBSTRING label match. With no ids,
+ * "Disconnect Switch Model".nth(1) landed on "Disconnect Switch Model Notes" (an optional textarea
+ * between a filled namesake and the empty one), wrote the AC part there, left the required box blank
+ * and reported it answered. A label resolves to a SET; the sweep found an ELEMENT.
+ *
+ * So the page runs the sweep itself, and every visible, required, unanswered control whose sweep
+ * name (cleaned exactly as the sweep's list is) equals `name` is collected at the point the sweep
+ * would list it. Exactly one → it is stamped `data-al-unrec="<token>"` (any earlier stamp is cleared
+ * first) and 1 is returned. None, or several the name cannot tell apart → nothing is stamped and the
+ * count is returned: the caller types nothing. The page is otherwise untouched.
+ */
+export async function pinEmptyRequiredControl(page: Page, name: string, token: string): Promise<number> {
+  if (!page || typeof page.evaluate !== "function") return 0;
+  const pin = JSON.stringify({ name: String(name ?? ""), token: String(token ?? ""), attr: PINNED_CONTROL_ATTR });
+  const res = await page.evaluate(
+    `globalThis.__name = globalThis.__name || function (fn) { return fn; };\n(${sweepInPage.toString()})(${controlReadsUnanswered.toString()}, null, ${pin})`,
+  ).catch(() => null) as { pinned?: unknown } | null;
+  return typeof res?.pinned === "number" ? res.pinned : 0;
+}
+
+/** The sweep, as the page runs it. `unanswered` is controlReadsUnanswered (see the caller). `BLANK`
+ *  is SWEPT_BLANK_ATTR, or null when pinning: a pin leaves the sweep's blank tags as they were. `pin`,
+ *  when given, is pinEmptyRequiredControl's request: the sweep's own list is not returned then. */
+const sweepInPage = (
+  unanswered: (el: Element) => boolean,
+  BLANK: string | null,
+  pin?: { name: string; token: string; attr: string } | null,
+): { empty: Array<{ name: string; why: string; handed?: Array<{ next: string; unattributed: string }>; file?: boolean }>; requiredSeen: string[]; pinned?: number } => {
+  {
+    if (BLANK) for (const el of Array.from(document.querySelectorAll(`[${BLANK}]`))) el.removeAttribute(BLANK);
     // TWO GRADES OF COMPLAINT, BECAUSE ONE OF THEM IS ALSO ORDINARY PROSE.
     //
     // "This field is required" is a portal refusing a filing. "Please select an option" is
@@ -95,7 +174,6 @@ export async function sweepEmptyRequiredControls(
     // something, not refusing their filing.
     const ADVISORY = /^\s*(please note|note|notice|important|reminder|attention)\b[:,]?/i;
     const COMPLAINT = new RegExp(`${HARD.source}|${SOFT.source}`, "i");
-    const PLACEHOLDER = /^(please\s+)?(select|choose)\b\.{0,3}$/i;
     const out: Array<{ name: string; why: string; handed?: Array<{ next: string; unattributed: string }>; file?: boolean }> = [];
     const requiredSeen: string[] = [];
     const tidy = (name: string): string => String(name || "").replace(/\s*\*\s*$/, "").replace(/\s+/g, " ").trim().slice(0, 70);
@@ -109,12 +187,13 @@ export async function sweepEmptyRequiredControls(
     const push = (name: string, why: string, el?: Element, handed?: Array<{ next: string; unattributed: string }>, file = false): void => {
       const clean = tidy(name);
       if (!clean) return;
-      if (el && !el.hasAttribute(BLANK)) el.setAttribute(BLANK, clean);
+      if (BLANK && el && !el.hasAttribute(BLANK)) el.setAttribute(BLANK, clean);
       const had = out.find((o) => o.name === clean);
       if (!had) { out.push({ name: clean, why, ...(handed && handed.length ? { handed } : {}), ...(file ? { file } : {}) }); return; }
       if (handed && handed.length) had.handed = [...(had.handed ?? []), ...handed];
       if (!file) delete had.file;
     };
+    const pinnedEls: HTMLElement[] = [];
     const orphanName = (c: HTMLElement): string => tidy(`portal reports "${(c.innerText || "").replace(/\s+/g, " ").trim().slice(0, 48)}" (field could not be identified)`);
 
     const visible = (el: Element): boolean => {
@@ -192,11 +271,7 @@ export async function sweepEmptyRequiredControls(
     // IS THIS CONTROL ANSWERED? Needed before attribution, not after — see below.
     const emptyish = new Set<HTMLElement>();
     for (const el of controls) {
-      const raw = ((el as HTMLInputElement).value || "").trim();
-      const shown = (el.tagName || "").toLowerCase() === "select"
-        ? ((((el as HTMLSelectElement).options[(el as HTMLSelectElement).selectedIndex] || {}).textContent) || "").trim()
-        : raw;
-      if (!raw || PLACEHOLDER.test(shown) || /^--/.test(shown)) emptyish.add(el);
+      if (unanswered(el)) emptyish.add(el);
     }
 
     const claimed = new Set<HTMLElement>();
@@ -333,18 +408,21 @@ export async function sweepEmptyRequiredControls(
         if (seenName && !requiredSeen.includes(seenName)) requiredSeen.push(seenName);
       }
 
-      // "Filled" must mean filled. A native select resting on its placeholder reports that
-      // option's text as .value, and a custom combobox is an input whose .value IS the
-      // placeholder — both read as non-empty and blessed unanswered controls.
-      const raw = ((el as HTMLInputElement).value || "").trim();
-      const shown = (el.tagName || "").toLowerCase() === "select"
-        ? ((((el as HTMLSelectElement).options[(el as HTMLSelectElement).selectedIndex] || {}).textContent) || "").trim()
-        : raw;
-      if (raw && !PLACEHOLDER.test(shown) && !/^--/.test(shown)) continue;
+      // "Filled" must mean filled — controlReadsUnanswered, the one reading.
+      if (!unanswered(el)) continue;
 
       const handed = (handedTo.get(el) ?? []).map((h) => ({ next: h.next ? tidy(nameOf(h.next)) : "", unattributed: h.unattributed }));
       const isFile = el.tagName === "INPUT" && (el.getAttribute("type") || "").toLowerCase() === "file";
-      push(nameOf(el), claimed.has(el) ? "complaint" : el.hasAttribute("required") || el.getAttribute("aria-required") === "true" ? "attribute" : "asterisk", el, handed, isFile);
+      const name = nameOf(el);
+      push(name, claimed.has(el) ? "complaint" : el.hasAttribute("required") || el.getAttribute("aria-required") === "true" ? "attribute" : "asterisk", el, handed, isFile);
+      // THE PIN (pinEmptyRequiredControl): this very element, at the point the sweep lists it.
+      if (pin && tidy(name) === pin.name) pinnedEls.push(el);
+    }
+
+    if (pin) {
+      document.querySelectorAll(`[${pin.attr}]`).forEach((e) => e.removeAttribute(pin.attr));
+      if (pinnedEls.length === 1) pinnedEls[0].setAttribute(pin.attr, pin.token);
+      return { empty: [], requiredSeen: [], pinned: pinnedEls.length };
     }
 
     // ---- unanswered required radio GROUPS -------------------------------------------
@@ -413,15 +491,5 @@ export async function sweepEmptyRequiredControls(
     }
 
     return { empty: out.slice(0, 14), requiredSeen: requiredSeen.slice(0, 120) };
-  }, SWEPT_BLANK_ATTR).catch(() => ({ empty: [], requiredSeen: [] })) as { empty: EmptyRequired[]; requiredSeen: string[] };
-
-  // NORMALISE BEFORE RETURNING. The .catch above absorbs a page that throws, but not a page
-  // that RESOLVES with something else — a stub, a page mid-navigation, an evaluate the portal
-  // interrupted. This is a diagnostic: the worst it may ever do is report nothing. Iterating
-  // an undefined here would abort a filing that was otherwise going fine, which is the only
-  // outcome worse than a missing warning.
-  return {
-    empty: Array.isArray(swept?.empty) ? swept.empty : [],
-    requiredSeen: Array.isArray(swept?.requiredSeen) ? swept.requiredSeen : [],
-  };
-}
+  }
+};
