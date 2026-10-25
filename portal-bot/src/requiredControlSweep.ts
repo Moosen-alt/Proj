@@ -34,8 +34,28 @@ import type { Page } from "playwright";
 export interface EmptyRequired {
   name: string;
   /** How we know it was required — for the operator's report, and for arguing with it. */
-  why: "attribute" | "asterisk" | "complaint" | "unattributed-complaint" | "radio-group";
+  why: "attribute" | "asterisk" | "complaint" | "unattributed-complaint" | "radio-group" | "checkbox";
+  /**
+   * `why: "complaint"` only (#327): one entry per complaint this control was handed. `next` is the
+   * next-nearest EMPTY control in range, named exactly as `name` would name it ("" when there is
+   * none); `unattributed` is the entry the sweep reports when no field can own the complaint. A
+   * caller that discharges this control (a held upload, recipeAdapter.sweepRequired) must not
+   * discharge the complaint with it: the portal's refusal is re-attributed or reported unowned.
+   */
+  handed?: Array<{ next: string; unattributed: string }>;
+  /**
+   * True only when EVERY control reported under this name is an `<input type=file>` (#327 round
+   * 4). The one thing a held upload may discharge: a text box captioned like the slot ("Plan set
+   * revision *", or exactly "Plan set *"), a checkbox or a radio row is never a file box, so one
+   * such control under the name clears the mark.
+   */
+  file?: boolean;
 }
+
+/** The attribute the sweep leaves on each blank control it names (#362): its value is the blank's
+ *  name. What a re-assert checks it is about to write the very control the sweep called that blank
+ *  (one namer for both, never two readings of a label). Cleared at the start of every sweep. */
+export const SWEPT_BLANK_ATTR = "data-al-blank";
 
 /**
  * Every visible required control still empty on the current page.
@@ -48,7 +68,8 @@ export async function sweepEmptyRequiredControls(
   page: Page,
 ): Promise<{ empty: EmptyRequired[]; requiredSeen: string[] }> {
   if (!page || typeof page.evaluate !== "function") return { empty: [], requiredSeen: [] };
-  const swept = await page.evaluate(() => {
+  const swept = await page.evaluate((BLANK: string) => {
+    for (const el of Array.from(document.querySelectorAll(`[${BLANK}]`))) el.removeAttribute(BLANK);
     // TWO GRADES OF COMPLAINT, BECAUSE ONE OF THEM IS ALSO ORDINARY PROSE.
     //
     // "This field is required" is a portal refusing a filing. "Please select an option" is
@@ -75,12 +96,26 @@ export async function sweepEmptyRequiredControls(
     const ADVISORY = /^\s*(please note|note|notice|important|reminder|attention)\b[:,]?/i;
     const COMPLAINT = new RegExp(`${HARD.source}|${SOFT.source}`, "i");
     const PLACEHOLDER = /^(please\s+)?(select|choose)\b\.{0,3}$/i;
-    const out: Array<{ name: string; why: string }> = [];
+    const out: Array<{ name: string; why: string; handed?: Array<{ next: string; unattributed: string }>; file?: boolean }> = [];
     const requiredSeen: string[] = [];
-    const push = (name: string, why: string): void => {
-      const clean = String(name || "").replace(/\s*\*\s*$/, "").replace(/\s+/g, " ").trim().slice(0, 70);
-      if (clean && !out.some((o) => o.name === clean)) out.push({ name: clean, why });
+    const tidy = (name: string): string => String(name || "").replace(/\s*\*\s*$/, "").replace(/\s+/g, " ").trim().slice(0, 70);
+    // ONE ENTRY PER NAME, BUT EVERY COMPLAINT IT WAS HANDED (#327). Two upload rows captioned
+    // "Attachment *" are one entry; when the second one is the slot a complaint went to, dropping
+    // its `handed` with the duplicate lost the complaint the moment the held read-back discharged
+    // "Attachment", and the PSE draft was created with Customer phone blank. So a same-name entry
+    // takes the newcomer's hand-offs too — and stays a FILE entry only while every control under
+    // the name is a file box. The control's blank tag (SWEPT_BLANK_ATTR) is set from the same
+    // `tidy` call as the entry's name: the re-assert compares the two.
+    const push = (name: string, why: string, el?: Element, handed?: Array<{ next: string; unattributed: string }>, file = false): void => {
+      const clean = tidy(name);
+      if (!clean) return;
+      if (el && !el.hasAttribute(BLANK)) el.setAttribute(BLANK, clean);
+      const had = out.find((o) => o.name === clean);
+      if (!had) { out.push({ name: clean, why, ...(handed && handed.length ? { handed } : {}), ...(file ? { file } : {}) }); return; }
+      if (handed && handed.length) had.handed = [...(had.handed ?? []), ...handed];
+      if (!file) delete had.file;
     };
+    const orphanName = (c: HTMLElement): string => tidy(`portal reports "${(c.innerText || "").replace(/\s+/g, " ").trim().slice(0, 48)}" (field could not be identified)`);
 
     const visible = (el: Element): boolean => {
       const r = el.getBoundingClientRect();
@@ -94,6 +129,45 @@ export async function sweepEmptyRequiredControls(
         if (["hidden", "submit", "button", "checkbox", "radio", "image", "reset"].includes(t)) return false;
         return visible(el);
       });
+
+    // A CONCEALED SLIVER IS ALSO MEASURED BY ITS WIDGET (#327). A bootstrap-select keeps the native
+    // <select> as a 0.5 px, opacity-0 sliver at left:50% of the widget, so its own box puts it
+    // half a widget to the right of where a person sees the field: a complaint under the widget's
+    // left edge was never "under" it, and lost to whatever sat nearer on the complaint's line. A
+    // control that thin, or invisible and small, is ALSO judged by the nearest ancestor a person
+    // can see (at least 20 x 10 px) — never by one that holds another visible control, which is a
+    // row or a form, not this control's widget.
+    //
+    // "ALSO", NOT "INSTEAD": THE WIDGET BOX MAY ONLY BRING A SLIVER NEARER. That ancestor is a
+    // guess at the widget, and for select2 it is a bad one: select2's face is the hidden select's
+    // SIBLING, so the nearest box is the whole form-group — the label above, and the complaint and
+    // help text below. Judged by that box alone, a Bootstrap 4 Utility (one help line under
+    // "This field is required.") ends 42 px below its own complaint, past the -40 bound, and the
+    // complaint went to the filled "Service address" above and was dropped: the PSE draft was
+    // created with Utility blank. So were a crispy-forms wrapper, two help lines, a 450 px inline
+    // caption (the box starts at the row's left edge, past the 420 px column bound) and a float
+    // wrapper that collapses and climbs to a radio fieldset. So a sliver is judged by its OWN rect
+    // and its widget box, and wherever it is measured (range, distance, beside, ownedBelow) the
+    // nearer of the two counts.
+    //
+    // FOR AN EMPTY CONTROL ONLY. A FILLED select2 with no per-field wrapper climbs to the whole
+    // fieldset, and that box held "This field is required." at the fieldset's foot — for an
+    // unticked checkbox or an unmarked Yes/No this sweep cannot see. Pass 1 handed the complaint
+    // to the filled Utility, a filled claimant drops it, and the stamped PSE draft was created
+    // where main reports the complaint unattributed. So pass 1 (filled controls) measures each by
+    // its own rect, exactly main's rule, and never drops a complaint main reports.
+    const rectsOf = (el: HTMLElement): DOMRect[] => {
+      const r = el.getBoundingClientRect();
+      const sliver = r.width < 4 || r.height < 4 || (Number(getComputedStyle(el).opacity) === 0 && (r.width < 20 || r.height < 10));
+      if (!sliver) return [r];
+      for (let p = el.parentElement; p && p !== document.body; p = p.parentElement) {
+        if (controls.some((o) => o !== el && p!.contains(o))) break;
+        const pr = p.getBoundingClientRect();
+        if (pr.width >= 20 && pr.height >= 10) return [r, pr];
+      }
+      return [r];
+    };
+    const rects = new Map<HTMLElement, DOMRect[]>(controls.map((el) => [el, rectsOf(el)]));
 
     // ---- complaint messages, attributed by PROXIMITY --------------------------------
     // Leaf-most matching elements only: an ancestor whose text merely CONTAINS the message
@@ -126,8 +200,29 @@ export async function sweepEmptyRequiredControls(
     }
 
     const claimed = new Set<HTMLElement>();
+    // Each complaint a control was handed, with the next-nearest empty control (see `handed`).
+    const handedTo = new Map<HTMLElement, Array<{ next: HTMLElement | null; unattributed: string }>>();
     for (const c of complaints) {
       const cr = c.getBoundingClientRect();
+      // A FIELD THAT HOLDS THE COMPLAINT UNDER ITSELF OUTRANKS ANY NEIGHBOUR'S "BESIDE" (#327).
+      //
+      // The beside rule below zeroes the vertical distance of a control the complaint sits just
+      // right of, on its own line. Without this bound it also handed "This field is required."
+      // UNDER an empty Customer phone to the upload slot ending to its left on the complaint's
+      // line — a slot the run had uploaded to, so the held-upload read-back discharged it, the
+      // complaint with it, and the PSE draft was created with Customer phone blank (main stopped).
+      // So when an EMPTY control sits directly above the complaint, aligned with it, holding the
+      // complaint inside its own box, nothing gets the beside discount and plain distance decides.
+      //
+      // "Aligned" is a window, not |dleft| <= 12: a complaint indented 20 to 40 px under its field
+      // is still that field's. And the window is CAPPED at 48 px: a full-width box above (a notes
+      // textarea, a Bootstrap .form-control-file slot) must not cancel a real beside complaint —
+      // without the cap requiredBlank's "Additional notes" misattribution comes back, and so does
+      // the draft created under a wide held slot (draftSubmitClick heldAboveMeter).
+      const ownedBelow = controls.some((el) => emptyish.has(el) && rects.get(el)!.some((er) => {
+        const dy = cr.top - er.bottom;
+        return dy >= -2 && dy <= 90 && cr.left >= er.left - 12 && cr.left <= er.left + Math.min(48, Math.max(12, er.width / 3));
+      }));
       // AN EMPTY FIELD IS THE ONLY THING "THIS FIELD IS REQUIRED" CAN MEAN.
       //
       // Pure proximity gave the message to the wrong control and lost it: on PacifiCorp's
@@ -138,28 +233,56 @@ export async function sweepEmptyRequiredControls(
       // So: consider answered controls only if no unanswered one is in range.
       let best: HTMLElement | null = null;
       let bestD = Infinity;
+      // The runner-up among the EMPTY controls, so a caller that discharges `best` can re-attribute.
+      let next: HTMLElement | null = null;
+      let nextD = Infinity;
       for (const pass of [0, 1]) {
         for (const el of controls) {
           if (pass === 0 && !emptyish.has(el)) continue;
-          const er = el.getBoundingClientRect();
-          // A validation message sits BELOW or beside its field, never far above it, and
-          // never in another column. Both bounds keep one complaint from claiming a page.
-          const dy = cr.top - er.bottom;
-          if (dy < -40 || dy > 90) continue;
-          if (Math.abs(cr.left - er.left) > 420) continue;
-          const d = Math.abs(dy) + Math.abs(cr.left - er.left) / 8;
-          if (d < bestD) { bestD = d; best = el; }
+          // The nearer of a sliver's own rect and its widget box (rectsOf, above) — for an EMPTY
+          // control only. A FILLED one (pass 1) is judged by its own rect, exactly main's rule.
+          let d = Infinity;
+          for (const er of (pass === 0 ? rects.get(el)! : rects.get(el)!.slice(0, 1))) {
+            // A validation message sits BELOW or beside its field, never far above it, and
+            // never in another column. Both bounds keep one complaint from claiming a page.
+            const dy = cr.top - er.bottom;
+            if (dy < -40 || dy > 90) continue;
+            if (Math.abs(cr.left - er.left) > 420) continue;
+            // BESIDE IS NOT FARTHER THAN BELOW (#327). A message on the SAME LINE, just after its
+            // field, overlaps it vertically, so |dy| charged it the field's whole height — and an
+            // empty box ending exactly where the message's line begins, far to the left, won by
+            // under a pixel: requiredBlank.dom.smoke's "This field is required." beside the empty
+            // inverter Manufacturer was blamed on the optional "Additional notes" box above it
+            // whenever the fonts wrapped that box onto the line above (since 3817c24d). Only a
+            // message to the RIGHT of the field counts as beside it; one that merely shares a
+            // line with a control further right is still measured as before. And never when an
+            // empty field holds the complaint under itself (ownedBelow, above).
+            const beside = !ownedBelow && cr.top < er.bottom && cr.bottom > er.top && cr.left >= er.right - 4;
+            d = Math.min(d, (beside ? 0 : Math.abs(dy)) + Math.abs(cr.left - er.left) / 8);
+          }
+          if (d === Infinity) continue;
+          if (d < bestD) {
+            if (pass === 0) { next = best; nextD = bestD; }
+            bestD = d; best = el;
+          } else if (pass === 0 && d < nextD) { nextD = d; next = el; }
         }
         if (best) break;
       }
-      if (best) { claimed.add(best); continue; }
+      if (best) {
+        claimed.add(best);
+        (handedTo.get(best) ?? handedTo.set(best, []).get(best)!).push({ next: emptyish.has(best) ? next : null, unattributed: orphanName(c) });
+        continue;
+      }
       // COULD NOT ATTRIBUTE IT — say so rather than drop it. The portal is refusing the
       // filing; not knowing which field is a reason to report harder, not to go quiet.
-      push(`portal reports "${(c.innerText || "").replace(/\s+/g, " ").trim().slice(0, 48)}" (field could not be identified)`, "unattributed-complaint");
+      push(orphanName(c), "unattributed-complaint");
     }
 
     // ---- requiredness and emptiness -------------------------------------------------
-    for (const el of controls) {
+    // How the page captions a control, and the name it is reported under. One reading, shared by
+    // the report and by `handed` (a complaint's runner-up must be named as the report names it,
+    // or a caller cannot tell it from a held slot).
+    const captionOf = (el: HTMLElement): { labelText: string; containerText: string } => {
       const id = el.getAttribute("id") || "";
       const forLbl = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
       const wrapLbl = el.closest("label");
@@ -179,6 +302,19 @@ export async function sweepEmptyRequiredControls(
       const container = el.closest('[class*="form-group"], [class*="field"], [class*="row"], li, tr, dd, p, div');
       const ownsOne = !!container && container.querySelectorAll("input, select, textarea").length === 1;
       const containerText = ownsOne ? ((container as HTMLElement).innerText || "").replace(/\s+/g, " ").trim() : "";
+      return { labelText, containerText };
+    };
+    const nameOf = (el: HTMLElement): string => {
+      const { labelText, containerText } = captionOf(el);
+      return labelText
+        || (containerText && containerText.length <= 90 ? containerText : "")
+        || el.getAttribute("aria-label")
+        || el.getAttribute("placeholder")
+        || el.getAttribute("name")
+        || "(unlabelled control)";
+    };
+    for (const el of controls) {
+      const { labelText, containerText } = captionOf(el);
       const asterisk = /\*/.test(labelText) || (containerText.length <= 160 && /\*/.test(containerText));
 
       const required = el.hasAttribute("required")
@@ -206,13 +342,9 @@ export async function sweepEmptyRequiredControls(
         : raw;
       if (raw && !PLACEHOLDER.test(shown) && !/^--/.test(shown)) continue;
 
-      const name = labelText
-        || (containerText && containerText.length <= 90 ? containerText : "")
-        || el.getAttribute("aria-label")
-        || el.getAttribute("placeholder")
-        || el.getAttribute("name")
-        || "(unlabelled control)";
-      push(name, claimed.has(el) ? "complaint" : el.hasAttribute("required") || el.getAttribute("aria-required") === "true" ? "attribute" : "asterisk");
+      const handed = (handedTo.get(el) ?? []).map((h) => ({ next: h.next ? tidy(nameOf(h.next)) : "", unattributed: h.unattributed }));
+      const isFile = el.tagName === "INPUT" && (el.getAttribute("type") || "").toLowerCase() === "file";
+      push(nameOf(el), claimed.has(el) ? "complaint" : el.hasAttribute("required") || el.getAttribute("aria-required") === "true" ? "attribute" : "asterisk", el, handed, isFile);
     }
 
     // ---- unanswered required radio GROUPS -------------------------------------------
@@ -233,12 +365,55 @@ export async function sweepEmptyRequiredControls(
       while (cont && cont !== document.body && !members.every((r) => cont!.contains(r))) cont = cont.parentElement;
       if (!cont || cont === document.body) continue;
       const text = (cont.innerText || "").replace(/\s+/g, " ").trim();
-      if (!/\*/.test(text.slice(0, 200)) && !COMPLAINT.test(text)) continue;
+      // Required by the markup too (#362): a member's own `required` / aria-required, or its
+      // radiogroup's. A required "ready to submit?" group with no asterisk read as a clean page,
+      // and the stamped draft Submit was clicked past it.
+      // Only a group a person could answer (Helm review of 4081f12, SF3): a member enabled and the
+      // group rendered. A hidden or disabled group's markup says nothing about THIS page.
+      const shownEl = (el: Element): boolean => {
+        if (!visible(el)) return false;
+        const cs = getComputedStyle(el);
+        return cs.visibility !== "hidden" && cs.display !== "none";
+      };
+      const answerable = members.some((r) => !r.disabled && !r.closest("fieldset[disabled]"))
+        && (members.some((r) => shownEl(r) || Array.from(r.labels ?? []).some((l) => shownEl(l))) && shownEl(cont));
+      const marked = answerable && (members.some((r) => r.required || r.getAttribute("aria-required") === "true")
+        || !!members[0].closest('[role="radiogroup"][aria-required="true"]'));
+      if (!marked && !/\*/.test(text.slice(0, 200)) && !COMPLAINT.test(text)) continue;
       push(text.replace(/\s*\*\s*/g, " ").trim(), "radio-group");
     }
 
+    // ---- an unticked REQUIRED checkbox (#362, Helm review of 4081f12, SF5) ------------
+    // "I am ready to submit [ ] *" with the box unticked is a blank like any other: without this
+    // a refused ready-to-submit box read as a clean page, and the stamped draft Submit was clicked
+    // into the portal's own refusal (an incident, not a review stop). Markup-required only
+    // (`required` / aria-required), visible and enabled — never an asterisk guess, so an optional
+    // "email me updates" box is not a blank. Boxes sharing a name are ONE group (Helm review of
+    // 381204a): one ticked member answers it, and an unanswered group is one blank, not one per box.
+    // Its own kind, "checkbox": a re-assert never re-runs another page's step into one.
+    const allBoxes = Array.from(document.querySelectorAll("input[type=checkbox]")) as HTMLInputElement[];
+    const groupDone = new Set<string>();
+    for (const box of allBoxes) {
+      const gname = box.getAttribute("name") || "";
+      const mates = gname ? allBoxes.filter((b) => b.getAttribute("name") === gname) : [box];
+      if (mates.length > 1) {
+        if (groupDone.has(gname)) continue;
+        groupDone.add(gname);
+        if (mates.some((b) => b.checked)) continue;
+      }
+      const cb = mates.find((b) => !b.checked && !b.disabled && !b.closest("fieldset[disabled]")
+        && (b.required || b.getAttribute("aria-required") === "true")
+        && (visible(b) || Array.from(b.labels ?? []).some((l) => visible(l))));
+      if (!cb) continue;
+      const lbls = Array.from(cb.labels ?? []);
+      const name = (lbls.map((l) => (l.textContent || "").replace(/\s+/g, " ").trim()).find(Boolean)
+        || cb.getAttribute("aria-label") || cb.getAttribute("name") || "(unlabelled checkbox)");
+      if (!requiredSeen.includes(name.slice(0, 70))) requiredSeen.push(name.slice(0, 70));
+      push(name, "checkbox", cb);
+    }
+
     return { empty: out.slice(0, 14), requiredSeen: requiredSeen.slice(0, 120) };
-  }).catch(() => ({ empty: [], requiredSeen: [] })) as { empty: EmptyRequired[]; requiredSeen: string[] };
+  }, SWEPT_BLANK_ATTR).catch(() => ({ empty: [], requiredSeen: [] })) as { empty: EmptyRequired[]; requiredSeen: string[] };
 
   // NORMALISE BEFORE RETURNING. The .catch above absorbs a page that throws, but not a page
   // that RESOLVES with something else — a stub, a page mid-navigation, an evaluate the portal

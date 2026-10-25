@@ -1,0 +1,289 @@
+// THE GAP-FILL NEVER ANSWERS A CONTROL THAT READS AS SUBMITTING (#362).
+//
+// The gap-fill prompt says a required Yes/No MUST be answered. On a page where the required dropdown
+// reads "Are you ready to submit your Net Metering (kWh) application?", a planner obeying it answered
+// Yes and the page's Submit then FILED, with no approval and no PORTAL_ALLOW_FINAL_SUBMIT (found
+// re-checking PR #353 against a stub planner). Wherever gap-fill runs (gapFillCurrentPage is its one
+// door), a control whose label reads as submit intent (portalSafety isSubmitIntent) is never offered
+// to the planner and never written, and an answer that itself reads as submitting is never typed.
+// Left blank, a required one is still reported for a person.
+//
+//   npx tsx portal-bot/src/llmGapFillSubmitIntent.test.ts
+import assert from "node:assert/strict";
+import { gapFillCurrentPage, gapFillMayAnswer, gapFillWriteKind } from "./llmGapFill";
+import type { LearnPlanRequest, LearnPlanResponse, RawField } from "./adapters/autoLearnAdapter";
+
+let failures = 0;
+const check = async (label: string, fn: () => Promise<void> | void): Promise<void> => {
+  try { await fn(); console.log(`  ok   - ${label}`); }
+  catch (e) { failures++; console.error(`  FAIL - ${label}\n         ${(e as Error).message}`); }
+};
+
+const READY = "Are you ready to submit your Net Metering (kWh) application?";
+const AGREE = "Do you agree to the terms of the Net Metering (kWh) Agreement?";
+
+// A page double: $$eval returns the raw fields; every locator, however it was built, resolves by the
+// key it was asked for, and every write is recorded against that key. Values start empty.
+function fakePage(raws: RawField[]) {
+  const writes: Array<{ key: string; value: string }> = [];
+  const loc = (key: string) => {
+    const self = {
+      first: () => self,
+      nth: () => self,
+      count: async () => 1,
+      inputValue: async () => "",
+      isChecked: async () => false,
+      selectOption: async (v: unknown) => { writes.push({ key, value: typeof v === "string" ? v : JSON.stringify(v) }); },
+      fill: async (v: string) => { writes.push({ key, value: v }); },
+      check: async () => { writes.push({ key, value: "checked" }); },
+      uncheck: async () => { writes.push({ key, value: "unchecked" }); },
+      blur: async () => undefined,
+    };
+    return self;
+  };
+  const page = {
+    $$eval: async () => raws,
+    evaluate: async () => undefined,
+    url: () => "http://127.0.0.1/part1",
+    title: async () => "Interconnection Application Part 1",
+    locator: (css: string) => (css === "body" ? { innerText: async () => "Interconnection Application Part 1" } : loc(css)),
+    getByLabel: (label: string) => loc(label),
+    getByRole: (_role: string, o?: { name?: string }) => loc(String(o?.name ?? "")),
+    getByText: (t: string) => loc(t),
+    getByPlaceholder: (t: string) => loc(t),
+    getByTestId: (t: string) => loc(t),
+  };
+  return { page, writes };
+}
+
+const yesNo = (id: string, label: string, required = true): RawField =>
+  ({ label, fieldType: "select", options: ["Select…", "Yes", "No"], id, required } as RawField);
+
+// The stub planner does what the prompt says: every Yes/No it is offered is answered Yes.
+function yesPlanner() {
+  const offered: string[][] = [];
+  const planner = async (req: LearnPlanRequest): Promise<LearnPlanResponse> => {
+    offered.push(req.fields.map((f) => String(f.label ?? "")));
+    return { fills: req.fields.map((f, i) => ({ selectorIndex: i, value: "Yes" })).filter((_, i) => req.fields[i].fieldType === "select"), atReview: false };
+  };
+  return { planner, offered };
+}
+
+await check("MUST EXCLUDE: a required control whose label reads as submit intent is never offered or written", async () => {
+  const { page, writes } = fakePage([yesNo("ready", READY), yesNo("agree", AGREE)]);
+  const { planner, offered } = yesPlanner();
+  const out = await gapFillCurrentPage(page, planner, {});
+  assert.equal(offered.length, 1, "the planner was asked once (the page has another required gap)");
+  assert.ok(!offered[0].some((l) => l.includes("ready to submit")), `offered: ${JSON.stringify(offered[0])}`);
+  assert.ok(!out.filled.some((l) => l.includes("ready to submit")) && !out.attempted.some((l) => l.includes("ready to submit")), `filled: ${JSON.stringify(out.filled)}`);
+  assert.equal(writes.length, 1, `writes: ${JSON.stringify(writes)}`);
+  assert.ok(out.filled.some((l) => l.includes("agree to the terms")), "the other required gap is still answered");
+});
+
+await check("MUST EXCLUDE: a page whose only required gap is the submit-intent control spends no planner call and writes nothing", async () => {
+  const { page, writes } = fakePage([yesNo("ready", READY)]);
+  const { planner, offered } = yesPlanner();
+  const out = await gapFillCurrentPage(page, planner, {});
+  assert.equal(offered.length, 0, `offered: ${JSON.stringify(offered)}`);
+  assert.equal(writes.length, 0, `writes: ${JSON.stringify(writes)}`);
+  assert.ok(out.reportedMissing.includes(READY), `the required blank is still reported for a person: ${JSON.stringify(out)}`);
+});
+
+await check("MUST EXCLUDE: an answer that reads as submitting is never typed, even on an innocent label", async () => {
+  const { page, writes } = fakePage([{ label: "Next step", fieldType: "select", options: ["Select…", "Save draft", "Submit application"], id: "next", required: true } as RawField]);
+  const planner = async (): Promise<LearnPlanResponse> => ({ fills: [{ selectorIndex: 0, value: "Submit application" }], atReview: false });
+  const out = await gapFillCurrentPage(page, planner, {});
+  assert.equal(writes.length, 0, `writes: ${JSON.stringify(writes)}`);
+  assert.deepEqual(out.attempted, []);
+});
+
+await check("MUST EXCLUDE: a select whose OPTIONS read as submitting is never offered or written, and is still reported", async () => {
+  const opts = ["Select…", "Yes, submit my application now", "No, save as a draft"];
+  for (const [label, answer] of [["Please choose", "Yes"], ["Next step", "application"]] as const) {
+    const { page, writes } = fakePage([{ label, fieldType: "select", options: opts, id: "nxt", required: true } as RawField]);
+    let asked = 0;
+    const planner = async (): Promise<LearnPlanResponse> => { asked++; return { fills: [{ selectorIndex: 0, value: answer }], atReview: false }; };
+    const out = await gapFillCurrentPage(page, planner, {});
+    assert.equal(asked, 0, `${label}: the planner was not asked`);
+    assert.equal(writes.length, 0, `${label}: writes: ${JSON.stringify(writes)}`);
+    assert.ok(out.reportedMissing.includes(label), `${label}: reported for a person: ${JSON.stringify(out)}`);
+  }
+});
+
+await check("MUST EXCLUDE: a Yes/No radio group whose QUESTION reads as submitting — no member offered, reported under the question", async () => {
+  // The three shapes extractFieldsInPage reads the question from (fieldset legend, a form-group
+  // label tied to no option, an aria radiogroup) all land as groupPrompt on each option.
+  const radio = (id: string, label: string): RawField => ({ label, fieldType: "radio", id, name: "readyR", groupPrompt: READY, required: true } as RawField);
+  const { page, writes } = fakePage([radio("rY", "Yes"), radio("rN", "No"), yesNo("agree", AGREE)]);
+  const offered: string[] = [];
+  const planner = async (req: LearnPlanRequest): Promise<LearnPlanResponse> => {
+    req.fields.forEach((f) => offered.push(`${f.fieldType}:${String(f.label ?? "")}`));
+    return { fills: req.fields.map((f, i) => ({ selectorIndex: i, value: "Yes" })), atReview: false };
+  };
+  const out = await gapFillCurrentPage(page, planner, {});
+  assert.ok(!offered.some((o) => o.startsWith("radio:")), `offered: ${JSON.stringify(offered)}`);
+  assert.ok(!writes.some((w) => w.key.includes("Yes") || w.key.includes("rY")), `writes: ${JSON.stringify(writes)}`);
+  assert.ok(out.reportedMissing.includes(READY), `the question is reported, not "Yes": ${JSON.stringify(out.reportedMissing)}`);
+  assert.equal(gapFillMayAnswer({ label: "Yes", groupPrompt: READY }), false);
+  assert.equal(gapFillMayAnswer({ label: "Yes", groupPrompt: AGREE }), true);
+});
+
+await check("MUST PASS: a write that throws after it reached the page is still reported in attempted", async () => {
+  const { page, writes } = fakePage([yesNo("agree", AGREE)]);
+  const throwing = (page as unknown as { getByLabel: (l: string) => Record<string, unknown> });
+  const orig = page.getByLabel;
+  const origLocator = page.locator;
+  const wrap = (l: Record<string, unknown>) => ({ ...l, first: () => wrap(l), selectOption: async (v: unknown) => { writes.push({ key: "agree", value: String(v) }); throw new Error("detached"); } });
+  throwing.getByLabel = (l: string) => wrap(orig(l) as unknown as Record<string, unknown>);
+  (page as unknown as { locator: (c: string) => unknown }).locator = (c: string) => (c === "body" ? origLocator(c) : wrap(origLocator(c) as unknown as Record<string, unknown>));
+  const { planner } = yesPlanner();
+  const out = await gapFillCurrentPage(page, planner, {});
+  assert.ok(writes.length >= 1, `the write reached the page: ${JSON.stringify(writes)}`);
+  assert.deepEqual(out.attempted, [AGREE]);
+  assert.equal(out.attemptedControls[0]?.id, "agree");
+});
+
+await check("DATA OR PICK: a choice answered through a bound project field is data; the same choice unbound is a pick", async () => {
+  const run = async (mapped: string | undefined) => {
+    const { page } = fakePage([yesNo("agree", AGREE), { label: "Installer Company", fieldType: "text", id: "inst", required: true } as RawField]);
+    const planner = async (): Promise<LearnPlanResponse> => ({ fills: [{ selectorIndex: 0, value: "Yes", ...(mapped ? { field: mapped } : {}) }, { selectorIndex: 1, value: "Acme Solar" }], atReview: false });
+    return gapFillCurrentPage(page, planner, { agreesToTerms: "Yes", installerCompany: "Acme Solar" });
+  };
+  const bound = await run("agreesToTerms");
+  const unbound = await run(undefined);
+  assert.deepEqual(bound.attemptedControls.map((c) => c.kind), ["data", "data"], JSON.stringify(bound.attemptedControls));
+  assert.deepEqual(unbound.attemptedControls.map((c) => c.kind), ["pick", "data"], JSON.stringify(unbound.attemptedControls));
+  // A binding to a field the project holds no value for is no data at all.
+  assert.equal(gapFillWriteKind({ fieldType: "select" }, "Yes", "agreesToTerms", { agreesToTerms: " " }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "radio", label: "Yes" }, "Yes", undefined, {}), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "checkbox" }, "No", "hasBattery", { hasBattery: "No" }), "data");
+  // Unbound free text is data only when it IS a project value (not just any text).
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "Acme Solar", undefined, { installerCompany: "Acme Solar" }), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "Sunrise Electric", undefined, { installerCompany: "Acme Solar" }), "pick");
+});
+
+await check("DATA OR PICK (Helm round 3, blocking 2): only the project's value RENDERED is data — never close to it", () => {
+  const sel = (options: string[]) => ({ fieldType: "select", options });
+  // Digit closeness is not the value: 405 is not 410.
+  assert.equal(gapFillWriteKind(sel(["405", "410"]), "410", "moduleWatts", { moduleWatts: "405" }, "410"), "pick");
+  assert.equal(gapFillWriteKind(sel(["405", "410"]), "405", "moduleWatts", { moduleWatts: "405" }, "405"), "data");
+  // A letter substring is not the model: IQ8M is not IQ8PLUS, and a prefix is not the model.
+  assert.equal(gapFillWriteKind(sel(["IQ8PLUS-72-2-US", "IQ8M-72-2-US"]), "IQ8PLUS-72-2-US", "inverterModel", { inverterModel: "IQ8M" }, "IQ8PLUS-72-2-US"), "pick");
+  assert.equal(gapFillWriteKind(sel(["IQ8", "IQ8M-72-2-US"]), "IQ8", "inverterModel", { inverterModel: "IQ8M-72-2-US" }, "IQ8"), "pick");
+  // The landed option, not the planner's word: an answer that lands somewhere else is a pick.
+  assert.equal(gapFillWriteKind(sel(["Yes", "Yes, grid-tied with battery backup", "No"]), "Yes", "gridTied", { gridTied: "Yes" }, "Yes, grid-tied with battery backup"), "pick");
+  assert.equal(gapFillWriteKind(sel(["Yes", "No"]), "Yes", "gridTied", { gridTied: "Yes" }, "Yes"), "data");
+  // A fuller rendering is data only when one option holds it; two options holding it is a pick.
+  assert.equal(gapFillWriteKind(sel(["Roof Mounted", "Ground"]), "Roof Mounted", "mountType", { mountType: "Roof" }, "Roof Mounted"), "data");
+  assert.equal(gapFillWriteKind(sel(["Roof Mounted", "Roof Integrated"]), "Roof Mounted", "mountType", { mountType: "Roof" }, "Roof Mounted"), "pick");
+  // A radio: the ticked option's own label is the bound value; ticking the other option is a pick.
+  assert.equal(gapFillWriteKind({ fieldType: "radio", label: "No" }, "Yes", "gridTied", { gridTied: "No" }), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "radio", label: "Yes" }, "Yes", "gridTied", { gridTied: "No" }), "pick");
+  // Bound text: "Yes" typed into a box bound to a name is not the name; a word inside a long digest is not data.
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "Yes", "installerCompany", { installerCompany: "Acme Solar" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "battery", undefined, { designNotesDigest: "Roof mount, 12 modules, no battery, main panel upgrade" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "Yes", undefined, { agreesToTerms: "Yes" }), "pick");
+  // A date renders the same day; a phone renders the same digits.
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "10/18/2026", "installDate", { installDate: "2026-10-18" }), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "(555) 010-1234", "contactPhone", { contactPhone: "555-010-1234" }), "data");
+});
+
+await check("DATA OR PICK (Helm round 4): days only from dates, numbers with units, counts are not yes, no prose", () => {
+  const sel = (options?: string[]) => ({ fieldType: "select", ...(options ? { options } : {}) });
+  // B4: a battery model is not a day — V8's lenient Date read "Encharge 3" as "Powerwall 3".
+  assert.equal(gapFillWriteKind(sel(["Powerwall 3", "Encharge 3"]), "Encharge 3", "batteryModel", { batteryModel: "Powerwall 3" }, "Encharge 3"), "pick");
+  assert.equal(gapFillWriteKind(sel(["LG RESU 10", "Sonnen Eco 10"]), "Sonnen Eco 10", "batteryModel", { batteryModel: "LG RESU 10" }, "Sonnen Eco 10"), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "7", "systemSizeKw", { systemSizeKw: "7.1" }), "pick");
+  // Real dates still render the same day, in every timezone (parsed by hand).
+  for (const d of ["10/18/2026", "Oct 18, 2026", "October 18 2026", "18-Oct-2026", "2026-10-18T09:00:00Z"]) {
+    assert.equal(gapFillWriteKind({ fieldType: "text" }, d, "installDate", { installDate: "2026-10-18" }), "data", d);
+  }
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "10/19/2026", "installDate", { installDate: "2026-10-18" }), "pick");
+  // The same number with a unit word, or exactly x1000 — never a tolerance.
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "7.6 kW", "systemSizeKw", { systemSizeKw: "7.6" }), "data");
+  assert.equal(gapFillWriteKind(sel(["100 Amps", "200 Amps"]), "200 Amps", "mainPanelAmps", { mainPanelAmps: "200" }, "200 Amps"), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "7600 W", "systemSizeKw", { systemSizeKw: "7.6 kW" }), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "7600 W", "systemSizeKw", { systemSizeKw: "7.6" }), "data");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "7.7 kW", "systemSizeKw", { systemSizeKw: "7.6" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "7600 A", "systemSizeKw", { systemSizeKw: "7.6 kW" }), "pick");
+  // A count is not a yes: "1" agrees with Yes only when the bound value is itself a word.
+  assert.equal(gapFillWriteKind(sel(["Yes", "No"]), "Yes", "inverterCount", { inverterCount: "1" }, "Yes"), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "checkbox" }, "on", "inverterCount", { inverterCount: "1" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "radio", label: "Yes" }, "Yes", "inverterCount", { inverterCount: "1" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "checkbox" }, "on", "hasBattery", { hasBattery: "Yes" }), "data");
+  // Prose that merely contains a project value, or negates it, is not the value.
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "Not Acme Solar", undefined, { installerCompany: "Acme Solar" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "We use Acme Solar for every install in this county", undefined, { installerCompany: "Acme Solar" }), "pick");
+  assert.equal(gapFillWriteKind({ fieldType: "text" }, "Acme Solar LLC", undefined, { installerCompany: "Acme Solar" }), "data");
+  // A combobox whose options were never captured: only an exact candidate is data (comboHolds).
+  assert.equal(gapFillWriteKind(sel(), "Enphase IQ8M-72-2-US", "inverterModel", { inverterModel: "IQ8M-72-2-US" }, "Enphase IQ8M-72-2-US"), "pick");
+  assert.equal(gapFillWriteKind(sel(), "IQ8M-72-2-US", "inverterModel", { inverterModel: "IQ8M-72-2-US" }, "IQ8M-72-2-US"), "data");
+  // Duplicate option text is not one exact answer.
+  assert.equal(gapFillWriteKind(sel(["IQ8M", "IQ8M", "IQ8A"]), "IQ8M", "inverterModel", { inverterModel: "IQ8M" }, "IQ8M"), "pick");
+  // K5: the lone module offered is still not the project's module (no digit closeness).
+  assert.equal(gapFillWriteKind(sel(["ZXM7-SH108-405/M"]), "ZXM7-SH108-405/M", "moduleModel", { moduleModel: "ZXM7-SH108-410/M" }, "ZXM7-SH108-405/M"), "pick");
+  // K16: a make alias and the `${key}Certified` value are data.
+  assert.equal(gapFillWriteKind(sel(["Altenergy Power System", "Enphase Energy"]), "Altenergy Power System", "inverterMake", { inverterMake: "APsystems" }, "Altenergy Power System"), "data");
+  assert.equal(gapFillWriteKind(sel(["Enphase Energy", "SolarEdge Technologies"]), "Enphase Energy", "inverterMake", { inverterMake: "Enphase" }, "Enphase Energy"), "data");
+  assert.equal(gapFillWriteKind(sel(["ZXM7-SH108-410/M", "ZXM7-SH108-415/M"]), "ZXM7-SH108-410/M", "moduleModel", { moduleModel: "ZXM7 410", moduleModelCertified: "ZXM7-SH108-410/M" }, "ZXM7-SH108-410/M"), "data");
+});
+
+await check("SUBMIT WORDING (Helm round 4): refused unless it only names a fact — both ways", () => {
+  const refused = [
+    "Is this application ready for submittal?", "Should this application be submitted now?", "Submit to the utility?",
+    "Do you confirm this request should be submitted?", "Okay to submit?", "Proceed to submit", "Are you ready to submit your application?",
+    "Confirm submission", "Sign and file", "Resubmit", "Finalize your application", "File the application now",
+    "Send this Net Metering application to the utility?", "¿Desea enviar la solicitud?", "Presentar solicitud", "Listo para enviar",
+    "¿Está listo para presentar la solicitud?",
+  ];
+  const answered = [
+    "Date Submitted", "Submittal Type", "Submitted by", "Submission Date", "Date of submission", "Who will submit the application?",
+    "File Name", "Filing fee tier", "Do you want to submit additional documents?", "Want to submit photos of the roof?",
+    "Do you need to submit revised plans?", "Estimated Finish Date", "Mill Finish", "Finalize", "Roof finish",
+    "Attach a file for this application", "Interconnection Application Part 1", "Application type", AGREE,
+  ];
+  for (const t of refused) assert.equal(gapFillMayAnswer(t), false, `answered: ${t}`);
+  for (const t of answered) assert.equal(gapFillMayAnswer(t), true, `refused: ${t}`);
+});
+
+await check("A radio pick is named by its question, not by its option word alone", async () => {
+  const radio = (id: string, label: string): RawField => ({ label, fieldType: "radio", id, name: "gridTied", groupPrompt: "Is the system grid-tied?", required: true } as RawField);
+  const { page } = fakePage([radio("gY", "Yes"), radio("gN", "No")]);
+  const planner = async (): Promise<LearnPlanResponse> => ({ fills: [{ selectorIndex: 0, value: "Yes" }], atReview: false });
+  const out = await gapFillCurrentPage(page, planner, {});
+  assert.deepEqual(out.attempted, ["Is the system grid-tied?: Yes"]);
+  assert.equal(out.attemptedControls[0]?.kind, "pick");
+});
+
+await check("MUST PASS: the predicate is portalSafety's reading — submit wording out, ordinary wording in", () => {
+  assert.equal(gapFillMayAnswer(READY), false);
+  assert.equal(gapFillMayAnswer("Finalize your application"), false);
+  assert.equal(gapFillMayAnswer("Resubmit"), false);
+  assert.equal(gapFillMayAnswer(AGREE, "Yes"), true);
+  assert.equal(gapFillMayAnswer("Submittal Type", "Residential"), true);
+  assert.equal(gapFillMayAnswer("Next step", "Submit application"), false);
+  // Readiness shapes, wherever they sit (label, question, option).
+  assert.equal(gapFillMayAnswer({ label: "Yes", questions: ["I am ready to submit"] }), false);
+  assert.equal(gapFillMayAnswer({ label: "Action", options: ["Save as draft", "Submit Net Metering Application"] }), false);
+  assert.equal(gapFillMayAnswer({ label: "Confirm submission" }), false);
+  assert.equal(gapFillMayAnswer({ label: "Sign and file" }), false);
+  // SF6: "finish" is not "finalize" — permit vocabulary still answers.
+  assert.equal(gapFillMayAnswer("Estimated Finish Date", "12/01/2026"), true);
+  assert.equal(gapFillMayAnswer({ label: "Rail finish", options: ["Mill Finish", "Black"] }, "Mill Finish"), true);
+  assert.equal(gapFillMayAnswer({ label: "Roof finish", options: ["Composition shingle", "Tile", "Metal"] }), true);
+  assert.equal(gapFillMayAnswer("Submittal Type", "Residential"), true);
+  assert.equal(gapFillMayAnswer("Filing fee tier", "Tier 1"), true);
+});
+
+await check("MUST PASS: every write the gap-fill tries is reported in attempted (what the draft click reads)", async () => {
+  const { page } = fakePage([yesNo("agree", AGREE)]);
+  const { planner } = yesPlanner();
+  const out = await gapFillCurrentPage(page, planner, {});
+  assert.deepEqual(out.attempted, [AGREE]);
+  assert.deepEqual(out.filled, [AGREE]);
+});
+
+console.log(failures === 0
+  ? "\nAll gap-fill submit-intent checks passed."
+  : `\n${failures} gap-fill submit-intent check(s) FAILED.`);
+process.exit(failures === 0 ? 0 : 1);
