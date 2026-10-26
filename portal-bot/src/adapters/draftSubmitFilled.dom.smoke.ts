@@ -43,6 +43,10 @@
 //     reassertReady   an earlier page's recorded "Net Metering" = Yes is never re-asserted into it
 //     radioLegend / radioGroup / radioAria   the same question as a Yes/No radio group, its question in a
 //                     fieldset legend, a form-group label, an aria radiogroup: no member is offered
+//     readyOnly       the page's ONLY gap is that required ready-to-submit select: the replay's
+//                     answer to a required control its recipe never recorded (PR #353) gives it no
+//                     standing answer (the kWh-netting rule reads "Net Metering (kWh)" in it), so the
+//                     stamped Submit is refused by name, never clicked
 //   MUST-PASS (one click, the draft, as on main)
 //     earlierPage     the gap-fill filled a box on an EARLIER page, nothing on Part 1
 //     gotoEarlier     the same, left by a recorded goto to Part 1
@@ -57,6 +61,9 @@
 //     boundRadio      the "unboundRadio" group answered Yes through a bound project field
 //     rerender        Part 1's OWN recorded field blanked by a re-render, re-asserted from its own step
 //     radioEarlier    the ready-to-submit radio group on an EARLIER page is never answered either
+//     learnerShape    the auto-learner's shape (no stopForReview before the stamped Submit) with a
+//                     required knife-blade question the recipe never recorded: PR #353's pass answers
+//                     it (the standing Yes, noted as data) BEFORE the click, nothing is left empty
 //
 // Run: npx tsx portal-bot/src/adapters/draftSubmitFilled.dom.smoke.ts
 import "../smokeArtifactDirs";
@@ -83,6 +90,9 @@ const check = (label: string, ok: boolean, detail = ""): void => {
 // No "Net Metering (kWh)" in it: PR #353's kWh standing answer would answer it on a merged tree.
 const AGREE = "Do you agree to the terms of the Interconnection Agreement?";
 const READY = "Are you ready to submit your Net Metering (kWh) application?";
+// PacifiCorp's own wording (powerClerkDisconnect.dom.smoke): a policy question the standing answers
+// carry ("knife blade" → Yes).
+const KNIFE = "Please indicate if the AC disconnect(s) for this installation are manually operated, lockable, load break, accessible, and has a visible open (knife blade type).";
 const posts: Array<{ mode: string; path: string; body: string }> = [];
 const gets: Array<{ mode: string; path: string; query: string }> = [];
 const saved: Record<string, Record<string, string>> = {};
@@ -138,6 +148,8 @@ const extra = (mode: string): string => {
     case "unboundRadio": case "boundRadio": return GRID_RADIOS;
     case "inPage": return `${yesNo(mode, "agree", AGREE)}<button type="button" id="btnMore" onclick="document.getElementById('more').style.display='block'">Show contact preferences</button><div id="more" style="display:none"><label for="pref">Preferred contact</label><input id="pref" name="pref" type="text"></div>`;
     case "submitIntent": return `${yesNo(mode, "ready", READY)}${installerBox}`;
+    case "readyOnly": return yesNo(mode, "ready", READY, { beacon: true });
+    case "learnerShape": return yesNo(mode, "knife", KNIFE);
     case "nextReveal": return `${yesNo(mode, "agree", AGREE)}${reveal("btnNext", "Next")}`;
     case "continueReveal": return `${yesNo(mode, "agree", AGREE)}${reveal("btnCont", "Continue")}`;
     case "nextInPage": return `${yesNo(mode, "agree", AGREE)}<button type="button" id="btnNext">Next</button>`;
@@ -265,7 +277,8 @@ const part1Steps = (mode: string): RecipeStep[] => {
     ); break;
     default: break;
   }
-  return [...own, step({ action: "stopForReview" }), submitStep];
+  // THE AUTO-LEARNER'S SHAPE records the stamped Submit with no stopForReview in front of it.
+  return mode === "learnerShape" ? [...own, submitStep] : [...own, step({ action: "stopForReview" }), submitStep];
 };
 const EARLY_MODES = new Set(["earlierPage", "gotoEarlier", "reassertEmail", "reassertReady", "radioEarlier"]);
 const earlySteps = (mode: string): RecipeStep[] => {
@@ -341,6 +354,16 @@ const handoffOf = (r: Record<string, unknown>): string => {
 };
 const told = (o: Outcome, words: string): boolean => /AUTOMATION PICKED ANSWERS/.test(handoffOf(o.r)) && handoffOf(o.r).includes(words) && msgOf(o.r).includes("AUTOMATION PICKED ANSWERS");
 const touched = (o: Outcome, id: string): boolean => o.gets.some((g) => /\/touched$/.test(g.path) && g.query.includes(`id=${id}`));
+// What the pass for unrecorded required controls answered (unrecordedAnswered), and its aging notes.
+const dataOf = (r: Record<string, unknown>, key: string): string[] => {
+  const steps = Array.isArray(r.steps) ? (r.steps as Array<{ data?: Record<string, unknown> }>) : [];
+  return Array.from(new Set([r[key], ...steps.map((st) => st?.data?.[key])].flatMap((n) => (Array.isArray(n) ? n.map(String) : []))));
+};
+/** The key is in the run's report at all (so an empty list is a reading, not a missing field). */
+const reported = (r: Record<string, unknown>, key: string): boolean => Array.isArray(r[key])
+  || (Array.isArray(r.steps) && (r.steps as Array<{ data?: Record<string, unknown> }>).some((st) => Array.isArray(st?.data?.[key])));
+const answeredNotes = (r: Record<string, unknown>): string[] => dataOf(r, "agingNotes")
+  .map((n) => /^answered "([^"]*)" from /.exec(n)?.[1] ?? "").filter(Boolean);
 const noRadioOffered = (o: Outcome): boolean => !o.offered.some((f) => f.type === "radio") && o.offered.some((f) => /installer company/i.test(f.label));
 
 try {
@@ -402,6 +425,19 @@ try {
     const toPart1 = o.gets.filter((g) => /\/part1$/.test(g.path));
     check("radioEarlier: the ready-to-submit radio group on an EARLIER page is never offered or answered", noRadioOffered(o) && toPart1.length > 0 && !toPart1.some((g) => /readyR=/.test(g.query)), brief(o));
     check("radioEarlier: nothing extra on Part 1, so the stamped Submit is clicked once and reads as the draft", drafted(o), brief(o));
+  }
+  {
+    const o = await stage("readyOnly");
+    check("readyOnly: the only gap is a required ready-to-submit select — it is never answered (never touched), 0 POSTs", o.posts.length === 0 && notAnIncident(o) && !touched(o, "ready"), brief(o));
+    check("readyOnly: the replay's pass gave it no standing answer (unrecordedAnswered does not carry it)", !dataOf(o.r, "unrecordedAnswered").some((l) => /ready to submit/i.test(l)), brief(o));
+    check("readyOnly: the run stops by name — the stamped Submit was refused for that empty required select", /required field\(s\) still empty on the page: [^|]*Are you ready to submit/.test(msgOf(o.r)), brief(o));
+  }
+  {
+    const o = await stage("learnerShape");
+    const answered = dataOf(o.r, "unrecordedAnswered");
+    check("learnerShape: no stopForReview before the stamped Submit — the pass answered the knife-blade question before the click (one click, the draft)", drafted(o) && answered.some((l) => KNIFE.startsWith(l)), brief(o));
+    check("learnerShape: ...with the standing Yes in the draft, and nothing required left empty", o.posts.some((p) => /(^|&)knife=Yes(&|$)/.test(p.body)) && dataOf(o.r, "requiredStillEmpty").length === 0 && reported(o.r, "requiredStillEmpty"), `${brief(o)} bodies=${JSON.stringify(o.posts.map((p) => p.body))} reported=${reported(o.r, "requiredStillEmpty")}`);
+    check("learnerShape: the pass's notes and unrecordedAnswered agree, and the gap-fill picked nothing", JSON.stringify([...answeredNotes(o.r)].sort()) === JSON.stringify([...answered].sort()) && answered.length === 1 && !gapFilled(o.r).length, brief(o));
   }
   {
     const o = await stage("upload");
