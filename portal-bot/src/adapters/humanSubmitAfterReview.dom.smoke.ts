@@ -176,7 +176,8 @@
 //     B27 a form_submit BEACON (resourceType ping) beside a held payment: held, never "may have gone".
 //     B28 a page script's el.click() on a fetch submit (its POST held unflagged; the run fails by name, as
 //         on main): personInput false, worded "A CLICK ON …", never "you clicked".
-//     Red at 209df536 (test-only change on the parent code), 15/178: B18 and B19 "…YOU CLICKED…"; B20
+//     Red at 209df536 (test-only change on the parent code), 15/178 on the full file with B28's first
+//     fixture (a document submit), and the same 15 on the [B]-only trim (15/112) with B28's fetch submit: B18 and B19 "…YOU CLICKED…"; B20
 //     "never 'has been filed'…" and "…the draft…"; B21 "…exactly one note…"; B22 "…one note…"; B23 "…one
 //     note…" and "…go Back…"; B24 "…the click stands…" and "…plus the payment note…"; B26 "…follow-up…"
 //     and "…never 'has been filed'…"; B27 "…never 'may have gone'…"; B28 "…humanSubmitPersonInput false"
@@ -195,6 +196,10 @@
 //         unflagged stopping abort … held" red (1/25); the smoke stays green (B28's unflagged abort then
 //         reads unconfirmed, which also begins "A CLICK ON").
 //       K-nofollowup (followUpHeldOnErrorPage never consulted): B26's note red (1/112).
+//     Kills NAMED, not measured, for the other two guard checks: B20's capture check — read the labelled
+//     number before the draft in captureSubmissionConfirmation; B1's wholeMessage — put the
+//     `${portalName}: ` prefix in front of the stopped-before-review template, or append a fragment
+//     ending "." to a clause continuing ", and".
 //   [round 4, THE RECORD'S SHAPE] (Helm Blocking 1 "stamp humanRequests and aborts with at", nit :97
 //   "record the requesting page") — extra checks on existing cases, no new case numbers:
 //     A1  also: the person's request is stamped POST / resourceType document / `at` inside the click's
