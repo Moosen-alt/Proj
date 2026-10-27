@@ -24,10 +24,15 @@
 //   [A, #370 × #333] A REDIRECT HOP CARRIES ITS FIRST LEG'S PERSON VERDICT (Helm's merge-order asks):
 //     A10 the person's submit is answered 307 → /apply/submit only after 4.6 s (past HUMAN_INPUT_MS):
 //         the hop still reaches it; the person's request is recorded once (the first leg).
-//     A11 the person's submit is answered 307 → /payment/charge: refused (payment first, always).
+//     A11 the person's submit is answered 307 → /payment/charge after 4.6 s: refused (payment first,
+//         always) — a GUARD PIN, green before by design (rule 1 already precedes the verdict); its
+//         kill: move the isPayRequestUrl check below rule 2, or let `via.human` short-circuit ahead
+//         of it. The refusal is flagged humanInput (the first leg's verdict, carried): that check
+//         fails while the abort flag is judged live at the hop.
 //     A12 handed over but not yet locked (the drain's moment): the run's own save goes out, the
 //         person touches the page, THEN its 307 → /SubmitApplication arrives: the hop is refused
-//         (the first leg was not the person's) and is not in humanRequests.
+//         (the first leg was not the person's), is not in humanRequests, and is NOT flagged
+//         humanInput (the run fails by name, as on main).
 //   [B] THE REPLAY (RecipeAdapter, guided manual: no approval, the flagged final submit never clicked):
 //     B1  the person clicks the portal's submit the moment the run hands the page over: the POST
 //         reaches the portal, the run is NOT failed, and it reports the person's submit.
@@ -116,7 +121,7 @@ const reviewBody = (k: string): string => {
 // after HUMAN_INPUT_MS (4 s) has passed since the person's click.
 const REDIRECTS: Record<string, [string, number]> = {
   "apply/slow307": ["apply/submit", 4600],
-  "apply/pay307": ["payment/charge", 300],
+  "apply/pay307": ["payment/charge", 4600],
   "apply/autosave307": ["SubmitApplication", 1000],
 };
 const server = http.createServer((req, res) => {
@@ -294,11 +299,16 @@ console.log("\n[A, #370] A REDIRECT HOP CARRIES THE FIRST LEG'S PERSON VERDICT")
   const from = posts.length;
   const b = await bed("A11");
   await personClicks(b.page);
-  await sleep(1800);
+  await sleep(6500);
   const p = postsFor("A11", from).map((x) => x.path);
   const hop = b.bs.aborts.find((a) => a.redirect && /\/apply\/pay307$/.test(a.redirect.from) && /\/payment\/charge$/.test(a.where));
-  check("A11 MUST-EXCLUDE the person's submit answered 307 → /payment/charge: nothing reaches it (payment is checked before the person's verdict)",
+  // GUARD PIN (green before by design): rule 1 already runs before the person's verdict is read.
+  check("A11 MUST-EXCLUDE the person's submit answered 307 → /payment/charge after 4.6 s: nothing reaches it (payment is checked before the person's verdict)",
     p.filter((x) => /\/apply\/pay307$/.test(x)).length === 1 && !p.some((x) => /\/payment\/charge$/.test(x)) && !!hop && hop.rule === "filing-url" && isStoppingAbort(hop), brief(b, "A11", from));
+  // The refusal is the PERSON'S (carried from the first leg), so the run reads it as their payment
+  // click held, never as the recipe's failure — judged live 4.6 s after the click it read unflagged.
+  check("A11 …and the refused hop is flagged as the person's (humanInput carried from the first leg, not before the hand-over)",
+    !!hop && hop.humanInput === true && !hop.beforeHandOver, brief(b, "A11", from));
   await b.close();
 }
 {
@@ -317,6 +327,9 @@ console.log("\n[A, #370] A REDIRECT HOP CARRIES THE FIRST LEG'S PERSON VERDICT")
   check("A12 MUST-EXCLUDE the run's own save, 307 → /SubmitApplication just after a touch: the hop never reaches it (the first leg was not the person's)",
     p.filter((x) => /\/apply\/autosave307$/.test(x)).length === 1 && !p.some((x) => /\/SubmitApplication$/.test(x)) && !!hop && hop.rule === "filing-url", brief(b, "A12", from));
   check("A12 …and the hop is not in humanRequests", !b.bs.humanRequests.some((r) => /\/(SubmitApplication|apply\/autosave307)$/.test(r.where)), brief(b, "A12", from));
+  // The refusal is the RUN'S (its first leg was not the person's): unflagged, so the run fails by
+  // name as on main — judged live, the touch 0.7 s earlier flagged it as the person's.
+  check("A12 …and the refused hop is NOT flagged as the person's (the first leg's verdict, carried)", !!hop && !hop.humanInput, brief(b, "A12", from));
   await b.close();
 }
 

@@ -172,7 +172,8 @@ export interface BackstopAbort {
 }
 
 /** A redirect hop being judged (#358): which hop, what answered it, and the own-write / drain
- *  exemption its first leg had (a hop is judged after that window may have closed). */
+ *  exemption and the person's verdict its first leg had (a hop is judged after that window may have
+ *  closed). */
 interface RedirectHop {
   hop: number; from: string; status: number; ownWrite: boolean; drain: boolean;
   /** #333 × #370: the FIRST leg's person verdict, carried — never recomputed at the hop. A person's
@@ -649,7 +650,8 @@ function pageOfRequest(request: any): any {
 // Chromium follows it (Fetch.continueResponse) or the leg fails, named and stopping. Chromium keeps
 // doing the follow, so cookies, HSTS, CSP, redirect modes, the body and the committed URL stay its
 // own. A hop never takes the approved or the information-page slot, and keeps only the own-write or
-// drain exemption its first leg had.
+// drain exemption its first leg had, and the person's verdict its first leg had (#333) — both for
+// letting it through and for flagging its refusal; payment (rule 1) is still checked before either.
 /** Method-keeping hops followed after the first request; one more is refused (stopping, named). */
 export const MAX_REDIRECT_HOPS = 3;
 /** Does a redirect with this status re-send `method` (and its body) to the Location? The Fetch
@@ -954,6 +956,8 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   const drainOn = (pg: unknown): boolean => !!pg && [...drains.values()].some((d) => d.page === pg);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   // `human`: the handler's verdict on THIS pass (#333) — recorded with the first leg so a hop inherits it.
+  // Only the handler's final pass passes it; a leg let through by an exemption (own write, drain,
+  // information page) went by that exemption, never by the person's verdict.
   const letThrough = async (route: any, request: any, via: RedirectHop | null, human = false): Promise<void> => {
     if (!via) {
       try {
@@ -966,7 +970,8 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     await route.fallback().catch(() => null);
   };
   // `via`: a redirect's Location, judged as a fresh request (#358, judgePaused). A hop never takes the
-  // approved or the information-page slot, and its own-write / drain exemption is its first leg's.
+  // approved or the information-page slot, and its own-write / drain exemption and the person's
+  // verdict (#333) are its first leg's.
   const handler = async (route: any, request: any, via: RedirectHop | null = null): Promise<void> => {
     let method = "";
     let url = "";
@@ -1012,7 +1017,12 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     try { resourceType = String(request.resourceType() || ""); } catch { /* keep "" */ }
     const requestPage = pageOfRequest(request);
     const abort = async (rule: BackstopRule, why: string): Promise<void> => {
-      const heldInput = recentHumanInput(requestPage);
+      // A refused hop's flag is its first leg's verdict too, never the input clock read when the 307
+      // arrives: the person's own submit answered 307 → a payment URL after HUMAN_INPUT_MS is still
+      // theirs (held, not the recipe's failure), and the run's own save refused at its hop just after
+      // a touch is still the run's (it fails by name, as on main). A carried-true verdict's input came
+      // after the hand-over by construction, so `beforeHandOver` falls out false for it.
+      const heldInput = via ? via.human : recentHumanInput(requestPage);
       const beforeHandOver = heldInput && (!handedOverAt || (humanInputAt.get(requestPage as object) ?? 0) <= handedOverAt);
       aborts.push({
         rule, method: method || "?", where: whereOf(url), why, resourceType,
@@ -1028,7 +1038,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     // A REDIRECT HOP CARRIES ITS FIRST LEG'S VERDICT (#370 merge order): judged live, a person's submit
     // answered 307 more than HUMAN_INPUT_MS later would read as not theirs (their filing cut off),
     // and the portal's own save hopping to a filing URL just after a touch would read as theirs.
-    const human = via ? via.human : (handedOverAt > 0 && !disposed && windows.size === 0 && humanInputSinceHandOver(requestPage));
+    const human = handedOverAt > 0 && !disposed && windows.size === 0 && (via ? via.human : humanInputSinceHandOver(requestPage));
     // R0 — THE INFORMATION-PAGE SLOT IS CONSUMED by the FIRST request that could be the verified
     // control's (#344): the bound page's own main-frame document navigation. Matched or not, the
     // slot is gone, and consuming it changes no rule's outcome: the request meets payment, the
@@ -1189,7 +1199,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         const own = via ? via.ownWrite : !!pg && ownWriteOn(pg);
         if (own) {
           ownWriteRequests.push(whereOf(url));
-          await letThrough(route, request, via, human);
+          await letThrough(route, request, via);
           return;
         }
         // THE RUN'S OWN SAVE, STILL IN FLIGHT (dryrun-0928 B3): while drainOwnWrites holds the page, a
@@ -1202,7 +1212,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
           const origin = originOf(url);
           if (origin !== "" && origin === originOf(pageUrl)) {
             drainRequests.push(whereOf(url));
-            await letThrough(route, request, via, human);
+            await letThrough(route, request, via);
             return;
           }
         }
@@ -1239,7 +1249,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
           // are held from its first byte, not only after checkInfoPageAfterClick returns.
           infoProof = { page: pg, entryId: infoAdmit.entryId, state: "pending", checked: false };
           infoProofEndpoint = whereOf(url);
-          await letThrough(route, request, via, human);
+          await letThrough(route, request, via);
           return;
         }
         // AN UNVERIFIED INFORMATION PAGE'S HELD REQUEST, OBSERVED (#344): the watch the click opened
