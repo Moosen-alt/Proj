@@ -845,6 +845,11 @@ await check("rule 1 (isPayRequestUrl) knows the processors a person's 4 s window
     "https://pay.pointandpay.net/api/v1/transactions",
     "https://permits.example.gov/api/fees/settle",
     "https://www.govpaynow.com/gps/user/cyg/submit",
+    // HOST tokens alone (no path token in these): pin authorize.net, pointandpay and govpay
+    // themselves, so dropping a host token goes red here (kill K-SF13c).
+    "https://secure.authorize.net/gateway/transact.dll",
+    "https://www.pointandpay.net/pay",
+    "https://www.govpaynow.com/gps/pay",
   ]) {
     assert.ok(isPayRequestUrl(u), u);
     assert.ok(pageCopy.isPayRequestUrl(u), `page copy: ${u}`);
