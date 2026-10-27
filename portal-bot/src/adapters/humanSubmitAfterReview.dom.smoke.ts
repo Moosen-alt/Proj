@@ -33,6 +33,11 @@
 //         person touches the page, THEN its 307 → /SubmitApplication arrives: the hop is refused
 //         (the first leg was not the person's), is not in humanRequests, and is NOT flagged
 //         humanInput (the run fails by name, as on main).
+//   [A, Helm Should-fix 6] THE FENCE HOLDS ONLY WHILE THE RUN'S INPUT IS IN FLIGHT (A2 is its pin):
+//     A13 a fenced touch that sends nothing, then a person's click 100 ms later: their form POST
+//         reaches the portal, recorded as theirs, no stopping abort. Red while the fence kept a
+//         1.5 s grace after each fenced input (the person's pointerdown was dropped, the lockdown
+//         aborted their filing).
 //   [B] THE REPLAY (RecipeAdapter, guided manual: no approval, the flagged final submit never clicked):
 //     B1  the person clicks the portal's submit the moment the run hands the page over: the POST
 //         reaches the portal, the run is NOT failed, and it reports the person's submit.
@@ -364,6 +369,22 @@ console.log("\n[A, #370] A REDIRECT HOP CARRIES THE FIRST LEG'S PERSON VERDICT")
   check("A12 …and the refused hop is NOT flagged as the person's (the first leg's verdict, carried)", !!hop && !hop.humanInput, brief(b, "A12", from));
   await b.close();
 }
+{
+  // A13 (Helm Should-fix 6): the fence holds only while the run's input is in flight. A fenced touch
+  // that sends nothing, then the PERSON'S click 100 ms later: theirs goes. Live, a click 432 ms after
+  // the run's last fenced tick was aborted and failed the run (the 1.5 s grace ate its pointerdown).
+  const from = posts.length;
+  const b = await bed("A13");
+  await b.bs.withAutomationInput(b.page, () => b.page.mouse.click(5, 5));
+  await sleep(100);
+  await personClicks(b.page);
+  await sleep(900);
+  check("A13 a person's click 100 ms after a fenced input: their form POST reaches the portal (no grace after the fence)",
+    postsFor("A13", from).filter((p) => /\/apply\/submit$/.test(p.path)).length === 1, brief(b, "A13", from));
+  check("A13 …recorded as the person's request, no stopping abort",
+    b.bs.humanRequests.some((r) => r.document && /\/apply\/submit$/.test(r.where)) && b.bs.stoppingAborts().length === 0, brief(b, "A13", from));
+  await b.close();
+}
 
 // ---------------------------------------------------------------------------------------------
 // [B] The replay
@@ -558,7 +579,8 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
 {
   // B7 (skeptic r2 F2): the run ticks a box on the review page, the portal reads "Saving...", and the
   // person clicks the fetch submit the moment the run starts draining that save (the run's own steps
-  // wait the indicator out first, so the drain is short; the tick is long past the fence's grace).
+  // wait the indicator out first, so the drain is short; the tick's own report arrived while it was
+  // in flight).
   let clickedAt = 0;
   const r = await replay("B7", {
     extraSteps: [TICK],

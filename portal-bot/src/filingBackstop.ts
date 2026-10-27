@@ -47,9 +47,11 @@
 //            (recipeAdapter inputsClosed), and everything after it is reads (a source scan pins it);
 //        (2) THE FENCE — A SECOND LINE for the replay's own input doors: its guarded clicks, presses,
 //            typing and checkbox writes run inside withAutomationInput, and input the watch sees
-//            while one is in flight, or within AUTOMATION_INPUT_GRACE_MS after it, is never recorded
-//            as a person's. Helper modules' input (combobox fill, gap fill, login, signature) is not
-//            fenced: the ordering covers it (all of it is awaited before the run's input closes).
+//            while one is in flight is never recorded as a person's — only while in flight, no grace
+//            after it (Helm's measurement: 150 of 150 fenced reports arrived in flight, even at 20x
+//            CPU throttle; a 1.5 s grace ate a person's click 432 ms after the run's last tick and
+//            failed the run, #333 again; A13 pins it, A2 the in-flight half). Helper modules'
+//            input (combobox fill, gap fill, login, signature) is not fenced: the ordering covers it (all of it is awaited before the run's input closes).
 //      THE TRADE-OFF, STATED (#333 skeptic round 1): for HUMAN_INPUT_MS after a person's input, ANY
 //      state-changing request from that page passes rules 2 and 4 — the page's own scripts included.
 //      It cannot be narrowed to "the click's own request" or "a click on a control" without holding
@@ -282,9 +284,9 @@ export interface FilingBackstop {
    *  the run's report, never lets anything through. */
   personActedSinceHandOver(pg?: unknown): boolean;
   /** #333 — THE FENCE: run `fn` (an input the run itself makes on `pg`: a click, a key press,
-   *  typing) so the input watch never records it as a person's — while it is in flight and for
-   *  AUTOMATION_INPUT_GRACE_MS after it (the trusted event lands in the page after the call
-   *  returns). Nested calls are counted. */
+   *  typing) so the input watch never records it as a person's — while it is in flight, and only
+   *  then: no grace after it (the trusted event and its binding report arrive before the Playwright
+   *  call returns). Nested calls are counted. */
   withAutomationInput<T>(pg: unknown, fn: () => Promise<T>): Promise<T>;
   /** Each request a person's own input let through after the hand-over: where it went (origin +
    *  path), whether it was a main-frame document request (a form submission), how many aborts had
@@ -365,10 +367,6 @@ const REGISTRY = new WeakMap<object, FilingBackstop>();
 /** #333: how long after a person's own input a state-changing request is theirs. A click's form
  *  POST follows its pointerdown by well under a second; a confirm() answered first takes longer. */
 const HUMAN_INPUT_MS = 4_000;
-/** #333: how long after a fenced automation input its trusted events may still reach the watch (the
- *  CDP event is dispatched after the Playwright call's own round trip; measured well under 100 ms
- *  on the replica, kept generous). */
-const AUTOMATION_INPUT_GRACE_MS = 1_500;
 /** The page binding the input watch reports through (one per context or page, never removed). Named
  *  per process, not a fixed public name (the repo is public): a page script cannot call it by
  *  knowing this file (#333 skeptic round 1; Playwright's own binding global stays shared). */
@@ -877,11 +875,11 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     const t = humanInputAt.get(pg as object) ?? 0;
     return t > handedOverAt && Date.now() - t <= HUMAN_INPUT_MS;
   };
-  // THE FENCE (#333): per page, how many of the run's own inputs are in flight and when the last ended.
+  // THE FENCE (#333): per page, how many of the run's own inputs are in flight. Fenced only while one
+  // is in flight — no grace after it (Helm Should-fix 6: a grace ate a person's click 432 ms after
+  // the run's last tick, and every fenced report measured arrived in flight).
   const automationDepth = new WeakMap<object, number>();
-  const automationEndedAt = new WeakMap<object, number>();
-  const automationFenced = (pg: object): boolean =>
-    (automationDepth.get(pg) ?? 0) > 0 || Date.now() - (automationEndedAt.get(pg) ?? 0) <= AUTOMATION_INPUT_GRACE_MS;
+  const automationFenced = (pg: object): boolean => (automationDepth.get(pg) ?? 0) > 0;
   // #344 — THE INFORMATION-PAGE PASS. Run-wide facts its predicate asks (the run wrote through an
   // own-write window; an approved final-submit slot was ever opened), its ONE slot, its candidate
   // watch, and what each admitted. Every closer below also closes these.
@@ -1569,7 +1567,6 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         return await fn();
       } finally {
         automationDepth.set(p, Math.max(0, (automationDepth.get(p) ?? 1) - 1));
-        automationEndedAt.set(p, Date.now());
       }
     },
     humanRequests,
