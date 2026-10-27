@@ -96,8 +96,8 @@
 //         over over a run that then fails by name. Kill (no check before handOverReviewPage): same.
 //     B14b a filing request recorded WHILE the arm runs (page-script fetch alongside it, the
 //         deterministic stand-in for a click inside the 12-19 ms arm). Red before / kill: as B14.
-//     B2 (above) is the guard: a click the watch SAW still hands over (widening the refusal to any
-//         stopping abort reddens it).
+//     B2 (above) gains a GUARD check, green before by design: a click the watch SAW still hands over
+//         ("the page is yours", no NOT_HANDED_OVER_NOTE). Kill: refuse on ANY stopping abort.
 //   [round 4, THE RECORD'S SHAPE] (Helm Blocking 1 "stamp humanRequests and aborts with at", nit :97
 //   "record the requesting page") — extra checks on existing cases, no new case numbers:
 //     A1  also: the person's request is stamped POST / resourceType document / `at` inside the click's
@@ -693,6 +693,12 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
   check("B2 the person clicks BEFORE the hand-over: held, nothing reached the portal", r.posts.length === 0, rbrief(r));
   check("B2 …the run is not failed, and it says plainly to click again", r.ok === true && (r.message.includes(HUMAN_CLICK_HELD_NOTE) || JSON.stringify(r.data).includes("YOUR CLICK WAS HELD BACK") || JSON.stringify(r.review.data).includes("YOUR CLICK WAS HELD BACK")), rbrief(r));
   check("B2 …and the error page a held click leaves is not 'where the run stopped' (never 'stopped before review')", r.pauseReason !== "stopped_before_review", rbrief(r));
+  // GUARD (Helm Should-fix 3, green before by design): a click the ARMED watch saw is flagged, so the
+  // run still hands the page over. Kill: refuse the hand-over on ANY stopping abort (drop the
+  // `!a.humanInput` from the run's unflaggedStop) and this goes red.
+  check("B2 …a click the watch saw still hands the page over ('the page is yours', never NOT_HANDED_OVER_NOTE)",
+    r.progressLines.some((l) => /the page is yours/i.test(l)) && !r.progressLines.includes(NOT_HANDED_OVER_NOTE)
+      && !((r.data.driftWarnings as string[] | undefined) ?? []).includes(NOT_HANDED_OVER_NOTE), JSON.stringify(r.progressLines.slice(-4)));
 }
 {
   const r = await replay("B3", {
