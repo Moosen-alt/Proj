@@ -15,11 +15,13 @@
 //      split and the review step's wording read: a main-frame document request, or a fetch/XHR to a
 //      submit/payment URL, after the click, never a GET and never a beacon; off the handed-over
 //      backstop only (cases 6-7 are allocated to later commits of this round).
+//   9. (round 4) NOT_HANDED_OVER_NOTE fits one progress line: at most 200 characters, and a progress
+//      sink receives the constant whole (progress() cuts at 200).
 //
 //   npx tsx portal-bot/src/adapters/backstopStopHuman.test.ts
 import type { PortalRecipe } from "../../../shared/src/types";
 import type { BackstopAbort } from "../filingBackstop";
-import { RecipeAdapter, HUMAN_CLICK_HELD_NOTE } from "./recipeAdapter";
+import { RecipeAdapter, HUMAN_CLICK_HELD_NOTE, NOT_HANDED_OVER_NOTE } from "./recipeAdapter";
 
 let failures = 0;
 let total = 0;
@@ -132,6 +134,20 @@ console.log("\n#333 round 4 — did a FILING-SHAPED request of the person's go a
     const offLive = live.personFilingShapedRequestAfter!.call(live, CLICK);
     check("8. it reads the HANDED-OVER backstop's record only (never this.backstop): no hand-over, nothing", offLive === false, String(offLive));
   }
+}
+
+console.log("\n#333 round 4 — the 'could not hand over' note fits one progress line (NOT_HANDED_OVER_NOTE)");
+{
+  // progress() cuts every message at 200 characters, so a longer note reached the dashboard
+  // truncated ("…an earlier click can be held back, and n"). The ONE constant must fit whole: the
+  // hand-off notes and the progress line carry the same text, with no second short version.
+  check("9. NOT_HANDED_OVER_NOTE is at most 200 characters", NOT_HANDED_OVER_NOTE.length <= 200, `length=${NOT_HANDED_OVER_NOTE.length}`);
+  const messages: string[] = [];
+  const adapter = new RecipeAdapter(recipe, {}, {}, { onProgress: (p) => { messages.push(p.message); } }) as unknown as {
+    progress(phase: "wait", message: string, elapsedMs: number): void;
+  };
+  adapter.progress("wait", NOT_HANDED_OVER_NOTE, 0);
+  check("9. …and a progress sink receives it whole", messages.includes(NOT_HANDED_OVER_NOTE), JSON.stringify(messages));
 }
 
 if (failures) { console.error(`\n${failures}/${total} backstopStopHuman.test check(s) FAILED.`); process.exit(1); }

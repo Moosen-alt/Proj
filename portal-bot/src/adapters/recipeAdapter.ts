@@ -108,7 +108,7 @@ import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, withAuto
  *  handed it over (the backstop held it; nothing was sent). */
 /** #333: the run could not hand the review page over (its input watch could not be armed), so the
  *  review lockdown holds until the stage finishes — said plainly, never silently. */
-export const NOT_HANDED_OVER_NOTE = "THE RUN COULD NOT HAND THE REVIEW PAGE OVER TO YOU: the review lockdown holds until the stage has finished, so click submit only after it says it has finished (an earlier click can be held back, and nothing would be sent).";
+export const NOT_HANDED_OVER_NOTE = "THE RUN COULD NOT HAND THE REVIEW PAGE OVER TO YOU: the review lockdown holds until the stage says it has finished, so click submit only then (an earlier click is held back, and nothing is sent).";
 /** #333: why the run's own input is refused once it has started handing the page over. */
 const INPUT_CLOSED = "the run has stopped at review and is handing the page to a person — it makes no input of its own on the page from here";
 
