@@ -16,7 +16,14 @@
 //     A2  automation's fenced click after the hand-over: aborted by the lockdown.
 //     A3  a page script's POST after the hand-over, no input: aborted.
 //     A4  a person's click on the review page, and a POPUP posts within the 4 s window: aborted.
-//     A5  a payment URL right after a person's click: aborted (payment is never lifted).
+//     A5  a payment URL right after a person's click: aborted (payment is never lifted; rule 1 is only
+//         as wide as PAY_FEE_URL).
+//     A5b-A5e (Helm Should-fix 13) a person's click whose fetch goes to a processor endpoint rule 1 did
+//         not know — A5b /xml/v1/request.api (Authorize.net), A5c /api/v1/transactions (Point & Pay),
+//         A5d /api/fees/settle (a portal's own fee settle), A5e /gps/user/42/submit (GovPayNet) — within
+//         the 4 s window: aborted by rule 1 (a fee-payment abort, flagged as the person's, never in
+//         humanRequests). Loopback paths only, never the real processor hosts. Red while PAY_FEE_URL
+//         lacked these tokens: the person's verdict lifted rules 2 and 4 and the POST reached the portal.
 //     A6  an input 1 s BEFORE the hand-over, a script POST 1 s after it: aborted (not carried over).
 //     A7  a person's click BEFORE the hand-over: aborted, flagged humanInput (the run says so).
 //     A8  a person's click while a dismisser window is open: aborted.
@@ -109,6 +116,13 @@ const formSubmit = (k: string): string => `<form method="post" action="/h/${k}/a
 // A fetch submit, then the completion page by location.href — under a label the click classifier
 // does not know (classifyRecordedClick("Send to City") is "capture", never "finalSubmit").
 const SEND = (k: string): string => `<button type="button" id="send" onclick="fetch('/h/${k}/api/application', { method: 'POST', body: 'x=1' }).then(function () { location.href = '/h/${k}/done'; })">Send to City</button>`;
+// Processor endpoints rule 1 must know (Helm Should-fix 13), served by the loopback fixture only.
+const PROCESSOR_PATHS: Record<string, string> = {
+  A5b: "xml/v1/request.api",
+  A5c: "api/v1/transactions",
+  A5d: "api/fees/settle",
+  A5e: "gps/user/42/submit",
+};
 const reviewBody = (k: string): string => {
   const summary = `<h1>Step 3: Review</h1><p>Please review your application before you submit it.</p><table><tr><th>Address</th><td>100 Fixture Way</td></tr></table>`;
   if (k === "B5") return `${summary}${formSubmit(k)}<button type="button" id="saveLater" onclick="fetch('/h/B5/api/save-later', { method: 'POST', body: 'x=1' }).then(function () { location.href = '/h/B5/records'; })">Save for Later</button>`;
@@ -131,6 +145,7 @@ const reviewBody = (k: string): string => {
   if (k === "B9") return `${summary}${formSubmit(k)}<button type="button" id="pay" onclick="fetch('/h/B9/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function () {})">Pay Fees</button>`;
   if (k === "A4") return `${summary}<button type="button" id="btnSubmit" onclick="window.open('/h/A4/popup', '_blank')">Submit Application</button>`;
   if (k === "A5") return `${summary}<button type="button" id="btnSubmit" onclick="fetch('/h/A5/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function(){})">Submit Application</button>`;
+  if (PROCESSOR_PATHS[k]) return `${summary}<button type="button" id="btnSubmit" onclick="fetch('/h/${k}/${PROCESSOR_PATHS[k]}', { method: 'POST', body: 'amt=150' }).catch(function(){})">Submit Application</button>`;
   // The portal answers the submit with a method-keeping redirect (judged as a fresh request, #370).
   if (k === "A10") return `${summary}<form method="post" action="/h/A10/apply/slow307"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
   if (k === "A11") return `${summary}<form method="post" action="/h/A11/apply/pay307"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
@@ -265,12 +280,27 @@ console.log("\n[A] THE BACKSTOP, DIRECTLY");
   await personClicks(b.page);
   await sleep(700);
   const doneAt = Date.now();
-  check("A5 a payment URL right after a person's click: aborted (payment is never lifted)",
+  check("A5 a payment URL right after a person's click: aborted (payment is never lifted; rule 1 is only as wide as PAY_FEE_URL)",
     postsFor("A5", from).length === 0 && b.bs.aborts.some((a) => /\/payment\/charge$/.test(a.where)), brief(b, "A5", from));
   // Round 4 (Helm Blocking 1): an abort says when it was held — "a stopping abort AFTER the click".
   const held = b.bs.aborts.find((a) => /\/payment\/charge$/.test(a.where));
   check("A5 …the abort is stamped with when it was held (`at` inside the click's window)",
     !!held && typeof held.at === "number" && held.at >= clickAt && held.at <= doneAt, `clickAt=${clickAt} doneAt=${doneAt} ${brief(b, "A5", from)}`);
+  await b.close();
+}
+for (const [k, path] of Object.entries(PROCESSOR_PATHS)) {
+  // A5b-A5e (Helm Should-fix 13): rule 1 is only as wide as PAY_FEE_URL. A processor endpoint it did
+  // not name passed inside the person's 4 s window (rules 2 and 4 lifted). /fee-payment/ on `why`
+  // tells rule 1 from rule 2, which also aborts with rule "filing-url".
+  const from = posts.length;
+  const b = await bed(k);
+  await personClicks(b.page);
+  await sleep(700);
+  const held = b.bs.aborts.find((a) => a.where.endsWith("/" + path));
+  check(`${k} a person's click whose request goes to /${path} within 4 s: aborted by rule 1 (payment stays blocked for URLs rule 1 knows)`,
+    postsFor(k, from).length === 0 && !!held && held.rule === "filing-url" && /fee-payment/.test(held.why) && held.humanInput === true && !held.beforeHandOver,
+    brief(b, k, from));
+  check(`${k} …and it is never recorded as the person's request`, b.bs.humanRequests.length === 0, brief(b, k, from));
   await b.close();
 }
 {

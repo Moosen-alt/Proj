@@ -1443,7 +1443,14 @@ export function portalSafetyFactory() {
   // Request-URL predicates (network recorder, implicit submission). Portal endpoints concatenate
   // words ("SubmitApplication", "CompleteApplication"), so these have no trailing word boundary.
   const FINAL_SUBMIT_URL = /(submit|finali[sz]e|completeapplication|fileapplication|continueapplication)/i;
-  const PAY_FEE_URL = /(payment|checkout|invoice|paymentus|payfee|placeorder)/i;
+  // Rule 1's whole vocabulary (filingBackstop's PAYMENT RULE): payment stays blocked only for URLs
+  // this names. After the hand-over a person's input lifts the filing-URL rule and the lockdown for
+  // 4 s, so a processor it does not name passes then like any other request. Processors (Helm
+  // Should-fix 13, #333): a HOST token so the real endpoint matches (authorize.net, pointandpay,
+  // govpay) and an anchored PATH token (/xml/vN/request.api, /api/vN/transactions, fees/settle,
+  // /gps/user/). Keep every token anchored: a loose one aborts a portal's own filing
+  // (approvedFinalSubmit.dom.smoke.ts). Plain regex syntax only: this source also runs in the page.
+  const PAY_FEE_URL = /(payment|checkout|invoice|paymentus|payfee|placeorder|authorize\.net|\/xml\/v\d+\/request\.api|pointandpay|\/api\/v\d+\/transactions|fees?\/settle|govpay|\/gps\/user\/)/i;
   const isSubmitOrPayRequestUrl = (url: string | null | undefined): boolean => {
     const u = String(url ?? "");
     return !!u && (FINAL_SUBMIT_URL.test(u) || PAY_FEE_URL.test(u));

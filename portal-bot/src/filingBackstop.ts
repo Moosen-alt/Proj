@@ -10,7 +10,9 @@
 // a form posted into an iframe, XHR, fetch, a beacon) — and aborts:
 //
 //   1. PAYMENT RULE: a request whose URL reads as a fee payment (isPayRequestUrl). Always, in any
-//      frame, of any type, even under a named approval: automation never pays.
+//      frame, of any type, even under a named approval: automation never pays. It is only as wide
+//      as isPayRequestUrl (PAY_FEE_URL): payment stays blocked only for URLs rule 1 knows; a processor
+//      it does not name passes inside a person's HUMAN_INPUT_MS window like any other request.
 //   2. FILING-URL RULE: a request whose URL — for a form POST, the form's action — reads as a
 //      filing (isFilingOrPaymentRequest, the same predicate the demo recorder's abort asks). A
 //      named approval admits ONE state-changing request in a short window after THE approved
@@ -61,7 +63,8 @@
 //      Only input that arrives AFTER the hand-over counts (an input just before it is not carried
 //      over), and only for the page that saw it. A page script posting with no input meets the lockdown
 //      exactly as before; payment (rule 1) and an open dismisser / Enter window (rule 3, the
-//      run's own action in flight) are never lifted. An abort that follows such an input is
+//      run's own action in flight) are never lifted — but payment stays blocked only for URLs rule 1
+//      knows (PAY_FEE_URL; Helm Should-fix 13 added Authorize.net, Point & Pay, fees/settle, GovPayNet). An abort that follows such an input is
 //      flagged humanInput, so the run can say "your click was held back — click again".
 //      (b) exempts the RUN'S OWN recorded write on that page while it is in flight
 //      (withOwnWriteWindow: a fill / select / check whose per-field autosave posts — PowerClerk's
@@ -275,7 +278,9 @@ export interface FilingBackstop {
   watchHumanInput(): Promise<boolean>;
   /** #333 — THE HAND-OVER: the run is done acting on the page and gives it to a person. From here a
    *  request that follows that person's own input (watchHumanInput) passes the filing-URL rule and
-   *  the review lockdown; nothing else changes. false = disposed, or the input watch is not armed. */
+   *  the review lockdown; nothing else changes. Payment (rule 1) is never lifted, and it stays blocked
+   *  only for URLs rule 1 knows (PAY_FEE_URL): a processor it does not name passes in that window.
+   *  false = disposed, or the input watch is not armed. */
   handOverToHuman(why: string): boolean;
   /** Has the run handed the page over (and not been disposed)? */
   handedOver(): boolean;

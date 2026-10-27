@@ -40,6 +40,7 @@ import {
   isSecretField,
   isSubmitIntent,
   isSubmitOrPayRequestUrl,
+  isPayRequestUrl,
   mayClickFinalSubmit,
   PORTAL_SAFETY_IN_PAGE_SOURCE,
   recordingHasFormData,
@@ -834,6 +835,33 @@ await check("network recorder flags filing and payment URLs through the shared p
   const built = rec.build({ scopeType: "ahj", profileKey: "k", state: "", ahj: "", utility: "", portalPlatform: "", portalUrl: "", createdBy: "t", nowIso: "2026-01-01" });
   assert.equal(built.requests[0].isFinalSubmit, true, "ContinueApplication request not flagged");
   assert.notEqual(built.requests[1].isFinalSubmit, true, "an ordinary save was flagged");
+});
+
+await check("rule 1 (isPayRequestUrl) knows the processors a person's 4 s window would otherwise pass (Helm Should-fix 13; Node and page copy)", () => {
+  // After the hand-over a person's input lifts rules 2 and 4 for HUMAN_INPUT_MS; rule 1 is the only
+  // payment line left, and it is only as wide as PAY_FEE_URL. Red before: none of these matched it.
+  for (const u of [
+    "https://api.authorize.net/xml/v1/request.api",
+    "https://pay.pointandpay.net/api/v1/transactions",
+    "https://permits.example.gov/api/fees/settle",
+    "https://www.govpaynow.com/gps/user/cyg/submit",
+  ]) {
+    assert.ok(isPayRequestUrl(u), u);
+    assert.ok(pageCopy.isPayRequestUrl(u), `page copy: ${u}`);
+  }
+  // Anchored tokens: a portal's own filing and save URLs, and an unversioned list endpoint, are not payment.
+  for (const u of [
+    "https://x.test/Project/SubmitApplication",
+    "https://x.test/apply/submit",
+    "https://x.test/api/application",
+    "https://x.test/Project/SaveChanges",
+    "https://x.test/Cap/ContinueApplication.aspx",
+    "https://x.test/api/SaveField",
+    "https://x.test/api/transactions/list",
+  ]) {
+    assert.ok(!isPayRequestUrl(u), u);
+    assert.ok(!pageCopy.isPayRequestUrl(u), `page copy: ${u}`);
+  }
 });
 
 console.log(failures === 0
