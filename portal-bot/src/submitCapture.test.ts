@@ -6,6 +6,8 @@
 //       every link cleaned of session material, and never a `javascript:` link;
 //   (b) no confident number + EXACTLY ONE new row in the account list → that row is the filing;
 //       two new rows, or a different unsure page read → nothing written, candidates instead;
+//   (b2) the one new row writes only when it reads as THIS filing: not an unsubmitted draft, and,
+//       with a site known, not naming another street (a row naming no address still writes);
 //   (c) no diff without a real "before" list the "after" page shares a row with;
 //   (d) the hand-off reports an UNSURE read as low confidence with its candidates — main reported
 //       every page number as high, so an unconfident read was written as the filing's number.
@@ -93,6 +95,41 @@ await check("(b) an unsure page read that disagrees with the one new row writes 
   const got = chooseSubmittedRecord({ read, numberHref: "", before: BEFORE, after: [row(42199), ...BEFORE], pageUrl: "https://grid.example.test/Projects/List" });
   assert.equal(got.confidence, "low");
   assert.deepEqual(got.candidates.map((c) => c.recordNumber), ["BLD-26-00123", "PC-0042199"]);
+});
+
+// THE ONE NEW ROW MUST BE THIS FILING (Helm review on #401): a shared account lists a colleague's
+// application for another home; a submit that only made a draft lists one new draft row.
+const SITE = { street: "12 Willow Rd", city: "Fernhollow", zip: "97999" };
+const newRow = (text: string): LedgerEntry => ({ id: "PC-0042199", href: "https://grid.example.test/Projects/View?ProjectId=42199", row: `PC-0042199 ${text}` });
+await check("(b2) one new row reading as a draft writes nothing: a candidate, with the reason", () => {
+  const got = chooseSubmittedRecord({ read: NO_READ, numberHref: "", before: BEFORE, after: [newRow("12 Willow Rd Status: Draft"), ...BEFORE], pageUrl: "https://grid.example.test/Projects/List" });
+  assert.equal(got.confidence, "low");
+  assert.equal(got.recordNumber, "");
+  assert.deepEqual(got.candidates.map((c) => c.recordNumber), ["PC-0042199"]);
+  assert.match(got.reason, /unsubmitted draft/);
+});
+await check("(b2) ...and so does an unsure page read that agrees with that draft row", () => {
+  const read = extractRecordNumber("Application PC-0042199");
+  const got = chooseSubmittedRecord({ read, numberHref: "", before: BEFORE, after: [newRow("12 Willow Rd Status: Draft"), ...BEFORE], pageUrl: "https://grid.example.test/Projects/List" });
+  assert.equal(got.recordNumber, "");
+  assert.deepEqual(got.candidates.map((c) => c.recordNumber), ["PC-0042199"]);
+});
+await check("(b2) with a site set, one new row naming another street writes nothing", () => {
+  const got = chooseSubmittedRecord({ read: NO_READ, numberHref: "", before: BEFORE, after: [newRow("880 Juniper Ave Fernhollow 97999 Submitted"), ...BEFORE], pageUrl: "https://grid.example.test/Projects/List", site: SITE });
+  assert.equal(got.confidence, "low");
+  assert.equal(got.recordNumber, "");
+  assert.deepEqual(got.candidates.map((c) => c.recordNumber), ["PC-0042199"]);
+  assert.match(got.reason, /different site/);
+});
+await check("(b2) with a site set, one new row naming this site still writes", () => {
+  const got = chooseSubmittedRecord({ read: NO_READ, numberHref: "", before: BEFORE, after: [newRow("12 Willow Rd Fernhollow 97999 Submitted"), ...BEFORE], pageUrl: "https://grid.example.test/Projects/List", site: SITE });
+  assert.equal(got.confidence, "high");
+  assert.equal(got.recordNumber, "PC-0042199");
+});
+await check("(b2) with a site set, one new row naming no address still writes", () => {
+  const got = chooseSubmittedRecord({ read: NO_READ, numberHref: "", before: BEFORE, after: [newRow("Net Metering Submitted 10/27/2026"), ...BEFORE], pageUrl: "https://grid.example.test/Projects/List", site: SITE });
+  assert.equal(got.confidence, "high");
+  assert.equal(got.recordNumber, "PC-0042199");
 });
 
 await check("(c) no diff without a before list, or when the after page shares no row with it", () => {

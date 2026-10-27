@@ -18,6 +18,8 @@
 // The read runs inside the page (page.evaluate), so it must be self-contained. The diff
 // and the scoring run in Node.
 
+import { readsAsUnsubmittedDraft, rowFit, siteKey } from "../draftCreated";
+
 export interface LedgerEntry {
   /** The record identifier exactly as the portal prints it. */
   id: string;
@@ -297,6 +299,28 @@ export function submitLedgerDiff(before: LedgerEntry[] | null | undefined, after
 }
 
 /**
+ * IS THE ONE NEW ROW THIS FILING? The account is shared — a colleague's application for another home
+ * can be the row that appeared while this filing kept an id already listed (PSE Part 2) or did not
+ * show — and a submit that only made a draft, on a page readDraftCreated misses, comes back to the
+ * list with one new DRAFT row. The site-draft check's own predicates (draftCreated.ts) answer both:
+ * a row reading as an unsubmitted draft is not a filing, and with a site known, a row whose address
+ * is another street is not this one. A row naming no address is not refused.
+ */
+export function newRowIsThisFiling(row: LedgerEntry, site?: { street?: string; city?: string; zip?: string } | null): { ok: boolean; why: string } {
+  if (readsAsUnsubmittedDraft(row.row)) return { ok: false, why: "it reads as an unsubmitted draft, not a filing" };
+  const key = site ? siteKey(site) : null;
+  // rowFit reads a row with no street line as "another street"; only a row that NAMES an address
+  // can name the wrong one.
+  if (key && ROW_NAMES_A_STREET.test(row.row)) {
+    const fitted = rowFit(row.row, key);
+    if (fitted.fit === "other") return { ok: false, why: `it names a different site than this project (${fitted.why})` };
+  }
+  return { ok: true, why: "" };
+}
+/** A house number, up to four street words and a street suffix: "12 Willow Rd", "4410 N Cedar Hollow Ln". */
+const ROW_NAMES_A_STREET = /\b\d{1,6}[a-z]?\s+(?:[a-z0-9.']+\s+){1,4}(?:st|street|ave|av|avenue|rd|road|dr|drive|ln|lane|ct|court|cir|circle|blvd|boulevard|way|pl|place|ter|terrace|trl|trail|pkwy|parkway|hwy|highway|loop|sq|square|cv|cove|pt|point|run|row|walk|path)\b/i;
+
+/**
  * WHICH NUMBER AND WHICH LINK, after a person clicked the final submit in the review window (#400).
  *
  * The link, best first: the href on the element carrying the number (Accela's number IS the link to
@@ -304,9 +328,10 @@ export function submitLedgerDiff(before: LedgerEntry[] | null | undefined, after
  * Every one through safeRecordLink, so no session token is stored.
  *
  * The number: a confident completion-page read (recordNumber.ts) wins. Without one, the account
- * list's before/after diff supplies it — only when EXACTLY ONE new row appeared and no unsure page
- * read names a different number. Zero rows, several rows, or a disagreement write nothing: what was
- * seen becomes candidates for a person to confirm. A wrong number is worse than none.
+ * list's before/after diff supplies it — only when EXACTLY ONE new row appeared, no unsure page
+ * read names a different number, and the row reads as THIS filing (newRowIsThisFiling). Zero rows,
+ * several rows, a disagreement or a row that is not this filing write nothing: what was seen
+ * becomes candidates for a person to confirm. A wrong number is worse than none.
  */
 export function chooseSubmittedRecord(input: {
   read: { value: string; confidence: "high" | "low"; reason: string };
@@ -315,6 +340,9 @@ export function chooseSubmittedRecord(input: {
   before: LedgerEntry[] | null | undefined;
   after: LedgerEntry[] | null | undefined;
   pageUrl: string;
+  /** The project's site, when known (the replay's siteDraft, NEM tracks): a new row naming another
+   *  street is never this filing. */
+  site?: { street?: string; city?: string; zip?: string } | null;
 }): SubmitRecordRead {
   const pageLink = safeRecordLink(input.pageUrl);
   const fresh = submitLedgerDiff(input.before, input.after);
@@ -325,7 +353,8 @@ export function chooseSubmittedRecord(input: {
   if (pageNumber && input.read.confidence === "high") {
     return { recordNumber: pageNumber, confidence: "high", source: "completion_page", recordLink: pageNumberLink, reason: input.read.reason, candidates: [] };
   }
-  if (fresh && fresh.length === 1 && (!pageNumber || sameId(pageNumber, fresh[0].id))) {
+  const fit = fresh && fresh.length === 1 ? newRowIsThisFiling(fresh[0], input.site) : null;
+  if (fresh && fresh.length === 1 && fit?.ok && (!pageNumber || sameId(pageNumber, fresh[0].id))) {
     const row = fresh[0];
     return {
       recordNumber: row.id.trim(), confidence: "high", source: "account_list",
@@ -342,7 +371,9 @@ export function chooseSubmittedRecord(input: {
   }
   const why = fresh && fresh.length > 1
     ? `${fresh.length} new applications appeared in the account's list after the submit — a person picks which one this filing is.`
-    : pageNumber
+    : fit && !fit.ok
+      ? `One new application appeared in the account's list after the submit, but ${fit.why} — a person confirms whether it is this filing.`
+      : pageNumber
       ? input.read.reason
       : "No record number on the page after the submit, and no single new application in the account's list.";
   return { recordNumber: "", confidence: "low", source: "none", recordLink: pageLink, reason: why, candidates: candidates.slice(0, 5) };

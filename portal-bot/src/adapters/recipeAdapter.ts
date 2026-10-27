@@ -1544,7 +1544,8 @@ export class RecipeAdapter extends BasePortalAdapter {
         ? String((await this.page.evaluate(recordLinkForNumberInPage, permitNumber).catch(() => "")) || "")
         : "";
       const after = canRead ? ((await this.page.evaluate(readApplicationLedgerInPage).catch(() => null)) as LedgerEntry[] | null) : null;
-      const recordRead = chooseSubmittedRecord({ read, numberHref, before: this.ledgerBefore, after, pageUrl: rawUrl });
+      // The site (NEM tracks: siteDraft) holds the one new row to this project's address.
+      const recordRead = chooseSubmittedRecord({ read, numberHref, before: this.ledgerBefore, after, pageUrl: rawUrl, site: this.options.siteDraft ?? null });
       const recordLink = permitNumber
         ? (recordRead.recordNumber === permitNumber ? recordRead.recordLink : recordRead.candidates.find((c) => c.recordNumber === permitNumber)?.recordLink || cleanRecordLink(rawUrl))
         : recordRead.recordLink || cleanRecordLink(rawUrl);
