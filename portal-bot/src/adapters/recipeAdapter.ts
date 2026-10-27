@@ -89,7 +89,7 @@ import { batteryControlKind, batteryControlOfStep, batteryDeclarationAnswer, par
 import { imageToPdfBytes, shouldConvertToPdf } from "../imageToPdf";
 import { removeUploadStaging, uploadPayloadFor, type PreparedUpload } from "./uploadPayload";
 import { attachmentTypeFor, isDocumentTypeList } from "./attachmentTypes";
-import { cleanRecordLink, readApplicationLedgerInPage, type LedgerEntry } from "./submissionLedger";
+import { chooseSubmittedRecord, cleanRecordLink, readApplicationLedgerInPage, recordLinkForNumberInPage, type LedgerEntry } from "./submissionLedger";
 import { exactUploadDocType, fileTypeAllowed, UPLOAD_LABEL_PATTERNS, uploadForbidsSubstitute } from "./autoLearnAdapter";
 import { reviewComparison, scrapeReviewScreen as scrapeReviewScreenShared, utilityIdentifiersEnteredBySteps, type ReviewMismatch } from "../reviewScreenScraper";
 import { controlReadsUnanswered, pinEmptyRequiredControl, PINNED_CONTROL_ATTR, SWEPT_BLANK_ATTR, sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
@@ -1055,6 +1055,9 @@ export class RecipeAdapter extends BasePortalAdapter {
   private draftSubmitAttempted = false;
   /** The draft the replay's own draft-creating click made, as the page after it read (#330). */
   private draftSubmitOutcome: (ReturnType<typeof readDraftCreated> & { clickedLabel: string; tenantKey: string }) | null = null;
+  /** The account's application list as the sign-in landed on it (openSubmission) — the "before"
+   *  of the person's filing (#400). null when the page could not be read. */
+  private ledgerBefore: LedgerEntry[] | null = null;
   /** The recipe step index the loop is on — the final-submit gate's "is this the terminal step". */
   private currentStepIdx = -1;
   /** The step whose selector resolveLocator is resolving right now (for disambiguation). */
@@ -1184,9 +1187,14 @@ export class RecipeAdapter extends BasePortalAdapter {
     // landed on is read, nothing is clicked. A draft found here is reported (existingDraft) for the
     // backend to record, so the next stage opens THAT draft's next form instead of replaying an
     // application start that would mint a second number for the same house.
+    // The same read is the BEFORE of a person's filing in this window (#400): the row that is new
+    // on the page they are left on is the application they filed.
+    if (this.page && typeof this.page.evaluate === "function") {
+      this.ledgerBefore = (await this.page.evaluate(readApplicationLedgerInPage).catch(() => null)) as LedgerEntry[] | null;
+    }
     const street = String(this.options.siteDraft?.street ?? "").trim();
-    if (street && this.page && typeof this.page.evaluate === "function") {
-      const entries = (await this.page.evaluate(readApplicationLedgerInPage).catch(() => [])) as LedgerEntry[];
+    if (street && this.ledgerBefore) {
+      const entries = this.ledgerBefore;
       const find = findSiteDraft(entries, { ...this.options.siteDraft, street });
       if (find.found || find.ambiguous) {
         const appNo = find.found ? find.entry.id : "";
@@ -1527,7 +1535,20 @@ export class RecipeAdapter extends BasePortalAdapter {
       // ProjectId/ProgramId identify the record, not the session — dropping them made the stored
       // link useless (a bare /MvcProjects/EditProject reaches nothing). ONE list: cleanRecordLink
       // (these two lists disagreed until dryrun-0928 B11).
-      const recordLink = cleanRecordLink(rawUrl);
+      // WHICH NUMBER AND WHICH LINK (#400, chooseSubmittedRecord): the link the portal puts on the
+      // number first, then the new row's in the account list, then the cleaned page URL; with no
+      // confident number, the before/after list diff. READ ONLY: both reads look at the page the
+      // person is left on — nothing navigates, clicks or opens a tab to reach a list.
+      const canRead = typeof this.page.evaluate === "function";
+      const numberHref = permitNumber && canRead
+        ? String((await this.page.evaluate(recordLinkForNumberInPage, permitNumber).catch(() => "")) || "")
+        : "";
+      const after = canRead ? ((await this.page.evaluate(readApplicationLedgerInPage).catch(() => null)) as LedgerEntry[] | null) : null;
+      // The site (NEM tracks: siteDraft) holds the one new row to this project's address.
+      const recordRead = chooseSubmittedRecord({ read, numberHref, before: this.ledgerBefore, after, pageUrl: rawUrl, site: this.options.siteDraft ?? null });
+      const recordLink = permitNumber
+        ? (recordRead.recordNumber === permitNumber ? recordRead.recordLink : recordRead.candidates.find((c) => c.recordNumber === permitNumber)?.recordLink || cleanRecordLink(rawUrl))
+        : recordRead.recordLink || cleanRecordLink(rawUrl);
       const submitted = pageConfirmsSubmission(bodyText);
       if (permitNumber || submitted) {
         return ok(`Captured submission confirmation${permitNumber ? `: ${permitNumber}` : ""}.`, {
@@ -1535,9 +1556,12 @@ export class RecipeAdapter extends BasePortalAdapter {
           confirmationNumber: permitNumber,
           discipline,
           recordLink,
+          recordRead,
         });
       }
-      return ok("Submitted; no record number found on the completion page yet.", { permitNumber: "", recordLink });
+      return ok(recordRead.recordNumber
+        ? `Submitted; ${recordRead.recordNumber} is the one new application in the account's list.`
+        : "Submitted; no record number found on the completion page yet.", { permitNumber: "", recordLink, recordRead });
     } catch (err) {
       return ok(`Confirmation capture skipped: ${err instanceof Error ? err.message : String(err)}`, { permitNumber: "", recordLink: "" });
     }

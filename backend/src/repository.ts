@@ -8998,7 +8998,7 @@ export async function prepareSubmission(
     // WRITTEN ONLY WHEN THE READ IS CONFIDENT. Every downstream check keys on this value,
     // so a low-confidence read is recorded as a NOTE for the operator to confirm rather
     // than written as fact — the manual capture form keeps working exactly as it does now.
-    onSubmitCaptured: (capture: { recordNumber: string; confidence: string; reason: string; recordLink: string; draftCreated?: ObservedDraft }) => {
+    onSubmitCaptured: (capture: { recordNumber: string; confidence: string; source?: string; reason: string; recordLink: string; candidates?: Array<{ recordNumber: string; recordLink: string; source: string }>; draftCreated?: ObservedDraft }) => {
       try {
         // THE CLICK ONLY MADE A DRAFT (#302: PSE's Part 1 Submit). Nothing was filed: no submission,
         // no record number. The draft is written down for the next stage to continue, and the
@@ -9015,21 +9015,27 @@ export async function prepareSubmission(
           // gets round to clicking submit — this fires from the left-open window, minutes
           // later. captureConfirmation is the SAME function the manual form calls, so the
           // filing is recorded through one path whoever supplied the number.
+          // THE LINK GOES THROUGH THE SAME DOOR (#400): the run's and the track target's
+          // tracking_url, exactly the columns the automatic-submit path writes.
+          const fromList = capture.source === "account_list";
           captureConfirmation(db, runId, {
             applicationNumber: capture.recordNumber,
-            submittedBy: "read from the portal's completion page",
+            recordLink: capture.recordLink,
+            submittedBy: fromList ? "read from the portal's application list" : "read from the portal's completion page",
             notes: capture.reason.slice(0, 300),
           });
           addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_read", {
-            track, runId, source: "completion_page", reason: capture.reason.slice(0, 200),
+            track, runId, source: fromList ? "account_list" : "completion_page", reason: capture.reason.slice(0, 200),
           });
           logger.info("submit-capture", "record number read off the completion page — no typing needed", {
             project: projectId, track,
           });
         } else {
-          // Not confident — say so where the operator will see it, and leave the form alone.
+          // Not confident — say so where the operator will see it, and leave the form alone. What
+          // was seen goes on the next-step panel as candidates for a person to confirm (#400).
+          const held = recordSubmitCaptureCandidates(db, runId, capture.candidates ?? [], capture.reason);
           addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_unread", {
-            track, reason: capture.reason.slice(0, 200),
+            track, reason: capture.reason.slice(0, 200), candidates: held,
           });
         }
       } catch { /* capture is a convenience; it must never disturb the run */ }
@@ -10076,6 +10082,45 @@ export function suggestReviewValues(db: AppDb, projectId: string, suggestions: R
   return applied;
 }
 
+/** A record link fit to store and to render as an href: http(s) only, bounded. Anything else
+ *  (a `javascript:` URL from a request body, an unparseable string) is no link at all. */
+function storableRecordLink(raw: unknown): string {
+  const link = String(raw ?? "").trim();
+  return link.length <= 2000 && /^https?:\/\/[^\s"'<>]+$/i.test(link) ? link : "";
+}
+
+/**
+ * HOLD UNSURE RECORD NUMBERS FOR A PERSON (#400). After a person's submit in the left-open window,
+ * a low-confidence completion-page read or an ambiguous account-list diff is NOT a filing's number:
+ * it is written to the run's own submit_capture_candidates (never result_json, never a submission
+ * row) and the next-step panel offers each one to confirm in one click, through captureConfirmation.
+ * Only while the run is still awaiting the person's submit — a run already confirmed is answered.
+ * Returns how many were held.
+ */
+export function recordSubmitCaptureCandidates(
+  db: AppDb,
+  portalRunId: string,
+  candidates: Array<{ recordNumber: string; recordLink: string; source: string }>,
+  reason: string,
+): number {
+  const held = candidates
+    .map((c) => ({
+      recordNumber: String(c?.recordNumber ?? "").trim().slice(0, 80),
+      recordLink: storableRecordLink(c?.recordLink),
+      source: c?.source === "account_list" ? "account_list" : "completion_page",
+    }))
+    .filter((c) => c.recordNumber)
+    .slice(0, 5);
+  if (!held.length) return 0;
+  const run = db.get<Row>("SELECT status FROM portal_runs WHERE id = ?", [portalRunId]);
+  if (!run || text(run.status) !== "awaiting_human_submit") return 0;
+  db.run(
+    "UPDATE portal_runs SET submit_capture_candidates = ? WHERE id = ?",
+    [JSON.stringify({ at: nowIso(), reason: String(reason || "").slice(0, 300), candidates: held }), portalRunId],
+  );
+  return held.length;
+}
+
 export function captureConfirmation(
   db: AppDb,
   portalRunId: string,
@@ -10083,6 +10128,9 @@ export function captureConfirmation(
     applicationNumber?: string;
     permitNumber?: string;
     confirmationNumber?: string;
+    /** The link that opens the record on the portal (#400) — the run's and the track target's
+     *  tracking_url. Optional: the manual form sends none. Only an http(s) link is kept. */
+    recordLink?: string;
     submittedBy?: string;
     notes?: string;
   },
@@ -10124,6 +10172,8 @@ export function captureConfirmation(
   // The confirmation number is deliberately NOT accepted here — a portal's receipt number
   // is not a record the status page can be searched by.
   const filingNumber = (input.applicationNumber || "").trim() || (input.permitNumber || "").trim();
+  const recordLink = storableRecordLink(input.recordLink);
+  let recordLinkRefused = false;
   // Hoisted so the post-transaction correction close can read it — see below.
   let remainingTracks = 0;
 
@@ -10204,6 +10254,19 @@ export function captureConfirmation(
     const trackKey = runPermitType
       || text(stamped?.permit_type)
       || (text(stamped?.submission_type) === "interconnection" ? "nem" : "");
+    // THE RECORD'S LINK (#400). Rule 5 at the one creator: a utility-portal link never lands on a
+    // permit target (ensureCheckTarget would refuse it). Here it is dropped instead of refused —
+    // the number is the precious fact, and a link must never cost the filing its record.
+    let trackingUrl = recordLink;
+    if (trackingUrl) {
+      try { refuseUtilityUrlOnPermitTarget(trackKey === "nem" ? "nem" : "permit", trackingUrl); } catch { trackingUrl = ""; recordLinkRefused = true; }
+    }
+    // The run carries the link the way the automatic path's does; its unsure candidates are
+    // answered now, whoever supplied the number.
+    db.run(
+      "UPDATE portal_runs SET tracking_url = COALESCE(NULLIF(?, ''), tracking_url), submit_capture_candidates = '' WHERE id = ?",
+      [trackingUrl, portalRunId],
+    );
     const ensured = filingNumber
       ? ensureCheckTarget(db, projectForTarget, {
           track: SUBMITTAL_TRACK_TYPES.includes(trackKey as SubmittalTrackType) ? (trackKey as SubmittalTrackType) : undefined,
@@ -10211,6 +10274,7 @@ export function captureConfirmation(
           permitType: trackKey,
           applicationNumber: input.applicationNumber,
           permitNumber: input.permitNumber,
+          trackingUrl,
           notes: "Tracking a filing a human confirmed from the dashboard.",
           // Due on the very next sweep. A filing was just made; waiting out a full
           // check_frequency_days window before the first read is a week of silence.
@@ -10244,6 +10308,8 @@ export function captureConfirmation(
       applicationNumber: input.applicationNumber || "",
       permitNumber: input.permitNumber || "",
       confirmationNumber: input.confirmationNumber || "",
+      ...(recordLink ? { recordLinkSaved: !recordLinkRefused } : {}),
+      ...(recordLinkRefused ? { recordLinkRefused: "a utility-portal link is never a permit filing's tracking link (rule 5)" } : {}),
     });
     // A SECOND ROW, because the audit panel renders the ACTION NAME and nothing else. The
     // stage_detail chip is overwritten by the next thing that happens to this project; this
