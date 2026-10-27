@@ -61,6 +61,7 @@ import { issuingAgencyFor, projectForTrack } from "./permitProcess";
 import { DECLARED_VALUATION_FIELD, rebindsToValuation } from "./valuation";
 import { feeBracketFieldForLabel } from "./feeBracketFields";
 import { SERVICE_FEEDER_200A_FIELD, SERVICE_FEEDER_400A_FIELD } from "./batteryServiceFeeder";
+import { DESIGN_NOTE_SOURCES, EXPORT_LIMITING_NO_EVIDENCE_KEY } from "../../shared/src/exportLimiting";
 
 /** The submittal track an AHJ learn files, from the recipe discipline it will be keyed under
  *  (authoritative — the value the recipe lookup asks for), else the requested permit type.
@@ -152,12 +153,9 @@ export { isPlannerSecretKey, projectSecretValues };
 export { redactSecretValues };
 
 // The parser's long narrative texts — the ones designNotesDigest reads its decision lines from.
-// One list for the digest and for the planner's view (plannerFieldView), which leaves the raw
-// texts out BECAUSE the digest already carries what in them answers a portal question.
-const DESIGN_NOTE_SOURCES = [
-  "sitePlanNotesText", "roofPlanNotesText", "projectDescriptionText", "electricalCalcText",
-  "structuralCalcText", "labelsText", "reviewFlags", "utilityUploadNotesText", "planSetExtractedText",
-] as const;
+// One list (shared exportLimiting DESIGN_NOTE_SOURCES) for the digest, for the planner's view
+// (plannerFieldView), which leaves the raw texts out BECAUSE the digest already carries what in them
+// answers a portal question, and for the one exportLimiting derivation.
 
 function digestLines(project: ProjectRecord, maxChars: number, matches: (line: string) => boolean, secrets: string[] = []): string {
   const snap = (project.parserSnapshot || {}) as Record<string, unknown>;
@@ -201,6 +199,7 @@ function digestLines(project: ProjectRecord, maxChars: number, matches: (line: s
 // Left out of what the MODEL is sent (the returned projectFields — the learn's fill and binding
 // map — is unchanged, so nothing a recipe binds goes missing at replay):
 //   - the narrative texts the digest reads (DESIGN_NOTE_SOURCES);
+//   - the exportLimiting evidence flag (EXPORT_LIMITING_NO_EVIDENCE_KEY, #356) — the replay reads it;
 //   - the parser's own review chatter (its `notes`, the packet-readiness line): what the parser
 //     doubted and what the packet lacks are questions for the reviewer, not portal answers;
 //   - a raw parser key that only repeats the canonical key it is the source of — the key the
@@ -241,7 +240,9 @@ const PLANNER_ALIAS_OF_CANONICAL: Readonly<Record<string, string>> = {
   existingInvQty: "existingInverterQty",
 };
 export function plannerFieldView(projectFields: Record<string, string>): Record<string, string> {
-  const omit = new Set<string>([...DESIGN_NOTE_SOURCES, ...PLANNER_REVIEW_PROSE_KEYS]);
+  // The exportLimiting evidence flag (#356) is the replay's to read, never the model's: the planner
+  // gets exportLimiting itself, as before, and no new text.
+  const omit = new Set<string>([...DESIGN_NOTE_SOURCES, ...PLANNER_REVIEW_PROSE_KEYS, EXPORT_LIMITING_NO_EVIDENCE_KEY]);
   const same = (a: string | undefined, b: string | undefined) =>
     String(a ?? "").trim().toLowerCase() === String(b ?? "").trim().toLowerCase();
   const out: Record<string, string> = {};
@@ -595,15 +596,11 @@ export function buildPortalPlanner(
   if (digest) projectFields["designNotes"] = digest;
   // EXPORT-LIMITING ANSWER. NEM portals ask a REQUIRED "Do you propose to limit the
   // export capacity?" radio; without a bound field the planner leaves it blank and the
-  // trust gate refuses the recipe on every run (seen live on PGE). Derive it: the
-  // answer is "Yes" only when the design carries actual export-limiting evidence
-  // (PCS / power control system, export limit, non-export, NGOM) — a plain NEM system
-  // exports and answers "No". Never override an explicit parser/operator value.
-  if (!projectFields["exportLimiting"]) {
-    const evidence = `${fieldValues["exportMode"] ?? ""} ${fieldValues["pcs"] ?? ""} ${fieldValues["exportLimit"] ?? ""} ${projectFields["designNotes"] ?? ""}`;
-    projectFields["exportLimiting"] =
-      /non.?export|export.?limit\b|power control system|\bpcs\b|\bngom\b/i.test(evidence) ? "Yes" : "No";
-  }
+  // trust gate refuses the recipe on every run (seen live on PGE). The answer is the replay
+  // map's own exportLimiting (above, from resolveRecipeFieldValues): THE ONE DERIVATION
+  // (shared exportLimitingFor, #356), which reads the snapshot AND the design notes. This used to
+  // derive its own from the digest, so a PCS named only in the design notes was "Yes" here and
+  // "No" at replay.
 
   // KB CONTEXT. Fuzzy, state-aware lookup so imported reference knowledge
   // ("Portland General Electric" / "Arizona Public Service Company") still hits

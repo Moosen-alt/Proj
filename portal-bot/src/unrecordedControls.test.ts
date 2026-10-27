@@ -7,7 +7,8 @@
 //
 // Run: npx tsx portal-bot/src/unrecordedControls.test.ts
 import assert from "node:assert/strict";
-import { answerForUnrecordedControl, disconnectPartKeyFor, missingRequiredStopMessage, POLICY_QUESTION_JOB_KEYS, readDisconnectPart, UNPINNED_CONTROL_WHY } from "./unrecordedControls";
+import { answerForUnrecordedControl, disconnectPartKeyFor, missingRequiredStopMessage, NO_JOB_EVIDENCE_WHY, POLICY_QUESTION_JOB_KEYS, readDisconnectPart, UNPINNED_CONTROL_WHY } from "./unrecordedControls";
+import { EXPORT_LIMITING_NO_EVIDENCE_KEY } from "../../shared/src/exportLimiting";
 import { POLICY_RADIO_DEFAULTS, policyDefaultAnswerFor, policyProfileFor, policyScopeFor } from "./adapters/autoLearnAdapter";
 import { operatorPolicyAnswer, perJobAnswerKeyFor } from "../../shared/src/perJobQuestions";
 
@@ -240,6 +241,26 @@ check("the export-capacity question: exportLimiting absent or empty → the stan
   for (const fv of [STD, { ...STD, exportLimiting: "" }, { ...STD, exportLimiting: "   " }] as Array<Record<string, string>>) {
     assert.deepEqual(answerForUnrecordedControl({ label: EXPORT_Q, fieldType: "select", options: YES_NO }, fv, "nem"),
       { kind: "policy", value: "No", why: "the operator's standing policy answer" }, JSON.stringify(fv));
+  }
+});
+// #356: the replay map's "No" is also its default, when nothing on the job says either way. Beside it,
+// exportLimitingNoEvidence = "1" (backend resolveRecipeFieldValues, shared exportLimitingFor). That
+// "No" is the operator's standing answer and is typed and noted as one, never "from exportLimiting";
+// an explicit "No" from the design (flag "") stays the job's own, bound.
+check("#356 no evidence on the job: the standing No (policy), noted \"standing answer, no evidence on the job\" — never bound as the job's", () => {
+  assert.equal(NO_JOB_EVIDENCE_WHY, "standing answer, no evidence on the job");
+  assert.deepEqual(answerForUnrecordedControl({ label: EXPORT_Q, fieldType: "select", options: YES_NO }, { ...STD, exportLimiting: "No", [EXPORT_LIMITING_NO_EVIDENCE_KEY]: "1" }, "nem"),
+    { kind: "policy", value: "No", why: NO_JOB_EVIDENCE_WHY });
+});
+check("#356 an explicit No from the design (flag empty): bound to exportLimiting, the job's own answer", () => {
+  assert.deepEqual(answerForUnrecordedControl({ label: EXPORT_Q, fieldType: "select", options: YES_NO }, { ...STD, exportLimiting: "No", [EXPORT_LIMITING_NO_EVIDENCE_KEY]: "" }, "nem"),
+    { kind: "bound", key: "exportLimiting", value: "No" });
+  assert.deepEqual(answerForUnrecordedControl({ label: EXPORT_Q, fieldType: "select", options: YES_NO }, { ...STD, exportLimiting: "Yes", [EXPORT_LIMITING_NO_EVIDENCE_KEY]: "" }, "nem"),
+    { kind: "bound", key: "exportLimiting", value: "Yes" });
+});
+check("#356 the flag widens nothing: policy off or a permit portal still leaves the export question alone (null)", () => {
+  for (const scope of ["none", "permit"] as const) {
+    assert.equal(answerForUnrecordedControl({ label: EXPORT_Q, fieldType: "select", options: YES_NO }, { ...STD, exportLimiting: "No", [EXPORT_LIMITING_NO_EVIDENCE_KEY]: "1" }, scope), null, scope);
   }
 });
 check("the export-capacity question: a job value the dropdown does not offer is missing (bound, no value — a stop by name), never the standing No", () => {
