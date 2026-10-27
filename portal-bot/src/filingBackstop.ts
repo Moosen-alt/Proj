@@ -331,6 +331,9 @@ export interface FilingBackstop {
   readonly infoPageAdmissions: Array<{ entryId: string; where: string; exempted: boolean }>;
   /** Each request that took the info-page slot and did NOT match (origin + path, why). */
   readonly infoPageRefusedRequests: Array<{ where: string; refusals: string[] }>;
+  /** Let go: from its first line on, the handler lets every request that arrives through unjudged
+   *  (none reaching it between `disposed` and the route coming off is aborted), then the route is
+   *  removed. */
   dispose(): Promise<void>;
 }
 
@@ -999,6 +1002,15 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // approved or the information-page slot, and its own-write / drain exemption and the person's
   // verdict (#333) are its first leg's.
   const handler = async (route: any, request: any, via: RedirectHop | null = null): Promise<void> => {
+    // A DISPOSED BACKSTOP JUDGES NOTHING (#333, Helm Blocking 1): dispose sets `disposed` first and
+    // takes the route off last, and in that gap the person's verdict already reads false: their
+    // filing to a filing URL was aborted by the run that had just let go of the page. Now a request
+    // arriving between `disposed` and the route coming off is let through UNJUDGED — a payment URL
+    // included — exactly as every request is once the route is off: the moment main lets everything
+    // through starts a few ms sooner (dispose's first line, not its last). The other shape Helm named
+    // (keep judging until unroute, lifting nothing) would keep rule 1 on in that gap. A hop in the gap
+    // is followed (judgePaused returns null).
+    if (disposed) { await route.fallback().catch(() => null); return; }
     let method = "";
     let url = "";
     try { method = String(request.method() || "").toUpperCase(); url = String(request.url() || ""); } catch { /* unreadable: fall through as not-GET */ }

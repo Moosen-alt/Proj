@@ -64,6 +64,12 @@
 //     B1  also: the completion document the person's POST committed is in the adapter's navDocuments
 //         with `at` after the hand-over.
 //   Each is red before the stamps exist (the fields are undefined).
+//   [C] THE CAPTURE (Helm Blocking 1; C1-C8 and C10-C19 are allocated to the capture rework):
+//     C9  a person's filing DURING the run's dispose (after `disposed` is set, before the route comes
+//         off — the harness holds the context's unroute until the fixture counted the POST, or 4 s):
+//         it goes (1 POST), nothing is aborted at or after the click, and the run is not failed.
+//         Red before the handler's first-line `if (disposed) → fallback`: the disposed backstop
+//         judged the POST not the person's, and /apply/submit is a filing URL → aborted.
 // Against main (no hand-over) A1 and B1 FAIL by name: the person's POST is aborted.
 //
 //   npx tsx portal-bot/src/adapters/humanSubmitAfterReview.dom.smoke.ts
@@ -389,8 +395,12 @@ interface Replay {
   handOverSeenAt: number;
   /** The adapter's record of the main-frame documents that committed (url, method, when). */
   navDocuments: Array<{ url: string; method: string; at?: number }>;
+  /** The backstop's aborts (path, rule, flagged as the person's, when). */
+  aborts: Array<{ where: string; rule: string; human: boolean; at?: number }>;
+  /** What onUnroute returned (the dispose gap's action). */
+  gap?: unknown;
 }
-async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: RecipeStep[]; onHandOver?: (page: Page, adapter: RecipeAdapter) => Promise<unknown>; onArmed?: (page: Page, track: (p: Promise<unknown>) => void) => Promise<void>; onDrain?: (page: Page, track: (p: Promise<unknown>) => void) => void; afterFill?: (page: Page) => Promise<unknown> } = {}): Promise<Replay> {
+async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: RecipeStep[]; onHandOver?: (page: Page, adapter: RecipeAdapter) => Promise<unknown>; onArmed?: (page: Page, track: (p: Promise<unknown>) => void) => Promise<void>; onDrain?: (page: Page, track: (p: Promise<unknown>) => void) => void; afterFill?: (page: Page) => Promise<unknown>; onUnroute?: (page: Page) => Promise<unknown> } = {}): Promise<Replay> {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
   const from = posts.length;
@@ -401,6 +411,22 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
   const tracked: Array<Promise<unknown>> = [];
   const drain = { closedAt: 0 };
   let handOverSeenAt = 0;
+  // THE DISPOSE GAP (C9): the backstop's route is installed on the BrowserContext, and dispose sets
+  // `disposed` first and takes the route off last. Holding the context's unroute once dispose has
+  // begun makes that gap as long as onUnroute needs (on a real portal it is a few ms — a coin flip
+  // without the hold).
+  const gapState = { disposing: false, fired: false, value: undefined as unknown };
+  if (opts.onUnroute) {
+    const c = ctx as unknown as { unroute: (...a: unknown[]) => Promise<void> };
+    const unroute = c.unroute.bind(ctx);
+    c.unroute = async (...a: unknown[]) => {
+      if (gapState.disposing && !gapState.fired) {
+        gapState.fired = true;
+        gapState.value = await opts.onUnroute!(page).catch((e: unknown) => e);
+      }
+      return unroute(...a);
+    };
+  }
   // The adapter's own progress line at the hand-over is the moment a watching person can click.
   const adapter: RecipeAdapter = new RecipeAdapter(recipeFor(k, opts.extraSteps ?? []), {}, {}, {
     ...(opts.autoSubmit ? { autoSubmit: true } : {}),
@@ -422,7 +448,7 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
     // milliseconds (on a real portal its review read-back and screenshots take seconds), so the
     // backstop is let go only once the person's action, and the page it led to, have settled.
     const dispose = bs.dispose.bind(bs);
-    bs.dispose = async () => { if (pending) tracked.push(pending); await Promise.allSettled(tracked); if (tracked.length) await sleep(1500); return dispose(); };
+    bs.dispose = async () => { if (pending) tracked.push(pending); await Promise.allSettled(tracked); if (tracked.length) await sleep(1500); gapState.disposing = true; return dispose(); };
     // The moment the run starts draining its own save is when onDrain's person acts (whatever the
     // run's tail took to get there).
     if (opts.onDrain) {
@@ -460,6 +486,8 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
     drainClosedAt: drain.closedAt,
     handOverSeenAt,
     navDocuments,
+    aborts: (spied.bs?.aborts ?? []).map((a) => ({ where: a.where.replace(base, ""), rule: a.rule, human: !!a.humanInput, at: a.at })),
+    gap: gapState.value,
   };
 }
 /** The person's request was said plainly, and nobody was told to "click submit manually". */
@@ -557,6 +585,34 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
   const all = JSON.stringify({ m: r.message, d: r.data, rm: r.review.message, rd: r.review.data });
   check("B9 the person's payment click after the hand-over is aborted (automation never pays; the run still holds the page)", r.posts.length === 0, rbrief(r));
   check("B9 …the run is not failed, and never says the click came before the hand-over", r.ok === true && !all.includes("YOUR CLICK WAS HELD BACK"), rbrief(r));
+}
+
+// ---------------------------------------------------------------------------------------------
+// [C] The capture
+// ---------------------------------------------------------------------------------------------
+console.log("\n[C] THE CAPTURE (Helm Blocking 1)");
+{
+  // C9 (Helm Blocking 1, "a person's filing during `dispose`"): the run is letting go — `disposed` is
+  // set, the route is not yet off — and the person clicks the portal's submit. Held open by the
+  // harness until the fixture has counted the POST (or 4 s pass with nothing counted).
+  const r = await replay("C9", {
+    onUnroute: async (page) => {
+      const before = posts.length;
+      const clickAt = Date.now();
+      await personClicks(page);
+      const t0 = Date.now();
+      while (Date.now() - t0 < 4000 && !postsFor("C9", before).length) await sleep(25);
+      return clickAt;
+    },
+  });
+  const clickAt = typeof r.gap === "number" ? r.gap : 0;
+  const detail = `clickAt=${clickAt} aborts=${JSON.stringify(r.aborts)} ${rbrief(r)}`;
+  check("C9 a person's filing during the run's dispose: it goes (exactly one POST reaches /apply/submit)",
+    clickAt > 0 && r.posts.filter((p) => /\/apply\/submit$/.test(p)).length === 1, detail);
+  // An abort in the gap is what the run would later read as a held — or "may have gone" — filing.
+  check("C9 …nothing is aborted at or after the click (the disposed backstop judges nothing)",
+    clickAt > 0 && !r.aborts.some((a) => (a.at ?? 0) >= clickAt), detail);
+  check("C9 …and the run is not failed (no stopping abort of its own making in the gap)", r.ok === true, detail);
 }
 
 await browser.close();
