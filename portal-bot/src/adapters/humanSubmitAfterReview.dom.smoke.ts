@@ -47,7 +47,12 @@
 //         aborted their filing).
 //   [A, Helm Should-fix 2] AN INPUT COVERS ONLY THE DOCUMENT THAT SAW IT (each main-frame navigation
 //   request is stamped; a request is judged against the stamp BEFORE it, so A1's own form POST — itself
-//   a navigation — still goes; A1, B1, B5-B7 are the guard that the read precedes the stamp):
+//   a navigation — still goes). That the read precedes the stamp is held by a GUARD set, green before
+//   by design; its kill Ka: the stamp is written before navBefore is read (swap the two lines at the
+//   handler's top). Measured at 0c853c76, Ka reddens 20/100: A1 x3, A7 (the abort flagged humanInput),
+//   A10 x2, A11 x2 (including "the refused hop is flagged as the person's", the pin this ask shares
+//   with g1's hop verdict), A13 x2, B1 x3, B1b x2, B2 x2, B10 x3. B5-B7 stay green under Ka: they take
+//   the no-navigation path, green by construction, not guards of the ordering:
 //     A14 a person's GET link off the review page, then the next document's parse-time filing POST
 //         (inside the 4 s window of the click): aborted by the filing-URL rule, 0 POSTs, not in
 //         humanRequests, and the abort is NOT flagged humanInput (the flag is judged against the same
