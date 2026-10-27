@@ -146,7 +146,10 @@
 //     B17b (positive twin) the person's own submit on the handed-over page goes, then the completion
 //         page's script POSTs the filing (aborted): the run is NOT failed. GUARD pin, green before by
 //         design; it holds the identity `request.frame().page() === adapter.page` in real Chromium.
-//         Kill Kp: record `page: null` at the backstop's push site.
+//         Kill Kp: record `page: null` at the backstop's push site. Measured at b936673f, Kp reddens
+//         4/105: A1's page stamp, B10 x2 (personMovedOn's first clause reads the same predicate) and
+//         B17b's "not failed". Kill Kr (the predicate without its page filter) reddens B17's "fails
+//         by name" (1/105) and backstopStopHuman case 6 (1/18).
 //   [round 4, THE RECORD'S SHAPE] (Helm Blocking 1 "stamp humanRequests and aborts with at", nit :97
 //   "record the requesting page") — extra checks on existing cases, no new case numbers:
 //     A1  also: the person's request is stamped POST / resourceType document / `at` inside the click's
