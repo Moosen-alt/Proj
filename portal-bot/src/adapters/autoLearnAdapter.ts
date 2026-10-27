@@ -3966,6 +3966,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // so no request of it may file or pay, whichever control or script fired it. Removed in the
     // finally below, before anything hands this page to a person.
     const backstop = await installFilingBackstop(this.page, "learn run").catch(() => null);
+    const guardNote = backstop?.redirectGuardNote ?? "";
     try {
       // What discipline this run is filing. Held on the instance so the fill guard can refuse
       // a record type that contradicts it — the planner sees one page at a time and does not.
@@ -3990,6 +3991,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // left, ended, stopped or found nothing fillable on without entering this job's own data there
       // — the incident, settled here (every exit of the walk), before the backstop is disposed.
       result = this.settleInfoPageProof(result, backstop);
+      // #394: the walk starts on the page login left loaded — if the redirect guard could not
+      // cover it, the result says so (never silent).
+      if (guardNote) result = { ...result, message: `${result.message} ${guardNote}`.trim() };
       // The message quotes the portal (validation errors, notices) — a portal can echo an account.
       result = { ...result, message: this.scrubSecrets(result.message) };
       // #344: the unverified information page this walk held (for a person to verify), and every

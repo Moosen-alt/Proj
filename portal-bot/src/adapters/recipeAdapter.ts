@@ -1261,6 +1261,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // before this returns: the operator submits by hand in this same page after stopAtReview
     // (armSubmitWatch), and a route left behind would abort the person's own filing.
     this.backstop = await installFilingBackstop(this.page, "replay run").catch(() => null);
+    if (this.backstop?.redirectGuardNote) this.driftWarnings.push(this.backstop.redirectGuardNote);
     try {
       const ran = await this.runAll(project);
       // A dismissed dialog cancelled the approved click: the result says so in data too.
@@ -1620,13 +1621,17 @@ export class RecipeAdapter extends BasePortalAdapter {
     // this returns — the person clicks the portal's resubmit themselves in this page. A
     // filing/payment abort turns the reopen into a named failure.
     this.backstop = await installFilingBackstop(this.page, "correction reopen").catch(() => null);
+    // #394: the reopen acts on the page login left loaded (it never navigates first) — a page the
+    // redirect guard could not cover is said, never silent.
+    const guardNote = this.backstop?.redirectGuardNote ?? "";
+    if (guardNote) this.driftWarnings.push(guardNote);
     this.backstopReported = 0;
     try {
       const r = await this.reopenSuspendedFilingImpl(applicationNumber);
       await this.backstop?.dispose().catch(() => null);
       const stop = this.backstopStop();
       if (stop) return fail(`${stop} (The reopen then reported: ${String(r.message ?? "").slice(0, 300)})`, { ...(r.data ?? {}), needsHuman: true, driftWarnings: this.driftWarnings, guardRefusals: this.guardRefusals });
-      return r;
+      return guardNote ? { ...r, message: `${String(r.message ?? "")} ${guardNote}`.trim() } : r;
     } finally {
       await this.backstop?.dispose().catch(() => null);
       this.backstop = null;

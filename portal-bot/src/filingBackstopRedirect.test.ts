@@ -30,5 +30,55 @@ check("a refused redirect's stop says the first request reached the portal and n
 check("an ordinary abort still says nothing was sent", backstopSentLine({ ...hop, redirect: undefined }) === "Nothing was sent.");
 check("a later hop says how many redirects in a row", /redirect 3 in a row/.test(describeBackstopAbort({ ...hop, redirect: { ...hop.redirect, hop: 3 } })));
 
+// #394: a page open at install whose loaded document the response pause cannot re-bind is NAMED —
+// redirectsJudged false for it, and a note the run puts in its warnings — until it loads a new
+// document (created under the browser-level pause). A double with no browser warns nothing.
+{
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const bed = (opts: { attach: "throws" | "ok"; browser?: boolean }): { page: any; fire: (ev: string) => void } => {
+    const listeners = new Map<string, Array<() => void>>();
+    const session = { on: () => undefined, send: async () => ({}), detach: async () => undefined };
+    const browser = { newBrowserCDPSession: async () => session };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const page: any = {
+      on: (ev: string, fn: () => void) => { listeners.set(ev, [...(listeners.get(ev) ?? []), fn]); },
+      off: () => undefined,
+      mainFrame: () => ({ evaluate: async () => false, url: () => "http://127.0.0.1:9/home" }),
+      frames: () => [],
+      url: () => "http://127.0.0.1:9/home",
+    };
+    const ctx = {
+      route: async () => undefined, unroute: async () => undefined, on: () => undefined, off: () => undefined,
+      pages: () => [page],
+      newCDPSession: async () => { if (opts.attach === "throws") throw new Error("Protocol error: Target closed"); return session; },
+      browser: () => (opts.browser === false ? null : browser),
+    };
+    page.context = () => ctx;
+    return { page, fire: (ev) => { for (const fn of listeners.get(ev) ?? []) fn(); } };
+  };
+  const { installFilingBackstop } = await import("./filingBackstop");
+  {
+    const t = bed({ attach: "throws" });
+    const bs = (await installFilingBackstop(t.page, "learn run"))!;
+    check("uncovered: a page whose loaded document cannot be re-bound is not judged (redirectsJudged, redirectsJudgedOn)", !!bs && bs.redirectsJudged === false && bs.redirectsJudgedOn(t.page) === false, String(bs?.redirectsJudged));
+    check("uncovered: the run gets a note naming the gap and the run", /Redirect guard \(#394\): a page already open when the learn run began could not be covered/.test(bs?.redirectGuardNote ?? ""), bs?.redirectGuardNote);
+    t.fire("domcontentloaded");
+    check("uncovered: once it loads a new document it is judged, and the note is gone", bs.redirectsJudged === true && bs.redirectGuardNote === "", `${bs.redirectsJudged} ${bs.redirectGuardNote}`);
+    await bs.dispose();
+  }
+  {
+    const t = bed({ attach: "ok" });
+    const bs = (await installFilingBackstop(t.page, "replay run"))!;
+    check("covered: a page re-bound at install is judged, with no note", bs.redirectsJudged === true && bs.redirectGuardNote === "", `${bs.redirectsJudged} ${bs.redirectGuardNote}`);
+    await bs.dispose();
+  }
+  {
+    const t = bed({ attach: "throws", browser: false });
+    const bs = (await installFilingBackstop(t.page, "replay run"))!;
+    check("a double with no browser: not judged, and no note (nothing joined to fall short of)", bs.redirectsJudged === false && bs.redirectGuardNote === "", `${bs.redirectsJudged} ${bs.redirectGuardNote}`);
+    await bs.dispose();
+  }
+}
+
 if (failures) { console.error(`\nfilingBackstopRedirect: ${failures} FAILED`); process.exit(1); }
 console.log("\nfilingBackstopRedirect: all checks passed");

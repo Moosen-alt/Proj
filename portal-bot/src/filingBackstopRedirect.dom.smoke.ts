@@ -36,6 +36,9 @@
 //   crossDocPlain — the same with a plain Location: the hop does not take the slot, the click files
 //   replay      — a recipe's "Next" that 307s to /payment: the replay STOPS, named, and says the
 //                 first request reached the portal
+//   preloaded*  — #394: the page is loaded BEFORE the backstop is installed (the learner's
+//                 post-login page): its own autosave → /SubmitApplication, a fetch → /payment/charge,
+//                 a 307 loop (each hop counted once), a cross-origin iframe's form and fetch
 // MUST-PASS:
 //   ok307       — 307 → /next-step: the body arrives there, the page is the next step
 //   see303      — 303 → /next-step: the browser follows it as a GET
@@ -170,13 +173,22 @@ let persistent: BrowserContext | null = null;
 try {
   type Out = { hits: Hit[]; url: string; body: string; aborts: FilingBackstop["aborts"]; stopping: FilingBackstop["aborts"]; actResult: unknown; judged: boolean; drainRequests: string[]; ownWriteRequests: string[]; approvedAdmissions: FilingBackstop["approvedAdmissions"] };
   // The backstop layer itself, on a fresh context (or the persistent-profile one); `act` drives it.
-  const run = async (m: string, act: (page: Page, bs: FilingBackstop) => Promise<unknown>, opts: { before?: (ctx: BrowserContext) => Promise<void>; ctx?: BrowserContext; formUrl?: string } = {}): Promise<Out> => {
+  // installAfter (#394): the page is loaded FIRST and the backstop installed on it after — the
+  // learner's post-login page, the correction reopen's landing page.
+  const run = async (m: string, act: (page: Page, bs: FilingBackstop) => Promise<unknown>, opts: { before?: (ctx: BrowserContext) => Promise<void>; ctx?: BrowserContext; formUrl?: string; installAfter?: boolean } = {}): Promise<Out> => {
     const ctx = opts.ctx ?? await browser.newContext();
     ctx.setDefaultTimeout(8000);
     if (opts.before) await opts.before(ctx);
     const page = await ctx.newPage();
-    const bs = (await installFilingBackstop(page, "redirect smoke"))!;
-    await page.goto(opts.formUrl ?? `${base}/form?m=${m}`);
+    const url = opts.formUrl ?? `${base}/form?m=${m}`;
+    let bs: FilingBackstop;
+    if (opts.installAfter) {
+      await page.goto(url);
+      bs = (await installFilingBackstop(page, "redirect smoke"))!;
+    } else {
+      bs = (await installFilingBackstop(page, "redirect smoke"))!;
+      await page.goto(url);
+    }
     hits.length = 0;
     let actResult: unknown = null;
     try { actResult = await act(page, bs); } catch (e) { actResult = `threw ${String(e).slice(0, 160)}`; }
@@ -422,6 +434,43 @@ try {
       check(`MUST-PASS ${variant}: the approved click files exactly once, and the slot went to it`,
         hitsOn("/SubmitApplication") === 1 && o.approvedAdmissions.length === 1 && o.approvedAdmissions[0].where.endsWith("/SubmitApplication") && o.approvedAdmissions[0].navigation, `${show(o)} admitted=${JSON.stringify(o.approvedAdmissions)}`);
     }
+  }
+  {
+    // #394 — A DOCUMENT LOADED BEFORE THE BACKSTOP. The browser-level response pause never re-binds
+    // a document that had already committed, so the fetch / XHR of the page a run is handed already
+    // loaded (the learner's post-login page) was followed unjudged. Each page open at install now
+    // gets its own response pause too; without it every MUST-EXCLUDE cell here turns red.
+    const write = (to: string) => (page: Page) => withOwnWriteWindow(page, "Accept terms", () => page.evaluate((u) => fetch(u, { method: "POST", body: "terms=on" }).then((r) => `status ${r.status}`, () => "rejected"), to));
+    const bad = await run("review", write("/Project/AutosaveFile"), { installAfter: true });
+    check("preloaded: the install page's already-loaded document is covered (redirectsJudged)", bad.judged, show(bad));
+    check("MUST-EXCLUDE preloadedOwnWriteFile: on a review page loaded before install, the run's own autosave 307 → /SubmitApplication never reaches it",
+      hitsOn("/Project/AutosaveFile") === 1 && hitsOn("/SubmitApplication") === 0 && hopStop(bad, "/SubmitApplication"), `${show(bad)} act=${bad.actResult}`);
+    const pay = await run("xhr", (page) => page.evaluate(() => fetch("/step/xhrPay", { method: "POST", body: "x=1" }).then((r) => `status ${r.status}`, () => "rejected")), { installAfter: true });
+    check("MUST-EXCLUDE preloadedXhrPay: a fetch POST of a page loaded before install, 307 → /payment/charge: nothing reaches it, the fetch fails",
+      hitsOn("/step/xhrPay") === 1 && hitsOn("/payment/charge") === 0 && pay.actResult === "rejected" && hopStop(pay, "/payment/charge"), `${show(pay)} act=${pay.actResult}`);
+    const ok = await run("review", write("/Project/AutosaveOk"), { installAfter: true });
+    check("MUST-PASS preloadedOwnWriteOk: the same autosave 307 → /Project/Autosave2 reaches it once, nothing aborted",
+      hitsOn("/Project/Autosave2") === 1 && ok.aborts.length === 0 && ok.actResult === "status 200", `${show(ok)} act=${ok.actResult}`);
+    const loop = await run("xhr", (page) => page.evaluate(() => fetch("/step/loop", { method: "POST", body: "x=1" }).then((r) => `status ${r.status}`, () => "rejected")), { installAfter: true });
+    const sent = hits.filter((h) => h.path === "/step/loop").length;
+    check(`MUST-EXCLUDE preloadedLoop: a 307 to itself is followed ${MAX_REDIRECT_HOPS} times, then refused (every hop counted once)`,
+      sent === MAX_REDIRECT_HOPS + 1 && loop.stopping.some((a) => /more than \d+ redirects in a row/.test(a.why)), `sent=${sent} ${show(loop)}`);
+    const frame = await run("iframe", async (page) => {
+      const f = page.frames().find((x) => x.url().startsWith(base2));
+      if (!f) return "no frame";
+      await f.evaluate(() => (document.getElementById("hf") as HTMLFormElement).submit());
+      await page.waitForTimeout(900);
+      return "posted";
+    }, { installAfter: true, formUrl: `${base}/form?m=iframe&src=${encodeURIComponent(`${base2}/frame`)}` });
+    check("MUST-EXCLUDE preloadedIframe: a cross-origin iframe loaded before install, its form 307 → its /SubmitApplication: nothing reaches it",
+      frame.actResult === "posted" && hitsOn("/step/iframe", "127.0.0.2") === 1 && hitsOn("/SubmitApplication", "127.0.0.2") === 0 && hopStop(frame, "/SubmitApplication"), `${show(frame)} act=${frame.actResult}`);
+    const xhrFrame = await run("iframe", async (page) => {
+      const f = page.frames().find((x) => x.url().startsWith(base2));
+      if (!f) return "no frame";
+      return f.evaluate(() => fetch("/step/xhrPay", { method: "POST", body: "x=1" }).then((r) => `status ${r.status}`, () => "rejected"));
+    }, { installAfter: true, formUrl: `${base}/form?m=iframe&src=${encodeURIComponent(`${base2}/frame`)}` });
+    check("MUST-EXCLUDE preloadedIframeXhr: a fetch POST in a cross-origin iframe loaded before install, 307 → /payment/charge: nothing reaches it",
+      hitsOn("/step/xhrPay", "127.0.0.2") === 1 && hitsOn("/payment/charge", "127.0.0.2") === 0 && xhrFrame.actResult === "rejected" && hopStop(xhrFrame, "/payment/charge"), `${show(xhrFrame)} act=${xhrFrame.actResult}`);
   }
   {
     let fixtureAnswered = 0;
