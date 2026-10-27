@@ -282,6 +282,14 @@ const PAGES: Record<string, string> = {
   pgeHookedExisting: shell(PGE() + `<fieldset><legend>Existing Inverter</legend><label for="ex-model">Model</label>
     <select id="ex-model" data-test-role="existing-inverter-model-select"><option>Select...</option><option>${IQ8}</option></select></fieldset>`),
   pgeExistingAhead: shell(PGE().replace('<label for="inv-model-real">', `${EXISTING_SAME}\n    <label for="inv-model-real">`)),
+  // #380 MUST LAND: the same two layouts on a NEW form instance, where the shadow's per-instance
+  // id no longer matches the recording (PowerClerk's ids are per form). The fingerprint redirect
+  // has no recorded control to send the write back to, so whatever the rescue picks is written:
+  // main wrote the "Existing Inverter" Model (hook outside the recorded section) and the
+  // "Existing Model" ahead of the real one (containment label tied with the exact one).
+  pgeHookedRenamed: shell(PGE().replace(/pcInputBase34/g, "pcInputBase99") + `<fieldset><legend>Existing Inverter</legend><label for="ex-model">Model</label>
+    <select id="ex-model" data-test-role="existing-inverter-model-select"><option>Select...</option><option>${IQ8}</option></select></fieldset>`),
+  pgeAheadRenamed: shell(PGE().replace(/pcInputBase34/g, "pcInputBase99").replace('<label for="inv-model-real">', `${EXISTING_SAME}\n    <label for="inv-model-real">`)),
 };
 
 const server = http.createServer((req, res) => {
@@ -423,6 +431,18 @@ for (const key of ["pgeHookedExisting", "pgeExistingAhead"]) {
     assert.equal(other, "Select...", `the neighbour holds ${JSON.stringify(other)} — written into the wrong control`);
     assert.equal(arr, "Select...", `the PV array's Model holds ${JSON.stringify(arr)}`);
     assert.ok(reportedModel(r), `verified=${JSON.stringify(r.data.fieldsVerified)} skipped=${JSON.stringify(r.data.skipped)}`);
+  });
+}
+// #380 MUST LAND: with no recorded control left to redirect to, the rescue itself must pick the
+// real Model: a hook outside the recorded section is not the recorded control, and an exact
+// label outranks a label that only contains it.
+for (const key of ["pgeHookedRenamed", "pgeAheadRenamed"]) {
+  const r = await run(key, [step("inverterModel", "Model", "pcInputBase34", "Inverter Clone System")], { inverterModel: IQ8 });
+  const real = await r.read("inv-model-real"), other = await r.read("ex-model"), arr = await r.read("mod-model");
+  check(`MUST LAND ${key}: the real inverter Model gets the model, the neighbour and the PV array's Model stay "Select..."`, () => {
+    assert.equal(other, "Select...", `the neighbour holds ${JSON.stringify(other)} — written into the wrong control`);
+    assert.equal(arr, "Select...", `the PV array's Model holds ${JSON.stringify(arr)}`);
+    assert.equal(real, IQ8, `the inverter Model reads ${JSON.stringify(real)}`);
   });
 }
 await browser.close();

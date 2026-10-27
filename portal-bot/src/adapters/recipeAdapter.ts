@@ -6803,6 +6803,16 @@ export class RecipeAdapter extends BasePortalAdapter {
    * benefit. `inverterModel` becomes ["inverter","model"], which matches
    * `inverter-model-select` and cannot match `pv-array-model-select`. Every token must
    * appear, so a partial overlap never wins.
+   *
+   * THE RECORDED SECTION OUTRANKS THE SHORTEST HOOK (#380). Tokens say which side, not which
+   * block: an "Existing Inverter" fieldset's `existing-inverter-model-select` carries every token
+   * of `inverterModel` too, and when the real inverter Model has no hook of its own it was the
+   * only hit, so it won. On a new form instance the recorded id is gone, nothing redirects the
+   * write, and the existing system's Model was filled and reported verified. So among the hits,
+   * one in exactly the recorded section wins, then one whose section overlaps it, then one whose
+   * section cannot be read; a hit under a heading that shares nothing with the recorded section
+   * is not the recorded control and is never returned, which leaves the step to the section
+   * rescue. The section is read with resolveBySection's algorithm, which is the learner's.
    */
   private async resolveByTestHook(step: RecipeStep): Promise<unknown | null> {
     if (!this.page || typeof this.page.evaluate !== "function") return null;
@@ -6815,9 +6825,39 @@ export class RecipeAdapter extends BasePortalAdapter {
       .map((t) => (t === "module" ? "array" : t === "pv" ? "array" : t))
       .filter((t) => t.length > 2 && !["the", "certified", "make"].includes(t));
     if (tokens.length < 2) return null;
-    const found = await this.page.evaluate((toks: string[]) => {
+    const want = String(step.fingerprint?.section ?? "").trim();
+    const found = await this.page.evaluate((arg: { toks: string[]; want: string }) => {
+      const toks = arg.toks;
+      const clean = (t: string | null | undefined): string => (t || "").replace(/\s+/g, " ").trim().slice(0, 80);
+      const norm = (t: string): string => clean(t).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      // resolveBySection's sectionOf, verbatim: a section read differently never matches.
+      const sectionOf = (el: Element): string => {
+        const fs = el.closest("fieldset");
+        const legend = fs ? fs.querySelector("legend") : null;
+        if (legend && clean(legend.textContent)) return clean(legend.textContent);
+        const container = el.closest('section, [class*="panel"], [class*="card"], [class*="section"], [class*="form-section"], [class*="block"], [role="group"], [role="region"]');
+        if (container) {
+          const h = container.querySelector('legend, h1, h2, h3, h4, h5, h6, .panel-title, .card-title, .card-header, .section-title, .panel-heading');
+          if (h && clean(h.textContent)) return clean(h.textContent);
+        }
+        let node: Element | null = el;
+        for (let hops = 0; node && hops < 6; hops++) {
+          let sib: Element | null = node.previousElementSibling;
+          while (sib) {
+            if (/^(H[1-6]|LEGEND)$/.test(sib.tagName) && clean(sib.textContent)) return clean(sib.textContent);
+            const inner = sib.querySelector ? sib.querySelector("h1, h2, h3, h4, h5, h6, legend") : null;
+            if (inner && clean(inner.textContent)) return clean(inner.textContent);
+            sib = sib.previousElementSibling;
+          }
+          node = node.parentElement;
+        }
+        return "";
+      };
+      const wantS = norm(arg.want);
       let best: HTMLElement | null = null;
+      let bestTier = -1;
       let bestLen = Infinity;
+      let outside = "";
       for (const el of Array.from(document.querySelectorAll("[data-test-role], [data-testid], [data-test-id]")) as HTMLElement[]) {
         const hook = (el.getAttribute("data-test-role") || el.getAttribute("data-testid") || el.getAttribute("data-test-id") || "")
           .toLowerCase().replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[^a-z]+/g, " ");
@@ -6826,14 +6866,26 @@ export class RecipeAdapter extends BasePortalAdapter {
         // The control itself, or the nearest one this hook wraps.
         const ctl = (el.matches("input, select, textarea") ? el : el.querySelector("input, select, textarea")) as HTMLElement | null;
         if (!ctl) continue;
-        if (hook.length < bestLen) { bestLen = hook.length; best = ctl; }
+        // 3 exact section, 2 overlapping, 1 unreadable (or no section recorded); another section: never.
+        let tier = 1;
+        if (wantS) {
+          const sec = norm(sectionOf(ctl));
+          if (sec === wantS) tier = 3;
+          else if (sec && (sec.includes(wantS) || wantS.includes(sec))) tier = 2;
+          else if (sec) { outside = outside || sectionOf(ctl); continue; }
+        }
+        if (tier > bestTier || (tier === bestTier && hook.length < bestLen)) { bestTier = tier; bestLen = hook.length; best = ctl; }
       }
-      if (!best) return "";
       document.querySelectorAll("[data-rc-hook-hit]").forEach((e) => e.removeAttribute("data-rc-hook-hit"));
+      if (!best) return outside ? `\u0000${outside}` : "";
       best.setAttribute("data-rc-hook-hit", "1");
       return best.closest("[data-test-role], [data-testid], [data-test-id]")?.getAttribute("data-test-role")
         || best.getAttribute("data-test-role") || "hook";
-    }, tokens).catch(() => "") as string;
+    }, { toks: tokens, want }).catch(() => "") as string;
+    if (found.startsWith("\u0000")) {
+      this.resolveTrail.push(`  ...rescue: the only test hook naming ${JSON.stringify(field.slice(0, 30))} sits under ${JSON.stringify(found.slice(1, 35))}, not the recorded section ${JSON.stringify(want.slice(0, 34))} — not taken`);
+      return null;
+    }
     if (!found) return null;
     this.agingNotes.push(
       `"${String(step.note ?? field).slice(0, 34)}" resolved by the portal's own test hook ${JSON.stringify(found.slice(0, 40))} — stabler than the recorded id`,
@@ -6909,10 +6961,15 @@ export class RecipeAdapter extends BasePortalAdapter {
         const r = el.getBoundingClientRect();
         const cs = getComputedStyle(el);
         const shown = r.width > 2 && r.height > 2 && cs.visibility !== "hidden" && cs.display !== "none" && Number(cs.opacity) !== 0;
+        // Then an EXACT label beats one that only contains it (#380): a visible "Existing Model"
+        // ahead of the real "Model" in the same panel tied with it here and, being first, won.
+        // Label exactness outranks visibility too, so a concealed exact namesake comes back as
+        // still concealed (the original is kept) rather than handing the write to a neighbour.
         let score = -1;
-        if (sec === wantS) score = 4;
-        else if (sec.includes(wantS) || wantS.includes(sec)) score = 2;
+        if (sec === wantS) score = 8;
+        else if (sec.includes(wantS) || wantS.includes(sec)) score = 4;
         if (score < 0) continue;
+        if (l === wantL) score += 2;
         if (shown) score += 1;
         if (score > bestScore) { bestScore = score; best = el; }
       }
