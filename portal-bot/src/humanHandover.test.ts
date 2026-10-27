@@ -85,6 +85,8 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS");
     ["heldHumanClick", /  private heldHumanClick\(/],
     ["firstHumanDocument", /  private firstHumanDocument\(/],
     ["pageUrlNoHash", /  private pageUrlNoHash\(/],
+    // Round 4: the one "filing-shaped request after the click" predicate (a record reader).
+    ["personFilingShapedRequestAfter", /  private personFilingShapedRequestAfter\(/],
   ] as const) {
     const body = methodBody(recipe, sig);
     check(`${name}: found, and makes no input on the page`, body.length > 0 && !INPUT_CALL.test(body), body ? (body.match(INPUT_CALL) || [""])[0] : "not found");

@@ -56,6 +56,14 @@
 //         run still holds the page), the run is not failed, and never "your click before the
 //         hand-over was held back".
 //     B2 also: a held click's error page is not "where the run stopped".
+//   [round 4, THE RECORD'S SHAPE] (Helm Blocking 1 "stamp humanRequests and aborts with at", nit :97
+//   "record the requesting page") — extra checks on existing cases, no new case numbers:
+//     A1  also: the person's request is stamped POST / resourceType document / `at` inside the click's
+//         window / the requesting page is the run's page.
+//     A5  also: the payment abort is stamped with `at` inside the click's window.
+//     B1  also: the completion document the person's POST committed is in the adapter's navDocuments
+//         with `at` after the hand-over.
+//   Each is red before the stamps exist (the fields are undefined).
 // Against main (no hand-over) A1 and B1 FAIL by name: the person's POST is aborted.
 //
 //   npx tsx portal-bot/src/adapters/humanSubmitAfterReview.dom.smoke.ts
@@ -184,20 +192,32 @@ async function bed(k: string, opts: { arm?: boolean; handOver?: boolean; lock?: 
   if (opts.handOver !== false && opts.arm !== false) bs.handOverToHuman(`smoke ${k}`);
   return { page, bs, close: async () => { await bs.dispose().catch(() => null); await ctx.close().catch(() => null); } };
 }
+// Fields picked by name: a humanRequests entry carries the requesting Page (circular — JSON.stringify
+// would throw on it).
 const brief = (b: Bed, k: string, from: number): string => JSON.stringify({
-  posts: postsFor(k, from).map((p) => p.path), aborts: b.bs.aborts.map((a) => ({ rule: a.rule, where: a.where.replace(base, ""), human: !!a.humanInput })), humanRequests: b.bs.humanRequests.map((r) => ({ ...r, where: r.where.replace(base, "") })),
+  posts: postsFor(k, from).map((p) => p.path), aborts: b.bs.aborts.map((a) => ({ rule: a.rule, where: a.where.replace(base, ""), human: !!a.humanInput, at: a.at })),
+  humanRequests: b.bs.humanRequests.map((r) => ({ where: r.where.replace(base, ""), document: r.document, abortsBefore: r.abortsBefore, method: r.method, resourceType: r.resourceType, at: r.at })),
 }).slice(0, 700);
 
 console.log("\n[A] THE BACKSTOP, DIRECTLY");
 {
   const from = posts.length;
   const b = await bed("A1");
+  const clickAt = Date.now();
   await personClicks(b.page);
   await sleep(900);
+  const doneAt = Date.now();
   check("A1 a person's click after the hand-over: their form POST (a filing URL) reaches the portal",
     postsFor("A1", from).filter((p) => /\/apply\/submit$/.test(p.path)).length === 1, brief(b, "A1", from));
   check("A1 …recorded as the person's request (a main-frame document submission), no stopping abort",
     b.bs.humanRequests.some((r) => r.document && /\/apply\/submit$/.test(r.where)) && b.bs.stoppingAborts().length === 0, brief(b, "A1", from));
+  // Round 4 (Helm Blocking 1, nit :97): the record says WHEN it went, HOW (method, resource type) and
+  // FROM WHICH PAGE — the capture judges a click by requests after it, never by a GET or a beacon,
+  // and counts only the handed-over page's document request.
+  const rec = b.bs.humanRequests.find((r) => /\/apply\/submit$/.test(r.where));
+  check("A1 …stamped: POST, resourceType document, `at` inside the click's window, and the requesting page is the run's page",
+    !!rec && rec.method === "POST" && rec.resourceType === "document" && typeof rec.at === "number" && rec.at >= clickAt && rec.at <= doneAt && rec.page === b.page,
+    `clickAt=${clickAt} doneAt=${doneAt} samePage=${!!rec && rec.page === b.page} ${brief(b, "A1", from)}`);
   await b.close();
 }
 {
@@ -230,10 +250,16 @@ console.log("\n[A] THE BACKSTOP, DIRECTLY");
 {
   const from = posts.length;
   const b = await bed("A5");
+  const clickAt = Date.now();
   await personClicks(b.page);
   await sleep(700);
+  const doneAt = Date.now();
   check("A5 a payment URL right after a person's click: aborted (payment is never lifted)",
     postsFor("A5", from).length === 0 && b.bs.aborts.some((a) => /\/payment\/charge$/.test(a.where)), brief(b, "A5", from));
+  // Round 4 (Helm Blocking 1): an abort says when it was held — "a stopping abort AFTER the click".
+  const held = b.bs.aborts.find((a) => /\/payment\/charge$/.test(a.where));
+  check("A5 …the abort is stamped with when it was held (`at` inside the click's window)",
+    !!held && typeof held.at === "number" && held.at >= clickAt && held.at <= doneAt, `clickAt=${clickAt} doneAt=${doneAt} ${brief(b, "A5", from)}`);
   await b.close();
 }
 {
@@ -359,6 +385,10 @@ interface Replay {
   humanRequests: string[];
   /** When the run's first own-save drain closed (0: none). */
   drainClosedAt: number;
+  /** When the adapter's "the page is yours" progress line arrived (0: never). */
+  handOverSeenAt: number;
+  /** The adapter's record of the main-frame documents that committed (url, method, when). */
+  navDocuments: Array<{ url: string; method: string; at?: number }>;
 }
 async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: RecipeStep[]; onHandOver?: (page: Page, adapter: RecipeAdapter) => Promise<unknown>; onArmed?: (page: Page, track: (p: Promise<unknown>) => void) => Promise<void>; onDrain?: (page: Page, track: (p: Promise<unknown>) => void) => void; afterFill?: (page: Page) => Promise<unknown> } = {}): Promise<Replay> {
   const ctx = await browser.newContext();
@@ -370,10 +400,12 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
   const spied: { bs: FilingBackstop | null } = { bs: null };
   const tracked: Array<Promise<unknown>> = [];
   const drain = { closedAt: 0 };
+  let handOverSeenAt = 0;
   // The adapter's own progress line at the hand-over is the moment a watching person can click.
   const adapter: RecipeAdapter = new RecipeAdapter(recipeFor(k, opts.extraSteps ?? []), {}, {}, {
     ...(opts.autoSubmit ? { autoSubmit: true } : {}),
     onProgress: (p) => {
+      if (/the page is yours/i.test(String(p.message ?? "")) && !handOverSeenAt) handOverSeenAt = Date.now();
       if (/the page is yours/i.test(String(p.message ?? "")) && opts.onHandOver && !pending) pending = opts.onHandOver(page, adapter).then((v) => { extra = v; }, (e) => { extra = e; });
     },
   });
@@ -416,6 +448,7 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
   if (opts.afterFill) await opts.afterFill(page).catch(() => null);
   await sleep(2000); // a completion page's read lands ~1.2 s after its load
   const review = await adapter.stopAtReview();
+  const navDocuments = [...((adapter as unknown as { navDocuments?: Array<{ url: string; method: string; at?: number }> }).navDocuments ?? [])];
   await ctx.close().catch(() => null);
   return {
     ok: fill.ok, message: String(fill.message ?? ""), data: (fill.data ?? {}) as Record<string, unknown>,
@@ -425,6 +458,8 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
     observed,
     humanRequests: (spied.bs?.humanRequests ?? []).map((r) => r.where.replace(base, "")),
     drainClosedAt: drain.closedAt,
+    handOverSeenAt,
+    navDocuments,
   };
 }
 /** The person's request was said plainly, and nobody was told to "click submit manually". */
@@ -441,6 +476,12 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
   check("B1 …the run is NOT failed", r.ok === true, rbrief(r));
   check("B1 …and it reports the person's submit from the review window (automation clicked nothing)",
     r.review.ok === true && r.review.data.humanSubmittedInReviewWindow === true && r.review.data.finalSubmitClicked === false, rbrief(r));
+  // Round 4 (Helm Blocking 1): the run's record of committed documents says WHEN each committed — the
+  // capture's "a main-frame document committed by a non-GET request within a short bound".
+  const done = r.navDocuments.find((d) => /\/apply\/submit$/.test(d.url) && d.method === "POST");
+  check("B1 …the completion document the person's POST committed is recorded with when it committed (`at` after the hand-over)",
+    !!done && typeof done.at === "number" && r.handOverSeenAt > 0 && done.at >= r.handOverSeenAt,
+    `handOverSeenAt=${r.handOverSeenAt} navDocuments=${JSON.stringify(r.navDocuments.map((d) => ({ ...d, url: d.url.replace(base, "") })))}`);
 }
 {
   // The click settles (its watch report and its held request) before the run can hand over: the watch

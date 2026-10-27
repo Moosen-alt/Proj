@@ -169,6 +169,31 @@ export interface BackstopAbort {
   /** #358: a REDIRECT the backstop refused to follow. `where` is the Location; the request to `from`
    *  (origin + path) REACHED the portal, which answered `status`; `hop` counts the redirects. */
   redirect?: { from: string; status: number; hop: number };
+  /** #333 round 4: when it was held (Date.now()) — "a stopping abort AFTER the person's click" is read
+   *  against it. Set on every abort the backstop records; optional so a record built elsewhere (a
+   *  test's literal) still types. */
+  at?: number;
+}
+
+/** #333 — a request a person's own input let through after the hand-over (FilingBackstop.humanRequests).
+ *  The stamps (round 4) are optional so a record built elsewhere still types; the backstop sets every
+ *  one. */
+export interface BackstopHumanRequest {
+  /** origin + pathname only. */
+  where: string;
+  /** A main-frame document request (a form submission or a navigation) of the requesting page. */
+  document: boolean;
+  /** How many aborts had been recorded before it (aborts after it are the page the click led to). */
+  abortsBefore: number;
+  /** When it went (Date.now(), as the backstop let it through). */
+  at?: number;
+  /** Its HTTP method (upper case; "?" when unreadable). A GET navigation is never evidence of a filing. */
+  method?: string;
+  /** Chromium's resource type ("document", "fetch", "xhr", "ping" for a beacon…). */
+  resourceType?: string;
+  /** The page that sent it (a Playwright Page; null when unreadable) — compared by identity only,
+   *  never serialised (it is circular). */
+  page?: unknown;
 }
 
 /** A redirect hop being judged (#358): which hop, what answered it, and the own-write / drain
@@ -262,9 +287,10 @@ export interface FilingBackstop {
    *  returns). Nested calls are counted. */
   withAutomationInput<T>(pg: unknown, fn: () => Promise<T>): Promise<T>;
   /** Each request a person's own input let through after the hand-over: where it went (origin +
-   *  path), whether it was a main-frame document request (a form submission), and how many aborts
-   *  had been recorded before it (aborts after it are the page the person's click led to). */
-  readonly humanRequests: Array<{ where: string; document: boolean; abortsBefore: number }>;
+   *  path), whether it was a main-frame document request (a form submission), how many aborts had
+   *  been recorded before it (aborts after it are the page the person's click led to), and (round 4)
+   *  when it went, its method, its resource type and the page that sent it. */
+  readonly humanRequests: BackstopHumanRequest[];
   /** Aborts that stop the run: filing, payment, review lockdown. */
   stoppingAborts(): BackstopAbort[];
   /** #358: a 307 / 308 of a request this run let through is judged before Chromium follows it (the
@@ -835,7 +861,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   const humanInputAt = new WeakMap<object, number>();
   let humanWatchArmed = false;
   let handedOverAt = 0;
-  const humanRequests: Array<{ where: string; document: boolean; abortsBefore: number }> = [];
+  const humanRequests: BackstopHumanRequest[] = [];
   const recentHumanInput = (pg: unknown): boolean => {
     if (!pg || typeof pg !== "object") return false;
     const t = humanInputAt.get(pg as object) ?? 0;
@@ -1028,6 +1054,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         rule, method: method || "?", where: whereOf(url), why, resourceType,
         ...(heldInput ? { humanInput: true, ...(beforeHandOver ? { beforeHandOver: true } : {}) } : {}),
         ...(via ? { redirect: { from: via.from, status: via.status, hop: via.hop } } : {}),
+        at: Date.now(),
       });
       await route.abort("blockedbyclient").catch(() => null);
     };
@@ -1279,10 +1306,15 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     // The slot's request was not one 4(b) would have held: it passes as on main (recorded).
     if (infoAdmit && infoAdmit.refusals.length === 0) infoPageAdmissions.push({ entryId: infoAdmit.entryId, where: whereOf(url), exempted: false });
     // The person's request is recorded once, on its first leg: a hop is the same request going on.
+    // Round 4: stamped with when it went, its method and resource type, and the page that sent it —
+    // recorded on a request whose verdict is already decided (the stamps change no rule's outcome).
     if (human && !via) {
       let mainFrame = false;
       try { mainFrame = !!requestPage && typeof requestPage.mainFrame === "function" && request.frame() === requestPage.mainFrame(); } catch { mainFrame = false; }
-      humanRequests.push({ where: whereOf(url), document: mainFrame && /^document$/i.test(resourceType), abortsBefore: aborts.length });
+      humanRequests.push({
+        where: whereOf(url), document: mainFrame && /^document$/i.test(resourceType), abortsBefore: aborts.length,
+        at: Date.now(), method: method || "?", resourceType, page: requestPage ?? null,
+      });
     }
     await letThrough(route, request, via, human);
   };
@@ -1318,7 +1350,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     let next = "";
     try { next = new URL(location, url).href.split("#")[0]; } catch { next = ""; }
     const refuse = (where: string, why: string): "fail" => {
-      aborts.push({ rule: "filing-url", method: method || "?", where, why, resourceType, redirect: { from, status, hop } });
+      aborts.push({ rule: "filing-url", method: method || "?", where, why, resourceType, redirect: { from, status, hop }, at: Date.now() });
       return "fail";
     };
     if (!/^https?:\/\//i.test(next)) {

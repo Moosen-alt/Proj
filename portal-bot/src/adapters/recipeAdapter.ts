@@ -1337,6 +1337,20 @@ export class RecipeAdapter extends BasePortalAdapter {
     return r ? r.abortsBefore : Infinity;
   }
 
+  /** #333 round 4 — THE ONE PREDICATE for "a FILING-SHAPED request of the person's went at or after
+   *  `at`" (the capture's committed/held split and the review step's wording both read it): a
+   *  main-frame document request (a form submission, to any URL), or a fetch/XHR to a submit or
+   *  payment URL — never a GET (a navigation is not evidence of a filing) and never a beacon or any
+   *  other resource type, whatever its URL says (an analytics "/form_submit" beacon matches the
+   *  filing-URL vocabulary). Read off the HANDED-OVER backstop's record only: by the time the run
+   *  reports, fillApplication's finally has let `this.backstop` go. */
+  private personFilingShapedRequestAfter(at: number): boolean {
+    const rs = this.handedOverBackstop?.humanRequests ?? [];
+    return rs.some((r) => typeof r.at === "number" && r.at >= at
+      && String(r.method ?? "").toUpperCase() !== "GET"
+      && (r.document || (/^(fetch|xhr)$/i.test(String(r.resourceType ?? "")) && isSubmitOrPayRequestUrl(r.where))));
+  }
+
   /** #333 — a person's click held back BEFORE the hand-over (a stopping abort flagged humanInput).
    *  After it, a flagged abort is the person's own payment (rule 1 never lifts): not "click again". */
   private heldHumanClick(): boolean {
@@ -1395,7 +1409,10 @@ export class RecipeAdapter extends BasePortalAdapter {
   // POST (bypass-reload.log: 2 POSTs). Now: only navigation RESPONSES that commit a document are
   // kept (not 204/205, not a 3xx hop, not an attachment), and the method is the one whose URL is
   // the page's current URL. A URL no committing response produced (a pushState) is unknown.
-  private navDocuments: Array<{ url: string; method: string }> = [];
+  // #333 round 4: each entry also says WHEN the document committed (`at`, Date.now() at its response —
+  // not when its request went), which the capture's "a main-frame document committed by a non-GET
+  // request within a short bound" reads.
+  private navDocuments: Array<{ url: string; method: string; at: number }> = [];
   private get lastDocumentMethod(): string | null {
     const here = typeof this.page?.url === "function" ? String(this.page.url() ?? "").split("#")[0] : "";
     if (!here) return null;
@@ -1417,7 +1434,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         const status = Number(r.status());
         const cd = String((r.headers() || {})["content-disposition"] || "");
         if (status === 204 || status === 205 || (status >= 300 && status < 400) || /\battachment\b/i.test(cd)) return;
-        this.navDocuments.push({ url: String(r.url() || "").split("#")[0], method: String(req.method() || "").toUpperCase() });
+        this.navDocuments.push({ url: String(r.url() || "").split("#")[0], method: String(req.method() || "").toUpperCase(), at: Date.now() });
         if (this.navDocuments.length > 60) this.navDocuments.shift();
       } catch { /* a response we cannot read adds nothing: the method stays unknown */ }
     });
