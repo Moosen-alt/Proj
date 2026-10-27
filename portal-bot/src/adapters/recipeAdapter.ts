@@ -104,15 +104,20 @@ import { commitField, installSettleProbe, waitForSettled } from "../settle";
 import { siteOfUrl } from "../siteOf";
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, withAutomationInput, describeBackstopAbort, backstopSentLine, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, isStoppingAbort, type FilingBackstop } from "../filingBackstop";
 
-/** #333: what the person is told when their own click on the review page came before the run had
- *  handed it over (the backstop held it; nothing was sent). */
-/** #333: the run could not hand the review page over (its input watch could not be armed), so the
- *  review lockdown holds until the stage finishes — said plainly, never silently. */
+/** #333: the run did not hand the review page over — its input watch could not be armed, or (Helm
+ *  Should-fix 3) a stopping abort the watch did not flag as the person's is on record, so the run
+ *  fails by name — and the review lockdown holds until the stage finishes: said plainly, never
+ *  silently, and never "the page is yours". */
 export const NOT_HANDED_OVER_NOTE = "THE RUN COULD NOT HAND THE REVIEW PAGE OVER TO YOU: the review lockdown holds until the stage says it has finished, so click submit only then (an earlier click is held back, and nothing is sent).";
 /** #333: why the run's own input is refused once it has started handing the page over. */
 const INPUT_CLOSED = "the run has stopped at review and is handing the page to a person — it makes no input of its own on the page from here";
 
-export const HUMAN_CLICK_HELD_NOTE = "YOUR CLICK WAS HELD BACK: you clicked on the review page before the run had handed it over to you, so that request was stopped and nothing was sent. If the window shows an error page, go Back to the review page; then click submit again — the run has let go of the page now.";
+/** #333: what the person is told when their own click on the review page came before the run had
+ *  handed it over — a click the ARMED watch saw (the abort is flagged humanInput + beforeHandOver);
+ *  the backstop held it, nothing was sent, and the run is still handed over. A click before the watch
+ *  listened (during the run's last writes or its arm) is held unflagged: the run is not handed over
+ *  (NOT_HANDED_OVER_NOTE) and fails by name, and this note is never said (Helm Should-fix 3). */
+export const HUMAN_CLICK_HELD_NOTE ="YOUR CLICK WAS HELD BACK: you clicked on the review page before the run had handed it over to you, so that request was stopped and nothing was sent. If the window shows an error page, go Back to the review page; then click submit again — the run has let go of the page now.";
 /** #333 round 3 (skeptic r2b): a request the person sent from the handed-over page went through, and
  *  the click detector did not see it as the portal's final submit (an unknown label, a fetch submit).
  *  It may have been the filing: never "click submit" or "nothing was filed" to someone who may have. */
@@ -2900,13 +2905,21 @@ export class RecipeAdapter extends BasePortalAdapter {
       // THE RUN'S OWN INPUT ENDS HERE (#333): its guarded clicks, presses and steps refuse from now on,
       // so the input watch armed next can only ever record a person's input.
       this.inputsClosed = `${INPUT_CLOSED} (${this.recipe.id})`;
-      const handOverArmed = await this.backstop!.watchHumanInput().catch(() => false);
+      // A FAILING RUN IS NEVER HANDED OVER (Helm Should-fix 3): a stopping abort the input watch did
+      // not flag as the person's (a click before the watch listened — during the run's last writes or
+      // its arm — or the page acting by itself) fails the run by name below. Asked BEFORE the arm (an
+      // armed watch would flag the person's next click as a held one, and the failing run would tell
+      // them to click again) and again just before the hand-over (an abort recorded during the arm).
+      // A click the armed watch saw is flagged, so it still hands over. Never asked earlier: the run's
+      // own helper input is not fenced, so arming sooner would flag automation's aborts as the person's.
+      const unflaggedStop = (): boolean => !!this.backstop && this.backstop.stoppingAborts().some((a) => !a.humanInput);
+      const handOverArmed = !unflaggedStop() && await this.backstop!.watchHumanInput().catch(() => false);
       // THE HAND-OVER (#333, owner ruling 2026-10-14) — BEFORE the drain and the read-only
       // housekeeping below (skeptic r2 F2): a person who clicks while the portal is still saving the
       // run's last answer is let through and their request recorded as theirs — the drain's and the
       // own-write window's own-save exemptions never take it. The page's own scripts posting with no
       // click still meet the lockdown below until fillApplication returns.
-      handedOver = handOverArmed && await this.handOverReviewPage();
+      handedOver = handOverArmed && !unflaggedStop() && await this.handOverReviewPage();
     }
     await this.drainBeforeReviewLock();
     this.backstop?.lockReview(`replay stopped at review (${this.recipe.id})`);
@@ -2920,7 +2933,8 @@ export class RecipeAdapter extends BasePortalAdapter {
           : "Staged to review — the page is yours to verify and submit", 0);
       }
       else {
-        // Fail closed AND say so, now and in the hand-off: the lockdown holds until the stage finishes.
+        // Fail closed AND say so, now and in the hand-off: the lockdown holds until the stage finishes
+        // (a failed arm, or an unflagged stop on record — the run then fails by name).
         if (!this.reviewHandoffNotes.includes(NOT_HANDED_OVER_NOTE)) this.reviewHandoffNotes.push(NOT_HANDED_OVER_NOTE);
         if (!this.driftWarnings.includes(NOT_HANDED_OVER_NOTE)) this.driftWarnings.push(NOT_HANDED_OVER_NOTE);
         this.progress("wait", NOT_HANDED_OVER_NOTE, 0);

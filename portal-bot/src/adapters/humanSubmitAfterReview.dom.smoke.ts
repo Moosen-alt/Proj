@@ -83,6 +83,21 @@
 //         and a person's click right after the lock: never handed over (the watch never armed, no
 //         "the page is yours"), 0 POSTs, the run fails by name (STOPPED BY THE NETWORK BACKSTOP), as
 //         on main. Red before: every guided-manual replay was handed over and the click filed.
+//   [B, Helm Should-fix 3] A FAILING RUN IS NEVER HANDED OVER: an UNFLAGGED stopping abort (a click the
+//   watch did not see) refuses the hand-over before the arm and again just before handOverReviewPage;
+//   each case asserts 0 POSTs to /apply/submit, failed by name, NOT_HANDED_OVER_NOTE in driftWarnings,
+//   reviewHandoffNotes and the progress line, never "the page is yours", never "YOUR CLICK WAS HELD BACK":
+//     B13 a person's click during the run's LAST WRITES (after its tick on an 8 s "Saving..." review
+//         page, before the watch is armed), then a second click at the refusal (or at "the page is
+//         yours"): the watch is never armed. Red before: handed over, and the second click filed.
+//         Kill (no check before the arm): the armed watch flags the second click and the failing run
+//         says "YOUR CLICK WAS HELD BACK".
+//     B14 a person's click as the run arms its watch (before the arm itself). Red before: handed
+//         over over a run that then fails by name. Kill (no check before handOverReviewPage): same.
+//     B14b a filing request recorded WHILE the arm runs (page-script fetch alongside it, the
+//         deterministic stand-in for a click inside the 12-19 ms arm). Red before / kill: as B14.
+//     B2 (above) is the guard: a click the watch SAW still hands over (widening the refusal to any
+//         stopping abort reddens it).
 //   [round 4, THE RECORD'S SHAPE] (Helm Blocking 1 "stamp humanRequests and aborts with at", nit :97
 //   "record the requesting page") — extra checks on existing cases, no new case numbers:
 //     A1  also: the person's request is stamped POST / resourceType document / `at` inside the click's
@@ -105,7 +120,7 @@ import http from "node:http";
 import { chromium, type Page } from "playwright";
 import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../../shared/src/types";
 import { backstopFor, installFilingBackstop, isStoppingAbort, withBackstopWindow, withOwnWriteWindow, type FilingBackstop } from "../filingBackstop";
-import { HUMAN_CLICK_HELD_NOTE, PERSON_REQUEST_WENT_NOTE, RecipeAdapter } from "./recipeAdapter";
+import { HUMAN_CLICK_HELD_NOTE, NOT_HANDED_OVER_NOTE, PERSON_REQUEST_WENT_NOTE, RecipeAdapter } from "./recipeAdapter";
 import { armSubmitCapture } from "../index";
 
 let failures = 0;
@@ -132,6 +147,9 @@ const formSubmit = (k: string): string => `<form method="post" action="/h/${k}/a
 // A fetch submit, then the completion page by location.href — under a label the click classifier
 // does not know (classifyRecordedClick("Send to City") is "capture", never "finalSubmit").
 const SEND = (k: string): string => `<button type="button" id="send" onclick="fetch('/h/${k}/api/application', { method: 'POST', body: 'x=1' }).then(function () { location.href = '/h/${k}/done'; })">Send to City</button>`;
+// The portal's submit as a fetch (no navigation: a held click leaves the review page where it was, so
+// the person can click it again), then the completion page by location.href.
+const FETCH_SUBMIT = (k: string): string => `<button type="button" id="btnSubmit" onclick="fetch('/h/${k}/apply/submit', { method: 'POST', body: 'x=1' }).then(function () { location.href = '/h/${k}/done'; }).catch(function () {})">Submit Application</button>`;
 // Processor endpoints rule 1 must know (Helm Should-fix 13), served by the loopback fixture only.
 const PROCESSOR_PATHS: Record<string, string> = {
   A5b: "xml/v1/request.api",
@@ -144,19 +162,20 @@ const reviewBody = (k: string): string => {
   if (k === "B5") return `${summary}${formSubmit(k)}<button type="button" id="saveLater" onclick="fetch('/h/B5/api/save-later', { method: 'POST', body: 'x=1' }).then(function () { location.href = '/h/B5/records'; })">Save for Later</button>`;
   if (k === "B6") return `${summary}${formSubmit(k)}${SEND(k)}`;
   // The run's tick on the review page starts an 8 s "Saving..." (PowerClerk's batched autosave shape;
-  // long enough to outlast the run's tail up to its drain).
-  if (k === "B7") return `${summary}<span data-test-role="project-save-state">Saved</span>
-    <div><input type="checkbox" id="terms"> <label for="terms">I certify the information in this application is correct</label></div>${formSubmit(k)}${SEND(k)}
+  // long enough to outlast the run's tail up to its drain). B13: the same page, with a fetch submit.
+  if (k === "B7" || k === "B13") return `${summary}<span data-test-role="project-save-state">Saved</span>
+    <div><input type="checkbox" id="terms"> <label for="terms">I certify the information in this application is correct</label></div>${k === "B13" ? FETCH_SUBMIT(k) : `${formSubmit(k)}${SEND(k)}`}
     <script>
       var st = document.querySelector("[data-test-role='project-save-state']"); var timer = null;
       document.getElementById('terms').addEventListener('change', function () {
         st.textContent = 'Saving...';
         if (timer) return;
         timer = setTimeout(function () {
-          fetch('/h/B7/Project/SaveChanges', { method: 'POST', body: 'terms=on' }).then(function () { st.textContent = 'Saved'; }).catch(function () { st.textContent = 'Save failed'; });
+          fetch('/h/${k}/Project/SaveChanges', { method: 'POST', body: 'terms=on' }).then(function () { st.textContent = 'Saved'; }).catch(function () { st.textContent = 'Save failed'; });
         }, 8000);
       });
     </script>`;
+  if (k === "B14" || k === "B14b") return `${summary}${FETCH_SUBMIT(k)}`;
   if (k === "B8") return `${summary}${formSubmit(k)}<a id="older" href="/h/B8/record">Older application BLD-2026-900001</a>`;
   if (k === "B9") return `${summary}${formSubmit(k)}<button type="button" id="pay" onclick="fetch('/h/B9/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function () {})">Pay Fees</button>`;
   if (k === "A4") return `${summary}<button type="button" id="btnSubmit" onclick="window.open('/h/A4/popup', '_blank')">Submit Application</button>`;
@@ -485,7 +504,10 @@ type Track = (p: Promise<unknown>) => void;
  *                  as index.ts passes it when the runner watches for the person's submit.
  *   at             the fixture page the recipe ends on (default "review").
  *   onHandOver     fires at the adapter's "the page is yours" progress line.
- *   onBeforeArm    fires inside watchHumanInput, BEFORE the real arm (the run's last writes are done).
+ *   onRefused      fires at the adapter's NOT_HANDED_OVER_NOTE progress line (the hand-over refused).
+ *   onTailSweep    awaited at each tail sweep of the page the run ends on (emptyRequiredControls: after
+ *                  its last step, re-assert and gap-fill, before the watch is armed).
+ *   onBeforeArm   fires inside watchHumanInput, BEFORE the real arm (the run's last writes are done).
  *   onArming       runs alongside the real arm (Promise.all with it).
  *   armFails       the arm reports false without arming anything.
  *   onArmed        fires after a successful arm, before the hand-over.
@@ -498,6 +520,8 @@ type Track = (p: Promise<unknown>) => void;
 async function replay(k: string, opts: {
   autoSubmit?: boolean; handOver?: boolean; at?: string; extraSteps?: RecipeStep[];
   onHandOver?: (page: Page, adapter: RecipeAdapter) => Promise<unknown>;
+  onRefused?: (page: Page, adapter: RecipeAdapter) => Promise<unknown>;
+  onTailSweep?: (page: Page) => Promise<unknown>;
   onBeforeArm?: (page: Page, track: Track) => Promise<void>;
   onArming?: (page: Page) => Promise<unknown>;
   armFails?: boolean;
@@ -547,11 +571,20 @@ async function replay(k: string, opts: {
       progressLines.push(String(p.message ?? ""));
       if (/the page is yours/i.test(String(p.message ?? "")) && !handOverSeenAt) handOverSeenAt = Date.now();
       if (/the page is yours/i.test(String(p.message ?? "")) && opts.onHandOver && !pending) pending = opts.onHandOver(page, adapter).then((v) => { extra = v; }, (e) => { extra = e; });
+      if (String(p.message ?? "") === NOT_HANDED_OVER_NOTE && opts.onRefused && !pending) pending = opts.onRefused(page, adapter).then((v) => { extra = v; }, (e) => { extra = e; });
     },
   });
   (adapter as unknown as { page: unknown }).page = page;
   // The run's review read-back (an instance wrap: the method's source, which humanHandover.test
   // scans, is untouched).
+  // The run's tail sweep of the page it ends on (emptyRequiredControls, after its last step, its
+  // re-assert and gap-fill, BEFORE its input watch is armed): onTailSweep's person acts there, awaited
+  // (an instance wrap, as above).
+  if (opts.onTailSweep) {
+    const a = adapter as unknown as { emptyRequiredControls: (...x: unknown[]) => Promise<unknown> };
+    const sweep = a.emptyRequiredControls.bind(adapter);
+    a.emptyRequiredControls = async (...x: unknown[]) => { await opts.onTailSweep!(page).catch(() => null); return sweep(...x); };
+  }
   if (opts.onReviewRead) {
     const a = adapter as unknown as { verifyReviewScreen: (...x: unknown[]) => Promise<unknown> };
     const verify = a.verifyReviewScreen.bind(adapter);
@@ -702,6 +735,71 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
   check("B11 …the person's click at the lock reaches nothing (0 POSTs)", r.posts.length === 0, rbrief(r));
   check("B11 …and the run fails by name (STOPPED BY THE NETWORK BACKSTOP), never reporting the person's submit",
     r.ok === false && r.message.includes("STOPPED BY THE NETWORK BACKSTOP") && r.review.data.humanSubmittedInReviewWindow !== true, rbrief(r));
+}
+/** Helm Should-fix 3: a run that holds an UNFLAGGED stopping abort (a click the watch did not see) is
+ *  never handed over — 0 filing POSTs, failed by name, NOT_HANDED_OVER_NOTE in the fill and the review
+ *  step, never "the page is yours", never "YOUR CLICK WAS HELD BACK". Asserted on driftWarnings and
+ *  reviewHandoffNotes, never on pauseReason. */
+const refusedHandOver = (k: string, r: Replay): void => {
+  const all = JSON.stringify({ m: r.message, d: r.data, rm: r.review.message, rd: r.review.data });
+  check(`${k} …nothing reached the portal's submit (0 POSTs to /apply/submit)`, !r.posts.some((p) => /\/apply\/submit$/.test(p)), rbrief(r));
+  check(`${k} …the run fails by name (STOPPED BY THE NETWORK BACKSTOP), never reporting the person's submit`,
+    r.ok === false && r.message.includes("STOPPED BY THE NETWORK BACKSTOP") && r.review.data.humanSubmittedInReviewWindow !== true, rbrief(r));
+  check(`${k} …the hand-over is refused and said: NOT_HANDED_OVER_NOTE in the fill's driftWarnings, the review step's notes and the progress line`,
+    ((r.data.driftWarnings as string[] | undefined) ?? []).includes(NOT_HANDED_OVER_NOTE)
+      && ((r.review.data.reviewHandoffNotes as string[] | undefined) ?? []).includes(NOT_HANDED_OVER_NOTE)
+      && r.progressLines.includes(NOT_HANDED_OVER_NOTE), JSON.stringify(r.progressLines.slice(-4)));
+  check(`${k} …nobody is told 'the page is yours'`, !r.progressLines.some((l) => /the page is yours/i.test(l)), JSON.stringify(r.progressLines.slice(-4)));
+  check(`${k} …and never 'YOUR CLICK WAS HELD BACK' (no 'click again' on a run that fails)`, !all.includes("YOUR CLICK WAS HELD BACK"), rbrief(r));
+};
+{
+  // B13 (Helm Should-fix 3, "a click during the last writes"): the run ticks the review page's box (the
+  // portal reads "Saving..." for 8 s), runs out of steps and re-asserts, gap-fills and sweeps the page
+  // it ends on — its tail, BEFORE its input watch is armed and after the step loop's own backstop
+  // check. The person clicks the portal's (fetch) submit at that sweep: the watch is not listening, so
+  // the backstop holds the filing UNFLAGGED. Then, at the progress line that refuses the hand-over (or,
+  // before the fix, at "the page is yours"), the person clicks again. The refusal BEFORE ARMING is what
+  // this pins: armed anyway, the watch would flag the second click as a held click and the run would
+  // say "click again" while it fails by name.
+  let clickedAt = 0;
+  let armCalledAt = 0;
+  const r = await replay("B13", {
+    extraSteps: [TICK],
+    onTailSweep: async (page) => {
+      if (clickedAt) return;
+      clickedAt = Date.now();
+      await personClicks(page);
+      await sleep(500);
+    },
+    onBeforeArm: async () => { armCalledAt = armCalledAt || Date.now(); },
+    onRefused: (page) => personClicks(page),
+    onHandOver: (page) => personClicks(page),
+  });
+  check("B13 the person's first click landed in the run's tail, before any arm (and was held unflagged)",
+    clickedAt > 0 && (armCalledAt === 0 || clickedAt < armCalledAt) && r.aborts.some((a) => /\/apply\/submit$/.test(a.where) && !a.human && (a.at ?? 0) >= clickedAt),
+    `clickedAt=${clickedAt} armCalledAt=${armCalledAt} aborts=${JSON.stringify(r.aborts)}`);
+  check("B13 …the watch is never armed once an unflagged stop is on record", r.watchArmed === false, rbrief(r));
+  refusedHandOver("B13", r);
+}
+{
+  // B14 (Helm Should-fix 3, "one during arming"): a person's click at the moment the run arms its watch
+  // (inside watchHumanInput, before the arm itself): the watch did not see it, so it is held UNFLAGGED,
+  // and the refusal JUST BEFORE handOverReviewPage is what this pins. The fetch submit leaves the review
+  // page where it was (a form POST would leave Chromium's error page under the arm).
+  const r = await replay("B14", { onBeforeArm: async (page) => { await personClicks(page); await sleep(500); } });
+  check("B14 a person's click as the run arms its watch is held unflagged", r.aborts.some((a) => /\/apply\/submit$/.test(a.where) && !a.human), JSON.stringify(r.aborts));
+  refusedHandOver("B14", r);
+}
+{
+  // B14b: the same refusal for a filing request recorded WHILE the arm runs (a page-script fetch run
+  // alongside the real arm — the abort record a person's click inside the 12-19 ms arm leaves; a raw
+  // mouse click concurrent with the arm is a race the watch may or may not see, so this deterministic
+  // stand-in is the pin).
+  const r = await replay("B14b", {
+    onArming: (page) => page.evaluate(() => fetch("/h/B14b/apply/submit", { method: "POST", body: "x=1" }).then(() => 0, () => 0)),
+  });
+  check("B14b a filing request recorded during the arm is held unflagged", r.aborts.some((a) => /\/apply\/submit$/.test(a.where) && !a.human), JSON.stringify(r.aborts));
+  refusedHandOver("B14b", r);
 }
 
 {

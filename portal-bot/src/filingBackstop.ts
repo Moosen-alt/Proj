@@ -169,7 +169,9 @@ export interface BackstopAbort {
    *  the held request was most likely their click, not the page acting by itself. */
   humanInput?: boolean;
   /** #333: …and that input came BEFORE the hand-over (or there was none): "your click was held back,
-   *  click again" is true of it. A flagged abort after the hand-over is the person's own payment. */
+   *  click again" is true of it — of a click the ARMED watch saw. A click before the watch listened
+   *  leaves an abort with no humanInput at all, and the run refuses the hand-over and fails by name
+   *  (Helm Should-fix 3). A flagged abort after the hand-over is the person's own payment. */
   beforeHandOver?: boolean;
   /** #358: a REDIRECT the backstop refused to follow. `where` is the Location; the request to `from`
    *  (origin + path) REACHED the portal, which answered `status`; `hop` counts the redirects. */
