@@ -47,7 +47,20 @@
 //         aborted their filing).
 //   [B] THE REPLAY (RecipeAdapter, guided manual: no approval, the flagged final submit never clicked):
 //     B1  the person clicks the portal's submit the moment the run hands the page over: the POST
-//         reaches the portal, the run is NOT failed, and it reports the person's submit.
+//         reaches the portal, the run is NOT failed, and it reports the person's submit; the
+//         runner's submit watch is handed that submit exactly once (the capture starts) and
+//         HUMAN_SUBMITTED_NOTE is in the hand-off (Helm Should-fix 11). Those two checks are GUARD
+//         checks, green before by design (nothing read them). Kills (measured at 5d785555): the
+//         submit watch's callback reports nothing (noteHumanSubmit never called) reddens both, B1's
+//         "reports the person's submit" and B1b's report + note (5/96) while the POST still goes and
+//         r.ok holds; K1b (handOverReviewPage returns false) reddens B1 x5, B1b x4, B2's guard, B3,
+//         B5 x2, B6 x2, B7 x3, B10 x2 (20/96).
+//     B1b the person clicks the portal's submit right after the run LOCKS review (after the hand-over
+//         and the drain; the click lands after the lock, not before "the page is yours": progress()
+//         is synchronous and the click first awaits a bounding box): one POST, the run is NOT
+//         failed, the submit reported from the review window and handed on once, HUMAN_SUBMITTED_NOTE
+//         in the hand-off, never "YOUR CLICK WAS HELD BACK". GUARD pin, green before by design on
+//         this branch (it fails on main BY NAME); kill K1b (the replay never hands over) reddens it.
 //     B2  the person clicks BEFORE the hand-over: held, 0 POSTs, the run is not failed and says
 //         "click again" (HUMAN_CLICK_HELD_NOTE).
 //     B3  automation tries to click after the hand-over: the replay refuses its own input
@@ -124,7 +137,8 @@
 //         it goes (1 POST), nothing is aborted at or after the click, and the run is not failed.
 //         Red before the handler's first-line `if (disposed) → fallback`: the disposed backstop
 //         judged the POST not the person's, and /apply/submit is a filing URL → aborted.
-// Against main (no hand-over) A1 and B1 FAIL by name: the person's POST is aborted.
+// Against main (no hand-over) A1 and B1b FAIL by name: the person's POST is aborted by the lockdown.
+// B1 fails on main only because its person never clicks (main never says "the page is yours"), not by name.
 //
 //   npx tsx portal-bot/src/adapters/humanSubmitAfterReview.dom.smoke.ts
 import "../smokeArtifactDirs";
@@ -132,7 +146,7 @@ import http from "node:http";
 import { chromium, type Page } from "playwright";
 import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../../shared/src/types";
 import { backstopFor, installFilingBackstop, isStoppingAbort, withBackstopWindow, withOwnWriteWindow, type FilingBackstop } from "../filingBackstop";
-import { HUMAN_CLICK_HELD_NOTE, NOT_HANDED_OVER_NOTE, PERSON_REQUEST_WENT_NOTE, RecipeAdapter } from "./recipeAdapter";
+import { HUMAN_CLICK_HELD_NOTE, HUMAN_SUBMITTED_NOTE, NOT_HANDED_OVER_NOTE, PERSON_REQUEST_WENT_NOTE, RecipeAdapter } from "./recipeAdapter";
 import { armSubmitCapture } from "../index";
 
 let failures = 0;
@@ -696,6 +710,25 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
   check("B1 …the completion document the person's POST committed is recorded with when it committed (`at` after the hand-over)",
     !!done && typeof done.at === "number" && r.handOverSeenAt > 0 && done.at >= r.handOverSeenAt,
     `handOverSeenAt=${r.handOverSeenAt} navDocuments=${JSON.stringify(r.navDocuments.map((d) => ({ ...d, url: d.url.replace(base, "") })))}`);
+  // Helm Should-fix 11 (GUARD, green before by design): the capture STARTS — the runner's watch is
+  // handed the person's submit once, and the hand-off says they filed.
+  check("B1 …the runner's submit watch is handed the person's submit exactly once (the capture starts)", r.observed.length === 1, rbrief(r));
+  check("B1 …and HUMAN_SUBMITTED_NOTE is in the hand-off (reviewHandoffNotes)",
+    ((r.review.data.reviewHandoffNotes as string[] | undefined) ?? []).includes(HUMAN_SUBMITTED_NOTE), rbrief(r));
+}
+{
+  // Helm Should-fix 11 — B1b: the click lands right after the run LOCKS review (the real lock first, so
+  // the click meets the locked page, not the drain window — that is B7's case).
+  const r = await replay("B1b", { onLock: (page, track) => track(personClicks(page)) });
+  const all = JSON.stringify({ m: r.message, d: r.data, rm: r.review.message, rd: r.review.data, p: r.progressLines });
+  check("B1b the person clicks the portal's submit right after the run locks review (after the lock, not before 'the page is yours'): the POST reaches the portal",
+    r.posts.filter((p) => /\/apply\/submit$/.test(p)).length === 1, rbrief(r));
+  check("B1b …the run is NOT failed", r.ok === true, rbrief(r));
+  check("B1b …it reports the person's submit from the review window, and the runner's watch is handed it once",
+    r.review.data.humanSubmittedInReviewWindow === true && r.review.data.finalSubmitClicked === false && r.observed.length === 1, rbrief(r));
+  check("B1b …HUMAN_SUBMITTED_NOTE is in the hand-off",
+    ((r.review.data.reviewHandoffNotes as string[] | undefined) ?? []).includes(HUMAN_SUBMITTED_NOTE), rbrief(r));
+  check("B1b …and never 'YOUR CLICK WAS HELD BACK' (the armed watch saw the click)", !all.includes("YOUR CLICK WAS HELD BACK"), rbrief(r));
 }
 {
   // The click settles (its watch report and its held request) before the run can hand over: the watch
