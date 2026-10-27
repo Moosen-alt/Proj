@@ -9941,6 +9941,10 @@ export async function prepareSubmission(
     // say so where the operator looks, so the number is entered by hand (the manual form).
     runOutcomeRecorded = true;
     for (const capture of capturesBeforeOutcome.splice(0)) {
+      // A held DRAFT is not a filing and needs no recorded outcome: it is written down as on the
+      // happy path (audit + result_json; the status write below leaves result_json alone). A
+      // failed-outcome run with a recorded draft is the next stage's to continue.
+      if (capture.draftCreated) { recordSubmitCapture(capture); continue; }
       try {
         addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_unread", {
           track, runId, reason: `the run's outcome could not be recorded, so the completion page's read was not either: ${capture.reason.slice(0, 160)}`,
