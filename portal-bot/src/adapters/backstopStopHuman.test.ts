@@ -11,10 +11,14 @@
 //   4. a person's own document submit went, then an abort on the page it led to: not a failure;
 //   5. a person's input AFTER the hand-over whose request was still held (their own payment click:
 //      rule 1 never lifts): not a failure, and never "your click before the hand-over was held".
+//   6. (Helm nit :97) a person's document request from ANOTHER page (a popup's contact form) went,
+//      then a page script tries to file on the handed-over page: still a failure — only the
+//      HANDED-OVER page's own document request ends what the run answers for (case 4's entry names
+//      the run's page). Red while firstHumanDocument took a document request from any page.
 //   8. (round 4) personFilingShapedRequestAfter(at) — the one predicate the capture's commit/held
 //      split and the review step's wording read: a main-frame document request, or a fetch/XHR to a
 //      submit/payment URL, after the click, never a GET and never a beacon; off the handed-over
-//      backstop only (cases 6-7 are allocated to later commits of this round).
+//      backstop only (case 7 is allocated to a later commit of this round).
 //   9. (round 4) NOT_HANDED_OVER_NOTE fits one progress line: at most 200 characters, and a progress
 //      sink receives the constant whole (progress() cuts at 200).
 //
@@ -86,13 +90,22 @@ console.log("\n#333 backstopStop after the hand-over");
   check("2. a page script tries to file with no person's input: the run is stopped, named", /STOPPED BY THE NETWORK BACKSTOP/.test(r.stop), r.stop);
 }
 {
-  const r = stopFor([filingDoc(false)], [{ where: "https://portal.example/api/track", document: false, abortsBefore: 0 }]);
+  const r = stopFor([filingDoc(false)], [{ where: "https://portal.example/api/track", document: false, abortsBefore: 0, page: RUN_PAGE }]);
   check("3. a person's harmless background request went, then a page script tries to file: still stopped",
     /STOPPED BY THE NETWORK BACKSTOP/.test(r.stop), `stop=${JSON.stringify(r.stop)}`);
 }
 {
-  const r = stopFor([filingDoc(false)], [{ where: "https://portal.example/apply/submit", document: true, abortsBefore: 0 }]);
+  const r = stopFor([filingDoc(false)], [{ where: "https://portal.example/apply/submit", document: true, abortsBefore: 0, page: RUN_PAGE }]);
   check("4. the person's own document submit went, then an abort on the page it led to: not a failure", r.stop === "", r.stop);
+}
+{
+  // Helm nit :97 — the excuse is the HANDED-OVER page's own document request only. A popup's contact
+  // form (another Page object than the run's) that the person sent does not excuse a page script's
+  // filing on the review page afterwards.
+  const POPUP = {};
+  const r = stopFor([filingDoc(false)], [{ where: "https://portal.example/contact/send", document: true, abortsBefore: 0, page: POPUP }]);
+  check("6. a person's document request from ANOTHER page (a popup's contact form) went, then a page script files on the handed-over page: still stopped",
+    /STOPPED BY THE NETWORK BACKSTOP/.test(r.stop), `stop=${JSON.stringify(r.stop)}`);
 }
 {
   const r = stopFor([payment()], []);

@@ -102,7 +102,7 @@ import {
 } from "../../../shared/src/portalSafety";
 import { commitField, installSettleProbe, waitForSettled } from "../settle";
 import { siteOfUrl } from "../siteOf";
-import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, withAutomationInput, describeBackstopAbort, backstopSentLine, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, isStoppingAbort, type FilingBackstop } from "../filingBackstop";
+import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, withAutomationInput, describeBackstopAbort, backstopSentLine, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, isStoppingAbort, type FilingBackstop, type BackstopHumanRequest } from "../filingBackstop";
 
 /** #333: the run did not hand the review page over — its input watch could not be armed, or (Helm
  *  Should-fix 3) a stopping abort the watch did not flag as the person's is on record, so the run
@@ -1343,11 +1343,24 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  filing/payment request (the filing-URL rule), else "". A window abort (a dismisser click or
    *  a terminal-page Enter fired a state-changing request — often a consent XHR) is reported and
    *  the run goes on: nothing was sent. */
-  /** #333 — the abort index at the first request a person's input sent OFF the page (their own
-   *  document submit or navigation): what follows is the page their own action led to. */
+  /** #333 — the abort index at the first request a person's input sent OFF THE HANDED-OVER PAGE
+   *  (their own document submit or navigation there): what follows is the page their own action led
+   *  to. A popup's or another tab's document request is not it (Helm nit :97). */
   private firstHumanDocument(): number {
-    const r = (this.backstop?.humanRequests ?? []).find((h) => h.document);
+    const r = this.humanDocumentFromHandedOverPage(this.backstop);
     return r ? r.abortsBefore : Infinity;
+  }
+
+  /** #333 (Helm nit :97) — THE ONE PREDICATE for "the person's own main-frame document request from the
+   *  page the run handed over" (their submit or navigation there): the first such entry in `bs`'s
+   *  record, or null. The record names the requesting Page (request.frame().page()); the run's page is
+   *  `this.page`, the page the backstop was installed on and handed over. A popup's or another tab's
+   *  document request (a contact form the person sent) is another Page and never counts, and neither
+   *  does an entry whose page could not be read (null never matches, even with no page in hand). */
+  private humanDocumentFromHandedOverPage(bs: FilingBackstop | null): BackstopHumanRequest | null {
+    const runPage = this.page;
+    if (runPage == null) return null;
+    return (bs?.humanRequests ?? []).find((h) => h.document && h.page === runPage) ?? null;
   }
 
   /** #333 round 4 — THE ONE PREDICATE for "a FILING-SHAPED request of the person's went at or after
@@ -2963,7 +2976,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // not where the run stopped either (F6) — that page only (round 3).
     const bsNow = this.backstop;
     const hereNow = this.pageUrlNoHash();
-    const personMovedOn = (bsNow?.humanRequests ?? []).some((r) => r.document) || !!this.humanSubmit
+    const personMovedOn = !!this.humanDocumentFromHandedOverPage(bsNow) || !!this.humanSubmit
       || (!!bsNow && this.handOverUrl !== "" && hereNow !== "" && hereNow !== this.handOverUrl && bsNow.personActedSinceHandOver(this.page));
     this.personMovedOn = personMovedOn;
     this.personRequestWent = (bsNow?.humanRequests ?? []).length > 0;

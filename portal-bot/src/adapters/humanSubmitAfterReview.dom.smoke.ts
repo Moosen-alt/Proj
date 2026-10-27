@@ -137,6 +137,16 @@
 //         `handOverArmed &&` dropped reddens A9 and B12's "page is yours", note and 0-POST checks;
 //         dropping the three NOT_HANDED_OVER_NOTE lines reddens B12's note check (and B13/B14/B14b's).
 //     B12b (a failed CDP arm) waits for the isolated-world watch (Should-fix 1); not pinned until then.
+//   [B, Helm nit :97] ONLY THE HANDED-OVER PAGE'S OWN DOCUMENT REQUEST ENDS WHAT THE RUN ANSWERS FOR
+//   (RecipeAdapter.humanDocumentFromHandedOverPage: the record's requesting Page must be the run's page):
+//     B17 the person opens the review page's "Contact us" popup and sends its form (its document POST
+//         goes, recorded as theirs, page = the popup), then — past the review page's 4 s window — a
+//         page script submits the filing form on the review page: 0 POSTs to /apply/submit, the run
+//         fails by name. Red before: the popup's document request excused the review-page abort (ok).
+//     B17b (positive twin) the person's own submit on the handed-over page goes, then the completion
+//         page's script POSTs the filing (aborted): the run is NOT failed. GUARD pin, green before by
+//         design; it holds the identity `request.frame().page() === adapter.page` in real Chromium.
+//         Kill Kp: record `page: null` at the backstop's push site.
 //   [round 4, THE RECORD'S SHAPE] (Helm Blocking 1 "stamp humanRequests and aborts with at", nit :97
 //   "record the requesting page") — extra checks on existing cases, no new case numbers:
 //     A1  also: the person's request is stamped POST / resourceType document / `at` inside the click's
@@ -217,6 +227,8 @@ const reviewBody = (k: string): string => {
     </script>`;
   if (k === "B14" || k === "B14b") return `${summary}${FETCH_SUBMIT(k)}`;
   if (k === "B8") return `${summary}${formSubmit(k)}<a id="older" href="/h/B8/record">Older application BLD-2026-900001</a>`;
+  // B17: the review page links a contact form that opens in a popup (another tab, another Page).
+  if (k === "B17") return `${summary}${formSubmit(k)}<a id="help" href="/h/B17/popup-form" target="_blank">Contact us</a>`;
   if (k === "B9") return `${summary}${formSubmit(k)}<button type="button" id="pay" onclick="fetch('/h/B9/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function () {})">Pay Fees</button>`;
   if (k === "A4") return `${summary}<button type="button" id="btnSubmit" onclick="window.open('/h/A4/popup', '_blank')">Submit Application</button>`;
   if (k === "A5") return `${summary}<button type="button" id="btnSubmit" onclick="fetch('/h/A5/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function(){})">Submit Application</button>`;
@@ -253,7 +265,9 @@ const server = http.createServer((req, res) => {
   if (req.method === "POST" && rest === "apply/submit") { send(COMPLETION); return; }
   if (req.method === "POST" && rest === "apply/continue") { send(html("Review and Submit", reviewBody(k))); return; }
   if (rest === "popup") { send(html("Processing", `<h1>Processing</h1><script>fetch('/h/${k}/popup/post', { method: 'POST', body: 'from=popup' }).catch(function(){});</script>`)); return; }
+  if (req.method === "POST" && rest === "contact/send") { send(html("Message sent", "<h1>Thank you</h1><p>Your message was sent.</p>")); return; }
   if (req.method !== "GET") { res.writeHead(204); res.end(); return; }
+  if (rest === "popup-form") { send(html("Contact us", `<h1>Contact us</h1><form method="post" action="/h/${k}/contact/send"><textarea name="msg">Question</textarea><button type="submit" id="sendMsg">Send</button></form>`)); return; }
   if (rest === "next") { send(html("Processing", `<h1>Processing</h1><script>fetch('/h/${k}/apply/submit', { method: 'POST', body: 'auto=1' }).catch(function(){});</script>`)); return; }
   if (rest === "records") { send(MY_RECORDS); return; }
   if (rest === "record") { send(OLD_RECORD); return; }
@@ -962,6 +976,58 @@ const refusedHandOver = (k: string, r: Replay): void => {
   const all = JSON.stringify({ m: r.message, d: r.data, rm: r.review.message, rd: r.review.data });
   check("B9 the person's payment click after the hand-over is aborted (automation never pays; the run still holds the page)", r.posts.length === 0, rbrief(r));
   check("B9 …the run is not failed, and never says the click came before the hand-over", r.ok === true && !all.includes("YOUR CLICK WAS HELD BACK"), rbrief(r));
+}
+
+{
+  // B17 (Helm nit :97, "a popup's contact form excused a later review-page filing abort"): after the
+  // hand-over the person opens the review page's "Contact us" popup and sends its form (their own
+  // input in THAT page: its document POST goes, recorded as theirs with page = the popup). More than
+  // the 4 s input window after their click on the review page, a page script there submits the
+  // filing form with no input of theirs: aborted, and the run fails by name — the popup's document
+  // request is not the handed-over page's. Red while firstHumanDocument took the first document
+  // request of ANY page: the review page's abort indexed after the popup's and was excused (ok).
+  const r = await replay("B17", {
+    onHandOver: async (page) => {
+      const popupP = page.context().waitForEvent("page", { timeout: 5000 });
+      const clickedAt = Date.now();
+      await personClicks(page, "#help");
+      const popup = await popupP;
+      await popup.waitForLoadState("load");
+      await Promise.all([popup.waitForLoadState("load"), personClicks(popup, "#sendMsg")]);
+      await sleep(400);
+      // Past the review page's own 4 s input window (HUMAN_INPUT_MS), so its script's request is
+      // never the person's on that count alone.
+      const wait = 4600 - (Date.now() - clickedAt);
+      if (wait > 0) await sleep(wait);
+      await page.evaluate(() => (document.forms[0] as HTMLFormElement).submit()).catch(() => null);
+      await sleep(900);
+    },
+  });
+  check("B17 the person's popup contact form went (their own input in the popup; the precondition)",
+    r.posts.some((p) => /\/contact\/send$/.test(p)) && r.humanRequests.some((w) => /\/contact\/send$/.test(w)), rbrief(r));
+  check("B17 …then a page script's filing submit on the review page: 0 POSTs to /apply/submit",
+    r.posts.filter((p) => /\/apply\/submit$/.test(p)).length === 0 && r.aborts.some((a) => /\/apply\/submit$/.test(a.where) && !a.human), rbrief(r));
+  check("B17 …and the run fails by name: the popup's request does not excuse the handed-over page's abort",
+    r.ok === false && /STOPPED BY THE NETWORK BACKSTOP/.test(r.message), rbrief(r));
+}
+{
+  // B17b (positive twin, GUARD — green before by design): the person's own document submit on the
+  // handed-over page goes, and on the completion page it led to a script then tries a filing POST
+  // (aborted). The run is NOT failed: the run's own page's document request is found, which holds
+  // only while the backstop's record of the requesting page (request.frame().page()) is the SAME
+  // object as the adapter's page in real Chromium. Kill Kp: record `page: null` at the push site.
+  const r = await replay("B17b", {
+    onHandOver: async (page) => {
+      await Promise.all([page.waitForLoadState("load"), personClicks(page)]);
+      await page.waitForURL(/\/apply\/submit$/, { timeout: 5000 }).catch(() => null);
+      await page.evaluate(() => fetch("/h/B17b/apply/submit", { method: "POST", body: "auto=1" }).then(() => "sent", () => "aborted")).catch(() => null);
+      await sleep(600);
+    },
+  });
+  check("B17b the person's own submit on the handed-over page went (1 POST), the completion page's script POST was aborted",
+    r.posts.filter((p) => /\/apply\/submit$/.test(p)).length === 1 && r.aborts.some((a) => /\/apply\/submit$/.test(a.where) && !a.human), rbrief(r));
+  check("B17b …and the run is not failed: that abort follows the handed-over page's own document request",
+    r.ok === true && !/STOPPED BY THE NETWORK BACKSTOP/.test(r.message), rbrief(r));
 }
 
 // ---------------------------------------------------------------------------------------------
