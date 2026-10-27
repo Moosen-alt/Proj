@@ -182,7 +182,19 @@
 //     and "…never 'has been filed'…"; B27 "…never 'may have gone'…"; B28 "…humanSubmitPersonInput false"
 //     and "…'A CLICK ON'…". (Step 14 had already stopped a provisional sighting from saying "filed", so
 //     B18/B19's "never 'has been filed'" is green there; their red check is the note.)
-//     Kills: measured in the next commit, and written here.
+//     KILLS, measured at 2bbad673 in a throwaway tree on the [B]-only trim (112 checks), with
+//     backstopStopHuman.test (25):
+//       K-noread (stopAtReview takes no page read; "filed" only from a capture that already confirmed):
+//         B1 x2, B1b x2, B20's draft note, B25 red (6/112). That read is what lets production say "filed".
+//       K-commit500 (HUMAN_CLICK_COMMIT_MS = 500), B25's named kill: B25 red (1/112).
+//       K-prwn (PERSON_REQUEST_WENT_NOTE beside a sighting too): B22, B23, B24, B26 red (4/112), and
+//         case 10 "never PERSON_REQUEST_WENT_NOTE" (1/25).
+//       K-twonotes (a held payment gets the held-click note as well): B21, B22, B23, B27 red (4/112), and
+//         case 10 "exactly one note" (1/25).
+//       K-flagonly (held only for an abort flagged as the person's): case 10 "a pending click with an
+//         unflagged stopping abort … held" red (1/25); the smoke stays green (B28's unflagged abort then
+//         reads unconfirmed, which also begins "A CLICK ON").
+//       K-nofollowup (followUpHeldOnErrorPage never consulted): B26's note red (1/112).
 //   [round 4, THE RECORD'S SHAPE] (Helm Blocking 1 "stamp humanRequests and aborts with at", nit :97
 //   "record the requesting page") — extra checks on existing cases, no new case numbers:
 //     A1  also: the person's request is stamped POST / resourceType document / `at` inside the click's
