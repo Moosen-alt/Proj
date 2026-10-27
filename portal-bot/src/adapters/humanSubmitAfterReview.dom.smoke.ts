@@ -45,6 +45,15 @@
 //         reaches the portal, recorded as theirs, no stopping abort. Red while the fence kept a
 //         1.5 s grace after each fenced input (the person's pointerdown was dropped, the lockdown
 //         aborted their filing).
+//   [A, Helm Should-fix 2] AN INPUT COVERS ONLY THE DOCUMENT THAT SAW IT (each main-frame navigation
+//   request is stamped; a request is judged against the stamp BEFORE it, so A1's own form POST — itself
+//   a navigation — still goes; A1, B1, B5-B7 are the guard that the read precedes the stamp):
+//     A14 a person's GET link off the review page, then the next document's parse-time filing POST
+//         (inside the 4 s window of the click): aborted by the filing-URL rule, 0 POSTs, not in
+//         humanRequests, and the abort is NOT flagged humanInput (the flag is judged against the same
+//         stamp, so the run fails by name as on main for a page script's POST). Red while the 4 s window survived the navigation (the POST reached the
+//         portal and was recorded as the person's). The cost: an interstitial that auto-posts the
+//         filing after the person's own click is held, as on main.
 //   [B] THE REPLAY (RecipeAdapter, guided manual: no approval, the flagged final submit never clicked):
 //     B1  the person clicks the portal's submit the moment the run hands the page over: the POST
 //         reaches the portal, the run is NOT failed, and it reports the person's submit; the
@@ -210,6 +219,8 @@ const reviewBody = (k: string): string => {
   // The portal answers the submit with a method-keeping redirect (judged as a fresh request, #370).
   if (k === "A10") return `${summary}<form method="post" action="/h/A10/apply/slow307"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
   if (k === "A11") return `${summary}<form method="post" action="/h/A11/apply/pay307"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
+  // A14: a plain GET link off the review page; the next document posts the filing as it parses.
+  if (k === "A14") return `${summary}<a id="next" href="/h/A14/next">Continue</a>`;
   return `${summary}<form method="post" action="/h/${k}/apply/submit"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
 };
 // A step BEFORE review (B10): an attachments page whose Continue posts and is answered with the review
@@ -238,6 +249,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "POST" && rest === "apply/continue") { send(html("Review and Submit", reviewBody(k))); return; }
   if (rest === "popup") { send(html("Processing", `<h1>Processing</h1><script>fetch('/h/${k}/popup/post', { method: 'POST', body: 'from=popup' }).catch(function(){});</script>`)); return; }
   if (req.method !== "GET") { res.writeHead(204); res.end(); return; }
+  if (rest === "next") { send(html("Processing", `<h1>Processing</h1><script>fetch('/h/${k}/apply/submit', { method: 'POST', body: 'auto=1' }).catch(function(){});</script>`)); return; }
   if (rest === "records") { send(MY_RECORDS); return; }
   if (rest === "record") { send(OLD_RECORD); return; }
   if (rest === "done") { send(COMPLETION); return; }
@@ -479,6 +491,28 @@ console.log("\n[A, #370] A REDIRECT HOP CARRIES THE FIRST LEG'S PERSON VERDICT")
     postsFor("A13", from).filter((p) => /\/apply\/submit$/.test(p.path)).length === 1, brief(b, "A13", from));
   check("A13 …recorded as the person's request, no stopping abort",
     b.bs.humanRequests.some((r) => r.document && /\/apply\/submit$/.test(r.where)) && b.bs.stoppingAborts().length === 0, brief(b, "A13", from));
+  await b.close();
+}
+{
+  // A14 (Helm Should-fix 2): a person's input covers only the DOCUMENT that saw it. They follow a GET
+  // link off the review page; the next document posts the filing while it parses, well inside the
+  // 4 s window of their click. Their click asked for that page, not for its script's POST.
+  const from = posts.length;
+  const b = await bed("A14");
+  await personClicks(b.page, "#next");
+  await sleep(1500);
+  const filing = postsFor("A14", from).filter((p) => /\/apply\/submit$/.test(p.path));
+  check("A14 a GET link, then the next document's parse-time filing POST: 0 POSTs reach the portal",
+    filing.length === 0, brief(b, "A14", from));
+  const held = b.bs.aborts.find((a) => a.rule === "filing-url" && /\/apply\/submit$/.test(a.where));
+  check("A14 …aborted by the filing-URL rule", !!held, brief(b, "A14", from));
+  // The abort flag is judged against the same stamp (recentHumanInput): the click asked for the
+  // next page, so the held POST is not "your click was held back" — the run fails by name, as on main
+  // for a page script's POST.
+  check("A14 …and the abort is NOT flagged as the person's input (the click was for another document)",
+    !!held && !held.humanInput, brief(b, "A14", from));
+  check("A14 …and never recorded as the person's request",
+    !b.bs.humanRequests.some((r) => /\/apply\/submit$/.test(r.where)), brief(b, "A14", from));
   await b.close();
 }
 

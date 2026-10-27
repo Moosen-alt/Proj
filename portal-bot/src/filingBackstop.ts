@@ -61,7 +61,11 @@
 //      styled div (DevHub's tiles). It lasts only until dispose() — seconds — after which main lets
 //      everything through anyway. Automation's own input never opens it (the ordering).
 //      Only input that arrives AFTER the hand-over counts (an input just before it is not carried
-//      over), and only for the page that saw it. A page script posting with no input meets the lockdown
+//      over), and only for the page that saw it — and only for the DOCUMENT that saw it (Helm
+//      Should-fix 2): each main-frame navigation request is stamped, and a request is judged against
+//      the stamp BEFORE it, so the person's own form POST (itself a navigation) still counts their
+//      click while the next document's posts do not. The cost: an interstitial that auto-posts the
+//      filing after the person's click is held, as on main. A page script posting with no input meets the lockdown
 //      exactly as before; payment (rule 1) and an open dismisser / Enter window (rule 3, the
 //      run's own action in flight) are never lifted — but payment stays blocked only for URLs rule 1
 //      knows (PAY_FEE_URL; Helm Should-fix 13 added Authorize.net, Point & Pay, fees/settle, GovPayNet). An abort that follows such an input is
@@ -870,17 +874,22 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   let humanWatchArmed = false;
   let handedOverAt = 0;
   const humanRequests: BackstopHumanRequest[] = [];
-  const recentHumanInput = (pg: unknown): boolean => {
+  // AN INPUT COVERS ONLY THE DOCUMENT THAT SAW IT (Helm Should-fix 2): when each page's main frame
+  // last asked for a new document (request time, stamped at the handler's top; never on a hop).
+  // `navBefore` is the stamp BEFORE the request being judged — strict `t > navBefore`, so an input
+  // and a navigation in the same millisecond read as not covered (held, the safe side).
+  const mainFrameNavAt = new WeakMap<object, number>();
+  const recentHumanInput = (pg: unknown, navBefore = 0): boolean => {
     if (!pg || typeof pg !== "object") return false;
     const t = humanInputAt.get(pg as object) ?? 0;
-    return t > 0 && Date.now() - t <= HUMAN_INPUT_MS;
+    return t > 0 && t > navBefore && Date.now() - t <= HUMAN_INPUT_MS;
   };
-  // A PERSON'S INPUT THAT COUNTS for the hand-over: on this page, AFTER the hand-over (an input just
-  // before it is never carried over), and recent.
-  const humanInputSinceHandOver = (pg: unknown): boolean => {
+  // A PERSON'S INPUT THAT COUNTS for the hand-over: on this page and this document, AFTER the
+  // hand-over (an input just before it is never carried over), and recent.
+  const humanInputSinceHandOver = (pg: unknown, navBefore = 0): boolean => {
     if (!pg || typeof pg !== "object" || !handedOverAt) return false;
     const t = humanInputAt.get(pg as object) ?? 0;
-    return t > handedOverAt && Date.now() - t <= HUMAN_INPUT_MS;
+    return t > handedOverAt && t > navBefore && Date.now() - t <= HUMAN_INPUT_MS;
   };
   // THE FENCE (#333): per page, how many of the run's own inputs are in flight. Fenced only while one
   // is in flight — no grace after it (Helm Should-fix 6: a grace ate a person's click 432 ms after
@@ -1019,6 +1028,21 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     let method = "";
     let url = "";
     try { method = String(request.method() || "").toUpperCase(); url = String(request.url() || ""); } catch { /* unreadable: fall through as not-GET */ }
+    // THE DOCUMENT BOUNDARY (Helm Should-fix 2): read the stamp BEFORE this request, THEN stamp if it
+    // is the page's main-frame navigation — in that order, or the person's own form POST (itself a
+    // navigation) would be judged against its own stamp and refused. Synchronous, ahead of any await,
+    // so concurrent requests read the stamps in arrival order. A hop is never stamped (asRedirectedTo
+    // keeps isNavigationRequest()); its verdict and abort flag are its first leg's (`via`).
+    let navBefore = 0;
+    if (!via) {
+      try {
+        const pg = pageOfRequest(request);
+        if (pg && typeof pg === "object") {
+          navBefore = mainFrameNavAt.get(pg) ?? 0;
+          if (request.isNavigationRequest() && request.frame() === pg.mainFrame()) mainFrameNavAt.set(pg, Date.now());
+        }
+      } catch { /* unreadable: judged against the stamp read so far */ }
+    }
     if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
       // The clicked page's main frame navigating by GET ends the approved click's slot: its own
       // request was that navigation (nothing state-changing to admit), and the next document's
@@ -1065,7 +1089,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       // theirs (held, not the recipe's failure), and the run's own save refused at its hop just after
       // a touch is still the run's (it fails by name, as on main). A carried-true verdict's input came
       // after the hand-over by construction, so `beforeHandOver` falls out false for it.
-      const heldInput = via ? via.human : recentHumanInput(requestPage);
+      const heldInput = via ? via.human : recentHumanInput(requestPage, navBefore);
       const beforeHandOver = heldInput && (!handedOverAt || (humanInputAt.get(requestPage as object) ?? 0) <= handedOverAt);
       aborts.push({
         rule, method: method || "?", where: whereOf(url), why, resourceType,
@@ -1082,7 +1106,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     // A REDIRECT HOP CARRIES ITS FIRST LEG'S VERDICT (#370 merge order): judged live, a person's submit
     // answered 307 more than HUMAN_INPUT_MS later would read as not theirs (their filing cut off),
     // and the portal's own save hopping to a filing URL just after a touch would read as theirs.
-    const human = handedOverAt > 0 && !disposed && windows.size === 0 && (via ? via.human : humanInputSinceHandOver(requestPage));
+    const human = handedOverAt > 0 && !disposed && windows.size === 0 && (via ? via.human : humanInputSinceHandOver(requestPage, navBefore));
     // R0 — THE INFORMATION-PAGE SLOT IS CONSUMED by the FIRST request that could be the verified
     // control's (#344): the bound page's own main-frame document navigation. Matched or not, the
     // slot is gone, and consuming it changes no rule's outcome: the request meets payment, the
