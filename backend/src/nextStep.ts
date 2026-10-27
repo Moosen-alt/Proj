@@ -58,6 +58,7 @@ import type {
   ProjectStatus,
   ReviewerFinding,
   SubmitGateHold,
+  SubmitCaptureCandidate,
   SubmitGateReport,
   SubmittalTrackType,
 } from "../../shared/src/types";
@@ -239,6 +240,10 @@ export interface TrackFacts {
    *  electrical permit is named as the county's. Optional: absent, the answer falls back to the
    *  AHJ / utility on the facts record (agencyOf). */
   agency?: string;
+  /** UNSURE RECORD NUMBERS read after a person's submit in this track's left-open window (#400,
+   *  portal_runs.submit_capture_candidates of the staged run) — offered for one-click
+   *  confirmation, never treated as a filing. Absent when there are none. */
+  recordCandidates?: Array<{ recordNumber: string; recordLink: string; source: "completion_page" | "account_list" }>;
 }
 
 export interface NextStepFacts {
@@ -474,11 +479,12 @@ export function loadNextStepFacts(db: AppDb, projects: ProjectRecord[]): Map<str
   // Gap-fill lists for the staged drafts only (result_json can be large; never load it for all runs).
   if (stagedRunIds.length) {
     const rph = stagedRunIds.map(() => "?").join(",");
-    const stagedRows = db.query<Row>(`SELECT id, result_json FROM portal_runs WHERE id IN (${rph})`, stagedRunIds);
+    const stagedRows = db.query<Row>(`SELECT id, result_json, submit_capture_candidates FROM portal_runs WHERE id IN (${rph})`, stagedRunIds);
     const gaps = new Map(stagedRows.map((r) => [s(r.id), reviewInfoFromResultJson(r.result_json).gapFillMissing] as const));
     // THE SIGNATURE PART OF THE NEM FLOW (#310): the staged run's review state, moved on by a person's
     // "I sent the signature request" recorded after it. Read-only, like everything here.
     const reviewStates = new Map(stagedRows.map((r) => [s(r.id), s(parseJson<Row>(s(r.result_json) || "{}", {}).reviewState)] as const));
+    const candidates = new Map(stagedRows.map((r) => [s(r.id), recordCandidatesOf(r.submit_capture_candidates)] as const));
     const confirmations = groupBy(
       db.query<Row>(`SELECT project_id, details, created_at FROM audit_logs WHERE project_id IN (${ph}) AND action = ?`, [...ids, SIGNATURE_REQUEST_CONFIRMED_ACTION]),
       (r) => s(r.project_id),
@@ -487,6 +493,8 @@ export function loadNextStepFacts(db: AppDb, projects: ProjectRecord[]): Map<str
       for (const t of facts.tracks) {
         if (!t.stagedRun) continue;
         t.gapFillMissing = gaps.get(t.stagedRun.id) ?? [];
+        const held = candidates.get(t.stagedRun.id) ?? [];
+        if (held.length) t.recordCandidates = held;
         const reviewState = reviewStates.get(t.stagedRun.id) ?? "";
         if (t.track !== "nem" || !reviewState) continue;
         const view = reduceNemSignatureState([
@@ -498,6 +506,21 @@ export function loadNextStepFacts(db: AppDb, projects: ProjectRecord[]): Map<str
     }
   }
   return out;
+}
+
+/** The staged run's held candidates (repository.recordSubmitCaptureCandidates), defensively read:
+ *  only a non-empty number survives, and only an http(s) link. */
+function recordCandidatesOf(raw: unknown): NonNullable<TrackFacts["recordCandidates"]> {
+  const parsed = parseJson<{ candidates?: unknown }>(s(raw) || "{}", {});
+  const list = Array.isArray(parsed?.candidates) ? parsed.candidates as Array<Record<string, unknown>> : [];
+  return list
+    .map((c) => ({
+      recordNumber: s(c?.recordNumber).trim(),
+      recordLink: /^https?:\/\//i.test(s(c?.recordLink)) ? s(c?.recordLink) : "",
+      source: (s(c?.source) === "account_list" ? "account_list" : "completion_page") as "completion_page" | "account_list",
+    }))
+    .filter((c) => c.recordNumber)
+    .slice(0, 5);
 }
 
 // ── The rule table ──────────────────────────────────────────────────────────────────────
@@ -616,6 +639,11 @@ export function decideNextStep(facts: NextStepFacts): NextStep {
   // (gateCanOverrule), so a reordered rule cannot leave a client-side key list behind.
   const allFiled = facts.tracks.length > 0 && unfinished.length === 0;
   const hasStagedDraft = !facts.archived && (unfinished.some((t) => t.stagedRun) || facts.status === "awaiting_human_resubmit");
+  // WHAT A PERSON MAY CONFIRM WITH ONE CLICK (#400), whatever the answer's key: numbers read after
+  // their submit that were not sure enough to write. Carried on every answer of an unarchived job.
+  const recordCandidates: SubmitCaptureCandidate[] = facts.archived ? [] : unfinished.flatMap((t) => (t.stagedRun && t.recordCandidates?.length
+    ? t.recordCandidates.map((c) => ({ runId: t.stagedRun!.id, track: t.track, ...c }))
+    : []));
   // Set once evaluation passes rule 7 (the submit gate). An answer produced after it, on a list
   // tier that never ran the gate, with something still to file, is one rule 7 could have pre-empted.
   let passedGateRule = false;
@@ -628,6 +656,7 @@ export function decideNextStep(facts: NextStepFacts): NextStep {
     allFiled,
     gateCanOverrule: passedGateRule && !gateChecked && unfinished.length > 0,
     hasStagedDraft,
+    ...(recordCandidates.length ? { recordCandidates } : {}),
   });
 
   if (facts.archived) return make("archived", "nobody", "done", "Archived — nothing is asked of anyone.", [], null);

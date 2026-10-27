@@ -214,3 +214,136 @@ export function draftReferenceFromUrl(raw: string): { link: string; id: string }
   } catch { /* an unparseable link carries no key */ }
   return { link, id: id.slice(0, 80) };
 }
+
+// ---------------------------------------------------------------------------
+// AFTER A PERSON FILES IN THE REVIEW WINDOW (#400): which number, which link, or neither.
+// ---------------------------------------------------------------------------
+
+/**
+ * A record link that is safe to store AND to render as an href: through cleanRecordLink (no
+ * session material), and only http(s). cleanRecordLink hands back an unparseable input as is, and
+ * a `javascript:` anchor parses with origin "null", so neither may reach a stored link.
+ */
+export function safeRecordLink(raw: string | null | undefined): string {
+  const link = cleanRecordLink(String(raw ?? "").trim());
+  return /^https?:\/\//i.test(link) ? link : "";
+}
+
+/**
+ * THE LINK THE PORTAL PUTS ON THE NUMBER, read in the page (page.evaluate — self-contained, and it
+ * only reads). On an Accela completion page the record number is itself the anchor to CapDetail;
+ * on a list it is the row's one link. Site chrome never counts. "" when nothing links the number.
+ */
+export function recordLinkForNumberInPage(recordNumber: string): string {
+  const want = String(recordNumber || "").trim().toUpperCase();
+  if (!want) return "";
+  const textOf = (el: Element): string => ((el as HTMLElement).innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+  const inChrome = (el: Element): boolean => Boolean(el.closest("nav, header, footer, [role='navigation'], [role='banner'], [role='contentinfo']"));
+  // The anchor whose own text IS the number wins over one that merely contains it in a sentence.
+  let loose = "";
+  for (const a of Array.from(document.querySelectorAll("a[href]"))) {
+    if (inChrome(a)) continue;
+    const label = textOf(a).toUpperCase();
+    const href = (a as HTMLAnchorElement).href || "";
+    if (!href) continue;
+    if (label === want) return href;
+    if (!loose && label.includes(want)) loose = href;
+  }
+  if (loose) return loose;
+  // The number is plain text in a ROW that links to the record (PowerClerk's "View" beside APP-…):
+  // that row's link, only when the row carries exactly one — a row of several links is not read.
+  for (const row of Array.from(document.querySelectorAll("tr, li, [role='row']"))) {
+    if (inChrome(row)) continue;
+    const rowText = textOf(row).toUpperCase();
+    if (!rowText.includes(want) || rowText.length > 600) continue;
+    const hrefs = [...new Set(Array.from(row.querySelectorAll("a[href]")).map((a) => (a as HTMLAnchorElement).href || "").filter(Boolean))];
+    if (hrefs.length === 1) return hrefs[0];
+  }
+  return "";
+}
+
+/** One number a person may confirm with a click: never written until they do. */
+export interface SubmitRecordCandidate {
+  recordNumber: string;
+  recordLink: string;
+  source: "completion_page" | "account_list";
+}
+
+/** What the page after a person's submit says was filed. Only `high` is ever written as fact. */
+export interface SubmitRecordRead {
+  /** "" unless the read is confident. */
+  recordNumber: string;
+  confidence: "high" | "low";
+  source: "completion_page" | "account_list" | "none";
+  /** The best link to the record (see chooseSubmittedRecord), or the cleaned page URL. */
+  recordLink: string;
+  reason: string;
+  /** Unsure reads, for the next-step panel. Empty on a confident read. */
+  candidates: SubmitRecordCandidate[];
+}
+
+const sameId = (a: string, b: string): boolean => a.trim().toUpperCase() === b.trim().toUpperCase();
+
+/**
+ * THE BEFORE/AFTER DIFF, OR NONE. A diff only means something when both reads are the SAME list:
+ * "before" is the list the sign-in landed on, "after" the page the person is left on. With no
+ * before list, or an after page sharing no row with it (a completion page, a different screen),
+ * every id on the after page would read as "new" — so there is no diff (null), never a guess.
+ */
+export function submitLedgerDiff(before: LedgerEntry[] | null | undefined, after: LedgerEntry[] | null | undefined): LedgerEntry[] | null {
+  if (!before?.length || !after?.length) return null;
+  const overlap = after.some((e) => before.some((b) => sameId(b.id, e.id)));
+  return overlap ? newLedgerEntries(before, after) : null;
+}
+
+/**
+ * WHICH NUMBER AND WHICH LINK, after a person clicked the final submit in the review window (#400).
+ *
+ * The link, best first: the href on the element carrying the number (Accela's number IS the link to
+ * the record), then the matching new row's href in the account list, then the cleaned page URL.
+ * Every one through safeRecordLink, so no session token is stored.
+ *
+ * The number: a confident completion-page read (recordNumber.ts) wins. Without one, the account
+ * list's before/after diff supplies it — only when EXACTLY ONE new row appeared and no unsure page
+ * read names a different number. Zero rows, several rows, or a disagreement write nothing: what was
+ * seen becomes candidates for a person to confirm. A wrong number is worse than none.
+ */
+export function chooseSubmittedRecord(input: {
+  read: { value: string; confidence: "high" | "low"; reason: string };
+  /** The href recordLinkForNumberInPage found for read.value ("" when none). */
+  numberHref: string;
+  before: LedgerEntry[] | null | undefined;
+  after: LedgerEntry[] | null | undefined;
+  pageUrl: string;
+}): SubmitRecordRead {
+  const pageLink = safeRecordLink(input.pageUrl);
+  const fresh = submitLedgerDiff(input.before, input.after);
+  const rowLink = (n: string): string => safeRecordLink(fresh?.find((e) => sameId(e.id, n))?.href);
+  const pageNumber = String(input.read.value || "").trim();
+  const pageNumberLink = pageNumber ? (safeRecordLink(input.numberHref) || rowLink(pageNumber) || pageLink) : "";
+
+  if (pageNumber && input.read.confidence === "high") {
+    return { recordNumber: pageNumber, confidence: "high", source: "completion_page", recordLink: pageNumberLink, reason: input.read.reason, candidates: [] };
+  }
+  if (fresh && fresh.length === 1 && (!pageNumber || sameId(pageNumber, fresh[0].id))) {
+    const row = fresh[0];
+    return {
+      recordNumber: row.id.trim(), confidence: "high", source: "account_list",
+      recordLink: (pageNumber ? safeRecordLink(input.numberHref) : "") || safeRecordLink(row.href) || pageLink,
+      reason: "Exactly one new application appeared in the account's list after the submit.",
+      candidates: [],
+    };
+  }
+  const candidates: SubmitRecordCandidate[] = [];
+  if (pageNumber) candidates.push({ recordNumber: pageNumber, recordLink: pageNumberLink, source: "completion_page" });
+  for (const row of fresh ?? []) {
+    if (candidates.some((c) => sameId(c.recordNumber, row.id))) continue;
+    candidates.push({ recordNumber: row.id.trim(), recordLink: safeRecordLink(row.href) || pageLink, source: "account_list" });
+  }
+  const why = fresh && fresh.length > 1
+    ? `${fresh.length} new applications appeared in the account's list after the submit — a person picks which one this filing is.`
+    : pageNumber
+      ? input.read.reason
+      : "No record number on the page after the submit, and no single new application in the account's list.";
+  return { recordNumber: "", confidence: "low", source: "none", recordLink: pageLink, reason: why, candidates: candidates.slice(0, 5) };
+}

@@ -522,6 +522,16 @@ check("1k. and the approve button stays available (a later track still needs it)
     /2 · Build &amp; Validate/.test(b1.innerHTML) && !/Stage 3/.test(b1.innerHTML) && !/3 · Submit/.test(b1.innerHTML), b1.innerHTML.slice(0, 160));
   check("10b3. MUST EXCLUDE: headline and why are esc()'d into innerHTML", !/<b>|<img/.test(b1.innerHTML) && /&lt;img/.test(b1.innerHTML));
   check("10b4. it says who acts, and links the why to its panel", /Who acts: <strong>You<\/strong>/.test(b1.innerHTML) && /data-fix-target="portalRuns"/.test(b1.innerHTML));
+  // #400: unsure record numbers read after a person's submit are offered for one-click confirmation,
+  // every value esc()'d (a portal's own text is untrusted), never a link that is not http(s).
+  const bCand = renderWith({ selectedProjectId: "p-build", detail: { project: buildProject, stageIndex: 1, portalRuns: [] }, nextStepProjectId: "p-build", projects: [],
+    nextStep: { ...serverAnswer, recordCandidates: [
+      { runId: "r1", track: "building", recordNumber: "PC-<img src=x onerror=alert(1)>", recordLink: "https://grid.example.test/rec?ProjectId=1&x=\"><script>", source: "account_list" },
+      { runId: "r1", track: "building", recordNumber: "PC-0042200", recordLink: "", source: "account_list" },
+    ] } });
+  check("10b4b. #400: each record candidate renders with its own confirm button, esc()'d",
+    (bCand.innerHTML.match(/data-confirm-record="/g) || []).length === 2 && !/<img|<script/.test(bCand.innerHTML) && /PC-&lt;img/.test(bCand.innerHTML)
+      && (bCand.innerHTML.match(/open ↗/g) || []).length === 1, bCand.innerHTML.slice(0, 400));
   // The old status-table path (server answer unavailable) must ALSO use the real stage.
   const b2 = renderWith({ selectedProjectId: "p-build", detail: { project: buildProject, stageIndex: 1, portalRuns: [{ status: "failed", permitType: "building", startedAt: "2026-09-21" }] }, nextStep: null, projects: [] });
   check("10b5. fallback banner (no server answer) still names the real stage and keeps its qualifier",
