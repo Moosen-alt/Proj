@@ -281,6 +281,36 @@ export const recipe = (url: string): PortalRecipe => ({
   createdBy: "test", createdAt: "", updatedAt: "", notes: "", discipline: "",
 } as unknown as PortalRecipe);
 
+/** #386 — THE OWNER'S HAND PATCH (PacifiCorp learn, 2026-10-21): at review the owner clicked "Add
+ *  Array" twice and typed rows 2–3, and patch-by-demonstration recorded it all before Next. The
+ *  steps are as the capture describes these controls (role + accessible name, the row's legend as
+ *  the section) and as appendHumanPatchSteps merges them for the learn project (arrays 9 / 5 / 5 / 2):
+ *  the Qty "5" matches two arrays and stays a literal, the certified make matches nothing and stays
+ *  a literal, and the certified model binds to moduleModelCertified. */
+export const handPatchedRows = (): RecipeStep[] => {
+  const section = "PV ArrayDelete Array";
+  const steps: RecipeStep[] = [
+    { action: "click", selector: { role: "button", name: "Add Array" }, note: "human-patch: Add Array" },
+    { action: "click", selector: { role: "button", name: "Add Array" }, note: "human-patch: Add Array" },
+  ];
+  for (const n of [2, 3]) {
+    steps.push(
+      { action: "fill", selector: { role: "textbox", name: "Qty" }, fingerprint: { id: `pcInputBase${61 + 6 * n}`, placeholder: "Qty", ariaLabel: "Qty", section }, value: "5", note: "human-patch: Qty" },
+      { action: "select", selector: { role: "combobox", name: "Manufacturer" }, fingerprint: { id: `pcInputBase${62 + 6 * n}`, ariaLabel: "Manufacturer", section }, value: CERT_MAKE, note: "human-patch: Manufacturer" },
+      { action: "select", selector: { role: "combobox", name: "Model" }, fingerprint: { id: `pcInputBase${63 + 6 * n}`, ariaLabel: "Model", section }, field: "moduleModelCertified", note: "human-patch: Model" },
+    );
+  }
+  return steps;
+};
+
+/** The row recipe with the owner's hand patch merged in before Next (where the merge lands it). */
+export const recipeWithHandPatchedRows = (url: string): PortalRecipe => {
+  const base = recipe(url);
+  const steps = [...base.steps];
+  steps.splice(steps.findIndex((s) => s.action === "click" && /next/i.test(String(s.note ?? ""))), 0, ...handPatchedRows());
+  return { ...base, steps };
+};
+
 // The project's arrays (synthetic project; the numbers are the plan set's geometry), with the
 // PLAN SET's make wording — the portal lists the certified "Znshine PV-Tech".
 export const ARRAYS = [

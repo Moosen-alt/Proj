@@ -547,6 +547,80 @@ export function isArrayAdderClick(step: RecipeStep | undefined): boolean {
   return [sel.css, ...(sel.fallbacks ?? []).map((f) => f.css)].some((c) => /data-test-role=["']?add-array-btn\b/i.test(String(c ?? "")));
 }
 
+/** The words a PV-array row labels its own controls with (ROW_FIELD_HOOKS' names, the learner's
+ *  humanised hook, the plan-set words). Read only from a step that names no other section. */
+const ROW_CONTROL_WORDS = /^(qty|quantity|(pv\s*)?array\s*quantity|module\s*quantity|manufacturer|make|model|tilt|azimuth|tracking)$/i;
+/** A row-owned field: array<N>* (array2ModuleQuantity, array3ModuleManufacturer…) and the module
+ *  make/model every row files, as the merge binds them (moduleModelCertified for the portal's own
+ *  certified wording). */
+const ROW_FIELD = /^(array\d+[A-Z]\w*|moduleMake|moduleModel|moduleModelCertified)$/;
+const ROW_HOOK_ROLES = new Set(Object.values(ROW_FIELD_HOOKS).map((h) => h.role));
+
+/** Which PV-array row a recorded step names, 0 when it names none: its field's array number, its
+ *  section ("PV Array 3"), or a row hook css with an nth (nth 1 = row 2). */
+function recordedArrayRow(step: RecipeStep): number {
+  const f = /^array(\d+)[A-Z]/.exec(String(step.field ?? ""));
+  if (f) return Number(f[1]);
+  const s = /\bpv\s*array\s*#?\s*(\d+)\b/i.exec(String(step.fingerprint?.section ?? ""));
+  if (s) return Number(s[1]);
+  const sel = step.selector ?? {};
+  for (const x of [sel, ...(sel.fallbacks ?? [])]) {
+    const role = /data-test-role=["']?([\w-]+)/i.exec(String(x.css ?? ""))?.[1] ?? "";
+    if (role && ROW_HOOK_ROLES.has(role) && typeof x.nth === "number") return x.nth + 1;
+  }
+  return 0;
+}
+
+/** Does this recorded write name a PV-array row's own control (Qty / make / model / tilt / azimuth
+ *  / tracking)? By its field, a row hook, a "PV Array" section, or — when its section names no
+ *  OTHER one (the inverter's "Manufacturer" sits in "Inverter") — the row's own words. */
+function isArrayRowControl(step: RecipeStep): boolean {
+  if (step.action !== "fill" && step.action !== "select") return false;
+  if (ROW_FIELD.test(String(step.field ?? ""))) return true;
+  const sel = step.selector ?? {};
+  const all = [sel, ...(sel.fallbacks ?? [])];
+  if (all.some((x) => {
+    const role = /data-test-role=["']?([\w-]+)/i.exec(String(x.css ?? ""))?.[1] ?? "";
+    return ROW_HOOK_ROLES.has(role) || /^pv-array-/i.test(role);
+  })) return true;
+  const section = String(step.fingerprint?.section ?? "").trim();
+  // No \b after "array": the legend's text runs into its own button ("PV ArrayDelete Array").
+  if (section) return /\bpv\s*array/i.test(section);
+  const words = [...all.flatMap((x) => [x.name, x.label, x.placeholder, x.text]), step.fingerprint?.ariaLabel, step.fingerprint?.placeholder,
+    String(step.note ?? "").replace(/^human-patch\s*:?\s*/i, "")];
+  return words.some((w) => ROW_CONTROL_WORDS.test(String(w ?? "").replace(/\s+/g, " ").trim()));
+}
+
+const isHumanPatch = (step: RecipeStep | undefined): boolean => /^human-patch\b/i.test(String(step?.note ?? ""));
+
+/**
+ * #386 — THE HAND-PATCHED PV-ARRAY ROW WRITES A REPLAY MUST NOT REPEAT, by step index, each with
+ * why (for the run's notes). Live (PacifiCorp, 2026-10-21) the owner added rows 2–4 at review;
+ * patch-by-demonstration recorded the two "Add Array" clicks (#382 stops those replaying) AND the
+ * Qty / make / model typed into the new rows. Replayed, those are the LEARN project's numbers
+ * aimed at bare "Qty" / "Manufacturer" labels: a Qty of "5" (two of that project's arrays) lands
+ * on row 1 or the inverter's Qty, and on a one-array project rows 2–3 do not exist at all. The
+ * rows a project needs are its own data — row mode fills every one from the project's arrays —
+ * so a human-patched step counts when it writes a row control
+ *   - of a row past the first (array2*, "PV Array 3", a row hook's nth), or
+ *   - anywhere after a recorded "Add Array" click in the same human-patched run of steps.
+ * Row 1's own fixes and every other control replay as before. Read at replay, not dropped at the
+ * merge: recipes already saved hold these steps.
+ */
+export function handPatchedArrayRowSteps(steps: RecipeStep[]): Map<number, string> {
+  const out = new Map<number, string>();
+  let adderAt = -1; // the recorded adder click this human-patched run follows, -1 when none
+  steps.forEach((s, i) => {
+    if (isArrayAdderClick(s)) { adderAt = i; return; }
+    if (!isHumanPatch(s)) { adderAt = -1; return; }
+    if (!isArrayRowControl(s)) return;
+    const row = recordedArrayRow(s);
+    if (row >= 2) out.set(i, `it writes PV array row ${row}`);
+    else if (adderAt >= 0) out.set(i, `it writes a PV array row after the recorded "Add Array" click (step ${adderAt + 1})`);
+  });
+  return out;
+}
+
 /** The recorded control of a write step as an id css (#362): its `#id` selector, an `[id=…]` one, or
  *  its fingerprint id. "" when the step names no id — then only its own document and view make a
  *  re-assert of it this page's own. */
@@ -895,6 +969,9 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  marker) — for every project, one array or several (#382). Per-array steps then run INSIDE their own row container,
    *  never by a page-wide nth. null until the first per-array step decides it. */
   private arrayRowMode: boolean | null = null;
+  /** #386 — the hand-patched row writes this run did not replay (step indices): a later re-assert
+   *  of a blank never runs one of them either. */
+  private handPatchedRowsSkipped = new Set<number>();
   /** The row (1-based) every resolution is scoped to while a row is being filled; 0 = page. */
   private arrayRowScope = 0;
   /** Which project arrays each rendered row holds: [[1],[2],…] by default. A merge (the
@@ -1785,9 +1862,13 @@ export class RecipeAdapter extends BasePortalAdapter {
     // several roof planes. Measured: Bren Trask has FOUR arrays (10+3+5+6 = 24 modules) and
     // the recipe learned on him types "10"; Randal Rowland has two (18+5 = 23) and gets 18.
     // A 10.32 kW system was being filed as roughly 4.4 kW.
+    // #386 — hand-patched row writes never replay, so they never stretch the block either (a row-2
+    // Qty the merge bound to array1ModuleQuantity by value would otherwise become its last step).
+    const handPatchedRows = handPatchedArrayRowSteps(this.recipe.steps);
+    const recipeAddsRows = this.recipe.steps.some((s2) => isArrayAdderClick(s2));
     const arrayBound = this.recipe.steps
       .map((s2, i) => ({ s2, i }))
-      .filter(({ s2 }) => /^array1[A-Z]/.test(String(s2.field ?? "")));
+      .filter(({ s2, i }) => /^array1[A-Z]/.test(String(s2.field ?? "")) && !handPatchedRows.has(i));
     this.arrayBlockStart = arrayBound.length ? arrayBound[0].i : -1;
     this.arrayBlockEnd = arrayBound.length ? arrayBound[arrayBound.length - 1].i : -1;
     const slowSteps: Array<{ i: number; action: string; note: string; ms: number; phases?: Record<string, number> }> = [];
@@ -1834,6 +1915,20 @@ export class RecipeAdapter extends BasePortalAdapter {
         if (!this.driftWarnings.includes(why)) this.driftWarnings.push(why);
         trace.push({ i: stepIdx, action: "click", note: String(recordedStep.note ?? "Add Array").slice(0, 52), outcome: "not replayed (rows come from the project's arrays)", page: await currentPageLabel() });
         continue;
+      }
+      // #386 — NOR ARE THE ROW FILLS A PERSON TYPED INTO ROWS THAT CLICK ADDED. They carry the learn
+      // project's numbers to bare row labels; the rows come from the project's arrays (row mode, or
+      // the recorded block's nth pass), which is why they are skipped only where the recipe has that
+      // block AND the rows are added (countable rows, or a recorded adder). Named, never silent.
+      {
+        const why = handPatchedRows.get(stepIdx);
+        if (why && this.arrayBlockStart >= 0 && (this.arrayRowMode === true || recipeAddsRows)) {
+          const label = String(recordedStep.note ?? recordedStep.action).replace(/^human-patch\s*:?\s*/i, "").slice(0, 40) || recordedStep.action;
+          this.driftWarnings.push(`hand-patched step ${stepIdx + 1} ("${label}") not replayed — ${why}; every row is filled from the project's ${this.projectArrayCount()} array(s)`);
+          trace.push({ i: stepIdx, action: String(recordedStep.action), note: String(recordedStep.note ?? "").slice(0, 52), outcome: "not replayed (hand-patched array row; rows come from the project's arrays)", page: await currentPageLabel() });
+          this.handPatchedRowsSkipped.add(stepIdx);
+          continue;
+        }
       }
       const inArrayBlock = this.arrayBlockStart >= 0
         && stepIdx >= this.arrayBlockStart && stepIdx <= this.arrayBlockEnd;
@@ -8667,7 +8762,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         if (!norm(name)) return "";
         return open.find((b) => norm(name) === norm(bare(b))) ?? open.find((b) => sameName(name, bare(b))) ?? "";
       };
-      const matched = this.recipe.steps.filter((rs) => (rs.action === "fill" || rs.action === "select") && !!matchOf(rs));
+      const matched = this.recipe.steps.filter((rs, i) => (rs.action === "fill" || rs.action === "select") && !this.handPatchedRowsSkipped.has(i) && !!matchOf(rs));
       const own = await this.ownRecordedSteps(matched);
       const ownView = (rs: RecipeStep): boolean => own.has(rs);
       // THIS VIEW'S OWN STEP WINS ITS BLANK: another page's step sharing the label is not also re-run.
