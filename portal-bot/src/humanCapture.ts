@@ -118,6 +118,12 @@ export interface HumanCaptureOptions {
    *  automation filled the form — steps this sink never saw — so "nothing entered yet" is
    *  unknown there, and must stay undefined, never false. */
   startsFresh?: boolean;
+  /** Default true: the FIRST filing click signals once and disarms the session (the learn path:
+   *  nothing after the filing is a fix to the recipe). false (#333 round 4, the replay's own submit
+   *  watch only): EVERY filing click signals and nothing disarms. A click is only a sighting there;
+   *  the replay commits it on the evidence that followed, so a click that sent nothing must not
+   *  spend the detector before the person's real one. */
+  oneShot?: boolean;
 }
 
 export function createHumanCaptureSink(onStep: HumanStepFn, opts: HumanCaptureOptions = {}): (p: HumanCapturePayload) => void {
@@ -137,7 +143,7 @@ export function createHumanCaptureSink(onStep: HumanStepFn, opts: HumanCaptureOp
       const cls = classifyRecordedClick(p.label, ctx);
       if (cls === "finalSubmit") {
         if (!disarmed) {
-          disarmed = true;
+          disarmed = opts.oneShot !== false;
           onStep(payloadToStep({ kind: "submitObserved", selector: {}, label: p.label })!);
         }
         return;

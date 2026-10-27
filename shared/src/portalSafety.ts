@@ -2363,6 +2363,53 @@ export function classifySubmissionText(body: string | null | undefined): Submiss
   return { verdict: "unknown", evidence: null };
 }
 
+/** What a page's own words say about the person's application being filed (#333 round 4). */
+export interface CompletionEvidence {
+  /** The completion phrase found (the person's application as its subject), or null. */
+  phrase: string | null;
+  /** The context that cancels it ("with errors", "not filed", "duplicate"…), or null. */
+  veto: string | null;
+}
+
+// THE CONTEXT THAT CANCELS A COMPLETION PHRASE (Helm Blocking 1): every rejection phrase, plus the
+// words a duplicate, a refusal or a validation re-render puts beside "was submitted".
+const COMPLETION_VETO: RegExp[] = [
+  ...REJECTED_EVIDENCE,
+  /\bnot\s+(?:yet\s+)?(?:been\s+)?(?:filed|submitted|accepted|received)\b/i,
+  /\b(?:could|can)\s*not\b/i,
+  /\bduplicate\b/i,
+  /\balready\b/i,
+  /\bwith\s+errors?\b/i,
+  /\berrors?\b/i,
+  /\brejected\b/i,
+];
+
+/**
+ * THE ONE "DOES THIS PAGE SAY THE PERSON'S APPLICATION WAS FILED?" READING for the human-submit
+ * capture (#333 round 4). A phrase needs the application as its subject (ACCEPTED_EVIDENCE — never
+ * the record-label fallback classifySubmissionText allows: a review page's own "Record Number:" is
+ * not a completion), and its context vetoes it: its own sentence and the sentence on each side
+ * ("An application was submitted … under record X. This application was not filed."). A status word
+ * ("Application Submitted", "Status: Submitted") is no phrase. The first phrase whose context is clear
+ * wins; when every phrase is vetoed, the first one comes back with its veto. The caller passes the
+ * page's text with its table cells taken out (a list's status cells never count).
+ */
+export function completionEvidence(body: string | null | undefined): CompletionEvidence {
+  const sentences = String(body ?? "").split(/(?<=[.!?])\s+|\n+/).map((s) => s.replace(/\s+/g, " ").trim()).filter(Boolean);
+  let vetoed: CompletionEvidence | null = null;
+  for (let i = 0; i < sentences.length; i++) {
+    for (const re of ACCEPTED_EVIDENCE) {
+      const m = sentences[i].match(re);
+      if (!m) continue;
+      const context = sentences.slice(Math.max(0, i - 1), i + 2).join(" ");
+      const veto = COMPLETION_VETO.map((v) => context.match(v)?.[0]).find(Boolean) ?? null;
+      if (!veto) return { phrase: m[0], veto: null };
+      vetoed ??= { phrase: m[0], veto };
+    }
+  }
+  return vetoed ?? { phrase: null, veto: null };
+}
+
 // ---------------------------------------------------------------------------------------------
 // Recipe shape
 // ---------------------------------------------------------------------------------------------

@@ -292,8 +292,10 @@ export interface FilingBackstop {
   handedOver(): boolean;
   /** #333 round 2 — did a person's own input reach `pg` (default: the run's page) at any time after
    *  the hand-over? Not time-limited (unlike the exemption): it tells "the person acted here" for
-   *  the run's report, never lets anything through. */
-  personActedSinceHandOver(pg?: unknown): boolean;
+   *  the run's report, never lets anything through. `withinMs` (#333 round 4) asks instead whether
+   *  that input was in the last `withinMs` ms: the replay stamps a submit sighting with it (a page
+   *  script's el.click() on the submit comes with no input of the person's). */
+  personActedSinceHandOver(pg?: unknown, withinMs?: number): boolean;
   /** #333 — THE FENCE: run `fn` (an input the run itself makes on `pg`: a click, a key press,
    *  typing) so the input watch never records it as a person's — while it is in flight, and only
    *  then: no grace after it (the trusted event and its binding report arrive before the Playwright
@@ -1587,9 +1589,10 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       return true;
     },
     handedOver() { return handedOverAt > 0 && !disposed; },
-    personActedSinceHandOver(pg?: unknown) {
+    personActedSinceHandOver(pg?: unknown, withinMs?: number) {
       const p = (pg && typeof pg === "object" ? pg : page) as object;
-      return handedOverAt > 0 && !disposed && (humanInputAt.get(p) ?? 0) > handedOverAt;
+      const t = humanInputAt.get(p) ?? 0;
+      return handedOverAt > 0 && !disposed && t > handedOverAt && (withinMs === undefined || Date.now() - t <= withinMs);
     },
     async withAutomationInput<T>(pg: unknown, fn: () => Promise<T>): Promise<T> {
       const p = (pg && typeof pg === "object" ? pg : page) as object;

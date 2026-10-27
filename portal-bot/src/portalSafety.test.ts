@@ -22,6 +22,7 @@ import vm from "node:vm";
 import {
   classifyRecordedClick,
   classifySubmissionText,
+  completionEvidence,
   finalSubmitEnvAllows,
   finalSubmitRefusals,
   isFinalSubmitControl,
@@ -675,6 +676,37 @@ await check("humanCapture sink: the filing click signals ONCE and disarms; a mid
   const signals = got.filter((s) => s.note === HUMAN_SUBMIT_OBSERVED_NOTE);
   assert.equal(signals.length, 1, `expected one submitObserved signal, got ${signals.length}`);
   assert.equal(got.length, 3, "nothing is captured after the filing click");
+});
+await check("humanCapture sink, oneShot:false (the replay's own watch, #333): EVERY filing click signals; nothing disarms", () => {
+  const got: RecipeStep[] = [];
+  const sink = createHumanCaptureSink((s) => got.push(s), { oneShot: false });
+  sink({ kind: "click", selector: {}, label: "Submit" });
+  sink({ kind: "fill", selector: { label: "Initials" }, label: "Initials", value: "AB", identity: { label: "Initials" } });
+  sink({ kind: "click", selector: {}, label: "Submit" });
+  const signals = got.filter((s) => s.note === HUMAN_SUBMIT_OBSERVED_NOTE);
+  assert.equal(signals.length, 2, `expected two submitObserved signals, got ${signals.length}`);
+  assert.equal(got.length, 3, "the fill between the clicks is still reported");
+});
+await check("completionEvidence (#333): the person's application as the subject, vetoed by its context (its sentence and the neighbours)", () => {
+  const ok1 = completionEvidence("Application Submitted\nYour application has been successfully submitted.\nRecord Number: BLD-2026-900123");
+  assert.ok(ok1.phrase && !ok1.veto, JSON.stringify(ok1));
+  const far = completionEvidence("Your application has been submitted. Your permit will be reviewed. Inspections follow. Report site errors to the webmaster.");
+  assert.ok(far.phrase && !far.veto, `a footer's "errors" two sentences away is not context: ${JSON.stringify(far)}`);
+  for (const t of [
+    "Step 3: Review. The form was submitted with errors. Record Number: 26TMP-004411",
+    "An application was submitted for this address on 10/01/2026 under record 187-26-000100-STR. This application was not filed.",
+    "Your application was received. It is a duplicate of record 187-26-000100-STR.",
+    "Your application has been submitted already.",
+    "Your application was submitted but could not be processed.",
+    "The application was rejected. Your application was received on 10/01/2026.",
+  ]) {
+    const e = completionEvidence(t);
+    assert.ok(e.phrase && e.veto, `vetoed: "${t}" -> ${JSON.stringify(e)}`);
+  }
+  for (const t of ["Application Submitted", "Record Number: 26TMP-004411", "Status: Submitted", "Record Issued. Permit Number: BLD-2026-900777", ""]) {
+    const e = completionEvidence(t);
+    assert.equal(e.phrase, null, `no subject phrase in "${t}" (status words and a record label are not completion wording): ${JSON.stringify(e)}`);
+  }
 });
 await check("humanCapture: secret identity marks the fill sensitive; ordinary identity does not", () => {
   const acct = payloadToStep({ kind: "fill", selector: { label: "Utility Account Number" }, label: "Utility Account Number", value: "3091", identity: { label: "Utility Account Number", name: "account_number" } });
