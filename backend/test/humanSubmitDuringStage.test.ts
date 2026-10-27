@@ -17,6 +17,8 @@
 //   (e) a submit that only CREATED A DRAFT, read during the run, is held the same way and recorded
 //       after the outcome as a draft (portal.draft_created audit + result_json.draftCreated), never
 //       as a filing: run and submission stay awaiting_human_submit, no number on the submission.
+//       GUARD PIN: green before by design (the hold already drained a draft); its kills are the
+//       no-hold and no-draft-branch kills below.
 //   (f) the outcome could not be recorded (a trigger refuses the write): the held draft is still
 //       written down for the next stage to continue, not dropped as "the completion page's read".
 //
