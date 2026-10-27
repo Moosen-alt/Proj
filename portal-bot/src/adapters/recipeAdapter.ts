@@ -97,12 +97,12 @@ import { openPortal } from "../browser";
 import { selectWithFallback, comboboxFaceInPage, type ComboboxPick } from "../comboboxFill";
 import {
   classifySubmissionText, finalSubmitEnvAllows, finalSubmitRefusals, isFinalSubmitControl, isPayFee, isPayNowDialogText, mayClickFinalSubmit,
-  isRecipeShapeValid, isSignatureNameLabel, isSignatureRequestControl, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
+  isPayRequestUrl, isRecipeShapeValid, isSignatureNameLabel, isSignatureRequestControl, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
   type HealedStep, type RunApproval, type SubmissionOutcome,
 } from "../../../shared/src/portalSafety";
 import { commitField, installSettleProbe, waitForSettled } from "../settle";
 import { siteOfUrl } from "../siteOf";
-import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, withAutomationInput, describeBackstopAbort, backstopSentLine, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, isStoppingAbort, type FilingBackstop, type BackstopHumanRequest } from "../filingBackstop";
+import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, withAutomationInput, describeBackstopAbort, backstopSentLine, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, isStoppingAbort, type BackstopAbort, type FilingBackstop, type BackstopHumanRequest } from "../filingBackstop";
 
 /** #333: the run did not hand the review page over — its input watch could not be armed, or (Helm
  *  Should-fix 3) a stopping abort the watch did not flag as the person's is on record, so the run
@@ -127,6 +127,44 @@ export const PERSON_REQUEST_WENT_NOTE = "A REQUEST YOU SENT FROM THE REVIEW PAGE
  *  completion page's number can be read. */
 export const HUMAN_SUBMITTED_NOTE = "YOU SUBMITTED FROM THE REVIEW WINDOW while the stage was finishing (automation clicked nothing). The record number is read off the completion page and recorded only when it is read confidently — if the project does not show it, enter it with the capture form. Do not stage this track again: it has been filed.";
 
+// #333 round 4 (Helm Blocking 2) — WHAT THE REVIEW STEP SAYS ABOUT THE PERSON'S CLICK, BUILT WHOLE.
+// "Filed" (HUMAN_SUBMITTED_NOTE) only for a committed submit whose page read as a completion; every
+// other outcome has its own whole note below. Each names the click by its label and says only what the
+// run saw: never "nothing was sent" when it saw no request (it cannot know), "click again" only beside
+// what the window shows, and never a note saying the filing went beside a held or unsent click.
+/** The person's submit went, then a request the page it led to made was held back, and the window shows
+ *  Chromium's error page. */
+export const HUMAN_FOLLOW_UP_HELD_NOTE = "YOUR SUBMIT WENT TO THE PORTAL, BUT A REQUEST THE NEXT PAGE MADE WAS HELD BACK and the window shows an error page (automation clicked nothing). Check the portal: if the application shows as submitted, enter its record number with the capture form; if it does not, go Back to the review page and submit again.";
+const clickedLabel = (label: string | undefined): string => `"${String(label || "the submit").slice(0, 60)}"`;
+/** "YOU CLICKED "X" ON THE REVIEW PAGE" — or, for a click with no input of the person's in the 2 s
+ *  before it (a page script's el.click()), "A CLICK ON "X" WAS SEEN ON THE REVIEW PAGE". */
+const clickedOnReview = (label: string | undefined, personInput: boolean | undefined): string =>
+  personInput === false ? `A CLICK ON ${clickedLabel(label)} WAS SEEN ON THE REVIEW PAGE` : `YOU CLICKED ${clickedLabel(label)} ON THE REVIEW PAGE`;
+const ERROR_PAGE_GO_BACK = " The window shows an error page: go Back to the review page first.";
+/** A sighting the run saw no request of the person's follow. */
+export function humanClickUnconfirmedNote(label: string | undefined, errorPage: boolean, personInput?: boolean): string {
+  return `${clickedOnReview(label, personInput)} while the stage was finishing (automation clicked nothing), and the run saw no request go from that click. Check the portal: if the application shows as submitted, enter its record number with the capture form; if it does not, finish in the open window.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
+}
+/** A committed click (a request of the person's went after it) whose page did not read as a completion. */
+export function humanClickStandsNote(label: string | undefined, personInput?: boolean): string {
+  return `${clickedOnReview(label, personInput)} while the stage was finishing (automation clicked nothing), and a request of yours went to the portal, but no completion page was read. The filing may have gone: check the portal before you click again; if it shows as submitted, enter its record number with the capture form.`;
+}
+/** A click a stopping abort held, with no filing-shaped request of the person's after it. Never begins
+ *  "YOUR CLICK WAS HELD BACK" (HUMAN_CLICK_HELD_NOTE: a click before the hand-over). */
+export function humanClickHeldNote(label: string | undefined, abort: BackstopAbort, errorPage: boolean, personInput?: boolean): string {
+  return `${personInput === false ? "A CLICK ON" : "YOUR CLICK ON"} ${clickedLabel(label)} ON THE REVIEW PAGE WAS HELD BACK: the submit itself was not sent — ${describeBackstopAbort(abort)}. Check the portal before you click again.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
+}
+/** A payment request after the person's click, held by rule 1 (automation never pays). Stands in for
+ *  Should-fix 5's payment note until that lands; no "click again" on a payment. */
+export function humanPaymentHeldNote(abort: BackstopAbort, errorPage: boolean): string {
+  return `A PAYMENT REQUEST FROM THE REVIEW PAGE WAS HELD BACK — ${describeBackstopAbort(abort)}. Automation never pays, and nothing was paid: check the portal, and pay there yourself once you have seen whether the application was submitted.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
+}
+/** The person's submit was answered with a draft (PSE Part 1): nothing is filed, the track is staged
+ *  again (the next run continues the draft), and the draft's number is never entered as a filing. */
+export function humanDraftCreatedNote(applicationNumber: string, nextForm: string): string {
+  return `YOUR SUBMIT FROM THE REVIEW WINDOW CREATED DRAFT ${applicationNumber || "(no number shown)"}, not a filing (automation clicked nothing). NOTHING WAS FILED.${nextForm ? ` The filing is in "${nextForm}".` : ""} Stage this track again: the next run opens this draft and continues it. Do not enter the draft's number in the capture form.`;
+}
+
 // #333 round 4 (Helm Blocking 1) — THE PERSON'S SUBMIT CLICK IS A SIGHTING, COMMITTED ON EVIDENCE.
 /** A final-submit click the replay's own watch saw after the hand-over: provisional until a request
  *  of the person's that followed it commits it (RecipeAdapter.judgeHumanClick). */
@@ -147,6 +185,19 @@ interface HumanClickSighting {
   filingEvidence?: boolean;
   /** The one slow-server re-read after a reopen was scheduled. */
   slowRereadDone?: boolean;
+}
+/** #333 round 4 (Helm Blocking 2) — what became of the person's click, as the review step reports it
+ *  (RecipeAdapter.humanClickVerdict). */
+interface HumanClickVerdict {
+  verdict: "followUpHeld" | "filed" | "draft" | "stands" | "held" | "unconfirmed";
+  click: { label?: string; at: number; personInput?: boolean } | null;
+  /** The stopping abort that held the click (held only). */
+  held: BackstopAbort | null;
+  /** A payment request held after the click (rule 1). */
+  payment: BackstopAbort | null;
+  /** The window shows Chromium's error page now. */
+  errorPage: boolean;
+  draft?: { applicationNumber: string; nextForm: string };
 }
 /** The review page's own reading, taken at the hand-over while the lockdown still held the page: what
  *  the capture judges a later page against (never its URL). */
@@ -1433,6 +1484,113 @@ export class RecipeAdapter extends BasePortalAdapter {
     return rs.some((r) => typeof r.at === "number" && r.at >= at && filingShapedHumanRequest(r));
   }
 
+  /** #333 round 4 (Helm Blocking 2) — the person's own document request from the handed-over page went,
+   *  a stopping abort came after it, and the window shows Chromium's error page now: the page their
+   *  submit led to made a follow-up request the backstop held. Read at report time, off the HANDED-OVER
+   *  backstop only (fillApplication's finally has let `this.backstop` go by then). */
+  private followUpHeldOnErrorPage(): boolean {
+    const bs = this.handedOverBackstop;
+    const doc = this.humanDocumentFromHandedOverPage(bs);
+    if (!bs || !doc || !/^chrome-error:/i.test(this.pageUrlNoHash())) return false;
+    return bs.aborts.some((a, i) => i >= doc.abortsBefore && isStoppingAbort(a));
+  }
+
+  /** #333 round 4 (Helm Blocking 2) — the person's click the review step reports: the latest sighting,
+   *  whatever became of it — committed (humanSubmit), still pending (a reopened one included), or held.
+   *  null: the watch saw no final-submit click. */
+  private reportedHumanClick(): { click: { label?: string; at: number; personInput?: boolean; evidenceAfter?: number }; state: "committed" | "pending" | "held" } | null {
+    const seen: Array<{ click: { label?: string; at: number; personInput?: boolean; evidenceAfter?: number }; state: "committed" | "pending" | "held" }> = [];
+    if (this.humanSubmit) seen.push({ click: { label: this.humanSubmit.label, at: this.humanSubmit.at ?? 0, personInput: this.humanSubmit.personInput }, state: "committed" });
+    if (this.pendingHumanClick) seen.push({ click: this.pendingHumanClick, state: "pending" });
+    if (this.heldHumanClickAfterHandOver) seen.push({ click: this.heldHumanClickAfterHandOver, state: "held" });
+    return seen.sort((a, b) => b.click.at - a.click.at)[0] ?? null;
+  }
+
+  /** #333 round 4 (Helm Blocking 2) — WHAT BECAME OF THE PERSON'S CLICK, read when the run reports. In
+   *  order: the follow-up held on an error page; HELD (a stopping abort on the handed-over backstop after
+   *  the click, flagged as the person's or not, with no filing-shaped request of theirs after it); a
+   *  DRAFT the page reads as created; FILED (committed, and the page read as the completion — the
+   *  capture's judgeCompletion, read here once more because the runner's capture reads only after the
+   *  run reports); STANDS (committed, or a request of theirs went after it, with no completion read);
+   *  UNCONFIRMED (no request of theirs seen after it). A pending click is never "filed". Read-only: the
+   *  page is read, never touched, and the capture's state is not moved. */
+  private async humanClickVerdict(): Promise<HumanClickVerdict | null> {
+    const errorPage = /^chrome-error:/i.test(this.pageUrlNoHash());
+    const seen = this.reportedHumanClick();
+    if (this.followUpHeldOnErrorPage()) return { verdict: "followUpHeld", click: seen?.click ?? null, held: null, payment: null, errorPage };
+    if (!seen) return null;
+    const { click, state } = seen;
+    // The click's form POST and its sighting travel different event streams: an abort, or a filing-shaped
+    // request, may land just before the sighting (the capture's own allowance).
+    const early = click.at - HUMAN_CLICK_EARLY_MS;
+    const stoppedAfter = (this.handedOverBackstop?.aborts ?? []).filter((a) => isStoppingAbort(a) && !a.beforeHandOver && typeof a.at === "number" && a.at >= early);
+    const payment = stoppedAfter.find((a) => isPayRequestUrl(a.where)) ?? null;
+    const filingWent = this.personFilingShapedRequestAfter(early);
+    const runPage = this.page;
+    const requestWent = filingWent || (this.handedOverBackstop?.humanRequests ?? []).some((r) => r.page === runPage && typeof r.at === "number" && r.at >= click.at && String(r.method ?? "").toUpperCase() !== "GET");
+    const base = { click, payment, errorPage };
+    if (state === "held" || (state === "pending" && click.evidenceAfter === undefined && stoppedAfter.length > 0 && !filingWent)) {
+      return { ...base, verdict: "held", held: payment ?? stoppedAfter[0] ?? null };
+    }
+    if (state === "committed") {
+      const read = errorPage ? null : await this.readPageForCapture();
+      if (read) {
+        const d = readDraftCreated(read.text);
+        if (d.draft) return { ...base, verdict: "draft", held: null, draft: { applicationNumber: d.applicationNumber, nextForm: d.nextForm } };
+        if (!this.completionConfirmed) this.judgeCompletion(read, click.at);
+      }
+      return { ...base, verdict: this.completionConfirmed ? "filed" : "stands", held: null };
+    }
+    // Pending: a reopened click (a request went, the page came back as the review), or one a request of
+    // the person's followed that the capture has not committed yet, stands; else the run saw nothing go.
+    return { ...base, verdict: click.evidenceAfter !== undefined || requestWent ? "stands" : "unconfirmed", held: null };
+  }
+
+  /** #333 round 4 (Helm Blocking 2) — the review step's report for a verdict, each built WHOLE: the note
+   *  for the hand-off (and the payment note beside a click that stands), the one sentence the caller
+   *  puts between "handed it to you; " and " No fee payment was automated.", and the step's data. The
+   *  portal is named only by the caller. */
+  private humanClickReport(v: HumanClickVerdict): { notes: string[]; sentence: string; data: Record<string, unknown> } {
+    const label = v.click?.label;
+    const pi = v.click?.personInput;
+    const clicked = pi === false ? `a click on ${clickedLabel(label)} was seen on the review page` : `you clicked ${clickedLabel(label)} on the review page`;
+    const yourClick = pi === false ? `a click on ${clickedLabel(label)}` : `your click on ${clickedLabel(label)}`;
+    const data: Record<string, unknown> = {
+      humanSubmittedInReviewWindow: v.verdict === "filed",
+      ...(v.click ? { humanClick: { label: String(label ?? ""), verdict: v.verdict }, humanSubmitPersonInput: pi } : { humanClick: { label: "", verdict: v.verdict } }),
+    };
+    switch (v.verdict) {
+      case "followUpHeld":
+        return { notes: [HUMAN_FOLLOW_UP_HELD_NOTE], data, sentence: "your submit went, then a request the next page made was held back and the window shows an error page — check the portal, then go Back and submit again if the application is not there." };
+      case "filed":
+        return { notes: [HUMAN_SUBMITTED_NOTE], data, sentence: "you submitted from the review window while the run was finishing — automation clicked nothing. The completion page was read: its record number is recorded on the project only when it is read confidently — if the project does not show it, enter it with the capture form." };
+      case "draft": {
+        const n = v.draft?.applicationNumber || "(no number shown)";
+        return {
+          notes: [humanDraftCreatedNote(v.draft?.applicationNumber ?? "", v.draft?.nextForm ?? "")],
+          data: { ...data, humanDraftCreated: { applicationNumber: v.draft?.applicationNumber ?? "", nextForm: v.draft?.nextForm ?? "" } },
+          sentence: `your submit from the review window created draft ${n} — the submit this portal answers with a draft, never the filing. NOTHING WAS FILED: stage this track again, and the next run opens this draft.`,
+        };
+      }
+      case "stands":
+        return {
+          notes: [humanClickStandsNote(label, pi), ...(v.payment ? [humanPaymentHeldNote(v.payment, v.errorPage)] : [])], data,
+          sentence: `${clicked} and a request of yours went to the portal, but no completion page was read — the filing may have gone: check the portal before you click again.`,
+        };
+      case "held":
+        // A held payment gets ONE note, the payment's; any other held request, the held-click note.
+        if (v.payment) {
+          return { notes: [humanPaymentHeldNote(v.payment, v.errorPage)], data, sentence: `${yourClick} was held back with the payment request it sent — automation never pays, and no filing request went from it; check the portal.` };
+        }
+        return {
+          notes: v.held ? [humanClickHeldNote(label, v.held, v.errorPage, pi)] : [humanClickUnconfirmedNote(label, v.errorPage, pi)], data,
+          sentence: `${yourClick} was held back — the submit itself was not sent; check the portal before you click again.`,
+        };
+      default:
+        return { notes: [humanClickUnconfirmedNote(label, v.errorPage, pi)], data, sentence: `${clicked} and the run saw no request go from that click — check the portal before anything else.` };
+    }
+  }
+
   /** #333 — a person's click held back BEFORE the hand-over (a stopping abort flagged humanInput).
    *  After it, a flagged abort is the person's own payment (rule 1 never lifts): not "click again". */
   private heldHumanClick(): boolean {
@@ -1565,31 +1723,31 @@ export class RecipeAdapter extends BasePortalAdapter {
         { finalSubmitClicked: false, stoppedBeforeReview: true, personMovedOn: this.personMovedOn, ...handoffData },
       );
     }
-    // THE PERSON SUBMITTED (OR MOVED ON) FROM THE REVIEW WINDOW WHILE THE RUN WAS FINISHING (#333).
-    // Automation clicked nothing; the run staged the page and handed it over, and the person's own
-    // click went. Never "failed", never "click submit" to someone who already has.
-    if (this.personMovedOn || this.humanSubmit) {
-      const filed = !!this.humanSubmit;
-      // On the record (skeptic r2 F5): the hand-off notes reach the project's next-step panel, so the
-      // fact that the person filed survives a completion page whose number cannot be read.
-      if (filed && !this.reviewHandoffNotes.includes(HUMAN_SUBMITTED_NOTE)) this.reviewHandoffNotes.push(HUMAN_SUBMITTED_NOTE);
-      if (!filed && this.personRequestWent && !this.reviewHandoffNotes.includes(PERSON_REQUEST_WENT_NOTE)) this.reviewHandoffNotes.push(PERSON_REQUEST_WENT_NOTE);
+    // THE PERSON CLICKED THE SUBMIT (OR MOVED ON) FROM THE REVIEW WINDOW WHILE THE RUN WAS FINISHING
+    // (#333). Automation clicked nothing; the run staged the page and handed it over. Round 4 (Helm
+    // Blocking 2): what the step says comes from what became of the click (humanClickVerdict) — "filed"
+    // only for a committed submit whose page read as the completion — each outcome built whole, with
+    // the portal named once, by this frame. The outcome's note leads the hand-off notes (nextStep keeps
+    // the first six). PERSON_REQUEST_WENT_NOTE is said only when the watch saw no click at all.
+    const verdict = await this.humanClickVerdict();
+    if (verdict || this.personMovedOn) {
+      const report: { notes: string[]; sentence: string; data: Record<string, unknown> } = verdict ? this.humanClickReport(verdict) : {
+        notes: this.personRequestWent ? [PERSON_REQUEST_WENT_NOTE] : [], data: { humanSubmittedInReviewWindow: false },
+        sentence: "you moved on from the review window while the run was finishing — automation clicked nothing. If that was the submit, the filing went: check the portal and enter its record number with the capture form; if not, finish in the open window.",
+      };
+      // On the record (skeptic r2 F5): the hand-off notes reach the project's next-step panel.
+      for (const n of [...report.notes].reverse()) if (!this.reviewHandoffNotes.includes(n)) this.reviewHandoffNotes.unshift(n);
       return ok(
-        `${this.portalName}: the recipe staged the review screen and handed it to you, and you ${filed ? "submitted" : "moved on"} from the review window while the run was finishing — automation clicked nothing. `
-          + (filed
-            ? "The completion page is being read: its record number is recorded on the project only when it is read confidently — if the project does not show it, enter it with the capture form."
-            : "If that was the submit, the filing went: check the portal and enter its record number with the capture form; if not, finish in the open window.")
-          + " No fee payment was automated. AUTOMATION HAS STOPPED.",
+        `${this.portalName}: the recipe staged the review screen and handed it to you; ${report.sentence} No fee payment was automated. AUTOMATION HAS STOPPED.`,
         {
-          finalSubmitClicked: false, humanSubmittedInReviewWindow: filed,
-          // Round 4: whether the person's own input came with the submit (tri-state, stamped at sighting).
-          ...(this.humanSubmit ? { humanSubmitPersonInput: this.humanSubmit.personInput } : {}),
+          finalSubmitClicked: false, ...report.data,
           ...(this.reviewHandoffNotes.length ? { reviewHandoffNotes: [...this.reviewHandoffNotes] } : {}),
         },
       );
     }
     // A request the person sent went through and the click detector did not see a final submit
-    // (round 3): on the record, and never "click submit manually" as if nothing had happened.
+    // (round 3): on the record, and never "click submit manually" as if nothing had happened. (No
+    // sighting exists here: a click the watch saw is reported above.)
     if (this.personRequestWent && !this.reviewHandoffNotes.includes(PERSON_REQUEST_WENT_NOTE)) this.reviewHandoffNotes.push(PERSON_REQUEST_WENT_NOTE);
     // WHAT THE PERSON MUST KNOW BEFORE SUBMITTING (dryrun-0928 B3 / B14): answers the portal may
     // not have saved, and the portal's own background calls the lockdown held back on this page.

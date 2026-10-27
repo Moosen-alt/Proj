@@ -18,14 +18,23 @@
 //   8. (round 4) personFilingShapedRequestAfter(at) — the one predicate the capture's commit/held
 //      split and the review step's wording read: a main-frame document request, or a fetch/XHR to a
 //      submit/payment URL, after the click, never a GET and never a beacon; off the handed-over
-//      backstop only (case 7 is allocated to a later commit of this round).
+//      backstop only.
+//   7. (round 4, Helm Blocking 2) followUpHeldOnErrorPage — the person's document submit went, a stopping
+//      abort followed, and the window shows Chromium's error page: true; on a portal page, or read off
+//      this.backstop instead of the handed-over backstop: false. Red before: no such predicate.
+//  10. (round 4, Helm Blocking 2) stopAtReview at report time (backstop null): a held payment after a
+//      validate fetch gets ONE note (the payment's), never PERSON_REQUEST_WENT_NOTE; a pending click with
+//      an unflagged stopping abort after it reads as held, never "saw no request go". Red before: the
+//      validate made it PERSON_REQUEST_WENT_NOTE and no payment note; the pending click had no note. The
+//      no-sighting case (PERSON_REQUEST_WENT_NOTE still said) is a GUARD, green before by design; its
+//      kill: push PERSON_REQUEST_WENT_NOTE only with a sighting.
 //   9. (round 4) NOT_HANDED_OVER_NOTE fits one progress line: at most 200 characters, and a progress
 //      sink receives the constant whole (progress() cuts at 200).
 //
 //   npx tsx portal-bot/src/adapters/backstopStopHuman.test.ts
 import type { PortalRecipe } from "../../../shared/src/types";
 import type { BackstopAbort } from "../filingBackstop";
-import { RecipeAdapter, HUMAN_CLICK_HELD_NOTE, NOT_HANDED_OVER_NOTE } from "./recipeAdapter";
+import { RecipeAdapter, HUMAN_CLICK_HELD_NOTE, HUMAN_SUBMITTED_NOTE, NOT_HANDED_OVER_NOTE, PERSON_REQUEST_WENT_NOTE } from "./recipeAdapter";
 
 let failures = 0;
 let total = 0;
@@ -146,6 +155,69 @@ console.log("\n#333 round 4 — did a FILING-SHAPED request of the person's go a
     live.handedOverBackstop = null;
     const offLive = live.personFilingShapedRequestAfter!.call(live, CLICK);
     check("8. it reads the HANDED-OVER backstop's record only (never this.backstop): no hand-over, nothing", offLive === false, String(offLive));
+  }
+}
+
+console.log("\n#333 round 4 — the person's submit went, then the next page's request was held, on an error page (followUpHeldOnErrorPage)");
+{
+  // Helm Blocking 2: "When a stopping abort follows the person's document request and the window is on
+  // Chromium's error page, say the follow-up request was held." Read at REPORT time: off the
+  // handed-over backstop (this.backstop is null by then) and the page's address now.
+  const ERR_PAGE = { url: () => "chrome-error://chromewebdata/" };
+  const OK_PAGE = { url: () => "https://portal.example/Cap/Interstitial.aspx" };
+  const probe = (page: unknown, liveOnly = false): boolean | string => {
+    const a = atReportTime([{ ...filingDoc(false), at: 20 } as BackstopAbort],
+      [{ where: "https://portal.example/apply/submit", document: true, abortsBefore: 0, method: "POST", resourceType: "document", at: 10, page }]);
+    a.page = page;
+    if (liveOnly) { a.backstop = a.handedOverBackstop; a.handedOverBackstop = null; }
+    const fn = (a as unknown as { followUpHeldOnErrorPage?: () => boolean }).followUpHeldOnErrorPage;
+    return typeof fn === "function" ? fn.call(a) : "no followUpHeldOnErrorPage on the adapter";
+  };
+  const onError = probe(ERR_PAGE);
+  check("7. the person's document submit went, then a stopping abort, and the window shows chrome-error: the follow-up was held", onError === true, String(onError));
+  const onPage = probe(OK_PAGE);
+  check("7. …the same record with the window on a portal page: not this case", onPage === false, String(onPage));
+  const live = probe(ERR_PAGE, true);
+  check("7. …read off the HANDED-OVER backstop only (never this.backstop)", live === false, String(live));
+}
+
+console.log("\n#333 round 4 — what the review step says about the person's click, at report time (stopAtReview)");
+{
+  // Helm Blocking 2: a held click never also gets a note saying the filing went, and "held" is any
+  // stopping abort after the click, flagged as the person's or not (the fill step already says STOPPED
+  // BY THE NETWORK BACKSTOP; the review step must not say it saw no request). At report time: backstop
+  // null, the handed-over backstop's record, the page a fake with no DOM (no page read).
+  const PAGE = { url: () => "https://portal.example/review" };
+  type Sighting = { label?: string; at: number; abortsBefore: number; requestsBefore: number; personInput: boolean | undefined };
+  const report = async (aborts: BackstopAbort[], humanRequests: HumanRequest[], s: { held?: Sighting; pending?: Sighting }): Promise<{ notes: string[]; all: string; data: Record<string, unknown> }> => {
+    const a = atReportTime(aborts, humanRequests) as unknown as Internals & Record<string, unknown> & { stopAtReview(): Promise<{ message?: string; data?: Record<string, unknown> }> };
+    a.page = PAGE;
+    if (s.held) a.heldHumanClickAfterHandOver = s.held;
+    if (s.pending) a.pendingHumanClick = s.pending;
+    const r = await a.stopAtReview();
+    const data = r.data ?? {};
+    return { notes: (data.reviewHandoffNotes as string[] | undefined) ?? [], all: JSON.stringify({ m: r.message, d: data }), data };
+  };
+  const click = (at: number): Sighting => ({ label: "Submit Application", at, abortsBefore: 0, requestsBefore: 0, personInput: true });
+  const validate: HumanRequest = { where: "https://portal.example/api/validate", document: false, abortsBefore: 0, method: "POST", resourceType: "fetch", at: 12, page: PAGE };
+  {
+    const r = await report([{ ...payment(), at: 13 } as BackstopAbort], [validate], { held: click(10) });
+    check("10. a validate fetch went, then the person's payment was held: exactly one note, the payment's",
+      r.notes.filter((n) => /\/payment\//.test(n)).length === 1, JSON.stringify(r.notes));
+    check("10. …never PERSON_REQUEST_WENT_NOTE beside it, never 'has been filed'",
+      !r.notes.includes(PERSON_REQUEST_WENT_NOTE) && !r.all.includes("has been filed") && !r.notes.includes(HUMAN_SUBMITTED_NOTE) && r.data.humanSubmittedInReviewWindow !== true, JSON.stringify(r.notes));
+  }
+  {
+    // The judge may still be inside its settle when the run reports: a pending click with an UNFLAGGED
+    // stopping abort after it is held all the same.
+    const r = await report([{ ...filingDoc(false), at: 11 } as BackstopAbort], [], { pending: click(10) });
+    check("10. a pending click with an unflagged stopping abort after it reads as held, never 'saw no request go'",
+      r.notes.some((n) => n.startsWith('YOUR CLICK ON "Submit Application"') && /WAS HELD BACK/.test(n)) && !/saw no request go/.test(r.all), JSON.stringify(r.notes));
+  }
+  {
+    // No sighting at all: the request that went is still said plainly (B5-B7's shape).
+    const r = await report([], [validate], {});
+    check("10. no sighting, a request of the person's went: PERSON_REQUEST_WENT_NOTE (GUARD)", r.notes.includes(PERSON_REQUEST_WENT_NOTE), JSON.stringify(r.notes));
   }
 }
 

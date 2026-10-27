@@ -150,6 +150,39 @@
 //         4/105: A1's page stamp, B10 x2 (personMovedOn's first clause reads the same predicate) and
 //         B17b's "not failed". Kill Kr (the predicate without its page filter) reddens B17's "fails
 //         by name" (1/105) and backstopStopHuman case 6 (1/18).
+//   [B, Helm Blocking 2] "FILED" ONLY FOR A COMMITTED SUBMIT WHOSE PAGE READS AS A COMPLETION; EVERY OTHER
+//   OUTCOME SAYS WHAT THE RUN SAW, WHOLE (RecipeAdapter.humanClickVerdict / humanClickReport). Each case
+//   also asserts the review step's message is whole (wholeMessage: the portal named once, no "., ").
+//   B1 gains that check (a GUARD, green before by design):
+//     B18 a Submit on a form with an empty required box, and B19 one whose confirm() is dismissed: 0
+//         POSTs, never "has been filed"; the note says YOU CLICKED "Submit Application", the run saw no
+//         request go from it, check the portal; never "nothing was sent", never "click submit again".
+//     B20 PSE Part 1: the Submit is answered "Your draft application NEM-90017 has been created": the
+//         note names the draft, NOTHING WAS FILED, "Stage this track again", never enter its number;
+//         never "Do not stage this track again". The adapter's own capture still reads the draft (a
+//         GUARD check, green before by design: captureSubmissionConfirmation is unchanged).
+//     B21 "Submit Application" posting straight to /payment/charge: rule 1 holds it, the run is not
+//         failed, exactly one note (the held payment), never PERSON_REQUEST_WENT_NOTE.
+//     B22 a validate fetch, then the payment it chains held: one note (the payment's), never "the filing
+//         went", never "nothing was sent".
+//     B23 a two-phase submit (stage fetch, then a document POST to /payment/checkout, held): one note,
+//         with "go Back" (the window shows the error page).
+//     B24 a filing fetch, then a held payment: the click STANDS ("may have gone; check the portal before
+//         you click again") plus the payment note; never "filed" (no completion page was read).
+//     B25 a modal, then "Yes" a second later: still filed (HUMAN_SUBMITTED_NOTE). GUARD, green before by
+//         design.
+//     B26 the person's submit goes; the interstitial it led to auto-posts 5 s later and is held on an
+//         error page: HUMAN_FOLLOW_UP_HELD_NOTE, never "filed", never "the filing went".
+//     B27 a form_submit BEACON (resourceType ping) beside a held payment: held, never "may have gone".
+//     B28 a page script's el.click() on a fetch submit (its POST held unflagged; the run fails by name, as
+//         on main): personInput false, worded "A CLICK ON …", never "you clicked".
+//     Red at 209df536 (test-only change on the parent code), 15/178: B18 and B19 "…YOU CLICKED…"; B20
+//     "never 'has been filed'…" and "…the draft…"; B21 "…exactly one note…"; B22 "…one note…"; B23 "…one
+//     note…" and "…go Back…"; B24 "…the click stands…" and "…plus the payment note…"; B26 "…follow-up…"
+//     and "…never 'has been filed'…"; B27 "…never 'may have gone'…"; B28 "…humanSubmitPersonInput false"
+//     and "…'A CLICK ON'…". (Step 14 had already stopped a provisional sighting from saying "filed", so
+//     B18/B19's "never 'has been filed'" is green there; their red check is the note.)
+//     Kills: measured in the next commit, and written here.
 //   [round 4, THE RECORD'S SHAPE] (Helm Blocking 1 "stamp humanRequests and aborts with at", nit :97
 //   "record the requesting page") — extra checks on existing cases, no new case numbers:
 //     A1  also: the person's request is stamped POST / resourceType document / `at` inside the click's
@@ -228,6 +261,9 @@ import { chromium, type Page } from "playwright";
 import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../../shared/src/types";
 import { backstopFor, installFilingBackstop, isStoppingAbort, withBackstopWindow, withOwnWriteWindow, type FilingBackstop } from "../filingBackstop";
 import { HUMAN_CLICK_HELD_NOTE, HUMAN_SUBMITTED_NOTE, NOT_HANDED_OVER_NOTE, PERSON_REQUEST_WENT_NOTE, RecipeAdapter } from "./recipeAdapter";
+// Read by namespace: a constant this round adds is then undefined on older code (a FAIL by name),
+// never a link-time SyntaxError that would take the whole smoke down.
+import * as recipeAdapterModule from "./recipeAdapter";
 import { armSubmitCapture } from "../index";
 
 let failures = 0;
@@ -332,10 +368,43 @@ const C_RERENDERS: Record<string, string> = {
   "C16|apply/dup": html("Review and Submit", `<p class="err">An application was submitted for this address on 10/01/2026 under record 187-26-000100-STR. This application was not filed.</p>${SUMMARY}${submitForm("/h/C16/apply/dup")}`),
   "C18|apply/history": html("Review and Submit", `${SUMMARY}<h2>History</h2><table><tr><th>Event</th><th>Record</th></tr><tr><td>Your application has been submitted</td><td>187-26-000199-STR</td></tr></table>${submitForm("/h/C18/apply/history")}`),
 };
+// [B, Helm Blocking 2] THE REVIEW STEP'S WORDING — each review page keeps the summary; a submit control
+// whose click the detector reads as the final submit ("Submit Application").
+const B_REVIEWS: Record<string, string> = {
+  // An empty required box: the browser holds the submit (nothing sent).
+  B18: `${SUMMARY}${submitForm("/h/B18/apply/submit", `<label for="initials">Initials</label> <input id="initials" name="initials" required> `)}`,
+  // A native confirm() Playwright dismisses: nothing sent.
+  B19: `${SUMMARY}${submitForm("/h/B19/apply/submit", "", "btnSubmit", ` onsubmit="return confirm('Submit this application?')"`)}`,
+  // PSE Part 1: the Submit is answered with the draft-created page (B_ANSWERS).
+  B20: `${SUMMARY}${submitForm("/h/B20/apply/submit")}`,
+  // "Submit Application" posts straight to a payment URL (rule 1 holds it).
+  B21: `${SUMMARY}${submitForm("/h/B21/payment/charge")}`,
+  // A validate fetch goes, then the payment it chains is held.
+  B22: `${SUMMARY}<button type="button" id="btnSubmit" onclick="fetch('/h/B22/api/validate', { method: 'POST', body: 'x=1' }).then(function () { return fetch('/h/B22/payment/charge', { method: 'POST', body: 'amt=150' }); }).catch(function () {})">Submit Application</button>`,
+  // A two-phase submit: a stage fetch goes, then the page posts its (payment) form as a document.
+  B23: `${SUMMARY}<form method="post" action="/h/B23/payment/checkout"></form><button type="button" id="btnSubmit" onclick="fetch('/h/B23/api/stage', { method: 'POST', body: 'x=1' }).then(function () { document.forms[0].submit(); }).catch(function () {})">Submit Application</button>`,
+  // A filing fetch goes, then the payment it chains is held (the page stays the review).
+  B24: `${SUMMARY}<button type="button" id="btnSubmit" onclick="fetch('/h/B24/apply/submit', { method: 'POST', body: 'x=1' }).then(function () { return fetch('/h/B24/payment/charge', { method: 'POST', body: 'amt=150' }); }).catch(function () {})">Submit Application</button>`,
+  // "Submit Application" opens a modal; its "Yes" posts the filing.
+  B25: `${SUMMARY}<button type="button" id="btnSubmit" onclick="document.getElementById('modal').hidden = false">Submit Application</button><div id="modal" hidden><p>Submit this application now?</p><form method="post" action="/h/B25/apply/submit"><button type="submit" id="yes">Yes</button></form></div>`,
+  // A form_submit analytics BEACON goes, and the payment fetch beside it is held.
+  // A fetch submit (the page stays the review page; a document submit's held navigation would leave the
+  // error page, which the run reads as where it stopped — Should-fix 5's case, not this one).
+  B28: `${SUMMARY}<button type="button" id="btnSubmit" onclick="fetch('/h/B28/apply/submit', { method: 'POST', body: 'x=1' }).catch(function () {})">Submit Application</button>`,
+  B27: `${SUMMARY}<button type="button" id="btnSubmit" onclick="navigator.sendBeacon('/h/B27/analytics/form_submit', 'e=submit'); fetch('/h/B27/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function () {})">Submit Application</button>`,
+};
+// What a B case's POST to /apply/submit is answered with (default: COMPLETION).
+const B_ANSWERS: Record<string, string> = {
+  // PSE Part 1's answer (issue #302's wording, as draftCreated.test.ts quotes it; number synthetic).
+  B20: html("Interconnection", `<h1>Puget Sound Energy — Interconnection</h1><p>Your draft application NEM-90017 has been created. Please continue to Interconnection Application - Part 2 to complete your interconnection application and submit to PSE.</p><p><a href="/h/B20/home">Return to Program Home</a></p>`),
+  // An interstitial that auto-posts the second step 5 s after it loads (past the 4 s input window).
+  B26: html("Processing", `<h1>Processing your submission</h1><p>Please wait.</p><form method="post" action="/h/B26/apply/finalize"><input type="hidden" name="step" value="2"></form><script>setTimeout(function () { document.forms[0].submit(); }, 5000);</script>`),
+};
 // "My Applications": status cells and ANOTHER application's number.
 const MY_APPS = html("My Applications", `<h1>My Applications</h1><table><tr><th>Record</th><th>Status</th></tr><tr><td>187-26-000100-STR</td><td>Application Submitted</td></tr></table>`);
 const reviewBody = (k: string): string => {
   if (C_REVIEWS[k]) return C_REVIEWS[k];
+  if (B_REVIEWS[k]) return B_REVIEWS[k];
   const summary = SUMMARY;
   if (k === "B5") return `${summary}${formSubmit(k)}<button type="button" id="saveLater" onclick="fetch('/h/B5/api/save-later', { method: 'POST', body: 'x=1' }).then(function () { location.href = '/h/B5/records'; })">Save for Later</button>`;
   if (k === "B6") return `${summary}${formSubmit(k)}${SEND(k)}`;
@@ -393,7 +462,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "POST" && C_RERENDERS[`${k}|${rest}`]) { send(C_RERENDERS[`${k}|${rest}`]); return; }
   if (req.method === "POST" && rest === "api/submit-slow") { setTimeout(() => send(`<h1>Thank you</h1><p>Your application has been successfully submitted.</p><p>Record Number: 187-26-000710-STR</p>`), 12_000); return; }
   if (req.method === "POST" && rest === "review" && C_COMPLETIONS[k]) { send(C_COMPLETIONS[k]); return; }
-  if (req.method === "POST" && rest === "apply/submit") { send(C_COMPLETIONS[k] ?? COMPLETION); return; }
+  if (req.method === "POST" && rest === "apply/submit") { send(C_COMPLETIONS[k] ?? B_ANSWERS[k] ?? COMPLETION); return; }
   if (rest === "myapps") { send(MY_APPS); return; }
   if (req.method === "POST" && rest === "apply/continue") { send(html("Review and Submit", reviewBody(k))); return; }
   if (rest === "popup") { send(html("Processing", `<h1>Processing</h1><script>fetch('/h/${k}/popup/post', { method: 'POST', body: 'from=popup' }).catch(function(){});</script>`)); return; }
@@ -707,6 +776,10 @@ interface Replay {
   progressLines: string[];
   /** What the runner's capture (index.ts armSubmitCapture, `capture: true` only) reported. */
   captures: SubmitCapture[];
+  /** The backstop's record of the person's own requests with how each went (method, resource type). */
+  humanRequestKinds: Array<{ where: string; method?: string; resourceType?: string }>;
+  /** What afterReport returned (run after stopAtReview, before the window closes). */
+  reported?: unknown;
 }
 type SubmitCapture = Parameters<NonNullable<Parameters<typeof armSubmitCapture>[1]["onSubmitCaptured"]>>[0];
 type Track = (p: Promise<unknown>) => void;
@@ -729,7 +802,9 @@ type Track = (p: Promise<unknown>) => void;
  *   onUnroute      fires inside the dispose gap (disposed set, route still on).
  *   capture        also arms index.ts armSubmitCapture and waits up to captureWaitMs for its reports.
  *   settleMs       a FIXED wait after afterFill (default 2000): a capture that reopens and commits again
- *                  reports twice, so "as many captures as submits" can end the wait too early. */
+ *                  reports twice, so "as many captures as submits" can end the wait too early.
+ *   afterReport    runs after stopAtReview, before the window closes (B20 calls the adapter's own
+ *                  captureSubmissionConfirmation there); its value is `reported`. */
 async function replay(k: string, opts: {
   autoSubmit?: boolean; handOver?: boolean; at?: string; extraSteps?: RecipeStep[];
   onHandOver?: (page: Page, adapter: RecipeAdapter) => Promise<unknown>;
@@ -745,6 +820,7 @@ async function replay(k: string, opts: {
   afterFill?: (page: Page) => Promise<unknown>;
   onUnroute?: (page: Page) => Promise<unknown>;
   capture?: boolean; captureWaitMs?: number; settleMs?: number;
+  afterReport?: (page: Page, adapter: RecipeAdapter) => Promise<unknown>;
 } = {}): Promise<Replay> {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
@@ -859,6 +935,7 @@ async function replay(k: string, opts: {
     while (Date.now() - t0 < (opts.captureWaitMs ?? 6000) && captures.length < observed.length) await sleep(50);
   }
   const review = await adapter.stopAtReview();
+  const reported = opts.afterReport ? await opts.afterReport(page, adapter).catch((e: unknown) => e) : undefined;
   const navDocuments = [...((adapter as unknown as { navDocuments?: Array<{ url: string; method: string; at?: number }> }).navDocuments ?? [])];
   await ctx.close().catch(() => null);
   return {
@@ -875,6 +952,8 @@ async function replay(k: string, opts: {
     gap: gapState.value,
     progressLines,
     captures,
+    humanRequestKinds: (spied.bs?.humanRequests ?? []).map((r) => ({ where: r.where.replace(base, ""), method: r.method, resourceType: r.resourceType })),
+    reported,
   };
 }
 /** The person's request was said plainly, and nobody was told to "click submit manually". */
@@ -882,6 +961,25 @@ const saidPlainly = (r: Replay): boolean => {
   const notes = (r.review.data.reviewHandoffNotes as string[] | undefined) ?? [];
   return notes.includes(PERSON_REQUEST_WENT_NOTE) && !/click submit manually/i.test(r.review.message);
 };
+// Helm's whole-message nit: the review step's message names the portal ONCE (its "Recipe: …" prefix)
+// and stitches no fragment ending "." onto a clause that continues with ","; never "it Recipe:".
+// (Not "it STOPPED": the stopped-before-review template says that, and it is whole.)
+const wholeMessage = (r: Replay): boolean =>
+  (r.review.message.match(/Recipe: City of Fernhollow \(fixture\)/g) || []).length === 1 && !/\.\s*,|\bit Recipe:/.test(r.review.message);
+const notesOf = (r: Replay): string[] => (r.review.data.reviewHandoffNotes as string[] | undefined) ?? [];
+/** Everything the review step says (its message and data, notes included). */
+const said = (r: Replay): string => JSON.stringify({ m: r.review.message, d: r.review.data });
+/** Never "filed": no "has been filed", no HUMAN_SUBMITTED_NOTE, humanSubmittedInReviewWindow not true. */
+const neverFiled = (r: Replay): boolean =>
+  !said(r).includes("has been filed") && !notesOf(r).includes(HUMAN_SUBMITTED_NOTE) && r.review.data.humanSubmittedInReviewWindow !== true;
+/** The hand-off notes that name a held payment request (its /payment/ URL). */
+const paymentNotes = (r: Replay): string[] => notesOf(r).filter((n) => /\/payment\//.test(n));
+const clickVerdict = (r: Replay): string => String((r.review.data.humanClick as { verdict?: unknown } | undefined)?.verdict ?? "");
+const wbrief = (r: Replay): string => JSON.stringify({
+  ok: r.ok, pause: r.pauseReason, posts: r.posts, aborts: r.aborts.map((a) => `${a.rule}:${a.where}:${a.human ? "human" : "-"}`), observed: r.observed,
+  verdict: r.review.data.humanClick, filed: r.review.data.humanSubmittedInReviewWindow, pi: r.review.data.humanSubmitPersonInput,
+  msg: r.review.message.slice(0, 420), notes: notesOf(r).map((n) => n.slice(0, 200)),
+}).slice(0, 1800);
 const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseReason, posts: r.posts, msg: r.message.slice(0, 260), review: { ok: r.review.ok, msg: r.review.message.slice(0, 200), human: r.review.data.humanSubmittedInReviewWindow }, armed: r.watchArmed, observed: r.observed, humanRequests: r.humanRequests, extra: r.extra instanceof Error ? r.extra.message.slice(0, 160) : r.extra }).slice(0, 1100);
 
 {
@@ -906,6 +1004,7 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
   // stamped, when it is seen, with whether the person's own input reached the page in the last 2 s.
   check("B1 …the submit is stamped as the person's own input (humanSubmitPersonInput true)",
     r.review.data.humanSubmitPersonInput === true, rbrief(r));
+  check("B1 …and the review step's message is built whole (the portal named once, no stitched fragment)", wholeMessage(r), r.review.message);
 }
 {
   // Helm Should-fix 11 — B1b: the click lands right after the run LOCKS review (the real lock first, so
@@ -1166,6 +1265,130 @@ const refusedHandOver = (k: string, r: Replay): void => {
     r.posts.filter((p) => /\/apply\/submit$/.test(p)).length === 1 && r.aborts.some((a) => /\/apply\/submit$/.test(a.where) && !a.human), rbrief(r));
   check("B17b …and the run is not failed: that abort follows the handed-over page's own document request",
     r.ok === true && !/STOPPED BY THE NETWORK BACKSTOP/.test(r.message), rbrief(r));
+}
+
+// [B, Helm Blocking 2] "FILED" ONLY FOR A COMMITTED SUBMIT WHOSE PAGE READS AS A COMPLETION.
+console.log("\n[B, Helm Blocking 2] THE REVIEW STEP SAYS WHAT BECAME OF THE PERSON'S CLICK");
+for (const [k, how] of [["B18", "a Submit on a form with an empty required box"], ["B19", "a Submit whose confirm() the browser dismissed"]] as const) {
+  // B18 / B19: the click sends nothing. The run saw no request go from it, so it cannot say "filed",
+  // and it cannot say "nothing was sent" either: "you clicked X; check the portal".
+  const r = await replay(k, { onHandOver: (page) => personClicks(page) });
+  check(`${k} ${how}: nothing reached the portal, never "has been filed", no submit handed on`,
+    r.posts.length === 0 && neverFiled(r) && r.observed.length === 0, wbrief(r));
+  check(`${k} …the hand-off says YOU CLICKED "Submit Application", the run saw no request go from it: check the portal`,
+    notesOf(r).some((n) => n.startsWith('YOU CLICKED "Submit Application"') && /saw no request go/.test(n) && /Check the portal/.test(n)) && clickVerdict(r) === "unconfirmed", wbrief(r));
+  check(`${k} …never "nothing was sent", never "click submit again" (the window still shows the review page)`,
+    !/nothing was sent|click submit again/i.test(said(r)), wbrief(r));
+  check(`${k} …the review step's message is built whole`, wholeMessage(r), r.review.message);
+}
+{
+  // B20: PSE Part 1. The person's Submit is answered with "Your draft application NEM-90017 has been
+  // created": a draft, never a filing. Never "Do not stage this track again" (the next stage continues
+  // the draft), never "enter its number". The runner's own capture still reads the draft (GUARD check,
+  // green before by design: captureSubmissionConfirmation reads the draft first and is untouched).
+  const r = await replay("B20", { onHandOver: (page) => personClicks(page), afterReport: (_page, adapter) => adapter.captureSubmissionConfirmation() });
+  check("B20 PSE Part 1: the person's Submit went (1 POST) and was answered with draft NEM-90017",
+    r.posts.filter((p) => /\/apply\/submit$/.test(p)).length === 1, wbrief(r));
+  check("B20 …never 'has been filed', never 'Do not stage this track again'", neverFiled(r) && !said(r).includes("Do not stage this track again"), wbrief(r));
+  check("B20 …the hand-off says the draft: NEM-90017, NOTHING WAS FILED, stage this track again, never enter its number",
+    notesOf(r).some((n) => n.includes("NEM-90017") && n.includes("NOTHING WAS FILED") && n.includes("Stage this track again") && n.includes("Do not enter the draft's number")) && clickVerdict(r) === "draft", wbrief(r));
+  const cap = (r.reported ?? {}) as { data?: { permitNumber?: unknown; draftCreated?: { applicationNumber?: unknown } } };
+  check("B20 …and the adapter's capture reads a draft, never a record number (GUARD)",
+    cap.data?.permitNumber === "" && cap.data?.draftCreated?.applicationNumber === "NEM-90017", JSON.stringify(r.reported).slice(0, 300));
+  check("B20 …the review step's message is built whole", wholeMessage(r), r.review.message);
+}
+{
+  // B21: "Submit Application" posts straight to a payment URL. Rule 1 holds it (flagged as the
+  // person's, so the run is not failed), and the review step says so once, never "filed".
+  const r = await replay("B21", { onHandOver: (page) => personClicks(page) });
+  check("B21 a 'Submit Application' that posts to a payment URL: rule 1 holds it (0 POSTs), the run is not failed",
+    r.posts.length === 0 && r.ok === true && r.aborts.some((a) => /\/payment\/charge$/.test(a.where) && a.rule === "filing-url"), wbrief(r));
+  check("B21 …never 'has been filed', no submit handed on", neverFiled(r) && r.observed.length === 0, wbrief(r));
+  check("B21 …exactly one note names the held payment, and never PERSON_REQUEST_WENT_NOTE",
+    paymentNotes(r).length === 1 && !notesOf(r).includes(PERSON_REQUEST_WENT_NOTE) && clickVerdict(r) === "held", wbrief(r));
+  check("B21 …the review step's message is built whole", wholeMessage(r), r.review.message);
+}
+{
+  // B22: a validate fetch goes (not filing-shaped), then the payment it chains is held. The click is
+  // held: one note, the payment's — never "the filing went", never "nothing was sent" (the validate did).
+  const r = await replay("B22", { onHandOver: (page) => personClicks(page) });
+  check("B22 a validate fetch went, then the payment it chained was held: only the validate reached the portal",
+    r.posts.length === 1 && /\/api\/validate$/.test(r.posts[0]) && r.aborts.some((a) => /\/payment\/charge$/.test(a.where)), wbrief(r));
+  check("B22 …one note, the payment's; never PERSON_REQUEST_WENT_NOTE, never 'has been filed', never 'nothing was sent'",
+    paymentNotes(r).length === 1 && !notesOf(r).includes(PERSON_REQUEST_WENT_NOTE) && neverFiled(r) && !/nothing was sent/i.test(said(r)) && clickVerdict(r) === "held", wbrief(r));
+  check("B22 …the review step's message is built whole", wholeMessage(r), r.review.message);
+}
+{
+  // B23: a two-phase submit — the stage fetch goes, then the page posts its form to a payment URL as a
+  // document (held by rule 1; the window shows Chromium's error page). One note, and it says go Back.
+  const r = await replay("B23", { onHandOver: async (page) => { await personClicks(page); await sleep(1500); } });
+  check("B23 a two-phase submit: the stage fetch went, the payment form it then posted was held (rule 1)",
+    r.posts.length === 1 && /\/api\/stage$/.test(r.posts[0]) && r.aborts.some((a) => /\/payment\/checkout$/.test(a.where)), wbrief(r));
+  check("B23 …exactly one note (the held payment), never PERSON_REQUEST_WENT_NOTE, never 'has been filed'",
+    paymentNotes(r).length === 1 && !notesOf(r).includes(PERSON_REQUEST_WENT_NOTE) && neverFiled(r) && clickVerdict(r) === "held", wbrief(r));
+  check("B23 …and the window's error page is named: go Back to the review page", /go Back to the review page/.test(paymentNotes(r)[0] ?? ""), wbrief(r));
+  check("B23 …the review step's message is built whole", wholeMessage(r), r.review.message);
+}
+{
+  // B24: a filing fetch goes, then the payment it chains is held. The click STANDS (the filing may have
+  // gone: check the portal before you click again), plus the payment note: two notes, never "filed"
+  // (no completion page was read), never "nothing was sent".
+  const r = await replay("B24", { onHandOver: (page) => personClicks(page) });
+  check("B24 a filing fetch went, then the payment it chained was held",
+    r.posts.length === 1 && /\/apply\/submit$/.test(r.posts[0]) && r.aborts.some((a) => /\/payment\/charge$/.test(a.where)), wbrief(r));
+  check("B24 …the click stands: YOU CLICKED \"Submit Application\", the filing may have gone, check the portal before you click again",
+    notesOf(r).some((n) => n.startsWith('YOU CLICKED "Submit Application"') && /may have gone/.test(n) && /check the portal before you click again/i.test(n)) && clickVerdict(r) === "stands", wbrief(r));
+  check("B24 …plus the payment note; never PERSON_REQUEST_WENT_NOTE, never 'has been filed', never 'nothing was sent'",
+    paymentNotes(r).length === 1 && !notesOf(r).includes(PERSON_REQUEST_WENT_NOTE) && neverFiled(r) && !/nothing was sent/i.test(said(r)), wbrief(r));
+  check("B24 …the review step's message is built whole", wholeMessage(r), r.review.message);
+}
+{
+  // B25 (GUARD, green before by design: the click committed on the Yes POST and its page reads as the
+  // completion): "Submit Application" opens a modal and the person clicks "Yes" a second later. Still
+  // filed. Kill: HUMAN_CLICK_COMMIT_MS = 500 (the Yes POST falls outside the commit bound).
+  const r = await replay("B25", { onHandOver: async (page) => { await personClicks(page); await sleep(1000); await Promise.all([page.waitForLoadState("load"), personClicks(page, "#yes")]); } });
+  check("B25 a modal, then 'Yes' a second later: the filing POST went (1)", r.posts.filter((p) => /\/apply\/submit$/.test(p)).length === 1, wbrief(r));
+  check("B25 …it reads as filed: humanSubmittedInReviewWindow, HUMAN_SUBMITTED_NOTE, the submit handed on once",
+    r.review.data.humanSubmittedInReviewWindow === true && notesOf(r).includes(HUMAN_SUBMITTED_NOTE) && r.observed.length === 1, wbrief(r));
+  check("B25 …the review step's message is built whole", wholeMessage(r), r.review.message);
+}
+{
+  // B26: the person's form POST goes and is answered by an interstitial that auto-posts its second step
+  // 5 s later (past the 4 s input window): the lockdown holds it and the window shows an error page.
+  // Say the follow-up was held: check the portal, go Back, submit again. Never "filed", never "the
+  // filing went".
+  const r = await replay("B26", { onHandOver: async (page) => { await personClicks(page); await sleep(6500); } });
+  check("B26 the person's submit went (1 POST to /apply/submit); the interstitial's auto-post was held (0 to /apply/finalize)",
+    r.posts.filter((p) => /\/apply\/submit$/.test(p)).length === 1 && !r.posts.some((p) => /finalize/.test(p)) && r.aborts.some((a) => /\/apply\/finalize$/.test(a.where)), wbrief(r));
+  check("B26 …the run is not failed and not stopped before review", r.ok === true && r.pauseReason !== "stopped_before_review", wbrief(r));
+  const followUp = (recipeAdapterModule as Record<string, unknown>).HUMAN_FOLLOW_UP_HELD_NOTE;
+  check("B26 …the hand-off says the follow-up request was held on an error page (HUMAN_FOLLOW_UP_HELD_NOTE)",
+    typeof followUp === "string" && notesOf(r).includes(followUp), wbrief(r));
+  check("B26 …never 'has been filed', never 'the filing went'", neverFiled(r) && !/the filing went/i.test(said(r)), wbrief(r));
+  check("B26 …the review step's message is built whole", wholeMessage(r), r.review.message);
+}
+{
+  // B27: a form_submit analytics BEACON goes (its URL matches the filing-URL vocabulary) and the payment
+  // fetch beside it is held. A beacon is never filing-shaped: the click is held, never "stands".
+  const r = await replay("B27", { onHandOver: (page) => personClicks(page) });
+  check("B27 a form_submit beacon went (Chromium reports it as resourceType ping); the payment beside it was held",
+    r.posts.some((p) => /\/analytics\/form_submit$/.test(p)) && r.humanRequestKinds.some((h) => /form_submit$/.test(h.where) && h.resourceType === "ping")
+      && r.aborts.some((a) => /\/payment\/charge$/.test(a.where)), `${JSON.stringify(r.humanRequestKinds)} ${wbrief(r)}`);
+  check("B27 …the beacon never makes the click stand: one note, the payment's; never 'may have gone', never 'has been filed'",
+    paymentNotes(r).length === 1 && !/may have gone/.test(said(r)) && neverFiled(r) && clickVerdict(r) === "held", wbrief(r));
+  check("B27 …the review step's message is built whole", wholeMessage(r), r.review.message);
+}
+{
+  // B28: a page script's el.click() on the submit (no input of the person's): the sighting is stamped
+  // personInput false and worded "A click on …", never "you clicked"/"your click". Its POST is held
+  // unflagged, so the run fails by name, as on main.
+  const r = await replay("B28", { onHandOver: async (page) => { await page.evaluate(() => { (document.getElementById("btnSubmit") as HTMLElement).click(); }); await sleep(2500); } });
+  check("B28 a page script's el.click() on the submit: its POST is held, unflagged (0 POSTs)",
+    r.posts.length === 0 && r.aborts.some((a) => /\/apply\/submit$/.test(a.where) && !a.human), wbrief(r));
+  check("B28 …the sighting is stamped as no input of the person's (humanSubmitPersonInput false)", r.review.data.humanSubmitPersonInput === false, wbrief(r));
+  check("B28 …and worded 'A CLICK ON \"Submit Application\"', never 'YOU CLICKED' or 'YOUR CLICK ON'",
+    notesOf(r).some((n) => n.startsWith('A CLICK ON "Submit Application"')) && !/YOU CLICKED|YOUR CLICK ON|you clicked|your click on/.test(said(r)), wbrief(r));
+  check("B28 …the review step's message is built whole", wholeMessage(r), r.review.message);
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -103,6 +103,12 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS");
     ["readPageForCapture", /  private async readPageForCapture\(/],
     ["readReviewForCapture", /  private async readReviewForCapture\(/],
     ["judgeCompletion", /  private judgeCompletion\(/],
+    // Round 4 (Helm Blocking 2): the review step's readers of what became of the person's click (called
+    // from stopAtReview, outside the tail; listed so a reader never grows an input).
+    ["followUpHeldOnErrorPage", /  private followUpHeldOnErrorPage\(/],
+    ["reportedHumanClick", /  private reportedHumanClick\(/],
+    ["humanClickVerdict", /  private async humanClickVerdict\(/],
+    ["humanClickReport", /  private humanClickReport\(/],
   ] as const) {
     const body = methodBody(recipe, sig);
     check(`${name}: found, and makes no input on the page`, body.length > 0 && !INPUT_CALL.test(body), body ? (body.match(INPUT_CALL) || [""])[0] : "not found");
