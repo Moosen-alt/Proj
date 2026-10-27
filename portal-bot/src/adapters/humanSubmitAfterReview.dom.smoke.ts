@@ -198,6 +198,21 @@
 //         number (C12); take the first new number of any tier (C13).
 //     C17a a completion with only "Record Issued" + a new number, C17b one whose wording the review page
 //         already showed: captured. Kill: a new number needs completion wording the review did not show.
+//     KILLS, measured at fec3bb15 in a throwaway tree, each run on the C blocks it names (a trimmed copy):
+//       K-url (evidence skips the handed-over page's own URL): C5, C7 red.
+//       K-fixed (a pending click dropped 1.5 s after it with no evidence): C6a, C6b, C7, C8 red.
+//       K-spa (no page read after a late plain fetch): C8 red.
+//       K-own (never the review's own number): C12, C13 red. K-anytier (the first new number of any
+//         tier): C13 red.
+//       K-phrase (a new number needs wording the review did not show): C17a, C17b red.
+//       K-cells (completion wording read off table cells too): C18 x2 red.
+//       K-reopen (the capture never reopens the watch): C10's capture, C11's and C14's re-click, and
+//         C15/C16/C18 "does not stand" red (6/12).
+//       K-nav (a page reached by GET navigation alone may yield a number): C3b red.
+//       K-sight (the sighting commits on sight, as before): C1's re-click, C2, C19, C3 red (the judged
+//         read alone still keeps C1's review id out).
+//       K-veto1 (the veto read on the phrase's own sentence only): C16 x2 red, and portalSafety.test's
+//         completionEvidence case.
 //     C9  a person's filing DURING the run's dispose (after `disposed` is set, before the route comes
 //         off — the harness holds the context's unroute until the fixture counted the POST, or 4 s):
 //         it goes (1 POST), nothing is aborted at or after the click, and the run is not failed.
