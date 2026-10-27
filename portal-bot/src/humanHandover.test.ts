@@ -90,6 +90,19 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS");
     ["pageUrlNoHash", /  private pageUrlNoHash\(/],
     // Round 4: the one "filing-shaped request after the click" predicate (a record reader).
     ["personFilingShapedRequestAfter", /  private personFilingShapedRequestAfter\(/],
+    // Round 4 (Helm Blocking 1): the provisional sighting, its judgement, the late hooks and the
+    // capture's readers — all run after the watch is armed, so none may make an input.
+    ["sightHumanSubmit", /  private sightHumanSubmit\(/],
+    ["startJudging", /  private startJudging\(/],
+    ["judgeHumanClick", /  private judgeHumanClick\(/],
+    ["commitHumanClick", /  private commitHumanClick\(/],
+    ["reopenHumanSubmit", /  private reopenHumanSubmit\(/],
+    ["hookLateHumanRequests", /  private hookLateHumanRequests\(/],
+    ["scheduleCompletionReread", /  private scheduleCompletionReread\(/],
+    ["rereadForCompletion", /  private async rereadForCompletion\(/],
+    ["readPageForCapture", /  private async readPageForCapture\(/],
+    ["readReviewForCapture", /  private async readReviewForCapture\(/],
+    ["judgeCompletion", /  private judgeCompletion\(/],
   ] as const) {
     const body = methodBody(recipe, sig);
     check(`${name}: found, and makes no input on the page`, body.length > 0 && !INPUT_CALL.test(body), body ? (body.match(INPUT_CALL) || [""])[0] : "not found");

@@ -158,7 +158,46 @@
 //     B1  also: the completion document the person's POST committed is in the adapter's navDocuments
 //         with `at` after the hand-over.
 //   Each is red before the stamps exist (the fields are undefined).
-//   [C] THE CAPTURE (Helm Blocking 1; C1-C8 and C10-C19 are allocated to the capture rework):
+//   [C] THE CAPTURE (Helm Blocking 1). After the hand-over a submit click is only a SIGHTING: evidence
+//   after it (a non-GET request of the person's, a document a non-GET request committed, on any URL)
+//   commits it; a stopping abort after it with no filing-shaped request of theirs holds it; and the
+//   page after it is judged against the review page's own reading (numbers by shape tier, completion
+//   wording with its veto, the review's submit control), never by URL. A capture that finds the review
+//   (or the error page) reopens the watch. Each case arms index.ts armSubmitCapture; "recorded" = a
+//   number the runner reported (index.ts reports any non-empty number HIGH). LATE = after the run let
+//   go and after a capture of the first click would have read the page.
+//     C1  an Accela review with an empty required box: the tail click sends nothing, then LATE the person
+//         types their initials and clicks again: 26TMP-004411 never recorded, 187-26-000328-STR recorded.
+//     C2  a dismissed confirm() on a review showing APP-7734120, and C19 the same on PSE Part 2's header
+//         (NEM-204411): 0 POSTs, nothing recorded, no submit handed on.
+//     C3  a Submit that sends nothing, then "My Applications" (status cells, ANOTHER application's
+//         187-26-000100-STR) by GET: nothing recorded, no submit handed on. C3b: the Submit's only request
+//         is an analytics fetch (the click commits on it), then "My Applications": nothing recorded (a
+//         page reached by navigation alone never yields a number).
+//     C4  the Submit posts to a payment URL (rule 1 holds it, 0 POSTs there), then LATE the real submit:
+//         captured (BLD-2026-900123).
+//     C10 a single-page app whose server answers the filing fetch 12 s after the click: 26TMP-004411
+//         never recorded; the completion is captured once it arrives (the review read reopens the watch).
+//     C11 an analytics fetch + pushState("?saved=1"), and C14 a POST that re-renders the review at
+//         /review2, then LATE the real submit: 26TMP-004411 never recorded, the re-click captured.
+//     C15 a "submitted with errors" re-render, C16 a duplicate rejection naming 187-26-000100-STR ("This
+//         application was not filed."), C18 a re-render whose history TABLE cell reads "Your application
+//         has been submitted" beside 187-26-000199-STR: nothing recorded, and the click does not stand
+//         as the person's submit at the end (the capture found the review and reopened the watch).
+//     Each of C1-C4, C10, C11, C14-C16, C18, C19 and C3b is red on main's capture (measured at 97a39d6a:
+//     the click committed on sight, the one-shot detector was spent, and the loose read recorded the
+//     review's own id, a list's or a banner's number HIGH).
+//     GUARD pins, green before by design (the loose read already recorded these), each with its kill:
+//     C5  a postback to the review page's OWN URL is captured. Kill: commit only on another URL.
+//     C6a/C6b/C7/C8 the portal sends the filing 2.5 s / 4 s after the click, after the run let go — a form
+//         POST, a postback to the review URL, an in-place fetch submit to a URL that is not filing-shaped
+//         (the DOM re-renders): each captured. Kills: release a pending click after a fixed 1.5 s; drop a
+//         late plain fetch's re-read (C8).
+//     C12 PowerClerk's completion reusing the review's own APP-7734121 is captured, and C13 beside a
+//         "Confirmation #: PFP-2026-55120" the APP- number is recorded. Kills: never take the review's own
+//         number (C12); take the first new number of any tier (C13).
+//     C17a a completion with only "Record Issued" + a new number, C17b one whose wording the review page
+//         already showed: captured. Kill: a new number needs completion wording the review did not show.
 //     C9  a person's filing DURING the run's dispose (after `disposed` is set, before the route comes
 //         off — the harness holds the context's unroute until the fixture counted the POST, or 4 s):
 //         it goes (1 POST), nothing is aborted at or after the click, and the run is not failed.
@@ -210,8 +249,79 @@ const PROCESSOR_PATHS: Record<string, string> = {
   A5d: "api/fees/settle",
   A5e: "gps/user/42/submit",
 };
+// [C] THE CAPTURE'S FIXTURES (Helm Blocking 1). The review id an Accela review shows (labelled tier).
+const TMP_ID = "26TMP-004411";
+const SUMMARY = `<h1>Step 3: Review</h1><p>Please review your application before you submit it.</p><table><tr><th>Address</th><td>100 Fixture Way</td></tr></table>`;
+const submitForm = (action: string, extra = "", id = "btnSubmit", attrs = ""): string => `<form method="post" action="${action}"${attrs}>${extra}<button type="submit" id="${id}">Submit Application</button></form>`;
+const completionWith = (lines: string): string => html("Application Submitted", `<h1>Thank you</h1>${lines}`);
+// What each C case's filing POST is answered with (default: COMPLETION with RECORD).
+const C_COMPLETIONS: Record<string, string> = {
+  C1: completionWith(`<p>Your application has been successfully submitted.</p><p>Record Number: 187-26-000328-STR</p>`),
+  C5: completionWith(`<p>Your application has been successfully submitted.</p><p>Record Number: 187-26-000505-STR</p>`),
+  C6a: completionWith(`<p>Your application has been successfully submitted.</p><p>Record Number: 187-26-000601-STR</p>`),
+  C6b: completionWith(`<p>Your application has been successfully submitted.</p><p>Record Number: 187-26-000602-STR</p>`),
+  C7: completionWith(`<p>Your application has been successfully submitted.</p><p>Record Number: 187-26-000707-STR</p>`),
+  C10: completionWith(`<p>Your application has been successfully submitted.</p><p>Record Number: 187-26-000710-STR</p>`),
+  C14: completionWith(`<p>Your application has been successfully submitted.</p><p>Record Number: 187-26-000714-STR</p>`),
+  // PowerClerk reuses the review's own APP- id on its completion (C12), and may add a confirmation (C13).
+  C12: completionWith(`<p>Your application has been submitted.</p><p>Application APP-7734121</p>`),
+  C13: completionWith(`<p>Your application has been submitted.</p><p>Application APP-7734121</p><p>Confirmation #: PFP-2026-55120</p>`),
+  // A completion with no listed phrase (C17a), and one whose wording the review page already showed (C17b).
+  C17a: completionWith(`<h1>Record Issued</h1><p>Permit Number: BLD-2026-900777</p>`),
+  C17b: completionWith(`<p>Your application has been submitted.</p><p>Record Number: BLD-2026-900778</p>`),
+};
+// The review pages of the C cases (each keeps its submit control; see the server for what a POST returns).
+const C_REVIEWS: Record<string, string> = {
+  // An Accela review with an EMPTY required box: the first click sends nothing (the browser holds it).
+  C1: `${SUMMARY}<p>Record Number: ${TMP_ID}</p>${submitForm("/h/C1/apply/submit", `<label for="initials">Initials</label> <input id="initials" name="initials" required> `)}`,
+  // A native confirm() Playwright dismisses: nothing is sent. C19 is PSE Part 2's header id (labelled).
+  C2: `${SUMMARY}<p>Application APP-7734120</p>${submitForm("/h/C2/apply/submit", "", "btnSubmit", ` onsubmit="return confirm('Submit this application?')"`)}`,
+  C19: `${SUMMARY}<p>Application NEM-204411 (Part 2: Interconnection Agreement)</p>${submitForm("/h/C19/apply/submit", "", "btnSubmit", ` onsubmit="return confirm('Submit this application?')"`)}`,
+  // A Submit that sends nothing, and the portal's "My Applications" list one GET away.
+  C3: `${SUMMARY}<button type="button" id="btnSubmit" onclick="return false">Submit Application</button> <a id="myapps" href="/h/C3/myapps">My Applications</a>`,
+  // C3b: the Submit sends only an analytics fetch (a request of the person's, so the click commits), then
+  // "My Applications" one GET away.
+  C3b: `${SUMMARY}<button type="button" id="btnSubmit" onclick="fetch('/h/C3b/t/collect', { method: 'POST', body: 'e=submit' }).catch(function () {})">Submit Application</button> <a id="myapps" href="/h/C3b/myapps">My Applications</a>`,
+  // The first Submit posts to a payment URL (rule 1 holds it); the real one is the form's.
+  C4: `${SUMMARY}<button type="button" id="btnSubmit" onclick="fetch('/h/C4/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function () {})">Submit Application</button>${submitForm("/h/C4/apply/submit", "", "btnSubmit2")}`,
+  // A postback to the review page's own URL (ASP.NET-style).
+  C5: `${SUMMARY}${submitForm("/h/C5/review")}`,
+  // The portal posts the form 2.5 s / 4 s after the click (the run has let go by then); C7 to its own URL.
+  C6a: `${SUMMARY}<form method="post" action="/h/C6a/apply/submit"></form><button type="button" id="btnSubmit" onclick="setTimeout(function () { document.forms[0].submit(); }, 2500)">Submit Application</button>`,
+  C6b: `${SUMMARY}<form method="post" action="/h/C6b/apply/submit"></form><button type="button" id="btnSubmit" onclick="setTimeout(function () { document.forms[0].submit(); }, 4000)">Submit Application</button>`,
+  C7: `${SUMMARY}<form method="post" action="/h/C7/review"></form><button type="button" id="btnSubmit" onclick="setTimeout(function () { document.forms[0].submit(); }, 2500)">Submit Application</button>`,
+  // An in-place fetch submit to a URL that is not filing-shaped, 2.5 s after the click: the DOM re-renders.
+  C8: `${SUMMARY}<button type="button" id="btnSubmit" onclick="setTimeout(function () { fetch('/h/C8/x/go', { method: 'POST', body: 'x=1' }).then(function () { document.body.innerHTML = '<h1>Thank you</h1><p>Your application has been submitted.</p><p>Permit Number: BLD-2026-900888</p>'; }); }, 2500)">Submit Application</button>`,
+  // The server answers the filing 10 s after the click.
+  // A single-page app: its submit is a fetch the server answers 12 s later, then it renders the answer.
+  C10: `${SUMMARY}<p>Record Number: ${TMP_ID}</p><button type="button" id="btnSubmit" onclick="fetch('/h/C10/api/submit-slow', { method: 'POST', body: 'x=1' }).then(function (r) { return r.text(); }).then(function (t) { document.body.innerHTML = t; }).catch(function () {})">Submit Application</button>`,
+  // An analytics fetch and a pushState (the page stays the review); the real submit is the form's.
+  C11: `${SUMMARY}<p>Record Number: ${TMP_ID}</p><button type="button" id="btnSubmit" onclick="fetch('/h/C11/t/collect', { method: 'POST', body: 'e=submit' }).catch(function () {}); history.pushState({}, '', '?saved=1')">Submit Application</button>${submitForm("/h/C11/apply/submit", "", "btnSubmit2")}`,
+  C12: `${SUMMARY}<p>Application APP-7734121</p>${submitForm("/h/C12/apply/submit")}`,
+  C13: `${SUMMARY}<p>Application APP-7734121</p>${submitForm("/h/C13/apply/submit")}`,
+  // The first POST re-renders the same review at a new URL (/review2), whose form then files.
+  C14: `${SUMMARY}<p>Record Number: ${TMP_ID}</p>${submitForm("/h/C14/review2")}`,
+  // A server-side validation error re-renders the review.
+  C15: `${SUMMARY}<p>Record Number: ${TMP_ID}</p>${submitForm("/h/C15/apply/errors")}`,
+  // A duplicate rejection re-renders the review with a banner naming another record.
+  C16: `${SUMMARY}${submitForm("/h/C16/apply/dup")}`,
+  C17a: `${SUMMARY}${submitForm("/h/C17a/apply/submit")}`,
+  C17b: `${SUMMARY}<p>Once your application has been submitted, you cannot change it.</p>${submitForm("/h/C17b/apply/submit")}`,
+  // The POST re-renders the review with a history TABLE whose status cell reads as completion wording.
+  C18: `${SUMMARY}${submitForm("/h/C18/apply/history")}`,
+};
+// What a re-rendering POST answers (the review again, its submit control still there).
+const C_RERENDERS: Record<string, string> = {
+  "C14|review2": html("Review and Submit", `${SUMMARY}<p>Record Number: ${TMP_ID}</p>${submitForm("/h/C14/apply/submit")}`),
+  "C15|apply/errors": html("Review and Submit", `<p class="err">The form was submitted with errors. Please correct the following.</p>${SUMMARY}<p>Record Number: ${TMP_ID}</p>${submitForm("/h/C15/apply/errors")}`),
+  "C16|apply/dup": html("Review and Submit", `<p class="err">An application was submitted for this address on 10/01/2026 under record 187-26-000100-STR. This application was not filed.</p>${SUMMARY}${submitForm("/h/C16/apply/dup")}`),
+  "C18|apply/history": html("Review and Submit", `${SUMMARY}<h2>History</h2><table><tr><th>Event</th><th>Record</th></tr><tr><td>Your application has been submitted</td><td>187-26-000199-STR</td></tr></table>${submitForm("/h/C18/apply/history")}`),
+};
+// "My Applications": status cells and ANOTHER application's number.
+const MY_APPS = html("My Applications", `<h1>My Applications</h1><table><tr><th>Record</th><th>Status</th></tr><tr><td>187-26-000100-STR</td><td>Application Submitted</td></tr></table>`);
 const reviewBody = (k: string): string => {
-  const summary = `<h1>Step 3: Review</h1><p>Please review your application before you submit it.</p><table><tr><th>Address</th><td>100 Fixture Way</td></tr></table>`;
+  if (C_REVIEWS[k]) return C_REVIEWS[k];
+  const summary = SUMMARY;
   if (k === "B5") return `${summary}${formSubmit(k)}<button type="button" id="saveLater" onclick="fetch('/h/B5/api/save-later', { method: 'POST', body: 'x=1' }).then(function () { location.href = '/h/B5/records'; })">Save for Later</button>`;
   if (k === "B6") return `${summary}${formSubmit(k)}${SEND(k)}`;
   // The run's tick on the review page starts an 8 s "Saving..." (PowerClerk's batched autosave shape;
@@ -265,7 +375,11 @@ const server = http.createServer((req, res) => {
     setTimeout(() => { res.writeHead(307, { location: `/h/${k}/${to}` }); res.end(); }, delay);
     return;
   }
-  if (req.method === "POST" && rest === "apply/submit") { send(COMPLETION); return; }
+  if (req.method === "POST" && C_RERENDERS[`${k}|${rest}`]) { send(C_RERENDERS[`${k}|${rest}`]); return; }
+  if (req.method === "POST" && rest === "api/submit-slow") { setTimeout(() => send(`<h1>Thank you</h1><p>Your application has been successfully submitted.</p><p>Record Number: 187-26-000710-STR</p>`), 12_000); return; }
+  if (req.method === "POST" && rest === "review" && C_COMPLETIONS[k]) { send(C_COMPLETIONS[k]); return; }
+  if (req.method === "POST" && rest === "apply/submit") { send(C_COMPLETIONS[k] ?? COMPLETION); return; }
+  if (rest === "myapps") { send(MY_APPS); return; }
   if (req.method === "POST" && rest === "apply/continue") { send(html("Review and Submit", reviewBody(k))); return; }
   if (rest === "popup") { send(html("Processing", `<h1>Processing</h1><script>fetch('/h/${k}/popup/post', { method: 'POST', body: 'from=popup' }).catch(function(){});</script>`)); return; }
   if (req.method === "POST" && rest === "contact/send") { send(html("Message sent", "<h1>Thank you</h1><p>Your message was sent.</p>")); return; }
@@ -598,7 +712,9 @@ type Track = (p: Promise<unknown>) => void;
  *   onReviewRead   fires at the start of the run's review read-back (verifyReviewScreen).
  *   afterFill      fires after fillApplication returned and the submit watch is armed.
  *   onUnroute      fires inside the dispose gap (disposed set, route still on).
- *   capture        also arms index.ts armSubmitCapture and waits up to captureWaitMs for its reports. */
+ *   capture        also arms index.ts armSubmitCapture and waits up to captureWaitMs for its reports.
+ *   settleMs       a FIXED wait after afterFill (default 2000): a capture that reopens and commits again
+ *                  reports twice, so "as many captures as submits" can end the wait too early. */
 async function replay(k: string, opts: {
   autoSubmit?: boolean; handOver?: boolean; at?: string; extraSteps?: RecipeStep[];
   onHandOver?: (page: Page, adapter: RecipeAdapter) => Promise<unknown>;
@@ -613,7 +729,7 @@ async function replay(k: string, opts: {
   onReviewRead?: (page: Page, track: Track) => void;
   afterFill?: (page: Page) => Promise<unknown>;
   onUnroute?: (page: Page) => Promise<unknown>;
-  capture?: boolean; captureWaitMs?: number;
+  capture?: boolean; captureWaitMs?: number; settleMs?: number;
 } = {}): Promise<Replay> {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
@@ -722,7 +838,7 @@ async function replay(k: string, opts: {
   // …and, when asked, the runner's own capture of the person's submit (reads 4 s after the click).
   if (opts.capture) await armSubmitCapture(adapter, { onSubmitCaptured: (c) => { captures.push(c); } });
   if (opts.afterFill) await opts.afterFill(page).catch(() => null);
-  await sleep(2000); // a completion page's read lands ~1.2 s after its load
+  await sleep(opts.settleMs ?? 2000); // a completion page's read lands ~1.2 s after its load
   if (opts.capture) {
     const t0 = Date.now();
     while (Date.now() - t0 < (opts.captureWaitMs ?? 6000) && captures.length < observed.length) await sleep(50);
@@ -771,6 +887,10 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
   check("B1 …the runner's submit watch is handed the person's submit exactly once (the capture starts)", r.observed.length === 1, rbrief(r));
   check("B1 …and HUMAN_SUBMITTED_NOTE is in the hand-off (reviewHandoffNotes)",
     ((r.review.data.reviewHandoffNotes as string[] | undefined) ?? []).includes(HUMAN_SUBMITTED_NOTE), rbrief(r));
+  // Round 4 (Helm nit "word a held click with no person's input as 'A click on X'"): the sighting is
+  // stamped, when it is seen, with whether the person's own input reached the page in the last 2 s.
+  check("B1 …the submit is stamped as the person's own input (humanSubmitPersonInput true)",
+    r.review.data.humanSubmitPersonInput === true, rbrief(r));
 }
 {
   // Helm Should-fix 11 — B1b: the click lands right after the run LOCKS review (the real lock first, so
@@ -1059,6 +1179,124 @@ console.log("\n[C] THE CAPTURE (Helm Blocking 1)");
   check("C9 …nothing is aborted at or after the click (the disposed backstop judges nothing)",
     clickAt > 0 && !r.aborts.some((a) => (a.at ?? 0) >= clickAt), detail);
   check("C9 …and the run is not failed (no stopping abort of its own making in the gap)", r.ok === true, detail);
+}
+// The numbers the runner's capture recorded (index.ts reports any non-empty number HIGH, and the
+// backend records exactly those): "never recorded" means never in this list.
+const recorded = (r: Replay): string[] => r.captures.filter((c) => !!c.recordNumber).map((c) => c.recordNumber);
+const cbrief = (r: Replay): string => JSON.stringify({ posts: r.posts, observed: r.observed, captures: r.captures.map((c) => `${c.recordNumber || "-"}/${c.confidence}/${c.source}`), aborts: r.aborts.map((a) => `${a.rule}:${a.where}`), human: r.review.data.humanSubmittedInReviewWindow, msg: r.review.message.slice(0, 160) }).slice(0, 900);
+// A capture case: the person acts at "the page is yours" (onHandOver), and — when given — again LATE,
+// after the run let go and after a capture of the first click would have read the page (afterFill
+// waits LATE_MS first).
+const LATE_MS = 7000;
+const captureCase = (k: string, first: (page: Page) => Promise<unknown>, late?: (page: Page) => Promise<unknown>, settleMs = 9000): Promise<Replay> =>
+  replay(k, {
+    capture: true, settleMs,
+    onHandOver: first,
+    ...(late ? { afterFill: async (page: Page) => { await sleep(LATE_MS); await late(page); } } : {}),
+  });
+{
+  // C1: an Accela review with an empty required box — the tail click is held by the browser (nothing
+  // sent); then, late, the person types their initials and clicks again. Red before: the first click
+  // spent the one-shot detector, the capture read the review page 4 s later and recorded its own id
+  // (26TMP-004411) HIGH, and the real filing was never captured.
+  const r = await captureCase("C1", (page) => personClicks(page), async (page) => {
+    await personClicks(page, "#initials");
+    await page.keyboard.type("AB");
+    await personClicks(page);
+  });
+  check("C1 the Accela review's own id (26TMP-004411) is never recorded after a click that sent nothing", !recorded(r).includes(TMP_ID), cbrief(r));
+  check("C1 …and the person's real re-click is captured: 187-26-000328-STR recorded",
+    recorded(r).includes("187-26-000328-STR") && r.posts.filter((p) => /\/apply\/submit$/.test(p)).length === 1, cbrief(r));
+}
+for (const [k, id] of [["C2", "APP-7734120"], ["C19", "NEM-204411"]] as const) {
+  // C2 / C19: a dismissed confirm() on a review page showing a PowerClerk APP- id (C2) or PSE Part 2's
+  // NEM- header (C19): nothing is sent. Red before: the click spent the detector and the review's own
+  // id was recorded HIGH off the review page.
+  const r = await captureCase(k, (page) => personClicks(page));
+  check(`${k} a dismissed confirm() (nothing sent): no number recorded (never ${id}) and no submit handed on`,
+    r.posts.length === 0 && recorded(r).length === 0 && r.observed.length === 0, cbrief(r));
+}
+{
+  // C3: a Submit that sends nothing, then the person opens "My Applications" (a GET): status cells and
+  // ANOTHER application's number. Red before: 187-26-000100-STR recorded HIGH ("it has been filed").
+  const r = await captureCase("C3", async (page) => { await personClicks(page); await sleep(800); await Promise.all([page.waitForLoadState("load"), personClicks(page, "#myapps")]); });
+  check("C3 a Submit that sent nothing, then 'My Applications': no number recorded (never 187-26-000100-STR), no submit handed on",
+    recorded(r).length === 0 && r.observed.length === 0, cbrief(r));
+  // C3b: the Submit's only request is an analytics fetch (the click commits on it), then the person
+  // opens "My Applications" by GET. A page reached by navigation alone never yields a number. Red
+  // before: 187-26-000100-STR recorded HIGH.
+  const r3b = await captureCase("C3b", async (page) => { await personClicks(page); await sleep(800); await Promise.all([page.waitForLoadState("load"), personClicks(page, "#myapps")]); });
+  check("C3b an analytics fetch, then 'My Applications' by GET: no number recorded (navigation alone never takes one)",
+    recorded(r3b).length === 0 && r3b.posts.some((p) => /\/t\/collect$/.test(p)), cbrief(r3b));
+}
+{
+  // C4: the first Submit posts to a payment URL — rule 1 holds it (0 POSTs there) — then, late, the
+  // person clicks the real submit. Red before: the held click spent the detector; the re-click was
+  // never captured.
+  const r = await captureCase("C4", (page) => personClicks(page), (page) => personClicks(page, "#btnSubmit2"));
+  check("C4 the held payment-URL submit sent nothing (rule 1), and the re-click's filing is captured",
+    !r.posts.some((p) => /payment/.test(p)) && recorded(r).includes(RECORD), cbrief(r));
+}
+{
+  // C5 (GUARD, green before by design: the click committed on sight): a postback to the review page's
+  // OWN URL is evidence like any other POST. Kill: commit only on a request to another URL than the
+  // handed-over page's.
+  const r = await captureCase("C5", (page) => personClicks(page));
+  check("C5 a postback to the review page's own URL is captured (URL identity is never the evidence)", recorded(r).includes("187-26-000505-STR"), cbrief(r));
+}
+for (const [k, n] of [["C6a", "187-26-000601-STR"], ["C6b", "187-26-000602-STR"], ["C7", "187-26-000707-STR"], ["C8", "BLD-2026-900888"]] as const) {
+  // C6a/C6b/C7/C8 (GUARD pins, green before by design: the click committed on sight and the harness's
+  // read landed after the page changed): the portal sends the filing 2.5 s / 4 s after the click, after
+  // the run let go — a form POST (C6a/C6b), a postback to the review URL (C7), an in-place fetch submit
+  // to a URL that is not filing-shaped that re-renders the DOM (C8). Kills: release a pending click
+  // after a fixed 1.5 s (C6-C8); commit late only on another URL (C7); drop late non-filing fetches (C8).
+  const r = await captureCase(k, (page) => personClicks(page), undefined, 11_000);
+  check(`${k} the portal's filing after the run let go is committed late and captured (${n})`, recorded(r).includes(n), cbrief(r));
+}
+{
+  // C10: a single-page app whose server answers the filing fetch 12 s after the click (Helm: "8 s").
+  // Red before: the capture read the review page at +4 s and recorded its own 26TMP-004411 HIGH. After:
+  // that read finds the review and reopens the watch; the filing request's own completion (or the one
+  // slow-server re-read) commits it again and the completion is captured.
+  const r = await captureCase("C10", (page) => personClicks(page), undefined, 22_000);
+  check("C10 a slow server: the review's 26TMP-004411 is never recorded", !recorded(r).includes(TMP_ID), cbrief(r));
+  check("C10 …and the completion read after it arrives is captured (187-26-000710-STR)", recorded(r).includes("187-26-000710-STR"), cbrief(r));
+}
+for (const k of ["C11", "C14"] as const) {
+  // C11: an analytics fetch + pushState("?saved=1") (the page is still the review); C14: a POST that
+  // re-renders the same review at /review2. Then, late, the person's real submit. Red before: the
+  // review's own 26TMP-004411 recorded HIGH, the re-click never captured. Judged by content, never URL.
+  const n = k === "C11" ? RECORD : "187-26-000714-STR";
+  const r = await captureCase(k, (page) => personClicks(page), (page) => personClicks(page, k === "C11" ? "#btnSubmit2" : "#btnSubmit"));
+  check(`${k} the review's own 26TMP-004411 is never recorded, whatever URL the review now has`, !recorded(r).includes(TMP_ID), cbrief(r));
+  check(`${k} …and the person's real re-click is captured (${n})`, recorded(r).includes(n), cbrief(r));
+}
+{
+  // C12 / C13 (GUARD pins, green before by design: extractRecordNumber's tier order). PowerClerk reuses
+  // the review's APP-7734121 on its completion: captured (kill: take only numbers the review did not
+  // show); and beside a "Confirmation #: PFP-2026-55120" the APP- number still wins (kill: take the first
+  // new number of any shape).
+  const r12 = await captureCase("C12", (page) => personClicks(page));
+  check("C12 PowerClerk's completion reusing the review's own APP-7734121 is captured", recorded(r12).includes("APP-7734121"), cbrief(r12));
+  const r13 = await captureCase("C13", (page) => personClicks(page));
+  check("C13 …and beside a 'Confirmation #: PFP-2026-55120' the APP- number is recorded, never PFP-2026-55120",
+    recorded(r13).includes("APP-7734121") && !recorded(r13).includes("PFP-2026-55120"), cbrief(r13));
+}
+for (const [k, label] of [["C15", "a 'submitted with errors' re-render"], ["C16", "a duplicate rejection naming 187-26-000100-STR"], ["C18", "a re-render whose history table's cell reads 'Your application has been submitted'"]] as const) {
+  // C15 / C16 / C18: the person's POST went, and the portal answered with the review again — a
+  // validation error, a duplicate rejection, a table whose status cell carries completion wording. Red
+  // before: the review's id or the banner's / cell's number recorded HIGH and the submit stood.
+  const r = await captureCase(k, (page) => personClicks(page));
+  check(`${k} ${label}: no number recorded`, recorded(r).length === 0, cbrief(r));
+  check(`${k} …and the click does not stand as the person's submit (the capture found the review and reopened the watch)`,
+    r.review.data.humanSubmittedInReviewWindow !== true, cbrief(r));
+}
+for (const [k, n] of [["C17a", "BLD-2026-900777"], ["C17b", "BLD-2026-900778"]] as const) {
+  // C17a / C17b (GUARD pins, green before by design: the loose read took any number): a completion with
+  // no listed phrase ("Record Issued"), and one whose wording the review page already showed — a NEW
+  // number on a page without the review's submit control counts. Kill: a number needs a phrase.
+  const r = await captureCase(k, (page) => personClicks(page));
+  check(`${k} a completion with a new number and no review form is captured (${n})`, recorded(r).includes(n), cbrief(r));
 }
 
 await browser.close();

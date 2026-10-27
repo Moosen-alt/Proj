@@ -3,7 +3,7 @@ import path from "path";
 import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep } from "../../../shared/src/types";
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, ok, fail, type PortalContext, type PortalStepResult } from "../adapter";
 import { applyFormatHint } from "../formatHint";
-import { extractRecordNumber, pageConfirmsSubmission } from "../recordNumber";
+import { extractRecordNumber, pageConfirmsSubmission, recordNumberCandidates, RECORD_NUMBER_TIERS } from "../recordNumber";
 import { findSiteDraft, readDraftCreated } from "../draftCreated";
 import { completeStamp, draftCreatingClickRefusals, draftLabelKey, draftStepLabel, draftTenantKey, readDraftAfterClick, type DraftCreatingStamp } from "../draftSubmitGate";
 import { armHumanCaptureOnPage, HUMAN_SUBMIT_OBSERVED_NOTE } from "../humanCapture";
@@ -84,7 +84,7 @@ export function looksLikeProjectData(label: string, value: string): boolean {
 import { rankAddressVersions } from "../addressVersion";
 import { isCompanyIdentityLabel } from "../../../shared/src/companyFacts";
 import { licenceKeyForLabel } from "../../../shared/src/licenceKinds";
-import { labelWords } from "../../../shared/src/portalSafety";
+import { completionEvidence, labelWords } from "../../../shared/src/portalSafety";
 import { batteryControlKind, batteryControlOfStep, batteryDeclarationAnswer, parseHasBattery } from "../../../shared/src/batteryControls";
 import { imageToPdfBytes, shouldConvertToPdf } from "../imageToPdf";
 import { removeUploadStaging, uploadPayloadFor, type PreparedUpload } from "./uploadPayload";
@@ -126,6 +126,64 @@ export const PERSON_REQUEST_WENT_NOTE = "A REQUEST YOU SENT FROM THE REVIEW PAGE
  *  on the record in the hand-off notes (the project's next-step panel), whether or not the
  *  completion page's number can be read. */
 export const HUMAN_SUBMITTED_NOTE = "YOU SUBMITTED FROM THE REVIEW WINDOW while the stage was finishing (automation clicked nothing). The record number is read off the completion page and recorded only when it is read confidently — if the project does not show it, enter it with the capture form. Do not stage this track again: it has been filed.";
+
+// #333 round 4 (Helm Blocking 1) — THE PERSON'S SUBMIT CLICK IS A SIGHTING, COMMITTED ON EVIDENCE.
+/** A final-submit click the replay's own watch saw after the hand-over: provisional until a request
+ *  of the person's that followed it commits it (RecipeAdapter.judgeHumanClick). */
+interface HumanClickSighting {
+  label?: string;
+  /** When the sighting reached the run (Date.now()). */
+  at: number;
+  /** The handed-over backstop's record sizes when it was seen. */
+  abortsBefore: number;
+  requestsBefore: number;
+  /** The person's own input reached the page in the 2 s before it: true / false while a live,
+   *  handed-over backstop could tell; undefined once the run had let the page go. */
+  personInput: boolean | undefined;
+  /** Set when a capture found the review (or error) page and reopened the watch: only evidence that
+   *  completed after this may commit it again. */
+  evidenceAfter?: number;
+  /** The commit rested on a document or filing-shaped request (the slow-server re-read's condition). */
+  filingEvidence?: boolean;
+  /** The one slow-server re-read after a reopen was scheduled. */
+  slowRereadDone?: boolean;
+}
+/** The review page's own reading, taken at the hand-over while the lockdown still held the page: what
+ *  the capture judges a later page against (never its URL). */
+interface ReviewReading {
+  /** Every record-number candidate the review page showed. */
+  numbers: Set<string>;
+  /** The review's submit control ("" = none found, or the read failed). */
+  filingControl: string;
+  reviewPage?: boolean;
+  /** Completion wording the review page itself showed ("Once your application has been submitted…"). */
+  completionPhrase: string | null;
+}
+/** A page read for the capture: its text, the same text with table cells taken out, and its controls. */
+interface CapturePageRead { text: string; cellFree: string; filingControl: string; reviewPage?: boolean }
+/** How long after a sighting a request of the person's may still commit it (Helm's 2.5 s / 4 s / 8 s
+ *  shapes fit inside). */
+const HUMAN_CLICK_COMMIT_MS = 10_000;
+/** A main-frame document or filing-shaped request may precede its sighting by this much (the click's
+ *  form POST and its sighting travel different CDP event streams). A plain fetch must follow it. */
+const HUMAN_CLICK_EARLY_MS = 300;
+/** A sighting with only a plain fetch, or with a stopping abort, is judged only this long after it:
+ *  the click's filing request may still be on its way. */
+const HUMAN_CLICK_SETTLE_MS = 1_500;
+/** A capture that reopened a click committed on a filing request reads the page once more this much
+ *  later (the slow-server shape). */
+const HUMAN_CLICK_SLOW_REREAD_MS = 6_000;
+/** A late plain fetch is followed by one page read this much later (an in-place SPA submit). */
+const HUMAN_CLICK_SPA_REREAD_MS = 1_200;
+
+/** #333 round 4 — THE ONE "IS THIS REQUEST OF THE PERSON'S FILING-SHAPED?" PREDICATE: a main-frame
+ *  document request (a form submission, to any URL), or a fetch/XHR to a submit or payment URL —
+ *  never a GET and never a beacon or other resource type, whatever its URL says. */
+function filingShapedHumanRequest(r: { document?: boolean; method?: string; resourceType?: string; where: string }): boolean {
+  return String(r.method ?? "").toUpperCase() !== "GET"
+    && (!!r.document || (/^(fetch|xhr)$/i.test(String(r.resourceType ?? "")) && isSubmitOrPayRequestUrl(r.where)));
+}
+const normPhrase = (s: string | null | undefined): string => String(s ?? "").toLowerCase().replace(/\s+/g, " ").trim();
 
 // How long the drift precheck waits for an async-rendered form to paint before concluding
 // the replay is on the wrong page. PowerClerk's Ameren form reports zero inputs for several
@@ -1372,9 +1430,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  reports, fillApplication's finally has let `this.backstop` go. */
   private personFilingShapedRequestAfter(at: number): boolean {
     const rs = this.handedOverBackstop?.humanRequests ?? [];
-    return rs.some((r) => typeof r.at === "number" && r.at >= at
-      && String(r.method ?? "").toUpperCase() !== "GET"
-      && (r.document || (/^(fetch|xhr)$/i.test(String(r.resourceType ?? "")) && isSubmitOrPayRequestUrl(r.where))));
+    return rs.some((r) => typeof r.at === "number" && r.at >= at && filingShapedHumanRequest(r));
   }
 
   /** #333 — a person's click held back BEFORE the hand-over (a stopping abort flagged humanInput).
@@ -1438,7 +1494,9 @@ export class RecipeAdapter extends BasePortalAdapter {
   // #333 round 4: each entry also says WHEN the document committed (`at`, Date.now() at its response —
   // not when its request went), which the capture's "a main-frame document committed by a non-GET
   // request within a short bound" reads.
-  private navDocuments: Array<{ url: string; method: string; at: number }> = [];
+  // `sentAt` is when its request went (Playwright's request timing; absent when unreadable): a slow
+  // server's document commits long after the click whose request it answers.
+  private navDocuments: Array<{ url: string; method: string; at: number; sentAt?: number }> = [];
   private get lastDocumentMethod(): string | null {
     const here = typeof this.page?.url === "function" ? String(this.page.url() ?? "").split("#")[0] : "";
     if (!here) return null;
@@ -1454,14 +1512,17 @@ export class RecipeAdapter extends BasePortalAdapter {
     this.documentMethodHooked = true;
     page.on("response", (resp: unknown) => {
       try {
-        const r = resp as { url: () => string; status: () => number; headers: () => Record<string, string>; request: () => { isNavigationRequest: () => boolean; frame: () => unknown; method: () => string } };
+        const r = resp as { url: () => string; status: () => number; headers: () => Record<string, string>; request: () => { isNavigationRequest: () => boolean; frame: () => unknown; method: () => string; timing?: () => { startTime?: number } } };
         const req = r.request();
         if (!req.isNavigationRequest() || req.frame() !== page.mainFrame!()) return;
         const status = Number(r.status());
         const cd = String((r.headers() || {})["content-disposition"] || "");
         if (status === 204 || status === 205 || (status >= 300 && status < 400) || /\battachment\b/i.test(cd)) return;
-        this.navDocuments.push({ url: String(r.url() || "").split("#")[0], method: String(req.method() || "").toUpperCase(), at: Date.now() });
+        const started = Number((typeof req.timing === "function" ? req.timing() : null)?.startTime ?? 0);
+        this.navDocuments.push({ url: String(r.url() || "").split("#")[0], method: String(req.method() || "").toUpperCase(), at: Date.now(), ...(started > 0 ? { sentAt: Math.round(started) } : {}) });
         if (this.navDocuments.length > 60) this.navDocuments.shift();
+        // A document the person's click committed is evidence for a pending sighting (round 4).
+        this.judgeHumanClick();
       } catch { /* a response we cannot read adds nothing: the method stays unknown */ }
     });
   }
@@ -1519,7 +1580,12 @@ export class RecipeAdapter extends BasePortalAdapter {
             ? "The completion page is being read: its record number is recorded on the project only when it is read confidently — if the project does not show it, enter it with the capture form."
             : "If that was the submit, the filing went: check the portal and enter its record number with the capture form; if not, finish in the open window.")
           + " No fee payment was automated. AUTOMATION HAS STOPPED.",
-        { finalSubmitClicked: false, humanSubmittedInReviewWindow: filed, ...(this.reviewHandoffNotes.length ? { reviewHandoffNotes: [...this.reviewHandoffNotes] } : {}) },
+        {
+          finalSubmitClicked: false, humanSubmittedInReviewWindow: filed,
+          // Round 4: whether the person's own input came with the submit (tri-state, stamped at sighting).
+          ...(this.humanSubmit ? { humanSubmitPersonInput: this.humanSubmit.personInput } : {}),
+          ...(this.reviewHandoffNotes.length ? { reviewHandoffNotes: [...this.reviewHandoffNotes] } : {}),
+        },
       );
     }
     // A request the person sent went through and the click detector did not see a final submit
@@ -1562,31 +1628,292 @@ export class RecipeAdapter extends BasePortalAdapter {
     return armed;
   }
 
-  /** #333 — THE PERSON'S OWN SUBMIT, SEEN ONCE, whoever asks (the hand-over arms it; the runner's
-   *  armSubmitWatch later registers on the same watch — the page binding can be exposed only once). */
-  private humanSubmit: { label?: string } | null = null;
+  /** #333 — THE PERSON'S OWN SUBMIT, COMMITTED, whoever asks (the hand-over arms the watch; the runner's
+   *  armSubmitWatch later registers on the same watch — the page binding can be exposed only once).
+   *  Round 4 (Helm Blocking 1): after a hand-over this is set only when evidence committed the click
+   *  (judgeHumanClick), and a capture that finds the review or error page clears it again
+   *  (reopenHumanSubmit). Never handed over: the click commits on sight, as on main. */
+  private humanSubmit: { label?: string; at?: number; personInput?: boolean } | null = null;
   private submitObservers: Array<(clickedLabel?: string) => void> = [];
   private submitWatch: Promise<boolean> | null = null;
-  private noteHumanSubmit(label?: string): void {
+  /** Round 4 — the click seen and not yet committed or held. */
+  private pendingHumanClick: HumanClickSighting | null = null;
+  /** Round 4 — the last committed click (what a reopen restores). */
+  private lastCommittedClick: HumanClickSighting | null = null;
+  /** Round 4 — a click after the hand-over that a stopping abort held with no filing-shaped request of
+   *  the person's after it (the review step's wording reads it; nothing was sent from it). */
+  private heldHumanClickAfterHandOver: HumanClickSighting | null = null;
+  /** Round 4 — set ONLY by judgeCompletion: a page after the person's click read as their completion.
+   *  Separate from humanSubmit: production reports (stopAtReview) before the capture reads the page. */
+  private completionConfirmed = false;
+  /** Round 4 — the review page's own reading, taken at the hand-over (null: never handed over — the
+   *  approved path and every other caller keep today's read). */
+  private reviewReading: ReviewReading | null = null;
+  /** Round 4 — filing-shaped requests of the person's that went AFTER the backstop let the page go. */
+  private lateHumanRequests: Array<{ where: string; document: boolean; method: string; resourceType: string; at: number; doneAt: number }> = [];
+  /** Round 4 — no evidence before this may commit a later sighting (the previous click's moment). */
+  private clickFloor = 0;
+  private judgeTimer: ReturnType<typeof setInterval> | null = null;
+  private rereadTimer: ReturnType<typeof setTimeout> | null = null;
+  private lateHooked = false;
+  private noteHumanSubmit(label?: string, at?: number, personInput?: boolean): void {
     if (this.humanSubmit) return;
-    this.humanSubmit = { label };
+    this.humanSubmit = { label, at: at ?? Date.now(), personInput };
     for (const fn of this.submitObservers) { try { fn(label); } catch { /* an observer never breaks the run */ } }
   }
+
+  /** Round 4 — the watch saw a final-submit click. After a hand-over it is PROVISIONAL: it does not set
+   *  humanSubmit, notify the observers or disarm the watch (the sink keeps reporting, oneShot:false);
+   *  the evidence that follows commits it (judgeHumanClick). With no hand-over (an approved run, a
+   *  refused hand-over: the runner arms after the run), the click commits on sight, as on main. */
+  private sightHumanSubmit(label?: string): void {
+    if (this.humanSubmit) return;
+    const live = this.backstop;
+    const personInput = live && typeof live.handedOver === "function" && live.handedOver() && typeof live.personActedSinceHandOver === "function"
+      ? live.personActedSinceHandOver(this.page, 2000) : undefined;
+    const at = Date.now();
+    const bs = this.handedOverBackstop;
+    if (!bs) { this.noteHumanSubmit(label, at, personInput); return; }
+    if (this.pendingHumanClick) this.clickFloor = Math.max(this.clickFloor, this.pendingHumanClick.at);
+    this.pendingHumanClick = { label, at, abortsBefore: bs.aborts.length, requestsBefore: bs.humanRequests.length, personInput };
+    this.judgeHumanClick();
+    this.startJudging();
+  }
+
+  /** Round 4 — re-judge the pending click every 200 ms until it is committed or held, or its bound
+   *  lapsed: the backstop's record (humanRequests, aborts) grows with no callback to the run. */
+  private startJudging(): void {
+    if (this.judgeTimer) return;
+    const t = setInterval(() => {
+      const p = this.pendingHumanClick;
+      if (!p || this.humanSubmit || Date.now() - p.at > HUMAN_CLICK_COMMIT_MS + HUMAN_CLICK_SETTLE_MS) {
+        clearInterval(t);
+        this.judgeTimer = null;
+        return;
+      }
+      this.judgeHumanClick();
+    }, 200);
+    (t as { unref?: () => void }).unref?.();
+    this.judgeTimer = t;
+  }
+
+  /** Round 4 (Helm Blocking 1) — JUDGE THE PENDING CLICK ON WHAT FOLLOWED IT. Evidence: a non-GET
+   *  request of the person's (the handed-over backstop's record, or a filing-shaped one that went after
+   *  it let go) or a main-frame document a non-GET request committed — on ANY URL, the review page's own
+   *  included (a postback); never a GET navigation, never on Chromium's error page. A document or
+   *  filing-shaped request may precede the sighting by HUMAN_CLICK_EARLY_MS; a plain fetch must follow
+   *  it, and commits only once HUMAN_CLICK_SETTLE_MS passed with no stopping abort. A stopping abort
+   *  after the click with no filing-shaped request of the person's makes it HELD. */
+  private judgeHumanClick(): "committed" | "held" | "pending" | null {
+    const p = this.pendingHumanClick;
+    const bs = this.handedOverBackstop;
+    if (!p || !bs || this.humanSubmit) return null;
+    const now = Date.now();
+    const after = Math.max(p.evidenceAfter ?? 0, this.clickFloor);
+    const early = Math.max(p.at - HUMAN_CLICK_EARLY_MS, after);
+    const until = p.at + HUMAN_CLICK_COMMIT_MS;
+    const runPage = this.page;
+    const evidence: Array<{ sent: number; done: number; filing: boolean }> = [];
+    for (const r of bs.humanRequests) {
+      if (r.page !== runPage || typeof r.at !== "number" || String(r.method ?? "").toUpperCase() === "GET") continue;
+      evidence.push({ sent: r.at, done: r.at, filing: filingShapedHumanRequest(r) });
+    }
+    for (const r of this.lateHumanRequests) evidence.push({ sent: r.at, done: r.doneAt, filing: true });
+    for (const d of this.navDocuments) if (d.method && d.method !== "GET") evidence.push({ sent: d.sentAt ?? d.at, done: d.at, filing: true });
+    const counts = (e: { sent: number; done: number; filing: boolean }): boolean => e.done > after && e.sent <= until && e.sent >= (e.filing ? early : Math.max(p.at, after));
+    const filingEv = evidence.some((e) => e.filing && counts(e));
+    const plainEv = evidence.some((e) => !e.filing && counts(e));
+    const onErrorPage = /^chrome-error:/i.test(this.pageUrlNoHash());
+    if (filingEv && !onErrorPage) return this.commitHumanClick(p, true);
+    const settled = now - p.at >= HUMAN_CLICK_SETTLE_MS;
+    const held = bs.aborts.some((a) => isStoppingAbort(a) && !a.beforeHandOver && typeof a.at === "number" && a.at >= early && a.at > after);
+    if (held && !this.personFilingShapedRequestAfter(early)) {
+      if (!settled) return "pending";
+      this.heldHumanClickAfterHandOver = p;
+      this.pendingHumanClick = null;
+      return "held";
+    }
+    if (plainEv && !held && !onErrorPage && settled) return this.commitHumanClick(p, false);
+    return "pending";
+  }
+
+  /** Round 4 — commit a judged click: humanSubmit is set and the observers (the runner's capture) told. */
+  private commitHumanClick(p: HumanClickSighting, filing: boolean): "committed" {
+    this.pendingHumanClick = null;
+    this.lastCommittedClick = { ...p, filingEvidence: filing };
+    this.noteHumanSubmit(p.label, p.at, p.personInput);
+    return "committed";
+  }
+
+  /** Round 4 — the capture found the review (or Chromium's error) page after a committed click: the
+   *  watch reopens. Only evidence completed after now, a new sighting, or (when the commit rested on a
+   *  filing request) one slow-server re-read may commit it again — never the same evidence. */
+  private reopenHumanSubmit(): void {
+    const last = this.lastCommittedClick;
+    if (!last || !this.humanSubmit) return;
+    this.humanSubmit = null;
+    this.completionConfirmed = false;
+    const p: HumanClickSighting = { ...last, evidenceAfter: Date.now() };
+    this.pendingHumanClick = p;
+    if (last.filingEvidence && !last.slowRereadDone) {
+      p.slowRereadDone = true;
+      this.scheduleCompletionReread(HUMAN_CLICK_SLOW_REREAD_MS);
+    }
+  }
+
+  /** Round 4 — hook the person's requests that were answered after the backstop let the page go: on the
+   *  response or requestfinished, whichever comes (a fetch answered 204 may raise no requestfinished),
+   *  never on "request", which fires before the route handler would have judged it — an aborted request
+   *  is never answered, so it never counts. A filing-shaped one is late evidence; a plain fetch
+   *  schedules one page read (an in-place SPA submit commits only if that read holds). While the
+   *  backstop still holds the page, its record is the evidence: the hooks only re-judge. Listeners
+   *  only: nothing is routed, aborted or clicked. */
+  private hookLateHumanRequests(): void {
+    const page = this.page as { on?: (ev: string, fn: (x: unknown) => void) => void; mainFrame?: () => unknown } | null;
+    if (this.lateHooked || !page || typeof page.on !== "function") return;
+    this.lateHooked = true;
+    const seen = new WeakSet<object>();
+    const onAnswered = (request: unknown): void => {
+      try {
+        const p = this.pendingHumanClick;
+        if (!p || this.humanSubmit || !request || typeof request !== "object" || seen.has(request)) return;
+        seen.add(request);
+        const req = request as { method: () => string; url: () => string; resourceType: () => string; isNavigationRequest: () => boolean; frame: () => { page?: () => unknown }; timing?: () => { startTime?: number } };
+        const method = String(req.method() || "").toUpperCase();
+        if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
+        const frame = req.frame();
+        if (typeof frame?.page !== "function" || frame.page() !== this.page) return;
+        if (this.handedOverBackstop?.handedOver()) { this.judgeHumanClick(); return; }
+        const started = Number((typeof req.timing === "function" ? req.timing() : null)?.startTime ?? 0);
+        const sent = started > 0 ? Math.round(started) : Date.now();
+        if (sent > p.at + HUMAN_CLICK_COMMIT_MS || sent < p.at - HUMAN_CLICK_EARLY_MS) return;
+        let where = "";
+        try { const u = new URL(String(req.url() || "")); where = `${u.origin}${u.pathname}`; } catch { return; }
+        const entry = { where, document: req.isNavigationRequest() && typeof page.mainFrame === "function" && frame === page.mainFrame(), method, resourceType: String(req.resourceType() || ""), at: sent, doneAt: Date.now() };
+        if (filingShapedHumanRequest(entry)) {
+          this.lateHumanRequests.push(entry);
+          this.judgeHumanClick();
+        } else {
+          this.scheduleCompletionReread(HUMAN_CLICK_SPA_REREAD_MS);
+        }
+      } catch { /* a request we cannot read adds no evidence */ }
+    };
+    page.on("requestfinished", onAnswered);
+    page.on("response", (resp: unknown) => {
+      try { onAnswered((resp as { request: () => unknown }).request()); } catch { /* no request: no evidence */ }
+    });
+    page.on("requestfailed", () => { try { this.judgeHumanClick(); } catch { /* nothing to judge */ } });
+  }
+
+  /** Round 4 — one page read later (one at a time), for an in-place SPA submit or a slow server. */
+  private scheduleCompletionReread(ms: number): void {
+    if (this.rereadTimer) return;
+    const t = setTimeout(() => { this.rereadTimer = null; void this.rereadForCompletion(); }, ms);
+    (t as { unref?: () => void }).unref?.();
+    this.rereadTimer = t;
+  }
+
+  /** Round 4 — read the page for the pending click: it commits only when the completion reading holds. */
+  private async rereadForCompletion(): Promise<void> {
+    const p = this.pendingHumanClick;
+    if (!p || this.humanSubmit || !this.reviewReading) return;
+    const read = await this.readPageForCapture();
+    if (!read || /^chrome-error:/i.test(this.pageUrlNoHash()) || this.pendingHumanClick !== p || this.humanSubmit) return;
+    const judged = this.judgeCompletion(read, p.at);
+    if (judged.number || judged.confirmed) this.commitHumanClick(p, !!p.filingEvidence);
+  }
+
+  /** Round 4 — the page's text, the same text with every attached table cell's own text taken out (a
+   *  list's status cells never count as completion wording; nothing on the page is changed), and its
+   *  submit control. null when it cannot be read (the page is gone or navigating). */
+  private async readPageForCapture(): Promise<CapturePageRead | null> {
+    const page = this.page;
+    if (!page || typeof page.evaluate !== "function") return null;
+    try {
+      const texts = await Promise.race([
+        page.evaluate(() => {
+          const body = document.body;
+          const text = body ? body.innerText : "";
+          let cellFree = text;
+          if (body) {
+            for (const cell of Array.from(body.querySelectorAll("td, th, [role=cell], [role=gridcell]"))) {
+              const own = String((cell as HTMLElement).innerText || "").trim();
+              if (own) cellFree = cellFree.replace(own, " ");
+            }
+          }
+          return { text, cellFree };
+        }),
+        sleep(3000).then(() => null),
+      ]) as { text?: string; cellFree?: string } | null;
+      if (!texts) return null;
+      const ctx = await this.pageSafetyContext();
+      return { text: String(texts.text ?? ""), cellFree: String(texts.cellFree ?? ""), filingControl: String(ctx.filingControl ?? ""), reviewPage: ctx.reviewPage };
+    } catch { return null; }
+  }
+
+  /** Round 4 — the review page's own reading for the capture; on a failed read, no numbers and no known
+   *  control (only completion wording with its veto clear can then count — never today's loose read). */
+  private async readReviewForCapture(): Promise<ReviewReading> {
+    const read = await this.readPageForCapture().catch(() => null);
+    if (!read) return { numbers: new Set(), filingControl: "", completionPhrase: null };
+    return {
+      numbers: new Set(recordNumberCandidates(read.text).map((c) => c.value)),
+      filingControl: read.filingControl,
+      reviewPage: read.reviewPage,
+      completionPhrase: completionEvidence(read.cellFree).phrase,
+    };
+  }
+
+  /** Round 4 (Helm Blocking 1) — JUDGE A PAGE AFTER THE PERSON'S CLICK AGAINST THE REVIEW'S OWN READING,
+   *  by number and content, never by URL. Numbers: the strongest shape tier with a candidate, never a
+   *  weaker one; in it, the first number the review did not show — which counts when the review's form
+   *  is gone (formLost) or completion wording stands with its veto clear — else the review's own number,
+   *  only beside formLost AND wording the review page did not already show. A page reached by a GET
+   *  navigation after the click, with no document request of the person's since, yields no number. */
+  private judgeCompletion(read: CapturePageRead, clickAt: number): { number: string; confirmed: boolean; stillReview: boolean } {
+    const rr = this.reviewReading ?? { numbers: new Set<string>(), filingControl: "", completionPhrase: null };
+    const formLost = rr.filingControl !== "" && read.filingControl === "" && read.reviewPage !== true;
+    const words = completionEvidence(read.cellFree);
+    const phraseOk = !!words.phrase && !words.veto;
+    const phraseFresh = phraseOk && normPhrase(words.phrase) !== normPhrase(rr.completionPhrase);
+    const here = this.pageUrlNoHash();
+    let doc: { method: string; at: number } | null = null;
+    for (let i = this.navDocuments.length - 1; i >= 0 && !doc; i--) if (this.navDocuments[i].url === here) doc = this.navDocuments[i];
+    const documentPostSince = (this.handedOverBackstop?.humanRequests ?? []).some((h) => h.document && h.page === this.page && typeof h.at === "number" && h.at >= clickAt - HUMAN_CLICK_EARLY_MS && String(h.method ?? "").toUpperCase() !== "GET")
+      || this.lateHumanRequests.some((h) => h.document && h.at >= clickAt - HUMAN_CLICK_EARLY_MS);
+    const navigationOnly = !!doc && doc.method === "GET" && doc.at > clickAt && !documentPostSince;
+    const candidates = recordNumberCandidates(read.text);
+    const tier = RECORD_NUMBER_TIERS.find((t) => candidates.some((c) => c.source === t));
+    const inTier = tier ? candidates.filter((c) => c.source === tier).map((c) => c.value) : [];
+    const fresh = inTier.filter((v) => !rr.numbers.has(v));
+    const own = inTier.filter((v) => rr.numbers.has(v));
+    let number = "";
+    if (!navigationOnly) {
+      if (fresh.length) { if (formLost || phraseOk) number = fresh[0]; }
+      else if (own.length && formLost && phraseFresh) number = own[0];
+    }
+    const confirmed = !navigationOnly && (number !== "" || (phraseOk && formLost));
+    if (confirmed) this.completionConfirmed = true;
+    return { number, confirmed, stillReview: number === "" && read.filingControl !== "" };
+  }
+
   private armOwnSubmitWatch(): Promise<boolean> {
     if (this.submitWatch) return this.submitWatch;
     const page = this.page;
     if (!page) return Promise.resolve(false);
+    this.hookLateHumanRequests();
     // ONLY THE CLICK DETECTOR SAYS "THE PERSON SUBMITTED" (#333 skeptic r2b). A page-text signal — a
     // completion-looking page after a person's request — failed both ways: a step page reading "once
     // your application is submitted…" after the person's own Previous click read as a filing (with a
     // draft's id), and real completion pages with a "* required field" legend did not. What a page
     // says is never what made the filing; a request the person sent is said plainly instead
     // (PERSON_REQUEST_WENT_NOTE), and the number is theirs to enter.
-    // The click detector the learn path already uses: one submitObserved step when the FINAL submit
-    // is clicked; every other captured step belongs to the learn path and is ignored here.
+    // The click detector the learn path already uses: a submitObserved step when the FINAL submit is
+    // clicked; every other captured step belongs to the learn path and is ignored here. Round 4: it
+    // keeps watching (oneShot:false) — a click is a sighting, committed on the evidence after it.
     this.submitWatch = armHumanCaptureOnPage(page, (step) => {
-      if (String(step.note || "").includes(HUMAN_SUBMIT_OBSERVED_NOTE)) this.noteHumanSubmit(step.value || undefined);
-    }).catch(() => false);
+      if (String(step.note || "").includes(HUMAN_SUBMIT_OBSERVED_NOTE)) this.sightHumanSubmit(step.value || undefined);
+    }, { oneShot: false }).catch(() => false);
     return this.submitWatch;
   }
 
@@ -1594,8 +1921,12 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  lets their own click through from here (filingBackstop handOverToHuman), and the submit watch is
    *  armed now, not after the run returns: a filing made in the run's last seconds is captured. */
   private async handOverReviewPage(): Promise<boolean> {
+    // Round 4: FIRST, while the lockdown still holds the page, the review page's own reading — what the
+    // capture judges every later page against (a fast click's completion must never land in it).
+    const reading = await this.readReviewForCapture();
     const bs = this.backstop;
     if (!bs || !bs.handOverToHuman(`replay staged ${this.recipe.id} to review`)) return false;
+    this.reviewReading = reading;
     // The page handed over: a person who acted and left it moved on (runAll's report).
     this.handOverUrl = this.pageUrlNoHash();
     this.handedOverBackstop = bs;
@@ -1629,10 +1960,6 @@ export class RecipeAdapter extends BasePortalAdapter {
           draftTenantKey: draftTenantKey(here),
         });
       }
-      const read = extractRecordNumber(bodyText);
-      const permitNumber = read.value;
-      // Accela record suffix encodes the discipline: -STR (structural), -ELE (electrical), etc.
-      const discipline = permitNumber.match(/-([A-Z]{2,4})$/)?.[1] ?? null;
       // Keep origin+path only — completion-page URLs can embed session-scoped query tokens
       // (capId/agency/auth tickets) that would persist session material in the stored run
       // result and won't work when clicked later anyway.
@@ -1641,6 +1968,33 @@ export class RecipeAdapter extends BasePortalAdapter {
       // link useless (a bare /MvcProjects/EditProject reaches nothing). ONE list: cleanRecordLink
       // (these two lists disagreed until dryrun-0928 B11).
       const recordLink = cleanRecordLink(rawUrl);
+      // #333 round 4 (Helm Blocking 1): A PAGE AFTER THE PERSON'S OWN CLICK ON A HANDED-OVER REVIEW is
+      // judged against the review's own reading (judgeCompletion), never read loosely: the review's
+      // own id, a list's numbers, a duplicate's or a validation re-render's are not the filing's. The
+      // review (its submit control still there, no number) or Chromium's error page reopens the watch.
+      if (this.reviewReading) {
+        const errorPage = /^chrome-error:/i.test(rawUrl);
+        const page = errorPage ? null : await this.readPageForCapture();
+        const judged = page ? this.judgeCompletion(page, this.lastCommittedClick?.at ?? 0) : { number: "", confirmed: false, stillReview: false };
+        if (judged.number) {
+          return ok(`Captured submission confirmation: ${judged.number}.`, {
+            permitNumber: judged.number, confirmationNumber: judged.number,
+            discipline: judged.number.match(/-([A-Z]{2,4})$/)?.[1] ?? null, recordLink,
+          });
+        }
+        if (judged.stillReview || errorPage) this.reopenHumanSubmit();
+        return ok(
+          errorPage ? "The window shows the browser's error page: nothing recorded, and the submit watch is open again."
+            : judged.stillReview ? "The page still reads as the review page: nothing recorded, and the submit watch is open again."
+              : judged.confirmed ? "Submitted; no record number found on the completion page yet."
+                : "This page does not read as the application's completion: no record number recorded.",
+          { permitNumber: "", recordLink, stillReview: judged.stillReview, errorPage },
+        );
+      }
+      const read = extractRecordNumber(bodyText);
+      const permitNumber = read.value;
+      // Accela record suffix encodes the discipline: -STR (structural), -ELE (electrical), etc.
+      const discipline = permitNumber.match(/-([A-Z]{2,4})$/)?.[1] ?? null;
       const submitted = pageConfirmsSubmission(bodyText);
       if (permitNumber || submitted) {
         return ok(`Captured submission confirmation${permitNumber ? `: ${permitNumber}` : ""}.`, {
