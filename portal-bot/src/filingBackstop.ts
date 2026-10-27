@@ -173,7 +173,13 @@ export interface BackstopAbort {
 
 /** A redirect hop being judged (#358): which hop, what answered it, and the own-write / drain
  *  exemption its first leg had (a hop is judged after that window may have closed). */
-interface RedirectHop { hop: number; from: string; status: number; ownWrite: boolean; drain: boolean }
+interface RedirectHop {
+  hop: number; from: string; status: number; ownWrite: boolean; drain: boolean;
+  /** #333 × #370: the FIRST leg's person verdict, carried — never recomputed at the hop. A person's
+   *  submit answered 307 five seconds later is still theirs; the portal's own save that hops to a
+   *  filing URL just after a touch is still not. Payment (rule 1) is checked before it is read. */
+  human: boolean;
+}
 
 export interface FilingBackstop {
   readonly aborts: BackstopAbort[];
@@ -943,17 +949,18 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // THE RUN'S OWN REQUESTS THAT WENT (#358): each state-changing request the handler let through,
   // keyed by method + URL, until its response pauses at the response stage (judgePaused) — with the
   // own-write / drain exemption it had when it was judged.
-  const sentLegs: Array<{ key: string; request: any; hop: number; from: string; ownWrite: boolean; drain: boolean; at: number }> = [];
+  const sentLegs: Array<{ key: string; request: any; hop: number; from: string; ownWrite: boolean; drain: boolean; human: boolean; at: number }> = [];
   const legKey = (method: string, url: string): string => `${String(method || "").toUpperCase()} ${String(url || "").split("#")[0]}`;
   const drainOn = (pg: unknown): boolean => !!pg && [...drains.values()].some((d) => d.page === pg);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const letThrough = async (route: any, request: any, via: RedirectHop | null): Promise<void> => {
+  // `human`: the handler's verdict on THIS pass (#333) — recorded with the first leg so a hop inherits it.
+  const letThrough = async (route: any, request: any, via: RedirectHop | null, human = false): Promise<void> => {
     if (!via) {
       try {
         const pg = pageOfRequest(request);
         const now = Date.now();
         for (let i = sentLegs.length - 1; i >= 0; i--) if (now - sentLegs[i].at > 600_000) sentLegs.splice(i, 1);
-        sentLegs.push({ key: legKey(request.method(), request.url()), request, hop: 0, from: "", ownWrite: ownWriteOn(pg), drain: drainOn(pg), at: now });
+        sentLegs.push({ key: legKey(request.method(), request.url()), request, hop: 0, from: "", ownWrite: ownWriteOn(pg), drain: drainOn(pg), human, at: now });
       } catch { /* unreadable: its redirect cannot be judged as this run's (it continues, as on main) */ }
     }
     await route.fallback().catch(() => null);
@@ -1018,7 +1025,10 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     // watch is armed only after the run's last input, and the run makes none after the hand-over)
     // and no run action is in flight (a dismisser / Enter window). It passes the filing-URL rule and
     // the review lockdown below; payment and the windows still apply.
-    const human = handedOverAt > 0 && !disposed && windows.size === 0 && humanInputSinceHandOver(requestPage);
+    // A REDIRECT HOP CARRIES ITS FIRST LEG'S VERDICT (#370 merge order): judged live, a person's submit
+    // answered 307 more than HUMAN_INPUT_MS later would read as not theirs (their filing cut off),
+    // and the portal's own save hopping to a filing URL just after a touch would read as theirs.
+    const human = via ? via.human : (handedOverAt > 0 && !disposed && windows.size === 0 && humanInputSinceHandOver(requestPage));
     // R0 — THE INFORMATION-PAGE SLOT IS CONSUMED by the FIRST request that could be the verified
     // control's (#344): the bound page's own main-frame document navigation. Matched or not, the
     // slot is gone, and consuming it changes no rule's outcome: the request meets payment, the
@@ -1179,7 +1189,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         const own = via ? via.ownWrite : !!pg && ownWriteOn(pg);
         if (own) {
           ownWriteRequests.push(whereOf(url));
-          await letThrough(route, request, via);
+          await letThrough(route, request, via, human);
           return;
         }
         // THE RUN'S OWN SAVE, STILL IN FLIGHT (dryrun-0928 B3): while drainOwnWrites holds the page, a
@@ -1192,7 +1202,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
           const origin = originOf(url);
           if (origin !== "" && origin === originOf(pageUrl)) {
             drainRequests.push(whereOf(url));
-            await letThrough(route, request, via);
+            await letThrough(route, request, via, human);
             return;
           }
         }
@@ -1229,7 +1239,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
           // are held from its first byte, not only after checkInfoPageAfterClick returns.
           infoProof = { page: pg, entryId: infoAdmit.entryId, state: "pending", checked: false };
           infoProofEndpoint = whereOf(url);
-          await letThrough(route, request, via);
+          await letThrough(route, request, via, human);
           return;
         }
         // AN UNVERIFIED INFORMATION PAGE'S HELD REQUEST, OBSERVED (#344): the watch the click opened
@@ -1258,12 +1268,13 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     }
     // The slot's request was not one 4(b) would have held: it passes as on main (recorded).
     if (infoAdmit && infoAdmit.refusals.length === 0) infoPageAdmissions.push({ entryId: infoAdmit.entryId, where: whereOf(url), exempted: false });
-    if (human) {
+    // The person's request is recorded once, on its first leg: a hop is the same request going on.
+    if (human && !via) {
       let mainFrame = false;
       try { mainFrame = !!requestPage && typeof requestPage.mainFrame === "function" && request.frame() === requestPage.mainFrame(); } catch { mainFrame = false; }
       humanRequests.push({ where: whereOf(url), document: mainFrame && /^document$/i.test(resourceType), abortsBefore: aborts.length });
     }
-    await letThrough(route, request, via);
+    await letThrough(route, request, via, human);
   };
 
   await target.route("**/*", handler);
@@ -1273,7 +1284,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // request through. Every other response of the chain ends it and continues at once. A response
   // this run did not send is not its to judge (null). Matched by method + URL on the first pause,
   // then by the chain's network id (the same for every leg of one redirect chain).
-  const chains = new Map<string, { request: any; hop: number; ownWrite: boolean; drain: boolean; at: number }>();
+  const chains = new Map<string, { request: any; hop: number; ownWrite: boolean; drain: boolean; human: boolean; at: number }>();
   const judgePaused: PausedJudge = async (e) => {
     if (disposed) return null;
     const method = String(e.request?.method || "").toUpperCase();
@@ -1284,7 +1295,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       const i = sentLegs.findIndex((l) => l.key === legKey(method, url));
       if (i < 0) return null;
       const leg = sentLegs.splice(i, 1)[0];
-      chain = { request: leg.request, hop: leg.hop, ownWrite: leg.ownWrite, drain: leg.drain, at: leg.at };
+      chain = { request: leg.request, hop: leg.hop, ownWrite: leg.ownWrite, drain: leg.drain, human: leg.human, at: leg.at };
     }
     if (net) chains.delete(net);
     const status = Number(e.responseStatusCode || 0);
@@ -1311,13 +1322,13 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       fallback: async () => { outcome.verdict = "continue"; },
       abort: async () => { outcome.verdict = "fail"; },
     };
-    await handler(hopRoute, asRedirectedTo(chain.request, next), { hop, from, status, ownWrite: chain.ownWrite, drain: chain.drain });
+    await handler(hopRoute, asRedirectedTo(chain.request, next), { hop, from, status, ownWrite: chain.ownWrite, drain: chain.drain, human: chain.human });
     const verdict = outcome.verdict;
     if (verdict === "continue") {
       const now = Date.now();
       for (const [k, c] of chains) if (now - c.at > 600_000) chains.delete(k);
       if (net) chains.set(net, { ...chain, hop, at: now });
-      else sentLegs.push({ key: legKey(method, next), request: chain.request, hop, from, ownWrite: chain.ownWrite, drain: chain.drain, at: now });
+      else sentLegs.push({ key: legKey(method, next), request: chain.request, hop, from, ownWrite: chain.ownWrite, drain: chain.drain, human: chain.human, at: now });
     }
     return verdict;
   };

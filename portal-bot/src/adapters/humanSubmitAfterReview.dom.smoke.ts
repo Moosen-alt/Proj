@@ -21,6 +21,13 @@
 //     A7  a person's click BEFORE the hand-over: aborted, flagged humanInput (the run says so).
 //     A8  a person's click while a dismisser window is open: aborted.
 //     A9  the input watch never armed: handOverToHuman refuses, a person's click is aborted.
+//   [A, #370 × #333] A REDIRECT HOP CARRIES ITS FIRST LEG'S PERSON VERDICT (Helm's merge-order asks):
+//     A10 the person's submit is answered 307 → /apply/submit only after 4.6 s (past HUMAN_INPUT_MS):
+//         the hop still reaches it; the person's request is recorded once (the first leg).
+//     A11 the person's submit is answered 307 → /payment/charge: refused (payment first, always).
+//     A12 handed over but not yet locked (the drain's moment): the run's own save goes out, the
+//         person touches the page, THEN its 307 → /SubmitApplication arrives: the hop is refused
+//         (the first leg was not the person's) and is not in humanRequests.
 //   [B] THE REPLAY (RecipeAdapter, guided manual: no approval, the flagged final submit never clicked):
 //     B1  the person clicks the portal's submit the moment the run hands the page over: the POST
 //         reaches the portal, the run is NOT failed, and it reports the person's submit.
@@ -51,7 +58,7 @@ import "../smokeArtifactDirs";
 import http from "node:http";
 import { chromium, type Page } from "playwright";
 import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../../shared/src/types";
-import { backstopFor, installFilingBackstop, isStoppingAbort, withBackstopWindow, type FilingBackstop } from "../filingBackstop";
+import { backstopFor, installFilingBackstop, isStoppingAbort, withBackstopWindow, withOwnWriteWindow, type FilingBackstop } from "../filingBackstop";
 import { HUMAN_CLICK_HELD_NOTE, PERSON_REQUEST_WENT_NOTE, RecipeAdapter } from "./recipeAdapter";
 
 let failures = 0;
@@ -100,7 +107,17 @@ const reviewBody = (k: string): string => {
   if (k === "B9") return `${summary}${formSubmit(k)}<button type="button" id="pay" onclick="fetch('/h/B9/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function () {})">Pay Fees</button>`;
   if (k === "A4") return `${summary}<button type="button" id="btnSubmit" onclick="window.open('/h/A4/popup', '_blank')">Submit Application</button>`;
   if (k === "A5") return `${summary}<button type="button" id="btnSubmit" onclick="fetch('/h/A5/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function(){})">Submit Application</button>`;
+  // The portal answers the submit with a method-keeping redirect (judged as a fresh request, #370).
+  if (k === "A10") return `${summary}<form method="post" action="/h/A10/apply/slow307"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
+  if (k === "A11") return `${summary}<form method="post" action="/h/A11/apply/pay307"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
   return `${summary}<form method="post" action="/h/${k}/apply/submit"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
+};
+// Method-keeping redirects the fixture answers, with the delay before the 307 (ms): the slow one lands
+// after HUMAN_INPUT_MS (4 s) has passed since the person's click.
+const REDIRECTS: Record<string, [string, number]> = {
+  "apply/slow307": ["apply/submit", 4600],
+  "apply/pay307": ["payment/charge", 300],
+  "apply/autosave307": ["SubmitApplication", 1000],
 };
 const server = http.createServer((req, res) => {
   const url = new URL(req.url || "/", "http://127.0.0.1");
@@ -109,6 +126,11 @@ const server = http.createServer((req, res) => {
   const rest = parts.slice(2).join("/");
   if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS") posts.push({ k, path: url.pathname });
   const send = (body: string): void => { res.writeHead(200, { "content-type": "text/html; charset=utf-8" }); res.end(body); };
+  if (req.method === "POST" && REDIRECTS[rest]) {
+    const [to, delay] = REDIRECTS[rest];
+    setTimeout(() => { res.writeHead(307, { location: `/h/${k}/${to}` }); res.end(); }, delay);
+    return;
+  }
   if (req.method === "POST" && rest === "apply/submit") { send(COMPLETION); return; }
   if (rest === "popup") { send(html("Processing", `<h1>Processing</h1><script>fetch('/h/${k}/popup/post', { method: 'POST', body: 'from=popup' }).catch(function(){});</script>`)); return; }
   if (req.method !== "GET") { res.writeHead(204); res.end(); return; }
@@ -138,13 +160,18 @@ async function personTouchesPage(page: Page): Promise<void> {
 // [A] The backstop, directly
 // ---------------------------------------------------------------------------------------------
 interface Bed { page: Page; bs: FilingBackstop; close: () => Promise<void> }
-async function bed(k: string, opts: { arm?: boolean; handOver?: boolean } = {}): Promise<Bed> {
+async function bed(k: string, opts: { arm?: boolean; handOver?: boolean; lock?: boolean } = {}): Promise<Bed> {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
-  await page.goto(`${base}/h/${k}/review`);
+  // Installed BEFORE the page loads, as every production run's first step loads a fresh document
+  // under it: the redirect guard (#370) does not see subresource redirects of a document that was
+  // already loaded when it joined (#394).
   const bs = await installFilingBackstop(page, `human-submit ${k}`);
   if (!bs) throw new Error("no backstop");
-  bs.lockReview(`smoke ${k} at review`);
+  await page.goto(`${base}/h/${k}/review`);
+  // lock:false — the replay's own order is hand over → drain its own save → lock (B7); a bed that
+  // still has its own save to send must not be locked yet.
+  if (opts.lock !== false) bs.lockReview(`smoke ${k} at review`);
   if (opts.arm !== false) {
     const armed = await bs.watchHumanInput();
     if (!armed) throw new Error("the input watch could not be armed");
@@ -243,6 +270,53 @@ console.log("\n[A] THE BACKSTOP, DIRECTLY");
   await sleep(900);
   check("A9 the input watch never armed: handOverToHuman refuses, and a person's click is aborted",
     handed === false && postsFor("A9", from).length === 0, `handed=${handed} ${brief(b, "A9", from)}`);
+  await b.close();
+}
+
+// [A, #370 × #333] A redirect hop is judged as a fresh request (#370). The person's verdict is the FIRST
+// leg's, carried on the hop — never recomputed when the 307 arrives. Judged live, A10's hop would
+// read as not the person's (4.6 s > HUMAN_INPUT_MS: their filing cut off) and A12's hop as theirs
+// (a touch 0.7 s before it: the run's own save let through to a filing URL).
+console.log("\n[A, #370] A REDIRECT HOP CARRIES THE FIRST LEG'S PERSON VERDICT");
+{
+  const from = posts.length;
+  const b = await bed("A10");
+  await personClicks(b.page);
+  await sleep(6500);
+  const p = postsFor("A10", from).map((x) => x.path);
+  check("A10 MUST-PASS the person's submit answered 307 after 4.6 s: the hop still reaches /apply/submit",
+    p.filter((x) => /\/apply\/slow307$/.test(x)).length === 1 && p.filter((x) => /\/apply\/submit$/.test(x)).length === 1 && b.bs.stoppingAborts().length === 0, brief(b, "A10", from));
+  check("A10 …recorded as the person's request ONCE (the first leg), never again for the hop",
+    b.bs.humanRequests.filter((r) => /\/apply\/slow307$/.test(r.where)).length === 1 && !b.bs.humanRequests.some((r) => /\/apply\/submit$/.test(r.where)), brief(b, "A10", from));
+  await b.close();
+}
+{
+  const from = posts.length;
+  const b = await bed("A11");
+  await personClicks(b.page);
+  await sleep(1800);
+  const p = postsFor("A11", from).map((x) => x.path);
+  const hop = b.bs.aborts.find((a) => a.redirect && /\/apply\/pay307$/.test(a.redirect.from) && /\/payment\/charge$/.test(a.where));
+  check("A11 MUST-EXCLUDE the person's submit answered 307 → /payment/charge: nothing reaches it (payment is checked before the person's verdict)",
+    p.filter((x) => /\/apply\/pay307$/.test(x)).length === 1 && !p.some((x) => /\/payment\/charge$/.test(x)) && !!hop && hop.rule === "filing-url" && isStoppingAbort(hop), brief(b, "A11", from));
+  await b.close();
+}
+{
+  const from = posts.length;
+  // Handed over, not yet locked: the run still has its own save to drain (the replay's order, B7).
+  const b = await bed("A12", { lock: false });
+  // The run's own save (an own-write window, as the drain's or a fill's autosave) goes out first…
+  await withOwnWriteWindow(b.page, "smoke A12 autosave", () => b.page.evaluate(() => { void fetch("/h/A12/apply/autosave307", { method: "POST", body: "terms=on" }).catch(() => null); }));
+  await sleep(300);
+  // …the person touches the page (an input that sends nothing)…
+  await personTouchesPage(b.page);
+  // …and its 307 → /SubmitApplication (a filing URL) arrives 0.7 s after the touch.
+  await sleep(2200);
+  const p = postsFor("A12", from).map((x) => x.path);
+  const hop = b.bs.aborts.find((a) => a.redirect && /\/apply\/autosave307$/.test(a.redirect.from) && /\/SubmitApplication$/.test(a.where));
+  check("A12 MUST-EXCLUDE the run's own save, 307 → /SubmitApplication just after a touch: the hop never reaches it (the first leg was not the person's)",
+    p.filter((x) => /\/apply\/autosave307$/.test(x)).length === 1 && !p.some((x) => /\/SubmitApplication$/.test(x)) && !!hop && hop.rule === "filing-url", brief(b, "A12", from));
+  check("A12 …and the hop is not in humanRequests", !b.bs.humanRequests.some((r) => /\/(SubmitApplication|apply\/autosave307)$/.test(r.where)), brief(b, "A12", from));
   await b.close();
 }
 
