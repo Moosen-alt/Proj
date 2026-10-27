@@ -25,6 +25,11 @@
    execution policy, `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
    Portal RECORDING (visible browser) always runs on a local machine like
    this — use the "Record this portal" button's generated command/.bat.
+   A server started in a console window (`cmd /k npm start`, `start.bat`)
+   turns QuickEdit off for that window at boot, so a click or text selection
+   in it can no longer freeze the server (#360). No launcher change is needed;
+   `AUTOPILOT_KEEP_QUICKEDIT=1` keeps QuickEdit on. Edit → Mark and Ctrl+S
+   (scroll lock) still pause console output until Esc is pressed.
 
 
 ## Deploy (one VM, ~$20–40/mo: Hetzner / DigitalOcean / Lightsail; 4GB+ RAM)

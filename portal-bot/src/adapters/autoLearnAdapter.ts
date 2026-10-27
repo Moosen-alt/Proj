@@ -3,7 +3,7 @@ import { preferredRowLabel, rankAddressVersions, type SiteIdentity } from "../ad
 import { imageToPdfBytes, pdfNameFor, shouldConvertToPdf } from "../imageToPdf";
 import path from "path";
 import type { Page, Frame, Locator } from "playwright";
-import type { ProjectRecord, RecipeSelector, RecipeStep, StepFingerprint } from "../../../shared/src/types";
+import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep, StepFingerprint } from "../../../shared/src/types";
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, type PortalContext, type PortalStepResult } from "../adapter";
 import { openPortal } from "../browser";
 import { selectWithFallback, readClosedComboboxOptions } from "../comboboxFill";
@@ -51,7 +51,7 @@ export interface ContinueDraft {
 }
 import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isInterstitialForwardLabel as sharedIsInterstitialForwardLabel, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
 import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
-import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
+import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopSentLine, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
 // Types only (erased): the information-page door is reached duck-typed on the installed backstop.
 import type { FilingBackstop, InfoPageCandidateTake, InfoPagePassOpen } from "../filingBackstop";
 import { INFO_PAGE_PRIOR_PROGRESS_REFUSAL, infoPageEvidence, infoPageProofOfProgressRefusals, infoPageProofStepRefusals, type InfoPageProofStep, type InfoPageRunState, type InfoPageRunStep } from "../../../shared/src/infoPagePass";
@@ -63,6 +63,7 @@ import {
   type ContactFieldKind, type ContactRole, type ContactTrack,
 } from "../../../shared/src/contactRoles";
 import { portalSaysNotServed } from "../../../shared/src/portalNotServed";
+import { prepareComputeSettle, waitForComputeSettled } from "../computeSettle";
 
 // AutoLearnAdapter — AUTONOMOUSLY learns an unknown AHJ/utility portal form instead of
 // having a human record it. Each page is scraped into a structured snapshot
@@ -143,6 +144,19 @@ export interface ExtractedField {
    *  post-reveal re-scan — this key lets it recognize (and never re-answer) a group that
    *  already has a recorded answer, which would silently flip the selection. */
   group?: string;
+  /** A radio's / checkbox's GROUP QUESTION (#362): its own label is the option word ("Yes"), and
+   *  the question ("Are you ready to submit…?") lives in the fieldset legend, the radiogroup's
+   *  accessible name, or a group label tied to no single option. Read by the gap-fill's
+   *  submit-intent guard; never sent to a planner. */
+  groupPrompt?: string;
+  /** EVERY text that may be this control's question (#362), from every source rather than the
+   *  first: each enclosing fieldset legend, its own and its group's aria-labelledby / aria-label,
+   *  its label (a choice control's own option word excluded), and the text around it in the
+   *  smallest container holding only it (or only its group): a row's <th> or first cell, a
+   *  leading span / p / strong, a .control-label — plus a text-only element just before that
+   *  container. Headings and option words are never part of it. Read by the gap-fill's
+   *  submit-intent guard on the element about to be written; never sent to a planner. */
+  questions?: string[];
   /** True when the control cannot be operated right now — :disabled (which also covers a
    *  control inside <fieldset disabled>), aria-disabled="true", or a `disabled` class token.
    *  Carried because A DISABLED NEXT IS A GATE, NOT AN ABSENCE: a wizard step whose Next
@@ -344,6 +358,10 @@ const PAY_FEE = /\b(pay\s*(and|&)\s*submit|pay fees?|pay fee|pay now|submit\s*(&
  *  Three allows a legitimate re-render plus one retry; Miami's Property Search was walked
  *  SEVEN times, which bought nothing and spent the whole budget. */
 const REPEAT_PAGE_LIMIT = 3;
+/** #382 — after the late equipment pass fills a control, how long a debounced autosave gets to
+ *  land and render what it unlocks (a PowerClerk row's Model after its make) before the next
+ *  re-scrape. Only paid when that pass actually filled something. */
+const LATE_EQUIP_REVEAL_GRACE_MS = 2_000;
 
 const SUBMIT_INTENT = /\b(continue application|submit application|file application|submit|finish|finalize|confirm submission|place order|complete submission)\b/i;
 /** A login-worded control ("Sign In", "Log in", "Login", "Log On"). Never a walk advance while its
@@ -462,8 +480,15 @@ const OTHER_SPECIFY_VALUE = "Solar";
 
 // `scope`: "nem" (the default) applies on utility interconnection learns (profile residential_nem);
 // "permit" applies on AHJ/permit learns (profile permit_standard). A policy never crosses scopes.
-const POLICY_RADIO_DEFAULTS: Array<{ question: RegExp; answer: "Yes" | "No"; enforce?: boolean; scope?: "nem" | "permit" }> = [
-  { question: /do you propose to limit the export capacity/i, answer: "No" },
+// `jobKey`: the replay-map key (backend resolveRecipeFieldValues) that carries THIS job's own answer
+// to the question; the replay of a control its recipe never recorded binds that key ahead of the
+// standing answer (unrecordedControls POLICY_QUESTION_JOB_KEYS, derived from this table — so the
+// question is ONE regex, here). A rule without one has only the standing answer.
+// Every `question` is a non-global regex: the replay tests the same RegExp objects, so a `g`/`y` flag
+// would carry lastIndex between the two callers.
+export type PolicyRadioRule = Readonly<{ question: RegExp; answer: "Yes" | "No"; enforce?: boolean; scope?: "nem" | "permit"; jobKey?: string }>;
+export const POLICY_RADIO_DEFAULTS: ReadonlyArray<PolicyRadioRule> = Object.freeze(([
+  { question: /do you propose to limit the export capacity/i, answer: "No", jobKey: "exportLimiting" },
   // HYPHENS COUNT. Ameren Illinois asks "Is the inverter lab-certified as that term is
   // defined in the Illinois Distributed Generation Interconnection Standard?" — hyphenated,
   // which a whitespace-only pattern misses, leaving a REQUIRED question blank on every
@@ -491,7 +516,8 @@ const POLICY_RADIO_DEFAULTS: Array<{ question: RegExp; answer: "Yes" | "No"; enf
   // the application is submitted, so this is a commercial decision encoded as a default, not
   // a mechanical one. enforce=false, so anything already answered — by a human or from
   // project data — always wins.
-  { question: /net\s*k?wh|kwh\s*netting|net\s*metering\s*\(k?wh\)/i, answer: "Yes" },
+  // `\bnet`: "internet wh…" is not net kWh (Helm review of PR #353).
+  { question: /\bnet\s*k?wh|kwh\s*netting|net\s*metering\s*\(k?wh\)/i, answer: "Yes" },
   { question: /monetiz/i, answer: "Yes" },
   // Ameren Illinois: "requires a Manual, External Knife-Blade Type Disconnect OR a Circuit
   // Breaker in a Secured Compartment/Enclosure … along with signage … no less than 5\" by 7\"
@@ -509,7 +535,51 @@ const POLICY_RADIO_DEFAULTS: Array<{ question: RegExp; answer: "Yes" | "No"; enf
   // project." — "can be yes"; the learn picked No and the operator corrected it mid-run). enforce: a
   // planner's No is corrected.
   { question: /consent\s+to\s+drone|drones?\b.{0,60}\binspections?\b|drone\s+inspection/i, answer: "Yes", enforce: true, scope: "permit" },
-];
+] as PolicyRadioRule[]).map((rule) => Object.freeze(rule)));
+
+/** A POLICY SCOPE: "nem" on a utility interconnection, "permit" on an AHJ, "none" when the operator
+ *  turned the policy answers off (PORTAL_POLICY_DEFAULTS=off). Read from policyProfileFor below — the
+ *  one rule the learn (backend autoLearn.ts) and the replay (policyScopeFor) both ask. */
+export type PolicyScope = "nem" | "permit" | "none";
+
+/** Which deterministic policy-answer set a run may use (the learner's constructor option). */
+export type PolicyProfile = "residential_nem" | "permit_standard" | "none";
+
+/** THE ONE RULE FOR WHICH POLICY ANSWERS APPLY (PR #353 round 2: the backend's learn and the replay
+ *  each carried a copy). Deterministic policy answers (export capacity → No, UL 1741 → Yes) are
+ *  standard-residential-NEM domain policy: a UTILITY interconnection gets them, an AHJ/permit portal
+ *  gets the permit set, and PORTAL_POLICY_DEFAULTS=off (or 0) disables them everywhere (non-standard
+ *  projects; the planner + project data then decide). */
+export function policyProfileFor(scopeType: string | null | undefined, env: NodeJS.ProcessEnv = process.env): PolicyProfile {
+  if (env.PORTAL_POLICY_DEFAULTS === "off" || env.PORTAL_POLICY_DEFAULTS === "0") return "none";
+  return scopeType === "utility" ? "residential_nem" : "permit_standard";
+}
+
+/** THE LEARNER'S STANDING ANSWER TO A QUESTION, read from POLICY_RADIO_DEFAULTS — the one table
+ *  (issue #352). The replay asks it for a REQUIRED control its recipe has no step for (PacifiCorp's
+ *  knife-blade question renders only for a larger system, so a recipe learned on a small one never
+ *  recorded it), so a learn and a replay give one question one answer. "" when no rule matches or the
+ *  scope is "none". `enforce` is the learner's correction of a planner's other pick; a caller that
+ *  only ever answers an EMPTY control has nothing to correct, so it does not apply. */
+export function policyDefaultAnswerFor(question: string, scope: PolicyScope): "Yes" | "No" | "" {
+  return policyDefaultRuleFor(question, scope)?.answer ?? "";
+}
+
+/** The POLICY_RADIO_DEFAULTS rule that answers a question in this scope, or null — what
+ *  policyDefaultAnswerFor reads, for a caller that also needs the rule's own regex (the replay's
+ *  negation check reads the sentence the rule matched). */
+export function policyDefaultRuleFor(question: string, scope: PolicyScope): PolicyRadioRule | null {
+  if (scope === "none") return null;
+  const text = String(question ?? "");
+  return POLICY_RADIO_DEFAULTS.find((p) => (p.scope ?? "nem") === scope && p.question.test(text)) ?? null;
+}
+
+/** The policy scope a replay runs under: the learn's own profile (policyProfileFor) for the recipe's
+ *  scope, as the scope POLICY_RADIO_DEFAULTS rules carry. */
+export function policyScopeFor(scopeType: string | null | undefined, env: NodeJS.ProcessEnv = process.env): PolicyScope {
+  const profile = policyProfileFor(scopeType, env);
+  return profile === "none" ? "none" : profile === "residential_nem" ? "nem" : "permit";
+}
 
 // Sensitive field labels whose literal value must NEVER be stored in a recorded step.
 // FREE-TEXT IDENTIFIERS. An account or meter number is typed; it is never one of three
@@ -1318,6 +1388,13 @@ export interface RawField {
   offstage?: boolean;
   /** True when the control is not operable right now. See ExtractedField.disabled. */
   disabled?: boolean;
+  /** See ExtractedField.groupPrompt. */
+  groupPrompt?: string;
+  /** See ExtractedField.questions. */
+  questions?: string[];
+  /** A probe mark the draft click's pick read put on the element (data-al-pq), echoed back so its
+   *  reading can be tied to the element (#362). Nothing else sets or reads it. */
+  probe?: string;
   /** A choice tile (markChoiceTilesInPage): a card clicked as a whole, labelled by its title.
    *  Its selector is the title TEXT — getByRole finds nothing on a plain container. */
   tile?: boolean;
@@ -1444,6 +1521,110 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
     const text = (el.textContent || "").trim();
     if (text) return text;
     return "";
+  }
+
+  // THE OPTION WORDS OF A CHOICE GROUP (#362): the labels of every radio / checkbox sharing this
+  // one's name (just its own for an unnamed one). Never a question.
+  function optionWordsOf(el: Element): string[] {
+    const ty = (el.getAttribute("type") || "").toLowerCase();
+    if (el.tagName.toLowerCase() !== "input" || (ty !== "radio" && ty !== "checkbox")) return [];
+    const nm = el.getAttribute("name");
+    const root = el.getRootNode() as Document | ShadowRoot;
+    const members = nm ? Array.from(root.querySelectorAll(`input[name="${CSS.escape(nm)}"]`)) : [el];
+    // Its label, its value and a <label for> right AFTER it (Miami's radios share one id, and their
+    // labels point at "Yes"/"No", so labelFor cannot tie them): every one is an option's own word.
+    // Never the element before the first option: that is where the group's question label sits.
+    const words: string[] = [];
+    for (const m of members) {
+      words.push(labelFor(m), m.getAttribute("value") || "");
+      const sib = m.nextElementSibling;
+      if (sib && sib.tagName === "LABEL" && sib.hasAttribute("for") && !sib.querySelector("input, select, textarea")) words.push(sib.textContent || "");
+    }
+    return words.map((w) => w.replace(/\s+/g, " ").trim()).filter(Boolean);
+  }
+
+  // THE CONTROL'S QUESTION FROM EVERY SOURCE (#362) — see ExtractedField.questions. One reading
+  // for the extractor and for the gap-fill's last check before a write (claimForWrite runs this
+  // function on the element itself), so the two can never disagree.
+  //   - every legend of every enclosing fieldset, nested anywhere in it (not a nested fieldset's);
+  //   - aria-labelledby, aria-label and aria-describedby, on the control and on its group;
+  //   - a non-choice control's own label;
+  //   - a choice control or a select (never a free-text box: its question is its label, aria and
+  //     legend): the text BEFORE it in the smallest container whose only ANSWER controls are this
+  //     one or its group — a help, info or Clear button in the row is not an answer and does not
+  //     end the climb — each part (≤200) and the parts joined (≤200); then one text-only element
+  //     just before that container. Never text after the control (help, a hint), never script,
+  //     style, template, a heading, a button's own words, or an option's own word.
+  function questionsOf(el: Element, kind: string, ownLabel: string): string[] {
+    const clean = (t: string | null | undefined): string => String(t || "").replace(/\s+/g, " ").trim();
+    const out: string[] = [];
+    const add = (t: string | null | undefined): void => {
+      const c = clean(t).slice(0, 300);
+      if (c && !out.includes(c)) out.push(c);
+    };
+    const root = el.getRootNode() as Document | ShadowRoot;
+    const byId = (r: string): Element | null => (typeof root.getElementById === "function" ? root.getElementById(r) : null) || document.getElementById(r);
+    const byIds = (ids: string | null): string => (ids || "").split(/\s+/).filter(Boolean)
+      .map((r) => clean(byId(r)?.textContent)).filter(Boolean).join(" ");
+    const choice = kind === "radio" || kind === "checkbox";
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    const listish = kind === "select" || el.tagName === "SELECT" || role === "combobox" || role === "listbox";
+    const words = new Set(optionWordsOf(el).map((w) => w.toLowerCase()));
+    for (let fs = el.closest("fieldset"); fs; fs = fs.parentElement ? fs.parentElement.closest("fieldset") : null) {
+      for (const lg of Array.from(fs.querySelectorAll("legend"))) if (lg.closest("fieldset") === fs) add(lg.textContent);
+    }
+    add(byIds(el.getAttribute("aria-labelledby")));
+    add(el.getAttribute("aria-label"));
+    add(byIds(el.getAttribute("aria-describedby")));
+    const grp = el.closest('[role="radiogroup"], [role="group"]');
+    if (grp) { add(byIds(grp.getAttribute("aria-labelledby"))); add(grp.getAttribute("aria-label")); add(byIds(grp.getAttribute("aria-describedby"))); }
+    if (!choice) add(ownLabel);
+    if (!choice && !listish) return out;
+    // A select with its OWN label is asked by that label: an instruction above it ("When you are
+    // ready to submit, click Submit below") is not its question.
+    if (!choice) {
+      const id = el.getAttribute("id");
+      const ownLbl = (id && document.querySelector(`label[for="${CSS.escape(id)}"]`)) || el.closest("label");
+      if ((ownLbl && clean(ownLbl.textContent)) || clean(el.getAttribute("aria-label")) || byIds(el.getAttribute("aria-labelledby"))) return out;
+    }
+    // The smallest container holding only this control's answers (a choice control: its group).
+    const nm = choice ? el.getAttribute("name") : null;
+    const ours = (c: Element): boolean => c === el || (!!nm && c.getAttribute("name") === nm);
+    const ANSWERS = 'input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]):not([type=image]), select, textarea, [role=combobox], [role=listbox], [role=radio], [role=checkbox]';
+    let box: Element = el;
+    for (let up = el.parentElement; up && up !== document.body && up.tagName !== "FORM"; up = up.parentElement) {
+      if (!Array.from(up.querySelectorAll(ANSWERS)).every(ours)) break;
+      box = up;
+    }
+    const SKIP = "h1, h2, h3, h4, h5, h6, option, script, style, template, noscript, legend, button, [role=button], select";
+    if (box !== el) {
+      const first = Array.from(box.querySelectorAll(ANSWERS)).find(ours) || el;
+      const parts: string[] = [];
+      const walker = document.createTreeWalker(box, NodeFilter.SHOW_TEXT);
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        // Only text BEFORE the control: what follows it is help, a hint or an option's word.
+        if (!(first.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_PRECEDING)) continue;
+        const host = n.parentElement;
+        if (!host || host.closest(SKIP)) continue;
+        const t = clean(n.textContent);
+        if (!t || words.has(t.toLowerCase()) || (choice && t === ownLabel)) continue;
+        parts.push(t);
+      }
+      // A container of prose is not a question (instructions that mention submitting): a caption
+      // is short, as the required sweep reads one (≤160 there; 200 here for a long question).
+      for (const p of parts) if (p.length <= 200) add(p);
+      const joined = parts.join(" ");
+      if (joined.length <= 200) add(joined);
+    }
+    // A text-only element just before that container ("<p>Question?</p><select>").
+    let sib = box.previousElementSibling;
+    for (let k = 0; sib && k < 2; k++, sib = sib.previousElementSibling) {
+      if (sib.matches("script, style, template, noscript")) { k--; continue; }
+      if (sib.querySelector(ANSWERS) || /^H[1-6]$/.test(sib.tagName)) break;
+      const t = clean(sib.textContent);
+      if (t && t.length <= 200) { add(t); break; }
+    }
+    return out;
   }
 
   // Derive the SECTION a field lives under — its fieldset legend / enclosing card-or-panel
@@ -1747,6 +1928,40 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       requiredByAsterisk = labelHasAsterisk(forLbl?.textContent) || labelHasAsterisk(wrapLbl?.textContent);
     }
     const required = (el as HTMLInputElement).required || el.getAttribute("aria-required") === "true" || requiredByAsterisk || undefined;
+    // THE GROUP'S OWN QUESTION (#362), in order: the fieldset legend; the radiogroup/group's
+    // aria-labelledby / aria-label; then a label in the group's container tied to no single option
+    // (no for=, or a for= naming no choice control, and not wrapping one) or a .control-label.
+    let groupPrompt = "";
+    if (fieldType === "radio" || fieldType === "checkbox") {
+      const clean = (t: string | null | undefined): string => String(t || "").replace(/\s+/g, " ").trim();
+      const legend = el.closest("fieldset")?.querySelector("legend");
+      groupPrompt = clean(legend?.textContent);
+      if (!groupPrompt) {
+        const rg = el.closest('[role="radiogroup"], [role="group"]');
+        if (rg) {
+          const by = (rg.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean)
+            .map((ref) => clean(document.getElementById(ref)?.textContent)).filter(Boolean).join(" ");
+          groupPrompt = by || clean(rg.getAttribute("aria-label"));
+        }
+      }
+      if (!groupPrompt) {
+        const box = el.closest("fieldset, .form-group, [class*='form-group'], [class*='field'], .row, [class*='row']");
+        const lbls = box ? Array.from(box.querySelectorAll("label, .control-label, .field-label")) : [];
+        // An OPTION'S OWN WORD is never the question: Miami's <label for="No">No</label> names an
+        // id that does not exist, so the for= test alone let "No" become the question.
+        const words = new Set(optionWordsOf(el).map((w) => w.toLowerCase()));
+        for (const l of lbls) {
+          if (l.querySelector("input, select, textarea")) continue;
+          const f = l.getAttribute("for");
+          const tgt = f ? document.getElementById(f) : null;
+          if (tgt && /^(radio|checkbox)$/i.test((tgt as HTMLInputElement).type || "")) continue;
+          const t = clean(l.textContent);
+          if (t && t !== label && !words.has(t.toLowerCase())) { groupPrompt = t; break; }
+        }
+      }
+      groupPrompt = groupPrompt.slice(0, 200);
+    }
+    const questions = fieldType === "button" || fieldType === "file" ? [] : questionsOf(el, fieldType, label);
 
     out.push({
       label, fieldType, options, role, name, placeholder, id, text, href,
@@ -1754,6 +1969,9 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       required: required || undefined,
       section: sectionFor(el) || undefined,
       testCss,
+      groupPrompt: groupPrompt || undefined,
+      questions: questions.length ? questions : undefined,
+      probe: el.getAttribute("data-al-pq") || undefined,
       ariaLabel: el.getAttribute("aria-label")?.trim() || undefined,
       inActiveScope: scopeEl ? scopeEl.contains(el) : undefined,
       offstage: scopeEl ? !!el.closest('[aria-hidden="true"], [inert]') : undefined,
@@ -1877,6 +2095,8 @@ export function toExtractedField(raw: RawField): ExtractedField {
     };
   }
   if (raw.fieldType === "radio" && raw.name) field.group = raw.name;
+  if (raw.groupPrompt) field.groupPrompt = raw.groupPrompt;
+  if (raw.questions?.length) field.questions = [...raw.questions];
   return field;
 }
 
@@ -2457,6 +2677,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     context: string,
     fallbackSide?: "inverter" | "module",
     bareSelect = false,
+    /** The page shows PV Array repeater rows (arrayRowsInPage, the replay's own row predicate). */
+    arrayRowPage = false,
   ): { key: string; candidates: string[]; side: "inverter" | "module" | null } | null {
     const l = (context || "").toLowerCase();
     const isModel = /\bmodel\b/.test(l);
@@ -2529,9 +2751,19 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     const explicitlyPv = /module|pv ?array|solar|photovoltaic/.test(l);
     if (EQUIPMENT_NEGATIVE_GUARD.test(l) && !explicitlyPv) return null;
 
+    // #382 — A PV ARRAY ROW IS ARRAY 1's ROW. On a page of PV Array repeater rows, the row a fresh
+    // application renders is where the learn meets the first roof plane, so its Qty / Tilt /
+    // Azimuth bind array1*: the replay re-reads array1* as array N in row N, and the learn fills
+    // rows 2..N from the same keys (fillRemainingArrayRows). The project-wide total ("moduleQty")
+    // in row 1 filed the whole system as one plane. Without per-array data, without rows on the
+    // page, or for a control whose context does not name the array, nothing changes.
+    const arrayRow = arrayRowPage && /pv ?array|\barray\b/.test(l);
+    const rowKey = (k: string): string | null => (arrayRow && (this.equipment[k] || "").trim() ? k : null);
+
     // Array-geometry fields are side-agnostic — fill straight from project data.
     if (isTilt || isAzimuth || isTracking) {
-      const key = isTilt ? "tilt" : isAzimuth ? "azimuth" : "tracking";
+      const key = (isTilt && rowKey("array1Tilt")) || (isAzimuth && rowKey("array1Azimuth"))
+        || (isTilt ? "tilt" : isAzimuth ? "azimuth" : "tracking");
       const value = (this.equipment[key] || "").trim();
       return value ? { key, candidates: [value], side: null } : null;
     }
@@ -2544,7 +2776,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     if (!side) return null;
     const key = side === "inverter"
       ? (isQty ? "inverterQty" : isModel ? "inverterModel" : "inverterMake")
-      : (isQty ? "moduleQty" : isModel ? "moduleModel" : "moduleMake");
+      : (isQty ? (rowKey("array1ModuleQuantity") ?? "moduleQty") : isModel ? "moduleModel" : "moduleMake");
     const value = (this.equipment[key] || "").trim();
     if (!value) return null;
     const candidates = [value];
@@ -2635,6 +2867,59 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     return false;
   }
 
+  /** How many PV Array repeater rows the page shows — the replay's own row predicate
+   *  (arrayRowsInPage), imported lazily (recipeAdapter imports this module). 0 when unreadable. */
+  private async pageArrayRowCount(): Promise<number> {
+    if (!this.page || typeof this.page.evaluate !== "function") return 0;
+    try {
+      const { arrayRowsInPage } = await import("./recipeAdapter");
+      return Number(await this.page.evaluate(arrayRowsInPage, "mark").catch(() => 0)) || 0;
+    } catch { return 0; }
+  }
+
+  /** The project's PV array count: array1ModuleQuantity, array2…, as the replay counts them. */
+  private projectArrayCount(): number {
+    let n = 0;
+    for (let i = 1; i <= 12; i++) {
+      if ((this.equipment[`array${i}ModuleQuantity`] || "").trim()) n = i;
+      else break;
+    }
+    return n || 1;
+  }
+
+  /**
+   * #382 — EVERY ROOF PLANE GETS ITS OWN ROW IN THE LEARN TOO. Live (PacifiCorp NEM, 2026-10-21,
+   * four arrays 9 / 5 / 5 / 2) the learn filled the one row a fresh application renders and never
+   * clicked "Add Array"; the owner added rows 2–4 by hand, and those clicks were recorded.
+   *
+   * The rows are NOT a second copy of the row logic: the row steps this page recorded (the
+   * per-array ones, nothing else) go to a RecipeAdapter on this same page, whose
+   * fillRemainingArrayRows adds a row per remaining array and fills each inside its own row, then
+   * proves every row against ITS array (row 1 included) — exactly what a replay of this recipe
+   * does. Nothing it writes is recorded: rows 2..N are the project's data, and a replay derives
+   * them from the project's arrays the same way (a recorded "Add Array" never replays). A row that
+   * will not hold, or arrays the portal would not take a row for, are this run's misses.
+   */
+  private async fillRemainingArrayRows(pageSteps: RecipeStep[]): Promise<{ added: number; stop: string | null; review: string[] }> {
+    const none = { added: 0, stop: null, review: [] as string[] };
+    const arrays = this.projectArrayCount();
+    if (!this.page || arrays < 2) return none;
+    const perArray = (s: RecipeStep): boolean => /^array1[A-Z]/.test(String(s.field ?? "")) || s.field === "moduleMake" || s.field === "moduleModel";
+    const rowSteps = pageSteps.filter((s) => (s.action === "fill" || s.action === "select") && perArray(s));
+    if (!rowSteps.some((s) => /^array1[A-Z]/.test(String(s.field ?? "")))) return none;
+    const before = await this.pageArrayRowCount();
+    if (before < 1) return none;
+    const { RecipeAdapter } = await import("./recipeAdapter");
+    const rows = new RecipeAdapter(
+      { id: "learn-array-rows", steps: rowSteps, portalUrl: String(this.page.url?.() ?? "") } as unknown as PortalRecipe,
+      { ...this.equipment }, {}, { autoSubmit: false },
+    );
+    const r = await rows.fillRemainingArrayRows(this.page);
+    const review = r.warnings.filter((w) => /REVIEW BEFORE SUBMIT|not added|NOT filed/i.test(w));
+    this.debug?.event({ type: "array_rows", arrays, rowsBefore: before, rowsAfter: r.rows, stop: (r.stop ?? "").slice(0, 300), warnings: r.warnings.slice(0, 8).map((w) => w.slice(0, 200)) });
+    return { added: Math.max(0, r.rows - before), stop: r.stop, review };
+  }
+
   /** Fill unresolved equipment manufacturer/model/quantity + array-geometry fields
    *  from project data. Returns how many were filled; appends recipe steps + labels
    *  like other passes. Fills in DOM order so a manufacturer select's AJAX postback
@@ -2667,6 +2952,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // Ordinal of bare combined selects seen within a spec-flavored section — see
     // the side heuristic below.
     let specBareSelectSeen = 0;
+    // #382 — does this page render PV Array repeater rows? Asked once, of the replay's own row
+    // predicate, so "a row" means the same thing to the learn and to the replay.
+    const arrayRowPage = (await this.pageArrayRowCount()) > 0;
     for (let i = 0; i < fields.length; i++) {
       const field = fields[i];
       // Unlabeled / generic-labeled SELECTS stay in the pass: the PowerClerk
@@ -2706,7 +2994,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       if (bareSelect && !fallbackSide && specSection) {
         fallbackSide = specBareSelectSeen === 0 ? "inverter" : "module";
       }
-      const resolved = this.equipmentValueFor(context, fallbackSide, bareSelect);
+      const resolved = this.equipmentValueFor(context, fallbackSide, bareSelect, arrayRowPage);
       if (bareSelect && specSection) specBareSelectSeen++;
       if (!resolved) continue;
       // A combined bare select never seeds proximity inheritance — its side may
@@ -2814,7 +3102,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     return size < 0 || size <= cap;
   }
 
-  private resolveUpload(field: ExtractedField, required = true, accept = ""): { docType: string; file: string } | null {
+  private resolveUpload(field: ExtractedField, required = true, accept = "", exactOnly = false): { docType: string; file: string } | null {
     const label = field.label || "";
     const cap = this.uploadMaxBytes();
     // A candidate must fit the size cap AND be a type this control accepts. Folding the type
@@ -2830,6 +3118,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // by a plan-set fallback, in either upload mode. Record only the exact type
     // so learning cannot teach replay to repeat a substitute indefinitely.
     const namedType = UPLOAD_LABEL_PATTERNS.find(({ re }) => re.test(label))?.docType;
+    // THE REVIEW PAGE TAKES ONLY THE DOCUMENT ITS SLOT NAMES (#383): no substitute, no fallback
+    // tier, no combined-mode plan set — a slot we cannot match exactly is left for the person.
+    if (exactOnly) return namedType && fits(namedType) ? { docType: namedType, file: this.docsByType[namedType] } : null;
     if (uploadForbidsSubstitute(label)) {
       if (namedType && fits(namedType)) return { docType: namedType, file: this.docsByType[namedType] };
       this.debug?.event({ type: "upload_no_substitute", label: label.slice(0, 60) });
@@ -2922,8 +3213,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   }
 
   // Resolve a docType for an upload control by its label only (no ExtractedField wrapper).
-  private resolveUploadByLabel(label: string, required = true, accept = ""): { docType: string; file: string } | null {
-    return this.resolveUpload({ selector: {}, label, fieldType: "file" }, required, accept);
+  private resolveUploadByLabel(label: string, required = true, accept = "", exactOnly = false): { docType: string; file: string } | null {
+    return this.resolveUpload({ selector: {}, label, fieldType: "file" }, required, accept, exactOnly);
   }
 
   // Capture a full-page PNG of the current page as base64 for VISION-ASSISTED PLANNING, so the
@@ -3104,9 +3395,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     } catch { return []; }
   }
 
+  // `reviewPage` (#383): the page reads as review, so the pass is ATTACH-ONLY — a native file
+  // input whose label names a document we hold, set directly. Nothing is clicked (a custom
+  // Browse widget needs a click, and on a review page a click is how a portal files), no
+  // substitute document is filed, and every required slot left empty is reported.
   private async performUploads(
     steps: RecipeStep[],
     alreadyFilledLabels: string[],
+    opts: { reviewPage?: boolean } = {},
   ): Promise<{ filled: string[]; missingRequired: string[]; attached: number }> {
     const filled: string[] = [];
     const missingRequired: string[] = [];
@@ -3152,7 +3448,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     let pathKey = "";
     try { pathKey = new URL(String(this.page.url?.() ?? "")).pathname.toLowerCase(); } catch { pathKey = ""; }
     for (const slot of slots) {
-      const resolved = this.resolveUploadByLabel(slot.label, !!slot.required, slot.accept || "");
+      if (opts.reviewPage && slot.kind !== "input") {
+        this.debug?.event({ type: "upload_review_widget_left", label: (slot.label || "").slice(0, 80) });
+        if (slot.required) missingRequired.push(`${slot.label || "Required document"} (on the review page — attach it by hand; automation clicks no upload widget there)`);
+        continue;
+      }
+      const resolved = this.resolveUploadByLabel(slot.label, !!slot.required, slot.accept || "", !!opts.reviewPage);
       if (!resolved) {
         // No document for this control — never fake it. Report it if the portal requires it.
         if (slot.required) missingRequired.push(slot.label || "Required document");
@@ -3216,9 +3517,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         async () => {
           if (slot.kind === "input") {
             // Native input — set files directly even when visually hidden behind a button.
+            // The run's OWN write: the portal's async upload request that follows is this
+            // attach committing, and must not meet the review lockdown's live reading (rule
+            // 4b) on a page that reads as review — PowerClerk's attachments sit on exactly
+            // that page (#383). Payment, the filing-URL rule and the sticky lock still apply.
             const loc = this.page!.locator(selector.css!);
             this.options.beforeUpload?.(resolved.docType, resolved.file);
-            await loc.setInputFiles(uploadPayload ?? resolved.file);
+            await withOwnWriteWindow(this.page, `learner upload (${resolved.docType})`, () => loc.setInputFiles(uploadPayload ?? resolved.file));
           } else {
             // Custom widget — the real <input> is created on click, so intercept the
             // browser's file-chooser dialog (works for ANY uploader, no DOM coupling).
@@ -5467,6 +5772,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         break;
       }
       pageCount++;
+      // Where this page's recorded steps begin (#382: the PV Array row steps it records).
+      const pageStepsFrom = steps.length;
       // THE BACKSTOP ABORTED A FILING, A PAYMENT OR A REVIEW-PAGE POST: stop here, named. Walking
       // on would drive the same page (and its filing control) again. learn() reports every abort.
       {
@@ -5494,11 +5801,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // can do about it.
           if (this.infoPageHeldVerified.length) {
             return {
-              ...fail(steps, this.portalName, `HELD AT A VERIFIED INFORMATION PAGE: ${describeBackstopAbort(stopping[0])}. Nothing was sent. The page is one a person verified, but this project already made progress on this portal (an earlier run passed this page, may have entered data, reached review, or a number, draft or filing is on record), so automation does not pass it again. Check this project's application on the portal; a person can then allow the pass once more for this project (project → Portal runs).`, null, pageCount, portalNotices),
+              ...fail(steps, this.portalName, `HELD AT A VERIFIED INFORMATION PAGE: ${describeBackstopAbort(stopping[0])}. ${backstopSentLine(stopping[0])} The page is one a person verified, but this project already made progress on this portal (an earlier run passed this page, may have entered data, reached review, or a number, draft or filing is on record), so automation does not pass it again. Check this project's application on the portal; a person can then allow the pass once more for this project (project → Portal runs).`, null, pageCount, portalNotices),
               stopReason: "backstop_abort",
             };
           }
-          return { ...fail(steps, this.portalName, `Stopped by the network backstop: ${describeBackstopAbort(stopping[0])}. Nothing was sent; the step (or page script) that fired it must be reviewed.`, null, pageCount, portalNotices), stopReason: "backstop_abort" };
+          return { ...fail(steps, this.portalName, stopping[0].redirect
+            ? `Stopped by the network backstop: the portal answered a request of this run with a ${stopping[0].redirect.status} redirect it would not follow — ${describeBackstopAbort(stopping[0])}. ${backstopSentLine(stopping[0])} Check on the portal what it did with that request.`
+            : `Stopped by the network backstop: ${describeBackstopAbort(stopping[0])}. Nothing was sent; the step (or page script) that fired it must be reviewed.`, null, pageCount, portalNotices), stopReason: "backstop_abort" };
         }
       }
       // Reset per-page label tracking so the planner sees a clean slate on each page —
@@ -6932,19 +7241,23 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //     "Browse"/"Upload"/"Choose File" widgets whose real input is created only on click
       //     (driven via the browser's filechooser event). Required slots with no matching
       //     document are reported (never faked) so the human can complete them.
-      // A REVIEW/confirm screen is a read-only summary of what was already staged — it
-      // lists the attachments rather than accepting new ones. Uploading there re-attaches
-      // a document that is already committed and then re-runs the attachment Save on a
-      // page that has nothing to commit (operator-observed on ACA's Step 3: Review).
-      if (isReviewPage || plan.atReview) {
-        this.debug?.event({ type: "upload_skipped_on_review", page: pageCount });
-      } else {
-        this.debug?.event({ type: "upload_phase_start", page: pageCount });
+      // A REVIEW/confirm screen USUALLY lists the attachments rather than accepting new ones,
+      // and uploading there once re-attached a committed document and re-ran the attachment
+      // Save (operator-observed on ACA's Step 3: Review). But PowerClerk's FINAL page carries
+      // both the review text and the attachments — live on PacifiCorp NEM the pass was
+      // skipped there and the meter photo never went in (#383). So on a review page the pass
+      // still runs, ATTACH-ONLY (performUploads' reviewPage): a native file input whose label
+      // names a document we hold, nothing clicked, no substitute, no attachment Save — and the
+      // run stops at review afterwards exactly as before, naming any required slot left empty.
+      // ACA's unlabeled attachment rows name no document, so they are still left alone.
+      {
+        const reviewUpload = isReviewPage || plan.atReview === true;
+        this.debug?.event({ type: "upload_phase_start", page: pageCount, ...(reviewUpload ? { attachOnly: true } : {}) });
         const seenSlotLabels = new Set<string>(await this.uploadSlotLabels());
         const up = await this.withPhaseTimeout(
           "uploads",
           150_000,
-          () => this.performUploads(steps, alreadyFilledLabels),
+          () => this.performUploads(steps, alreadyFilledLabels, { reviewPage: reviewUpload }),
           { filled: [] as string[], missingRequired: [] as string[], attached: 0 },
         );
         this.debug?.event({ type: "upload_phase_done", page: pageCount, attached: up.attached, missing: up.missingRequired.length });
@@ -6968,7 +7281,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           const late = await this.withPhaseTimeout(
             "uploads_late",
             90_000,
-            () => this.performUploads(steps, alreadyFilledLabels),
+            () => this.performUploads(steps, alreadyFilledLabels, { reviewPage: reviewUpload }),
             { filled: [] as string[], missingRequired: [] as string[], attached: 0 },
           );
           up.attached += late.attached;
@@ -6978,7 +7291,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         for (const m of up.missingRequired) if (!missingRequiredDocs.includes(m)) missingRequiredDocs.push(m);
         // ACA commits attachments only on the section's own Save (Continue Application
         // leaves them pending) — and each pending row needs its Description + Type first.
-        if (up.attached > 0 && this.isAcaPage(url, fields) && acaAttachmentSaves < 3) {
+        // Never on a review page: the Save is a click, and the attach-only pass clicks nothing.
+        if (up.attached > 0 && !reviewUpload && this.isAcaPage(url, fields) && acaAttachmentSaves < 3) {
           acaAttachmentSaves++;
           const saved = await this.withPhaseTimeout(
             "attachment_save",
@@ -7223,7 +7537,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // whatever the computation then reveals (e.g. an export-capacity question).
         const MAX_RESCAN_PASSES = 7;
         let computedThisPage = false;
-        let lateEquipTried = false;
+        // The reveal the late equipment pass last looked at (null = not yet). #382: a PV Array row
+        // reveals its controls one save at a time (Manufacturer after Qty, Model after the make), and
+        // each arrives under a label the page already "filled" — so the pass looks again whenever
+        // the set of revealed controls has changed, and never twice at the same set.
+        let lateEquipSig: string | null = null;
         let lastRevealSig = "";
         for (let rescanPass = 0; rescanPass < MAX_RESCAN_PASSES; rescanPass++) {
           let revealedThisPass = 0;
@@ -7280,14 +7598,21 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             if (newFillable.length === 0) {
               // A cascade can reveal a SECOND section reusing bare labels the first
               // section already "filled" ("Manufacturer"/"Model") — those are invisible
-              // to the label-based newFillable filter, so give the equipment pass ONE
-              // look before giving up (once per page: it self-guards via value-held
-              // skip + fail memory, but pages whose values can't be read back must
-              // not loop here).
-              if (!lateEquipTried) {
-                lateEquipTried = true;
+              // to the label-based newFillable filter, so give the equipment pass a
+              // look before giving up — once per set of revealed controls (it self-guards
+              // via value-held skip + fail memory, but pages whose values can't be read
+              // back must not loop here; MAX_RESCAN_PASSES bounds it too).
+              if (lateEquipSig !== lastRevealSig) {
+                lateEquipSig = lastRevealSig;
                 const lateEquip = await this.fillEquipmentSelects(postFields, alreadyFilledLabels, steps);
-                if (lateEquip > 0) { pageFillCount += lateEquip; continue; }
+                if (lateEquip > 0) {
+                  pageFillCount += lateEquip;
+                  // A DEBOUNCED autosave is invisible to the settle (nothing is on the wire for a
+                  // beat after the pick), and the control it unlocks renders only after it lands —
+                  // let it, or the next scrape sees the same page and the cascade ends one short.
+                  await sleep(LATE_EQUIP_REVEAL_GRACE_MS);
+                  continue;
+                }
               }
               // No more cascade reveals. Before giving up, click any Calculate/Update-Totals
               // button once and loop again so the values it computes (and any field it then
@@ -7443,6 +7768,20 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           pageFillCount++;
           appliedThisPage.push(bd.applied);
         }
+      }
+
+      // d3d) EVERY PV ARRAY ITS OWN ROW (#382) — after every other pass on the page, so nothing
+      //      else re-plans the rows this adds; before the persist settle, so their autosaves land.
+      //      Never on a page that reads as review: no Add Array click or row write lands there.
+      if (!isReviewPage && !plan.atReview && !isDashboard && this.page) {
+        try {
+          const rowsOut = await this.fillRemainingArrayRows(steps.slice(Math.min(pageStepsFrom, steps.length)));
+          pageFillCount += rowsOut.added;
+          for (const m of [...(rowsOut.stop ? [rowsOut.stop] : []), ...rowsOut.review]) {
+            if (!fillVerifyMisses.includes(m)) fillVerifyMisses.push(m);
+            if (!missesDidNotHold.includes(m)) missesDidNotHold.push(m);
+          }
+        } catch { /* best-effort: row 1 stands as the learn filled it */ }
       }
 
       // d1) PERSIST SETTLE (ADAPTIVE). Portals like PowerClerk autosave each page's fields via
@@ -9567,7 +9906,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const label = ((await btn.textContent().catch(() => "")) || "").trim();
       // Defense in depth: never click something that's actually a pay or submit control.
       if (isPayFee(label) || SUBMIT_INTENT.test(label)) return false;
+      // WAIT FOR THE RESULT, NOT THE CLICK (issue #352). A question the computed rating decides
+      // (PacifiCorp's AC disconnect section) renders only when the result is back; reading the page
+      // before that recorded nothing for it, and the learn's own sweep then found it required and
+      // never filled. The shared settle reads the page's own "still computing" signals, bounded.
+      await prepareComputeSettle(this.page);
       await this.clickResilient(btn);
+      const computed = await waitForComputeSettled(this.page);
+      this.debug?.event({ type: "compute_settled", label: label.slice(0, 40), settled: computed.settled, ms: computed.waitedMs, reason: computed.reason.slice(0, 160) });
       await this.waitForDynamicFieldsSettle();
       await this.clearOverlays();
       steps.push({

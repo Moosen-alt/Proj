@@ -167,6 +167,17 @@ import { enqueueStageSteps } from "./autoStageSteps";
 import type { ClientResolution, EditionProposalDecisionResult, ParserExtractionResponse, SubmittalTrackType } from "../../shared/src/types";
 import { FINAL_SUBMIT_GATE_SENTENCE } from "../../shared/src/portalSafety";
 import { resolveListenHost } from "./listenHost";
+import { disableConsoleQuickEdit } from "./consoleQuickEdit";
+
+// First thing, before the first log line: a click in this window must never freeze the
+// server (#360). Runs only when stdout is a real Windows console; see consoleQuickEdit.ts.
+{
+  const quickEdit = disableConsoleQuickEdit();
+  if (!quickEdit.skipped) {
+    if (quickEdit.ok) logger.info("console", "QuickEdit off for this window: a click or selection here no longer blocks the server", { mode: `${quickEdit.before?.toString(16)}->${quickEdit.after?.toString(16)}` });
+    else logger.warn("console", `Could not turn QuickEdit off for this window (${quickEdit.error}); a click inside it can still freeze the server until Esc is pressed`);
+  }
+}
 
 const app = express();
 

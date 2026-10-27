@@ -29,6 +29,15 @@ import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE } from "../../shared
  *  pays). Diagnostic only; "" when none. */
 export let lastComboboxEnterRefusal = "";
 
+/** What a fill reports about the option it CLICKED: `text` is that option's words ("" when it
+ *  clicked none, or when the select went through a native selectOption). Passed in by the
+ *  caller and filled by this call, never a module global: with JOB_CONCURRENCY>1 two adapters
+ *  fill at once, and a shared slot let one run's pick confirm the other's (#327). The replay's
+ *  read-back compares a widget's face against THIS, not the recipe's answer: a containment pick
+ *  ("Pacific Gas & Electric Company" for "Pacific Gas & Electric") is the option the face
+ *  should then show. */
+export type ComboboxPick = { text: string };
+
 const SEARCH_BOX_SELECTORS = [
   'input[role="combobox"]',
   'input[type="search"]',
@@ -191,10 +200,12 @@ async function waitForOptions(page: any, budgetMs = 2500, ownScope?: any): Promi
 
 // Click a located option, scrolling it into view first (virtualized/long lists render
 // the row off-screen so a blind click misses). Returns true if the click went through.
-async function clickOption(loc: any): Promise<boolean> {
+async function clickOption(loc: any, pick?: ComboboxPick): Promise<boolean> {
   try {
     await loc.scrollIntoViewIfNeeded?.({ timeout: 1000 }).catch(() => {});
+    const text = String(await loc.textContent?.({ timeout: 1000 }).catch(() => "") ?? "").replace(/\s+/g, " ").trim();
     await loc.click({ timeout: 5000 });
+    if (pick) pick.text = text;
     return true;
   } catch {
     return false;
@@ -373,6 +384,11 @@ export async function readClosedComboboxOptions(page: any, loc: any): Promise<st
  *   mode "probe" — the same walk, no click: "preferred" means the hidden control has a real face
  *                  a person could use (the replay's row resolver accepts it as usable).
  *   mode "text"  — the preferred face's text: what the widget SHOWS as selected ("" if none).
+ *   mode "own"   — like "text", but only THIS input's own face (not a neighbouring widget's),
+ *                  and only its rendered words (no icon/arrow text, no screen-reader-only text).
+ *   mode "adjacent" — "own", and only when that face sits right beside the input with no
+ *                  visible text between them ("" otherwise): the evidence a face gives when the
+ *                  input's key did not move.
  *
  * Runs IN THE PAGE (loc.evaluate): self-contained, no module references.
  */
@@ -403,13 +419,119 @@ export function comboboxFaceInPage(el: Element, mode: string): string {
       return preferred ? "preferred" : "any";
     }
     if (mode === "text") return preferred ? String(preferred.innerText || preferred.textContent || "").replace(/\s+/g, " ").trim() : "";
+    if (mode === "own" || mode === "adjacent") {
+      // "own" — the text a person reads on THIS input's face, for the replay's read-back of a
+      // concealed backing input (#327). Two things "text" does not do:
+      //   - A face belongs to the concealed input NEAREST it in the tree (fewest hops through
+      //     their common ancestor), ties broken by how many siblings apart the two sit under
+      //     that ancestor; still tied = ambiguous, never ours. So the Generator dropdown beside
+      //     the Battery one is the Generator's even when its key input sits beside its face
+      //     rather than inside it, and a row of bare widgets reads as nobody's. A widget
+      //     posting its key and its text in two hidden inputs of its own still reads: the key
+      //     input sits next to the face.
+      //   - Only the rendered words: an arrow/icon/caret span (Telerik's t-icon reads
+      //     "select"), anything not rendered, and screen-reader-only text ("Selected:") are
+      //     left out, so the face can be compared for EQUALITY with the option clicked.
+      const concealed = (n: Element): boolean => {
+        if (n === el || !/^(INPUT|SELECT)$/.test(n.tagName)) return false;
+        if ((n.getAttribute("type") || "").toLowerCase() === "hidden") return true;
+        const r = n.getBoundingClientRect();
+        const s = getComputedStyle(n);
+        return r.width <= 2 || r.height <= 2 || s.display === "none" || s.visibility === "hidden" || Number(s.opacity) === 0;
+      };
+      const hidden = Array.from(document.querySelectorAll("input, select")).filter((n) => n === el || concealed(n));
+      const chain = (n: Element): Element[] => { const out: Element[] = []; for (let a: Element | null = n; a; a = a.parentElement) out.unshift(a); return out; };
+      const hiddenChains = hidden.map((c) => ({ c, cc: chain(c) }));
+      const shared = (a: Element[], b: Element[]): number => { let k = 0; while (k < a.length && k < b.length && a[k] === b[k]) k++; return k; };
+      const ours = (f: Element): boolean => {
+        const cf = chain(f);
+        // Tree distance to every concealed input first; the sibling gap only among the ties at
+        // the minimum (an indexOf per input made this walk quadratic on a large page).
+        let bestDist = Infinity;
+        let tied: Array<{ c: Element; cc: Element[]; k: number }> = [];
+        for (const { c, cc } of hiddenChains) {
+          const k = shared(cf, cc);
+          if (!k) continue;
+          const dist = (cf.length - k) + (cc.length - k);
+          if (dist < bestDist) { bestDist = dist; tied = [{ c, cc, k }]; }
+          else if (dist === bestDist) tied.push({ c, cc, k });
+        }
+        if (tied.length > 1) {
+          const gapOf = (t: { cc: Element[]; k: number }): number => {
+            const kids = Array.from(cf[t.k - 1].children);
+            return cf[t.k] && t.cc[t.k] ? Math.abs(kids.indexOf(cf[t.k]) - kids.indexOf(t.cc[t.k])) : 0;
+          };
+          const gaps = tied.map(gapOf);
+          const min = Math.min(...gaps);
+          tied = tied.filter((_, i) => gaps[i] === min);
+        }
+        return tied.length === 1 && tied[0].c === el;
+      };
+      // THE NEAREST OF THIS INPUT'S FACES, never simply the first in the row (#327 round 4): a
+      // dressed face whose own key input is far away still passed ours() and, coming first, read
+      // as this input's. Outermost faces only (a toggle inside its own dropdown is one face);
+      // two at the same distance are ambiguous, never ours.
+      const faces = cands.filter((n) => ours(n))
+        .filter((n) => /form-select|\bselect\b|display|toggle|control|dropdown/i.test(n.className || "") || n.getAttribute("role") === "button");
+      const outer = faces.filter((f) => !faces.some((g) => g !== f && g.contains(f)));
+      const elChain = chain(el);
+      const distTo = (f: Element): number => { const cf = chain(f); const k = shared(cf, elChain); return (cf.length - k) + (elChain.length - k); };
+      const dists = outer.map(distTo);
+      const nearest = dists.length ? Math.min(...dists) : Infinity;
+      const atNearest = outer.filter((_, i) => dists[i] === nearest);
+      const face = atNearest.length === 1 ? atNearest[0] : undefined;
+      if (!face) continue;
+      if (mode === "adjacent") {
+        // "adjacent" — "own", and the face sits RIGHT BESIDE this input (#327 round 4,
+        // should-fix 4): the input is a direct child of the container the two share (a sibling
+        // of the face's widget, or inside that widget), or sits in a wrapper that renders
+        // nothing; and no visible text lies between them in document order. A captioned row
+        // where a bare Battery key precedes "Generator [Yes]", or captions in a table header
+        // over cells, read the Generator's face as Battery's otherwise.
+        const cf = chain(face);
+        const k = shared(cf, elChain);
+        const branch = elChain[k];
+        if (branch && branch !== el) {
+          const br = branch.getBoundingClientRect();
+          if (br.width > 0 && br.height > 0 && getComputedStyle(branch).display !== "none") return "";
+        }
+        const elFirst = !!(el.compareDocumentPosition(face) & Node.DOCUMENT_POSITION_FOLLOWING);
+        const [a, b] = elFirst ? [el, face] : [face, el];
+        const lca = cf[k - 1];
+        const texts = document.createTreeWalker(lca, NodeFilter.SHOW_TEXT);
+        for (let t = texts.nextNode(); t; t = texts.nextNode()) {
+          if (!(t.textContent || "").trim() || a.contains(t) || b.contains(t)) continue;
+          if (!(a.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+          if (!(t.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING)) continue;
+          const p = t.parentElement;
+          if (!p) continue;
+          const s = getComputedStyle(p);
+          if (p.getClientRects().length && s.visibility !== "hidden" && s.display !== "none") return "";
+        }
+      }
+      let out = "";
+      const walker = document.createTreeWalker(face, NodeFilter.SHOW_TEXT);
+      for (let t = walker.nextNode(); t; t = walker.nextNode()) {
+        let skip = false;
+        for (let p = t.parentElement; p; p = p.parentElement) {
+          const s = getComputedStyle(p);
+          const r = p.getBoundingClientRect();
+          if (s.display === "none" || s.visibility === "hidden" || r.width <= 1 || r.height <= 1) { skip = true; break; }
+          if (p === face) break;
+          if (/icon|arrow|caret|sr-only|visually-hidden|screen-reader|offscreen/i.test(p.getAttribute("class") || "")) { skip = true; break; }
+        }
+        if (!skip) out += ` ${t.textContent || ""}`;
+      }
+      return out.replace(/\s+/g, " ").trim();
+    }
     return preferred ? "preferred" : "any";
   }
   if (mode === "click") (el as HTMLElement).click();
   return "";
 }
 
-export async function fillCustomCombobox(page: any, loc: any, value: string): Promise<boolean> {
+export async function fillCustomCombobox(page: any, loc: any, value: string, pick?: ComboboxPick): Promise<boolean> {
+  if (pick) pick.text = "";
   const v = (value ?? "").trim();
   if (!v) return false;
 
@@ -538,7 +660,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
   //     "4300" for "430" or a longer model that merely contains the typed token.
   try {
     const best = await bestOptionMatch(page, v, (ownPopup && await ownPopup.isVisible().catch(() => false)) ? ownPopup : undefined);
-    if (best && (await best.count().catch(() => 0)) && (await clickOption(best))) {
+    if (best && (await best.count().catch(() => 0)) && (await clickOption(best, pick))) {
       return true;
     }
   } catch { /* fall through */ }
@@ -556,7 +678,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
       await searchBox.fill("", { timeout: 2000 }).catch(() => {});
       await waitForOptions(page, 2500, (ownPopup && await ownPopup.isVisible().catch(() => false)) ? ownPopup : undefined);
       const best2 = await bestOptionMatch(page, v, (ownPopup && await ownPopup.isVisible().catch(() => false)) ? ownPopup : undefined);
-      if (best2 && (await best2.count().catch(() => 0)) && (await clickOption(best2))) {
+      if (best2 && (await best2.count().catch(() => 0)) && (await clickOption(best2, pick))) {
         return true;
       }
     }
@@ -565,7 +687,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
   // 3b. ARIA option matching the value (substring, case-insensitive).
   try {
     const opt = page.getByRole("option", { name: new RegExp(escapeRegExp(v), "i") }).first();
-    if (await opt.count().catch(() => 0) && (await clickOption(opt))) {
+    if (await opt.count().catch(() => 0) && (await clickOption(opt, pick))) {
       return true;
     }
   } catch { /* fall through */ }
@@ -573,7 +695,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
   // 3c. Otherwise click the first visible list row containing the value text.
   try {
     const row = optionRowsIn(await scopeOf(), page).filter({ hasText: new RegExp(escapeRegExp(v), "i") }).first();
-    if (await row.count().catch(() => 0) && (await clickOption(row))) {
+    if (await row.count().catch(() => 0) && (await clickOption(row, pick))) {
       return true;
     }
   } catch { /* fall through */ }
@@ -588,7 +710,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
     const lastToken = v.split(/\s+/).pop() ?? v;
     if (lastToken !== v && lastToken.length >= 1 && /\d/.test(lastToken)) {
       const row = optionRowsIn(await optionScope(page), page).filter({ hasText: new RegExp(`\\b${escapeRegExp(lastToken)}\\b`, "i") }).first();
-      if (await row.count().catch(() => 0) && (await clickOption(row))) {
+      if (await row.count().catch(() => 0) && (await clickOption(row, pick))) {
         return true;
       }
     }
@@ -600,7 +722,7 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
     const cnt = await allVisible.count().catch(() => 0);
     for (let i = 0; i < Math.min(cnt, 8); i++) {
       const el = allVisible.nth(i);
-      if (await el.isVisible().catch(() => false) && (await clickOption(el))) {
+      if (await el.isVisible().catch(() => false) && (await clickOption(el, pick))) {
         return true;
       }
     }
@@ -651,7 +773,8 @@ export async function fillCustomCombobox(page: any, loc: any, value: string): Pr
  * something, or fillCustomCombobox reported a click — false when NOTHING was selected,
  * so callers can surface the miss instead of silently continuing.
  */
-export async function selectWithFallback(page: any, loc: any, value: string): Promise<boolean> {
+export async function selectWithFallback(page: any, loc: any, value: string, pick?: ComboboxPick): Promise<boolean> {
+  if (pick) pick.text = "";
   // Only a real <select> can take selectOption. Running it on a styled-div widget or a
   // (readonly, visually-hidden) input[role="combobox"] — PowerClerk's Vue filtered-select —
   // stalls the full actionability timeout TWICE before the combobox path even runs (the
@@ -662,7 +785,7 @@ export async function selectWithFallback(page: any, loc: any, value: string): Pr
   const tag: string | null = typeof loc.evaluate === "function"
     ? await loc.evaluate((el: Element) => (el.tagName || "").toLowerCase()).catch(() => null)
     : null;
-  if (tag !== null && tag !== "select") return fillCustomCombobox(page, loc, value);
+  if (tag !== null && tag !== "select") return fillCustomCombobox(page, loc, value, pick);
   // Short timeouts on the native attempts: a HIDDEN native <select> behind a styled
   // widget can never pass actionability, so the default timeout would stall twice
   // before the combobox path even runs.
@@ -697,5 +820,5 @@ export async function selectWithFallback(page: any, loc: any, value: string): Pr
   if (matchedValue) {
     try { await loc.selectOption(matchedValue, { timeout: 5000 }); return true; } catch { /* combobox */ }
   }
-  return fillCustomCombobox(page, loc, value);
+  return fillCustomCombobox(page, loc, value, pick);
 }
