@@ -2,7 +2,8 @@
 // powerClerkRowHooks.dom.smoke.ts (six arrays to review), powerClerkRowHooksStop.dom.smoke.ts
 // (rows the portal will not keep: the stop, its capture and its message), and the #348 review's
 // shapes: powerClerkRowHiddenFace / powerClerkRowModelRewrite / powerClerkRowMicroinverter
-// .dom.smoke.ts (a neighbour's text or control is never the row's). One copy of the markup, so
+// .dom.smoke.ts (a neighbour's text or control is never the row's), and the owner's hand-patched
+// rows (#386: powerClerkHandPatchedRows.dom.smoke.ts, handPatchedArrayRows.test.ts). One copy of the markup, so
 // the smokes cannot drift apart. Not a smoke itself (not discovered by the runners).
 //
 // Source: data/learn-runs/2026-09-28_16-05-17_pacificorp_0upf, page p009 (equipment only, no
