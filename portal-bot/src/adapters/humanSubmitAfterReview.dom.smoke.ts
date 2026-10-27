@@ -98,6 +98,18 @@
 //         deterministic stand-in for a click inside the 12-19 ms arm). Red before / kill: as B14.
 //     B2 (above) gains a GUARD check, green before by design: a click the watch SAW still hands over
 //         ("the page is yours", no NOT_HANDED_OVER_NOTE). Kill: refuse on ANY stopping abort.
+//   [B, Helm Should-fix 12] THE FAIL-CLOSED NOTE, PINNED ON ITS OWN CAUSE (a failed arm):
+//     B12 the input watch cannot be armed (the arm reports false, no sink) and the person clicks
+//         right after the lock: never "the page is yours", the whole NOT_HANDED_OVER_NOTE as a progress
+//         line and in driftWarnings + reviewHandoffNotes, 0 POSTs, no submit reported, never "YOUR
+//         CLICK WAS HELD BACK" (r.ok not asserted: the run fails by name, as on main). GUARD pin, green
+//         before by design: the fail-closed branch and the <=200-char note landed before it (earlier,
+//         nothing collected progress lines and progress() cut the 222-char note at 200). Kills
+//         (measured at 15ad02a6): K11 alone (handOverToHuman without its armed-watch check) reddens
+//         A9 only, because the adapter also asks for an armed watch; K11 plus the adapter's
+//         `handOverArmed &&` dropped reddens A9 and B12's "page is yours", note and 0-POST checks;
+//         dropping the three NOT_HANDED_OVER_NOTE lines reddens B12's note check (and B13/B14/B14b's).
+//     B12b (a failed CDP arm) waits for the isolated-world watch (Should-fix 1); not pinned until then.
 //   [round 4, THE RECORD'S SHAPE] (Helm Blocking 1 "stamp humanRequests and aborts with at", nit :97
 //   "record the requesting page") — extra checks on existing cases, no new case numbers:
 //     A1  also: the person's request is stamped POST / resourceType document / `at` inside the click's
@@ -806,6 +818,25 @@ const refusedHandOver = (k: string, r: Replay): void => {
   });
   check("B14b a filing request recorded during the arm is held unflagged", r.aborts.some((a) => /\/apply\/submit$/.test(a.where) && !a.human), JSON.stringify(r.aborts));
   refusedHandOver("B14b", r);
+}
+{
+  // B12 (Helm Should-fix 12, "a failed arm and a click at the lock"): the input watch cannot be armed
+  // (the spy reports false without arming anything, the real failed-arm shape: no sink), and the person
+  // clicks the portal's submit right after the lockdown. Fail closed AND say so: never "the page is
+  // yours", the whole NOT_HANDED_OVER_NOTE as its own progress line and in the hand-off, 0 POSTs. r.ok
+  // is not asserted: the click's abort is unflagged, so the run fails by name, as on main.
+  const r = await replay("B12", { armFails: true, onLock: (page, track) => track(personClicks(page)) });
+  const all = JSON.stringify({ m: r.message, d: r.data, rm: r.review.message, rd: r.review.data });
+  check("B12 the watch cannot be armed and the person clicks at the lock: nobody is told 'the page is yours'",
+    r.watchArmed === false && !r.progressLines.some((l) => /the page is yours/i.test(l)), JSON.stringify(r.progressLines.slice(-4)));
+  check("B12 …the whole NOT_HANDED_OVER_NOTE is a progress line, in the fill's driftWarnings and in the review step's notes",
+    r.progressLines.includes(NOT_HANDED_OVER_NOTE)
+      && ((r.data.driftWarnings as string[] | undefined) ?? []).includes(NOT_HANDED_OVER_NOTE)
+      && ((r.review.data.reviewHandoffNotes as string[] | undefined) ?? []).includes(NOT_HANDED_OVER_NOTE),
+    JSON.stringify(r.progressLines.slice(-4)));
+  check("B12 …the click reaches nothing (its filing is held by the lockdown, 0 POSTs) and no submit is reported",
+    r.aborts.some((a) => /\/apply\/submit$/.test(a.where)) && r.posts.length === 0 && r.observed.length === 0 && r.review.data.humanSubmittedInReviewWindow !== true, rbrief(r));
+  check("B12 …and never 'YOUR CLICK WAS HELD BACK'", !all.includes("YOUR CLICK WAS HELD BACK"), rbrief(r));
 }
 
 {
