@@ -18,8 +18,9 @@
 //   3. A POLICY QUESTION — the learner's own table (autoLearnAdapter policyDefaultAnswerFor), so a
 //      learn and a replay give one question one answer. When the job itself carries the answer
 //      (a learner rule's own `jobKey`, read through POLICY_QUESTION_JOB_KEYS: the export-capacity
-//      question ↔ exportLimiting), the job's value, bound to that key; the standing answer only when
-//      the key is absent or empty.
+//      question ↔ exportLimiting), the job's value, bound to that key; the standing answer when the
+//      key is absent or empty, or when the replay map says the job carries no evidence for it (#356:
+//      exportLimiting's "No" is then the standing answer, and the note says so).
 // A control none of these knows is not this module's: the LLM gap-fill and the required sweep keep it.
 //
 // THE STANDING ANSWER FOR AN UNRECORDED PER-JOB CONTROL IS READ BY ITS KEY. The distance question
@@ -32,6 +33,7 @@
 // not have asked about, and only when it is EMPTY.
 import { operatorPolicyAnswer, perJobAnswerKeyFor, perJobControlOfField, perJobRuleFor } from "../../shared/src/perJobQuestions";
 import { isSubmitIntent } from "../../shared/src/portalSafety";
+import { EXPORT_LIMITING_NO_EVIDENCE_KEY } from "../../shared/src/exportLimiting";
 import { isSensitiveLabel, POLICY_RADIO_DEFAULTS, policyDefaultRuleFor, type PolicyScope } from "./adapters/autoLearnAdapter";
 import { isSubmitIntentField } from "./llmGapFill";
 
@@ -180,6 +182,20 @@ export const POLICY_QUESTION_JOB_KEYS: ReadonlyArray<Readonly<{ question: RegExp
   POLICY_RADIO_DEFAULTS.flatMap((rule) => (rule.jobKey ? [Object.freeze({ question: rule.question, key: rule.jobKey })] : [])),
 );
 
+/**
+ * NO EVIDENCE ON THE JOB (#356). The replay map always carries exportLimiting ("Yes" / "No", so a
+ * recorded step bound to it fills), and beside it EXPORT_LIMITING_NO_EVIDENCE_KEY = "1" when nothing on
+ * the job says either way (backend resolveRecipeFieldValues, shared exportLimitingFor). Its "No" is then
+ * the operator's standing answer, not the job's: it is typed as the standing answer and noted as one,
+ * never "from exportLimiting". An explicit "No" from the design leaves the flag "" and stays bound.
+ */
+const NO_EVIDENCE_KEYS: Readonly<Record<string, string>> = Object.freeze({ exportLimiting: EXPORT_LIMITING_NO_EVIDENCE_KEY });
+export const NO_JOB_EVIDENCE_WHY = "standing answer, no evidence on the job";
+function noJobEvidence(fieldValues: Record<string, string>, key: string): boolean {
+  const flag = NO_EVIDENCE_KEYS[key];
+  return !!flag && String(fieldValues?.[flag] ?? "").trim() === "1";
+}
+
 /** The replay-map key that carries this job's own answer to a policy question, or null. */
 function policyQuestionJobKeyFor(question: string): string | null {
   const text = String(question ?? "");
@@ -292,9 +308,12 @@ export function answerForUnrecordedControl(
       // in its place — and the run stops by name.
       const jobKey = policyQuestionJobKeyFor(label);
       const own = jobKey ? String(fieldValues?.[jobKey] ?? "").trim() : "";
-      if (jobKey && own) return { kind: "bound", key: jobKey, value: offered(options, own) };
+      // With no evidence on the job (#356) its value is the default, not its answer: the standing
+      // answer below, noted honestly.
+      const noEvidence = !!jobKey && !!own && noJobEvidence(fieldValues, jobKey);
+      if (jobKey && own && !noEvidence) return { kind: "bound", key: jobKey, value: offered(options, own) };
       const policy = offered(options, standing);
-      if (policy) return { kind: "policy", value: policy, why: "the operator's standing policy answer" };
+      if (policy) return { kind: "policy", value: policy, why: noEvidence ? NO_JOB_EVIDENCE_WHY : "the operator's standing policy answer" };
     }
   }
   return null;

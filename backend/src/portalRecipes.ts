@@ -38,6 +38,7 @@ import { firstEmail, looksLikeEmail } from "../../shared/src/emailAddress";
 import { contactKeyRole } from "../../shared/src/contactRoles";
 import { mountAdjective, mountKindForProject } from "./codeReviewRules";
 import { DISCONNECT_DISTANCE_QUESTION, perJobAnswerKeyFor, perJobQuestionText, perJobStepEvidence } from "../../shared/src/perJobQuestions";
+import { EXPORT_LIMITING_NO_EVIDENCE_KEY, exportLimitingFor } from "../../shared/src/exportLimiting";
 
 type Row = Record<string, unknown>;
 
@@ -2005,6 +2006,8 @@ export function resolveRecipeFieldValues(
     perJobAnswer(project.disconnectWithin10ft, answersRow?.disconnect_within_10ft, snapshotFlat.disconnectWithin10ft),
     YES_NO_ANSWER_RENDER,
   );
+  // THE ONE exportLimiting DERIVATION (#356) — learn and replay give one job one answer.
+  const exportLimiting = exportLimitingFor(snapshot as Record<string, unknown>, project.existingSystem?.exportMode);
   // TWO ROLES, TWO FIELDS — DO NOT COLLAPSE THEM.
   //
   // A first cut made homeownerName resolve to the account holder on any utility portal. That
@@ -2146,12 +2149,13 @@ export function resolveRecipeFieldValues(
     ...dateFields(),
     // EXPORT LIMITING. Derived here, not only in the learner's planner map: a step that
     // BINDS to this key must resolve at REPLAY time, and it used to exist only at learn
-    // time — so a recipe binding it filled nothing, forever, silently. Same derivation the
-    // learner uses (autoLearn.ts), kept in the resolver so both sides agree by construction.
-    exportLimiting:
-      /non.?export|export.?limit\b|power control system|\bpcs\b|\bngom\b/i
-        .test(`${snapshotFlat.exportMode ?? ""} ${snapshotFlat.pcs ?? ""} ${snapshotFlat.exportLimit ?? ""}`)
-        ? "Yes" : "No",
+    // time — so a recipe binding it filled nothing, forever, silently. THE ONE DERIVATION
+    // (shared exportLimitingFor, #356): the snapshot's structured keys AND the design notes, read
+    // from the whole snapshot (the note texts are over the 400-character cut above). The learner
+    // reads this value from here. Beside it, whether the job gave any evidence: with none, "No" is
+    // the standing answer and a replay that types it says so (EXPORT_LIMITING_NO_EVIDENCE_KEY).
+    exportLimiting: exportLimiting.value,
+    [EXPORT_LIMITING_NO_EVIDENCE_KEY]: exportLimiting.evidence === "none" ? "1" : "",
     // ENERGY SOURCE — the GATE for a portal's whole battery section, and the reason it is
     // derived here rather than left as a recorded literal.
     //

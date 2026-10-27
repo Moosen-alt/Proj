@@ -33,7 +33,9 @@
 //   [X] (round 4, Helm's should-fix) the section also asks "Do you propose to limit the export capacity
 //       of this system?" (a required Yes/No select, a policy question whose standing answer is "No"):
 //       the job's exportLimiting "Yes" commits "Yes", "No" commits "No", and only a job with no
-//       exportLimiting gets the standing "No";
+//       exportLimiting gets the standing "No"; (#356) a "No" flagged as no evidence on the job
+//       (exportLimitingNoEvidence "1") is typed as the standing answer and noted as one, never "from
+//       exportLimiting";
 //   [L] the LEARNER's Calculate (clickComputeButton) returns only once the result is on the page,
 //       so its rescan sees the four controls and its policy pass records the two Yes/No answers.
 //
@@ -373,12 +375,30 @@ const X2 = await run({ ...X_FIELDS, exportLimiting: "No" }, "/?v=x");
 console.log(`   ${outline(X2)}`);
 check("[X2] the export-capacity question = No (the job's own answer) and the run reaches review",
   X2.committed.discExport === "No" && atReview(X2) && xBlanks(X2).length === 0, `${outline(X2)} blanks=${JSON.stringify(xBlanks(X2))}`);
+// #356: an explicit "No" from the design (no-evidence flag empty) is the job's own answer, and says so.
+check("[X2] the answer is reported as the job's own (bound to exportLimiting)",
+  ((X2.data.agingNotes as string[] | undefined) ?? []).some((n) => n.includes(EXPORT_Q.slice(0, 40)) && n.includes("from exportLimiting")),
+  JSON.stringify(X2.data.agingNotes ?? []).slice(0, 600));
 
 console.log("\n[X3] the job carries no exportLimiting");
 const X3 = await run({ ...X_FIELDS }, "/?v=x");
 console.log(`   ${outline(X3)}`);
 check("[X3] the export-capacity question = No (the standing policy answer, only because the job has none) and the run reaches review",
   X3.committed.discExport === "No" && atReview(X3) && xBlanks(X3).length === 0, `${outline(X3)} blanks=${JSON.stringify(xBlanks(X3))}`);
+
+// [X4] (#356): the replay map's exportLimiting is "No" only because nothing on the job says either way
+// (exportLimitingNoEvidence "1", backend resolveRecipeFieldValues). The standing "No" is typed, and the
+// note says it is the standing answer — never "from exportLimiting", the job's own.
+console.log("\n[X4] the job's exportLimiting \"No\" is a default: no export-limiting evidence on the job");
+const X4 = await run({ ...X_FIELDS, exportLimiting: "No", exportLimitingNoEvidence: "1" }, "/?v=x");
+console.log(`   ${outline(X4)}`);
+const x4Notes = ((X4.data.agingNotes as string[] | undefined) ?? []).filter((n) => n.includes(EXPORT_Q.slice(0, 40)));
+check("[X4] the export-capacity question = No (the standing answer) and the run reaches review",
+  X4.committed.discExport === "No" && atReview(X4) && xBlanks(X4).length === 0, `${outline(X4)} blanks=${JSON.stringify(xBlanks(X4))}`);
+check("[X4] the note says \"standing answer, no evidence on the job\", never \"from exportLimiting\"",
+  x4Notes.length > 0 && x4Notes.every((n) => n.includes("standing answer, no evidence on the job") && !n.includes("from exportLimiting")),
+  JSON.stringify(X4.data.agingNotes ?? []).slice(0, 600));
+check("[X4] nothing was filed", X4.filed === false, outline(X4));
 
 // ---------------------------------------------------------------------------
 // [L] THE LEARNER'S Calculate: a fresh learn must SEE the section to record it. The learner clicks
