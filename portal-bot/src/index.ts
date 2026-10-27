@@ -331,7 +331,7 @@ const openStagingAdapters = new Map<string, import("./adapter").PortalAdapter>()
  * every downstream check keys on it. The read carries its own confidence and the caller
  * decides; an unconfident read leaves the operator's manual form exactly as it is today.
  */
-async function armSubmitCapture(
+export async function armSubmitCapture(
   adapter: import("./adapter").PortalAdapter,
   options: StageOptions,
 ): Promise<void> {
@@ -705,6 +705,8 @@ export async function stageWithRecipe(
     owedAttachments: options.owedAttachments,
     siteDraft: options.siteDraft,
     draftSubmitStamp: options.draftSubmitStamp ?? null,
+    // The review page is handed to a person only when this caller watches for their submit (#333).
+    handOverReview: typeof options.onSubmitCaptured === "function",
   }), project, files, options));
 }
 

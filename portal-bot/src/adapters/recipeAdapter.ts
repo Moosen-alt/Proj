@@ -949,6 +949,9 @@ export class RecipeAdapter extends BasePortalAdapter {
   /** runs-finish item 3: the run ended on a page NOT verified as the review page — where, in the
    *  page's own words. stopAtReview then says so instead of "staged to the review screen". */
   private stoppedBeforeReview = "";
+  /** …and the reading it was built from: stopAtReview re-words it with what it knows by then (a
+   *  request of the person's that landed after the tail read it is said, never "Nothing was filed"). */
+  private stoppedBeforeReviewAt: { where: string; refused: string[] } | null = null;
   /** Policy-default steps whose control was absent when their turn came — re-tried once
    *  just before the page's advance, when a conditional section has had every chance to
    *  render. Cleared on each advance. */
@@ -1036,6 +1039,11 @@ export class RecipeAdapter extends BasePortalAdapter {
        *  after it must read as draft-created. Not an approval to file: the final-submit gate never
        *  reads it. */
       draftSubmitStamp?: DraftCreatingStamp | null;
+      /** A PERSON WILL TAKE THE REVIEW PAGE, AND THE CALLER WATCHES FOR THEIR SUBMIT (#333, Helm
+       *  Should-fix 4). index.ts stageWithRecipe passes it only when StageOptions.onSubmitCaptured is a
+       *  function; the learn self-test, the cross-project replay, the benchmark and the correction /
+       *  status constructions never hand over, so a click in their tail is held as on main. */
+      handOverReview?: boolean;
     } = {},
   ) {
     super();
@@ -1464,6 +1472,20 @@ export class RecipeAdapter extends BasePortalAdapter {
     // A request the person sent may land after the run's tail read it, and before the run let the page
     // go: the handed-over backstop's record is read again now (round 3).
     if ((this.handedOverBackstop?.humanRequests.length ?? 0) > 0) this.personRequestWent = true;
+    // Never "staged to the review screen" for a run that did not verifiably reach it (runs-finish 3) —
+    // even when the person moved on from that page (Helm Should-fix 4). The stop message is the one
+    // sentence about a request that went (no second note naming "the review page" it never was).
+    if (this.stoppedBeforeReview && !this.humanSubmit) {
+      const notes = this.reviewHandoffNotes;
+      const handoff = notes.length ? ` ${notes.join(" ")}` : "";
+      const handoffData = notes.length ? { reviewHandoffNotes: [...notes], reviewPageBlockedCalls: [...this.reviewPageBlockedCalls] } : {};
+      const at = this.stoppedBeforeReviewAt;
+      const stopped = at ? this.stoppedBeforeReviewMessage(at.where, at.refused, this.personRequestWent) : this.stoppedBeforeReview;
+      return ok(
+        `${HUMAN_REVIEW_MESSAGE} The recipe did NOT stage ${this.portalName} at its review screen — it ${stopped}${handoff} AUTOMATION HAS STOPPED.`,
+        { finalSubmitClicked: false, stoppedBeforeReview: true, personMovedOn: this.personMovedOn, ...handoffData },
+      );
+    }
     // THE PERSON SUBMITTED (OR MOVED ON) FROM THE REVIEW WINDOW WHILE THE RUN WAS FINISHING (#333).
     // Automation clicked nothing; the run staged the page and handed it over, and the person's own
     // click went. Never "failed", never "click submit" to someone who already has.
@@ -1490,13 +1512,6 @@ export class RecipeAdapter extends BasePortalAdapter {
     const notes = this.reviewHandoffNotes;
     const handoff = notes.length ? ` ${notes.join(" ")}` : "";
     const handoffData = notes.length ? { reviewHandoffNotes: [...notes], reviewPageBlockedCalls: [...this.reviewPageBlockedCalls] } : {};
-    // Never "staged to the review screen" for a run that did not verifiably reach it (runs-finish 3).
-    if (this.stoppedBeforeReview) {
-      return ok(
-        `${HUMAN_REVIEW_MESSAGE} The recipe did NOT stage ${this.portalName} at its review screen — it ${this.stoppedBeforeReview}${handoff} AUTOMATION HAS STOPPED.`,
-        { finalSubmitClicked: false, stoppedBeforeReview: true, ...handoffData },
-      );
-    }
     if (this.personRequestWent) {
       return ok(
         `${this.portalName}: the recipe staged the review screen and handed it to you, and a request you sent from it went through while the run was finishing — automation clicked nothing. If that was the submit, the filing went: check the portal and enter its record number with the capture form. If not, verify every field and uploaded file, handle any MFA/fee, then click submit.${handoff} AUTOMATION HAS STOPPED.`,
@@ -1844,8 +1859,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     const none = { summary: "", fieldsSeen: 0, confirmed: 0, mismatches: [] as ReviewMismatch[] };
     if (!this.page || !project) return none;
     try {
-      const fields = await scrapeReviewScreenShared(this.page);
-      const body = String(await this.page.locator("body").innerText().catch(() => ""));
+      const { fields, body, confirmed, mismatches } = await this.reviewValuesOnPage(project);
       // A REVIEW SCREEN WE COULD NOT READ MUST LEAVE ITS PAGE BEHIND.
       //
       // The first live replay benchmark scored PacifiCorp `replayed_clean` — 98 steps, no
@@ -1863,16 +1877,12 @@ export class RecipeAdapter extends BasePortalAdapter {
           await this.page.screenshot({ path: path.join(dir, `review-unreadable-${stamp}.png`), fullPage: true }).catch(() => {});
         } catch { /* diagnostics must never change the outcome */ }
       }
-      // A utility identifier is checked only when THIS recipe typed it (B8) — never a meter on a
-      // permit application that has no meter field.
-      const cmp = reviewComparison(fields, project, utilityIdentifiersEnteredBySteps(this.recipe.steps), body);
-      const mismatches = cmp.mismatches;
       if (!mismatches.length) {
         // SAY WHAT WAS CONFIRMED, NOT JUST THAT NOTHING COMPLAINED. Zero mismatches on a page
         // where nothing could be compared is not a verified filing.
         return {
-          summary: ` Review screen checked against the project: ${fields.length} field(s) read, ${cmp.confirmed} project value(s) confirmed present, no mismatch.`,
-          fieldsSeen: fields.length, confirmed: cmp.confirmed, mismatches,
+          summary: ` Review screen checked against the project: ${fields.length} field(s) read, ${confirmed} project value(s) confirmed present, no mismatch.`,
+          fieldsSeen: fields.length, confirmed, mismatches,
         };
       }
       const named = mismatches.slice(0, 4)
@@ -1881,12 +1891,28 @@ export class RecipeAdapter extends BasePortalAdapter {
       return {
         summary: ` VERIFY BEFORE SUBMITTING — the review screen does not match the project on ${mismatches.length} field(s): ${named}${mismatches.length > 4 ? ", …" : ""}.`,
         fieldsSeen: fields.length,
-        confirmed: cmp.confirmed,
+        confirmed,
         mismatches,
       };
     } catch {
       return none;
     }
+  }
+
+  /** THE PROJECT'S VALUES ON THE PAGE NOW — the review read-back's comparison, READ ONLY (no capture
+   *  written, no input). verifyReviewScreen reports from it; the hand-over's early "where did the run
+   *  stop" read (Helm Should-fix 4) takes the same `confirmed`, so both readings of one page carry the
+   *  same evidence. Throws only what the scrape throws; callers catch. */
+  private async reviewValuesOnPage(
+    project: ProjectRecord,
+  ): Promise<{ fields: Awaited<ReturnType<typeof scrapeReviewScreenShared>>; body: string; confirmed: number; mismatches: ReviewMismatch[] }> {
+    if (!this.page) return { fields: [], body: "", confirmed: 0, mismatches: [] };
+    const fields = await scrapeReviewScreenShared(this.page);
+    const body = String(await this.page.locator("body").innerText().catch(() => ""));
+    // A utility identifier is checked only when THIS recipe typed it (B8) — never a meter on a
+    // permit application that has no meter field.
+    const cmp = reviewComparison(fields, project, utilityIdentifiersEnteredBySteps(this.recipe.steps), body);
+    return { fields, body, confirmed: cmp.confirmed, mismatches: cmp.mismatches };
   }
 
   private async runAll(project?: ProjectRecord): Promise<PortalStepResult> {
@@ -2857,10 +2883,20 @@ export class RecipeAdapter extends BasePortalAdapter {
     // change; the final-submit refusal and stopForReview exits both arrive here with it pending.
     // #333 — FROM HERE THE RUN MAKES NO INPUT ON THIS PAGE, so a person's own click can be told from
     // it: the backstop's input watch is armed now (a guided-manual run only — an approved run clicks
-    // its own final submit and is never handed over).
-    const handingOver = !this.options.autoSubmit && !this.finalSubmitClicked && !!this.backstop;
+    // its own final submit and is never handed over) — and only for a caller that watches for the
+    // person's submit (Helm Should-fix 4: handOverReview, which index.ts passes only with
+    // onSubmitCaptured). The learn self-test, the cross-project replay and the benchmark never see that
+    // submit, so a click in their tail is held by the lockdown and fails the run by name, as on main.
+    const handingOver = this.options.handOverReview === true && !this.options.autoSubmit && !this.finalSubmitClicked && !!this.backstop;
     let handedOver = false;
+    // WHERE THE RUN STOPPED, READ BEFORE THE PAGE IS HANDED OVER (Helm Should-fix 4): once the person
+    // acts, the page is theirs and no longer where the run stopped. Read-only, with the same evidence
+    // as the review read-back (the project's values on the page).
+    let earlyStop: { where: string; refused: string[]; message: string } | null = null;
     if (handingOver) {
+      earlyStop = !pastReview && !this.stoppedAtPayment
+        ? await this.whereTheRunStopped(project ? (await this.reviewValuesOnPage(project).catch(() => ({ confirmed: 0 }))).confirmed : 0)
+        : null;
       // THE RUN'S OWN INPUT ENDS HERE (#333): its guarded clicks, presses and steps refuse from now on,
       // so the input watch armed next can only ever record a person's input.
       this.inputsClosed = `${INPUT_CLOSED} (${this.recipe.id})`;
@@ -2877,7 +2913,12 @@ export class RecipeAdapter extends BasePortalAdapter {
     if (handingOver) {
       // Told only once the run's own save has drained — not an invitation to click while the portal
       // reads "Saving…" (an eager click is still let through, and recorded).
-      if (handedOver) this.progress("wait", "Staged to review — the page is yours to verify and submit", 0);
+      // A run that stopped before review says so here too — never "Staged to review" (Should-fix 4).
+      if (handedOver) {
+        this.progress("wait", earlyStop
+          ? `Stopped on "${earlyStop.where}" — NOT the review page; the page is yours to finish, continue to review, verify and submit`
+          : "Staged to review — the page is yours to verify and submit", 0);
+      }
       else {
         // Fail closed AND say so, now and in the hand-off: the lockdown holds until the stage finishes.
         if (!this.reviewHandoffNotes.includes(NOT_HANDED_OVER_NOTE)) this.reviewHandoffNotes.push(NOT_HANDED_OVER_NOTE);
@@ -2913,9 +2954,17 @@ export class RecipeAdapter extends BasePortalAdapter {
     this.personMovedOn = personMovedOn;
     this.personRequestWent = (bsNow?.humanRequests ?? []).length > 0;
     const onHeldErrorPage = this.heldHumanClick() && /^chrome-error:/i.test(hereNow);
-    const stop = !pastReview && !this.stoppedAtPayment && !personMovedOn && !onHeldErrorPage ? await this.whereTheRunStopped(review.confirmed, this.personRequestWent) : null;
+    // A person who moved on from a page the run did NOT stage at review (Helm Should-fix 4: their
+    // Continue on an attachments step) is told where the run stopped, from the reading taken before the
+    // hand-over. A final submit the click detector saw is not decided here (the review step's wording).
+    const stop = !pastReview && !this.stoppedAtPayment && !onHeldErrorPage
+      ? (personMovedOn && !this.humanSubmit
+        ? (earlyStop && { where: earlyStop.where, refused: earlyStop.refused, message: this.stoppedBeforeReviewMessage(earlyStop.where, earlyStop.refused, this.personRequestWent) })
+        : (personMovedOn ? null : await this.whereTheRunStopped(review.confirmed, this.personRequestWent)))
+      : null;
     if (stop) {
       this.stoppedBeforeReview = stop.message;
+      this.stoppedBeforeReviewAt = { where: stop.where, refused: stop.refused };
       // THE PICKS FIRST (#362): the run card and the stage line read this message's first line (the
       // backend's pausedRunSentence), so what automation picked leads it, before the where-it-stopped.
       return { ...ok(`${this.draftPickTell ? `${this.draftPickTell} ` : ""}Replayed ${executed} recorded step(s); ${stop.message}${review.summary}`, { ...data, stoppedBeforeReview: stop.where }), pauseReason: "stopped_before_review" };
@@ -2929,7 +2978,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  say "not review" — a page that cannot be read (a unit-test double) keeps today's report.
    *  Otherwise: the page is readable, is not the review page, and shows none of the project's
    *  values — the run stopped before review, and says where in the page's own words. */
-  private async whereTheRunStopped(confirmed: number, personRequestWent = false): Promise<{ where: string; message: string } | null> {
+  private async whereTheRunStopped(confirmed: number, personRequestWent = false): Promise<{ where: string; refused: string[]; message: string } | null> {
     if (confirmed > 0) return null;
     const at = await this.pageSafetyContext();
     if (at.reviewPage !== false) return null;
@@ -2948,16 +2997,20 @@ export class RecipeAdapter extends BasePortalAdapter {
     }).catch(() => "")) : "";
     const where = titled || (await this.pageLabelNow().catch(() => "")) || "the last page the recipe reached";
     const refused = (await this.readPortalRefusal().catch(() => [] as string[])).slice(0, 3).map((t) => t.replace(/[.\s]+$/, ""));
-    return {
-      where,
-      message: `STOPPED on "${where}" — NOT the review page (the page does not read as the portal's review step, and none of the project's values are on it), so the application is NOT staged at review.`
-        + `${refused.length ? ` The portal says: ${refused.join(" | ")}.` : ""}`
-        // A request the person sent went through after the hand-over (round 3): it may have been the
-        // filing — never "Nothing was filed" (PERSON_REQUEST_WENT_NOTE rides in the hand-off).
-        + (personRequestWent
-          ? ` A request you sent from the page went through while the stage was finishing — check the portal before anything else.`
-          : ` Next: in the portal, finish that page (check every attachment is listed and nothing is flagged required), continue to the review page, verify every field there, then submit. Nothing was filed.`),
-    };
+    return { where, refused, message: this.stoppedBeforeReviewMessage(where, refused, personRequestWent) };
+  }
+
+  /** THE STOPPED-BEFORE-REVIEW SENTENCE, whole (pure). Built from a reading taken before the hand-over
+   *  too (Helm Should-fix 4): a person who moved on from the page the run stopped on is told where the
+   *  run stopped, never that it staged the review screen. */
+  private stoppedBeforeReviewMessage(where: string, refused: string[], personRequestWent: boolean): string {
+    return `STOPPED on "${where}" — NOT the review page (the page does not read as the portal's review step, and none of the project's values are on it), so the application is NOT staged at review.`
+      + `${refused.length ? ` The portal says: ${refused.join(" | ")}.` : ""}`
+      // A request the person sent went through after the hand-over (round 3): it may have been the
+      // filing — never "Nothing was filed"; this sentence is the one that says so.
+      + (personRequestWent
+        ? ` A request you sent from the page went through while the stage was finishing — check the portal before anything else.`
+        : ` Next: in the portal, finish that page (check every attachment is listed and nothing is flagged required), continue to the review page, verify every field there, then submit. Nothing was filed.`);
   }
 
   /** Binding keys the planner invented that the dictionary does not define — reported once

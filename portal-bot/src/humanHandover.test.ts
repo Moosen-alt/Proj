@@ -78,6 +78,9 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS");
     ["verifyReviewScreen", /  private async verifyReviewScreen\(/],
     ["writeSanitizedCapture", /  private async writeSanitizedCapture\(/],
     ["whereTheRunStopped", /  private async whereTheRunStopped\(/],
+    // Helm Should-fix 4: the early "where did the run stop" read and its sentence.
+    ["reviewValuesOnPage", /  private async reviewValuesOnPage\(/],
+    ["stoppedBeforeReviewMessage", /  private stoppedBeforeReviewMessage\(/],
     // …and the readers those call (skeptic round 1: the scan reached only the named methods).
     ["pageSafetyContext", /  private async pageSafetyContext\(/],
     ["readPortalRefusal", /  private async readPortalRefusal\(/],
@@ -116,6 +119,26 @@ console.log("\n4. EVERY INPUT THE RUN MAKES IS FENCED");
   const ticks = recipe.split("\n").filter((l) => /\.(?:check|uncheck)\s*\(/.test(l));
   const unfencedTicks = ticks.filter((l) => !/withAutomationInput\(/.test(l));
   check("every checkbox write (check / uncheck) in recipeAdapter.ts is fenced", ticks.length >= 4 && unfencedTicks.length === 0, JSON.stringify(unfencedTicks.map((l) => l.trim().slice(0, 140))));
+}
+
+console.log("\n5. ONLY A CALLER THAT WATCHES FOR THE SUBMIT IS HANDED THE PAGE (Helm Should-fix 4)");
+{
+  // A caller with no onSubmitCaptured (the learn self-test, the cross-project replay, the benchmark)
+  // never sees the person's submit: its tail click is held by the lockdown, as on main.
+  check("handingOver in recipeAdapter.ts requires the caller's handOverReview option",
+    /const handingOver = this\.options\.handOverReview === true && /.test(recipe), (recipe.match(/const handingOver = [^\n]*/) || [""])[0]);
+  const index = read("portal-bot/src/index.ts");
+  const stageAt = index.indexOf("export async function stageWithRecipe(");
+  const stage = stageAt >= 0 ? index.slice(stageAt, index.indexOf("\n}\n", stageAt)) : "";
+  check("index.ts stageWithRecipe passes handOverReview only when the caller gives onSubmitCaptured",
+    /handOverReview: typeof options\.onSubmitCaptured === "function"/.test(stage), stage ? stage.slice(-400) : "stageWithRecipe not found");
+  // GUARD PINS (green before by design: none of the three ever passed onSubmitCaptured). Kill: give
+  // autoLearn.ts's stageWithRecipe call an onSubmitCaptured, and its check goes red.
+  for (const rel of ["backend/src/autoLearn.ts", "backend/src/runCrossProjectReplay.ts", "backend/src/runReplayBenchmark.ts"]) {
+    const src = read(rel);
+    check(`${rel} stages with stageWithRecipe and gives no onSubmitCaptured (never handed over)`,
+      /\bstageWithRecipe\(/.test(src) && !/onSubmitCaptured/.test(src));
+  }
 }
 
 if (failures) { console.error(`\n${failures}/${total} humanHandover.test check(s) FAILED.`); process.exit(1); }

@@ -68,6 +68,21 @@
 //         run still holds the page), the run is not failed, and never "your click before the
 //         hand-over was held back".
 //     B2 also: a held click's error page is not "where the run stopped".
+//   [B, Helm Should-fix 4] A RUN THAT STOPPED BEFORE REVIEW NEVER READS AS STAGED, AND ONLY A CALLER
+//   THAT WATCHES FOR THE SUBMIT IS HANDED THE PAGE (index.ts passes handOverReview only when the
+//   caller gives onSubmitCaptured; replay() below passes it unless `handOver: false`):
+//     B10 the replay ends on "Step 2: Attachments" (not the review page; neither its text nor its URL
+//         reads as review, and "Continue Application" is no final submit, so no click detector fires)
+//         and the person clicks Continue the moment the page is theirs. The fixture answers that POST
+//         with its review page (a real navigation, so the pin does not rest on the request-time
+//         document stamp alone): 1 POST, the run pauses stopped_before_review, the fill, the progress
+//         line and the review step all say STOPPED on "Step 2: Attachments" — NOT the review page,
+//         and none says "staged the review screen" / "stopped at review". Red before: the person's
+//         Continue read as "moved on" from a staged review page (ok, no pause reason).
+//     B11 a caller that passes no onSubmitCaptured (the learn self-test's shape: no handOverReview)
+//         and a person's click right after the lock: never handed over (the watch never armed, no
+//         "the page is yours"), 0 POSTs, the run fails by name (STOPPED BY THE NETWORK BACKSTOP), as
+//         on main. Red before: every guided-manual replay was handed over and the click filed.
 //   [round 4, THE RECORD'S SHAPE] (Helm Blocking 1 "stamp humanRequests and aborts with at", nit :97
 //   "record the requesting page") — extra checks on existing cases, no new case numbers:
 //     A1  also: the person's request is stamped POST / resourceType document / `at` inside the click's
@@ -91,6 +106,7 @@ import { chromium, type Page } from "playwright";
 import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../../shared/src/types";
 import { backstopFor, installFilingBackstop, isStoppingAbort, withBackstopWindow, withOwnWriteWindow, type FilingBackstop } from "../filingBackstop";
 import { HUMAN_CLICK_HELD_NOTE, PERSON_REQUEST_WENT_NOTE, RecipeAdapter } from "./recipeAdapter";
+import { armSubmitCapture } from "../index";
 
 let failures = 0;
 let total = 0;
@@ -151,6 +167,9 @@ const reviewBody = (k: string): string => {
   if (k === "A11") return `${summary}<form method="post" action="/h/A11/apply/pay307"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
   return `${summary}<form method="post" action="/h/${k}/apply/submit"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
 };
+// A step BEFORE review (B10): an attachments page whose Continue posts and is answered with the review
+// page. Neither its text nor its URL (/attachments) reads as the review step.
+const ATTACHMENTS = (k: string): string => html("Attachments", `<h1>Step 2: Attachments</h1><p>Upload the documents this application needs.</p><div><label for="doc">Site plan</label> <input type="file" id="doc"></div><form method="post" action="/h/${k}/apply/continue"><button type="submit" id="btnContinue">Continue Application</button></form>`);
 // Method-keeping redirects the fixture answers, with the delay before the 307 (ms): the slow one lands
 // after HUMAN_INPUT_MS (4 s) has passed since the person's click.
 const REDIRECTS: Record<string, [string, number]> = {
@@ -171,11 +190,13 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.method === "POST" && rest === "apply/submit") { send(COMPLETION); return; }
+  if (req.method === "POST" && rest === "apply/continue") { send(html("Review and Submit", reviewBody(k))); return; }
   if (rest === "popup") { send(html("Processing", `<h1>Processing</h1><script>fetch('/h/${k}/popup/post', { method: 'POST', body: 'from=popup' }).catch(function(){});</script>`)); return; }
   if (req.method !== "GET") { res.writeHead(204); res.end(); return; }
   if (rest === "records") { send(MY_RECORDS); return; }
   if (rest === "record") { send(OLD_RECORD); return; }
   if (rest === "done") { send(COMPLETION); return; }
+  if (rest === "attachments") { send(ATTACHMENTS(k)); return; }
   if (rest === "review" || rest === "") { send(html("Review and Submit", reviewBody(k))); return; }
   send(html("Not found", "<h1>Not found</h1>"));
 });
@@ -422,11 +443,13 @@ console.log("\n[A, #370] A REDIRECT HOP CARRIES THE FIRST LEG'S PERSON VERDICT")
 console.log("\n[B] THE REPLAY (guided manual: the flagged final submit is never clicked by automation)");
 const flagged: RecipeStep = { action: "click", selector: { css: "#btnSubmit" }, note: "final submit: Submit Application", isFinalSubmit: true } as RecipeStep;
 const TICK = { action: "check", selector: { css: "#terms", label: "I certify the information in this application is correct" }, note: "I certify the information in this application is correct" } as RecipeStep;
-const recipeFor = (k: string, extra: RecipeStep[] = []): PortalRecipe => ({
+// `at`: the fixture page the recipe ends on ("review" by default; B10's "attachments" must never be a
+// /review path, which looksLikeReviewUrl would read as the review step).
+const recipeFor = (k: string, extra: RecipeStep[] = [], at = "review"): PortalRecipe => ({
   id: `human-submit-${k}`, scopeType: "ahj", profileKey: "or|fernhollow|", state: "OR", ahj: "City of Fernhollow", utility: "",
-  portalPlatform: "fixture", portalUrl: `${base}/h/${k}/review`, status: "complete", version: 1, createdBy: "smoke", createdAt: "", updatedAt: "", notes: "",
+  portalPlatform: "fixture", portalUrl: `${base}/h/${k}/${at}`, status: "complete", version: 1, createdBy: "smoke", createdAt: "", updatedAt: "", notes: "",
   steps: [
-    { action: "goto", value: `${base}/h/${k}/review`, note: "open the review page" } as RecipeStep,
+    { action: "goto", value: `${base}/h/${k}/${at}`, note: `open the ${at} page` } as RecipeStep,
     ...extra,
     { action: "stopForReview" } as RecipeStep,
     flagged,
@@ -450,8 +473,42 @@ interface Replay {
   aborts: Array<{ where: string; rule: string; human: boolean; at?: number }>;
   /** What onUnroute returned (the dispose gap's action). */
   gap?: unknown;
+  /** Every progress line the adapter sent, in order. */
+  progressLines: string[];
+  /** What the runner's capture (index.ts armSubmitCapture, `capture: true` only) reported. */
+  captures: SubmitCapture[];
 }
-async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: RecipeStep[]; onHandOver?: (page: Page, adapter: RecipeAdapter) => Promise<unknown>; onArmed?: (page: Page, track: (p: Promise<unknown>) => void) => Promise<void>; onDrain?: (page: Page, track: (p: Promise<unknown>) => void) => void; afterFill?: (page: Page) => Promise<unknown>; onUnroute?: (page: Page) => Promise<unknown> } = {}): Promise<Replay> {
+type SubmitCapture = Parameters<NonNullable<Parameters<typeof armSubmitCapture>[1]["onSubmitCaptured"]>>[0];
+type Track = (p: Promise<unknown>) => void;
+/** THE SHARED REPLAY HARNESS (#333 fix round, built once for every later pin). Options:
+ *   handOver       false = a caller that passes no onSubmitCaptured (never handed over); default true,
+ *                  as index.ts passes it when the runner watches for the person's submit.
+ *   at             the fixture page the recipe ends on (default "review").
+ *   onHandOver     fires at the adapter's "the page is yours" progress line.
+ *   onBeforeArm    fires inside watchHumanInput, BEFORE the real arm (the run's last writes are done).
+ *   onArming       runs alongside the real arm (Promise.all with it).
+ *   armFails       the arm reports false without arming anything.
+ *   onArmed        fires after a successful arm, before the hand-over.
+ *   onDrain        fires when the run opens its first own-save drain.
+ *   onLock         fires right after the real lockReview (pushed through track).
+ *   onReviewRead   fires at the start of the run's review read-back (verifyReviewScreen).
+ *   afterFill      fires after fillApplication returned and the submit watch is armed.
+ *   onUnroute      fires inside the dispose gap (disposed set, route still on).
+ *   capture        also arms index.ts armSubmitCapture and waits up to captureWaitMs for its reports. */
+async function replay(k: string, opts: {
+  autoSubmit?: boolean; handOver?: boolean; at?: string; extraSteps?: RecipeStep[];
+  onHandOver?: (page: Page, adapter: RecipeAdapter) => Promise<unknown>;
+  onBeforeArm?: (page: Page, track: Track) => Promise<void>;
+  onArming?: (page: Page) => Promise<unknown>;
+  armFails?: boolean;
+  onArmed?: (page: Page, track: Track) => Promise<void>;
+  onDrain?: (page: Page, track: Track) => void;
+  onLock?: (page: Page, track: Track) => void;
+  onReviewRead?: (page: Page, track: Track) => void;
+  afterFill?: (page: Page) => Promise<unknown>;
+  onUnroute?: (page: Page) => Promise<unknown>;
+  capture?: boolean; captureWaitMs?: number;
+} = {}): Promise<Replay> {
   const ctx = await browser.newContext();
   const page = await ctx.newPage();
   const from = posts.length;
@@ -478,15 +535,28 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
       return unroute(...a);
     };
   }
+  const progressLines: string[] = [];
+  const captures: SubmitCapture[] = [];
+  const track: Track = (p) => { tracked.push(p); };
   // The adapter's own progress line at the hand-over is the moment a watching person can click.
-  const adapter: RecipeAdapter = new RecipeAdapter(recipeFor(k, opts.extraSteps ?? []), {}, {}, {
+  const adapter: RecipeAdapter = new RecipeAdapter(recipeFor(k, opts.extraSteps ?? [], opts.at), {}, {}, {
     ...(opts.autoSubmit ? { autoSubmit: true } : {}),
+    // What index.ts stageWithRecipe passes when its caller watches for the person's submit.
+    ...(opts.handOver === false ? {} : { handOverReview: true }),
     onProgress: (p) => {
+      progressLines.push(String(p.message ?? ""));
       if (/the page is yours/i.test(String(p.message ?? "")) && !handOverSeenAt) handOverSeenAt = Date.now();
       if (/the page is yours/i.test(String(p.message ?? "")) && opts.onHandOver && !pending) pending = opts.onHandOver(page, adapter).then((v) => { extra = v; }, (e) => { extra = e; });
     },
   });
   (adapter as unknown as { page: unknown }).page = page;
+  // The run's review read-back (an instance wrap: the method's source, which humanHandover.test
+  // scans, is untouched).
+  if (opts.onReviewRead) {
+    const a = adapter as unknown as { verifyReviewScreen: (...x: unknown[]) => Promise<unknown> };
+    const verify = a.verifyReviewScreen.bind(adapter);
+    a.verifyReviewScreen = (...x: unknown[]) => { opts.onReviewRead!(page, track); return verify(...x); };
+  }
   // Spy the backstop the run installs: note when its input watch is armed (and run onArmed then).
   const spy = setInterval(() => {
     const bs = backstopFor(page) as (FilingBackstop & { __spied?: boolean }) | null;
@@ -494,7 +564,19 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
     bs.__spied = true;
     spied.bs = bs;
     const orig = bs.watchHumanInput.bind(bs);
-    bs.watchHumanInput = async () => { const r = await orig(); watchArmed = watchArmed || r; if (r && opts.onArmed) await opts.onArmed(page, (p) => { tracked.push(p); }); return r; };
+    bs.watchHumanInput = async () => {
+      if (opts.onBeforeArm) await opts.onBeforeArm(page, track);
+      if (opts.armFails) return false;
+      const r = opts.onArming ? (await Promise.all([orig(), opts.onArming(page).catch(() => null)]))[0] : await orig();
+      watchArmed = watchArmed || r;
+      if (r && opts.onArmed) await opts.onArmed(page, track);
+      return r;
+    };
+    // The moment the run locks the page (after its own save drained): onLock's person acts.
+    if (opts.onLock) {
+      const lockReview = bs.lockReview.bind(bs);
+      bs.lockReview = (...a: Parameters<FilingBackstop["lockReview"]>) => { const v = lockReview(...a); opts.onLock!(page, track); return v; };
+    }
     // THE RUN IS STILL FINISHING WHEN THE PERSON ACTS. On this local fixture the run's tail takes
     // milliseconds (on a real portal its review read-back and screenshots take seconds), so the
     // backstop is let go only once the person's action, and the page it led to, have settled.
@@ -507,7 +589,7 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
       let fired = false;
       bs.openDrain = (pg: unknown, why: string) => {
         const first = !fired;
-        if (first) { fired = true; opts.onDrain!(page, (p) => { tracked.push(p); }); }
+        if (first) { fired = true; opts.onDrain!(page, track); }
         const close = openDrain(pg, why);
         return () => { if (first) drain.closedAt = Date.now(); close(); };
       };
@@ -522,8 +604,14 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
   // person's submit — one seen during the run is handed on at once.
   const observed: string[] = [];
   await adapter.armSubmitWatch((label?: string) => { observed.push(label || "(completion page)"); }).catch(() => false);
+  // …and, when asked, the runner's own capture of the person's submit (reads 4 s after the click).
+  if (opts.capture) await armSubmitCapture(adapter, { onSubmitCaptured: (c) => { captures.push(c); } });
   if (opts.afterFill) await opts.afterFill(page).catch(() => null);
   await sleep(2000); // a completion page's read lands ~1.2 s after its load
+  if (opts.capture) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < (opts.captureWaitMs ?? 6000) && captures.length < observed.length) await sleep(50);
+  }
   const review = await adapter.stopAtReview();
   const navDocuments = [...((adapter as unknown as { navDocuments?: Array<{ url: string; method: string; at?: number }> }).navDocuments ?? [])];
   await ctx.close().catch(() => null);
@@ -539,6 +627,8 @@ async function replay(k: string, opts: { autoSubmit?: boolean; extraSteps?: Reci
     navDocuments,
     aborts: (spied.bs?.aborts ?? []).map((a) => ({ where: a.where.replace(base, ""), rule: a.rule, human: !!a.humanInput, at: a.at })),
     gap: gapState.value,
+    progressLines,
+    captures,
   };
 }
 /** The person's request was said plainly, and nobody was told to "click submit manually". */
@@ -584,6 +674,34 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
 {
   const r = await replay("B4", { autoSubmit: true });
   check("B4 an approved (autoSubmit) run is never handed over: the input watch is never armed", r.watchArmed === false && r.posts.length === 0, rbrief(r));
+}
+{
+  // B10 (Helm Should-fix 4): the run ends on an attachments step, not the review page. Its text and its
+  // /attachments URL do not read as review, and "Continue Application" is no final submit, so the click
+  // detector never fires (humanSubmit stays unset) — either slipping would make this a review-page case.
+  const r = await replay("B10", { at: "attachments", onHandOver: (page) => personClicks(page, "#btnContinue") });
+  const at = `STOPPED on "Step 2: Attachments" — NOT the review page`;
+  const said = `${r.message} ${r.review.message}`;
+  check("B10 the run stopped on an attachments step and the person clicks Continue at 'the page is yours': their POST goes (1 POST)",
+    r.posts.length === 1 && /\/apply\/continue$/.test(r.posts[0] ?? ""), rbrief(r));
+  check("B10 …the run pauses stopped_before_review, naming where it stopped",
+    r.pauseReason === "stopped_before_review" && r.message.includes(at), rbrief(r));
+  check("B10 …the review step says the same (stoppedBeforeReview), never that it staged the review screen",
+    r.review.data.stoppedBeforeReview === true && r.review.message.includes(at) && !/staged the review screen|stopped at review/i.test(said), rbrief(r));
+  check("B10 …and the progress line that handed the page over said so too (never 'Staged to review')",
+    r.progressLines.some((l) => l.startsWith(`Stopped on "Step 2: Attachments" — NOT the review page; the page is yours`)) && !r.progressLines.some((l) => /Staged to review/i.test(l)),
+    JSON.stringify(r.progressLines.slice(-4)));
+}
+{
+  // B11 (Helm Should-fix 4): a caller that does not watch for the person's submit (the learn self-test,
+  // runCrossProjectReplay, runReplayBenchmark pass no onSubmitCaptured) is never handed the page: a
+  // person's click right after the lock is held by the lockdown and fails the run by name, as on main.
+  const r = await replay("B11", { handOver: false, onLock: (page, track) => track(personClicks(page)) });
+  check("B11 a caller with no onSubmitCaptured is never handed over: the watch is never armed, nobody is told 'the page is yours'",
+    r.watchArmed === false && !r.progressLines.some((l) => /the page is yours/i.test(l)), rbrief(r));
+  check("B11 …the person's click at the lock reaches nothing (0 POSTs)", r.posts.length === 0, rbrief(r));
+  check("B11 …and the run fails by name (STOPPED BY THE NETWORK BACKSTOP), never reporting the person's submit",
+    r.ok === false && r.message.includes("STOPPED BY THE NETWORK BACKSTOP") && r.review.data.humanSubmittedInReviewWindow !== true, rbrief(r));
 }
 
 {
