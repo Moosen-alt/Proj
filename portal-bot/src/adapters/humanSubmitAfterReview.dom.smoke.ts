@@ -153,7 +153,8 @@
 //   [B, Helm Blocking 2] "FILED" ONLY FOR A COMMITTED SUBMIT WHOSE PAGE READS AS A COMPLETION; EVERY OTHER
 //   OUTCOME SAYS WHAT THE RUN SAW, WHOLE (RecipeAdapter.humanClickVerdict / humanClickReport). Each case
 //   also asserts the review step's message is whole (wholeMessage: the portal named once, no "., ").
-//   B1 gains that check (a GUARD, green before by design):
+//   B1 and B10 gain that check (GUARDS, green before by design; their kills are below). B10's is the
+//   stopped-before-review template Helm's nit (helm-review.md:102) names:
 //     B18 a Submit on a form with an empty required box, and B19 one whose confirm() is dismissed: 0
 //         POSTs, never "has been filed"; the note says YOU CLICKED "Submit Application", the run saw no
 //         request go from it, check the portal; never "nothing was sent", never "click submit again".
@@ -1082,6 +1083,8 @@ const rbrief = (r: Replay): string => JSON.stringify({ ok: r.ok, pause: r.pauseR
   check("B10 …and the progress line that handed the page over said so too (never 'Staged to review')",
     r.progressLines.some((l) => l.startsWith(`Stopped on "Step 2: Attachments" — NOT the review page; the page is yours`)) && !r.progressLines.some((l) => /Staged to review/i.test(l)),
     JSON.stringify(r.progressLines.slice(-4)));
+  // Helm's whole-message nit (helm-review.md:102) names this template: GUARD, green before by design.
+  check("B10 …the review step's message is built whole", wholeMessage(r), r.review.message);
 }
 {
   // B11 (Helm Should-fix 4): a caller that does not watch for the person's submit (the learn self-test,
