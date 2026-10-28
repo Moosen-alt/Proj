@@ -197,10 +197,17 @@
 //         unflagged stopping abort … held" red (1/25); the smoke stays green (B28's unflagged abort then
 //         reads unconfirmed, which also begins "A CLICK ON").
 //       K-nofollowup (followUpHeldOnErrorPage never consulted): B26's note red (1/112).
-//     Kills NAMED, not measured, for the other two guard checks: B20's capture check — read the labelled
-//     number before the draft in captureSubmissionConfirmation; B1's wholeMessage — put the
-//     `${portalName}: ` prefix in front of the stopped-before-review template, or append a fragment
-//     ending "." to a clause continuing ", and".
+//     The two wholeMessage GUARDS, measured at 5560dc31 the same way (113 checks on the trim, 25 in
+//     backstopStopHuman.test):
+//       K-sbrprefix (the `${portalName}: ` prefix in front of the stopped-before-review template,
+//         stopAtReview's `stoppedBeforeReview && !humanSubmit` return), B10's kill: B10's wholeMessage
+//         red (1/113); backstopStopHuman 25/25.
+//       K-filedportal (the portal named inside humanClickReport's "filed" sentence: "you submitted to
+//         ${portalName} from the review window"), B1's kill: B1's and B25's wholeMessage red (2/113);
+//         backstopStopHuman 25/25. (B1 is a filed click: it never reaches the stopped-before-review
+//         template, so that template's kill is B10's, not B1's.)
+//     Kill NAMED, not measured, for the other guard check: B20's capture check — read the labelled
+//     number before the draft in captureSubmissionConfirmation.
 //   [round 4, THE RECORD'S SHAPE] (Helm Blocking 1 "stamp humanRequests and aborts with at", nit :97
 //   "record the requesting page") — extra checks on existing cases, no new case numbers:
 //     A1  also: the person's request is stamped POST / resourceType document / `at` inside the click's
