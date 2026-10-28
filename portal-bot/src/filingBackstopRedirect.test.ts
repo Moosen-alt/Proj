@@ -35,7 +35,7 @@ check("a later hop says how many redirects in a row", /redirect 3 in a row/.test
 // document (created under the browser-level pause). A double with no browser warns nothing.
 {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const bed = (opts: { attach: "throws" | "ok"; browser?: boolean }): { page: any; fire: (ev: string) => void } => {
+  const bed = (opts: { attach: "throws" | "ok"; browser?: boolean; workers?: number }): { page: any; fire: (ev: string) => void } => {
     const listeners = new Map<string, Array<() => void>>();
     const session = { on: () => undefined, send: async () => ({}), detach: async () => undefined };
     const browser = { newBrowserCDPSession: async () => session };
@@ -52,6 +52,7 @@ check("a later hop says how many redirects in a row", /redirect 3 in a row/.test
       pages: () => [page],
       newCDPSession: async () => { if (opts.attach === "throws") throw new Error("Protocol error: Target closed"); return session; },
       browser: () => (opts.browser === false ? null : browser),
+      serviceWorkers: () => Array.from({ length: opts.workers ?? 0 }, () => ({})),
     };
     page.context = () => ctx;
     return { page, fire: (ev) => { for (const fn of listeners.get(ev) ?? []) fn(); } };
@@ -70,6 +71,16 @@ check("a later hop says how many redirects in a row", /redirect 3 in a row/.test
     const t = bed({ attach: "ok" });
     const bs = (await installFilingBackstop(t.page, "replay run"))!;
     check("covered: a page re-bound at install is judged, with no note", bs.redirectsJudged === true && bs.redirectGuardNote === "", `${bs.redirectsJudged} ${bs.redirectGuardNote}`);
+    await bs.dispose();
+  }
+  {
+    // A service worker already running at install: its own fetch has no page to re-bind.
+    const t = bed({ attach: "ok", workers: 1 });
+    const bs = (await installFilingBackstop(t.page, "replay run"))!;
+    check("a service worker running at install: not judged, and the note names it (even after a new document)",
+      bs.redirectsJudged === false && /a service worker was already running when the replay run began/.test(bs.redirectGuardNote) && !/a page already open/.test(bs.redirectGuardNote), `${bs.redirectsJudged} ${bs.redirectGuardNote}`);
+    t.fire("domcontentloaded");
+    check("…the worker note is sticky for the run", bs.redirectsJudged === false && /service worker/.test(bs.redirectGuardNote), bs.redirectGuardNote);
     await bs.dispose();
   }
   {

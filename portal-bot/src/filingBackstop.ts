@@ -628,24 +628,26 @@ async function judgeAll(judges: Set<PausedJudge>, e: PausedResponse): Promise<Ve
   }
   return "continue";
 }
-/** The verdict for `session`'s pause of `e`. A redirect's response is judged ONCE however many
- *  sessions pause it: the n-th pause of the same hop (same network request, URL, status and
- *  Location) by one session takes the n-th verdict, so a 307 to itself still counts every hop. */
+/** The verdict for `session`'s pause of `e`. EVERY response is judged ONCE however many sessions
+ *  pause it: the n-th pause of the same response (same network request, URL, status and
+ *  Location) by one session takes the n-th verdict, so a 307 to itself still counts every hop.
+ *  Not only redirects: judging a response consumes its request's leg, and a second judging of a
+ *  200 took the leg of a CONCURRENT request with the same method and URL — whose 307 then found
+ *  no leg and was followed unjudged (two quick autosaves to one endpoint; #394 skeptic). */
 function verdictFor(g: GuardState, session: object, e: PausedResponse): Promise<Verdict> {
   const status = Number(e.responseStatusCode || 0);
   const location = String((e.responseHeaders || []).find((h) => /^location$/i.test(String(h?.name || "")))?.value || "");
   const net = String(e.networkId || "");
-  // Only a redirect's judgement changes the run's state; any other response a second pause finds
-  // already settled (its leg was taken by the first) and continues.
-  if (!net || status < 300 || status > 399 || !location) return judgeAll(g.judges, e);
+  if (!net) return judgeAll(g.judges, e);
+  // Records are kept in creation order: drop the expired head (a second pause follows the first
+  // by milliseconds; two minutes is far past any redirect chain).
   const now = Date.now();
-  for (const [k, r] of g.seen) if (now - r.at > 120_000) g.seen.delete(k);
+  for (const [k, r] of g.seen) { if (now - r.at <= 120_000) break; g.seen.delete(k); }
   const key = `${net}\n${status}\n${String(e.request?.url || "")}\n${location}`;
   let rec = g.seen.get(key);
   if (!rec) { rec = { verdicts: [], counts: new Map(), at: now }; g.seen.set(key, rec); }
   const n = (rec.counts.get(session) ?? 0) + 1;
   rec.counts.set(session, n);
-  rec.at = now;
   if (n > rec.verdicts.length) rec.verdicts.push(judgeAll(g.judges, e));
   return rec.verdicts[n - 1];
 }
@@ -674,11 +676,18 @@ async function coverTarget(g: GuardState, ctx: any, target: object): Promise<Cov
     })().catch((e: unknown): Cover => ({ session: null, outcome: /does not have a separate CDP session/i.test(String((e as Error)?.message ?? e)) ? "shared" : "failed" }));
     g.covers.set(target, p);
   }
-  return (await p).outcome;
+  const { outcome } = await p;
+  // A cover that did not take is tried again by the next run that joins (never inherited).
+  if (outcome !== "on" && g.covers.get(target) === p) g.covers.delete(target);
+  return outcome;
 }
 /** A joined run: `leave` when it is done; `uncovered` = the pages open at join whose documents
- *  could not be re-bound (their redirects are followed unjudged until they load a new document). */
-type GuardMembership = { leave: () => Promise<void>; uncovered: Set<object> };
+ *  could not be re-bound (their redirects are followed unjudged until they load a new document);
+ *  `workers` = service workers already running at join. A service worker's own fetch is not a
+ *  page's, has no page target to re-bind, and the browser-level pause does not re-bind it either
+ *  (#394 skeptic sw-pre: its 307 → /payment/charge was followed) — named, never silent. One
+ *  started after the join is created under the browser-level pause and is judged. */
+type GuardMembership = { leave: () => Promise<void>; uncovered: Set<object>; workers: number };
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function joinRedirectGuard(browser: any, judge: PausedJudge, ctx?: any): Promise<GuardMembership | null> {
   if (!browser || typeof browser !== "object" || typeof browser.newBrowserCDPSession !== "function") return null;
@@ -718,8 +727,11 @@ async function joinRedirectGuard(browser: any, judge: PausedJudge, ctx?: any): P
   if (ctx && typeof ctx.pages === "function" && typeof ctx.newCDPSession !== "function") {
     try { for (const pg of ctx.pages()) uncovered.add(pg); } catch { /* no pages */ }
   }
+  let workers = 0;
+  try { workers = ctx && typeof ctx.serviceWorkers === "function" ? ctx.serviceWorkers().length : 0; } catch { workers = 0; }
   return {
     uncovered,
+    workers,
     leave: async () => {
       guard.judges.delete(judge);
       if (guard.judges.size || guard.closed) return;
@@ -896,8 +908,11 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // is judged by the page's last reading. A server-rendered page's review text is there at load;
   // an SPA's posts are fetch/XHR, which are read live.
   const lastReading = new WeakMap<object, boolean>();
-  // #394: the pages open at install whose loaded document the redirect guard could not re-bind.
+  // #394: the pages open at install whose loaded document the redirect guard could not re-bind,
+  // and the service workers already running then (sticky for the run: the worker that was running
+  // is not known to be gone when a new one starts).
   const uncoveredPages = new Set<object>();
+  let preInstallWorkers = 0;
   const unwatch: Array<() => void> = [];
   const watched = new WeakSet<object>();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1309,6 +1324,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     if (joined) {
       leaveGuard = joined.leave;
       for (const p of joined.uncovered) uncoveredPages.add(p);
+      preInstallWorkers = joined.workers;
     }
   } catch { leaveGuard = null; }
   const bs: FilingBackstop = {
@@ -1414,12 +1430,16 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       if (!locked) locked = `the run is at review (${String(why || label).slice(0, 100)}) — nothing legitimate posts from here until a person takes the page`;
     },
     stoppingAborts() { return aborts.filter(isStoppingAbort); },
-    get redirectsJudged() { return !!leaveGuard && !uncoveredPages.has(page); },
-    redirectsJudgedOn(pg?: unknown) { return !!leaveGuard && !uncoveredPages.has((pg && typeof pg === "object" ? pg : page) as object); },
+    get redirectsJudged() { return !!leaveGuard && !preInstallWorkers && !uncoveredPages.has(page); },
+    redirectsJudgedOn(pg?: unknown) { return !!leaveGuard && !preInstallWorkers && !uncoveredPages.has((pg && typeof pg === "object" ? pg : page) as object); },
     get redirectGuardNote() {
-      if (!leaveGuard || !uncoveredPages.size) return "";
+      if (!leaveGuard || (!uncoveredPages.size && !preInstallWorkers)) return "";
+      const parts: string[] = [];
       const n = uncoveredPages.size;
-      return `Redirect guard (#394): ${n === 1 ? "a page" : `${n} pages`} already open when the ${label} began could not be covered — a 307/308 of ${n === 1 ? "its" : "their"} fetch/XHR traffic is followed unjudged until ${n === 1 ? "it loads" : "each loads"} a new document (form posts and every first-leg rule still apply).`;
+      if (n) parts.push(`${n === 1 ? "a page" : `${n} pages`} already open when the ${label} began could not be covered — a 307/308 of ${n === 1 ? "its" : "their"} fetch/XHR traffic is followed unjudged until ${n === 1 ? "it loads" : "each loads"} a new document`);
+      const w = preInstallWorkers;
+      if (w) parts.push(`${w === 1 ? "a service worker was" : `${w} service workers were`} already running when the ${label} began — a 307/308 of a request ${w === 1 ? "it makes" : "they make"} on a page's behalf is followed unjudged`);
+      return `Redirect guard (#394): ${parts.join("; and ")} (form posts and every first-leg rule still apply).`;
     },
     async openInfoPagePass(pg: unknown, control: unknown, opts: { entries: ReadonlyArray<VerifiedInfoPage>; run: InfoPageRunState; reserve?: InfoPageReserve }): Promise<InfoPagePassOpen> {
       // A new open closes any earlier slot or watch (a candidate already observed is kept).
