@@ -3590,7 +3590,9 @@ export class RecipeAdapter extends BasePortalAdapter {
       // housekeeping below (skeptic r2 F2): a person who clicks while the portal is still saving the
       // run's last answer is let through and their request recorded as theirs — the drain's and the
       // own-write window's own-save exemptions never take it. The page's own scripts posting with no
-      // click still meet the lockdown below until fillApplication returns.
+      // input of the person's still meet the lockdown below until fillApplication returns, and they
+      // cannot forge that input: the watch runs in a CDP isolated world no page script can reach or
+      // drive (Helm Should-fix 1; the filingBackstop.ts header states its residual).
       handedOver = handOverArmed && !unflaggedStop() && await this.handOverReviewPage();
     }
     await this.drainBeforeReviewLock();

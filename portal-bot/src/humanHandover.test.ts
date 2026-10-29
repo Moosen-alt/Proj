@@ -160,6 +160,51 @@ console.log("\n5. ONLY A CALLER THAT WATCHES FOR THE SUBMIT IS HANDED THE PAGE (
   }
 }
 
+console.log("\n6. THE INPUT WATCH LIVES IN A CDP ISOLATED WORLD (Helm Should-fix 1)");
+{
+  // In the main world a page script could forge the person's input: find the watch's binding by its
+  // prefix, read its name off Playwright's binding controller, call it from a cross-origin iframe, or
+  // drive the watch's own listener through an addEventListener it wrapped before the arm. The smoke's
+  // A18-A23 (+ A19o/A22o/A22b) pin the behaviour; these pin the mechanism, so an edit that moves the
+  // watch back into the main world fails here too.
+  const backstop = read("portal-bot/src/filingBackstop.ts");
+  check("filingBackstop.ts exposes no binding and adds no init script through Playwright (exposeBinding / addInitScript are main-world)",
+    !/\.exposeBinding\s*\(/.test(backstop) && !/\.addInitScript\s*\(/.test(backstop),
+    (backstop.match(/\.(?:exposeBinding|addInitScript)\s*\([^\n]*/) || [""])[0].slice(0, 160));
+  const sends = (method: string): string[] => backstop.match(new RegExp(`send\\(\\s*"${method.replace(/\./g, "\\.")}"[^)]*\\)`, "g")) || [];
+  const addBinding = sends("Runtime.addBinding");
+  check("every Runtime.addBinding send names the isolated world (executionContextName): the binding exists in no main world",
+    addBinding.length >= 1 && addBinding.every((s) => /executionContextName:\s*HUMAN_INPUT_WORLD\b/.test(s)), JSON.stringify(addBinding));
+  const newDoc = sends("Page.addScriptToEvaluateOnNewDocument");
+  check("every Page.addScriptToEvaluateOnNewDocument send runs the watch in that world (worldName)",
+    newDoc.length >= 1 && newDoc.every((s) => /worldName:\s*HUMAN_INPUT_WORLD\b/.test(s)), JSON.stringify(newDoc));
+  const worlds = sends("Page.createIsolatedWorld");
+  check("every Page.createIsolatedWorld send (the documents already loaded) names that world too",
+    worlds.length >= 1 && worlds.every((s) => /worldName:\s*HUMAN_INPUT_WORLD\b/.test(s)), JSON.stringify(worlds));
+  check("the watch's session enables Runtime and Page (without Runtime.enable a new document's world gets no binding; without Page.enable no new document runs the watch)",
+    sends("Runtime.enable").length >= 1 && sends("Page.enable").length >= 1, `${sends("Runtime.enable").length} ${sends("Page.enable").length}`);
+  check("the armed marker is read back from the isolated world (a Runtime.evaluate with its contextId), never through a frame's main-world .evaluate(",
+    /send\(\s*"Runtime\.evaluate",\s*\{\s*expression:\s*"!!window\.__solarBackstopHumanInputArmed",\s*contextId:/.test(backstop)
+      && !/\.evaluate\(\s*"!!window\.__solarBackstopHumanInputArmed"/.test(backstop));
+  check("the watch script calls the binding with one argument (a raw CDP binding throws on none, and the script's catch would swallow every click while the read-back said armed)",
+    /w\.\$\{HUMAN_INPUT_BINDING\}\((?!\))/.test(backstop) && !/w\.\$\{HUMAN_INPUT_BINDING\}\(\)/.test(backstop));
+  // Helm Blocking 1, bullet 4: the watch's sessions are detached only after the route comes off. Not
+  // observable at run time now that a disposed handler lets everything through first thing, so this
+  // source pin is its only cover.
+  const disposeAt = backstop.indexOf("async dispose() {");
+  const disposeBody = disposeAt >= 0 ? backstop.slice(disposeAt) : "";
+  const unrouteAt = disposeBody.indexOf("await target.unroute(");
+  const detachAt = disposeBody.indexOf("humanSessions");
+  check("dispose detaches the watch's DevTools sessions only AFTER the route comes off",
+    unrouteAt > 0 && detachAt > unrouteAt, `unroute=${unrouteAt} detach=${detachAt}`);
+  const head = backstop.split("\n").slice(0, 100).join("\n");
+  check("the backstop's header names the isolated world and its residual (Chromium only)", /isolated world/i.test(head) && /Chromium only/.test(head));
+  // A comment is read with its line breaks folded, so a reflowed sentence is still caught.
+  const flat = recipe.replace(/\n\s*\/\/\s*/g, " ");
+  check("recipeAdapter.ts no longer says the page's own scripts \"posting with no click still meet the lockdown\" (a page could make that click)",
+    !/posting with no click still meet the lockdown/.test(flat));
+}
+
 if (failures) { console.error(`\n${failures}/${total} humanHandover.test check(s) FAILED.`); process.exit(1); }
 console.log(`\nAll ${total}/${total} humanHandover.test checks passed.`);
 process.exit(0);

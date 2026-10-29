@@ -65,10 +65,23 @@
 //      Should-fix 2): each main-frame navigation request is stamped, and a request is judged against
 //      the stamp BEFORE it, so the person's own form POST (itself a navigation) still counts their
 //      click while the next document's posts do not. The cost: an interstitial that auto-posts the
-//      filing after the person's click is held, as on main. A page script posting with no input meets the lockdown
-//      exactly as before; payment (rule 1) and an open dismisser / Enter window (rule 3, the
-//      run's own action in flight) are never lifted — but payment stays blocked only for URLs rule 1
-//      knows (PAY_FEE_URL; Helm Should-fix 13 added Authorize.net, Point & Pay, fees/settle, GovPayNet). An abort that follows such an input is
+//      filing after the person's click is held, as on main. A page script posting with no PERSON'S
+//      input meets the lockdown exactly as before, and it cannot forge that input (Helm Should-fix 1):
+//      the watch runs in a CDP ISOLATED WORLD — its binding is exposed only to that world, its
+//      listener is registered through that world's own addEventListener, and "armed" is read back
+//      from that world — so no page script can find the binding by its name, read it off Playwright's
+//      binding controller, call it from a cross-origin iframe, or drive the watch's listener through
+//      an addEventListener it wrapped before the arm (smoke A18-A21). RESIDUAL, stated: Chromium only
+//      (no DevTools session = not armed: the hand-over fails closed); a popup, or a cross-site iframe
+//      that appears or goes out of process after the arm, sees no input until its own session is
+//      attached (its requests are held meanwhile); out-of-process iframes are exercised headless under
+//      --site-per-process (A19o, A22o, A22b — a headed window, production's, puts a cross-site iframe
+//      out of process too: a headed probe, not a pin); and the click detector (humanCapture's
+//      __alPatchStep) stays in the main world, so a page can still forge a "submit seen" — which is
+//      why a sighting stays provisional until a request of the person's is seen. Payment (rule 1) and
+//      an open dismisser / Enter window (rule 3, the run's own action in flight) are never lifted —
+//      but payment stays blocked only for URLs rule 1 knows (PAY_FEE_URL; Helm Should-fix 13 added
+//      Authorize.net, Point & Pay, fees/settle, GovPayNet). An abort that follows such an input is
 //      flagged humanInput, so the run can say "your click was held back — click again".
 //      (b) exempts the RUN'S OWN recorded write on that page while it is in flight
 //      (withOwnWriteWindow: a fill / select / check whose per-field autosave posts — PowerClerk's
@@ -278,9 +291,12 @@ export interface FilingBackstop {
   lockReview(why: string): void;
   /** #333 — WATCH FOR A PERSON'S OWN INPUT: from now on a trusted pointerdown / mousedown /
    *  touchstart, or an Enter / Space keydown, in any frame of any page of the run's context is
-   *  recorded against its page. Call it only once the run has made its LAST input on the page (the
-   *  run's own clicks are trusted input too). false = it could not be armed (the hand-over then
-   *  lets nothing through: fail closed). */
+   *  recorded against its page — by a watch in a CDP isolated world that the page's own scripts
+   *  cannot reach or drive (Helm Should-fix 1; Chromium only). A page or frame that appears later is
+   *  watched once its session is attached. Call it only once the run has made its LAST input on the
+   *  page (the run's own clicks are trusted input too). false = no DevTools session (a double, a
+   *  browser that gives none), or the run's page's world did not read back as listening: the
+   *  hand-over then lets nothing through (fail closed). */
   watchHumanInput(): Promise<boolean>;
   /** #333 — THE HAND-OVER: the run is done acting on the page and gives it to a person. From here a
    *  request that follows that person's own input (watchHumanInput) passes the filing-URL rule and
@@ -386,19 +402,35 @@ const REGISTRY = new WeakMap<object, FilingBackstop>();
 /** #333: how long after a person's own input a state-changing request is theirs. A click's form
  *  POST follows its pointerdown by well under a second; a confirm() answered first takes longer. */
 const HUMAN_INPUT_MS = 4_000;
-/** The page binding the input watch reports through (one per context or page, never removed). Named
- *  per process, not a fixed public name (the repo is public): a page script cannot call it by
- *  knowing this file (#333 skeptic round 1; Playwright's own binding global stays shared). */
+/** The binding the input watch reports through. It exists ONLY in the CDP isolated world
+ *  HUMAN_INPUT_WORLD (Runtime.addBinding with executionContextName — Helm Should-fix 1), never on any
+ *  frame's main-world global: a page script cannot find it by its prefix, read its name off
+ *  Playwright's binding controller (the watch exposes nothing through Playwright), or call it from a
+ *  cross-origin iframe; and a main world that wrapped addEventListener / patched
+ *  getOwnPropertyDescriptor before the arm never sees the world's listener (the world registers
+ *  through its own). No keys, no retry: there is nothing page-side to harvest. Still named per
+ *  process (hardening only now: no page can reach it whatever its name). A SECOND BACKSTOP ON THE
+ *  SAME PAGE (a later run in the same window) also hears an earlier run's world, whose listener
+ *  outlives that run's detached session: the binding call reaches every session with that name
+ *  active. It is still a trusted input on that page, so it is stamped, not filtered by context id. */
 const HUMAN_INPUT_BINDING = `__solarBackstopHumanInput_${randomBytes(6).toString("hex")}`;
-/** The in-page watch. A string, not a function: tsx's __name wrapper does not exist in the page. */
+/** The isolated world the watch runs in (its name is the DevTools' own; no page can enter it). */
+const HUMAN_INPUT_WORLD = "__solarBackstopHumanInput";
+/** The watch, run in that world. A string, not a function: tsx's __name wrapper does not exist in
+ *  the page. The binding takes exactly ONE string (a raw CDP binding throws on none, and this catch
+ *  would swallow every click while the read-back still said armed). */
 const HUMAN_INPUT_SCRIPT = `(() => { const w = window; if (w.__solarBackstopHumanInputArmed) return; w.__solarBackstopHumanInputArmed = true;
   const note = (e) => { if (!e || !e.isTrusted) return; if (e.type === "keydown" && e.key !== "Enter" && e.key !== " ") return;
-    try { if (typeof w.${HUMAN_INPUT_BINDING} === "function") w.${HUMAN_INPUT_BINDING}(); } catch (_) { /* the watch never breaks the page */ } };
+    try { if (typeof w.${HUMAN_INPUT_BINDING} === "function") w.${HUMAN_INPUT_BINDING}(e.type); } catch (_) { /* the watch never breaks the page */ } };
   for (const t of ["pointerdown", "mousedown", "touchstart", "keydown"]) w.addEventListener(t, note, true); })();`;
-/** The binding is exposed once per host and dispatches to whichever backstop watches that host now
- *  (a second run in the same window — a correction reopen — must not lose its watch). */
-const HUMAN_INPUT_EXPOSED = new WeakSet<object>();
-const HUMAN_INPUT_SINKS = new WeakMap<object, (page: unknown) => void>();
+
+/** `p`, or null once `ms` pass first (the timer is cleared either way). */
+async function settleWithin<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([p, new Promise<null>((r) => { timer = setTimeout(() => r(null), ms); })]);
+  } finally { if (timer) clearTimeout(timer); }
+}
 
 /** #333 — run one of the run's own inputs on `page` inside its backstop's fence (no backstop: as is). */
 export async function withAutomationInput<T>(page: unknown, fn: () => Promise<T>): Promise<T> {
@@ -1005,6 +1037,119 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // the run's last tick, and every fenced report measured arrived in flight).
   const automationDepth = new WeakMap<object, number>();
   const automationFenced = (pg: object): boolean => (automationDepth.get(pg) ?? 0) > 0;
+  // #333 Helm Should-fix 1 — THE INPUT WATCH LIVES IN A CDP ISOLATED WORLD. Its own DevTools session
+  // per page of the context, and per OUT-OF-PROCESS frame (a cross-site iframe in a headed window),
+  // carries the binding (exposed only to HUMAN_INPUT_WORLD), the watch for every new document, and
+  // the watch in an isolated world of each frame already loaded. Never the redirect guard's sessions
+  // (#404): no domain is enabled or disabled on those here, and none of them is detached here.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  type HumanWorld = { session: any; rootWorld: number };
+  /** Per page / out-of-process frame: its session and the context id of its ROOT frame's world. */
+  const humanWorlds = new Map<object, Promise<HumanWorld | null>>();
+  /** Every session the watch opened (dispose detaches them, after the route comes off). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const humanSessions = new Set<any>();
+  /** Per page: its out-of-process frames' arms, as first asked (watchHumanInput waits on them, bounded). */
+  const humanFramesArmed = new WeakMap<object, Promise<void>>();
+  /** Per frame: the re-ask in flight (one at a time, so a burst of navigations opens one session). */
+  const humanFrameAsks = new WeakMap<object, Promise<void>>();
+  /** An arm was asked for: from now on a page that opens (a popup) is armed too. */
+  let humanArming = false;
+  /** A person's own input reached `pg` — never one the run itself is making (the fence). */
+  const noteHumanInput = (pg: unknown): void => {
+    if (!disposed && pg && typeof pg === "object" && !automationFenced(pg as object)) humanInputAt.set(pg as object, Date.now());
+  };
+  /** Open the watch's world on `target` — a page, or an out-of-process frame of the page `owner` —
+   *  and report its input against `owner`. null = not armed: no session (newCDPSession throws for a
+   *  frame that shares its page's process, or a closed target), or the ROOT frame's world could not
+   *  be made. A child frame's world failing never fails the target (a navigating frame; a
+   *  third-party tracker's, as Oregon ePermitting's walkme frame at review). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const openHumanWorld = async (target: any, owner: unknown): Promise<HumanWorld | null> => {
+    const session = await ctx.newCDPSession(target);
+    if (disposed) { await session.detach().catch(() => null); return null; }
+    humanSessions.add(session);
+    try {
+      session.on("Runtime.bindingCalled", (e: { name?: string }) => { if (e && e.name === HUMAN_INPUT_BINDING) noteHumanInput(owner); });
+      // Playwright's own order for a binding with a script: Runtime first (a context created after
+      // addBinding gets the binding only while Runtime is enabled on the session), and Page enabled
+      // before the script for new documents (no new document runs it otherwise).
+      await session.send("Runtime.enable");
+      await session.send("Runtime.addBinding", { name: HUMAN_INPUT_BINDING, executionContextName: HUMAN_INPUT_WORLD });
+      await session.send("Page.enable");
+      await session.send("Page.addScriptToEvaluateOnNewDocument", { source: HUMAN_INPUT_SCRIPT, worldName: HUMAN_INPUT_WORLD });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const tree: any = (await session.send("Page.getFrameTree"))?.frameTree;
+      const inWorld = async (frameId: string): Promise<number> => {
+        const made = await session.send("Page.createIsolatedWorld", { frameId, worldName: HUMAN_INPUT_WORLD });
+        const contextId = Number(made?.executionContextId);
+        await session.send("Runtime.evaluate", { expression: HUMAN_INPUT_SCRIPT, contextId });
+        return contextId;
+      };
+      const rootWorld = await inWorld(String(tree?.frame?.id ?? ""));
+      // The target's other frames in its own process (a frame out of process is not in this tree).
+      const children: string[] = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const walk = (n: any): void => { for (const c of Array.isArray(n?.childFrames) ? n.childFrames : []) { children.push(String(c?.frame?.id ?? "")); walk(c); } };
+      walk(tree);
+      for (const id of children) await inWorld(id).catch(() => null);
+      if (disposed) throw new Error("disposed while arming");
+      return { session, rootWorld };
+    } catch {
+      humanSessions.delete(session);
+      await session.detach().catch(() => null);
+      return null;
+    }
+  };
+  /** A non-main frame of `pg`: give it a session of its own if it is out of process. Asked when the
+   *  page is armed and again each time the frame commits a navigation: a frame that went out of
+   *  process gets its session; one whose session still answers keeps it (its script for new
+   *  documents covers the frame's next document — a cross-site hop within out-of-process frames
+   *  keeps its target); one whose session died (it came back into its page's process) is covered by
+   *  the page's session again. newCDPSession's "does not have a separate CDP session" throw is the
+   *  branch selector, as for the redirect guard's covers (#404). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const armFrameWorld = (f: any, pg: unknown): Promise<void> => {
+    const ask = async (): Promise<void> => {
+      if (disposed) return;
+      const held = humanWorlds.get(f);
+      if (held) {
+        const w = await held;
+        if (w && await w.session.send("Page.getFrameTree").then(() => true, () => false)) return;
+        if (humanWorlds.get(f) === held) humanWorlds.delete(f);
+        if (w) { humanSessions.delete(w.session); await w.session.detach().catch(() => null); }
+      }
+      if (disposed) return;
+      const p = openHumanWorld(f, pg).catch(() => null);
+      humanWorlds.set(f, p);
+      if (!(await p) && humanWorlds.get(f) === p) humanWorlds.delete(f);
+    };
+    const next = (humanFrameAsks.get(f) ?? Promise.resolve()).then(ask, ask).catch(() => undefined);
+    humanFrameAsks.set(f, next);
+    return next;
+  };
+  /** Arm `pg` (a page of the run's context), once: its own session and world first (all that "armed"
+   *  waits on), then each out-of-process frame of it, and from then on each frame navigation re-asks. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const armPageWorld = (pg: any): Promise<HumanWorld | null> => {
+    const held = humanWorlds.get(pg);
+    if (held) return held;
+    const p = openHumanWorld(pg, pg).catch(() => null);
+    humanWorlds.set(pg, p);
+    humanFramesArmed.set(pg, p.then(async (w) => {
+      if (!w) { if (humanWorlds.get(pg) === p) humanWorlds.delete(pg); return; }
+      if (disposed) return;
+      if (typeof pg.on === "function" && typeof pg.off === "function") {
+        const onFrame = (f: unknown): void => { try { if (f !== pg.mainFrame()) void armFrameWorld(f, pg); } catch { /* page gone */ } };
+        pg.on("framenavigated", onFrame);
+        unwatch.push(() => { try { pg.off("framenavigated", onFrame); } catch { /* page gone */ } });
+      }
+      let frames: unknown[] = [];
+      try { frames = pg.frames().filter((f: unknown) => f !== pg.mainFrame()); } catch { frames = []; }
+      await Promise.all(frames.map((f) => armFrameWorld(f, pg)));
+    }).catch(() => undefined));
+    return p;
+  };
   // #344 — THE INFORMATION-PAGE PASS. Run-wide facts its predicate asks (the run wrote through an
   // own-write window; an approved final-submit slot was ever opened), its ONE slot, its candidate
   // watch, and what each admitted. Every closer below also closes these.
@@ -1095,6 +1240,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     pg.on("load", onLoad);
     unwatch.push(() => { try { pg.off("domcontentloaded", onDocument); pg.off("domcontentloaded", onLoad); pg.off("load", onLoad); } catch { /* page gone */ } });
     refresh(pg);
+    // #333: a page that opens once the input watch was asked for (a popup) is watched too — none of
+    // its input counts until its session is attached (the residual, stated in the header).
+    if (humanArming && !disposed) void armPageWorld(pg);
   };
   try {
     if (ctx && typeof ctx.pages === "function" && typeof ctx.on === "function") {
@@ -1654,47 +1802,39 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     async watchHumanInput() {
       if (disposed) return false;
       if (humanWatchArmed) return true;
-      // The binding and the init script live on the context when there is one, so a popup the
-      // person opens is watched too; the existing documents get the script now.
-      const host = ctx && typeof ctx.exposeBinding === "function" && typeof ctx.addInitScript === "function" ? ctx
-        : typeof page.exposeBinding === "function" && typeof page.addInitScript === "function" ? page : null;
-      if (!host) return false;
-      // An input the run itself is making (the fence) is never a person's.
-      HUMAN_INPUT_SINKS.set(host, (pg) => { if (!disposed && pg && typeof pg === "object" && !automationFenced(pg as object)) humanInputAt.set(pg as object, Date.now()); });
-      try {
-        if (!HUMAN_INPUT_EXPOSED.has(host)) {
-          await host.exposeBinding(HUMAN_INPUT_BINDING, (source: { page?: unknown }) => {
-            try { HUMAN_INPUT_SINKS.get(host)?.(source && source.page); } catch { /* the watch never breaks the page */ }
-          });
-          await host.addInitScript({ content: HUMAN_INPUT_SCRIPT });
-          // Marked only once BOTH are in place: a failed init script is retried by the next arm.
-          HUMAN_INPUT_EXPOSED.add(host);
-        }
-      } catch { return false; }
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const pages: any[] = host === ctx && typeof ctx.pages === "function" ? ctx.pages() : [page];
-      const inject = async (): Promise<void> => {
-        for (const p of pages) {
-          for (const f of typeof p?.frames === "function" ? p.frames() : []) await f.evaluate(HUMAN_INPUT_SCRIPT).catch(() => null);
-        }
-      };
-      // A navigating frame cannot answer; the init script covers the document it is loading.
-      let timer: ReturnType<typeof setTimeout> | null = null;
-      await Promise.race([inject(), new Promise<void>((r) => { timer = setTimeout(r, TERMINAL_READ_TIMEOUT_MS); })]);
-      if (timer) clearTimeout(timer);
+      // FAIL CLOSED WITH NO DEVTOOLS SESSION (Chromium only): a double, or a browser that has none,
+      // is never armed — the hand-over then lets nothing through.
+      if (!ctx || typeof ctx.newCDPSession !== "function") return false;
+      humanArming = true;
+      // The run's own page first: its root frame's world is what "armed" reads back from.
+      const own = armPageWorld(page);
+      let ownWorld: HumanWorld | null | undefined;
+      void own.then((w) => { ownWorld = w; });
+      // Then every other page of the context (a popup already open) and every page's out-of-process
+      // frames — waited for within the read budget, never needed for "armed" (a navigating frame
+      // cannot answer; the script for new documents covers what it is loading).
+      const everyPage = (async (): Promise<void> => {
+        let pages: unknown[] = [];
+        try { pages = typeof ctx.pages === "function" ? ctx.pages() : []; } catch { pages = []; }
+        await Promise.all([page, ...pages.filter((p) => p !== page)].map(async (p) => {
+          await armPageWorld(p);
+          await humanFramesArmed.get(p as object);
+        }));
+      })().catch(() => undefined);
+      await settleWithin(everyPage, TERMINAL_READ_TIMEOUT_MS);
       // ARMED MEANS THE RUN'S OWN PAGE IS LISTENING (#333 skeptic rounds 1 and 2): the marker is read
-      // back from its main frame. A frame that cannot answer (navigating, hung) is NOT armed — the
-      // hand-over then fails closed and says so (NOT_HANDED_OVER_NOTE), never "the page is yours"
-      // over a document that cannot see the person's click.
+      // back from the ISOLATED WORLD of its root frame — never its main world, where a page script
+      // could have set it. A page whose world is not made in time (navigating, hung) is NOT armed —
+      // the hand-over then fails closed and says so (NOT_HANDED_OVER_NOTE), never "the page is
+      // yours" over a document that cannot see the person's click.
       let listening = false;
       try {
-        const mf = typeof page.mainFrame === "function" ? page.mainFrame() : null;
-        let readTimer: ReturnType<typeof setTimeout> | null = null;
-        listening = mf ? Boolean(await Promise.race([
-          Promise.resolve(mf.evaluate("!!window.__solarBackstopHumanInputArmed")).catch(() => false),
-          new Promise<boolean>((r) => { readTimer = setTimeout(() => r(false), TERMINAL_READ_TIMEOUT_MS); }),
-        ])) : false;
-        if (readTimer) clearTimeout(readTimer);
+        const w = ownWorld;
+        if (w) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const read: any = await settleWithin(Promise.resolve(w.session.send("Runtime.evaluate", { expression: "!!window.__solarBackstopHumanInputArmed", contextId: w.rootWorld, returnByValue: true })).catch(() => null), TERMINAL_READ_TIMEOUT_MS);
+          listening = read?.result?.value === true;
+        }
       } catch { listening = false; }
       humanWatchArmed = !disposed && listening;
       return humanWatchArmed;
@@ -1866,13 +2006,19 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       ownWrites.clear();
       drains.clear();
       locked = "";
-      // The input binding stays exposed (Playwright cannot remove it); it now reports to nobody.
-      for (const h of [ctx, page]) if (h && typeof h === "object" && HUMAN_INPUT_SINKS.has(h)) HUMAN_INPUT_SINKS.delete(h);
       for (const u of unwatch.splice(0)) u();
       if (leaveGuard) await leaveGuard();
       sentLegs.length = 0;
       chains.clear();
       await target.unroute("**/*", handler).catch(() => null);
+      // THE INPUT WATCH'S SESSIONS COME OFF LAST, after the route (Helm Blocking 1: a watch torn down
+      // while the route still judged once held a person's filing in that gap). Detaching a session
+      // removes its binding and its script for new documents; a world already made keeps its listener,
+      // which now reports to no session of this run. An arm still in flight detaches itself
+      // (openHumanWorld reads `disposed`).
+      for (const s of [...humanSessions]) await s.detach().catch(() => null);
+      humanSessions.clear();
+      humanWorlds.clear();
     },
   };
   REGISTRY.set(page, bs);

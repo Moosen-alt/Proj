@@ -88,6 +88,37 @@
 //     touchstart dispatch (green 41/41 at b6adf660 and on the parent 3ab2827d): K-trusted, M-touch,
 //     M-pointer, M-mouse and M-key each redden A15 x3 (3/41, nothing else). Without the touchstart
 //     dispatch (the smoke as committed at b6adf660), M-touch stayed green 41/41: that was the gap.
+//   [A, Helm Should-fix 1] A PAGE SCRIPT CANNOT FORGE THE PERSON'S INPUT: the watch runs in a CDP isolated
+//   world (its binding exposed only there, its listener registered through that world's own
+//   addEventListener, "armed" read back from there). Each route Helm named is held; a person's real
+//   input still counts. The cross-site iframe is served by a SECOND listener on 127.0.0.2 (never
+//   `localhost`); "o" cases run on a --site-per-process browser, where it is out of process (each prints
+//   which path it took — default headless Chromium keeps it in its page's process):
+//     A18 routes 1 and 2: the arm and the hand-over add NO own property to the main-world window (before:
+//         __playwright__binding__, __playwright__binding__controller__, the binding and its marker); a page
+//         script scanning for the binding by its prefix finds none, and its filing fetch is aborted, not
+//         flagged, not in humanRequests, personActedSinceHandOver false.
+//     A19 route 3: a cross-origin iframe looks for the binding in its main world and calls it, then the top
+//         page's script submits the filing form: no binding found, aborted, not flagged. A19o: the same with
+//         the iframe out of process.
+//     A20 route 4: a review page that wrapped addEventListener and patched getOwnPropertyDescriptor as it
+//         parsed (before the arm) drives every pointerdown listener it captured with a forged
+//         {isTrusted: true}, then posts the filing: it captured none of the watch's, aborted, not flagged.
+//     A21 no DevTools session (newCDPSession throws, patched between install and arm), and A21b none at
+//         all (newCDPSession absent): not armed, the hand-over refuses, a person's click reaches nothing.
+//     Red before (measured on the parent ff60da78 with these pins, the smoke trimmed to [A] A1, A2, A15,
+//     A16, A18-A23, the "o" cases and B12/B12b: 16/38): A18 x3, A19 x3, A20 x3, A21, A21b, A19o x2,
+//     B12b x3; humanHandover.test section 6, 10/62. That run is also the kill "the watch moved back to
+//     the main world" (A1, A2, A15, A16, B12 stayed green on it).
+//     GUARD pins, green before by design (the main-world watch covered every frame and every new document):
+//     A22 the person's real click inside the cross-site iframe (same-process here: its world is made by the
+//         page's session) files: one POST, recorded as theirs (document false), no stopping abort. A22o the
+//         same out of process (a session of its own).
+//     A22b a cross-site iframe the page adds after the hand-over (out of process): once its session is
+//         attached, the person's click inside it files. The residual, stated: no input of a frame or popup
+//         that appears after the arm counts until its session is attached.
+//     A23 the person follows a same-origin link to /review2 after the hand-over and clicks its submit: one
+//         POST — only the script for new documents (Page.enable, worldName) watches that document.
 //   [B] THE REPLAY (RecipeAdapter, guided manual: no approval, the flagged final submit never clicked):
 //     B1  the person clicks the portal's submit the moment the run hands the page over: the POST
 //         reaches the portal, the run is NOT failed, and it reports the person's submit; the
@@ -165,7 +196,9 @@
 //         A9 only, because the adapter also asks for an armed watch; K11 plus the adapter's
 //         `handOverArmed &&` dropped reddens A9 and B12's "page is yours", note and 0-POST checks;
 //         dropping the three NOT_HANDED_OVER_NOTE lines reddens B12's note check (and B13/B14/B14b's).
-//     B12b (a failed CDP arm) waits for the isolated-world watch (Should-fix 1); not pinned until then.
+//     B12b (Should-fix 12 with Should-fix 1: "pin a failed CDP arm too") the REAL arm runs but the context
+//         gives it no DevTools session (newCDPSession throws from the arm on): B12's checks on that cause.
+//         Red before: the main-world watch needed no session, the page was handed over and the click filed.
 //   [B, Helm nit :97] ONLY THE HANDED-OVER PAGE'S OWN DOCUMENT REQUEST ENDS WHAT THE RUN ANSWERS FOR
 //   (RecipeAdapter.humanDocumentFromHandedOverPage: the record's requesting Page must be the run's page):
 //     B17 the person opens the review page's "Contact us" popup and sends its form (its document POST
@@ -311,7 +344,7 @@
 //   npx tsx portal-bot/src/adapters/humanSubmitAfterReview.dom.smoke.ts
 import "../smokeArtifactDirs";
 import http from "node:http";
-import { chromium, type Page } from "playwright";
+import { chromium, type Browser, type Frame, type Page } from "playwright";
 import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../../shared/src/types";
 import { backstopFor, installFilingBackstop, isStoppingAbort, withBackstopWindow, withOwnWriteWindow, type FilingBackstop } from "../filingBackstop";
 import { HUMAN_CLICK_HELD_NOTE, HUMAN_SUBMITTED_NOTE, NOT_HANDED_OVER_NOTE, PERSON_REQUEST_WENT_NOTE, RecipeAdapter } from "./recipeAdapter";
@@ -489,6 +522,26 @@ const reviewBody = (k: string): string => {
   if (k === "A11") return `${summary}<form method="post" action="/h/A11/apply/pay307"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
   // A14: a plain GET link off the review page; the next document posts the filing as it parses.
   if (k === "A14") return `${summary}<a id="next" href="/h/A14/next">Continue</a>`;
+  // A19 / A22 (Helm Should-fix 1): the review page embeds a CROSS-SITE iframe, served by the second
+  // listener (127.0.0.2 — never `localhost`, which this host resolves to ::1 first). "o": the same case
+  // on the --site-per-process browser, where that iframe is out of process.
+  if (/^A(19|22)o?$/.test(k)) return `${summary}${formSubmit(k)}<iframe id="xo" src="${base2}/h/${k}/frame" style="width:420px;height:140px"></iframe>`;
+  // A20: the review page wraps addEventListener (and patches getOwnPropertyDescriptor to hide it) as
+  // it parses — BEFORE the arm — keeping every pointerdown listener anyone registers on it.
+  if (k === "A20") return `<script>
+    window.__captured = [];
+    (function () {
+      var orig = EventTarget.prototype.addEventListener;
+      var desc = Object.getOwnPropertyDescriptor(EventTarget.prototype, "addEventListener");
+      var wrapped = function (t, fn, o) { if (t === "pointerdown" && typeof fn === "function") window.__captured.push(fn); return orig.call(this, t, fn, o); };
+      EventTarget.prototype.addEventListener = wrapped;
+      window.addEventListener = wrapped;
+      var gopd = Object.getOwnPropertyDescriptor;
+      Object.getOwnPropertyDescriptor = function (o, p) { return p === "addEventListener" ? desc : gopd.apply(Object, arguments); };
+    })();
+  </script>${summary}${formSubmit(k)}`;
+  // A23: a same-origin link to a second review page (a NEW document after the hand-over).
+  if (k === "A23") return `${summary}<a id="next2" href="/h/A23/review2">Review the application again</a>`;
   return `${summary}<form method="post" action="/h/${k}/apply/submit"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
 };
 // A step BEFORE review (B10): an attachments page whose Continue posts and is answered with the review
@@ -529,11 +582,38 @@ const server = http.createServer((req, res) => {
   if (rest === "done") { send(COMPLETION); return; }
   if (rest === "attachments") { send(ATTACHMENTS(k)); return; }
   if (rest === "review" || rest === "") { send(html("Review and Submit", reviewBody(k))); return; }
+  // A23: the second review page, with its own submit.
+  if (rest === "review2") { send(html("Review and Submit", `${SUMMARY}${submitForm(`/h/${k}/apply/submit`)}`)); return; }
+  // A19 / A22: the cross-site iframe's page (served on 127.0.0.2). A19's sends nothing; A22's is the
+  // portal's own submit, posting to a filing URL from inside the frame.
+  if (rest === "frame") { send(html("Embedded", /^A19o?$/.test(k) ? "<p>An embedded widget</p>" : `<form method="post" action="/h/${k}/apply/submit"><button type="submit" id="frameSubmit">Submit Application</button></form>`)); return; }
   send(html("Not found", "<h1>Not found</h1>"));
 });
 await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
 const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+// A SECOND LISTENER, ANOTHER SITE (Helm Should-fix 1): the same fixture on 127.0.0.2 — a different
+// origin and a different site from 127.0.0.1 — for the cross-site iframes of A19 and A22.
+const server2 = http.createServer((req, res) => { server.emit("request", req, res); });
+await new Promise<void>((r) => server2.listen(0, "127.0.0.2", () => r()));
+const base2 = `http://127.0.0.2:${(server2.address() as { port: number }).port}`;
 const browser = await chromium.launch();
+// Default headless Chromium keeps a cross-site iframe in its parent's process; with --site-per-process
+// (a headed window's default: production's) it is out of process and has a DevTools target of its own.
+// Launched only for the "o" cases, and closed right after them (memory).
+let sppBrowser: Promise<Browser> | null = null;
+const spp = (): Promise<Browser> => (sppBrowser ??= chromium.launch({ args: ["--site-per-process"] }));
+/** Which path a frame's watch takes: its own DevTools target ("OOPIF") or its page's ("same-process"). */
+async function framePath(page: Page, frame: Frame | undefined): Promise<string> {
+  if (!frame) return "no frame";
+  try {
+    const s = await page.context().newCDPSession(frame);
+    await s.detach().catch(() => null);
+    return "OOPIF";
+  } catch (e) {
+    const m = String((e as Error)?.message ?? e);
+    return /does not have a separate CDP session/i.test(m) ? "same-process" : `unknown (${m.slice(0, 60)})`;
+  }
+}
 const postsFor = (k: string, from: number): Array<{ k: string; path: string }> => posts.slice(from).filter((p) => p.k === k);
 
 /** A PERSON'S click: a raw mouse click at the control's centre (a trusted event, no fence). */
@@ -551,8 +631,8 @@ async function personTouchesPage(page: Page): Promise<void> {
 // [A] The backstop, directly
 // ---------------------------------------------------------------------------------------------
 interface Bed { page: Page; bs: FilingBackstop; close: () => Promise<void> }
-async function bed(k: string, opts: { arm?: boolean; handOver?: boolean; lock?: boolean } = {}): Promise<Bed> {
-  const ctx = await browser.newContext();
+async function bed(k: string, opts: { arm?: boolean; handOver?: boolean; lock?: boolean; browser?: Browser } = {}): Promise<Bed> {
+  const ctx = await (opts.browser ?? browser).newContext();
   const page = await ctx.newPage();
   // Installed BEFORE the page loads, as every production run's first step loads a fresh document
   // under it: the redirect guard (#370) does not see subresource redirects of a document that was
@@ -839,6 +919,212 @@ console.log("\n[A, #370] A REDIRECT HOP CARRIES THE FIRST LEG'S PERSON VERDICT")
   await b.close();
 }
 
+// [A, Helm Should-fix 1] A PAGE SCRIPT CANNOT FORGE THE PERSON'S INPUT: the watch runs in a CDP
+// isolated world. Each route Helm named is held, and a person's real input still counts.
+console.log("\n[A, Should-fix 1] THE INPUT WATCH LIVES IN AN ISOLATED WORLD");
+{
+  // A18 (routes 1 and 2: the binding found by its prefix; its name read off Playwright's binding
+  // controller): the arm adds NO own property to the main-world window — no binding, no controller,
+  // no marker — so a page script that scans for the binding finds none, and its filing fetch is held.
+  // The snapshots are taken on the loaded page (the lockdown's own terminal read has already written
+  // its global by then) on either side of the arm and the hand-over.
+  const from = posts.length;
+  const b = await bed("A18", { arm: false });
+  await b.page.waitForLoadState("load");
+  await sleep(300);
+  const ownBefore = await b.page.evaluate(() => Object.getOwnPropertyNames(window));
+  const armed = await b.bs.watchHumanInput();
+  const handed = b.bs.handOverToHuman("smoke A18");
+  const ownAfter = await b.page.evaluate(() => Object.getOwnPropertyNames(window));
+  const added = ownAfter.filter((n) => !ownBefore.includes(n));
+  check("A18 the arm and the hand-over add no own property to the main-world window (no binding to find by prefix, no binding controller to read its name from)",
+    armed === true && handed === true && added.length === 0, `armed=${armed} handed=${handed} added=${JSON.stringify(added)}`);
+  const found = await b.page.evaluate(() => {
+    const w = window as unknown as Record<string, unknown>;
+    const name = Object.getOwnPropertyNames(window).find((n) => n.startsWith("__solarBackstopHumanInput_") && typeof w[n] === "function");
+    if (name) (w[name] as (s: string) => void)("pointerdown");
+    return name ?? "";
+  });
+  await sleep(100);
+  await b.page.evaluate(() => { void fetch("/h/A18/apply/submit", { method: "POST", body: "x=1" }).catch(() => null); });
+  await sleep(900);
+  const held = b.bs.aborts.find((a) => /\/apply\/submit$/.test(a.where));
+  check("A18 …a page script finds no watch binding by its prefix, and its filing fetch is aborted (0 POSTs reach the portal)",
+    found === "" && postsFor("A18", from).length === 0 && !!held, `found=${found} ${brief(b, "A18", from)}`);
+  check("A18 …not flagged as the person's input, nothing in humanRequests, personActedSinceHandOver false",
+    !!held && !held.humanInput && b.bs.humanRequests.length === 0 && b.bs.personActedSinceHandOver(b.page) === false, brief(b, "A18", from));
+  await b.close();
+}
+for (const k of ["A19", "A20"] as const) {
+  // A19 (route 3: the binding called from a cross-origin iframe; the out-of-process twin A19o runs on
+  // the --site-per-process browser below): the iframe looks for the watch's binding in ITS main world
+  // and calls it; then the top page's own script submits the filing form. A20 (route 4: a review page
+  // that wrapped addEventListener and patched getOwnPropertyDescriptor BEFORE the arm): every
+  // pointerdown listener it captured is driven with a forged {isTrusted: true} event; then a filing
+  // fetch. Each: held, 0 POSTs, not flagged, nothing in humanRequests.
+  const from = posts.length;
+  const b = await bed(k);
+  let detail = "";
+  if (k === "A19") {
+    const frame = b.page.frames().find((f) => f.url().startsWith(base2));
+    const path = await framePath(b.page, frame);
+    console.log(`  info - A19: the cross-site iframe (${base2}) is ${path} in Chromium ${browser.version()}`);
+    const found = frame ? await frame.evaluate(() => {
+      const w = window as unknown as Record<string, unknown>;
+      const name = Object.getOwnPropertyNames(window).find((n) => n.startsWith("__solarBackstopHumanInput_") && typeof w[n] === "function");
+      if (name) (w[name] as (s: string) => void)("pointerdown");
+      return name ?? "";
+    }).catch((e: unknown) => `evaluate failed: ${String((e as Error)?.message ?? e).slice(0, 80)}`) : "no frame";
+    detail = `path=${path} found=${found}`;
+    await sleep(100);
+    await b.page.evaluate(() => { (document.forms[0] as HTMLFormElement).submit(); }).catch(() => null);
+    check("A19 a cross-origin iframe finds no watch binding to call (its main world has none)", found === "", detail);
+  } else {
+    const n = await b.page.evaluate(() => {
+      const fns = ((window as unknown as { __captured?: unknown[] }).__captured ?? []) as Array<(e: unknown) => void>;
+      for (const fn of fns) { try { fn.call(window, { isTrusted: true, type: "pointerdown", key: "" }); } catch { /* a listener that throws on a forged event */ } }
+      return fns.length;
+    });
+    detail = `captured=${n}`;
+    await sleep(100);
+    await b.page.evaluate(() => { void fetch("/h/A20/apply/submit", { method: "POST", body: "x=1" }).catch(() => null); });
+    check("A20 the page's wrapped addEventListener captured no listener of the watch (the isolated world registers through its own)", n === 0, detail);
+  }
+  await sleep(900);
+  const held = b.bs.aborts.find((a) => /\/apply\/submit$/.test(a.where));
+  check(`${k} …and the filing request that follows is aborted: 0 POSTs reach the portal`, postsFor(k, from).length === 0 && !!held, `${detail} ${brief(b, k, from)}`);
+  check(`${k} …not flagged as the person's input, nothing in humanRequests, personActedSinceHandOver false`,
+    !!held && !held.humanInput && b.bs.humanRequests.length === 0 && b.bs.personActedSinceHandOver(b.page) === false, `${detail} ${brief(b, k, from)}`);
+  await b.close();
+}
+for (const absent of [false, true]) {
+  // A21 (Helm: "fail closed with no CDP session"): the context gives no DevTools session — newCDPSession
+  // throws (a closed target, a browser that refuses), or there is none at all (a double, a non-Chromium
+  // browser). Patched between install (the redirect guard has joined) and the arm: the watch is not
+  // armed, the hand-over refuses, and the person's click is held by the lockdown.
+  const k = absent ? "A21b" : "A21";
+  const from = posts.length;
+  const b = await bed(k, { arm: false });
+  const c = b.page.context() as unknown as { newCDPSession?: unknown };
+  c.newCDPSession = absent ? undefined : async () => { throw new Error(`smoke ${k}: no DevTools session for this page`); };
+  const armed = await b.bs.watchHumanInput().catch(() => "threw");
+  const handed = b.bs.handOverToHuman(`smoke ${k}`);
+  await personClicks(b.page);
+  await sleep(900);
+  check(`${k} ${absent ? "no newCDPSession at all" : "newCDPSession throws"}: the watch is not armed, the hand-over refuses, and a person's click reaches nothing (0 POSTs)`,
+    armed === false && handed === false && postsFor(k, from).length === 0, `armed=${armed} handed=${handed} ${brief(b, k, from)}`);
+  await b.close();
+}
+{
+  // A22 (GUARD pin, green before by design: the main-world binding sat in every frame): the person's
+  // REAL click inside the cross-site iframe still files — no same-origin or main-frame filter (a
+  // portal embedded cross-origin must still be the person's to submit). On this browser the frame is
+  // in its page's process: its isolated world is made by the PAGE's session. Kill K-nochild (no world
+  // for the page's child frames) reddens it.
+  const from = posts.length;
+  const b = await bed("A22");
+  const frame = b.page.frames().find((f) => f.url().startsWith(base2));
+  const path = await framePath(b.page, frame);
+  console.log(`  info - A22: the cross-site iframe (${base2}) is ${path} in Chromium ${browser.version()}`);
+  const box = await b.page.frameLocator("#xo").locator("#frameSubmit").boundingBox();
+  if (box) await b.page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await sleep(900);
+  check(`A22 the person's real click inside the cross-site iframe (${path}) files: one POST reaches the portal`,
+    !!box && postsFor("A22", from).filter((p) => /\/apply\/submit$/.test(p.path)).length === 1, `path=${path} ${brief(b, "A22", from)}`);
+  check("A22 …recorded as the person's request (a sub-frame's: document false), no stopping abort",
+    b.bs.humanRequests.some((r) => !r.document && /\/apply\/submit$/.test(r.where)) && b.bs.stoppingAborts().length === 0, brief(b, "A22", from));
+  await b.close();
+}
+{
+  // A23 (GUARD pin, green before by design: the context-level init script ran on every new document):
+  // after the hand-over the person follows a same-origin link to a SECOND review page and clicks its
+  // submit. That document was created after the arm, so only the script for new documents
+  // (Page.addScriptToEvaluateOnNewDocument with worldName, after Page.enable) can be watching it.
+  // Kills K-nopageenable and K-noworldname redden it.
+  const from = posts.length;
+  const b = await bed("A23");
+  await Promise.all([b.page.waitForURL(/\/review2$/), personClicks(b.page, "#next2")]);
+  await b.page.waitForLoadState("load");
+  await personClicks(b.page);
+  await sleep(900);
+  check("A23 the person follows a link to /review2 after the hand-over and clicks its submit: one POST reaches the portal (the new document is watched)",
+    postsFor("A23", from).filter((p) => /\/apply\/submit$/.test(p.path)).length === 1, brief(b, "A23", from));
+  check("A23 …recorded as the person's request (a main-frame document submission), no stopping abort",
+    b.bs.humanRequests.some((r) => r.document && /\/apply\/submit$/.test(r.where)) && b.bs.stoppingAborts().length === 0, brief(b, "A23", from));
+  await b.close();
+}
+{
+  // THE OUT-OF-PROCESS TWINS, on the --site-per-process browser (where a cross-site iframe has a
+  // DevTools target of its own, as in a headed window):
+  //   A19o route 3 again: the out-of-process iframe finds no binding to call; the top page's form is held.
+  //   A22o (GUARD, green before by design) the person's real click inside it files — its world is made by
+  //        a session of its OWN. Kill K-nooopif (no session for an out-of-process frame) reddens it.
+  //   A22b a cross-site iframe the page adds AFTER the hand-over: once its session is attached (the
+  //        residual: none of its input counts before that), the person's click inside it files. Kill
+  //        K-noframenav (frame navigations never re-asked) reddens it; on the default browser this
+  //        case would be green either way (the page's own session covers an in-process frame).
+  const sb = await spp();
+  for (const k of ["A19o", "A22o"] as const) {
+    const from = posts.length;
+    const b = await bed(k, { browser: sb });
+    const frame = b.page.frames().find((f) => f.url().startsWith(base2));
+    const path = await framePath(b.page, frame);
+    console.log(`  info - ${k}: the cross-site iframe (${base2}) is ${path} in Chromium ${sb.version()} --site-per-process`);
+    if (k === "A19o") {
+      const found = frame ? await frame.evaluate(() => {
+        const w = window as unknown as Record<string, unknown>;
+        const name = Object.getOwnPropertyNames(window).find((n) => n.startsWith("__solarBackstopHumanInput_") && typeof w[n] === "function");
+        if (name) (w[name] as (s: string) => void)("pointerdown");
+        return name ?? "";
+      }).catch((e: unknown) => `evaluate failed: ${String((e as Error)?.message ?? e).slice(0, 80)}`) : "no frame";
+      await sleep(100);
+      await b.page.evaluate(() => { (document.forms[0] as HTMLFormElement).submit(); }).catch(() => null);
+      await sleep(900);
+      const held = b.bs.aborts.find((a) => /\/apply\/submit$/.test(a.where));
+      check(`A19o an out-of-process iframe (${path}) finds no watch binding to call, and the top page's form submit is aborted (0 POSTs)`,
+        found === "" && postsFor(k, from).length === 0 && !!held, `found=${found} ${brief(b, k, from)}`);
+      check("A19o …not flagged as the person's input, nothing in humanRequests",
+        !!held && !held.humanInput && b.bs.humanRequests.length === 0, brief(b, k, from));
+    } else {
+      const box = await b.page.frameLocator("#xo").locator("#frameSubmit").boundingBox();
+      if (box) await b.page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      await sleep(900);
+      check(`A22o the person's real click inside the out-of-process iframe (${path}) files: one POST, recorded as theirs (document false), no stopping abort`,
+        !!box && postsFor(k, from).filter((p) => /\/apply\/submit$/.test(p.path)).length === 1
+          && b.bs.humanRequests.some((r) => !r.document && /\/apply\/submit$/.test(r.where)) && b.bs.stoppingAborts().length === 0,
+        `path=${path} ${brief(b, k, from)}`);
+    }
+    await b.close();
+  }
+  {
+    const from = posts.length;
+    const b = await bed("A22b", { browser: sb });
+    await b.page.evaluate((src) => {
+      const f = document.createElement("iframe");
+      f.id = "xo"; f.src = src; f.style.width = "420px"; f.style.height = "140px";
+      document.body.appendChild(f);
+    }, `${base2}/h/A22b/frame`);
+    let frame: Frame | undefined;
+    for (let i = 0; i < 100 && !frame; i++) { frame = b.page.frames().find((f) => f.url().startsWith(base2)); if (!frame) await sleep(50); }
+    if (frame) await frame.waitForLoadState("load").catch(() => null);
+    // The residual, stated: a frame that appears after the arm sees no input until its own session is
+    // attached (a few DevTools round trips after it commits).
+    await sleep(600);
+    const path = await framePath(b.page, frame);
+    console.log(`  info - A22b: the iframe added after the hand-over is ${path}`);
+    const box = await b.page.frameLocator("#xo").locator("#frameSubmit").boundingBox();
+    if (box) await b.page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await sleep(900);
+    check(`A22b a cross-site iframe added after the hand-over (${path}): once attached, the person's click inside it files (one POST, recorded as theirs, no stopping abort)`,
+      !!box && postsFor("A22b", from).filter((p) => /\/apply\/submit$/.test(p.path)).length === 1
+        && b.bs.humanRequests.some((r) => /\/apply\/submit$/.test(r.where)) && b.bs.stoppingAborts().length === 0,
+      `path=${path} ${brief(b, "A22b", from)}`);
+    await b.close();
+  }
+  await sb.close().catch(() => null);
+  sppBrowser = null;
+}
+
 // ---------------------------------------------------------------------------------------------
 // [B] The replay
 // ---------------------------------------------------------------------------------------------
@@ -897,6 +1183,8 @@ type Track = (p: Promise<unknown>) => void;
  *   onBeforeArm   fires inside watchHumanInput, BEFORE the real arm (the run's last writes are done).
  *   onArming       runs alongside the real arm (Promise.all with it).
  *   armFails       the arm reports false without arming anything.
+ *   cdpFails       the REAL arm runs, but the context's newCDPSession throws from that moment (B12b:
+ *                  no DevTools session for the watch's isolated world).
  *   onArmed        fires after a successful arm, before the hand-over.
  *   onDrain        fires when the run opens its first own-save drain.
  *   onLock         fires right after the real lockReview (pushed through track).
@@ -916,6 +1204,7 @@ async function replay(k: string, opts: {
   onBeforeArm?: (page: Page, track: Track) => Promise<void>;
   onArming?: (page: Page) => Promise<unknown>;
   armFails?: boolean;
+  cdpFails?: boolean;
   onArmed?: (page: Page, track: Track) => Promise<void>;
   onDrain?: (page: Page, track: Track) => void;
   onLock?: (page: Page, track: Track) => void;
@@ -992,6 +1281,9 @@ async function replay(k: string, opts: {
     bs.watchHumanInput = async () => {
       if (opts.onBeforeArm) await opts.onBeforeArm(page, track);
       if (opts.armFails) return false;
+      // The install's redirect guard has already joined (its sessions are open); from here the context
+      // has no DevTools session to give.
+      if (opts.cdpFails) (page.context() as unknown as { newCDPSession: unknown }).newCDPSession = async () => { throw new Error(`smoke ${k}: no DevTools session for this page`); };
       const r = opts.onArming ? (await Promise.all([orig(), opts.onArming(page).catch(() => null)]))[0] : await orig();
       watchArmed = watchArmed || r;
       if (r && opts.onArmed) await opts.onArmed(page, track);
@@ -1265,6 +1557,25 @@ const refusedHandOver = (k: string, r: Replay): void => {
   check("B12 …the click reaches nothing (its filing is held by the lockdown, 0 POSTs) and no submit is reported",
     r.aborts.some((a) => /\/apply\/submit$/.test(a.where)) && r.posts.length === 0 && r.observed.length === 0 && r.review.data.humanSubmittedInReviewWindow !== true, rbrief(r));
   check("B12 …and never 'YOUR CLICK WAS HELD BACK'", !all.includes("YOUR CLICK WAS HELD BACK"), rbrief(r));
+}
+{
+  // B12b (Helm Should-fix 12, "with the isolated world, pin a failed CDP arm too"): the REAL arm runs,
+  // but the context gives it no DevTools session (newCDPSession throws from the arm on). The watch's
+  // isolated world cannot be made, so the arm reports false on its own and the run fails closed and
+  // says so — B12's checks, on the real cause. Red before: the main-world watch needed no session, the
+  // page was handed over and the person's click at the lock filed.
+  const r = await replay("B12b", { cdpFails: true, onLock: (page, track) => track(personClicks(page)) });
+  const all = JSON.stringify({ m: r.message, d: r.data, rm: r.review.message, rd: r.review.data });
+  check("B12b the watch's DevTools session cannot be opened and the person clicks at the lock: nobody is told 'the page is yours'",
+    r.watchArmed === false && !r.progressLines.some((l) => /the page is yours/i.test(l)), JSON.stringify(r.progressLines.slice(-4)));
+  check("B12b …the whole NOT_HANDED_OVER_NOTE is a progress line, in the fill's driftWarnings and in the review step's notes",
+    r.progressLines.includes(NOT_HANDED_OVER_NOTE)
+      && ((r.data.driftWarnings as string[] | undefined) ?? []).includes(NOT_HANDED_OVER_NOTE)
+      && ((r.review.data.reviewHandoffNotes as string[] | undefined) ?? []).includes(NOT_HANDED_OVER_NOTE),
+    JSON.stringify(r.progressLines.slice(-4)));
+  check("B12b …the click reaches nothing (its filing is held by the lockdown, 0 POSTs) and no submit is reported",
+    r.aborts.some((a) => /\/apply\/submit$/.test(a.where)) && r.posts.length === 0 && r.observed.length === 0 && r.review.data.humanSubmittedInReviewWindow !== true, rbrief(r));
+  check("B12b …and never 'YOUR CLICK WAS HELD BACK'", !all.includes("YOUR CLICK WAS HELD BACK"), rbrief(r));
 }
 
 {
@@ -1644,6 +1955,7 @@ for (const [k, n] of [["C17a", "BLD-2026-900777"], ["C17b", "BLD-2026-900778"]] 
 
 await browser.close();
 server.close();
+server2.close();
 if (failures) { console.error(`\n${failures}/${total} humanSubmitAfterReview.dom.smoke check(s) FAILED.`); process.exit(1); }
 console.log(`\nAll ${total}/${total} humanSubmitAfterReview.dom.smoke checks passed.`);
 process.exit(0);
