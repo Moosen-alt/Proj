@@ -103,6 +103,7 @@ import { claimSignatureRequestApproval, runningJobSignatureRequestApprovalId } f
 import { deleteProjectInfoPages } from "./infoPages";
 import { nemSignatureState, nemStageIsResume } from "./signatureTrack";
 import { siteKey } from "../../portal-bot/src/draftCreated";
+import { safeRecordLink } from "../../portal-bot/src/adapters/submissionLedger";
 import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, type HostFit, type PortalUrlSource } from "./portalChannel";
 import { isPortalPaused } from "./portalPause";
 // The ONE creator of permit_check_targets rows (extracted from markTrackSubmitted).
@@ -6359,6 +6360,8 @@ export function createPermitCheckTarget(
 //     project's own org scope is the /api/projects/:id guard's. Never 403.
 //   · rule 5 — the same predicate and message as creation (refuseUtilityUrlOnPermitTarget), judged
 //     by the row's own kind (trackKind); and a non-empty URL that is not http(s) is refused.
+//   · links — every URL written goes through safeRecordLink first, so a pasted session query string
+//     is never stored (the ids that make the record readable are kept).
 //   · identity — an edit that writes the numbers must leave an application or a permit number, or
 //     it is refused (clearing one never orphans the row).
 //   · cadence — a frequency change recomputes next_check_at the way a reading does (effectiveCheckDays).
@@ -6385,9 +6388,19 @@ export function updatePermitCheckTarget(
   if (!row) throw new HttpError(404, "Permit check target not found.");
 
   const str = (v: unknown): string | undefined => (v === undefined || v === null ? undefined : String(v).trim());
+  // A URL pasted on the card is stored the way a captured record link is (safeRecordLink: origin +
+  // path + the record's own ids, never a session token, only http(s)). "" clears it; a non-empty
+  // paste that comes back empty is not a web address and is refused.
+  const link = (v: unknown): string | undefined => {
+    const raw = str(v);
+    if (!raw) return raw;
+    const safe = safeRecordLink(raw);
+    if (!safe) throw new HttpError(400, "A portal or status URL must be a web address starting with http:// or https://.");
+    return safe;
+  };
   const next = {
-    portal_url: str(input.portalUrl) ?? text(row.portal_url),
-    tracking_url: str(input.trackingUrl) ?? text(row.tracking_url),
+    portal_url: link(input.portalUrl) ?? text(row.portal_url),
+    tracking_url: link(input.trackingUrl) ?? text(row.tracking_url),
     application_number: str(input.applicationNumber) ?? text(row.application_number),
     permit_number: str(input.permitNumber) ?? text(row.permit_number),
     portal_name: str(input.portalName) ?? text(row.portal_name),
@@ -6395,14 +6408,6 @@ export function updatePermitCheckTarget(
   // Only the URLs this edit WRITES are judged: a legacy row already holding a refused URL must still
   // be retired (active:false) or have that URL cleared, not be frozen by its own bad value.
   const urlsWritten = [input.portalUrl === undefined ? "" : next.portal_url, input.trackingUrl === undefined ? "" : next.tracking_url];
-  for (const url of urlsWritten) {
-    if (!url) continue; // clearing a URL is allowed
-    let protocol = "";
-    try { protocol = new URL(url).protocol; } catch { /* not a URL at all */ }
-    if (protocol !== "http:" && protocol !== "https:") {
-      throw new HttpError(400, "A portal or status URL must be a web address starting with http:// or https://.");
-    }
-  }
   refuseUtilityUrlOnPermitTarget(trackKind(text(row.target_type), text(row.permit_type)), ...urlsWritten);
   const numbersWritten = input.applicationNumber !== undefined || input.permitNumber !== undefined;
   if (numbersWritten && !next.application_number && !next.permit_number) {

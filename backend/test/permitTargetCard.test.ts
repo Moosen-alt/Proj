@@ -154,10 +154,12 @@ await check("MUST PASS: Record on the electrical card posts the electrical targe
 });
 await check("MUST EXCLUDE: it is never the project's first target, and the paste box's numbers are not stamped on it", async () => {
   L.posted.length = 0;
-  L.state.permitFormFor = "p-1|t-str";
+  // The paste form is synced to THIS card's filing, with other numbers typed in it: only the card
+  // guard (fromCard) keeps those numbers off the reading.
+  L.state.permitFormFor = "p-1|t-elec";
   L.elements.permitStatusTarget = { value: "t-str" }; // the separate selector still names the FIRST filing
-  L.elements.permitApplicationNumber = { value: "519-26-001665-STR" };
-  L.elements.permitTrackingNumber = { value: "519-26-001665-STR" };
+  L.elements.permitApplicationNumber = { value: "519-26-009999-TYPED" };
+  L.elements.permitTrackingNumber = { value: "519-26-009999-TYPED" };
   L.handlePermitTargetClick(fakeCard("t-elec", "fees_due"));
   await flush();
   const post = L.posted.find((p) => p.url === "/api/projects/p-1/permit-checks");

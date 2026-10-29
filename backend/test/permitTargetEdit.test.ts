@@ -95,6 +95,8 @@ await check("audit: ONE permit_target.edited row naming the changed fields — n
   assert.deepEqual(details.fields, ["portalUrl", "portalName"], "frequency 7 = the stored 7, so it is not a change");
   assert.equal(details.targetId, elec.id);
   assert.ok(!rows[0].details.includes("SECRET-TOKEN") && !rows[0].details.includes("accela"), `a value reached the audit: ${rows[0].details}`);
+  assert.ok(!String(rowOf(elec.id).portal_url).includes("SECRET-TOKEN"), `the session token was stored: ${rowOf(elec.id).portal_url}`);
+  assert.equal(rowOf(elec.id).portal_url, ACCELA, "the record's own ids are kept");
   assert.equal(rows[0].actor_type, "human");
   assert.equal(rows[0].actor_name, "owner@test");
 });
