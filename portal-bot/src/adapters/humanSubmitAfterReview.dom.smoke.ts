@@ -63,11 +63,16 @@
 //   Both are GUARD pins, green before by design (the isTrusted filter and HUMAN_INPUT_MS landed with the
 //   watch); they hold those two lines through the isolated-world rewrite (Should-fix 1), which must
 //   re-run them. Each names its kill:
-//     A15 a page script dispatches a synthetic pointerdown, mousedown and keydown Enter on the submit,
-//         then (100 ms later, a separate evaluate, so the kill cannot lose a race to the request) sends
-//         a filing fetch: aborted, 0 POSTs, the abort NOT flagged humanInput, nothing in humanRequests,
-//         personActedSinceHandOver false. Kill K-trusted: HUMAN_INPUT_SCRIPT's
-//         `if (!e || !e.isTrusted) return;` becomes `if (!e) return;`.
+//     A15 a page script dispatches every type the watch listens for — a synthetic pointerdown,
+//         mousedown, keydown Enter and touchstart (a plain Event typed touchstart: desktop Chromium has
+//         no TouchEvent constructor without hasTouch) — on the submit, then (100 ms later, a separate
+//         evaluate, so the kill cannot lose a race to the request) sends a filing fetch: aborted,
+//         0 POSTs, the abort NOT flagged humanInput, nothing in humanRequests, personActedSinceHandOver
+//         false. Kills: K-trusted (HUMAN_INPUT_SCRIPT's `if (!e || !e.isTrusted) return;` becomes
+//         `if (!e) return;`), and one per type, M-touch / M-pointer / M-mouse / M-key (the filter
+//         waived for that type only: `if (!e || (!e.isTrusted && e.type !== "touchstart")) return;`
+//         and likewise "pointerdown", "mousedown", "keydown"), so a rewrite that loses the filter on
+//         any single type reddens A15.
 //     A16 a person's touch (sends nothing), then a page script's filing POST 4.5 s later: aborted (the
 //         4 s bound), 0 POSTs, NOT flagged humanInput, nothing in humanRequests — and the touch WAS
 //         counted: personActedSinceHandOver(page) (no withinMs) is still true. Kills: K-10s
@@ -79,7 +84,10 @@
 //     portal, recorded in humanRequests as the person's); K-10s reddens A16's abort and not-flagged
 //     checks (2/41: the POST reached the portal; A10/A11 stay green, their hop carries the verdict);
 //     K-bound reddens A16's "counted" check (1/41). K-bound was not run on [B] (personMovedOn reads the
-//     same method).
+//     same method). A15 with touchstart, re-measured on the same trim from the smoke at b6adf660 plus the
+//     touchstart dispatch (green 41/41 at b6adf660 and on the parent 3ab2827d): K-trusted, M-touch,
+//     M-pointer, M-mouse and M-key each redden A15 x3 (3/41, nothing else). Without the touchstart
+//     dispatch (the smoke as committed at b6adf660), M-touch stayed green 41/41: that was the gap.
 //   [B] THE REPLAY (RecipeAdapter, guided manual: no approval, the flagged final submit never clicked):
 //     B1  the person clicks the portal's submit the moment the run hands the page over: the POST
 //         reaches the portal, the run is NOT failed, and it reports the person's submit; the
@@ -782,8 +790,9 @@ console.log("\n[A, #370] A REDIRECT HOP CARRIES THE FIRST LEG'S PERSON VERDICT")
   await b.close();
 }
 {
-  // A15 (Helm Should-fix 9, GUARD pin, kill K-trusted): only a TRUSTED event is a person's input. A page
-  // script dispatches pointerdown, mousedown and keydown Enter on the submit (never a synthetic click:
+  // A15 (Helm Should-fix 9, GUARD pin, kills K-trusted and M-touch/M-pointer/M-mouse/M-key): only a
+  // TRUSTED event is a person's input. A page script dispatches every type the watch listens for —
+  // pointerdown, mousedown, keydown Enter and touchstart — on the submit (never a synthetic click:
   // Chromium runs a button's activation on that, which would make this a document POST), then sends a
   // filing fetch. The two evaluates are 100 ms apart so that, with the filter killed, the binding's
   // stamp lands before the fetch is judged — the kill measures the filter, not a race.
@@ -795,12 +804,15 @@ console.log("\n[A, #370] A REDIRECT HOP CARRIES THE FIRST LEG'S PERSON VERDICT")
     el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true }));
     el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
     el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    // touchstart is the watch's fourth type. Desktop Chromium has no TouchEvent constructor without
+    // hasTouch, but a plain Event typed touchstart reaches the listener, untrusted as a page's would be.
+    el.dispatchEvent(new Event("touchstart", { bubbles: true, cancelable: true }));
   });
   await sleep(100);
   await b.page.evaluate(() => { void fetch("/h/A15/apply/submit", { method: "POST", body: "x=1" }).catch(() => null); });
   await sleep(900);
   const held = b.bs.aborts.find((a) => /\/apply\/submit$/.test(a.where));
-  check("A15 a page's synthetic pointerdown, mousedown and Enter, then a filing fetch: aborted, 0 POSTs reach the portal",
+  check("A15 a page's synthetic pointerdown, mousedown, Enter and touchstart, then a filing fetch: aborted, 0 POSTs reach the portal",
     postsFor("A15", from).length === 0 && !!held, brief(b, "A15", from));
   check("A15 …and the abort is NOT flagged as the person's input", !!held && !held.humanInput, brief(b, "A15", from));
   check("A15 …nothing in humanRequests, and personActedSinceHandOver is false (the synthetic events were never the person's)",
