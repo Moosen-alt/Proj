@@ -89,7 +89,7 @@ import { batteryControlKind, batteryControlOfStep, batteryDeclarationAnswer, par
 import { imageToPdfBytes, shouldConvertToPdf } from "../imageToPdf";
 import { removeUploadStaging, uploadPayloadFor, type PreparedUpload } from "./uploadPayload";
 import { attachmentTypeFor, isDocumentTypeList } from "./attachmentTypes";
-import { cleanRecordLink, readApplicationLedgerInPage, type LedgerEntry } from "./submissionLedger";
+import { chooseSubmittedRecord, cleanRecordLink, readApplicationLedgerInPage, recordLinkForNumberInPage, type LedgerEntry } from "./submissionLedger";
 import { exactUploadDocType, fileTypeAllowed, UPLOAD_LABEL_PATTERNS, uploadForbidsSubstitute } from "./autoLearnAdapter";
 import { reviewComparison, scrapeReviewScreen as scrapeReviewScreenShared, utilityIdentifiersEnteredBySteps, type ReviewMismatch } from "../reviewScreenScraper";
 import { controlReadsUnanswered, pinEmptyRequiredControl, PINNED_CONTROL_ATTR, SWEPT_BLANK_ATTR, sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
@@ -679,6 +679,80 @@ export function isArrayAdderClick(step: RecipeStep | undefined): boolean {
   return [sel.css, ...(sel.fallbacks ?? []).map((f) => f.css)].some((c) => /data-test-role=["']?add-array-btn\b/i.test(String(c ?? "")));
 }
 
+/** The words a PV-array row labels its own controls with (ROW_FIELD_HOOKS' names, the learner's
+ *  humanised hook, the plan-set words). Read only from a step that names no other section. */
+const ROW_CONTROL_WORDS = /^(qty|quantity|(pv\s*)?array\s*quantity|module\s*quantity|manufacturer|make|model|tilt|azimuth|tracking)$/i;
+/** A row-owned field: array<N>* (array2ModuleQuantity, array3ModuleManufacturer…) and the module
+ *  make/model every row files, as the merge binds them (moduleModelCertified for the portal's own
+ *  certified wording). */
+const ROW_FIELD = /^(array\d+[A-Z]\w*|moduleMake|moduleModel|moduleModelCertified)$/;
+const ROW_HOOK_ROLES = new Set(Object.values(ROW_FIELD_HOOKS).map((h) => h.role));
+
+/** Which PV-array row a recorded step names, 0 when it names none: its field's array number, its
+ *  section ("PV Array 3"), or a row hook css with an nth (nth 1 = row 2). */
+function recordedArrayRow(step: RecipeStep): number {
+  const f = /^array(\d+)[A-Z]/.exec(String(step.field ?? ""));
+  if (f) return Number(f[1]);
+  const s = /\bpv\s*array\s*#?\s*(\d+)\b/i.exec(String(step.fingerprint?.section ?? ""));
+  if (s) return Number(s[1]);
+  const sel = step.selector ?? {};
+  for (const x of [sel, ...(sel.fallbacks ?? [])]) {
+    const role = /data-test-role=["']?([\w-]+)/i.exec(String(x.css ?? ""))?.[1] ?? "";
+    if (role && ROW_HOOK_ROLES.has(role) && typeof x.nth === "number") return x.nth + 1;
+  }
+  return 0;
+}
+
+/** Does this recorded write name a PV-array row's own control (Qty / make / model / tilt / azimuth
+ *  / tracking)? By its field, a row hook, a "PV Array" section, or — when its section names no
+ *  OTHER one (the inverter's "Manufacturer" sits in "Inverter") — the row's own words. */
+function isArrayRowControl(step: RecipeStep): boolean {
+  if (step.action !== "fill" && step.action !== "select") return false;
+  if (ROW_FIELD.test(String(step.field ?? ""))) return true;
+  const sel = step.selector ?? {};
+  const all = [sel, ...(sel.fallbacks ?? [])];
+  if (all.some((x) => {
+    const role = /data-test-role=["']?([\w-]+)/i.exec(String(x.css ?? ""))?.[1] ?? "";
+    return ROW_HOOK_ROLES.has(role) || /^pv-array-/i.test(role);
+  })) return true;
+  const section = String(step.fingerprint?.section ?? "").trim();
+  // No \b after "array": the legend's text runs into its own button ("PV ArrayDelete Array").
+  if (section) return /\bpv\s*array/i.test(section);
+  const words = [...all.flatMap((x) => [x.name, x.label, x.placeholder, x.text]), step.fingerprint?.ariaLabel, step.fingerprint?.placeholder,
+    String(step.note ?? "").replace(/^human-patch\s*:?\s*/i, "")];
+  return words.some((w) => ROW_CONTROL_WORDS.test(String(w ?? "").replace(/\s+/g, " ").trim()));
+}
+
+const isHumanPatch = (step: RecipeStep | undefined): boolean => /^human-patch\b/i.test(String(step?.note ?? ""));
+
+/**
+ * #386 — THE HAND-PATCHED PV-ARRAY ROW WRITES A REPLAY MUST NOT REPEAT, by step index, each with
+ * why (for the run's notes). Live (PacifiCorp, 2026-10-21) the owner added rows 2–4 at review;
+ * patch-by-demonstration recorded the two "Add Array" clicks (#382 stops those replaying) AND the
+ * Qty / make / model typed into the new rows. Replayed, those are the LEARN project's numbers
+ * aimed at bare "Qty" / "Manufacturer" labels: a Qty of "5" (two of that project's arrays) lands
+ * on row 1 or the inverter's Qty, and on a one-array project rows 2–3 do not exist at all. The
+ * rows a project needs are its own data — row mode fills every one from the project's arrays —
+ * so a human-patched step counts when it writes a row control
+ *   - of a row past the first (array2*, "PV Array 3", a row hook's nth), or
+ *   - anywhere after a recorded "Add Array" click in the same human-patched run of steps.
+ * Row 1's own fixes and every other control replay as before. Read at replay, not dropped at the
+ * merge: recipes already saved hold these steps.
+ */
+export function handPatchedArrayRowSteps(steps: RecipeStep[]): Map<number, string> {
+  const out = new Map<number, string>();
+  let adderAt = -1; // the recorded adder click this human-patched run follows, -1 when none
+  steps.forEach((s, i) => {
+    if (isArrayAdderClick(s)) { adderAt = i; return; }
+    if (!isHumanPatch(s)) { adderAt = -1; return; }
+    if (!isArrayRowControl(s)) return;
+    const row = recordedArrayRow(s);
+    if (row >= 2) out.set(i, `it writes PV array row ${row}`);
+    else if (adderAt >= 0) out.set(i, `it writes a PV array row after the recorded "Add Array" click (step ${adderAt + 1})`);
+  });
+  return out;
+}
+
 /** The recorded control of a write step as an id css (#362): its `#id` selector, an `[id=…]` one, or
  *  its fingerprint id. "" when the step names no id — then only its own document and view make a
  *  re-assert of it this page's own. */
@@ -1027,6 +1101,9 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  marker) — for every project, one array or several (#382). Per-array steps then run INSIDE their own row container,
    *  never by a page-wide nth. null until the first per-array step decides it. */
   private arrayRowMode: boolean | null = null;
+  /** #386 — the hand-patched row writes this run did not replay (step indices): a later re-assert
+   *  of a blank never runs one of them either. */
+  private handPatchedRowsSkipped = new Set<number>();
   /** The row (1-based) every resolution is scoped to while a row is being filled; 0 = page. */
   private arrayRowScope = 0;
   /** Which project arrays each rendered row holds: [[1],[2],…] by default. A merge (the
@@ -1113,6 +1190,9 @@ export class RecipeAdapter extends BasePortalAdapter {
   private draftSubmitAttempted = false;
   /** The draft the replay's own draft-creating click made, as the page after it read (#330). */
   private draftSubmitOutcome: (ReturnType<typeof readDraftCreated> & { clickedLabel: string; tenantKey: string }) | null = null;
+  /** The account's application list as the sign-in landed on it (openSubmission) — the "before"
+   *  of the person's filing (#400). null when the page could not be read. */
+  private ledgerBefore: LedgerEntry[] | null = null;
   /** The recipe step index the loop is on — the final-submit gate's "is this the terminal step". */
   private currentStepIdx = -1;
   /** The step whose selector resolveLocator is resolving right now (for disambiguation). */
@@ -1247,9 +1327,14 @@ export class RecipeAdapter extends BasePortalAdapter {
     // landed on is read, nothing is clicked. A draft found here is reported (existingDraft) for the
     // backend to record, so the next stage opens THAT draft's next form instead of replaying an
     // application start that would mint a second number for the same house.
+    // The same read is the BEFORE of a person's filing in this window (#400): the row that is new
+    // on the page they are left on is the application they filed.
+    if (this.page && typeof this.page.evaluate === "function") {
+      this.ledgerBefore = (await this.page.evaluate(readApplicationLedgerInPage).catch(() => null)) as LedgerEntry[] | null;
+    }
     const street = String(this.options.siteDraft?.street ?? "").trim();
-    if (street && this.page && typeof this.page.evaluate === "function") {
-      const entries = (await this.page.evaluate(readApplicationLedgerInPage).catch(() => [])) as LedgerEntry[];
+    if (street && this.ledgerBefore) {
+      const entries = this.ledgerBefore;
       const find = findSiteDraft(entries, { ...this.options.siteDraft, street });
       if (find.found || find.ambiguous) {
         const appNo = find.found ? find.entry.id : "";
@@ -1316,6 +1401,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // before this returns: the operator submits by hand in this same page after stopAtReview
     // (armSubmitWatch), and a route left behind would abort the person's own filing.
     this.backstop = await installFilingBackstop(this.page, "replay run").catch(() => null);
+    if (this.backstop?.redirectGuardNote) this.driftWarnings.push(this.backstop.redirectGuardNote);
     try {
       const ran = await this.runAll(project);
       // A dismissed dialog cancelled the approved click: the result says so in data too.
@@ -2125,34 +2211,69 @@ export class RecipeAdapter extends BasePortalAdapter {
       // ProjectId/ProgramId identify the record, not the session — dropping them made the stored
       // link useless (a bare /MvcProjects/EditProject reaches nothing). ONE list: cleanRecordLink
       // (these two lists disagreed until dryrun-0928 B11).
-      const recordLink = cleanRecordLink(rawUrl);
+      // WHICH NUMBER AND WHICH LINK (#400, chooseSubmittedRecord): the link the portal puts on the
+      // number first, then the new row's in the account list, then the cleaned page URL; with no
+      // confident number, the before/after list diff. READ ONLY: both reads look at the page the
+      // person is left on — nothing navigates, clicks or opens a tab to reach a list.
+      const canRead = typeof this.page.evaluate === "function";
+      const page = this.page;
+      const chooseRecord = async (read: { value: string; confidence: "high" | "low"; reason: string }) => {
+        const numberHref = read.value && canRead
+          ? String((await page.evaluate(recordLinkForNumberInPage, read.value).catch(() => "")) || "")
+          : "";
+        const after = canRead ? ((await page.evaluate(readApplicationLedgerInPage).catch(() => null)) as LedgerEntry[] | null) : null;
+        // The site (NEM tracks: siteDraft) holds the one new row to this project's address.
+        return chooseSubmittedRecord({ read, numberHref, before: this.ledgerBefore, after, pageUrl: rawUrl, site: this.options.siteDraft ?? null });
+      };
       // #333 round 4 (Helm Blocking 1): A PAGE AFTER THE PERSON'S OWN CLICK ON A HANDED-OVER REVIEW is
       // judged against the review's own reading (judgeCompletion), never read loosely: the review's
       // own id, a list's numbers, a duplicate's or a validation re-render's are not the filing's. The
       // review (its submit control still there, no number) or Chromium's error page reopens the watch.
+      // #400's list diff and link choice apply on top of that judgement, never in place of it: a new
+      // row in the account list is taken as the filing only on a page judged to be the completion;
+      // on any other page it is offered as a candidate for a person to confirm (a draft lists too).
       if (this.reviewReading) {
         const errorPage = /^chrome-error:/i.test(rawUrl);
-        const page = errorPage ? null : await this.readPageForCapture();
-        const judged = page ? this.judgeCompletion(page, this.lastCommittedClick?.at ?? 0) : { number: "", confirmed: false, stillReview: false };
+        const read = errorPage ? null : await this.readPageForCapture();
+        const judged = read ? this.judgeCompletion(read, this.lastCommittedClick?.at ?? 0) : { number: "", confirmed: false, stillReview: false };
         if (judged.number) {
+          const recordRead = await chooseRecord({ value: judged.number, confidence: "high", reason: "The page after the person's submit names the record." });
           return ok(`Captured submission confirmation: ${judged.number}.`, {
             permitNumber: judged.number, confirmationNumber: judged.number,
-            discipline: judged.number.match(/-([A-Z]{2,4})$/)?.[1] ?? null, recordLink,
+            discipline: judged.number.match(/-([A-Z]{2,4})$/)?.[1] ?? null, recordLink: recordRead.recordLink, recordRead,
           });
         }
-        if (judged.stillReview || errorPage) this.reopenHumanSubmit();
+        if (judged.stillReview || errorPage) {
+          this.reopenHumanSubmit();
+          return ok(
+            errorPage ? "The window shows the browser's error page: nothing recorded, and the submit watch is open again."
+              : "The page still reads as the review page: nothing recorded, and the submit watch is open again.",
+            { permitNumber: "", recordLink: cleanRecordLink(rawUrl), stillReview: judged.stillReview, errorPage },
+          );
+        }
+        const listed = await chooseRecord({ value: "", confidence: "low", reason: "" });
+        const recordRead = listed.confidence === "high" && !judged.confirmed
+          ? {
+            ...listed, recordNumber: "", confidence: "low" as const, source: "none" as const,
+            reason: "One new application appeared in the account's list, but the page after the submit does not read as the application's completion — a person confirms whether it is this filing.",
+            candidates: [{ recordNumber: listed.recordNumber, recordLink: listed.recordLink, source: "account_list" as const }],
+          }
+          : listed;
         return ok(
-          errorPage ? "The window shows the browser's error page: nothing recorded, and the submit watch is open again."
-            : judged.stillReview ? "The page still reads as the review page: nothing recorded, and the submit watch is open again."
-              : judged.confirmed ? "Submitted; no record number found on the completion page yet."
-                : "This page does not read as the application's completion: no record number recorded.",
-          { permitNumber: "", recordLink, stillReview: judged.stillReview, errorPage },
+          recordRead.confidence === "high" ? `Submitted; ${recordRead.recordNumber} is the one new application in the account's list.`
+            : judged.confirmed ? "Submitted; no record number found on the completion page yet."
+              : "This page does not read as the application's completion: no record number recorded.",
+          { permitNumber: "", recordLink: recordRead.recordLink || cleanRecordLink(rawUrl), stillReview: false, errorPage: false, recordRead },
         );
       }
       const read = extractRecordNumber(bodyText);
       const permitNumber = read.value;
       // Accela record suffix encodes the discipline: -STR (structural), -ELE (electrical), etc.
       const discipline = permitNumber.match(/-([A-Z]{2,4})$/)?.[1] ?? null;
+      const recordRead = await chooseRecord(read);
+      const recordLink = permitNumber
+        ? (recordRead.recordNumber === permitNumber ? recordRead.recordLink : recordRead.candidates.find((c) => c.recordNumber === permitNumber)?.recordLink || cleanRecordLink(rawUrl))
+        : recordRead.recordLink || cleanRecordLink(rawUrl);
       const submitted = pageConfirmsSubmission(bodyText);
       if (permitNumber || submitted) {
         return ok(`Captured submission confirmation${permitNumber ? `: ${permitNumber}` : ""}.`, {
@@ -2160,9 +2281,12 @@ export class RecipeAdapter extends BasePortalAdapter {
           confirmationNumber: permitNumber,
           discipline,
           recordLink,
+          recordRead,
         });
       }
-      return ok("Submitted; no record number found on the completion page yet.", { permitNumber: "", recordLink });
+      return ok(recordRead.recordNumber
+        ? `Submitted; ${recordRead.recordNumber} is the one new application in the account's list.`
+        : "Submitted; no record number found on the completion page yet.", { permitNumber: "", recordLink, recordRead });
     } catch (err) {
       return ok(`Confirmation capture skipped: ${err instanceof Error ? err.message : String(err)}`, { permitNumber: "", recordLink: "" });
     }
@@ -2221,13 +2345,17 @@ export class RecipeAdapter extends BasePortalAdapter {
     // this returns — the person clicks the portal's resubmit themselves in this page. A
     // filing/payment abort turns the reopen into a named failure.
     this.backstop = await installFilingBackstop(this.page, "correction reopen").catch(() => null);
+    // #394: the reopen acts on the page login left loaded (it never navigates first) — a page the
+    // redirect guard could not cover is said, never silent.
+    const guardNote = this.backstop?.redirectGuardNote ?? "";
+    if (guardNote) this.driftWarnings.push(guardNote);
     this.backstopReported = 0;
     try {
       const r = await this.reopenSuspendedFilingImpl(applicationNumber);
       await this.backstop?.dispose().catch(() => null);
       const stop = this.backstopStop();
       if (stop) return fail(`${stop} (The reopen then reported: ${String(r.message ?? "").slice(0, 300)})`, { ...(r.data ?? {}), needsHuman: true, driftWarnings: this.driftWarnings, guardRefusals: this.guardRefusals });
-      return r;
+      return guardNote ? { ...r, message: `${String(r.message ?? "")} ${guardNote}`.trim() } : r;
     } finally {
       await this.backstop?.dispose().catch(() => null);
       this.backstop = null;
@@ -2498,9 +2626,13 @@ export class RecipeAdapter extends BasePortalAdapter {
     // several roof planes. Measured: Bren Trask has FOUR arrays (10+3+5+6 = 24 modules) and
     // the recipe learned on him types "10"; Randal Rowland has two (18+5 = 23) and gets 18.
     // A 10.32 kW system was being filed as roughly 4.4 kW.
+    // #386 — hand-patched row writes never replay, so they never stretch the block either (a row-2
+    // Qty the merge bound to array1ModuleQuantity by value would otherwise become its last step).
+    const handPatchedRows = handPatchedArrayRowSteps(this.recipe.steps);
+    const recipeAddsRows = this.recipe.steps.some((s2) => isArrayAdderClick(s2));
     const arrayBound = this.recipe.steps
       .map((s2, i) => ({ s2, i }))
-      .filter(({ s2 }) => /^array1[A-Z]/.test(String(s2.field ?? "")));
+      .filter(({ s2, i }) => /^array1[A-Z]/.test(String(s2.field ?? "")) && !handPatchedRows.has(i));
     this.arrayBlockStart = arrayBound.length ? arrayBound[0].i : -1;
     this.arrayBlockEnd = arrayBound.length ? arrayBound[arrayBound.length - 1].i : -1;
     const slowSteps: Array<{ i: number; action: string; note: string; ms: number; phases?: Record<string, number> }> = [];
@@ -2547,6 +2679,20 @@ export class RecipeAdapter extends BasePortalAdapter {
         if (!this.driftWarnings.includes(why)) this.driftWarnings.push(why);
         trace.push({ i: stepIdx, action: "click", note: String(recordedStep.note ?? "Add Array").slice(0, 52), outcome: "not replayed (rows come from the project's arrays)", page: await currentPageLabel() });
         continue;
+      }
+      // #386 — NOR ARE THE ROW FILLS A PERSON TYPED INTO ROWS THAT CLICK ADDED. They carry the learn
+      // project's numbers to bare row labels; the rows come from the project's arrays (row mode, or
+      // the recorded block's nth pass), which is why they are skipped only where the recipe has that
+      // block AND the rows are added (countable rows, or a recorded adder). Named, never silent.
+      {
+        const why = handPatchedRows.get(stepIdx);
+        if (why && this.arrayBlockStart >= 0 && (this.arrayRowMode === true || recipeAddsRows)) {
+          const label = String(recordedStep.note ?? recordedStep.action).replace(/^human-patch\s*:?\s*/i, "").slice(0, 40) || recordedStep.action;
+          this.driftWarnings.push(`hand-patched step ${stepIdx + 1} ("${label}") not replayed — ${why}; every row is filled from the project's ${this.projectArrayCount()} array(s)`);
+          trace.push({ i: stepIdx, action: String(recordedStep.action), note: String(recordedStep.note ?? "").slice(0, 52), outcome: "not replayed (hand-patched array row; rows come from the project's arrays)", page: await currentPageLabel() });
+          this.handPatchedRowsSkipped.add(stepIdx);
+          continue;
+        }
       }
       const inArrayBlock = this.arrayBlockStart >= 0
         && stepIdx >= this.arrayBlockStart && stepIdx <= this.arrayBlockEnd;
@@ -7611,6 +7757,16 @@ export class RecipeAdapter extends BasePortalAdapter {
    * benefit. `inverterModel` becomes ["inverter","model"], which matches
    * `inverter-model-select` and cannot match `pv-array-model-select`. Every token must
    * appear, so a partial overlap never wins.
+   *
+   * THE RECORDED SECTION OUTRANKS THE SHORTEST HOOK (#380). Tokens say which side, not which
+   * block: an "Existing Inverter" fieldset's `existing-inverter-model-select` carries every token
+   * of `inverterModel` too, and when the real inverter Model has no hook of its own it was the
+   * only hit, so it won. On a new form instance the recorded id is gone, nothing redirects the
+   * write, and the existing system's Model was filled and reported verified. So among the hits,
+   * one in exactly the recorded section wins, then one whose section overlaps it, then one whose
+   * section cannot be read; a hit under a heading that shares nothing with the recorded section
+   * is not the recorded control and is never returned, which leaves the step to the section
+   * rescue. The section is read with resolveBySection's algorithm, which is the learner's.
    */
   private async resolveByTestHook(step: RecipeStep): Promise<unknown | null> {
     if (!this.page || typeof this.page.evaluate !== "function") return null;
@@ -7623,9 +7779,39 @@ export class RecipeAdapter extends BasePortalAdapter {
       .map((t) => (t === "module" ? "array" : t === "pv" ? "array" : t))
       .filter((t) => t.length > 2 && !["the", "certified", "make"].includes(t));
     if (tokens.length < 2) return null;
-    const found = await this.page.evaluate((toks: string[]) => {
+    const want = String(step.fingerprint?.section ?? "").trim();
+    const found = await this.page.evaluate((arg: { toks: string[]; want: string }) => {
+      const toks = arg.toks;
+      const clean = (t: string | null | undefined): string => (t || "").replace(/\s+/g, " ").trim().slice(0, 80);
+      const norm = (t: string): string => clean(t).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      // resolveBySection's sectionOf, verbatim: a section read differently never matches.
+      const sectionOf = (el: Element): string => {
+        const fs = el.closest("fieldset");
+        const legend = fs ? fs.querySelector("legend") : null;
+        if (legend && clean(legend.textContent)) return clean(legend.textContent);
+        const container = el.closest('section, [class*="panel"], [class*="card"], [class*="section"], [class*="form-section"], [class*="block"], [role="group"], [role="region"]');
+        if (container) {
+          const h = container.querySelector('legend, h1, h2, h3, h4, h5, h6, .panel-title, .card-title, .card-header, .section-title, .panel-heading');
+          if (h && clean(h.textContent)) return clean(h.textContent);
+        }
+        let node: Element | null = el;
+        for (let hops = 0; node && hops < 6; hops++) {
+          let sib: Element | null = node.previousElementSibling;
+          while (sib) {
+            if (/^(H[1-6]|LEGEND)$/.test(sib.tagName) && clean(sib.textContent)) return clean(sib.textContent);
+            const inner = sib.querySelector ? sib.querySelector("h1, h2, h3, h4, h5, h6, legend") : null;
+            if (inner && clean(inner.textContent)) return clean(inner.textContent);
+            sib = sib.previousElementSibling;
+          }
+          node = node.parentElement;
+        }
+        return "";
+      };
+      const wantS = norm(arg.want);
       let best: HTMLElement | null = null;
+      let bestTier = -1;
       let bestLen = Infinity;
+      let outside = "";
       for (const el of Array.from(document.querySelectorAll("[data-test-role], [data-testid], [data-test-id]")) as HTMLElement[]) {
         const hook = (el.getAttribute("data-test-role") || el.getAttribute("data-testid") || el.getAttribute("data-test-id") || "")
           .toLowerCase().replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[^a-z]+/g, " ");
@@ -7634,14 +7820,26 @@ export class RecipeAdapter extends BasePortalAdapter {
         // The control itself, or the nearest one this hook wraps.
         const ctl = (el.matches("input, select, textarea") ? el : el.querySelector("input, select, textarea")) as HTMLElement | null;
         if (!ctl) continue;
-        if (hook.length < bestLen) { bestLen = hook.length; best = ctl; }
+        // 3 exact section, 2 overlapping, 1 unreadable (or no section recorded); another section: never.
+        let tier = 1;
+        if (wantS) {
+          const sec = norm(sectionOf(ctl));
+          if (sec === wantS) tier = 3;
+          else if (sec && (sec.includes(wantS) || wantS.includes(sec))) tier = 2;
+          else if (sec) { outside = outside || sectionOf(ctl); continue; }
+        }
+        if (tier > bestTier || (tier === bestTier && hook.length < bestLen)) { bestTier = tier; bestLen = hook.length; best = ctl; }
       }
-      if (!best) return "";
       document.querySelectorAll("[data-rc-hook-hit]").forEach((e) => e.removeAttribute("data-rc-hook-hit"));
+      if (!best) return outside ? `\u0000${outside}` : "";
       best.setAttribute("data-rc-hook-hit", "1");
       return best.closest("[data-test-role], [data-testid], [data-test-id]")?.getAttribute("data-test-role")
         || best.getAttribute("data-test-role") || "hook";
-    }, tokens).catch(() => "") as string;
+    }, { toks: tokens, want }).catch(() => "") as string;
+    if (found.startsWith("\u0000")) {
+      this.resolveTrail.push(`  ...rescue: the only test hook naming ${JSON.stringify(field.slice(0, 30))} sits under ${JSON.stringify(found.slice(1, 35))}, not the recorded section ${JSON.stringify(want.slice(0, 34))} — not taken`);
+      return null;
+    }
     if (!found) return null;
     this.agingNotes.push(
       `"${String(step.note ?? field).slice(0, 34)}" resolved by the portal's own test hook ${JSON.stringify(found.slice(0, 40))} — stabler than the recorded id`,
@@ -7717,10 +7915,15 @@ export class RecipeAdapter extends BasePortalAdapter {
         const r = el.getBoundingClientRect();
         const cs = getComputedStyle(el);
         const shown = r.width > 2 && r.height > 2 && cs.visibility !== "hidden" && cs.display !== "none" && Number(cs.opacity) !== 0;
+        // Then an EXACT label beats one that only contains it (#380): a visible "Existing Model"
+        // ahead of the real "Model" in the same panel tied with it here and, being first, won.
+        // Label exactness outranks visibility too, so a concealed exact namesake comes back as
+        // still concealed (the original is kept) rather than handing the write to a neighbour.
         let score = -1;
-        if (sec === wantS) score = 4;
-        else if (sec.includes(wantS) || wantS.includes(sec)) score = 2;
+        if (sec === wantS) score = 8;
+        else if (sec.includes(wantS) || wantS.includes(sec)) score = 4;
         if (score < 0) continue;
+        if (l === wantL) score += 2;
         if (shown) score += 1;
         if (score > bestScore) { bestScore = score; best = el; }
       }
@@ -9475,7 +9678,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         if (!norm(name)) return "";
         return open.find((b) => norm(name) === norm(bare(b))) ?? open.find((b) => sameName(name, bare(b))) ?? "";
       };
-      const matched = this.recipe.steps.filter((rs) => (rs.action === "fill" || rs.action === "select") && !!matchOf(rs));
+      const matched = this.recipe.steps.filter((rs, i) => (rs.action === "fill" || rs.action === "select") && !this.handPatchedRowsSkipped.has(i) && !!matchOf(rs));
       const own = await this.ownRecordedSteps(matched);
       const ownView = (rs: RecipeStep): boolean => own.has(rs);
       // THIS VIEW'S OWN STEP WINS ITS BLANK: another page's step sharing the label is not also re-run.

@@ -83,10 +83,28 @@ const LOG_FILE = process.env.AUTOPILOT_LOG_FILE === ""
   : (process.env.AUTOPILOT_LOG_FILE || defaultLogFile());
 const LOG_MAX_BYTES = Number(process.env.AUTOPILOT_LOG_MAX_BYTES || 8 * 1024 * 1024);
 let logDirReady = false;
-let logWriteFailed = false;
+// A failed write used to silence the file for the life of the process. On 2026-10-25 a nearly full
+// disk stopped the live log at 02:24Z while the server answered /health for another 21 hours, so the
+// night the log was most needed is the night it said nothing (#388). A failure now pauses the sink
+// instead: lines are counted, not written, and the next line after LOG_RETRY_MS tries once again.
+// One attempt per window keeps the old "never retry-storm on a bad path" property.
+const LOG_RETRY_MS = 30_000;
+let logFailedAt: number | null = null;
+let droppedLines = 0;
+let clockForTests: (() => number) | null = null;
+const now = (): number => (clockForTests ?? Date.now)();
 
-function appendToLogFile(line: string): void {
-  if (!LOG_FILE || logWriteFailed) return;
+/** Test seam: drive the retry window without sleeping 30 s. `null` restores the real clock. */
+export function setLogFileClockForTests(fn: (() => number) | null): void {
+  clockForTests = fn;
+}
+
+function appendToLogFile(text: string): void {
+  if (!LOG_FILE) return;
+  if (logFailedAt !== null && now() - logFailedAt < LOG_RETRY_MS) {
+    droppedLines++;
+    return;
+  }
   try {
     if (!logDirReady) {
       fs.mkdirSync(path.dirname(LOG_FILE), { recursive: true });
@@ -97,10 +115,18 @@ function appendToLogFile(line: string): void {
     try {
       if (fs.statSync(LOG_FILE).size > LOG_MAX_BYTES) fs.renameSync(LOG_FILE, LOG_FILE + ".1");
     } catch { /* no file yet */ }
-    fs.appendFileSync(LOG_FILE, line + "\n");
+    // The gap goes in the SAME write as the line that ended it, so it can never land without it.
+    const gap = droppedLines
+      ? `${stamp()} ${ICON.warn} ${"WARN".padEnd(5)} [logger] file log resumed after ${droppedLines} dropped line(s)\n`
+      : "";
+    fs.appendFileSync(LOG_FILE, gap + text + "\n");
+    logFailedAt = null;
+    droppedLines = 0;
   } catch {
-    // Never let logging break the server, and never retry-storm on a bad path.
-    logWriteFailed = true;
+    // Never let logging break the server. The directory may be what went away, so re-make it next time.
+    logFailedAt = now();
+    logDirReady = false;
+    droppedLines++;
   }
 }
 
@@ -153,7 +179,10 @@ export function logErrorBlock(scope: string, err: unknown, context?: Record<stri
     for (const s of e.stack.split("\n").slice(0, 6)) lines.push(`│   ${s.trim()}`);
   }
   lines.push("└───────────────────────────────────────────────────────");
-  console.error(lines.join("\n"));
+  const block = lines.join("\n");
+  console.error(block);
+  // The same block on disk: a crash in a console window that is then closed left nothing behind (#388).
+  appendToLogFile(block);
 }
 
 // --- Diagnostics snapshot ----------------------------------------------------

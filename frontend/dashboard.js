@@ -3379,6 +3379,7 @@ function nextStepBannerHtml(step, ctx) {
   const who = NEXT_STEP_WHO[step.who] || "You";
   const since = step.since ? String(step.since).slice(0, 10) : "";
   const whys = Array.isArray(step.why) ? step.why.slice(0, 3) : [];
+  const cands = Array.isArray(step.recordCandidates) ? step.recordCandidates.filter((cand) => cand && cand.runId && cand.recordNumber) : [];
   const button = step.button && step.button.id && exists(step.button.id) ? step.button : null;
   const provisional = !step.gateChecked
     ? `<span class="next-step-provisional">${esc(c.full === false
@@ -3394,6 +3395,14 @@ function nextStepBannerHtml(step, ctx) {
         ? ` <button type="button" class="linklike next-step-fix" data-fix-target="${esc(w.fixTarget)}">Show</button>` : ""}</li>`).join("")}</ul>`
       : "")
     + (button ? `<button type="button" class="secondary next-step-go" data-next-button="${esc(button.id)}">${esc(button.label)} ↓</button>` : "")
+    // UNSURE RECORD NUMBERS (#400): read off the portal after a person's submit, not sure enough to
+    // save. Each is one click to confirm; nothing is saved until then. esc() on every value.
+    + (cands.length
+      ? `<span class="next-step-candidates"><span class="next-step-provisional">Read off the portal after the submit, not saved until you confirm:</span>`
+        + `<ul class="next-step-whys">${cands.map((cand, i) => `<li>${esc(humanize(cand.track || ""))}: <strong>${esc(cand.recordNumber || "")}</strong>`
+          + (cand.recordLink ? ` <a href="${esc(cand.recordLink)}" target="_blank" rel="noopener">open ↗</a>` : "")
+          + ` <button type="button" class="secondary next-step-confirm" data-confirm-record="${i}">Confirm this number</button></li>`).join("")}</ul></span>`
+      : "")
     + provisional
     + `</span>`;
   return { className: `next-step-banner is-server${tone}`, html };
@@ -3506,6 +3515,13 @@ function renderNextStep() {
     }
     banner.querySelectorAll("button[data-fix-target]").forEach((b) => {
       b.addEventListener("click", () => revealElement($(b.dataset.fixTarget)));
+    });
+    // ONE CLICK CONFIRMS AN UNSURE RECORD NUMBER (#400) through the confirmation door the manual
+    // form uses, with the link that was seen beside it.
+    const cands = Array.isArray(current.step.recordCandidates) ? current.step.recordCandidates.filter((cand) => cand && cand.runId && cand.recordNumber) : [];
+    banner.querySelectorAll("button[data-confirm-record]").forEach((b) => {
+      const cand = cands[Number(b.dataset.confirmRecord)];
+      if (cand) b.addEventListener("click", () => confirmRecordCandidate(cand, b));
     });
     return;
   }
@@ -9101,6 +9117,33 @@ async function captureConfirmation(event) {
       notes: $("confirmationNotes").value,
     }),
   });
+  await afterConfirmationCaptured();
+}
+
+// A person confirmed a record number read off the portal after their submit (#400, the next-step
+// panel's candidates): the same confirmation door, with the number and the link that was seen.
+async function confirmRecordCandidate(cand, button) {
+  if (button) button.disabled = true;
+  try {
+    state.detail = await api(`/api/portal-runs/${encodeURIComponent(cand.runId)}/capture-confirmation`, {
+      method: "POST",
+      body: JSON.stringify({
+        applicationNumber: cand.recordNumber,
+        recordLink: cand.recordLink || "",
+        submittedBy: "confirmed from the next-step panel",
+        notes: cand.source === "account_list"
+          ? "A person confirmed this number from the new rows in the portal's application list."
+          : "A person confirmed this number read off the portal's completion page.",
+      }),
+    });
+    await afterConfirmationCaptured();
+  } catch (err) {
+    showMessage(err.message || "Could not confirm the record number.", "error");
+    if (button) button.disabled = false;
+  }
+}
+
+async function afterConfirmationCaptured() {
   state.workflow = null;
   state.historicalReport = null;
   await loadOpsPlan();
@@ -9109,6 +9152,8 @@ async function captureConfirmation(event) {
   await loadProjectTimeline();
   await loadProcessMap();
   await loadInstallerPacket();
+  // The banner's answer changed too (the filing is in; a confirmed candidate is answered).
+  if (state.detail && state.detail.project && state.detail.project.id) await loadNextStep(state.detail.project.id);
   showMessage("Confirmation captured after human submit.");
   renderDetail();
   await loadProjects();

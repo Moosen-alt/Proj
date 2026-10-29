@@ -309,9 +309,15 @@ export interface FilingBackstop {
   /** Aborts that stop the run: filing, payment, review lockdown. */
   stoppingAborts(): BackstopAbort[];
   /** #358: a 307 / 308 of a request this run let through is judged before Chromium follows it (the
-   *  browser-level response pause joined). false only when the page has no Chromium browser to
-   *  pause (a double): its redirects are followed unjudged, as before. */
+   *  response pause joined, and covers the document the install page holds — #394). false when the
+   *  page has no Chromium browser to pause (a double), or its already-loaded document could not be
+   *  re-bound: its redirects are followed unjudged until it loads a new document. */
   readonly redirectsJudged: boolean;
+  /** The same, for one page of the run's context (default: the install page). */
+  redirectsJudgedOn(page?: unknown): boolean;
+  /** #394: "" — or, when the response pause joined but a page open at install could not have its
+   *  loaded document re-bound, the sentence a run puts in its warnings (never silent). */
+  readonly redirectGuardNote: string;
   /** A HUMAN-VERIFIED INFORMATION PAGE (#344): read `page`'s identity fresh on `control` (a
    *  Playwright locator resolving to ONE element in the main frame) and ask infoPagePassRefusals.
    *  Passing, ONE slot opens: that page's main-frame document POST equal to the verified control's
@@ -730,31 +736,105 @@ type PausedJudge = (e: PausedResponse) => Promise<"continue" | "fail" | null>;
 // ONE SESSION PER BROWSER, SHARED BY EVERY RUN ON IT (production opens a browser per run; the smokes
 // share one across contexts). Each paused response is offered to each run's judge; a response no
 // run owns continues untouched, at once.
+//
+// A DOCUMENT LOADED BEFORE THE GUARD JOINED (#394). The browser-level Fetch.enable binds the loaders
+// of documents created AFTER it; it never re-binds a document that had already committed, so the
+// fetch / XHR of a page the run was handed already loaded (the post-login page the learner walks
+// without navigating, the correction reopen's landing page) was followed unjudged. A PAGE-target
+// session's Fetch.enable does re-bind its frames' existing loaders (as page.route does for the
+// first leg), so every page open when a run installs — and each of its out-of-process frames — gets
+// one too. A response a document created after both sessions joined is paused TWICE (once per
+// session, one after the other): it is judged once, and the other pause gets the same verdict
+// (dedupe below). Never a reload or a re-navigation: a reload of a POST result can re-send it.
+type Verdict = "continue" | "fail";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const GUARDS = new WeakMap<object, { ready: Promise<any | null>; judges: Set<PausedJudge>; closed: boolean }>();
+type Cover = { session: any | null; outcome: "on" | "shared" | "failed" };
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-async function joinRedirectGuard(browser: any, judge: PausedJudge): Promise<(() => Promise<void>) | null> {
+type GuardState = { ready: Promise<any | null>; judges: Set<PausedJudge>; closed: boolean; covers: Map<object, Promise<Cover>>; seen: Map<string, { verdicts: Promise<Verdict>[]; counts: Map<object, number>; at: number }> };
+const GUARDS = new WeakMap<object, GuardState>();
+const FETCH_RESPONSE_STAGE = { patterns: [{ urlPattern: "*", requestStage: "Response" }] };
+/** One verdict for a paused response, from the first judge that owns it. */
+async function judgeAll(judges: Set<PausedJudge>, e: PausedResponse): Promise<Verdict> {
+  for (const j of [...judges]) {
+    let verdict: Verdict | null = null;
+    try { verdict = await j(e); } catch { verdict = "fail"; }
+    if (verdict) return verdict;
+  }
+  return "continue";
+}
+/** The verdict for `session`'s pause of `e`. EVERY response is judged ONCE however many sessions
+ *  pause it: the n-th pause of the same response (same network request, URL, status and
+ *  Location) by one session takes the n-th verdict, so a 307 to itself still counts every hop.
+ *  Not only redirects: judging a response consumes its request's leg, and a second judging of a
+ *  200 took the leg of a CONCURRENT request with the same method and URL — whose 307 then found
+ *  no leg and was followed unjudged (two quick autosaves to one endpoint; #394 skeptic). */
+function verdictFor(g: GuardState, session: object, e: PausedResponse): Promise<Verdict> {
+  const status = Number(e.responseStatusCode || 0);
+  const location = String((e.responseHeaders || []).find((h) => /^location$/i.test(String(h?.name || "")))?.value || "");
+  const net = String(e.networkId || "");
+  if (!net) return judgeAll(g.judges, e);
+  // Records are kept in creation order: drop the expired head (a second pause follows the first
+  // by milliseconds; two minutes is far past any redirect chain).
+  const now = Date.now();
+  for (const [k, r] of g.seen) { if (now - r.at <= 120_000) break; g.seen.delete(k); }
+  const key = `${net}\n${status}\n${String(e.request?.url || "")}\n${location}`;
+  let rec = g.seen.get(key);
+  if (!rec) { rec = { verdicts: [], counts: new Map(), at: now }; g.seen.set(key, rec); }
+  const n = (rec.counts.get(session) ?? 0) + 1;
+  rec.counts.set(session, n);
+  if (n > rec.verdicts.length) rec.verdicts.push(judgeAll(g.judges, e));
+  return rec.verdicts[n - 1];
+}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function pauseResponses(g: GuardState, session: any): void {
+  session.on("Fetch.requestPaused", (e: PausedResponse) => {
+    void (async () => {
+      const verdict = await verdictFor(g, session, e).catch((): Verdict => "fail");
+      if (verdict === "fail") await session.send("Fetch.failRequest", { requestId: e.requestId, errorReason: "BlockedByClient" }).catch(() => null);
+      else await session.send("Fetch.continueResponse", { requestId: e.requestId }).catch(() => null);
+    })();
+  });
+}
+/** Re-bind `target`'s already-loaded documents (a page, or an out-of-process frame): "on" when its
+ *  own response pause is on; "shared" for a frame that shares its parent's process (Playwright
+ *  gives it no session of its own — its page's covers it); "failed" otherwise. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function coverTarget(g: GuardState, ctx: any, target: object): Promise<Cover["outcome"]> {
+  let p = g.covers.get(target);
+  if (!p) {
+    p = (async (): Promise<Cover> => {
+      const session = await ctx.newCDPSession(target);
+      pauseResponses(g, session);
+      await session.send("Fetch.enable", FETCH_RESPONSE_STAGE);
+      return { session, outcome: "on" };
+    })().catch((e: unknown): Cover => ({ session: null, outcome: /does not have a separate CDP session/i.test(String((e as Error)?.message ?? e)) ? "shared" : "failed" }));
+    g.covers.set(target, p);
+  }
+  const { outcome } = await p;
+  // A cover that did not take is tried again by the next run that joins (never inherited).
+  if (outcome !== "on" && g.covers.get(target) === p) g.covers.delete(target);
+  return outcome;
+}
+/** A joined run: `leave` when it is done; `uncovered` = the pages open at join whose documents
+ *  could not be re-bound (their redirects are followed unjudged until they load a new document);
+ *  `workers` = service workers already running at join. A service worker's own fetch is not a
+ *  page's, has no page target to re-bind, and the browser-level pause does not re-bind it either
+ *  (#394 skeptic sw-pre: its 307 → /payment/charge was followed) — named, never silent. One
+ *  started after the join is created under the browser-level pause and is judged. */
+type GuardMembership = { leave: () => Promise<void>; uncovered: Set<object>; workers: number };
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function joinRedirectGuard(browser: any, judge: PausedJudge, ctx?: any): Promise<GuardMembership | null> {
   if (!browser || typeof browser !== "object" || typeof browser.newBrowserCDPSession !== "function") return null;
   let g = GUARDS.get(browser);
   if (!g) {
-    const judges = new Set<PausedJudge>();
-    const ready = (async () => {
+    const state: GuardState = { ready: Promise.resolve(null), judges: new Set(), closed: false, covers: new Map(), seen: new Map() };
+    state.ready = (async () => {
       const session = await browser.newBrowserCDPSession();
-      session.on("Fetch.requestPaused", (e: PausedResponse) => {
-        void (async () => {
-          let verdict: "continue" | "fail" | null = null;
-          for (const j of [...judges]) {
-            try { verdict = await j(e); } catch { verdict = "fail"; }
-            if (verdict) break;
-          }
-          if (verdict === "fail") await session.send("Fetch.failRequest", { requestId: e.requestId, errorReason: "BlockedByClient" }).catch(() => null);
-          else await session.send("Fetch.continueResponse", { requestId: e.requestId }).catch(() => null);
-        })();
-      });
-      await session.send("Fetch.enable", { patterns: [{ urlPattern: "*", requestStage: "Response" }] });
+      pauseResponses(state, session);
+      await session.send("Fetch.enable", FETCH_RESPONSE_STAGE);
       return session;
     })().catch(() => null);
-    g = { ready, judges, closed: false };
+    g = state;
     GUARDS.set(browser, g);
   }
   const guard = g;
@@ -763,15 +843,42 @@ async function joinRedirectGuard(browser: any, judge: PausedJudge): Promise<(() 
     if (GUARDS.get(browser) === guard) GUARDS.delete(browser);
     return null;
   }
-  if (guard.closed) return joinRedirectGuard(browser, judge);
+  if (guard.closed) return joinRedirectGuard(browser, judge, ctx);
   guard.judges.add(judge);
-  return async () => {
-    guard.judges.delete(judge);
-    if (guard.judges.size || guard.closed) return;
-    guard.closed = true;
-    if (GUARDS.get(browser) === guard) GUARDS.delete(browser);
-    await session.send("Fetch.disable").catch(() => null);
-    await session.detach().catch(() => null);
+  // Every page already open in the run's context, and every out-of-process frame of it.
+  const uncovered = new Set<object>();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let pages: any[] = [];
+  try { pages = ctx && typeof ctx.pages === "function" && typeof ctx.newCDPSession === "function" ? ctx.pages() : []; } catch { pages = []; }
+  await Promise.all(pages.map(async (pg) => {
+    if ((await coverTarget(guard, ctx, pg)) !== "on") { uncovered.add(pg); return; }
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let frames: any[] = [];
+    try { frames = pg.frames().filter((f: unknown) => f !== pg.mainFrame()); } catch { frames = []; }
+    const outcomes = await Promise.all(frames.map((f) => coverTarget(guard, ctx, f)));
+    if (outcomes.includes("failed")) uncovered.add(pg);
+  }));
+  if (ctx && typeof ctx.pages === "function" && typeof ctx.newCDPSession !== "function") {
+    try { for (const pg of ctx.pages()) uncovered.add(pg); } catch { /* no pages */ }
+  }
+  let workers = 0;
+  try { workers = ctx && typeof ctx.serviceWorkers === "function" ? ctx.serviceWorkers().length : 0; } catch { workers = 0; }
+  return {
+    uncovered,
+    workers,
+    leave: async () => {
+      guard.judges.delete(judge);
+      if (guard.judges.size || guard.closed) return;
+      guard.closed = true;
+      if (GUARDS.get(browser) === guard) GUARDS.delete(browser);
+      const covers = [...guard.covers.values()];
+      guard.covers.clear();
+      for (const s of [session, ...(await Promise.all(covers)).map((c) => c.session)]) {
+        if (!s) continue;
+        await s.send("Fetch.disable").catch(() => null);
+        await s.detach().catch(() => null);
+      }
+    },
   };
 }
 
@@ -963,6 +1070,11 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // is judged by the page's last reading. A server-rendered page's review text is there at load;
   // an SPA's posts are fetch/XHR, which are read live.
   const lastReading = new WeakMap<object, boolean>();
+  // #394: the pages open at install whose loaded document the redirect guard could not re-bind,
+  // and the service workers already running then (sticky for the run: the worker that was running
+  // is not known to be gone when a new one starts).
+  const uncoveredPages = new Set<object>();
+  let preInstallWorkers = 0;
   const unwatch: Array<() => void> = [];
   const watched = new WeakSet<object>();
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -975,8 +1087,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     if (!pg || typeof pg !== "object" || watched.has(pg) || typeof pg.on !== "function") return;
     watched.add(pg);
     const onLoad = (): void => refresh(pg);
-    // A new document on this page: the run's writes on the previous one are not this one's to save.
-    const onDocument = (): void => { lastLoadAt.set(pg, Date.now()); };
+    // A new document on this page: the run's writes on the previous one are not this one's to save;
+    // and it was created under the browser-level response pause, so its redirects are judged (#394).
+    const onDocument = (): void => { lastLoadAt.set(pg, Date.now()); uncoveredPages.delete(pg); };
     pg.on("domcontentloaded", onDocument);
     pg.on("domcontentloaded", onLoad);
     pg.on("load", onLoad);
@@ -1429,7 +1542,12 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   let leaveGuard: (() => Promise<void>) | null = null;
   try {
     const browser = ctx && typeof ctx.browser === "function" ? ctx.browser() : null;
-    leaveGuard = await joinRedirectGuard(browser, judgePaused);
+    const joined = await joinRedirectGuard(browser, judgePaused, ctx);
+    if (joined) {
+      leaveGuard = joined.leave;
+      for (const p of joined.uncovered) uncoveredPages.add(p);
+      preInstallWorkers = joined.workers;
+    }
   } catch { leaveGuard = null; }
   const bs: FilingBackstop = {
     aborts,
@@ -1605,7 +1723,17 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     },
     humanRequests,
     stoppingAborts() { return aborts.filter(isStoppingAbort); },
-    redirectsJudged: !!leaveGuard,
+    get redirectsJudged() { return !!leaveGuard && !preInstallWorkers && !uncoveredPages.has(page); },
+    redirectsJudgedOn(pg?: unknown) { return !!leaveGuard && !preInstallWorkers && !uncoveredPages.has((pg && typeof pg === "object" ? pg : page) as object); },
+    get redirectGuardNote() {
+      if (!leaveGuard || (!uncoveredPages.size && !preInstallWorkers)) return "";
+      const parts: string[] = [];
+      const n = uncoveredPages.size;
+      if (n) parts.push(`${n === 1 ? "a page" : `${n} pages`} already open when the ${label} began could not be covered — a 307/308 of ${n === 1 ? "its" : "their"} fetch/XHR traffic is followed unjudged until ${n === 1 ? "it loads" : "each loads"} a new document`);
+      const w = preInstallWorkers;
+      if (w) parts.push(`${w === 1 ? "a service worker was" : `${w} service workers were`} already running when the ${label} began — a 307/308 of a request ${w === 1 ? "it makes" : "they make"} on a page's behalf is followed unjudged`);
+      return `Redirect guard (#394): ${parts.join("; and ")} (form posts and every first-leg rule still apply).`;
+    },
     async openInfoPagePass(pg: unknown, control: unknown, opts: { entries: ReadonlyArray<VerifiedInfoPage>; run: InfoPageRunState; reserve?: InfoPageReserve }): Promise<InfoPagePassOpen> {
       // A new open closes any earlier slot or watch (a candidate already observed is kept).
       closeInfo();

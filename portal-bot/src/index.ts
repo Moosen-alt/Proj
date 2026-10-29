@@ -13,6 +13,7 @@ import { HUMAN_REVIEW_MESSAGE } from "./adapter";
 import { clearReviewOpen, markReviewOpen } from "./reviewSession";
 import { draftReferenceFromUrl } from "./adapters/submissionLedger";
 import { readDraftCreated, type DraftCreatedRead } from "./draftCreated";
+import type { SubmitRecordRead } from "./adapters/submissionLedger";
 import { draftTenantKey } from "./draftSubmitGate";
 import { HUMAN_SUBMIT_OBSERVED_NOTE } from "./humanCapture";
 
@@ -287,6 +288,10 @@ interface StageOptions {
     source: string;
     reason: string;
     recordLink: string;
+    /** UNSURE READS (#400): numbers seen after the submit — an unconfident completion-page read,
+     *  or the new rows when several appeared in the account's list — for a person to confirm.
+     *  Never written as fact. Present only on a low-confidence capture. */
+    candidates?: Array<{ recordNumber: string; recordLink: string; source: string }>;
     /** The click only CREATED A DRAFT (#302): nothing was filed, recordNumber is "", and the
      *  caller records the draft for the next stage to continue — never a submission. */
     draftCreated?: DraftCreatedObserved;
@@ -355,6 +360,21 @@ export async function armSubmitCapture(
               recordNumber: "", confidence: "low", source: "draft_created", reason: capture.message,
               recordLink: String(data.recordLink ?? ""),
               draftCreated: { ...draft, clickedLabel: String(clickedLabel ?? ""), tenantKey: String(data.draftTenantKey ?? "") },
+            });
+            return;
+          }
+          // THE ADAPTER'S OWN JUDGEMENT, when it gives one (#400, RecipeAdapter: submissionLedger
+          // chooseSubmittedRecord): its confidence, its best link, and the unsure candidates. Every
+          // other adapter keeps the reading below.
+          const chosen = data.recordRead as SubmitRecordRead | undefined;
+          if (chosen && typeof chosen === "object" && typeof chosen.confidence === "string") {
+            options.onSubmitCaptured?.({
+              recordNumber: chosen.confidence === "high" ? String(chosen.recordNumber ?? "") : "",
+              confidence: chosen.confidence === "high" ? "high" : "low",
+              source: String(chosen.source ?? "none"),
+              reason: String(chosen.reason || capture.message),
+              recordLink: String(chosen.recordLink ?? ""),
+              ...(chosen.confidence !== "high" && chosen.candidates?.length ? { candidates: chosen.candidates } : {}),
             });
             return;
           }

@@ -2803,6 +2803,9 @@ app.post("/api/parser/llm-extract", asyncHandler(async (req, res) => {
     // the racking callouts, read deterministically with their source page cited (#201).
     const { supplementPacketApplication } = await import("./packetApplication");
     extraction = supplementPacketApplication(extraction, planText);
+    // The AC disconnect's make / model (and amps / fusing) from its own SLD / schedule callout (#384).
+    const { supplementAcDisconnect } = await import("./acDisconnectIntake");
+    extraction = supplementAcDisconnect(extraction, planText);
     // HYBRID PLAN SET: the parser page first posted the PDF to /api/parser/plan-scan-extract, which
     // read the set's image-only pages (datasheets pasted in as pictures) by vision; that read rides
     // back here and is merged UNDER this text read — the text wins every field it answered

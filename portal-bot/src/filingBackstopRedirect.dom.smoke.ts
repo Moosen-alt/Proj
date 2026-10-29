@@ -37,6 +37,15 @@
 //   crossDocPlain — the same with a plain Location: the hop does not take the slot, the click files
 //   replay      — a recipe's "Next" that 307s to /payment: the replay STOPS, named, and says the
 //                 first request reached the portal
+//   preloaded*  — #394: the page is loaded BEFORE the backstop is installed (the learner's
+//                 post-login page): its own autosave → /SubmitApplication, a fetch → /payment/charge,
+//                 a 307 loop (each hop counted once), a cross-origin iframe's form and fetch
+//   steal*      — #394 skeptic: a quick save's 200 and a slow concurrent save to the SAME URL whose
+//                 307 goes to /payment/charge or /SubmitApplication (normal and preloaded install;
+//                 two slow saves) — a response two sessions pause is judged once
+//   swPreDirect/swPost — a service worker's own POST to /payment/charge; one started after install
+//   swPre       — NAMED, NOT CLOSED: a service worker already running at install — its fetch's 307
+//                 is still followed; the run is told (redirectsJudged false + redirectGuardNote)
 // MUST-PASS:
 //   ok307       — 307 → /next-step: the body arrives there, the page is the next step
 //   see303      — 303 → /next-step: the browser follows it as a GET
@@ -129,6 +138,23 @@ const handle = (host: string) => (req: http.IncomingMessage, res: http.ServerRes
     }
     if (req.method !== "GET" || url.pathname === "/next-step") rec();
     const cors = req.headers.origin ? { "access-control-allow-origin": String(req.headers.origin), "access-control-allow-credentials": "true" } : {};
+    // #394 skeptic: one autosave endpoint, answered by body — n=1 at once 200, n=2 / n=3 after 900 ms 307.
+    if (url.pathname === "/Project/Save" && req.method === "POST") {
+      const body = Buffer.concat(chunks).toString("utf8");
+      const to = /n=3/.test(body) ? "/SubmitApplication" : /n=2/.test(body) ? "/payment/charge" : "";
+      if (to) { setTimeout(() => { res.writeHead(307, { location: to }); res.end(); }, 900); return; }
+      res.writeHead(200, { "content-type": "text/plain" });
+      res.end("saved");
+      return;
+    }
+    if (url.pathname === "/sw.js") {
+      // A service worker that answers every POST with its OWN fetch of the same URL.
+      res.writeHead(200, { "content-type": "text/javascript", "service-worker-allowed": "/" });
+      res.end(`self.addEventListener("install", () => self.skipWaiting());
+self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
+self.addEventListener("fetch", (e) => { if (e.request.method === "POST") e.respondWith(fetch(e.request.url, { method: "POST", body: "sw=1" })); });`);
+      return;
+    }
     const r = REDIRECTS[url.pathname];
     if (r && req.method !== "GET") {
       setTimeout(() => { res.writeHead(r[0], { location: r[1], ...cors, ...(r[3] || {}) }); res.end(); }, r[2] || 0);
@@ -142,6 +168,9 @@ const handle = (host: string) => (req: http.IncomingMessage, res: http.ServerRes
       else if (m === "popup") res.end(formPage("/step/popup", `target="_blank"`));
       else if (m === "review") res.end(REVIEW_PAGE);
       else if (m === "xhr") res.end(`<!doctype html><html><body><h1>Step 3: Project Details</h1><p>Contacts</p></body></html>`);
+      else if (m === "sw") res.end(`<!doctype html><html><body><h1>Step 3: Project Details</h1><script>
+        window.swReady = navigator.serviceWorker.register("/sw.js").then(() => new Promise((r) => { if (navigator.serviceWorker.controller) r("controlled"); else navigator.serviceWorker.addEventListener("controllerchange", () => r("controlled")); }));
+      </script></body></html>`);
       else if (m === "iframe") res.end(`<!doctype html><html><body><h1>Step 3: Contacts</h1><iframe id="f" src="${url.searchParams.get("src")}"></iframe></body></html>`);
       else res.end(formPage(`/step/${m}`));
       return;
@@ -169,22 +198,32 @@ const pdf = (name: string, n: number): string => { const f = path.join(tmp, name
 const browser = await chromium.launch();
 let persistent: BrowserContext | null = null;
 try {
-  type Out = { hits: Hit[]; url: string; body: string; aborts: FilingBackstop["aborts"]; stopping: FilingBackstop["aborts"]; actResult: unknown; judged: boolean; drainRequests: string[]; ownWriteRequests: string[]; approvedAdmissions: FilingBackstop["approvedAdmissions"] };
+  type Out = { hits: Hit[]; url: string; body: string; aborts: FilingBackstop["aborts"]; stopping: FilingBackstop["aborts"]; actResult: unknown; judged: boolean; note: string; drainRequests: string[]; ownWriteRequests: string[]; approvedAdmissions: FilingBackstop["approvedAdmissions"] };
   // The backstop layer itself, on a fresh context (or the persistent-profile one); `act` drives it.
-  const run = async (m: string, act: (page: Page, bs: FilingBackstop) => Promise<unknown>, opts: { before?: (ctx: BrowserContext) => Promise<void>; ctx?: BrowserContext; formUrl?: string } = {}): Promise<Out> => {
+  // installAfter (#394): the page is loaded FIRST and the backstop installed on it after — the
+  // learner's post-login page, the correction reopen's landing page.
+  const run = async (m: string, act: (page: Page, bs: FilingBackstop) => Promise<unknown>, opts: { before?: (ctx: BrowserContext) => Promise<void>; ctx?: BrowserContext; formUrl?: string; installAfter?: boolean; afterGoto?: (page: Page) => Promise<unknown> } = {}): Promise<Out> => {
     const ctx = opts.ctx ?? await browser.newContext();
     ctx.setDefaultTimeout(8000);
     if (opts.before) await opts.before(ctx);
     const page = await ctx.newPage();
-    const bs = (await installFilingBackstop(page, "redirect smoke"))!;
-    await page.goto(opts.formUrl ?? `${base}/form?m=${m}`);
+    const url = opts.formUrl ?? `${base}/form?m=${m}`;
+    let bs: FilingBackstop;
+    if (opts.installAfter) {
+      await page.goto(url);
+      if (opts.afterGoto) await opts.afterGoto(page);
+      bs = (await installFilingBackstop(page, "redirect smoke"))!;
+    } else {
+      bs = (await installFilingBackstop(page, "redirect smoke"))!;
+      await page.goto(url);
+    }
     hits.length = 0;
     let actResult: unknown = null;
     try { actResult = await act(page, bs); } catch (e) { actResult = `threw ${String(e).slice(0, 160)}`; }
     await page.waitForTimeout(400);
     const out: Out = {
       hits: hits.slice(), url: page.url(), body: await page.textContent("body").catch(() => "") ?? "",
-      aborts: bs.aborts.slice(), stopping: bs.stoppingAborts().slice(), actResult, judged: bs.redirectsJudged,
+      aborts: bs.aborts.slice(), stopping: bs.stoppingAborts().slice(), actResult, judged: bs.redirectsJudged, note: bs.redirectGuardNote,
       drainRequests: bs.drainRequests.slice(), ownWriteRequests: bs.ownWriteRequests.slice(), approvedAdmissions: bs.approvedAdmissions.slice(),
     };
     await bs.dispose();
@@ -427,6 +466,80 @@ try {
       check(`MUST-PASS ${variant}: the approved click files exactly once, and the slot went to it`,
         hitsOn("/SubmitApplication") === 1 && o.approvedAdmissions.length === 1 && o.approvedAdmissions[0].where.endsWith("/SubmitApplication") && o.approvedAdmissions[0].navigation, `${show(o)} admitted=${JSON.stringify(o.approvedAdmissions)}`);
     }
+  }
+  {
+    // #394 — A DOCUMENT LOADED BEFORE THE BACKSTOP. The browser-level response pause never re-binds
+    // a document that had already committed, so the fetch / XHR of the page a run is handed already
+    // loaded (the learner's post-login page) was followed unjudged. Each page open at install now
+    // gets its own response pause too; without it every MUST-EXCLUDE cell here turns red.
+    const write = (to: string) => (page: Page) => withOwnWriteWindow(page, "Accept terms", () => page.evaluate((u) => fetch(u, { method: "POST", body: "terms=on" }).then((r) => `status ${r.status}`, () => "rejected"), to));
+    const bad = await run("review", write("/Project/AutosaveFile"), { installAfter: true });
+    check("preloaded: the install page's already-loaded document is covered (redirectsJudged)", bad.judged, show(bad));
+    check("MUST-EXCLUDE preloadedOwnWriteFile: on a review page loaded before install, the run's own autosave 307 → /SubmitApplication never reaches it",
+      hitsOn("/Project/AutosaveFile") === 1 && hitsOn("/SubmitApplication") === 0 && hopStop(bad, "/SubmitApplication"), `${show(bad)} act=${bad.actResult}`);
+    const pay = await run("xhr", (page) => page.evaluate(() => fetch("/step/xhrPay", { method: "POST", body: "x=1" }).then((r) => `status ${r.status}`, () => "rejected")), { installAfter: true });
+    check("MUST-EXCLUDE preloadedXhrPay: a fetch POST of a page loaded before install, 307 → /payment/charge: nothing reaches it, the fetch fails",
+      hitsOn("/step/xhrPay") === 1 && hitsOn("/payment/charge") === 0 && pay.actResult === "rejected" && hopStop(pay, "/payment/charge"), `${show(pay)} act=${pay.actResult}`);
+    const ok = await run("review", write("/Project/AutosaveOk"), { installAfter: true });
+    check("MUST-PASS preloadedOwnWriteOk: the same autosave 307 → /Project/Autosave2 reaches it once, nothing aborted",
+      hitsOn("/Project/Autosave2") === 1 && ok.aborts.length === 0 && ok.actResult === "status 200", `${show(ok)} act=${ok.actResult}`);
+    const loop = await run("xhr", (page) => page.evaluate(() => fetch("/step/loop", { method: "POST", body: "x=1" }).then((r) => `status ${r.status}`, () => "rejected")), { installAfter: true });
+    const sent = hits.filter((h) => h.path === "/step/loop").length;
+    check(`MUST-EXCLUDE preloadedLoop: a 307 to itself is followed ${MAX_REDIRECT_HOPS} times, then refused (every hop counted once)`,
+      sent === MAX_REDIRECT_HOPS + 1 && loop.stopping.some((a) => /more than \d+ redirects in a row/.test(a.why)), `sent=${sent} ${show(loop)}`);
+    const frame = await run("iframe", async (page) => {
+      const f = page.frames().find((x) => x.url().startsWith(base2));
+      if (!f) return "no frame";
+      await f.evaluate(() => (document.getElementById("hf") as HTMLFormElement).submit());
+      await page.waitForTimeout(900);
+      return "posted";
+    }, { installAfter: true, formUrl: `${base}/form?m=iframe&src=${encodeURIComponent(`${base2}/frame`)}` });
+    check("MUST-EXCLUDE preloadedIframe: a cross-origin iframe loaded before install, its form 307 → its /SubmitApplication: nothing reaches it",
+      frame.actResult === "posted" && hitsOn("/step/iframe", "127.0.0.2") === 1 && hitsOn("/SubmitApplication", "127.0.0.2") === 0 && hopStop(frame, "/SubmitApplication"), `${show(frame)} act=${frame.actResult}`);
+    const xhrFrame = await run("iframe", async (page) => {
+      const f = page.frames().find((x) => x.url().startsWith(base2));
+      if (!f) return "no frame";
+      return f.evaluate(() => fetch("/step/xhrPay", { method: "POST", body: "x=1" }).then((r) => `status ${r.status}`, () => "rejected"));
+    }, { installAfter: true, formUrl: `${base}/form?m=iframe&src=${encodeURIComponent(`${base2}/frame`)}` });
+    check("MUST-EXCLUDE preloadedIframeXhr: a fetch POST in a cross-origin iframe loaded before install, 307 → /payment/charge: nothing reaches it",
+      hitsOn("/step/xhrPay", "127.0.0.2") === 1 && hitsOn("/payment/charge", "127.0.0.2") === 0 && xhrFrame.actResult === "rejected" && hopStop(xhrFrame, "/payment/charge"), `${show(xhrFrame)} act=${xhrFrame.actResult}`);
+  }
+  {
+    // #394 SKEPTIC — TWO CONCURRENT SAVES TO ONE URL. A response two DevTools sessions pause (the
+    // browser-level one and the install page's own) must be judged once: a second judging of the
+    // quick save's 200 took the slow save's leg (same method + URL), and the slow save's 307 then
+    // found no leg and was followed unjudged — on the NORMAL install path, where main refuses it.
+    const race = (slowBodies: string[]) => (page: Page) => page.evaluate(async (bodies) => {
+      const slow = bodies.map((b) => fetch("/Project/Save", { method: "POST", body: b }).then((r) => `slow ${r.status}`, () => "slow rejected"));
+      await new Promise((r) => setTimeout(r, 150));
+      const fast = await fetch("/Project/Save", { method: "POST", body: "n=1" }).then((r) => `fast ${r.status}`, () => "fast rejected");
+      return [fast, ...(await Promise.all(slow))].join("; ");
+    }, slowBodies);
+    for (const [variant, bodies, target, installAfter] of [
+      ["stealPay", ["n=2"], "/payment/charge", false],
+      ["stealFile", ["n=3"], "/SubmitApplication", false],
+      ["stealPayPreloaded", ["n=2"], "/payment/charge", true],
+      ["stealThree", ["n=2&a", "n=2&b"], "/payment/charge", false],
+    ] as const) {
+      const o = await run("xhr", race([...bodies]), { installAfter });
+      check(`MUST-EXCLUDE ${variant}: a quick save's 200 does not take a concurrent same-URL save's leg — its 307 never reaches ${target}`,
+        hitsOn("/Project/Save") === bodies.length + 1 && hitsOn(target) === 0 && o.actResult === ["fast 200", ...bodies.map(() => "slow rejected")].join("; ")
+          && o.stopping.filter((a) => a.where.endsWith(target) && !!a.redirect).length === bodies.length, `${show(o)} act=${o.actResult}`);
+    }
+  }
+  {
+    // #394 SKEPTIC — A SERVICE WORKER. Its own fetch on a page's behalf has no page target to
+    // re-bind: one running BEFORE install is NAMED (not closed — the hop is still followed); one
+    // started after install is created under the browser-level pause and judged.
+    const swFetch = (to: string) => (page: Page) => page.evaluate((u) => fetch(u, { method: "POST", body: "x=1" }).then((r) => `status ${r.status}`, () => "rejected"), to);
+    const pre = await run("sw", swFetch("/step/xhrPay"), { installAfter: true, afterGoto: (page) => page.evaluate(() => (window as unknown as { swReady: Promise<string> }).swReady) });
+    check("swPre: a service worker running at install is NAMED — redirectsJudged false, and the note says so",
+      pre.judged === false && /a service worker was already running when the redirect smoke began/.test(pre.note), `judged=${pre.judged} note=${pre.note} ${show(pre)}`);
+    const direct = await run("sw", swFetch("/payment/charge"), { installAfter: true, afterGoto: (page) => page.evaluate(() => (window as unknown as { swReady: Promise<string> }).swReady) });
+    check("MUST-EXCLUDE swPreDirect: the same worker's own POST straight to /payment/charge is refused (the first leg is routed)", hitsOn("/payment/charge") === 0, show(direct));
+    const post = await run("sw", async (page) => { await page.evaluate(() => (window as unknown as { swReady: Promise<string> }).swReady); return swFetch("/step/xhrPay")(page); });
+    check("MUST-EXCLUDE swPost: a worker started after install — its fetch's 307 → /payment/charge never reaches it, and nothing is named",
+      hitsOn("/payment/charge") === 0 && hopStop(post, "/payment/charge") && post.judged && post.note === "", `${show(post)} note=${post.note}`);
   }
   {
     let fixtureAnswered = 0;

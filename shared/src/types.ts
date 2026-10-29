@@ -941,6 +941,20 @@ export interface NextStep {
   /** A draft is staged on a portal awaiting a person (an unfiled track's awaiting_human_submit
    *  run, or a reopened correction form awaiting the human resubmit), whatever `key` says. */
   hasStagedDraft: boolean;
+  /** UNSURE RECORD NUMBERS read after a person's submit in the review window (#400): a
+   *  low-confidence completion-page read, or the new rows when several appeared in the account's
+   *  list. Never written as fact — each is one click for a person to confirm (the confirmation
+   *  door, POST /api/portal-runs/:runId/capture-confirmation). Absent when there are none. */
+  recordCandidates?: SubmitCaptureCandidate[];
+}
+/** One record number a person may confirm (NextStep.recordCandidates). */
+export interface SubmitCaptureCandidate {
+  runId: string;
+  track: SubmittalTrackType;
+  recordNumber: string;
+  /** "" when no link was seen; otherwise http(s) and cleaned of session material. */
+  recordLink: string;
+  source: "completion_page" | "account_list";
 }
 export interface NextStepCompact {
   key: NextStepKey;
