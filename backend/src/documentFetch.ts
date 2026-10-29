@@ -39,6 +39,12 @@
 //   rather than around a misdetection. The distinction is the whole reason the two are
 //   classified separately below.
 //
+// * NOT A WAY INTO THE LAN (issue #391). The form-fill tool hands this module URLs an API-key
+//   holder typed, so the URL and EVERY redirect hop must resolve to a public address
+//   (publicUrlGuard.ts, the same predicate the AHJ form-template fetch asks). Redirects are
+//   followed by hand so the question is asked before each request, not once at the top; a
+//   refused hop ends the ladder with `privateTarget` set and nothing sent there.
+//
 // * BOUNDED: every rung has a timeout, one browser runs at a time, and the session is closed
 //   in a finally whatever happens.
 //
@@ -48,6 +54,7 @@
 // ---------------------------------------------------------------------------
 import pLimit from "p-limit";
 import { logger } from "./logger";
+import { publicUrlRefusal } from "./publicUrlGuard";
 import { looksBotBlocked } from "./runAbort";
 
 export type FetchVia = "http" | "browser";
@@ -65,6 +72,10 @@ export interface FetchedDocument {
   reason: string;
   /** The URL the bytes actually came from, after redirects — resolve links against this. */
   finalUrl: string;
+  /** Set when the URL, or a redirect hop, pointed at a private/loopback/link-local address and
+   *  was refused before any request went there. The refused URL. A caller at a route edge
+   *  answers this with a 400: the caller asked for something the server will not fetch. */
+  privateTarget?: string;
 }
 
 export interface DocumentLink {
@@ -112,6 +123,8 @@ const BROWSER_UA =
 const DEFAULT_TIMEOUT_MS = 20_000;
 const DEFAULT_BROWSER_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_BYTES = 32 * 1024 * 1024;
+/** Redirect hops followed by hand (fetch's own default is 20; a document needs a few). */
+const MAX_REDIRECTS = 10;
 /** Past this, a body is a document, not a block page — never classify it as a wall. */
 const WALL_BODY_MAX = 100_000;
 
@@ -235,34 +248,60 @@ interface HttpAttempt {
   bytes: Uint8Array;
   finalUrl: string;
   networkError?: string;
+  /** The URL the guard refused (the first one, or a redirect hop). Nothing was sent to it. */
+  refusedUrl?: string;
+  refusal?: string;
 }
 
 async function httpAttempt(url: string, opts: { timeoutMs: number; userAgent: string; maxBytes: number }): Promise<HttpAttempt> {
   const blank: HttpAttempt = { status: 0, contentType: "", server: "", bytes: new Uint8Array(0), finalUrl: url };
+  // ONE deadline for the whole chain, as fetch's own redirect:"follow" had.
+  const signal = AbortSignal.timeout(opts.timeoutMs);
+  let current = url;
   try {
-    const res = await fetch(url, {
-      redirect: "follow",
-      signal: AbortSignal.timeout(opts.timeoutMs),
-      // NO cookies, NO authorization, NO credentials of any kind. A plain public GET.
-      headers: {
-        "user-agent": opts.userAgent,
-        accept: "text/html,application/xhtml+xml,application/pdf,application/xml;q=0.9,*/*;q=0.8",
-        "accept-language": "en-US,en;q=0.9",
-      },
-    });
-    const contentType = res.headers.get("content-type") || "";
-    const server = res.headers.get("server") || "";
-    const declared = Number(res.headers.get("content-length") || 0);
-    if (declared && declared > opts.maxBytes) {
-      return { ...blank, status: res.status, contentType, server, finalUrl: res.url || url, networkError: `document is ${declared} bytes, over the ${opts.maxBytes}-byte cap` };
+    for (let hop = 0; ; hop++) {
+      // ASK BEFORE EVERY REQUEST. redirect:"follow" asked nothing past the first URL, so a public
+      // host answering 302 Location: http://169.254.169.254/ took the server there (#391).
+      const refusal = await publicUrlRefusal(current);
+      if (refusal) return { ...blank, finalUrl: current, refusedUrl: current, refusal };
+      const res = await fetch(current, {
+        redirect: "manual",
+        signal,
+        // NO cookies, NO authorization, NO credentials of any kind. A plain public GET.
+        headers: {
+          "user-agent": opts.userAgent,
+          accept: "text/html,application/xhtml+xml,application/pdf,application/xml;q=0.9,*/*;q=0.8",
+          "accept-language": "en-US,en;q=0.9",
+        },
+      });
+      const location = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+      if (location) {
+        await res.body?.cancel().catch(() => {});
+        if (hop >= MAX_REDIRECTS) return { ...blank, status: res.status, finalUrl: current, networkError: `more than ${MAX_REDIRECTS} redirects` };
+        const next = new URL(location, current);
+        // The URL check at the door, re-asked of the hop: a redirect is a URL too, and one carrying
+        // user:pass@ is as much a credential as the first.
+        if (next.username || next.password) {
+          return { ...blank, status: res.status, finalUrl: current, networkError: "a redirect pointed at a URL that carries credentials" };
+        }
+        current = next.toString();
+        continue;
+      }
+      const contentType = res.headers.get("content-type") || "";
+      const server = res.headers.get("server") || "";
+      const declared = Number(res.headers.get("content-length") || 0);
+      if (declared && declared > opts.maxBytes) {
+        await res.body?.cancel().catch(() => {});
+        return { ...blank, status: res.status, contentType, server, finalUrl: current, networkError: `document is ${declared} bytes, over the ${opts.maxBytes}-byte cap` };
+      }
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      if (bytes.length > opts.maxBytes) {
+        return { ...blank, status: res.status, contentType, server, finalUrl: current, networkError: `document is ${bytes.length} bytes, over the ${opts.maxBytes}-byte cap` };
+      }
+      return { status: res.status, contentType, server, bytes, finalUrl: current };
     }
-    const bytes = new Uint8Array(await res.arrayBuffer());
-    if (bytes.length > opts.maxBytes) {
-      return { ...blank, status: res.status, contentType, server, finalUrl: res.url || url, networkError: `document is ${bytes.length} bytes, over the ${opts.maxBytes}-byte cap` };
-    }
-    return { status: res.status, contentType, server, bytes, finalUrl: res.url || url };
   } catch (err) {
-    return { ...blank, networkError: err instanceof Error ? err.message : String(err) };
+    return { ...blank, finalUrl: current, networkError: err instanceof Error ? err.message : String(err) };
   }
 }
 
@@ -297,6 +336,22 @@ export async function fetchPublicDocument(url: string, opts: FetchPublicDocument
   const userAgent = opts.userAgent || BROWSER_UA;
 
   const attempt = await httpAttempt(checked.url.toString(), { timeoutMs, userAgent, maxBytes });
+
+  if (attempt.refusedUrl) {
+    // Not a network failure and not a wall: the server will not go there. No browser either —
+    // a window pointed at the same address would be the same request with more machinery.
+    return {
+      ok: false,
+      status: 0,
+      contentType: "",
+      via: "http",
+      reason: attempt.refusedUrl === checked.url.toString()
+        ? `Refused: ${attempt.refusal}`
+        : `Refused: ${checked.url.host} redirected to ${attempt.refusedUrl}. ${attempt.refusal}`,
+      finalUrl: attempt.refusedUrl,
+      privateTarget: attempt.refusedUrl,
+    };
+  }
 
   if (attempt.networkError) {
     // A dead host, a DNS failure or a timeout says nothing about robots, and a headed

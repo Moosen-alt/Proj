@@ -2492,7 +2492,7 @@ app.post("/api/tools/form-fill/batch", express.json({ limit: "8mb" }), asyncHand
   const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
   if (!rows.length) throw new HttpError(400, "rows required.");
   if (rows.length > 200) throw new HttpError(400, "Max 200 rows per batch.");
-  const { fetchPdf } = await import("./ahjFormAuto");
+  const { fetchPdfOutcome, FORM_FILL_TOOL_FETCH } = await import("./ahjFormAuto");
   const { autoFillByFieldName, listAcroFields, overlayText, isPdf } = await import("./formFiller");
   const { extractLabels, hasTextLayer, autoPlaceFromData } = await import("./formTextLayer");
   const AdmZip = (await import("adm-zip")).default;
@@ -2516,7 +2516,7 @@ app.post("/api/tools/form-fill/batch", express.json({ limit: "8mb" }), asyncHand
   // common case: load one AHJ form at the top, then batch-fill many rows).
   const sharedB64 = String(req.body?.sharedPdfBase64 || "");
   const shared = sharedB64 ? new Uint8Array(Buffer.from(sharedB64, "base64")) : null;
-  const blankCache = new Map<string, Uint8Array | null>();
+  const blankCache = new Map<string, { bytes: Uint8Array | null; privateTarget?: string; reason?: string }>();
   const results: Array<{ index: number; ok: boolean; filename?: string; matched?: number; error?: string }> = [];
   const usedNames = new Set<string>();
   for (let i = 0; i < rows.length; i++) {
@@ -2526,8 +2526,11 @@ app.post("/api/tools/form-fill/batch", express.json({ limit: "8mb" }), asyncHand
     try {
       let blank: Uint8Array | null;
       if (/^https?:\/\//i.test(url)) {
-        const cached = blankCache.get(url);
-        if (cached === undefined) { blank = await fetchPdf(url); blankCache.set(url, blank); } else { blank = cached; }
+        let got = blankCache.get(url);
+        if (got === undefined) { got = await fetchPdfOutcome(url, FORM_FILL_TOOL_FETCH); blankCache.set(url, got); }
+        // A refused address is the row's answer, said plainly — not "did not return a PDF".
+        if (got.privateTarget) throw new Error(got.reason || "Refused: that URL points at a private address.");
+        blank = got.bytes;
       } else {
         blank = shared; // no per-row URL → use the loaded form
       }
@@ -2551,10 +2554,13 @@ app.post("/api/tools/form-fill/batch", express.json({ limit: "8mb" }), asyncHand
 app.post("/api/tools/form-fill/fetch", express.json({ limit: "1mb" }), asyncHandler(async (req, res) => {
   const url = String(req.body?.url || "").trim();
   if (!/^https?:\/\//i.test(url)) throw new HttpError(400, "A http(s) URL is required.");
-  const { fetchPdf } = await import("./ahjFormAuto");
-  const bytes = await fetchPdf(url);
-  if (!bytes) throw new HttpError(422, "Could not fetch a PDF from that URL (not reachable, or not a PDF).");
-  res.type("application/pdf").send(Buffer.from(bytes));
+  const { fetchPdfOutcome, FORM_FILL_TOOL_FETCH } = await import("./ahjFormAuto");
+  const got = await fetchPdfOutcome(url, FORM_FILL_TOOL_FETCH);
+  // A private/loopback/link-local target (or a redirect to one) is a bad request, not a fetch
+  // that failed: 400, and nothing was sent there (issue #391).
+  if (got.privateTarget) throw new HttpError(400, got.reason || "Refused: that URL points at a private address.");
+  if (!got.bytes) throw new HttpError(422, `Could not fetch a PDF from that URL${got.reason ? `: ${got.reason}` : " (not reachable, or not a PDF)."}`);
+  res.type("application/pdf").send(Buffer.from(got.bytes));
 }));
 
 // Look up an AHJ's form from its website (LLM web-search), then fetch the blank
@@ -2565,14 +2571,14 @@ app.post("/api/tools/form-fill/lookup", express.json({ limit: "1mb" }), asyncHan
   const formType = String(req.body?.formType || "").trim() || undefined;
   if (!ahj) throw new HttpError(400, "ahj is required.");
   const { createLLMProvider } = await import("./llm");
-  const { fetchPdf } = await import("./ahjFormAuto");
+  const { fetchPdf, FORM_FILL_TOOL_FETCH } = await import("./ahjFormAuto");
   let research;
   try { research = await createLLMProvider().findAhjFormUrl({ ahj, state, formType }); }
   catch (err) { throw normalizeLlmError(err); }
   if (research.provider === "stub") throw new HttpError(422, "Form lookup needs an LLM (set ANTHROPIC_API_KEY). Paste the form URL instead.");
   // Try candidate URLs best-first; return the first that yields a real PDF.
   for (const url of research.candidateUrls || []) {
-    const bytes = await fetchPdf(url);
+    const bytes = await fetchPdf(url, FORM_FILL_TOOL_FETCH);
     if (bytes) { res.json({ found: true, formName: research.formName, sourceUrl: url, pdfBase64: Buffer.from(bytes).toString("base64"), notes: research.notes }); return; }
   }
   // None were directly downloadable — hand back what we found so the operator can grab it.
