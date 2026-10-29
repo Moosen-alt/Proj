@@ -59,6 +59,21 @@
 //         stamp, so the run fails by name as on main for a page script's POST). Red while the 4 s window survived the navigation (the POST reached the
 //         portal and was recorded as the person's). The cost: an interstitial that auto-posts the
 //         filing after the person's own click is held, as on main.
+//   [A, Helm Should-fix 9 + 10] WHAT COUNTS AS THE PERSON'S INPUT: a trusted event only, and for 4 s only.
+//   Both are GUARD pins, green before by design (the isTrusted filter and HUMAN_INPUT_MS landed with the
+//   watch); they hold those two lines through the isolated-world rewrite (Should-fix 1), which must
+//   re-run them. Each names its kill:
+//     A15 a page script dispatches a synthetic pointerdown, mousedown and keydown Enter on the submit,
+//         then (100 ms later, a separate evaluate, so the kill cannot lose a race to the request) sends
+//         a filing fetch: aborted, 0 POSTs, the abort NOT flagged humanInput, nothing in humanRequests,
+//         personActedSinceHandOver false. Kill K-trusted: HUMAN_INPUT_SCRIPT's
+//         `if (!e || !e.isTrusted) return;` becomes `if (!e) return;`.
+//     A16 a person's touch (sends nothing), then a page script's filing POST 4.5 s later: aborted (the
+//         4 s bound), 0 POSTs, NOT flagged humanInput, nothing in humanRequests — and the touch WAS
+//         counted: personActedSinceHandOver(page) (no withinMs) is still true. Kills: K-10s
+//         (HUMAN_INPUT_MS = 10_000) reddens the abort check; K-bound (personActedSinceHandOver's
+//         `withinMs === undefined` read as `withinMs ?? HUMAN_INPUT_MS`, a 4 s bound by default) reddens
+//         the "counted" check.
 //   [B] THE REPLAY (RecipeAdapter, guided manual: no approval, the flagged final submit never clicked):
 //     B1  the person clicks the portal's submit the moment the run hands the page over: the POST
 //         reaches the portal, the run is NOT failed, and it reports the person's submit; the
@@ -758,6 +773,51 @@ console.log("\n[A, #370] A REDIRECT HOP CARRIES THE FIRST LEG'S PERSON VERDICT")
     !!held && !held.humanInput, brief(b, "A14", from));
   check("A14 …and never recorded as the person's request",
     !b.bs.humanRequests.some((r) => /\/apply\/submit$/.test(r.where)), brief(b, "A14", from));
+  await b.close();
+}
+{
+  // A15 (Helm Should-fix 9, GUARD pin, kill K-trusted): only a TRUSTED event is a person's input. A page
+  // script dispatches pointerdown, mousedown and keydown Enter on the submit (never a synthetic click:
+  // Chromium runs a button's activation on that, which would make this a document POST), then sends a
+  // filing fetch. The two evaluates are 100 ms apart so that, with the filter killed, the binding's
+  // stamp lands before the fetch is judged — the kill measures the filter, not a race.
+  const from = posts.length;
+  const b = await bed("A15");
+  await b.page.evaluate(() => {
+    const el = document.getElementById("btnSubmit");
+    if (!el) throw new Error("no #btnSubmit");
+    el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true }));
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+  });
+  await sleep(100);
+  await b.page.evaluate(() => { void fetch("/h/A15/apply/submit", { method: "POST", body: "x=1" }).catch(() => null); });
+  await sleep(900);
+  const held = b.bs.aborts.find((a) => /\/apply\/submit$/.test(a.where));
+  check("A15 a page's synthetic pointerdown, mousedown and Enter, then a filing fetch: aborted, 0 POSTs reach the portal",
+    postsFor("A15", from).length === 0 && !!held, brief(b, "A15", from));
+  check("A15 …and the abort is NOT flagged as the person's input", !!held && !held.humanInput, brief(b, "A15", from));
+  check("A15 …nothing in humanRequests, and personActedSinceHandOver is false (the synthetic events were never the person's)",
+    b.bs.humanRequests.length === 0 && b.bs.personActedSinceHandOver(b.page) === false, brief(b, "A15", from));
+  await b.close();
+}
+{
+  // A16 (Helm Should-fix 10, GUARD pin, kills K-10s and K-bound): a person's input covers 4 s
+  // (HUMAN_INPUT_MS), no longer. They touch the page (it sends nothing); 4.5 s later a page script
+  // POSTs the filing. 4.5 s, not 4.1 s: Date.now() skew on a loaded box must not flake the margin.
+  const from = posts.length;
+  const b = await bed("A16");
+  await personTouchesPage(b.page);
+  await sleep(4500);
+  await b.page.evaluate(() => { void fetch("/h/A16/apply/submit", { method: "POST", body: "x=1" }).catch(() => null); });
+  await sleep(700);
+  const held = b.bs.aborts.find((a) => /\/apply\/submit$/.test(a.where));
+  check("A16 a touch, then a filing POST 4.5 s later: aborted (the 4 s bound), 0 POSTs reach the portal",
+    postsFor("A16", from).length === 0 && !!held, brief(b, "A16", from));
+  check("A16 …not flagged as the person's input, and not in humanRequests",
+    !!held && !held.humanInput && !b.bs.humanRequests.some((r) => /\/apply\/submit$/.test(r.where)), brief(b, "A16", from));
+  check("A16 …and the touch itself was counted (personActedSinceHandOver, no time bound, is true)",
+    b.bs.personActedSinceHandOver(b.page) === true, brief(b, "A16", from));
   await b.close();
 }
 
