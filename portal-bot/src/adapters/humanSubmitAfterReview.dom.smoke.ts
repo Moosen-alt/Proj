@@ -74,6 +74,12 @@
 //         (HUMAN_INPUT_MS = 10_000) reddens the abort check; K-bound (personActedSinceHandOver's
 //         `withinMs === undefined` read as `withinMs ?? HUMAN_INPUT_MS`, a 4 s bound by default) reddens
 //         the "counted" check.
+//     KILLS, measured at f3493df7 in a throwaway tree on the [A]-only trim (41 checks; green 41/41 on
+//     the parent 3ab2827d with these pins): K-trusted reddens A15 x3 (3/41: the fetch reached the
+//     portal, recorded in humanRequests as the person's); K-10s reddens A16's abort and not-flagged
+//     checks (2/41: the POST reached the portal; A10/A11 stay green, their hop carries the verdict);
+//     K-bound reddens A16's "counted" check (1/41). K-bound was not run on [B] (personMovedOn reads the
+//     same method).
 //   [B] THE REPLAY (RecipeAdapter, guided manual: no approval, the flagged final submit never clicked):
 //     B1  the person clicks the portal's submit the moment the run hands the page over: the POST
 //         reaches the portal, the run is NOT failed, and it reports the person's submit; the
