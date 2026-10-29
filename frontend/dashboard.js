@@ -43,6 +43,10 @@ const state = {
   // status" on a stale row. Cleared on project switch and after every recorded check — a stale
   // target id would file the next paste against the wrong permit.
   recheckTargetId: null,
+  // Which tracked-filing card has its Edit / Record status form open (#411) — a target id or null.
+  // State, not DOM, so a background re-render keeps the form open; cleared on project switch.
+  permitTargetEditing: null,
+  permitTargetRecording: null,
   // "<projectId>|<targetId>" the permit form's fields were last filled from (syncPermitForm);
   // recordPermitStatus posts the form's numbers only with THAT filing's check.
   permitFormFor: null,
@@ -2339,6 +2343,8 @@ async function selectProject(projectId) {
   state.submitGate = null;
   state.staleReadings = null;
   state.recheckTargetId = null;
+  state.permitTargetEditing = null;
+  state.permitTargetRecording = null;
   state.submittalTracks = null;
   state.paymentQuotes = null;
   state.feeReceipts = [];
@@ -7419,27 +7425,173 @@ function portalSaysFor(target, checks) {
   return text ? { text, at: newest.createdAt } : null;
 }
 
+// RECORD STATUS FROM THE CARD (#411) — the words each pick posts, chosen so the classifier reads
+// them as that status. A bare "Issued" classifies as needs_human_review; "Permit issued" is the
+// issued reading. Pinned through the real classifier by backend/test/permitTargetCard.test.ts.
+// The words are only a reading: what it may finish is still readingMayFinishTrack's call.
+const PERMIT_STATUS_PICKS = [
+  { key: "issued", label: "Issued", text: "Permit issued" },
+  { key: "approved", label: "Approved", text: "Approved" },
+  { key: "in_review", label: "In review", text: "In review" },
+  { key: "corrections", label: "Corrections required", text: "Corrections required" },
+  { key: "fees_due", label: "Fees due", text: "Fees due" },
+  { key: "other", label: "Other (type it)", text: "" },
+];
+
+// The status text one card's Record form posts: the pick's words, or the operator's own for Other.
+function permitTargetStatusText(pickKey, otherText) {
+  if (pickKey === "other") return String(otherText || "").trim();
+  return (PERMIT_STATUS_PICKS.find((p) => p.key === pickKey) || { text: "" }).text;
+}
+
+// Only what the operator CHANGED goes in the PATCH. The card's frequency is the EFFECTIVE cadence
+// (an open filing reads 1 day whatever is stored), so sending every field back would rewrite a
+// stored 7 to 1 on every save of an untouched form.
+function permitTargetEditPatch(target, values) {
+  const patch = {};
+  for (const key of ["portalUrl", "trackingUrl", "applicationNumber", "permitNumber", "portalName"]) {
+    const value = String(values[key] ?? "").trim();
+    if (value !== String(target[key] ?? "").trim()) patch[key] = value;
+  }
+  const days = Number(values.checkFrequencyDays);
+  if (String(values.checkFrequencyDays ?? "").trim() !== "" && days !== Number(target.checkFrequencyDays)) patch.checkFrequencyDays = days;
+  if (typeof values.active === "boolean" && values.active !== (target.active !== false)) patch.active = values.active;
+  return patch;
+}
+
+// ONE TRACKED FILING'S CARD, with its own Edit and Record status (#411). Pure — lifted by
+// backend/test/permitTargetCard.test.ts. Every control carries THIS card's target id; the inputs are
+// found inside the card (data-edit-field / data-record-field), never by page-wide id, because the
+// cards repeat. `ui` says which form, if any, is open on this card (state, so a re-render keeps it).
+function permitTargetCardHtml(target, checks, ui) {
+  const id = esc(target.id);
+  const platformLabel = target.portalPlatform && target.portalPlatform !== "unknown" && target.portalPlatform !== "public_url"
+    ? `<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:var(--info);color:#fff;margin-left:6px">${esc(target.portalPlatform)}</span>`
+    : "";
+  const sourceLabel = ` · ${esc(permitTargetKindLabel(target))}`;
+  const said = portalSaysFor(target, checks);
+  const stopped = target.active === false;
+  const field = (key, label, value, type = "text") => `
+        <label style="display:block;font-size:12px;margin-top:6px">${esc(label)}
+          <input type="${type}" data-edit-field="${key}" value="${esc(value ?? "")}" style="width:100%"${type === "number" ? ` min="1" max="365" step="1"` : ""}>
+        </label>`;
+  const editForm = ui?.editing ? `
+      <div class="permit-target-edit" style="margin-top:8px">${field("portalUrl", "Portal / record URL (the monitor reads this)", target.portalUrl)}${field("trackingUrl", "Public status URL", target.trackingUrl)}${field("applicationNumber", "Application number", target.applicationNumber)}${field("permitNumber", "Permit number", target.permitNumber)}${field("portalName", "Portal name", target.portalName)}${field("checkFrequencyDays", "Check every (days) — an open filing is still read daily", target.checkFrequencyDays, "number")}
+        <label style="display:block;font-size:12px;margin-top:6px"><input type="checkbox" data-edit-field="active"${stopped ? "" : " checked"}> Keep checking this filing</label>
+        <div style="margin-top:8px">
+          <button type="button" data-target-action="save" data-target-id="${id}">Save</button>
+          <button type="button" class="secondary" data-target-action="cancel" data-target-id="${id}">Cancel</button>
+        </div>
+      </div>` : "";
+  const recordForm = ui?.recording ? `
+      <div class="permit-target-record" style="margin-top:8px">
+        <label style="display:block;font-size:12px">What the ${esc(target.targetType === "nem" ? "utility" : "jurisdiction")} says now
+          <select data-record-field="pick">${PERMIT_STATUS_PICKS.map((p) => `<option value="${esc(p.key)}">${esc(p.label)}</option>`).join("")}</select>
+        </label>
+        <label style="display:block;font-size:12px;margin-top:6px">Other — the status in your words
+          <input type="text" data-record-field="other" style="width:100%">
+        </label>
+        <div style="margin-top:8px">
+          <button type="button" data-target-action="record-save" data-target-id="${id}">Record status</button>
+          <button type="button" class="secondary" data-target-action="cancel" data-target-id="${id}">Cancel</button>
+        </div>
+      </div>` : "";
+  return `
+    <article class="item info" data-permit-target="${id}">
+      <div class="item-title"><span>${esc(target.portalName || target.jurisdiction || "Permit target")}${sourceLabel}</span>${statusBadge(target.latestOutcome || (stopped ? "not tracked" : "active"))}${platformLabel}</div>
+      ${said ? `<p><strong>Portal says:</strong> “${esc(said.text)}” <span class="muted">· read ${esc(new Date(said.at).toLocaleString())}</span></p>` : ""}
+      <p>${esc([target.applicationNumber && `Application ${target.applicationNumber}`, target.permitNumber && `Permit ${target.permitNumber}`].filter(Boolean).join(" | ") || "No application/permit number recorded yet.")}</p>
+      ${target.portalUrl ? `<p class="muted" style="word-break:break-all">${esc(target.portalUrl)}</p>` : ""}
+      ${target.trackingUrl && target.trackingUrl !== target.portalUrl ? `<p class="muted" style="word-break:break-all">Status link: ${esc(target.trackingUrl)}</p>` : ""}
+      <p class="muted">${stopped ? "Tracking stopped — the monitor no longer reads this filing." : `Checks every ${esc(target.checkFrequencyDays)} day(s) · Next: ${target.nextCheckAt ? esc(new Date(target.nextCheckAt).toLocaleString()) : "not scheduled"}`} · Source strategy: ${esc(target.portalPlatform || "auto")}</p>
+      ${ui?.editing || ui?.recording ? "" : `<div style="margin-top:6px">
+        <button type="button" class="secondary" style="font-size:12px" data-target-action="edit" data-target-id="${id}">Edit</button>
+        <button type="button" class="secondary" style="font-size:12px" data-target-action="record" data-target-id="${id}">Record status</button>
+      </div>`}${editForm}${recordForm}
+    </article>`;
+}
+
+// Delegated on #permitTargets (rebuilt on every render), registered once. The target id is the
+// clicked control's own — a Record on the second card is that card's filing, never targets[0].
+function handlePermitTargetClick(event) {
+  const el = event.target;
+  if (!(el instanceof Element)) return;
+  const button = el.closest("button[data-target-action]");
+  if (!button) return;
+  const targetId = button.dataset.targetId;
+  const action = button.dataset.targetAction;
+  const card = button.closest("article[data-permit-target]");
+  if (action === "edit" || action === "record") {
+    state.permitTargetEditing = action === "edit" ? targetId : null;
+    state.permitTargetRecording = action === "record" ? targetId : null;
+    renderPermitMonitor();
+    return;
+  }
+  if (action === "cancel") {
+    state.permitTargetEditing = null;
+    state.permitTargetRecording = null;
+    renderPermitMonitor();
+    return;
+  }
+  if (action === "save") {
+    const target = (state.detail?.permitCheckTargets || []).find((t) => t.id === targetId);
+    if (!target || !card) return;
+    const values = {};
+    for (const input of card.querySelectorAll("[data-edit-field]")) {
+      values[input.dataset.editField] = input.type === "checkbox" ? input.checked : input.value;
+    }
+    savePermitTargetEdit(targetId, permitTargetEditPatch(target, values));
+    return;
+  }
+  if (action === "record-save") {
+    const pick = card?.querySelector('[data-record-field="pick"]')?.value || "";
+    const statusText = permitTargetStatusText(pick, card?.querySelector('[data-record-field="other"]')?.value);
+    if (!statusText) {
+      showMessage("Type the status the portal shows, or pick one from the list.", "warning");
+      return;
+    }
+    // recordPermitStatus closes this form and re-renders on success.
+    recordPermitStatus("manual", targetId, statusText)
+      .catch((err) => showMessage(err.message || "Could not record the status.", "error"));
+  }
+}
+
+// PATCH one filing and re-render from what the server says it now is. A refusal (rule 5, a
+// non-web URL, a number cleared to nothing) is the server's own message, shown — never swallowed.
+async function savePermitTargetEdit(targetId, patch) {
+  if (!state.selectedProjectId) return;
+  if (!Object.keys(patch).length) {
+    state.permitTargetEditing = null;
+    renderPermitMonitor();
+    showMessage("Nothing changed on this filing.", "info");
+    return;
+  }
+  try {
+    state.detail = await api(`/api/projects/${state.selectedProjectId}/permit-targets/${encodeURIComponent(targetId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    });
+  } catch (err) {
+    showMessage(err.message || "Could not save this filing.", "error");
+    return;
+  }
+  state.permitTargetEditing = null;
+  showMessage("Filing updated.");
+  renderDetail();
+}
+
 function renderPermitMonitor() {
   const targets = state.detail.permitCheckTargets || [];
   const checks = state.detail.permitStatusChecks || [];
   const emailMatches = state.detail.emailProjectMatches || [];
   renderPermitStatusTargetPicker();
 
-  $("permitTargets").innerHTML = targets.length ? targets.map((target) => {
-    const platformLabel = target.portalPlatform && target.portalPlatform !== "unknown" && target.portalPlatform !== "public_url"
-      ? `<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:var(--info);color:#fff;margin-left:6px">${esc(target.portalPlatform)}</span>`
-      : "";
-    const sourceLabel = ` · ${esc(permitTargetKindLabel(target))}`;
-    const said = portalSaysFor(target, checks);
-    return `
-    <article class="item info">
-      <div class="item-title"><span>${esc(target.portalName || target.jurisdiction || "Permit target")}${sourceLabel}</span>${statusBadge(target.latestOutcome || "active")}${platformLabel}</div>
-      ${said ? `<p><strong>Portal says:</strong> “${esc(said.text)}” <span class="muted">· read ${esc(new Date(said.at).toLocaleString())}</span></p>` : ""}
-      <p>${esc([target.applicationNumber && `Application ${target.applicationNumber}`, target.permitNumber && `Permit ${target.permitNumber}`].filter(Boolean).join(" | ") || "No application/permit number recorded yet.")}</p>
-      ${target.portalUrl ? `<p class="muted" style="word-break:break-all">${esc(target.portalUrl)}</p>` : ""}
-      <p class="muted">Checks every ${target.checkFrequencyDays} day(s) · Next: ${target.nextCheckAt ? esc(new Date(target.nextCheckAt).toLocaleString()) : "not scheduled"} · Source strategy: ${esc(target.portalPlatform || "auto")}</p>
-    </article>`;
-  }).join("") : `<p class="muted">No permit check targets yet.</p>`;
+  $("permitTargets").innerHTML = targets.length
+    ? targets.map((target) => permitTargetCardHtml(target, checks, {
+      editing: state.permitTargetEditing === target.id,
+      recording: state.permitTargetRecording === target.id,
+    })).join("")
+    : `<p class="muted">No permit check targets yet.</p>`;
 
   // The API returns up to 50 status checks and most are literal duplicates — a
   // monitor that runs every few days re-records "In review" until something
@@ -8773,9 +8925,12 @@ async function addPermitTarget() {
 // FIRST target — was the only behaviour, and on a project with a structural and an electrical
 // permit (Coos Bay: both, one stalled) it silently recorded every re-check against whichever
 // happened to be first. The stale panel always passes the target its row is about.
-async function recordPermitStatus(source = "manual", targetId = null) {
+// `cardStatusText` is a card's Record status pick (#411): the status comes from the card, not the
+// paste box, so the box and the form's number fields are neither read nor cleared.
+async function recordPermitStatus(source = "manual", targetId = null, cardStatusText = null) {
   if (!state.selectedProjectId) return;
-  const rawStatusText = source === "mock" ? "" : $("permitStatusText").value.trim();
+  const fromCard = cardStatusText !== null;
+  const rawStatusText = fromCard ? String(cardStatusText).trim() : source === "mock" ? "" : $("permitStatusText").value.trim();
   if (source === "manual" && !rawStatusText) {
     showMessage("Paste AHJ/portal status text before classifying.", "warning");
     return;
@@ -8784,7 +8939,7 @@ async function recordPermitStatus(source = "manual", targetId = null) {
   // The number fields above were filled from ONE filing (syncPermitForm, recorded in
   // state.permitFormFor). Sent with another filing's check they would stamp that filing's number
   // on this one's row; sent empty, the server records the chosen filing's own numbers.
-  const formIsChosen = !chosenId || state.permitFormFor === `${state.detail.project?.id || ""}|${chosenId}`;
+  const formIsChosen = !fromCard && (!chosenId || state.permitFormFor === `${state.detail.project?.id || ""}|${chosenId}`);
   state.detail = await api(`/api/projects/${state.selectedProjectId}/permit-checks`, {
     method: "POST",
     body: JSON.stringify({
@@ -8795,8 +8950,9 @@ async function recordPermitStatus(source = "manual", targetId = null) {
       permitNumber: formIsChosen ? $("permitTrackingNumber").value : "",
     }),
   });
-  $("permitStatusText").value = "";
+  if (!fromCard) $("permitStatusText").value = "";
   state.recheckTargetId = null;
+  state.permitTargetRecording = null;
   state.workflow = null;
   state.historicalReport = null;
   await loadOpsPlan();
@@ -9209,6 +9365,8 @@ $("permitStatusTarget")?.addEventListener("change", syncPermitForm);
 // The stale-reading panel renders inside #permitChecks and is rebuilt on every refresh, so its
 // re-check buttons are bound by delegation on the container, once.
 $("permitChecks").addEventListener("click", handleStaleRecheckClick);
+// Each tracked filing's Edit / Record status controls (#411), the same way: delegated, once.
+$("permitTargets").addEventListener("click", handlePermitTargetClick);
 // Mock Check removed for production: it recorded a FABRICATED status check on a
 // real project's permit history. Simulated checks live in tests, not the UI.
 $("mockPermitCheckBtn")?.addEventListener("click", () => recordPermitStatus("mock"));

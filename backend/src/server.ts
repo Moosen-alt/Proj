@@ -115,6 +115,7 @@ import {
   captureConfirmation,
   markCorrectionResubmitted,
   createPermitCheckTarget,
+  updatePermitCheckTarget,
   createProject,
   updateProject,
   setProjectStatusByOperator,
@@ -1704,6 +1705,22 @@ app.post("/api/corrections/:id/retract-learning", (req, res) => {
 
 app.post("/api/projects/:id/permit-targets", (req, res) => {
   res.status(201).json(createPermitCheckTarget(db, req.params.id, req.body || {}));
+});
+
+// The tracked-filing card's Edit (#411). Under /api/projects/:id, so the project's org scope is the
+// mounted guard's; the target must belong to the project (updatePermitCheckTarget: else 404). Only
+// the named fields pass through — never a status (a status is a reading: POST .../permit-checks).
+app.patch("/api/projects/:id/permit-targets/:targetId", (req, res) => {
+  const body = req.body || {};
+  res.json(updatePermitCheckTarget(db, String(req.params.id), String(req.params.targetId), {
+    portalUrl: body.portalUrl,
+    trackingUrl: body.trackingUrl,
+    applicationNumber: body.applicationNumber,
+    permitNumber: body.permitNumber,
+    portalName: body.portalName,
+    checkFrequencyDays: body.checkFrequencyDays,
+    active: body.active,
+  }, currentUser(db, req)?.email || "operator"));
 });
 
 // Onboard a new AHJ with the LLM (easy "add a jurisdiction" workflow for new
