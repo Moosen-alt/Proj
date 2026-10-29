@@ -1,7 +1,5 @@
 import fs from "node:fs";
 import path from "node:path";
-import dns from "node:dns/promises";
-import net from "node:net";
 import { PDFDocument, PDFName, PDFRadioGroup, StandardFonts, degrees, rgb } from "pdf-lib";
 import type { ProjectRecord } from "../../shared/src/types";
 import type { AppDb } from "./db";
@@ -42,6 +40,7 @@ import { BCD_5952_LIMITS, type ChecklistRecovery } from "./prescriptiveChecklist
 import { bcdChecklistAnswers, bcd5952AssumedFacts, bcd5952FailedRows, bcd5952MissingFacts, bcd5952SnapshotAdditions } from "./bcdChecklistFacts";
 import { iowaPvWorksheetValues } from "./iowaPvWorksheet";
 import { documentFetchDisabled } from "./documentFetch";
+import { assertPublicHttpUrl } from "./publicUrlGuard";
 import {
   agencyRowAppliesToJob, agencyRowProvenance, anchorSitesOnce,
   agencyTrackFormTypes, applicationKindForPath, applicationSlotFor, stateIssuerKeepsGenericSlot, explicitSingleFamilyAnswer, formApplicationKind, formAuthorityFor, rowBelongsToAuthority, structureMeaningOf,
@@ -1411,47 +1410,8 @@ export function matchingForms(project: { ahj?: string | null; state?: string | n
 }
 
 // SSRF guard: an AHJ form URL comes from operator input (/api/ahj-forms/inspect), so a
-// server-side fetch of it must never reach internal/cloud-metadata hosts. Reject anything
-// that isn't a public http(s) address. Returns the validated URL; throws HttpError(400) on
-// a private/loopback/link-local/metadata/multicast target or a non-http scheme.
-function ipIsPrivate(ip: string): boolean {
-  const kind = net.isIP(ip);
-  if (kind === 4) {
-    const o = ip.split(".").map(Number);
-    if (o[0] === 10 || o[0] === 127 || o[0] === 0) return true;
-    if (o[0] === 169 && o[1] === 254) return true;            // link-local + cloud metadata
-    if (o[0] === 172 && o[1] >= 16 && o[1] <= 31) return true;
-    if (o[0] === 192 && o[1] === 168) return true;
-    if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return true; // CGNAT
-    if (o[0] === 192 && o[1] === 0 && o[2] === 0) return true;
-    if (o[0] >= 224) return true;                              // multicast / reserved
-    return false;
-  }
-  if (kind === 6) {
-    const lower = ip.toLowerCase();
-    if (lower === "::1" || lower === "::") return true;
-    if (lower.startsWith("fe8") || lower.startsWith("fe9") || lower.startsWith("fea") || lower.startsWith("feb")) return true; // fe80::/10
-    if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // unique-local fc00::/7
-    const mapped = lower.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);        // IPv4-mapped
-    if (mapped) return ipIsPrivate(mapped[1]);
-    return false;
-  }
-  return true; // not a valid IP literal → treat as unsafe
-}
-
-async function assertPublicHttpUrl(raw: string): Promise<void> {
-  let u: URL;
-  try { u = new URL(raw); } catch { throw new HttpError(400, `Invalid URL: ${raw}`); }
-  if (u.protocol !== "http:" && u.protocol !== "https:") {
-    throw new HttpError(400, `Only http(s) URLs may be fetched (got ${u.protocol}).`);
-  }
-  const host = u.hostname;
-  const addrs = net.isIP(host) ? [host] : (await dns.lookup(host, { all: true })).map((a) => a.address);
-  if (!addrs.length || addrs.some((a) => ipIsPrivate(a))) {
-    throw new HttpError(400, `Refusing to fetch an internal/private address (${host}).`);
-  }
-}
-
+// server-side fetch of it must never reach internal/cloud-metadata hosts. The predicate is
+// shared with fetchPublicDocument (publicUrlGuard.ts, issue #391): one address list, two doors.
 // Fetch following redirects MANUALLY, re-validating each hop against the SSRF guard so a
 // public URL can't 30x-redirect into an internal host.
 async function safeFetchTemplate(rawUrl: string): Promise<Response> {
