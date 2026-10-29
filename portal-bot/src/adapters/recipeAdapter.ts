@@ -2237,7 +2237,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         const read = errorPage ? null : await this.readPageForCapture();
         const judged = read ? this.judgeCompletion(read, this.lastCommittedClick?.at ?? 0) : { number: "", confirmed: false, stillReview: false };
         if (judged.number) {
-          const recordRead = await chooseRecord({ value: judged.number, confidence: "high", reason: "The page after the person's submit names the record." });
+          const recordRead = await chooseRecord({ value: judged.number, confidence: "high", reason: `Captured submission confirmation: ${judged.number}.` });
           return ok(`Captured submission confirmation: ${judged.number}.`, {
             permitNumber: judged.number, confirmationNumber: judged.number,
             discipline: judged.number.match(/-([A-Z]{2,4})$/)?.[1] ?? null, recordLink: recordRead.recordLink, recordRead,
@@ -2251,18 +2251,19 @@ export class RecipeAdapter extends BasePortalAdapter {
             { permitNumber: "", recordLink: cleanRecordLink(rawUrl), stillReview: judged.stillReview, errorPage },
           );
         }
-        const listed = await chooseRecord({ value: "", confidence: "low", reason: "" });
+        const unread = judged.confirmed ? "Submitted; no record number found on the completion page yet."
+          : "This page does not read as the application's completion: no record number recorded.";
+        const listed = await chooseRecord({ value: "", confidence: "low", reason: unread });
         const recordRead = listed.confidence === "high" && !judged.confirmed
           ? {
             ...listed, recordNumber: "", confidence: "low" as const, source: "none" as const,
             reason: "One new application appeared in the account's list, but the page after the submit does not read as the application's completion — a person confirms whether it is this filing.",
             candidates: [{ recordNumber: listed.recordNumber, recordLink: listed.recordLink, source: "account_list" as const }],
           }
-          : listed;
+          // With nothing in the list to offer, the reason is the page's judgement, as before #400.
+          : listed.confidence === "low" && !listed.candidates.length ? { ...listed, reason: unread } : listed;
         return ok(
-          recordRead.confidence === "high" ? `Submitted; ${recordRead.recordNumber} is the one new application in the account's list.`
-            : judged.confirmed ? "Submitted; no record number found on the completion page yet."
-              : "This page does not read as the application's completion: no record number recorded.",
+          recordRead.confidence === "high" ? `Submitted; ${recordRead.recordNumber} is the one new application in the account's list.` : unread,
           { permitNumber: "", recordLink: recordRead.recordLink || cleanRecordLink(rawUrl), stillReview: false, errorPage: false, recordRead },
         );
       }
