@@ -119,6 +119,26 @@
 //         that appears after the arm counts until its session is attached.
 //     A23 the person follows a same-origin link to /review2 after the hand-over and clicks its submit: one
 //         POST — only the script for new documents (Page.enable, worldName) watches that document.
+//     KILLS, measured at 0525b131 in a throwaway tree on a trim to A1, A2, A13, A15, A16, A18-A23, the "o"
+//     cases, B1, B1b, B12 and B12b (53 checks, green 53/53 unmutated), with humanHandover.test (62):
+//       K-zeroarg (the script calls the binding with no argument): 23/53 — A1 x3, A13 x2, A16's "counted",
+//         A22 x2, A23 x2, A22o, A22b, B1 x7, B1b x4 (every person's input lost while the read-back said
+//         armed); section 6's one-argument check.
+//       K-noctxname (Runtime.addBinding without executionContextName: the binding in every main world):
+//         A18 x3, A19 x3, A19o x2 (8/53); section 6's addBinding check.
+//       K-nopageenable (no Page.enable on the watch's session) and K-noworldname (the new-document script
+//         run in the main world): A23 x2 each (2/53); section 6's Runtime/Page or worldName check.
+//       K-nochild (no world for a target's in-process child frames): A22 x2 (2/53).
+//       K-nooopif (no session for an out-of-process frame present at the arm): A22o (1/53).
+//       K-noframenav (frame navigations never re-asked): A22b (1/53).
+//       K-armed ("armed" without the read-back): A21, B12b's "page is yours" and note checks (3/53).
+//       K-trusted and M-touch (step 18's, re-run on the isolated world): A15 x3 each (3/53) — the
+//         isTrusted filter is still what holds A15.
+//     Not observable at run time, said: K-notypeof (no typeof guard on newCDPSession) stays 53/53 — the call
+//     to an absent newCDPSession throws inside the arm and fails closed by itself, so A21b holds the
+//     "none at all" shape either way; K-disposeorder (the watch's sessions detached before the route
+//     comes off) stays 53/53 behind the handler's first-line disposed guard, and only section 6's
+//     dispose-order check goes red.
 //   [B] THE REPLAY (RecipeAdapter, guided manual: no approval, the flagged final submit never clicked):
 //     B1  the person clicks the portal's submit the moment the run hands the page over: the POST
 //         reaches the portal, the run is NOT failed, and it reports the person's submit; the
