@@ -9,10 +9,13 @@
 //   (2) THE FENCE: every input the replay makes runs inside withAutomationInput.
 // This scan makes (1) and (2) durable: a later edit that adds an input to the post-review path, a
 // second caller of the hand-over, or an unfenced click / key press / typing call fails here. "An input"
-// means one the scan can NAME: a Playwright input method in any call shape, a run door, the keyboard /
-// mouse / touchscreen, a raw DevTools session or an Input-domain method (section 0 pins each pattern
-// both ways), or a call it cannot follow. It is a source scan, not a proof: what section 3 lists under
-// NOT FOLLOWED (a method reached by a computed name, an input method taken as a value) is not seen.
+// means one INPUT_CALL can NAME: a Playwright input method in any call shape, a called run door
+// (guardedClick, executeStep, …), a `keyboard.` / `mouse.` / `touchscreen.` reference, a raw DevTools
+// session or an Input-domain method. Section 0 pins the call shapes and the DevTools / Input-domain
+// patterns both ways; the keyboard / mouse / touchscreen patterns have no section-0 row. Section 3
+// separately fails on a call it cannot follow (a bracket call, `import(`, an unlisted import). It is a
+// source scan, not a proof: what section 3 lists under NOT FOLLOWED (a method reached by a computed
+// name, an input method taken as a value) is not seen.
 //
 //   npx tsx portal-bot/src/humanHandover.test.ts
 import fs from "node:fs";
@@ -133,7 +136,7 @@ console.log("\n0. THE INPUT PATTERNS READ EVERY CALL SHAPE (Helm Should-fix 8, t
   const cdpWrong = cdpMustNot.filter((s) => INPUT_CALL.test(s));
   check("INPUT_CALL reads a raw DevTools session (newCDPSession / newBrowserCDPSession, called or taken) and the Input domain's methods as input, and the word Input in prose as none",
     cdpMissed.length === 0 && cdpWrong.length === 0, `missed: ${JSON.stringify(cdpMissed)} wrongly read: ${JSON.stringify(cdpWrong)}`);
-  const typingMust =["await scoped.type?.(v)", "await scoped!.type!(v, { delay: 35 })", "await loc.pressSequentially?.(v)"];
+  const typingMust = ["await scoped.type?.(v)", "await scoped!.type!(v, { delay: 35 })", "await loc.pressSequentially?.(v)"];
   const tickMust = ["await box.setChecked?.(true)", "await box.check!()", "await box.uncheck?.()"];
   const notTyping = ["typeof scoped!.type === \"function\"", "if (inf?.type !== \"radio\")"];
   check("section 4's typing and checkbox patterns read optional and non-null calls (`.type?.(`, `.setChecked?.(`, `.check!(`)",
@@ -218,7 +221,9 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   // (`.click.call(`, `.click.bind(` and `['click'](` ARE seen); a member reached by a COMPUTED name
   // through a call (`Reflect.get(ctx, "newCDP" + "Session")`, a method name or an Input-domain name
   // built by concatenation), since the scan reads names, never values (a computed `x[…](` call fails
-  // above, a `Reflect.get(…)(…)` does not); a programmatic submit
+  // above, a `Reflect.get(…)(…)` does not); a name spelled with a string escape or built in a
+  // template (`"Input.dispatch\x4beyEvent"`, `` `Input.${d}` ``, `el['cl\x69ck']()`), since the
+  // raw source is read, never the string's value; a programmatic submit
   // (`form.requestSubmit()`, `form.submit()` in the page): it makes no input event, so the lockdown holds
   // it (as it holds A15's untrusted events), and the in-page source scanned whole names it in prose
   // (Helm's call whether to add it; see the step-21 report); a local, parameter or
@@ -334,7 +339,7 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //   mustMatch rows missed) and is green now. Its mustNotMatch rows were measured against a broadened
   //   pattern (`\bInput\.\w+`, and `newCDPSession` with no trailing word boundary) → 1 FAIL of 145,
   //   wrongly read: `Input.value`, `Input.dispatched …`, `newCDPSessions`.
-  const classAt =recipe.indexOf("\nexport class RecipeAdapter ");
+  const classAt = recipe.indexOf("\nexport class RecipeAdapter ");
   const cls = classAt >= 0 ? recipe.slice(classAt, recipe.indexOf("\n}\n", classAt) + 3) : "";
   check("the RecipeAdapter class is found in recipeAdapter.ts", cls.length > 10_000, `len=${cls.length}`);
   const esc = (s: string): string => s.replace(/[$]/g, "\\$");
