@@ -820,6 +820,21 @@ check("1k. and the approve button stays available (a later track still needs it)
     await pl5.recordPermitStatus("public_url", "t2");
     check("10l9. MUST PASS: an explicit target id (stale-panel fetch) is posted as given",
       (posted as Record<string, unknown> | null)?.targetId === "t2");
+    // 10l9b — A RE-CHECK THAT READ NOTHING (#412): the server records nothing and says so in
+    // `unreadable`. The newest row is then the OLD one, so "Permit check classified: Issued" would
+    // tell the operator a read that found nothing came back Issued.
+    {
+      const said: Array<[string, string]> = [];
+      const unreadable = "The portal gave no readable status (the public page held no readable status) — nothing recorded. The filing keeps its last known status: Issued.";
+      const apiUnread = async () => ({ permitCheckTargets: [t1, t2], permitStatusChecks: [{ statusLabel: "Issued" }], unreadable });
+      const stU: Record<string, unknown> = { selectedProjectId: "p1", recheckTargetId: null, detail: { permitCheckTargets: [t1, t2] } };
+      const plU = load(pickEls(), stU, { api: apiUnread, ...loaders, showMessage: (m: string, k = "info") => { said.push([m, k]); } });
+      await plU.recordPermitStatus("public_url", "t1");
+      check("10l9b. a re-check the server did not record shows ITS sentence as a warning, never the old row's label",
+        said.length === 1 && said[0][0] === unreadable && said[0][1] === "warning", JSON.stringify(said));
+      check("10l9c. ...and the answer is not kept on state.detail (it is the call's, not the project's)",
+        !("unreadable" in (stU.detail as Record<string, unknown>)) && Array.isArray((stU.detail as Record<string, unknown>).permitCheckTargets));
+    }
     // The stale panel's "Paste a fresh status" (no portal URL) promises the paste is recorded
     // against ITS filing. The selector wins at POST time, so the panel must move the selector —
     // else the operator's paste goes to whatever the selector happened to show.
