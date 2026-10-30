@@ -135,6 +135,27 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //         <runAll tail>, makes no input". Old: green. K-nit-c `.setChecked(true)` there → that and
   //         section 4. Old: green. (`touchscreen.tap(` there is red on the old scan too, by `.tap(`:
   //         `\btouchscreen\.` is a guard for a touchscreen method Playwright may add.)
+  // VERIFIER ROUND (the scan above beat by four shapes at 385e4d78): KILLS run once in the throwaway
+  // tree at 397b6b63 against this scan, and at 385e4d78 against the scan it replaced ("Old": 126
+  // checks), the slip put just after the same lockReview line. Each is 1 FAIL of 129, the closure check:
+  //   K-S8i `await dismissPageModals?.(this.page!, …)` → "<runAll tail> → dismissPageModals(: an imported
+  //         function not on NO_INPUT_HELPERS / IMPORTED_VALUES". Old: green.
+  //   K-S8j `await (dismissPageModals)(this.page!, …)` → "dismissPageModals: an imported value not on
+  //         NO_INPUT_HELPERS / IMPORTED_VALUES". Old: green.
+  //   K-S8k `const f = dismissPageModals; await f(this.page!, …)` (the residual this round retired) →
+  //         the same "imported value" line. Old: green.
+  //   K-S8l `const self = this; await self.answerUnrecordedRequired();` → "<runAll tail> → this as a
+  //         value: its members cannot be followed". Old: green.
+  //   K-S8m `const { answerUnrecordedRequired: fillRest } = this; await fillRest.call(this);` → two
+  //         "this as a value" lines (the destructure and the `.call(this)`). Old: green.
+  //   K-S8n `await (new BasePortalAdapter() as any).dismiss?.();` → "BasePortalAdapter(: an imported
+  //         function not on NO_INPUT_HELPERS / IMPORTED_VALUES". Old: green (`new` was skipped).
+  //         K-S8n2 `await new Foo(this.page).run();` → "Foo(: a call to a name that is not imported,
+  //         local or followed". Old: green.
+  //   K-S8o `const { dismissPageModals: d } = await import("./autoLearnAdapter"); await d(…)` →
+  //         "import(: a module loaded at run time cannot be followed". Old: green.
+  //   K-S8c and K-S8h, re-run at 397b6b63, now read "dismissPageModals(: an imported function not on
+  //         NO_INPUT_HELPERS / IMPORTED_VALUES".
   const classAt = recipe.indexOf("\nexport class RecipeAdapter ");
   const cls = classAt >= 0 ? recipe.slice(classAt, recipe.indexOf("\n}\n", classAt) + 3) : "";
   check("the RecipeAdapter class is found in recipeAdapter.ts", cls.length > 10_000, `len=${cls.length}`);
