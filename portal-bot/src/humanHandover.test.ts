@@ -31,16 +31,21 @@ const listTs = (dir: string): string[] => fs.readdirSync(path.join(root, dir), {
   return /\.ts$/.test(d.name) && !/\.(test|smoke)\.ts$|dom\.smoke\.ts$/.test(d.name) ? [rel] : [];
 });
 const recipe = read("portal-bot/src/adapters/recipeAdapter.ts");
-// A class method's body: from its signature to the next member at the same indent.
+// A class method's body: from its signature to the next member at the same indent (`override ` and
+// accessors included, Helm Should-fix 8: `protected override async runGapFill(` was invisible), cut at
+// the method's own closing brace so the next member's doc comment is not read as part of it.
+const MODIFIERS = "(?:private |protected |public |static |readonly |override )*";
 const methodBody = (src: string, signature: RegExp): string => {
   const m = signature.exec(src);
   if (!m) return "";
   const start = m.index;
   const rest = src.slice(start + m[0].length);
-  const next = /\n  (?:private |protected |public |static |readonly )*(?:async )?[A-Za-z_$][\w$]*\s*(?:<[^>]*>)?\(|\n  (?:private |protected |public |readonly )+[A-Za-z_$][\w$]*\s*[:=]|\n}\n/.exec(rest);
-  return src.slice(start, start + m[0].length + (next ? next.index : rest.length));
+  const next = new RegExp(`\\n  ${MODIFIERS}(?:async )?(?:get |set )?[A-Za-z_$][\\w$]*\\s*(?:<[^>]*>)?\\(|\\n  (?:private |protected |public |static |readonly |override )+[A-Za-z_$][\\w$]*\\s*[:=]|\\n}\\n`).exec(rest);
+  const body = src.slice(start, start + m[0].length + (next ? next.index : rest.length));
+  const close = body.lastIndexOf("\n  }");
+  return close > 0 ? body.slice(0, close + 4) : body;
 };
-const INPUT_CALL = /\.(?:click|dblclick|tap|press|pressSequentially|type|fill|check|uncheck|selectOption|setInputFiles|hover|dragTo|dispatchEvent|focus)\s*\(|\bkeyboard\.|\bmouse\.|guardedClick\s*\(|guardedPress\s*\(|executeStep\s*\(|dismissModalsGuarded\s*\(|clickResilient\s*\(/;
+const INPUT_CALL = /\.(?:click|dblclick|tap|press|pressSequentially|type|fill|check|uncheck|setChecked|selectOption|setInputFiles|hover|dragTo|dragAndDrop|dispatchEvent|focus)\s*\(|\bkeyboard\.|\bmouse\.|\btouchscreen\.|guardedClick\s*\(|guardedPress\s*\(|executeStep\s*\(|dismissModalsGuarded\s*\(|clickResilient\s*\(/;
 
 console.log("\n1. THE HAND-OVER HAS ONE DOOR");
 {
@@ -63,56 +68,277 @@ console.log("\n2. THE RUN'S INPUT CLOSES BEFORE THE WATCH IS ARMED, AND ITS DOOR
   }
 }
 
-console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS");
+console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8: every call followed)");
 {
-  const armAt = recipe.indexOf(".watchHumanInput(");
-  const tailEnd = recipe.indexOf("const stop = !pastReview", armAt);
-  const tail = armAt > 0 && tailEnd > armAt ? recipe.slice(armAt, tailEnd) : "";
-  check("the runAll tail from the watch to the stop decision exists", tail.length > 200, `len=${tail.length}`);
-  check("…and makes no input call", !INPUT_CALL.test(tail), (tail.match(INPUT_CALL) || [""])[0]);
-  for (const [name, sig] of [
-    ["drainBeforeReviewLock", /  private async drainBeforeReviewLock\(/],
-    ["handOverReviewPage", /  private async handOverReviewPage\(/],
-    ["armOwnSubmitWatch", /  private armOwnSubmitWatch\(/],
-    ["noteHumanSubmit", /  private noteHumanSubmit\(/],
-    ["verifyReviewScreen", /  private async verifyReviewScreen\(/],
-    ["writeSanitizedCapture", /  private async writeSanitizedCapture\(/],
-    ["whereTheRunStopped", /  private async whereTheRunStopped\(/],
-    // Helm Should-fix 4: the early "where did the run stop" read and its sentence.
-    ["reviewValuesOnPage", /  private async reviewValuesOnPage\(/],
-    ["stoppedBeforeReviewMessage", /  private stoppedBeforeReviewMessage\(/],
-    // …and the readers those call (skeptic round 1: the scan reached only the named methods).
-    ["pageSafetyContext", /  private async pageSafetyContext\(/],
-    ["readPortalRefusal", /  private async readPortalRefusal\(/],
-    ["pageLabelNow", /  private async pageLabelNow\(/],
-    ["heldHumanClick", /  private heldHumanClick\(/],
-    ["firstHumanDocument", /  private firstHumanDocument\(/],
-    ["pageUrlNoHash", /  private pageUrlNoHash\(/],
-    // Round 4: the one "filing-shaped request after the click" predicate (a record reader).
-    ["personFilingShapedRequestAfter", /  private personFilingShapedRequestAfter\(/],
-    // Round 4 (Helm Blocking 1): the provisional sighting, its judgement, the late hooks and the
-    // capture's readers — all run after the watch is armed, so none may make an input.
-    ["sightHumanSubmit", /  private sightHumanSubmit\(/],
-    ["startJudging", /  private startJudging\(/],
-    ["judgeHumanClick", /  private judgeHumanClick\(/],
-    ["commitHumanClick", /  private commitHumanClick\(/],
-    ["reopenHumanSubmit", /  private reopenHumanSubmit\(/],
-    ["hookLateHumanRequests", /  private hookLateHumanRequests\(/],
-    ["scheduleCompletionReread", /  private scheduleCompletionReread\(/],
-    ["rereadForCompletion", /  private async rereadForCompletion\(/],
-    ["readPageForCapture", /  private async readPageForCapture\(/],
-    ["readReviewForCapture", /  private async readReviewForCapture\(/],
-    ["judgeCompletion", /  private judgeCompletion\(/],
-    // Round 4 (Helm Blocking 2): the review step's readers of what became of the person's click (called
-    // from stopAtReview, outside the tail; listed so a reader never grows an input).
-    ["followUpHeldOnErrorPage", /  private followUpHeldOnErrorPage\(/],
-    ["reportedHumanClick", /  private reportedHumanClick\(/],
-    ["humanClickVerdict", /  private async humanClickVerdict\(/],
-    ["humanClickReport", /  private humanClickReport\(/],
-  ] as const) {
-    const body = methodBody(recipe, sig);
-    check(`${name}: found, and makes no input on the page`, body.length > 0 && !INPUT_CALL.test(body), body ? (body.match(INPUT_CALL) || [""])[0] : "not found");
+  // THE TAIL: from the line that closes the run's own input to the end of runAll (so the arm's receiver
+  // `this.backstop!` and the stop decision's whereTheRunStopped are both inside it). Its CLOSURE is
+  // everything it can reach: every `this.X` it names is followed into X's body in recipeAdapter.ts,
+  // transitively, and so is every module-level function of recipeAdapter.ts it calls. The scan FAILS
+  // (by caller → callee) on:
+  //   - a `this.X(` with no method body in recipeAdapter.ts's RecipeAdapter class (a getter called, a
+  //     field holding a function, or an inherited BasePortalAdapter method — none can be read here);
+  //   - a `super.X`, a `this[…]`, a computed call `…](` or `…].call/apply/bind(`;
+  //   - a call off the backstop (this.backstop, this.handedOverBackstop, or a local / parameter that
+  //     holds one, `!` and `?.` included) not on BACKSTOP_NO_INPUT;
+  //   - a free call to an imported function not on NO_INPUT_HELPERS;
+  //   - an INPUT_CALL in any body it reaches (read RAW, comments and strings included: an in-page
+  //     `el.click()` in an evaluate string counts).
+  // Call DISCOVERY reads each body with comments and string text blanked but template EXPRESSIONS kept
+  // (a `${this.pageLabelNow()}` is a real call): see codeOnly below and its self-check.
+  // Two more roots, both run on the person's page after the hand-over: the review step (stopAtReview,
+  // after fillApplication lets the page go: it reads what became of the person's click) and the capture
+  // (captureSubmissionConfirmation, which index.ts calls when the person's submit is seen). Neither may
+  // click either.
+  // A helper a later change adds to the closure fails here BY NAME until it is added to the class (a
+  // method is followed, never allowlisted) or to one of the two lists below with its reason.
+  const classAt = recipe.indexOf("\nexport class RecipeAdapter ");
+  const cls = classAt >= 0 ? recipe.slice(classAt, recipe.indexOf("\n}\n", classAt) + 3) : "";
+  check("the RecipeAdapter class is found in recipeAdapter.ts", cls.length > 10_000, `len=${cls.length}`);
+  const esc = (s: string): string => s.replace(/[$]/g, "\\$");
+  // A method or accessor, never `(?:get )?` in a method's signature (a called getter has no method body).
+  const sigFor = (name: string): RegExp => new RegExp(`\\n  ${MODIFIERS}(?:async )?\\*?${esc(name)}\\s*(?:<[^>]*>)?\\(`);
+  const getterFor = (name: string): RegExp => new RegExp(`\\n  ${MODIFIERS}get ${esc(name)}\\s*\\(`);
+  const memberBody = (name: string): { kind: "method" | "getter"; body: string } | null => {
+    const m = methodBody(cls, sigFor(name));
+    if (m) return { kind: "method", body: m };
+    const g = methodBody(cls, getterFor(name));
+    return g ? { kind: "getter", body: g } : null;
+  };
+  // A module-level function of recipeAdapter.ts (outside the class): `function NAME(` or `const NAME = …`.
+  const moduleSrc = classAt >= 0 ? recipe.slice(0, classAt) + recipe.slice(classAt + cls.length) : recipe;
+  const moduleFnBody = (name: string): string => {
+    const fn = new RegExp(`\\n(?:export )?(?:async )?function\\s*\\*?\\s*${esc(name)}\\s*(?:<[^>]*>)?\\(`).exec(moduleSrc);
+    if (fn) { const end = moduleSrc.indexOf("\n}\n", fn.index); return moduleSrc.slice(fn.index, end < 0 ? undefined : end + 3); }
+    const cn = new RegExp(`\\n(?:export )?const ${esc(name)}\\b[^=\\n]*=\\s*(?:async\\s*)?(?:\\(|[A-Za-z_$][\\w$]*\\s*=>|function)`).exec(moduleSrc);
+    if (!cn) return "";
+    const rest = moduleSrc.slice(cn.index + 1);
+    const end = /\n(?=[^\s})\]])/.exec(rest);
+    return moduleSrc.slice(cn.index, cn.index + 1 + (end ? end.index : rest.length));
+  };
+
+  // Comments blanked, string and template TEXT blanked, regex literals blanked, template expressions
+  // KEPT. A string, comment-free regex or regex literal never spans a line, so a misread `/` costs at
+  // most the rest of that line.
+  const codeOnly = (src: string): string => {
+    let out = "";
+    let i = 0;
+    let depth = 0;
+    const tpl: number[] = [];
+    const lastToken = (): string => (/([\w$]+|[^\s])\s*$/.exec(out) || ["", ""])[1];
+    const regexMayStart = (): boolean => {
+      const t = lastToken();
+      return t === "" || /^[(,=:[!&|?{};+\-*%<>~^]$/.test(t) || /^(?:return|typeof|case|in|of|delete|void|throw|new|await|yield|instanceof)$/.test(t);
+    };
+    const template = (): void => {
+      while (i < src.length) {
+        const c = src[i];
+        if (c === "\\") { i += 2; continue; }
+        if (c === "`") { i++; out += "``"; return; }
+        if (c === "$" && src[i + 1] === "{") { i += 2; tpl.push(depth); depth++; out += "` "; return; }
+        if (c === "\n") out += "\n";
+        i++;
+      }
+    };
+    while (i < src.length) {
+      const c = src[i];
+      const d = src[i + 1];
+      if (c === "/" && d === "/") { while (i < src.length && src[i] !== "\n") i++; continue; }
+      if (c === "/" && d === "*") {
+        const e = src.indexOf("*/", i + 2);
+        const end = e < 0 ? src.length : e + 2;
+        out += src.slice(i, end).replace(/[^\n]/g, "");
+        i = end;
+        continue;
+      }
+      if (c === "\"" || c === "'") {
+        let j = i + 1;
+        while (j < src.length && src[j] !== c && src[j] !== "\n") j += src[j] === "\\" ? 2 : 1;
+        out += `${c}${c}`;
+        i = j + 1;
+        continue;
+      }
+      if (c === "`") { i++; out += "`"; template(); continue; }
+      if (c === "/" && regexMayStart()) {
+        let j = i + 1;
+        let inClass = false;
+        while (j < src.length && src[j] !== "\n") {
+          if (src[j] === "\\") { j += 2; continue; }
+          if (src[j] === "[") inClass = true;
+          else if (src[j] === "]") inClass = false;
+          else if (src[j] === "/" && !inClass) break;
+          j++;
+        }
+        if (j < src.length && src[j] === "/") {
+          j++;
+          while (j < src.length && /[a-z]/.test(src[j])) j++;
+          out += " 0 ";
+          i = j;
+          continue;
+        }
+      }
+      if (c === "{") depth++;
+      if (c === "}") {
+        depth--;
+        if (tpl.length && tpl[tpl.length - 1] === depth) { tpl.pop(); i++; out += " `"; template(); continue; }
+      }
+      out += c;
+      i++;
+    }
+    return out;
+  };
+  {
+    // codeOnly's own pin: the shapes the tail uses, read the way discovery needs them.
+    const sample = [
+      "// this.commentCall()",
+      "/* this.blockCall() */ const a = \"this.stringCall()\" + 'b(' + `x ${this.tplCall(`y ${inner()}`)} z(` ;",
+      "const re = /(?:click|press)\\(/i.test(s) ? 1 : 2; const half = n / 2 / k; this.afterRegex();",
+      "const o = { k: `${{ a: 1 }.a}` }; this.afterNested();",
+    ].join("\n");
+    const c = codeOnly(sample);
+    check("codeOnly keeps calls in code and in template expressions, and drops comments, strings and regex literals",
+      /this\.tplCall\(/.test(c) && /inner\(/.test(c) && /this\.afterRegex\(/.test(c) && /this\.afterNested\(/.test(c)
+        && !/commentCall|blockCall|stringCall|click|z\(|b\(/.test(c), JSON.stringify(c));
   }
+
+  const KEYWORDS = new Set(["if", "for", "while", "switch", "catch", "return", "typeof", "function", "await", "async", "super", "import", "void", "delete", "in", "of", "do", "else", "try", "yield", "throw", "case", "instanceof", "as", "satisfies", "new", "keyof"]);
+  const GLOBALS = new Set(["String", "Number", "Boolean", "Date", "Math", "JSON", "Array", "Object", "Promise", "Error", "RegExp", "Map", "Set", "WeakMap", "WeakSet", "URL", "URLSearchParams", "Buffer", "Symbol", "BigInt", "setTimeout", "setInterval", "clearTimeout", "clearInterval", "queueMicrotask", "fetch", "structuredClone", "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI", "require",
+    // in-page reads inside an evaluate body (they run in the browser, never on the page's behalf of a click)
+    "getComputedStyle"]);
+  // The backstop's calls a body after the arm may make: none is an input on the page.
+  const BACKSTOP_NO_INPUT: Record<string, string> = {
+    watchHumanInput: "arms the input watch (CDP sessions in an isolated world); no input",
+    handOverToHuman: "flips the backstop's verdict for a person's input; no input",
+    lockReview: "starts the review lockdown (route state only); no input",
+    personActedSinceHandOver: "reads the watch's record",
+    stoppingAborts: "reads the abort record",
+    handedOver: "reads the hand-over state",
+  };
+  // Imported functions the closure calls, each a reader or a pure builder (grepped: no input-shaped call).
+  const NO_INPUT_HELPERS: Record<string, string> = {
+    ok: "adapter.ts: builds a PortalStepResult",
+    fail: "adapter.ts: builds a PortalStepResult",
+    sleep: "safeAction.ts: a timer",
+    drainOwnWrites: "filingBackstop.ts: waits out the run's own in-flight saves (route state only)",
+    unsavedAtReviewWarning: "filingBackstop.ts: words a note",
+    isStoppingAbort: "filingBackstop.ts: reads an abort record",
+    armHumanCaptureOnPage: "humanCapture.ts: listens for the person's submit (an observer); no input",
+    scrapeReviewScreenShared: "reviewScreenScraper.ts: the review read-back (scanned whole below)",
+    reviewComparison: "reviewScreenScraper.ts: compares two readings",
+    utilityIdentifiersEnteredBySteps: "reviewScreenScraper.ts: reads the recipe's steps",
+    redactCaptureText: "safeAction.ts: scrubs text",
+    collectPortalErrorBanner: "safeAction.ts: reads the page's error banner",
+    collectValidationErrorsFrom: "autoLearnAdapter.ts: reads the page's validation messages (page.evaluate only)",
+    describeBackstopAbort: "filingBackstop.ts: words an abort record",
+    isPayRequestUrl: "shared/src/portalSafety.ts: a URL predicate (rule 1)",
+    isSubmitOrPayRequestUrl: "shared/src/portalSafety.ts: a URL predicate",
+    completionEvidence: "shared/src/portalSafety.ts: reads completion wording out of text",
+    recordNumberCandidates: "recordNumber.ts: reads record numbers out of text",
+    readDraftCreated: "draftCreated.ts: reads whether the page shows a created draft (page.evaluate only)",
+    smartWait: "safeAction.ts: waits for a load state",
+    extractRecordNumber: "recordNumber.ts: reads a record number out of text",
+    pageConfirmsSubmission: "recordNumber.ts: reads completion wording out of text",
+    cleanRecordLink: "adapters/submissionLedger.ts: tidies a link (#401)",
+    chooseSubmittedRecord: "adapters/submissionLedger.ts: picks a record off the ledger it read (#401)",
+    draftTenantKey: "draftSubmitGate.ts: builds a key from a URL",
+  };
+  // Identifiers a body declares itself (const / let / var / function / catch / parameters): a call to one
+  // is a local callback (progress's `sink`, noteHumanSubmit's `fn`), never a helper of the module.
+  const localsOf = (code: string): Set<string> => {
+    const names = new Set<string>();
+    const add = (text: string): void => { for (const m of text.matchAll(/[A-Za-z_$][\w$]*/g)) names.add(m[0]); };
+    for (const m of code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g)) names.add(m[1]);
+    for (const m of code.matchAll(/\b(?:const|let|var)\s*([{[][^=]*?[}\]])\s*=/g)) add(m[1]);
+    for (const m of code.matchAll(/\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)/g)) names.add(m[1]);
+    for (const m of code.matchAll(/\bcatch\s*\(\s*([A-Za-z_$][\w$]*)/g)) names.add(m[1]);
+    for (const m of code.matchAll(/\(([^()]*)\)\s*(?::[^=;{}()]*)?=>/g)) add(m[1]);
+    for (const m of code.matchAll(/([A-Za-z_$][\w$]*)\s*=>/g)) names.add(m[1]);
+    const sig = /^[^{]*\{/.exec(code.replace(/^\s+/, ""));
+    if (sig) add(sig[0]);
+    return names;
+  };
+
+  const runAllSig = /\n  private async runAll\(/;
+  const runAllAt = (runAllSig.exec(recipe) || { index: -1 }).index;
+  const runAllBody = runAllAt >= 0 ? methodBody(recipe, runAllSig) : "";
+  const closeAt = recipe.indexOf("this.inputsClosed = `");
+  const tail = runAllAt >= 0 && closeAt > runAllAt && closeAt < runAllAt + runAllBody.length ? recipe.slice(closeAt, runAllAt + runAllBody.length) : "";
+  check("the runAll tail, from the line that closes the run's input to the end of runAll, exists", tail.length > 200 && /\n  }$/.test(tail), `len=${tail.length}`);
+  check("…and makes no input call", !INPUT_CALL.test(tail), (tail.match(INPUT_CALL) || [""])[0]);
+  check("…and calls the arm off the backstop after a non-null assertion (`this.backstop!.watchHumanInput(`)", tail.includes("this.backstop!.watchHumanInput("));
+  const stopAtReviewBody = methodBody(cls, sigFor("stopAtReview"));
+  check("the review step (stopAtReview) is found", stopAtReviewBody.length > 200, `len=${stopAtReviewBody.length}`);
+  const captureBody = methodBody(cls, sigFor("captureSubmissionConfirmation"));
+  check("the capture (captureSubmissionConfirmation) is found", captureBody.length > 200, `len=${captureBody.length}`);
+
+  const closure = new Map<string, string>(); // a member or module function → who reached it first
+  const freeCalls = new Map<string, string>();
+  const backstopCalls = new Map<string, string>();
+  const problems = new Set<string>();
+  const queue: Array<{ name: string; via: string; body: string }> = [
+    { name: "<runAll tail>", via: "", body: tail },
+    { name: "stopAtReview", via: "<the review step>", body: stopAtReviewBody },
+    { name: "captureSubmissionConfirmation", via: "<the capture of the person's page>", body: captureBody },
+  ];
+  closure.set("stopAtReview", "<the review step>");
+  closure.set("captureSubmissionConfirmation", "<the capture of the person's page>");
+  const enqueue = (name: string, via: string, body: string): void => {
+    if (closure.has(name)) return;
+    closure.set(name, via);
+    queue.push({ name, via, body });
+  };
+  while (queue.length) {
+    const { name, via, body } = queue.shift()!;
+    if (via) check(`${name}: reached via ${via}, makes no input on the page`, !INPUT_CALL.test(body), (body.match(INPUT_CALL) || [""])[0]);
+    const code = codeOnly(body);
+    const locals = localsOf(code);
+    for (const m of code.matchAll(/\bsuper\s*\.\s*([A-Za-z_$][\w$]*)/g)) problems.add(`${name} → super.${m[1]}: resolves outside recipeAdapter.ts`);
+    for (const m of code.matchAll(/\bthis\s*[!?]?\s*(?:\?\.)?\s*\[/g)) problems.add(`${name} → this[…]: a bracket member (${code.slice(m.index!, m.index! + 40)})`);
+    for (const m of code.matchAll(/\]\s*!?\s*(?:\?\.)?\s*\(|\]\s*[!?]?\s*\.\s*(?:call|apply|bind)\s*\(/g)) problems.add(`${name} → …](: a bracket call (${code.slice(Math.max(0, m.index! - 40), m.index! + 3).replace(/\s+/g, " ")})`);
+    for (const m of code.matchAll(/\bthis\s*[!?]?\s*\.\s*([A-Za-z_$][\w$]*)(\s*!?\s*(?:\?\.)?\s*\()?/g)) {
+      const member = m[1];
+      const called = !!m[2];
+      const found = memberBody(member);
+      if (found && (found.kind === "method" || !called)) enqueue(member, name, found.body);
+      else if (called) problems.add(`${name} → this.${member}(: no method body in recipeAdapter.ts (${found ? "a getter, called" : "a field holding a function, or an inherited method"})`);
+    }
+    // The backstop and every local or parameter that holds it.
+    const aliases = ["this\\s*\\.\\s*backstop", "this\\s*\\.\\s*handedOverBackstop"];
+    for (const m of code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]*)?=\s*this\s*\.\s*(?:backstop|handedOverBackstop)\b\s*(?:\?\?\s*this\s*\.\s*(?:backstop|handedOverBackstop)\b\s*)?[;\n]/g)) aliases.push(m[1]);
+    for (const m of code.matchAll(/([A-Za-z_$][\w$]*)\s*\??\s*:\s*FilingBackstop\b/g)) aliases.push(m[1]);
+    const onBackstop = new RegExp(`(?<![\\w$.])(?:${aliases.join("|")})\\s*[!?]?\\s*\\.\\s*([A-Za-z_$][\\w$]*)\\s*\\(`, "g");
+    for (const m of code.matchAll(onBackstop)) {
+      if (!backstopCalls.has(m[1])) backstopCalls.set(m[1], name);
+      if (!(m[1] in BACKSTOP_NO_INPUT)) problems.add(`${name} → backstop.${m[1]}(: not on BACKSTOP_NO_INPUT`);
+    }
+    for (const m of code.matchAll(/(?<![.\w$])(new\s+)?([A-Za-z_$][\w$]*)\s*(?:<[^<>()]*>)?\s*\(/g)) {
+      const fn = m[2];
+      if (m[1] || KEYWORDS.has(fn) || GLOBALS.has(fn) || locals.has(fn)) continue;
+      if (!freeCalls.has(fn)) freeCalls.set(fn, name);
+      const own = moduleFnBody(fn);
+      if (own) enqueue(`function ${fn}`, name, own);
+      else if (!(fn in NO_INPUT_HELPERS)) problems.add(`${name} → ${fn}(: an imported function not on NO_INPUT_HELPERS`);
+    }
+  }
+  check("the closure makes no call it cannot follow (every this.X( has a body here, no super / bracket call, every backstop and imported call allowlisted)",
+    problems.size === 0, [...problems].join("\n         "));
+  // The fixed list this scan replaced, kept as a FLOOR: a rename or a re-cut that stops reaching one fails.
+  for (const name of [
+    "drainBeforeReviewLock", "handOverReviewPage", "armOwnSubmitWatch", "noteHumanSubmit", "verifyReviewScreen",
+    "writeSanitizedCapture", "whereTheRunStopped", "stoppedBeforeReviewMessage", "pageSafetyContext", "readPortalRefusal",
+    "pageLabelNow", "heldHumanClick", "firstHumanDocument", "pageUrlNoHash", "personFilingShapedRequestAfter",
+    "sightHumanSubmit", "startJudging", "judgeHumanClick", "commitHumanClick", "reopenHumanSubmit", "hookLateHumanRequests",
+    "scheduleCompletionReread", "rereadForCompletion", "readPageForCapture", "readReviewForCapture", "judgeCompletion",
+    "followUpHeldOnErrorPage", "reportedHumanClick", "humanClickVerdict", "humanClickReport", "reviewValuesOnPage",
+  ]) check(`the closure reaches ${name}`, closure.has(name), [...closure.keys()].join(", "));
+  // …and the doors and fill paths the run makes its input through are NOT reached (the durable form of
+  // the round's fence inventory: main's #353 / #362 / #387 fill paths all run above inputsClosed).
+  for (const name of ["executeStep", "guardedClick", "guardedPress", "dismissModalsGuarded", "answerUnrecordedRequired",
+    "reassertBlanksOnce", "reassertPass", "runGapFill", "attachOwedDocuments", "fillArrayRow", "addAnotherArrayRow"]) {
+    check(`the closure never reaches ${name}`, !closure.has(name), closure.has(name) ? `reached via ${closure.get(name)}` : "");
+  }
+  check("the arm is seen as a backstop call (the `!` assertion is read)", backstopCalls.has("watchHumanInput"), JSON.stringify([...backstopCalls]));
+  console.log(`  info - closure: ${closure.size} member(s) — ${[...closure].map(([k, v]) => `${k} ← ${v}`).join("; ")}`);
+  console.log(`  info - free calls: ${[...freeCalls.keys()].join(", ")}; backstop calls: ${[...backstopCalls.keys()].join(", ")}`);
   // THE HAND-OVER COMES BEFORE THE DRAIN (round 2, skeptic r2 F2), and the person is told after it.
   const handAt = tail.indexOf("this.handOverReviewPage()");
   const drainAt = tail.indexOf("this.drainBeforeReviewLock()");
@@ -134,10 +360,11 @@ console.log("\n4. EVERY INPUT THE RUN MAKES IS FENCED");
   const typing = recipe.split("\n").filter((l) => /\.(?:pressSequentially|type)!?\s*\(/.test(l));
   const unfenced = typing.filter((l) => !/withAutomationInput\(/.test(l));
   check("every typing call (pressSequentially / type) in recipeAdapter.ts is fenced", typing.length >= 3 && unfenced.length === 0, JSON.stringify(unfenced.map((l) => l.trim().slice(0, 140))));
-  // Checkbox writes too (skeptic round 1: check / uncheck were trusted input outside the fence).
-  const ticks = recipe.split("\n").filter((l) => /\.(?:check|uncheck)\s*\(/.test(l));
+  // Checkbox writes too (skeptic round 1: check / uncheck were trusted input outside the fence; Helm's
+  // nit: setChecked fires the same trusted pointerdown + mousedown).
+  const ticks = recipe.split("\n").filter((l) => /\.(?:check|uncheck|setChecked)\s*\(/.test(l));
   const unfencedTicks = ticks.filter((l) => !/withAutomationInput\(/.test(l));
-  check("every checkbox write (check / uncheck) in recipeAdapter.ts is fenced", ticks.length >= 4 && unfencedTicks.length === 0, JSON.stringify(unfencedTicks.map((l) => l.trim().slice(0, 140))));
+  check("every checkbox write (check / uncheck / setChecked) in recipeAdapter.ts is fenced", ticks.length >= 4 && unfencedTicks.length === 0, JSON.stringify(unfencedTicks.map((l) => l.trim().slice(0, 140))));
 }
 
 console.log("\n5. ONLY A CALLER THAT WATCHES FOR THE SUBMIT IS HANDED THE PAGE (Helm Should-fix 4)");
