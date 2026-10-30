@@ -128,6 +128,22 @@
 //         3/8 on its trim) and K-readback191 (A24 green; humanHandover.test section 6 only), measured
 //         in the A24 block. A page script cannot set the marker itself (a world shares no
 //         expando), and a named property is an element or a window, never the boolean true.
+//     A25 / A25c (step 19.2) a review page with in-process (same-origin) iframes whose isolated worlds are
+//         made late — a test seam (slowChildWorlds, A21's pattern: newCDPSession wrapped between install
+//         and arm) delays Page.createIsolatedWorld for every frame that is not its target's root; the
+//         root's world and the read-back pass straight through. A25: 3 iframes x 2000 ms — armed, handed
+//         over, the person's click on the top page's submit files (one POST, document true, no stopping
+//         abort). A25c: 5 iframes x 700 ms — armed, and the person's click inside the LAST iframe right
+//         after the hand-over files (one POST, document false). Red on the parent c33bddf9 (3/3 runs,
+//         4/11 on a trim to A22-A25c): openHumanWorld armed the children one after another before it
+//         returned the root's world, so the arm spent the 1.5 s budget (watchHumanInput 1.5 s), armed
+//         false, handed false, and the person's click was held (A25's abort flagged humanInput — the
+//         #333 complaint). Green 3/3 (11/11): the root's world is returned first, the children are armed
+//         concurrently and waited for within the budget (A25c arms in ~720 ms). Kills, 3 runs each on
+//         that trim: K-awaitchildren (concurrent, but awaited before the root's world is returned) reddens
+//         A25 x2 (2/11); K-serialchild (root first, children one after another behind it) reddens A25c's
+//         click (1/11); K-nowaitframes (the children's arms not waited for in humanFramesArmed: armed in
+//         ~15 ms, the last iframe's world not yet made) reddens A25c's click (1/11; A22 stays green).
 //     KILLS, measured at 0525b131 in a throwaway tree on a trim to A1, A2, A13, A15, A16, A18-A23, the "o"
 //     cases, B1, B1b, B12 and B12b (53 checks, green 53/53 unmutated), with humanHandover.test (62):
 //       K-zeroarg (the script calls the binding with no argument): 23/53 — A1 x3, A13 x2, A16's "counted",
@@ -574,6 +590,9 @@ const reviewBody = (k: string): string => {
   // A24 (step 19.1): an element whose id is the watch's armed marker — a Window named property, which
   // every world (the isolated one too) sees on `window`.
   if (k === "A24") return `${summary}<div id="__solarBackstopHumanInputArmed" hidden></div>${formSubmit(k)}`;
+  // A25 / A25c (step 19.2): a review page with several SAME-ORIGIN iframes (in its own process), each
+  // the portal's own submit (/frame) — A25 three, A25c five.
+  if (k === "A25" || k === "A25c") return `${summary}${formSubmit(k)}<div>${Array.from({ length: k === "A25" ? 3 : 5 }, (_, i) => `<iframe id="f${i}" src="/h/${k}/frame" style="width:200px;height:70px"></iframe>`).join("")}</div>`;
   return `${summary}<form method="post" action="/h/${k}/apply/submit"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
 };
 // A step BEFORE review (B10): an attachments page whose Continue posts and is answered with the review
@@ -1120,6 +1139,69 @@ for (const absent of [false, true]) {
     postsFor("A24", from).filter((p) => /\/apply\/submit$/.test(p.path)).length === 1, brief(b, "A24", from));
   check("A24 …recorded as the person's request (a main-frame document submission), no stopping abort",
     b.bs.humanRequests.some((r) => r.document && /\/apply\/submit$/.test(r.where)) && b.bs.stoppingAborts().length === 0, brief(b, "A24", from));
+  await b.close();
+}
+/** A25 / A25c's seam (test-only, A21's pattern: patched between install and arm). Every session the
+ *  context opens from here passes each send straight through, except that the isolated world of a
+ *  CHILD frame (Page.createIsolatedWorld for a frame that is not the root of its target's tree) is
+ *  made `ms` late. The root frame's world and its read-back are never delayed, and a frame with no
+ *  session of its own still gets newCDPSession's own throw (armFrameWorld branches on it). */
+function slowChildWorlds(page: Page, ms: number): void {
+  type Send = (m: string, p?: unknown) => Promise<unknown>;
+  const c = page.context() as unknown as { newCDPSession: (t: unknown) => Promise<{ send: Send }> };
+  const real = c.newCDPSession.bind(c);
+  c.newCDPSession = async (t: unknown) => {
+    const s = await real(t);
+    const send: Send = s.send.bind(s);
+    let root = "";
+    s.send = async (m: string, p?: unknown) => {
+      if (m === "Page.createIsolatedWorld" && root && (p as { frameId?: unknown } | undefined)?.frameId !== root) await sleep(ms);
+      const r = await send(m, p);
+      if (m === "Page.getFrameTree") root = String((r as { frameTree?: { frame?: { id?: unknown } } } | undefined)?.frameTree?.frame?.id ?? "");
+      return r;
+    };
+    return s;
+  };
+}
+for (const k of ["A25", "A25c"] as const) {
+  // A25 / A25c (step 19.2): a review page with in-process iframes, each child frame's isolated world
+  // made late (slowChildWorlds) — the shape of a page with many iframes, where arming every child one
+  // after another outlasted the 1.5 s read budget. Red on the parent: openHumanWorld returned the
+  // root's world only after every child's, one after another (A25 3 x 2000 ms, A25c 5 x 700 ms), so
+  // the read-back found no world in time, the watch was not armed, the hand-over refused, and the
+  // person's own click was held (the #333 complaint). Green: the root's world is returned first and
+  // the children are armed concurrently, waited for within the budget (never needed for "armed").
+  //   A25  each child 2000 ms (beyond the budget even concurrently): armed, handed over, and the
+  //        person's click on the top page's submit files.
+  //   A25c each child 700 ms (inside the budget concurrently, 3.5 s one after another): the person's
+  //        click inside the LAST iframe, right after the hand-over, files — the children were armed
+  //        within the budget, concurrently.
+  const ms = k === "A25" ? 2000 : 700;
+  const from = posts.length;
+  const b = await bed(k, { arm: false });
+  slowChildWorlds(b.page, ms);
+  const t0 = Date.now();
+  const armed = await b.bs.watchHumanInput();
+  const armMs = Date.now() - t0;
+  const handed = b.bs.handOverToHuman(`smoke ${k}`);
+  const frames = b.page.frames().filter((f) => f !== b.page.mainFrame()).length;
+  console.log(`  info - ${k}: ${frames} in-process child frames, each world ${ms} ms late; watchHumanInput took ${armMs} ms`);
+  check(`${k} a review page with ${frames} in-process iframes, each child's world ${ms} ms late: the watch arms and the hand-over takes`,
+    frames === (k === "A25" ? 3 : 5) && armed === true && handed === true, `frames=${frames} armed=${armed} handed=${handed} armMs=${armMs}`);
+  if (k === "A25") {
+    await personClicks(b.page);
+    await sleep(900);
+    check("A25 …the person's click on the top page's submit files: one POST, recorded as theirs (a main-frame document submission), no stopping abort",
+      postsFor(k, from).filter((p) => /\/apply\/submit$/.test(p.path)).length === 1
+        && b.bs.humanRequests.some((r) => r.document && /\/apply\/submit$/.test(r.where)) && b.bs.stoppingAborts().length === 0, brief(b, k, from));
+  } else {
+    const box = await b.page.frameLocator("#f4").locator("#frameSubmit").boundingBox();
+    if (box) await b.page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await sleep(900);
+    check("A25c …the person's click inside the LAST iframe, right after the hand-over, files: one POST, recorded as theirs (document false), no stopping abort",
+      !!box && postsFor(k, from).filter((p) => /\/apply\/submit$/.test(p.path)).length === 1
+        && b.bs.humanRequests.some((r) => !r.document && /\/apply\/submit$/.test(r.where)) && b.bs.stoppingAborts().length === 0, `box=${!!box} ${brief(b, k, from)}`);
+  }
   await b.close();
 }
 {

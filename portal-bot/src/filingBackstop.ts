@@ -1050,8 +1050,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // the watch in an isolated world of each frame already loaded. Never the redirect guard's sessions
   // (#404): no domain is enabled or disabled on those here, and none of them is detached here.
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  type HumanWorld = { session: any; rootWorld: number };
-  /** Per page / out-of-process frame: its session and the context id of its ROOT frame's world. */
+  type HumanWorld = { session: any; rootWorld: number; frames: Promise<void> };
+  /** Per page / out-of-process frame: its session, the context id of its ROOT frame's world, and its
+   *  in-process child frames' worlds (settled when every one is made or has failed). */
   const humanWorlds = new Map<object, Promise<HumanWorld | null>>();
   /** Every session the watch opened (dispose detaches them, after the route comes off). */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1069,8 +1070,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   /** Open the watch's world on `target` — a page, or an out-of-process frame of the page `owner` —
    *  and report its input against `owner`. null = not armed: no session (newCDPSession throws for a
    *  frame that shares its page's process, or a closed target), or the ROOT frame's world could not
-   *  be made. A child frame's world failing never fails the target (a navigating frame; a
-   *  third-party tracker's, as Oregon ePermitting's walkme frame at review). */
+   *  be made. Returned as soon as the ROOT frame's world is made; the target's in-process child frames
+   *  are armed concurrently after it (`frames`). A child frame's world failing never fails the target
+   *  (a navigating frame; a third-party tracker's, as Oregon ePermitting's walkme frame at review). */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const openHumanWorld = async (target: any, owner: unknown): Promise<HumanWorld | null> => {
     const session = await ctx.newCDPSession(target);
@@ -1094,14 +1096,18 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
         return contextId;
       };
       const rootWorld = await inWorld(String(tree?.frame?.id ?? ""));
-      // The target's other frames in its own process (a frame out of process is not in this tree).
+      if (disposed) throw new Error("disposed while arming");
+      // The target's other frames in its own process (a frame out of process is not in this tree):
+      // AFTER the root's world is made, and all at once (#333 step 19.2) — one after another, a page
+      // with many iframes spent the read budget before its root's world was returned, and the
+      // hand-over refused the person's own submit. Each in its own catch, so a child never fails the
+      // target; the caller waits for `frames` within the budget, never for "armed".
       const children: string[] = [];
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const walk = (n: any): void => { for (const c of Array.isArray(n?.childFrames) ? n.childFrames : []) { children.push(String(c?.frame?.id ?? "")); walk(c); } };
       walk(tree);
-      for (const id of children) await inWorld(id).catch(() => null);
-      if (disposed) throw new Error("disposed while arming");
-      return { session, rootWorld };
+      const frames = Promise.allSettled(children.map((id) => inWorld(id).catch(() => null))).then(() => undefined);
+      return { session, rootWorld, frames };
     } catch {
       humanSessions.delete(session);
       await session.detach().catch(() => null);
@@ -1129,14 +1135,18 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       if (disposed) return;
       const p = openHumanWorld(f, pg).catch(() => null);
       humanWorlds.set(f, p);
-      if (!(await p) && humanWorlds.get(f) === p) humanWorlds.delete(f);
+      const w = await p;
+      if (!w) { if (humanWorlds.get(f) === p) humanWorlds.delete(f); return; }
+      // The frame's own in-process children, armed concurrently after its root (openHumanWorld).
+      await w.frames;
     };
     const next = (humanFrameAsks.get(f) ?? Promise.resolve()).then(ask, ask).catch(() => undefined);
     humanFrameAsks.set(f, next);
     return next;
   };
-  /** Arm `pg` (a page of the run's context), once: its own session and world first (all that "armed"
-   *  waits on), then each out-of-process frame of it, and from then on each frame navigation re-asks. */
+  /** Arm `pg` (a page of the run's context), once: its own session and root frame's world first (all
+   *  that "armed" waits on), then — concurrently — its in-process child frames' worlds and each
+   *  out-of-process frame of it, and from then on each frame navigation re-asks. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const armPageWorld = (pg: any): Promise<HumanWorld | null> => {
     const held = humanWorlds.get(pg);
@@ -1153,7 +1163,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       }
       let frames: unknown[] = [];
       try { frames = pg.frames().filter((f: unknown) => f !== pg.mainFrame()); } catch { frames = []; }
-      await Promise.all(frames.map((f) => armFrameWorld(f, pg)));
+      await Promise.all([w.frames, ...frames.map((f) => armFrameWorld(f, pg))]);
     }).catch(() => undefined));
     return p;
   };
@@ -1817,9 +1827,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       const own = armPageWorld(page);
       let ownWorld: HumanWorld | null | undefined;
       void own.then((w) => { ownWorld = w; });
-      // Then every other page of the context (a popup already open) and every page's out-of-process
-      // frames — waited for within the read budget, never needed for "armed" (a navigating frame
-      // cannot answer; the script for new documents covers what it is loading).
+      // Then every other page of the context (a popup already open) and every page's child frames, in
+      // its process and out of it — waited for within the read budget, never needed for "armed" (a
+      // navigating frame cannot answer; the script for new documents covers what it is loading).
       const everyPage = (async (): Promise<void> => {
         let pages: unknown[] = [];
         try { pages = typeof ctx.pages === "function" ? ctx.pages() : []; } catch { pages = []; }
