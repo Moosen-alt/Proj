@@ -136,7 +136,7 @@ const readyForIssuePattern =
   /\b(ready for issue|ready to issue|ready for issuance|permit ready|ready for pickup|ready for pick up|approved pending payment|pay fees?|fees? due|issuance fees?|final fees?|ready to be issued)\b/i;
 
 const issuedPattern =
-  /\b(permit issued|issued permit|status:\s*issued|issued on|download permit|permit card|inspection card|permit has been issued)\b/i;
+  /\b(permit issued|issued permit|status:\s*(?:issued|finaled)|issued on|download permit|permit card|inspection card|permit has been issued)\b/i;
 
 const nemApprovalPattern =
   /\b(pto granted|permission to operate|net metering approved|customer generation approved|(?:interconnection|nem)(?:\s+\w+){0,3}\s+approved|approved(?:\s+\w+){0,3}\s+(?:interconnection|nem)|authorization to (?:install|interconnect|operate))\b/i;
@@ -442,7 +442,11 @@ function classifyScannedText(text: string, stated: string, track: TrackKind): Pe
     };
   }
 
-  if (issuedPattern.test(text) || statedIssuedPattern.test(stated)) {
+  // A BARE STATUS IS ITS OWN STATED STATUS. Text that is nothing but "Issued" (a status pasted into the
+  // monitor, the one word an operator reads off a list) has no "Status:" label for extractStatedStatus
+  // to find, so `stated` is "" and the whole text is scanned — where issuedPattern wants a phrase. The
+  // pattern is anchored, so only text that IS the status reads this way, never prose that holds it.
+  if (issuedPattern.test(text) || statedIssuedPattern.test(stated) || (!stated && statedIssuedPattern.test(text))) {
     return {
       outcome: "issued",
       statusLabel: "Permit issued",
