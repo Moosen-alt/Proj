@@ -3024,6 +3024,13 @@ export interface ProjectDetail {
   isBlocked: boolean;
 }
 
+/** POST /api/projects/:id/permit-checks (recordPermitStatusCheck). `unreadable` is set when the
+ *  check read NOTHING on a target whose status is already known (permitMonitor.shouldSkipEmptyRead):
+ *  nothing was recorded, the target was only rescheduled, and this is the sentence that says so. */
+export interface PermitStatusCheckResult extends ProjectDetail {
+  unreadable?: string;
+}
+
 // ---------------------------------------------------------------------------
 // THE TOKENIZED, NO-LOGIN CLIENT STATUS PAGE (/api/public/status/:token → frontend/status.html).
 //

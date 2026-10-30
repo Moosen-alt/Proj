@@ -199,6 +199,8 @@ async function main(): Promise<void> {
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  // The stub stands in for a public jurisdiction site; the fetch guard (#391) refuses loopback otherwise.
+  process.env.DOCUMENT_FETCH_ALLOW_ORIGINS = base;
 
   // The "headed window": no Chromium, but every decision around it is real.
   let windowsOpened = 0;

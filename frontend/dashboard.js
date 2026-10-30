@@ -8785,7 +8785,9 @@ async function recordPermitStatus(source = "manual", targetId = null) {
   // state.permitFormFor). Sent with another filing's check they would stamp that filing's number
   // on this one's row; sent empty, the server records the chosen filing's own numbers.
   const formIsChosen = !chosenId || state.permitFormFor === `${state.detail.project?.id || ""}|${chosenId}`;
-  state.detail = await api(`/api/projects/${state.selectedProjectId}/permit-checks`, {
+  // `unreadable`: the check read nothing on a filing whose status is known, so the server recorded
+  // nothing (#412). Kept off state.detail — it is this call's answer, not part of the project.
+  const { unreadable, ...detail } = await api(`/api/projects/${state.selectedProjectId}/permit-checks`, {
     method: "POST",
     body: JSON.stringify({
       targetId: chosenId,
@@ -8795,6 +8797,7 @@ async function recordPermitStatus(source = "manual", targetId = null) {
       permitNumber: formIsChosen ? $("permitTrackingNumber").value : "",
     }),
   });
+  state.detail = detail;
   $("permitStatusText").value = "";
   state.recheckTargetId = null;
   state.workflow = null;
@@ -8808,8 +8811,12 @@ async function recordPermitStatus(source = "manual", targetId = null) {
   // The new row is the CURE for a stale reading, so re-run the drift report: a mark that survives
   // a fresh check is noise, and one that vanishes without a check would be a lie.
   await loadStaleReadings();
+  // The newest row is NOT this check's when nothing was recorded — announcing it would say a read
+  // that found nothing came back "Issued". showMessage writes textContent, so the server's
+  // sentence needs no escaping.
   const latest = state.detail.permitStatusChecks?.[0];
-  showMessage(latest ? `Permit check classified: ${latest.statusLabel}` : "Permit check recorded.");
+  if (unreadable) showMessage(unreadable, "warning");
+  else showMessage(latest ? `Permit check classified: ${latest.statusLabel}` : "Permit check recorded.");
   renderDetail();
   await loadProjects();
 }

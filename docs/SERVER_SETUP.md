@@ -50,6 +50,7 @@ SESSION_ENCRYPTION_KEY=<openssl rand -hex 32>   # portal credentials at rest —
 ALLOWED_ORIGINS=https://autopilot.yourco.com     # lock CORS to your domain
 AUTOPILOT_DB_PATH=/var/lib/solar/autopilot.db   # persistent disk
 PORTAL_HEADLESS=true
+DOCUMENT_FETCH_BROWSER=0                # no headed-browser fallback for walled documents: a server has no display
 PUBLIC_BASE_URL=https://autopilot.yourco.com   # client-facing links in emails; NEVER leave the localhost default in production
 PORT=4000
 ```
@@ -82,6 +83,15 @@ another machine (a load balancer, Fly's proxy, a published Docker port) must
 connect directly. With `AUTH_ENABLED` off and a non-loopback `SERVER_HOST`, the
 server refuses to start and says why; `ALLOW_UNAUTHENTICATED_NETWORK=1` overrides
 that, and then every customer's data is open to the network without a login.
+
+Outbound document fetches (#391): blank forms and fee schedules are downloaded
+server-side, and the form-fill tool (`/api/tools/form-fill/*`, reachable with an
+org API key) fetches URLs its caller chose. Every such fetch refuses private,
+loopback and link-local addresses (cloud metadata included) on the URL and on
+every redirect hop. Those tool routes never open the headed-browser fallback;
+`DOCUMENT_FETCH_BROWSER=0` turns it off for every caller and belongs on any
+server. Leave `DOCUMENT_FETCH_ALLOW_ORIGINS` unset: it exists for the test
+suites' local stub servers.
 
 ### Backups — two halves, and you need both
 

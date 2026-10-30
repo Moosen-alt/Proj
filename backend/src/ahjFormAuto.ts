@@ -11,7 +11,7 @@ import { parseJson } from "./json";
 import { HttpError } from "./httpError";
 import { describePermitType, findApplicationProfile, permitStructureAnswer } from "./applicationDocs";
 import { ensureUtilityFilingLookedUp } from "./utilityFilingLookup";
-import { fetchPublicDocument } from "./documentFetch";
+import { fetchPublicDocument, type FetchPublicDocumentOptions } from "./documentFetch";
 import { logger } from "./logger";
 import { saveResearchedAhjProfile, knowledgeResearchHint, findKnowledgeForLearn } from "./knowledgeBase";
 import { researchedUrlRefusal } from "./researchedPortalUrl";
@@ -255,9 +255,19 @@ export function sha256(bytes: Uint8Array): string {
 // a bot wall to a real window, refuses to climb a CAPTCHA or a stated no-robots notice, and
 // ALWAYS carries a reason. Null still means "no usable PDF" to every caller; the reason is now
 // in the log instead of nowhere.
-export async function fetchPdf(url: string): Promise<Uint8Array | null> {
-  return (await fetchPdfOutcome(url)).bytes;
+export async function fetchPdf(url: string, opts: PdfFetchOptions = {}): Promise<Uint8Array | null> {
+  return (await fetchPdfOutcome(url, opts)).bytes;
 }
+
+/** The slice of fetchPublicDocument's options a form fetch passes through. allowBrowser:false is
+ *  what the form-fill tool routes send (issue #391): a URL an API-key holder typed never opens a
+ *  window on the operator's desktop. */
+export type PdfFetchOptions = Pick<FetchPublicDocumentOptions, "allowBrowser" | "launcher">;
+
+/** What every /api/tools/form-fill/* fetch passes: those routes take an org API key (product
+ *  form_filler), so the caller is outside the building and the headed-browser rung stays off
+ *  whatever DOCUMENT_FETCH_BROWSER says. One constant so a new tool route cannot forget it. */
+export const FORM_FILL_TOOL_FETCH: PdfFetchOptions = Object.freeze({ allowBrowser: false });
 
 /** A URL that answered 404 / 410: the document is GONE from that address (the AHJ moved it) — a
  *  different finding from a wall, a login page or a timeout (issue #205). */
@@ -265,15 +275,24 @@ export const isDeadLinkStatus = (status: number | undefined): boolean => status 
 
 /** fetchPdf with the reason kept: `deadLink` when the server answered 404 / 410 (issue #205 — a
  *  found blank whose link is dead is "found, dead link", never "not found"). */
-export async function fetchPdfOutcome(url: string): Promise<{ bytes: Uint8Array | null; status?: number; deadLink: boolean }> {
-  const failed = (status?: number) => { noteFormFetchFailure(url); return { bytes: null, ...(status ? { status } : {}), deadLink: isDeadLinkStatus(status) }; };
+export async function fetchPdfOutcome(url: string, opts: PdfFetchOptions = {}): Promise<{
+  bytes: Uint8Array | null; status?: number; deadLink: boolean;
+  /** Why there are no bytes, when there are none — fetchPublicDocument's reason, or "not a PDF". */
+  reason?: string;
+  /** The URL (or redirect hop) the private-address guard refused; nothing was sent there. */
+  privateTarget?: string;
+}> {
+  const failed = (status?: number, reason?: string, privateTarget?: string) => {
+    noteFormFetchFailure(url);
+    return { bytes: null, ...(status ? { status } : {}), deadLink: isDeadLinkStatus(status), ...(reason ? { reason } : {}), ...(privateTarget ? { privateTarget } : {}) };
+  };
   try {
-    const got = await fetchPublicDocument(url);
+    const got = await fetchPublicDocument(url, opts);
     if (!got.ok || !got.bytes) {
       logger.warn("ahj-forms", "a blank form could not be downloaded", {
         url, status: got.status, via: got.via, reason: got.reason,
       });
-      return failed(got.status);
+      return failed(got.status, got.reason, got.privateTarget);
     }
     const buf = got.bytes;
     const type = got.contentType || "";
@@ -285,7 +304,7 @@ export async function fetchPdfOutcome(url: string): Promise<{ bytes: Uint8Array 
     logger.warn("ahj-forms", "a form link answered, but not with a PDF", {
       url, status: got.status, contentType: type || "(none)", bytes: buf.length, via: got.via,
     });
-    return failed();
+    return failed(undefined, `the link answered (HTTP ${got.status}, ${type || "no content type"}), but not with a PDF`);
   } catch (err) {
     // fetchPublicDocument reports rather than throws; this is the belt on the braces, so the
     // acquisition loop's contract (null, never an exception) holds whatever happens below it.
