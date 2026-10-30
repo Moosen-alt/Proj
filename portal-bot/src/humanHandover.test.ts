@@ -236,7 +236,8 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   // throwaway tree at fd3a7c47 against this scan (143 checks), and at 8aaf0997 against the scan it
   // replaced ("Old": 129 checks; 05c9d0f2 is 8aaf0997 with LF line endings, nothing else). Each slip is
   // put just after the same lockReview line unless it says otherwise. Each is 1 FAIL; Old: all green
-  // (129/129) unless it says otherwise.
+  // (129/129) unless it says otherwise. Re-run at e24e1e39 (the write rule narrowed): every line
+  // identical; K-S8d2, K-S8e, K-S8g, K-S8i and K-S8l re-run there too, each still red with its own line.
   //   K-S8r `const bsW = this.backstop!; await bsW.withAutomationInput(this.page!, async () => null);`
   //         (K-S8e's door through a `!` alias) → "backstop.withAutomationInput(: not on BACKSTOP_NO_INPUT".
   //   K-S8s `const bsX = this.backstop!; bsX.allowApprovedFiling(30_000);` (the approved slot, a door),
