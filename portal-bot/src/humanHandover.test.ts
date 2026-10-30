@@ -79,8 +79,10 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //     field holding a function, or an inherited BasePortalAdapter method — none can be read here);
   //   - a `super.X`, a `this[…]`, a computed call `…](` or `…].call/apply/bind(`;
   //   - a call off the backstop (this.backstop, this.handedOverBackstop, or a local / parameter that
-  //     holds one, `!` and `?.` included) not on BACKSTOP_NO_INPUT;
-  //   - a free call to an imported function not on NO_INPUT_HELPERS;
+  //     holds one, `!` and `?.` included) not on BACKSTOP_NO_INPUT, or a read of one of its members
+  //     not on BACKSTOP_RECORDS (a method taken as a value);
+  //   - a free call (`.call` / `.apply` / `.bind` included) to an imported function not on
+  //     NO_INPUT_HELPERS;
   //   - an INPUT_CALL in any body it reaches (read RAW, comments and strings included: an in-page
   //     `el.click()` in an evaluate string counts).
   // Call DISCOVERY reads each body with comments and string text blanked but template EXPRESSIONS kept
@@ -90,7 +92,10 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   // (captureSubmissionConfirmation, which index.ts calls when the person's submit is seen). Neither may
   // click either.
   // A helper a later change adds to the closure fails here BY NAME until it is added to the class (a
-  // method is followed, never allowlisted) or to one of the two lists below with its reason.
+  // method is followed, never allowlisted) or to one of the lists below with its reason.
+  // NOT FOLLOWED (stated, not pinned): an imported function taken as a value — copied into a local or
+  // passed as an argument — whose later call reads as a local's; and calls off fields other than the
+  // backstop (this.page.*, this.options.*), which only INPUT_CALL's method names cover.
   const classAt = recipe.indexOf("\nexport class RecipeAdapter ");
   const cls = classAt >= 0 ? recipe.slice(classAt, recipe.indexOf("\n}\n", classAt) + 3) : "";
   check("the RecipeAdapter class is found in recipeAdapter.ts", cls.length > 10_000, `len=${cls.length}`);
@@ -213,6 +218,11 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
     stoppingAborts: "reads the abort record",
     handedOver: "reads the hand-over state",
   };
+  // The backstop's fields a body after the arm reads: records, never callable.
+  const BACKSTOP_RECORDS: Record<string, string> = {
+    humanRequests: "the person's requests that went (an array)",
+    aborts: "every abort (an array)",
+  };
   // Imported functions the closure calls, each a reader or a pure builder (grepped: no input-shaped call).
   const NO_INPUT_HELPERS: Record<string, string> = {
     ok: "adapter.ts: builds a PortalStepResult",
@@ -243,7 +253,7 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   };
   // Identifiers a body declares itself (const / let / var / function / catch / parameters): a call to one
   // is a local callback (progress's `sink`, noteHumanSubmit's `fn`), never a helper of the module.
-  const localsOf = (code: string): Set<string> => {
+  const localsOf = (code: string, isMember: boolean): Set<string> => {
     const names = new Set<string>();
     const add = (text: string): void => { for (const m of text.matchAll(/[A-Za-z_$][\w$]*/g)) names.add(m[0]); };
     for (const m of code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g)) names.add(m[1]);
@@ -252,8 +262,18 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
     for (const m of code.matchAll(/\bcatch\s*\(\s*([A-Za-z_$][\w$]*)/g)) names.add(m[1]);
     for (const m of code.matchAll(/\(([^()]*)\)\s*(?::[^=;{}()]*)?=>/g)) add(m[1]);
     for (const m of code.matchAll(/([A-Za-z_$][\w$]*)\s*=>/g)) names.add(m[1]);
-    const sig = /^[^{]*\{/.exec(code.replace(/^\s+/, ""));
-    if (sig) add(sig[0]);
+    // A method's or function's own parameter list: its first paren group, matched (never the tail's
+    // text, which has no signature — a kill once read the tail up to its first `{` as "parameters").
+    const open = isMember ? code.indexOf("(") : -1;
+    if (open >= 0) {
+      let level = 0;
+      let close = open;
+      for (; close < code.length; close++) {
+        if (code[close] === "(") level++;
+        else if (code[close] === ")" && --level === 0) break;
+      }
+      add(code.slice(0, close)); // its modifiers, its own name and its parameters
+    }
     return names;
   };
 
@@ -290,7 +310,7 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
     const { name, via, body } = queue.shift()!;
     if (via) check(`${name}: reached via ${via}, makes no input on the page`, !INPUT_CALL.test(body), (body.match(INPUT_CALL) || [""])[0]);
     const code = codeOnly(body);
-    const locals = localsOf(code);
+    const locals = localsOf(code, name !== "<runAll tail>");
     for (const m of code.matchAll(/\bsuper\s*\.\s*([A-Za-z_$][\w$]*)/g)) problems.add(`${name} → super.${m[1]}: resolves outside recipeAdapter.ts`);
     for (const m of code.matchAll(/\bthis\s*[!?]?\s*(?:\?\.)?\s*\[/g)) problems.add(`${name} → this[…]: a bracket member (${code.slice(m.index!, m.index! + 40)})`);
     for (const m of code.matchAll(/\]\s*!?\s*(?:\?\.)?\s*\(|\]\s*[!?]?\s*\.\s*(?:call|apply|bind)\s*\(/g)) problems.add(`${name} → …](: a bracket call (${code.slice(Math.max(0, m.index! - 40), m.index! + 3).replace(/\s+/g, " ")})`);
@@ -305,12 +325,16 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
     const aliases = ["this\\s*\\.\\s*backstop", "this\\s*\\.\\s*handedOverBackstop"];
     for (const m of code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]*)?=\s*this\s*\.\s*(?:backstop|handedOverBackstop)\b\s*(?:\?\?\s*this\s*\.\s*(?:backstop|handedOverBackstop)\b\s*)?[;\n]/g)) aliases.push(m[1]);
     for (const m of code.matchAll(/([A-Za-z_$][\w$]*)\s*\??\s*:\s*FilingBackstop\b/g)) aliases.push(m[1]);
-    const onBackstop = new RegExp(`(?<![\\w$.])(?:${aliases.join("|")})\\s*[!?]?\\s*\\.\\s*([A-Za-z_$][\\w$]*)\\s*\\(`, "g");
+    // Every member the body touches on it: a call (or .call/.apply/.bind) must be on BACKSTOP_NO_INPUT, a
+    // read on BACKSTOP_RECORDS — so a method taken as a value (`const w = bs.withAutomationInput`) fails too.
+    const onBackstop = new RegExp(`(?<![\\w$.])(?:${aliases.join("|")})\\s*[!?]?\\s*\\.\\s*([A-Za-z_$][\\w$]*)(\\s*(?:\\.\\s*(?:call|apply|bind)\\s*)?\\()?`, "g");
     for (const m of code.matchAll(onBackstop)) {
-      if (!backstopCalls.has(m[1])) backstopCalls.set(m[1], name);
-      if (!(m[1] in BACKSTOP_NO_INPUT)) problems.add(`${name} → backstop.${m[1]}(: not on BACKSTOP_NO_INPUT`);
+      if (m[2]) {
+        if (!backstopCalls.has(m[1])) backstopCalls.set(m[1], name);
+        if (!(m[1] in BACKSTOP_NO_INPUT)) problems.add(`${name} → backstop.${m[1]}(: not on BACKSTOP_NO_INPUT`);
+      } else if (!(m[1] in BACKSTOP_RECORDS) && !(m[1] in BACKSTOP_NO_INPUT)) problems.add(`${name} → backstop.${m[1]}: a member read that is not on BACKSTOP_RECORDS`);
     }
-    for (const m of code.matchAll(/(?<![.\w$])(new\s+)?([A-Za-z_$][\w$]*)\s*(?:<[^<>()]*>)?\s*\(/g)) {
+    for (const m of code.matchAll(/(?<![.\w$])(new\s+)?([A-Za-z_$][\w$]*)\s*(?:<[^<>()]*>)?\s*(?:\.\s*(?:call|apply|bind)\s*)?\(/g)) {
       const fn = m[2];
       if (m[1] || KEYWORDS.has(fn) || GLOBALS.has(fn) || locals.has(fn)) continue;
       if (!freeCalls.has(fn)) freeCalls.set(fn, name);
