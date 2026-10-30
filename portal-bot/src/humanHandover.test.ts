@@ -8,7 +8,11 @@
 //       armed only READS the page;
 //   (2) THE FENCE: every input the replay makes runs inside withAutomationInput.
 // This scan makes (1) and (2) durable: a later edit that adds an input to the post-review path, a
-// second caller of the hand-over, or an unfenced click / key press / typing call fails here.
+// second caller of the hand-over, or an unfenced click / key press / typing call fails here. "An input"
+// means one the scan can NAME: a Playwright input method in any call shape, a run door, the keyboard /
+// mouse / touchscreen, a raw DevTools session or an Input-domain method (section 0 pins each pattern
+// both ways), or a call it cannot follow. It is a source scan, not a proof: what section 3 lists under
+// NOT FOLLOWED (a method reached by a computed name, an input method taken as a value) is not seen.
 //
 //   npx tsx portal-bot/src/humanHandover.test.ts
 import fs from "node:fs";
@@ -59,6 +63,14 @@ const INPUT_CALL = new RegExp([
   `\\[\\s*["'\`](?:${INPUT_METHODS})["'\`]\\s*\\]${CALL}`,
   String.raw`\bkeyboard\.`, String.raw`\bmouse\.`, String.raw`\btouchscreen\.`,
   `\\b(?:guardedClick|guardedPress|executeStep|dismissModalsGuarded|clickResilient)${CALL}`,
+  // Trusted input sent over a raw DevTools session (step 21's verifier: `newCDPSession(…)` then
+  // `send("Input.dispatchMouseEvent", …)` after the lock read as no input). The session's factory is
+  // matched on ANY reference, called or taken as a value (nothing after the arm opens a session: the
+  // watch's own sessions are opened inside watchHumanInput, in filingBackstop.ts), and the Input
+  // domain's methods by their raw names, read in strings too (a session handed in from elsewhere still
+  // names the method it sends). A bare word "Input" is no match: only `Input.` plus one of these names.
+  String.raw`\bnew(?:Browser)?CDPSession\b`,
+  String.raw`\bInput\.(?:dispatch\w*Event|insertText|imeSetComposition|synthesize\w+|emulateTouchFromMouseEvent)\b`,
 ].join("|"));
 const TYPING_CALL = new RegExp(`\\.\\s*(?:pressSequentially|type)${CALL}`);
 const TICK_CALL = new RegExp(`\\.\\s*(?:check|uncheck|setChecked)${CALL}`);
@@ -92,7 +104,36 @@ console.log("\n0. THE INPUT PATTERNS READ EVERY CALL SHAPE (Helm Should-fix 8, t
   const wrong = mustNotMatch.filter((s) => INPUT_CALL.test(s));
   check("INPUT_CALL reads an optional, non-null, .call and called-bracket input as input, and a property read as none",
     missed.length === 0 && wrong.length === 0, `missed: ${JSON.stringify(missed)} wrongly read: ${JSON.stringify(wrong)}`);
-  const typingMust = ["await scoped.type?.(v)", "await scoped!.type!(v, { delay: 35 })", "await loc.pressSequentially?.(v)"];
+  // Trusted input over a raw DevTools session (step 21's verifier, K-S8z8): the session's factory on
+  // any reference, and each Input-domain method by its raw name. The word "Input" in prose, a string or
+  // a longer name is not the Input domain.
+  const cdpMust = [
+    "const cdp = await this.page!.context().newCDPSession(this.page!);",
+    "const cdp = await ctx.newCDPSession?.(page);",
+    "const open = ctx.newCDPSession;",
+    "const bs = await browser.newBrowserCDPSession();",
+    "await cdp.send(\"Input.dispatchMouseEvent\", { type: \"mousePressed\", x: 1, y: 1 });",
+    "await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key: 'Enter' });",
+    "await s.send(\"Input.dispatchTouchEvent\", { type: \"touchStart\", touchPoints: [] })",
+    "await s.send(\"Input.dispatchDragEvent\", { type: \"drop\", x: 1, y: 1, data: d })",
+    "await s.send(\"Input.insertText\", { text: \"x\" })",
+    "await s.send(\"Input.imeSetComposition\", { text: \"x\", selectionStart: 0, selectionEnd: 0 })",
+    "await s.send(\"Input.synthesizeTapGesture\", { x: 1, y: 1 })",
+    "await s.send(\"Input.emulateTouchFromMouseEvent\", { type: \"mousePressed\", x: 1, y: 1, button: \"left\" })",
+  ];
+  const cdpMustNot = [
+    "// Input: the person's click is theirs once the watch is armed.",
+    "const v = Input.value;",
+    "export const NOTE = \"Input from the person was not handed over\";",
+    "Input.dispatched by a person is recorded",
+    "the arm is watchHumanInput.dispatchMouseEvent-free",
+    "const n = cdpSessionCount + newCDPSessions;",
+  ];
+  const cdpMissed = cdpMust.filter((s) => !INPUT_CALL.test(s));
+  const cdpWrong = cdpMustNot.filter((s) => INPUT_CALL.test(s));
+  check("INPUT_CALL reads a raw DevTools session (newCDPSession / newBrowserCDPSession, called or taken) and the Input domain's methods as input, and the word Input in prose as none",
+    cdpMissed.length === 0 && cdpWrong.length === 0, `missed: ${JSON.stringify(cdpMissed)} wrongly read: ${JSON.stringify(cdpWrong)}`);
+  const typingMust =["await scoped.type?.(v)", "await scoped!.type!(v, { delay: 35 })", "await loc.pressSequentially?.(v)"];
   const tickMust = ["await box.setChecked?.(true)", "await box.check!()", "await box.uncheck?.()"];
   const notTyping = ["typeof scoped!.type === \"function\"", "if (inf?.type !== \"radio\")"];
   check("section 4's typing and checkbox patterns read optional and non-null calls (`.type?.(`, `.setChecked?.(`, `.check!(`)",
@@ -154,8 +195,11 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //   - a module loaded at run time (`import(` / `require(`);
   //   - an INPUT_CALL in any body it reaches (read RAW, comments and strings included: an in-page
   //     `el.click()` or `el['click']()` in an evaluate string counts). INPUT_CALL takes every call shape
-  //     after the method name (CALL: `m(`, `m!(`, `m?.(`, and `.call(` / `.apply(` / `.bind(`), and a
-  //     CALLED bracket member named like one; section 0 pins it both ways.
+  //     after the method name (CALL: `m(`, `m!(`, `m?.(`, and `.call(` / `.apply(` / `.bind(`), a
+  //     CALLED bracket member named like one, any reference to `newCDPSession` / `newBrowserCDPSession`
+  //     (a raw DevTools session sends trusted input past every Playwright method name), and the Input
+  //     domain's methods by raw name (`Input.dispatchMouseEvent`, `Input.insertText`, …, in a string
+  //     too); section 0 pins it both ways.
   // Call DISCOVERY reads each body with comments and string text blanked but template EXPRESSIONS kept
   // (a `${this.pageLabelNow()}` is a real call): see codeOnly below and its self-check.
   // Two more roots, both run on the person's page after the hand-over: the review step (stopAtReview,
@@ -171,7 +215,10 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   // method names cover — and an input method taken as a VALUE without a call (`const c =
   // this.page.click`, `const c = el['click']` in the page, `HTMLElement.prototype.click` stored) is not
   // seen at all, since a bare `.click` or `['click']` cannot be told from prose or an attribute read
-  // (`.click.call(`, `.click.bind(` and `['click'](` ARE seen); a programmatic submit
+  // (`.click.call(`, `.click.bind(` and `['click'](` ARE seen); a member reached by a COMPUTED name
+  // through a call (`Reflect.get(ctx, "newCDP" + "Session")`, a method name or an Input-domain name
+  // built by concatenation), since the scan reads names, never values (a computed `x[…](` call fails
+  // above, a `Reflect.get(…)(…)` does not); a programmatic submit
   // (`form.requestSubmit()`, `form.submit()` in the page): it makes no input event, so the lockdown holds
   // it (as it holds A15's untrusted events), and the in-page source scanned whole names it in prose
   // (Helm's call whether to add it; see the step-21 report); a local, parameter or
@@ -270,7 +317,24 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //         typing check.
   //   Section 0's two pattern self-checks were red on the old patterns (2 FAIL of 131: every mustMatch
   //   shape missed, and `.type?.(`, `.pressSequentially?.(` and the three tick shapes) and are green now.
-  const classAt = recipe.indexOf("\nexport class RecipeAdapter ");
+  // STEP 21.1 (step 21's verifier: trusted input over a raw DevTools session read as no input): KILLS
+  // run once in a throwaway tree at 57812d6a, each slip just after the same lockReview line, against
+  // this scan (145 checks) and against the scan at 57812d6a ("Old": 144 checks, all green on each slip):
+  //   K-S8z8 (the verifier's attack) `const cdpX = await this.page!.context().newCDPSession(this.page!);
+  //         await cdpX.send("Input.dispatchMouseEvent", { type: "mousePressed", … });` → 1 FAIL of 145,
+  //         "…and makes no input call" (newCDPSession). K-S8z8b the factory alone, optional-called
+  //         (`(this.page!.context() as any).newCDPSession?.(this.page!)`, then a `Page.bringToFront`
+  //         send) → the same line (newCDPSession). K-S8z8c a session off a field the scan does not
+  //         follow, `(this.options as any).cdp?.send("Input.insertText", …)` → the same line
+  //         (Input.insertText).
+  //   K-S8z8d (the stated residual, measured): `Reflect.get(ctxR, "newCDP" + "Session").call(ctxR, …)`
+  //         and `send("Input." + "dispatchMouseEvent", …)` → GREEN 145/145. A name built at run time is
+  //         not seen (NOT FOLLOWED above).
+  //   Section 0's DevTools check was red on the old patterns (1 FAIL of 145: every one of its 12
+  //   mustMatch rows missed) and is green now. Its mustNotMatch rows were measured against a broadened
+  //   pattern (`\bInput\.\w+`, and `newCDPSession` with no trailing word boundary) → 1 FAIL of 145,
+  //   wrongly read: `Input.value`, `Input.dispatched …`, `newCDPSessions`.
+  const classAt =recipe.indexOf("\nexport class RecipeAdapter ");
   const cls = classAt >= 0 ? recipe.slice(classAt, recipe.indexOf("\n}\n", classAt) + 3) : "";
   check("the RecipeAdapter class is found in recipeAdapter.ts", cls.length > 10_000, `len=${cls.length}`);
   const esc = (s: string): string => s.replace(/[$]/g, "\\$");
