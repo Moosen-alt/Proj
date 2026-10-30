@@ -50,7 +50,8 @@ async function bodyText(page: Page): Promise<string> {
 }
 
 /** THE FILING'S OWN ROW, each cell labelled by its column header ("Status: Issued | Record Number:
- *  …"), or null when the number is not in exactly one table row under a header row of the same width.
+ *  …"), or null unless the number is in exactly one table row under a header row of the same width
+ *  that has a status column.
  *  A list's cells carry no labels of their own: the window below read Oregon ePermitting's "Issued"
  *  as a bare word (no rule reads a bare word in a page's prose), and it reached into the rows above
  *  and below, so a neighbouring filing's status could speak for this one. Columns whose header says
@@ -71,6 +72,9 @@ async function labelledRowFor(page: Page, num: string): Promise<string | null> {
     const heads = cellsOf(header).map((c) => norm(c.innerText).replace(/:+$/, ""));
     const cells = cellsOf(tr).map((c) => norm(c.innerText));
     if (heads.length !== cells.length) return null; // spanned or ragged: the labels would be wrong
+    // No status column: this row cannot carry the status (a detail page's summary table), and the
+    // window may still reach one printed beside the grid.
+    if (!heads.some((h) => /status/i.test(h))) return null;
     const pairs = cells
       .map((v, i) => ({ v, h: heads[i], status: /status/i.test(heads[i]) }))
       .filter((c) => c.v)

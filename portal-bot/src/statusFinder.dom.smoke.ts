@@ -55,6 +55,12 @@ const RECORDS = shell(`<table class="layout"><tr><td><h1>My Records</h1>
   ${accelaRow("10/15/2026", "187-26-000328-STR", "Residential Structural", "Issued", "Request Inspection")}
   ${accelaRow("10/16/2026", "194-26-001491-ELEC", "Residential Electrical", "In Review", "")}
   </table></td></tr></table>`);
+// A SUMMARY GRID WITH NO STATUS COLUMN, the status printed below it: the row says nothing about the
+// status, so the read keeps the window that reaches the paragraph.
+const SUMMARY = shell(`<h1>Record 187-26-000329-STR</h1>
+  <table><tr><th>Date</th><th>Record Number</th><th>Record Type</th><th>Action</th></tr>
+  ${`<tr><td>10/15/2026</td><td>187-26-000329-STR</td><td>Residential Structural</td><td>View</td></tr>`}</table>
+  <p>Status: In Review</p>`);
 const LOGIN = shell(`<h1>Login</h1><form><input name="username"><input type="password" name="password"><button>Sign in</button></form>`);
 
 // A PowerClerk-shaped list: 5 pages, the filing on page 4, and a search box with no "search" words of
@@ -102,6 +108,7 @@ const server = http.createServer((q, r) => {
     : u.pathname === "/apps2" ? shell(`<h1>Home</h1><a href="/list2">Applications</a>`)
     : u.pathname === "/list2" ? shell(`<h1>Applications</h1><table><tbody>${row("APP-400001", "Draft")}</tbody></table><button onclick="location.href='/submit'">Next: Submit application</button>`)
     : u.pathname === "/records" ? RECORDS
+    : u.pathname === "/summary" ? SUMMARY
     : u.pathname === "/login" ? LOGIN
     : shell(`<h1>${u.pathname}</h1>`);
   r.writeHead(200, { "Content-Type": "text/html" });
@@ -229,6 +236,13 @@ await check("MUST-PASS a list grid with a header row reads the filing's OWN row,
   assert.ok(r.text && /^Status: Issued \| /.test(r.text), `status text: ${r.text} (${r.reason})`);
   assert.match(r.text, /Record Type: Residential Structural/);
   assert.ok(!/Corrections Required|In Review|Resubmit/.test(r.text), `a neighbouring row spoke for the filing: ${r.text}`);
+});
+
+await check("MUST-EXCLUDE a grid with no status column keeps the window, which reaches the status beside it (#418)", async () => {
+  await page.goto(`${base}/summary`);
+  const r = await findFilingStatus(page, ["187-26-000329-STR"], { settleMs: 5000 });
+  assert.ok(r.text && /Status: In Review/.test(r.text), `status text: ${r.text} (${r.reason})`);
+  assert.ok(!/Record Number:/.test(r.text), `the status-less row was labelled instead: ${r.text}`);
 });
 
 await check("MUST-PASS RecipeAdapter.checkStatus stays on the signed-in page: portalUrl = /login is never reloaded", async () => {
