@@ -38,19 +38,146 @@ const listTs = (dir: string): string[] => fs.readdirSync(path.join(root, dir), {
   return /\.ts$/.test(d.name) && !/\.(test|smoke)\.ts$|dom\.smoke\.ts$/.test(d.name) ? [rel] : [];
 });
 const recipe = read("portal-bot/src/adapters/recipeAdapter.ts");
-// A class method's body: from its signature to the next member at the same indent (`override ` and
-// accessors included, Helm Should-fix 8: `protected override async runGapFill(` was invisible), cut at
-// the method's own closing brace so the next member's doc comment is not read as part of it.
+
+// Comments blanked, string and template TEXT blanked, regex literals blanked, template expressions
+// KEPT. A string, comment-free regex or regex literal never spans a line, so a misread `/` costs at
+// most the rest of that line. `at[k]` is the source index the k-th character of `code` came from
+// (every `{`, `}` and line break is copied as it stands), so a position found in the code maps back
+// to the raw source (methodBody below); `inText[p]` is 1 where source index p is string or template
+// TEXT (statementFrom below: a template's continuation line is no new statement).
+const codeOnlyMapped = (src: string): { code: string; at: number[]; inText: Uint8Array } => {
+  let out = "";
+  const at: number[] = [];
+  const inText = new Uint8Array(src.length + 1);
+  const emit = (s: string, from: number): void => { out += s; for (let k = 0; k < s.length; k++) at.push(from); };
+  let i = 0;
+  let depth = 0;
+  const tpl: number[] = [];
+  const lastToken = (): string => (/([\w$]+|[^\s])\s*$/.exec(out) || ["", ""])[1];
+  const regexMayStart = (): boolean => {
+    const t = lastToken();
+    return t === "" || /^[(,=:[!&|?{};+\-*%<>~^]$/.test(t) || /^(?:return|typeof|case|in|of|delete|void|throw|new|await|yield|instanceof)$/.test(t);
+  };
+  const template = (): void => {
+    while (i < src.length) {
+      const c = src[i];
+      if (c === "\\") { inText[i] = 1; inText[i + 1] = 1; i += 2; continue; }
+      if (c === "`") { emit("``", i); i++; return; }
+      if (c === "$" && src[i + 1] === "{") { emit("` ", i); i += 2; tpl.push(depth); depth++; return; }
+      if (c === "\n") emit("\n", i);
+      inText[i] = 1;
+      i++;
+    }
+  };
+  while (i < src.length) {
+    const c = src[i];
+    const d = src[i + 1];
+    if (c === "/" && d === "/") { while (i < src.length && src[i] !== "\n") i++; continue; }
+    if (c === "/" && d === "*") {
+      const e = src.indexOf("*/", i + 2);
+      const end = e < 0 ? src.length : e + 2;
+      for (let k = i; k < end; k++) if (src[k] === "\n") emit("\n", k);
+      i = end;
+      continue;
+    }
+    if (c === "\"" || c === "'") {
+      let j = i + 1;
+      while (j < src.length && src[j] !== c && src[j] !== "\n") j += src[j] === "\\" ? 2 : 1;
+      emit(`${c}${c}`, i);
+      inText.fill(1, i + 1, Math.min(j, src.length));
+      i = j + 1;
+      continue;
+    }
+    if (c === "`") { emit("`", i); i++; template(); continue; }
+    if (c === "/" && regexMayStart()) {
+      let j = i + 1;
+      let inClass = false;
+      while (j < src.length && src[j] !== "\n") {
+        if (src[j] === "\\") { j += 2; continue; }
+        if (src[j] === "[") inClass = true;
+        else if (src[j] === "]") inClass = false;
+        else if (src[j] === "/" && !inClass) break;
+        j++;
+      }
+      if (j < src.length && src[j] === "/") {
+        j++;
+        while (j < src.length && /[a-z]/.test(src[j])) j++;
+        emit(" 0 ", i);
+        i = j;
+        continue;
+      }
+    }
+    if (c === "{") depth++;
+    if (c === "}") {
+      depth--;
+      if (tpl.length && tpl[tpl.length - 1] === depth) { tpl.pop(); emit(" `", i); i++; template(); continue; }
+    }
+    emit(c, i);
+    i++;
+  }
+  return { code: out, at, inText };
+};
+const codeOnly = (src: string): string => codeOnlyMapped(src).code;
+
+// A block's text: from `start` (a declaration's signature) to its OWN closing brace, found by brace
+// matching on the code (codeOnly: comments, strings and template text blanked) and returned RAW (the
+// input scan reads strings and comments too). It ends at the first `}` that brings the brace depth
+// counted from `start` back to 0 on a line that is exactly `indent` + `}` (trailing blanks aside): a
+// return type's braces (`): Promise<{ … }> {`) and a multi-line parameter type's (`  }) {`) close
+// mid-line. Step 21.2 (the rule-1 verifier): a member's end was once found on the RAW text (the next-
+// member regex, `\n}\n`), which also read a template literal's continuation line indented two spaces
+// (`` `review\n  note(s) follow` ``) or a "\n}\n" inside a template as the end, so a followed body was
+// cut short and an input call after the cut was never scanned. A block that never reaches that line,
+// or whose depth goes below 0, is UNTERMINATED: it is recorded by its signature line in bodyFaults
+// (section 3 FAILS on it) and returned to the end of `src`, so the scan reads more, never less.
+const bodyFaults = new Set<string>();
+// Each source is read once (lexed whole, from its first character); a block's start is found in the
+// code by the map.
+const mappedCache = new Map<string, ReturnType<typeof codeOnlyMapped>>();
+const mappedAt = (src: string, start: number): ReturnType<typeof codeOnlyMapped> & { k0: number } => {
+  let m = mappedCache.get(src);
+  if (!m) { m = codeOnlyMapped(src); mappedCache.set(src, m); }
+  let lo = 0;
+  let hi = m.at.length;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (m.at[mid] < start) lo = mid + 1; else hi = mid; }
+  return { ...m, k0: lo };
+};
+const blockFrom = (src: string, start: number, indent: string): string => {
+  const rest = src.slice(start);
+  const { code, at, k0 } = mappedAt(src, start);
+  const sigLine = rest.replace(/^\n/, "").split("\n")[0].trim().slice(0, 120);
+  const lineStart = `\n${indent}`;
+  let depth = 0;
+  for (let k = k0; k < code.length; k++) {
+    const c = code[k];
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth < 0) { bodyFaults.add(`${sigLine}: its braces go below depth 0 before its body ends`); return rest; }
+      if (depth === 0 && code.slice(k - lineStart.length, k) === lineStart && /^[ \t]*(?:\n|$)/.test(code.slice(k + 1, k + 200))) return src.slice(start, at[k] + 1);
+    }
+  }
+  bodyFaults.add(`${sigLine}: unterminated (no closing \`${indent}}\` line at depth 0 before the end of the text)`);
+  return rest;
+};
+// A statement at column 0 (`const H = { … };`, `const f = (…) => …;`): from its line to the next line
+// that starts at column 0 with no blank, `}`, `)` or `]` (the next statement, or the next one's doc
+// comment), where that line's first character is not string or template TEXT (step 21.2: a template's
+// continuation line at column 0 once ended it). Returned raw; with none after it, the rest of `src`.
+const statementFrom = (src: string, start: number): string => {
+  const { inText } = mappedAt(src, start);
+  const next = /\n(?=[^\s})\]])/g;
+  next.lastIndex = start + 1;
+  for (let end = next.exec(src); end; end = next.exec(src)) if (!inText[end.index + 1]) return src.slice(start, end.index);
+  return src.slice(start);
+};
+// A class method's body: from its signature to its own `  }` line (blockFrom). Accessors and
+// `override ` are matched by the signature (Helm Should-fix 8: `protected override async runGapFill(`
+// was invisible).
 const MODIFIERS = "(?:private |protected |public |static |readonly |override )*";
 const methodBody = (src: string, signature: RegExp): string => {
   const m = signature.exec(src);
-  if (!m) return "";
-  const start = m.index;
-  const rest = src.slice(start + m[0].length);
-  const next = new RegExp(`\\n  ${MODIFIERS}(?:async )?(?:get |set )?[A-Za-z_$][\\w$]*\\s*(?:<[^>]*>)?\\(|\\n  (?:private |protected |public |static |readonly |override )+[A-Za-z_$][\\w$]*\\s*[:=]|\\n}\\n`).exec(rest);
-  const body = src.slice(start, start + m[0].length + (next ? next.index : rest.length));
-  const close = body.lastIndexOf("\n  }");
-  return close > 0 ? body.slice(0, close + 4) : body;
+  return m ? blockFrom(src, m.index, "  ") : "";
 };
 // A call of any shape after a name: `m(`, `m!(`, `m?.(`, `m!?.(`, and `m.call(` / `.apply(` / `.bind(`
 // (each optional or non-null too). Helm Should-fix 8's nit and its verifier round: `.click?.()`,
@@ -339,8 +466,35 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //   mustMatch rows missed) and is green now. Its mustNotMatch rows were measured against a broadened
   //   pattern (`\bInput\.\w+`, and `newCDPSession` with no trailing word boundary) → 1 FAIL of 145,
   //   wrongly read: `Input.value`, `Input.dispatched …`, `newCDPSessions`.
+  // STEP 21.2 (step 21's verifier: a followed body cut short on the raw text): every block's end is
+  // now found on the code (blockFrom / statementFrom, at the top), for the class, its methods and the
+  // module functions, classes and declarations alike. On the tree every check reads exactly as before
+  // (every ok and info line identical to 80221dad's; the 211 members' bodies byte-identical) plus the
+  // new bodyFaults check. KILLS run once in a throwaway tree at 80221dad, against this scan (146
+  // checks) and the scan at 80221dad ("Old"), the slip in verifyReviewScreen's final `catch` unless it
+  // says otherwise:
+  //   K-S8z9 (the verifier's attack) `const atkNote = \`review` / `  note(s) follow\`; await
+  //         this.page?.locator("#btnSubmit").click();` (the template's second line indented two
+  //         spaces) → 1 FAIL of 146, "verifyReviewScreen: reached via <runAll tail>, makes no input on
+  //         the page" (.click(). Old: green, 145/145.
+  //   K-S8z9b the same with the template `\`review` / `}` / `\`` (a "\n}\n" inside it) → the same
+  //         1 FAIL of 146. Old: red BY ACCIDENT (8 FAIL of 135: the class itself was cut at that
+  //         "\n}\n", so `this.progress(` had no body), never on the click.
+  //   K-S8z9c the same "\n}\n" template and a `.click()` as the first line of the module function
+  //         pruneCaptureDir → 1 FAIL of 146, "function pruneCaptureDir: reached via
+  //         writeSanitizedCapture, makes no input". Old: green, 144/144 (the function was cut there).
+  //   K-S8z9d the one-line arrow clickedLabel extended with `+ \`x` / `y\` + String(….click())`
+  //         (a template line at column 0) → 1 FAIL of 146, "function clickedLabel: reached via
+  //         humanClickReport, makes no input". Old: green, 145/145.
+  //   K-S8z9e `if (project) /x{/.test("");` (a regex literal after `)`, which codeOnly reads as a
+  //         division, so its `{` is counted): no `  }` line closes the class or the method → 41 FAIL of
+  //         368, among them "every method body the scan read ends at its own closing brace" naming
+  //         `export class RecipeAdapter …: unterminated`, and every body after the slip read as
+  //         verifyReviewScreen's. Old: green, 145/145. The scan FAILS CLOSED on a misread `/`: a body it
+  //         cannot close is read to the end, never cut. The fix is the code, not the scan (write
+  //         `void /x{/` or escape the brace).
   const classAt = recipe.indexOf("\nexport class RecipeAdapter ");
-  const cls = classAt >= 0 ? recipe.slice(classAt, recipe.indexOf("\n}\n", classAt) + 3) : "";
+  const cls = classAt >= 0 ? blockFrom(recipe, classAt, "") : "";
   check("the RecipeAdapter class is found in recipeAdapter.ts", cls.length > 10_000, `len=${cls.length}`);
   const esc = (s: string): string => s.replace(/[$]/g, "\\$");
   // A method or accessor, never `(?:get )?` in a method's signature (a called getter has no method body).
@@ -356,96 +510,22 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   const moduleSrc = classAt >= 0 ? recipe.slice(0, classAt) + recipe.slice(classAt + cls.length) : recipe;
   const moduleFnBody = (name: string): string => {
     const fn = new RegExp(`\\n(?:export )?(?:async )?function\\s*\\*?\\s*${esc(name)}\\s*(?:<[^>]*>)?\\(`).exec(moduleSrc);
-    if (fn) { const end = moduleSrc.indexOf("\n}\n", fn.index); return moduleSrc.slice(fn.index, end < 0 ? undefined : end + 3); }
+    // Its own `}` line at column 0, by brace matching (step 21.2: a "\n}\n" inside a template once cut
+    // it short).
+    if (fn) return blockFrom(moduleSrc, fn.index, "");
     // A module-level class (`new X(` follows it: its constructor and field initialisers run).
     const kl = new RegExp(`\\n(?:export )?(?:abstract )?class ${esc(name)}\\b`).exec(moduleSrc);
-    if (kl) { const end = moduleSrc.indexOf("\n}\n", kl.index); return moduleSrc.slice(kl.index, end < 0 ? undefined : end + 3); }
+    if (kl) return blockFrom(moduleSrc, kl.index, "");
     const cn = new RegExp(`\\n(?:export )?const ${esc(name)}\\b[^=\\n]*=\\s*(?:async\\s*)?(?:\\(|[A-Za-z_$][\\w$]*\\s*=>|function)`).exec(moduleSrc);
-    if (!cn) return "";
-    const rest = moduleSrc.slice(cn.index + 1);
-    const end = /\n(?=[^\s})\]])/.exec(rest);
-    return moduleSrc.slice(cn.index, cn.index + 1 + (end ? end.index : rest.length));
+    return cn ? statementFrom(moduleSrc, cn.index) : "";
   };
   // Any other module-level declaration (`const H = { … }`, `let x = new Y()`): from its line to the next
-  // line that starts a new statement at column 0.
+  // line that starts a new statement at column 0 (statementFrom: read on the code).
   const moduleDeclBody = (name: string): string => {
     const d = new RegExp(`\\n(?:export )?(?:const|let|var) ${esc(name)}\\b`).exec(moduleSrc);
-    if (!d) return "";
-    const rest = moduleSrc.slice(d.index + 1);
-    const end = /\n(?=[^\s})\]])/.exec(rest);
-    return moduleSrc.slice(d.index, d.index + 1 + (end ? end.index : rest.length));
+    return d ? statementFrom(moduleSrc, d.index) : "";
   };
 
-  // Comments blanked, string and template TEXT blanked, regex literals blanked, template expressions
-  // KEPT. A string, comment-free regex or regex literal never spans a line, so a misread `/` costs at
-  // most the rest of that line.
-  const codeOnly = (src: string): string => {
-    let out = "";
-    let i = 0;
-    let depth = 0;
-    const tpl: number[] = [];
-    const lastToken = (): string => (/([\w$]+|[^\s])\s*$/.exec(out) || ["", ""])[1];
-    const regexMayStart = (): boolean => {
-      const t = lastToken();
-      return t === "" || /^[(,=:[!&|?{};+\-*%<>~^]$/.test(t) || /^(?:return|typeof|case|in|of|delete|void|throw|new|await|yield|instanceof)$/.test(t);
-    };
-    const template = (): void => {
-      while (i < src.length) {
-        const c = src[i];
-        if (c === "\\") { i += 2; continue; }
-        if (c === "`") { i++; out += "``"; return; }
-        if (c === "$" && src[i + 1] === "{") { i += 2; tpl.push(depth); depth++; out += "` "; return; }
-        if (c === "\n") out += "\n";
-        i++;
-      }
-    };
-    while (i < src.length) {
-      const c = src[i];
-      const d = src[i + 1];
-      if (c === "/" && d === "/") { while (i < src.length && src[i] !== "\n") i++; continue; }
-      if (c === "/" && d === "*") {
-        const e = src.indexOf("*/", i + 2);
-        const end = e < 0 ? src.length : e + 2;
-        out += src.slice(i, end).replace(/[^\n]/g, "");
-        i = end;
-        continue;
-      }
-      if (c === "\"" || c === "'") {
-        let j = i + 1;
-        while (j < src.length && src[j] !== c && src[j] !== "\n") j += src[j] === "\\" ? 2 : 1;
-        out += `${c}${c}`;
-        i = j + 1;
-        continue;
-      }
-      if (c === "`") { i++; out += "`"; template(); continue; }
-      if (c === "/" && regexMayStart()) {
-        let j = i + 1;
-        let inClass = false;
-        while (j < src.length && src[j] !== "\n") {
-          if (src[j] === "\\") { j += 2; continue; }
-          if (src[j] === "[") inClass = true;
-          else if (src[j] === "]") inClass = false;
-          else if (src[j] === "/" && !inClass) break;
-          j++;
-        }
-        if (j < src.length && src[j] === "/") {
-          j++;
-          while (j < src.length && /[a-z]/.test(src[j])) j++;
-          out += " 0 ";
-          i = j;
-          continue;
-        }
-      }
-      if (c === "{") depth++;
-      if (c === "}") {
-        depth--;
-        if (tpl.length && tpl[tpl.length - 1] === depth) { tpl.pop(); i++; out += " `"; template(); continue; }
-      }
-      out += c;
-      i++;
-    }
-    return out;
-  };
   {
     // codeOnly's own pin: the shapes the tail uses, read the way discovery needs them.
     const sample = [
@@ -767,6 +847,10 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   }
   check("the closure makes no call it cannot follow (every this.X( has a body here, no super / bracket call, every backstop and imported call or reference allowlisted)",
     problems.size === 0, [...problems].join("\n         "));
+  // Step 21.2: a body cut short hides what follows the cut, so a member whose end cannot be found by
+  // brace matching (methodBody above) fails here by its signature line.
+  check("every method body the scan read ends at its own closing brace (brace matching on the code, never the next-member text)",
+    bodyFaults.size === 0, [...bodyFaults].join("\n         "));
   // The fixed list this scan replaced, kept as a FLOOR: a rename or a re-cut that stops reaching one fails.
   for (const name of [
     "drainBeforeReviewLock", "handOverReviewPage", "armOwnSubmitWatch", "noteHumanSubmit", "verifyReviewScreen",
