@@ -1564,10 +1564,14 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  payment URL — never a GET (a navigation is not evidence of a filing) and never a beacon or any
    *  other resource type, whatever its URL says (an analytics "/form_submit" beacon matches the
    *  filing-URL vocabulary). Read off the HANDED-OVER backstop's record only: by the time the run
-   *  reports, fillApplication's finally has let `this.backstop` go. */
+   *  reports, fillApplication's finally has let `this.backstop` go. And from the RUN'S OWN PAGE only
+   *  (round 5, Helm item 2), as humanDocumentFromHandedOverPage: a popup's contact-form POST after
+   *  the click must not turn a held click into "stands". */
   private personFilingShapedRequestAfter(at: number): boolean {
+    const runPage = this.page;
+    if (runPage == null) return false;
     const rs = this.handedOverBackstop?.humanRequests ?? [];
-    return rs.some((r) => typeof r.at === "number" && r.at >= at && filingShapedHumanRequest(r));
+    return rs.some((r) => r.page === runPage && typeof r.at === "number" && r.at >= at && filingShapedHumanRequest(r));
   }
 
   /** #333 round 4 (Helm Blocking 2) — the person's own document request from the handed-over page went,

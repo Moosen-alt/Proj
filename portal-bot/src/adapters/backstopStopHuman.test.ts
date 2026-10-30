@@ -19,7 +19,7 @@
 //   8. (round 4) personFilingShapedRequestAfter(at) — the one predicate the capture's commit/held
 //      split and the review step's wording read: a main-frame document request, or a fetch/XHR to a
 //      submit/payment URL, after the click, never a GET and never a beacon; off the handed-over
-//      backstop only.
+//      backstop only, and (round 5) from the run's own page only, never a popup's.
 //   7. (round 4, Helm Blocking 2) followUpHeldOnErrorPage — the person's document submit went, a stopping
 //      abort followed, and the window shows Chromium's error page: true; on a portal page, or read off
 //      this.backstop instead of the handed-over backstop: false. Red before: no such predicate.
@@ -160,6 +160,11 @@ console.log("\n#333 round 4 — did a FILING-SHAPED request of the person's go a
     check("8. a GET navigation after the click (\"My Applications\") is never filing-shaped", nav === false, String(nav));
     const xhrSave = probe({ where: "https://portal.example/api/SaveField", document: false, abortsBefore: 0, method: "POST", resourceType: "xhr", at: 10, page: RUN_PAGE });
     check("8. an XHR POST to a URL that is not a submit or payment URL is not filing-shaped", xhrSave === false, String(xhrSave));
+    // Round 5 (Helm item 2): the run's own page only. A popup (another Page) sending its contact form
+    // after the click — a document POST, filing-shaped by every other measure — is not the person's
+    // filing on the handed-over page. Red before: the predicate read every page's requests.
+    const popupDoc = probe({ where: "https://portal.example/contact/send", document: true, abortsBefore: 0, method: "POST", resourceType: "document", at: 10, page: {} });
+    check("8. a POPUP's document POST after the click is not the person's filing on the run's page", popupDoc === false, String(popupDoc));
     const live = new RecipeAdapter(recipe, {}, {}, {}) as unknown as Internals;
     live.page = RUN_PAGE;
     live.backstop = { aborts: [], humanRequests: [{ where: "https://portal.example/apply/submit", document: true, abortsBefore: 0, method: "POST", resourceType: "document", at: 10, page: RUN_PAGE }] };
