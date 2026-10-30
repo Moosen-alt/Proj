@@ -68,7 +68,10 @@ const codeOnlyMapped = (src: string): { code: string; at: number[]; inside: Uint
   const regexMayStart = (): boolean => {
     const t = lastToken();
     if (t === ")") return closedHead;
-    return t === "" || /^[(,=:[!&|?{};+\-*%<>~^]$/.test(t) || /^(?:return|typeof|case|in|of|delete|void|throw|new|await|yield|instanceof)$/.test(t);
+    // `else` and `do` (round 5, Helm item 4: the verifier's M1): a `/` after either can never be a
+    // division, so it starts a regex literal; read as a division, a misread pair once balanced and let
+    // a fake `  }` line end a member before a click.
+    return t === "" || /^[(,=:[!&|?{};+\-*%<>~^]$/.test(t) || /^(?:return|typeof|case|in|of|delete|void|throw|new|await|yield|instanceof|else|do)$/.test(t);
   };
   const template = (): void => {
     while (i < src.length) {
@@ -587,11 +590,15 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //   Re-run unchanged on this scan: K-S8z9, K-S8z9b, K-S8z9c, K-S8z9d, K-S8z9f, K-S8z9g (each the same
   //   1 FAIL as above) and K-S8z9h (GREEN, the stated residual); V-A0 and V-A6 (the controls: a plain
   //   click in verifyReviewScreen and in pageUrlNoHash) → 1 FAIL on the click, Old the same.
-  //   NOT SEEN (stated, not pinned): a `/` misread in a shape the two rules do not cover (after a
+  //   M1 (round 5, the 21.2 verifier's finding) V-A1c's shape with the misread pair after `else`, not
+  //         after an if head (`if (!project) void 0; else /\}\}/.test("");` / `{` / `  }` / `  sleep(0);`
+  //         / the click / `else /\{\{/…`, in verifyReviewScreen's final catch) → 1 FAIL of 146 on the
+  //         click once `else|do` are regex-start keywords; GREEN 146/146 without them (the escape).
+  //   NOT SEEN (stated, not pinned): a `/` misread in a shape the rules do not cover (after a
   //   keyword read as a property name, `x.return / 2`, a postfix `x++ / y /` or a non-null `x! / y`),
   //   paired so the braces still balance and a fake `indent` + `}` line is followed by a line that
   //   reads as a declaration.
-  const classAt =recipe.indexOf("\nexport class RecipeAdapter ");
+  const classAt = recipe.indexOf("\nexport class RecipeAdapter ");
   const cls = classAt >= 0 ? blockFrom(recipe, classAt, "") : "";
   check("the RecipeAdapter class is found in recipeAdapter.ts", cls.length > 10_000, `len=${cls.length}`);
   const esc = (s: string): string => s.replace(/[$]/g, "\\$");
