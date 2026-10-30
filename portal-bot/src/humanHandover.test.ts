@@ -43,15 +43,18 @@ const recipe = read("portal-bot/src/adapters/recipeAdapter.ts");
 // KEPT. A string, comment-free regex or regex literal never spans a line, so a misread `/` costs at
 // most the rest of that line. `at[k]` is the source index the k-th character of `code` came from
 // (every `{`, `}` and line break is copied as it stands), so a position found in the code maps back
-// to the raw source (methodBody below); `inText[p]` is 1 where source index p is string or template
-// TEXT (statementFrom below: a template's continuation line is no new statement).
-const codeOnlyMapped = (src: string): { code: string; at: number[]; inText: Uint8Array } => {
+// to the raw source (methodBody below). `inside[p]` is 1 where source index p is inside something:
+// string or template text, a template's own backticks and `${`, or any character while a `(`, `[` or
+// `{` (a template expression's included) is open. statementFrom below: a line at column 0 there is
+// no new statement.
+const codeOnlyMapped = (src: string): { code: string; at: number[]; inside: Uint8Array } => {
   let out = "";
   const at: number[] = [];
-  const inText = new Uint8Array(src.length + 1);
+  const inside = new Uint8Array(src.length + 1);
   const emit = (s: string, from: number): void => { out += s; for (let k = 0; k < s.length; k++) at.push(from); };
   let i = 0;
   let depth = 0;
+  let paren = 0;
   const tpl: number[] = [];
   const lastToken = (): string => (/([\w$]+|[^\s])\s*$/.exec(out) || ["", ""])[1];
   const regexMayStart = (): boolean => {
@@ -61,22 +64,24 @@ const codeOnlyMapped = (src: string): { code: string; at: number[]; inText: Uint
   const template = (): void => {
     while (i < src.length) {
       const c = src[i];
-      if (c === "\\") { inText[i] = 1; inText[i + 1] = 1; i += 2; continue; }
+      inside[i] = 1;
+      if (c === "\\") { inside[i + 1] = 1; i += 2; continue; }
       if (c === "`") { emit("``", i); i++; return; }
-      if (c === "$" && src[i + 1] === "{") { emit("` ", i); i += 2; tpl.push(depth); depth++; return; }
+      if (c === "$" && src[i + 1] === "{") { inside[i + 1] = 1; emit("` ", i); i += 2; tpl.push(depth); depth++; return; }
       if (c === "\n") emit("\n", i);
-      inText[i] = 1;
       i++;
     }
   };
   while (i < src.length) {
     const c = src[i];
     const d = src[i + 1];
-    if (c === "/" && d === "/") { while (i < src.length && src[i] !== "\n") i++; continue; }
+    const nested = depth > 0 || paren > 0 ? 1 : 0;
+    if (c === "/" && d === "/") { const from = i; while (i < src.length && src[i] !== "\n") i++; inside.fill(nested, from, i); continue; }
     if (c === "/" && d === "*") {
       const e = src.indexOf("*/", i + 2);
       const end = e < 0 ? src.length : e + 2;
       for (let k = i; k < end; k++) if (src[k] === "\n") emit("\n", k);
+      inside.fill(nested, i, end);
       i = end;
       continue;
     }
@@ -84,11 +89,13 @@ const codeOnlyMapped = (src: string): { code: string; at: number[]; inText: Uint
       let j = i + 1;
       while (j < src.length && src[j] !== c && src[j] !== "\n") j += src[j] === "\\" ? 2 : 1;
       emit(`${c}${c}`, i);
-      inText.fill(1, i + 1, Math.min(j, src.length));
+      inside[i] = nested;
+      inside.fill(1, i + 1, Math.min(j + 1, src.length));
       i = j + 1;
       continue;
     }
-    if (c === "`") { emit("`", i); i++; template(); continue; }
+    if (c === "`") { inside[i] = 1; emit("`", i); i++; template(); continue; }
+    inside[i] = nested;
     if (c === "/" && regexMayStart()) {
       let j = i + 1;
       let inClass = false;
@@ -103,10 +110,13 @@ const codeOnlyMapped = (src: string): { code: string; at: number[]; inText: Uint
         j++;
         while (j < src.length && /[a-z]/.test(src[j])) j++;
         emit(" 0 ", i);
+        inside.fill(nested, i, j);
         i = j;
         continue;
       }
     }
+    if (c === "(" || c === "[") paren++;
+    if (c === ")" || c === "]") paren--;
     if (c === "{") depth++;
     if (c === "}") {
       depth--;
@@ -115,7 +125,7 @@ const codeOnlyMapped = (src: string): { code: string; at: number[]; inText: Uint
     emit(c, i);
     i++;
   }
-  return { code: out, at, inText };
+  return { code: out, at, inside };
 };
 const codeOnly = (src: string): string => codeOnlyMapped(src).code;
 
@@ -162,13 +172,16 @@ const blockFrom = (src: string, start: number, indent: string): string => {
 };
 // A statement at column 0 (`const H = { … };`, `const f = (…) => …;`): from its line to the next line
 // that starts at column 0 with no blank, `}`, `)` or `]` (the next statement, or the next one's doc
-// comment), where that line's first character is not string or template TEXT (step 21.2: a template's
-// continuation line at column 0 once ended it). Returned raw; with none after it, the rest of `src`.
+// comment), where that line's first character is inside nothing (codeOnlyMapped's `inside`: step 21.2,
+// a template's continuation line, its closing backtick or a `${` at column 0 once ended it, and so
+// did a comment line at column 0 inside an object). Returned raw; with none after it, the rest of
+// `src`. NOT SEEN: an expression continued at column 0 outside every bracket (`\n+ f()`,
+// `\n.concat(…)`) is read as the next statement; this repo indents its continuations.
 const statementFrom = (src: string, start: number): string => {
-  const { inText } = mappedAt(src, start);
+  const { inside } = mappedAt(src, start);
   const next = /\n(?=[^\s})\]])/g;
   next.lastIndex = start + 1;
-  for (let end = next.exec(src); end; end = next.exec(src)) if (!inText[end.index + 1]) return src.slice(start, end.index);
+  for (let end = next.exec(src); end; end = next.exec(src)) if (!inside[end.index + 1]) return src.slice(start, end.index);
   return src.slice(start);
 };
 // A class method's body: from its signature to its own `  }` line (blockFrom). Accessors and
@@ -493,6 +506,15 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //         verifyReviewScreen's. Old: green, 145/145. The scan FAILS CLOSED on a misread `/`: a body it
   //         cannot close is read to the end, never cut. The fix is the code, not the scan (write
   //         `void /x{/` or escape the brace).
+  //   K-S8z9f clickedLabel extended with `+ \`x` / `\` + String(….click())` (the template's CLOSING
+  //         backtick at column 0) → 1 FAIL of 146, the clickedLabel line. Old: green, 145/145.
+  //   K-S8z9g ERROR_PAGE_GO_BACK written `String(` / `// a note` / `  (….click()) + " The window …"`
+  //         (a comment at column 0 inside the parentheses) → 1 FAIL of 146, "const ERROR_PAGE_GO_BACK:
+  //         reached via function humanPaymentHeldNote, makes no input". Old: green, 145/145.
+  //   K-S8z9h (the stated residual, measured; statementFrom's NOT SEEN) ERROR_PAGE_GO_BACK's string
+  //         continued on a new line `+ String(….click());` at column 0 → GREEN 146/146 (Old: green,
+  //         145/145). An expression continued at column 0 outside every bracket reads as the next
+  //         statement.
   const classAt = recipe.indexOf("\nexport class RecipeAdapter ");
   const cls = classAt >= 0 ? blockFrom(recipe, classAt, "") : "";
   check("the RecipeAdapter class is found in recipeAdapter.ts", cls.length > 10_000, `len=${cls.length}`);
