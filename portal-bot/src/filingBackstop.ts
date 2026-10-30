@@ -418,8 +418,15 @@ const HUMAN_INPUT_BINDING = `__solarBackstopHumanInput_${randomBytes(6).toString
 const HUMAN_INPUT_WORLD = "__solarBackstopHumanInput";
 /** The watch, run in that world. A string, not a function: tsx's __name wrapper does not exist in
  *  the page. The binding takes exactly ONE string (a raw CDP binding throws on none, and this catch
- *  would swallow every click while the read-back still said armed). */
-const HUMAN_INPUT_SCRIPT = `(() => { const w = window; if (w.__solarBackstopHumanInputArmed) return; w.__solarBackstopHumanInputArmed = true;
+ *  would swallow every click while the read-back still said armed). THE MARKER IS THE BOOLEAN true,
+ *  TESTED AS SUCH (`=== true`, here and in the read-back; #333 step 19.1). A world shares no expando
+ *  with the main world, so no page script can set it; but a Window's NAMED properties (an element
+ *  with that id or name, a child frame with that name) are seen from every world, and a named
+ *  property is an element or a window, never the boolean true. Tested by truthiness, a review page
+ *  carrying `<div id="__solarBackstopHumanInputArmed">` made this script return before it added a
+ *  listener while the read-back said armed: the person's own click was held (smoke A24). The
+ *  assignment below makes an own property of this world's window, which shadows the named one. */
+const HUMAN_INPUT_SCRIPT = `(() => { const w = window; if (w.__solarBackstopHumanInputArmed === true) return; w.__solarBackstopHumanInputArmed = true;
   const note = (e) => { if (!e || !e.isTrusted) return; if (e.type === "keydown" && e.key !== "Enter" && e.key !== " ") return;
     try { if (typeof w.${HUMAN_INPUT_BINDING} === "function") w.${HUMAN_INPUT_BINDING}(e.type); } catch (_) { /* the watch never breaks the page */ } };
   for (const t of ["pointerdown", "mousedown", "touchstart", "keydown"]) w.addEventListener(t, note, true); })();`;
@@ -1826,13 +1833,14 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       // back from the ISOLATED WORLD of its root frame — never its main world, where a page script
       // could have set it. A page whose world is not made in time (navigating, hung) is NOT armed —
       // the hand-over then fails closed and says so (NOT_HANDED_OVER_NOTE), never "the page is
-      // yours" over a document that cannot see the person's click.
+      // yours" over a document that cannot see the person's click. `=== true`, never truthiness: an
+      // element named like the marker is visible from this world too (HUMAN_INPUT_SCRIPT's comment).
       let listening = false;
       try {
         const w = ownWorld;
         if (w) {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const read: any = await settleWithin(Promise.resolve(w.session.send("Runtime.evaluate", { expression: "!!window.__solarBackstopHumanInputArmed", contextId: w.rootWorld, returnByValue: true })).catch(() => null), TERMINAL_READ_TIMEOUT_MS);
+          const read: any = await settleWithin(Promise.resolve(w.session.send("Runtime.evaluate", { expression: "window.__solarBackstopHumanInputArmed === true", contextId: w.rootWorld, returnByValue: true })).catch(() => null), TERMINAL_READ_TIMEOUT_MS);
           listening = read?.result?.value === true;
         }
       } catch { listening = false; }

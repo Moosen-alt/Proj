@@ -119,6 +119,15 @@
 //         that appears after the arm counts until its session is attached.
 //     A23 the person follows a same-origin link to /review2 after the hand-over and clicks its submit: one
 //         POST — only the script for new documents (Page.enable, worldName) watches that document.
+//     A24 (step 19.1) a review page carrying an element whose id is the watch's armed marker
+//         (`<div id="__solarBackstopHumanInputArmed">`, a Window named property, seen from every world):
+//         armed, and the person's click files — one POST, recorded as theirs, no stopping abort. Red on
+//         the parent 6b12844e, where the marker was tested by truthiness: the script returned before it
+//         listened while the read-back said armed, the hand-over said "the page is yours", and the
+//         person's click was held (0 POSTs, the abort not flagged humanInput). Kills K-script191 (A24
+//         3/8 on its trim) and K-readback191 (A24 green; humanHandover.test section 6 only), measured
+//         in the A24 block. A page script cannot set the marker itself (a world shares no
+//         expando), and a named property is an element or a window, never the boolean true.
 //     KILLS, measured at 0525b131 in a throwaway tree on a trim to A1, A2, A13, A15, A16, A18-A23, the "o"
 //     cases, B1, B1b, B12 and B12b (53 checks, green 53/53 unmutated), with humanHandover.test (62):
 //       K-zeroarg (the script calls the binding with no argument): 23/53 — A1 x3, A13 x2, A16's "counted",
@@ -562,6 +571,9 @@ const reviewBody = (k: string): string => {
   </script>${summary}${formSubmit(k)}`;
   // A23: a same-origin link to a second review page (a NEW document after the hand-over).
   if (k === "A23") return `${summary}<a id="next2" href="/h/A23/review2">Review the application again</a>`;
+  // A24 (step 19.1): an element whose id is the watch's armed marker — a Window named property, which
+  // every world (the isolated one too) sees on `window`.
+  if (k === "A24") return `${summary}<div id="__solarBackstopHumanInputArmed" hidden></div>${formSubmit(k)}`;
   return `${summary}<form method="post" action="/h/${k}/apply/submit"><button type="submit" id="btnSubmit">Submit Application</button></form>`;
 };
 // A step BEFORE review (B10): an attachments page whose Continue posts and is answered with the review
@@ -1071,6 +1083,42 @@ for (const absent of [false, true]) {
     postsFor("A23", from).filter((p) => /\/apply\/submit$/.test(p.path)).length === 1, brief(b, "A23", from));
   check("A23 …recorded as the person's request (a main-frame document submission), no stopping abort",
     b.bs.humanRequests.some((r) => r.document && /\/apply\/submit$/.test(r.where)) && b.bs.stoppingAborts().length === 0, brief(b, "A23", from));
+  await b.close();
+}
+{
+  // A24 (step 19.1): the review page carries `<div id="__solarBackstopHumanInputArmed">`. A Window's
+  // named properties are seen from every world, so the watch's isolated world reads that element at
+  // `window.__solarBackstopHumanInputArmed`. Red on the parent (the marker tested by truthiness): the
+  // watch script returned before it listened, the read-back (`!!`) still said armed, and the person's
+  // click was held with no humanInput flag — a silent false stop. Green: the marker is tested
+  // `=== true` at both ends; the script's assignment shadows the element in its own world. A page
+  // cannot reach the other way (make the marker true from the main world): a world shares no expando
+  // with it, and a named property is an element or a window, never the boolean true.
+  // Measured in a throwaway tree (kill-191) on a trim to A1, A23 and A24 (8 checks), with
+  // humanHandover.test (144): the parent 6b12844e reddens A24's two filing checks (2/8: armed=true,
+  // the click aborted as filing-url, human false, 0 POSTs) and section 6's two marker checks (2/144);
+  // the fix is green 8/8 and 144/144. Kills on the fix: K-script191 (the script's early return by
+  // truthiness again, the read-back strict) reddens all three A24 checks (3/8: armed=false — the
+  // watch is then not armed, which fails closed, never "the page is yours") and section 6's `=== true`
+  // check (1/144); K-readback191 (the read-back `!!` again, the script strict) stays green 8/8 here —
+  // the strict script arms either way — and reddens section 6's read-back and `=== true` checks
+  // (2/144), that line's only cover.
+  const from = posts.length;
+  const b = await bed("A24", { arm: false });
+  const named = await b.page.evaluate(() => {
+    const v = (window as unknown as Record<string, unknown>).__solarBackstopHumanInputArmed;
+    return v instanceof HTMLElement ? `element#${v.id}` : String(v);
+  });
+  const armed = await b.bs.watchHumanInput();
+  const handed = b.bs.handOverToHuman("smoke A24");
+  check("A24 the fixture: the main world sees the marker's name as the element (a Window named property), and the watch arms and the hand-over takes",
+    named === "element#__solarBackstopHumanInputArmed" && armed === true && handed === true, `named=${named} armed=${armed} handed=${handed}`);
+  await personClicks(b.page);
+  await sleep(900);
+  check("A24 the person's click on a review page carrying an element named like the armed marker files: one POST reaches the portal",
+    postsFor("A24", from).filter((p) => /\/apply\/submit$/.test(p.path)).length === 1, brief(b, "A24", from));
+  check("A24 …recorded as the person's request (a main-frame document submission), no stopping abort",
+    b.bs.humanRequests.some((r) => r.document && /\/apply\/submit$/.test(r.where)) && b.bs.stoppingAborts().length === 0, brief(b, "A24", from));
   await b.close();
 }
 {

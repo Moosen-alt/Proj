@@ -775,7 +775,7 @@ console.log("\n6. THE INPUT WATCH LIVES IN A CDP ISOLATED WORLD (Helm Should-fix
   // In the main world a page script could forge the person's input: find the watch's binding by its
   // prefix, read its name off Playwright's binding controller, call it from a cross-origin iframe, or
   // drive the watch's own listener through an addEventListener it wrapped before the arm. The smoke's
-  // A18-A23 (+ A19o/A22o/A22b) pin the behaviour; these pin the mechanism, so an edit that moves the
+  // A18-A24 (+ A19o/A22o/A22b) pin the behaviour; these pin the mechanism, so an edit that moves the
   // watch back into the main world fails here too.
   const backstop = read("portal-bot/src/filingBackstop.ts");
   check("filingBackstop.ts exposes no binding and adds no init script through Playwright (exposeBinding / addInitScript are main-world)",
@@ -794,8 +794,19 @@ console.log("\n6. THE INPUT WATCH LIVES IN A CDP ISOLATED WORLD (Helm Should-fix
   check("the watch's session enables Runtime and Page (without Runtime.enable a new document's world gets no binding; without Page.enable no new document runs the watch)",
     sends("Runtime.enable").length >= 1 && sends("Page.enable").length >= 1, `${sends("Runtime.enable").length} ${sends("Page.enable").length}`);
   check("the armed marker is read back from the isolated world (a Runtime.evaluate with its contextId), never through a frame's main-world .evaluate(",
-    /send\(\s*"Runtime\.evaluate",\s*\{\s*expression:\s*"!!window\.__solarBackstopHumanInputArmed",\s*contextId:/.test(backstop)
-      && !/\.evaluate\(\s*"!!window\.__solarBackstopHumanInputArmed"/.test(backstop));
+    /send\(\s*"Runtime\.evaluate",\s*\{\s*expression:\s*"window\.__solarBackstopHumanInputArmed === true",\s*contextId:/.test(backstop)
+      && !/\.evaluate\(\s*"[^"]*__solarBackstopHumanInputArmed/.test(backstop));
+  // Step 19.1: the marker is the boolean true, tested as such at both ends. A Window's named
+  // properties (an element with that id) are seen from the isolated world too; by truthiness, such
+  // an element made the script return before it listened while the read-back said armed (smoke A24
+  // pins the behaviour; this pins the read-back, which A24 cannot redden while the script is strict).
+  // Every read of the marker off a window (`w.` in the script, `window.` in the read-back); its one
+  // assignment (`= true`) is left out, and so is prose (the comment's `id="…"` is not a read).
+  const markerTests = backstop.match(/\b(?:w|window)\.__solarBackstopHumanInputArmed(?!\s*=[^=])[^;")]*/g) || [];
+  check("the armed marker is tested `=== true` wherever it is read (the watch script's early return and the read-back): never by truthiness, never `!!`",
+    markerTests.length >= 2 && markerTests.every((s) => /^(?:w|window)\.__solarBackstopHumanInputArmed\s*===\s*true\b/.test(s))
+      && !/!!\s*window\.__solarBackstopHumanInputArmed/.test(backstop),
+    JSON.stringify(markerTests));
   check("the watch script calls the binding with one argument (a raw CDP binding throws on none, and the script's catch would swallow every click while the read-back said armed)",
     /w\.\$\{HUMAN_INPUT_BINDING\}\((?!\))/.test(backstop) && !/w\.\$\{HUMAN_INPUT_BINDING\}\(\)/.test(backstop));
   // Helm Blocking 1, bullet 4: the watch's sessions are detached only after the route comes off. Not
