@@ -20,13 +20,16 @@
 //       GUARD PIN: green before by design (the hold already drained a draft); its kills are the
 //       no-hold and no-draft-branch kills below.
 //   (f) the outcome could not be recorded (a trigger refuses the write): the held draft is still
-//       written down for the next stage to continue, not dropped as "the completion page's read".
+//       written down for the next stage to continue, not dropped as "the completion page's read",
+//       and (round 5) WITHOUT a recipe, so the #330 heal never runs off that run; (e) pins that the
+//       happy path still records it against the recipe (the heal stays there).
 //
 // KILL TEST: in repository.ts onSubmitCaptured, record at once instead of holding the capture
 // until runOutcomeRecorded → (a), (b) and (e) fail (run 'awaiting_human_submit' / 'failed', number
 // lost; the outcome's result_json write drops the draft). Drop recordSubmitCapture's draftCreated
 // branch → (e) and (f) fail (the draft is stamped as a filing). Restore the catch's old loop (only
-// the record_number_unread audit) → (f) fails (no draft audit, no result_json.draftCreated).
+// the record_number_unread audit) → (f) fails (no draft audit, no result_json.draftCreated). Pass
+// the recipe again on the catch path (recordSubmitCapture) → (f) fails (recipeId set: the heal ran).
 //
 // Run: npx tsx backend/test/humanSubmitDuringStage.test.ts
 import "./_isolate"; // FIRST
@@ -137,6 +140,8 @@ await check("(e) a draft-created read during the run is held, then recorded as a
   const d = JSON.parse(drafts[0].details) as Record<string, unknown>;
   assert.equal(d.runId, run.id, "the draft audit names another run");
   assert.equal(d.applicationNumber, DRAFT);
+  // The happy path keeps the heal (#330): the draft is recorded against the replayed recipe.
+  assert.ok(typeof d.recipeId === "string" && d.recipeId.length > 0, `the happy path recorded the draft with no recipe: ${String(d.recipeId)}`);
   assert.equal((JSON.parse(String(run.result_json)) as { draftCreated?: { applicationNumber?: string } }).draftCreated?.applicationNumber, DRAFT,
     "the run's result_json lost draftCreated (the outcome's write overwrote it)");
   assert.equal(fx.audits("submission.record_number_read").filter((a) => a.project_id === projectId).length, 0, "the draft was read as a filing");
@@ -160,6 +165,9 @@ await check("(f) the outcome could not be recorded: a held draft capture is stil
   const drafts = draftAudits(projectId);
   assert.equal(drafts.length, 1, `expected one portal.draft_created audit, found ${drafts.length}: the held draft was dropped`);
   assert.equal((JSON.parse(drafts[0].details) as Record<string, unknown>).runId, run.id);
+  // Round 5 (Helm item 3): NO heal off a run whose outcome could not be recorded — the draft is
+  // recorded with no recipe, so healDraftCreatingFinalSubmit (click authority, #330) never runs.
+  assert.equal((JSON.parse(drafts[0].details) as Record<string, unknown>).recipeId, null, "the failed-outcome path recorded the draft against the recipe: the heal ran");
   assert.equal((JSON.parse(String(run.result_json ?? "{}")) as { draftCreated?: { applicationNumber?: string } }).draftCreated?.applicationNumber, DRAFT,
     "the run's result_json carries no draftCreated");
   assert.equal(fx.audits("submission.record_number_unread").filter((a) => a.project_id === projectId).length, 0,

@@ -9979,10 +9979,17 @@ export async function prepareSubmission(
     // say so where the operator looks, so the number is entered by hand (the manual form).
     runOutcomeRecorded = true;
     for (const capture of capturesBeforeOutcome.splice(0)) {
-      // A held DRAFT is not a filing and needs no recorded outcome: it is written down as on the
-      // happy path (audit + result_json; the status write below leaves result_json alone). A
-      // failed-outcome run with a recorded draft is the next stage's to continue.
-      if (capture.draftCreated) { recordSubmitCapture(capture); continue; }
+      // A held DRAFT is not a filing and needs no recorded outcome: it is written down (audit +
+      // result_json; the status write below leaves result_json alone), and a failed-outcome run with
+      // a recorded draft is the next stage's to continue. WITHOUT a recipe (round 5, Helm item 3):
+      // healDraftCreatingFinalSubmit is click authority under the #330 carve-out, and it never runs
+      // off a run whose outcome could not be recorded. The happy path keeps the heal.
+      if (capture.draftCreated) {
+        try {
+          recordPortalDraft(db, { projectId, track: track ?? "permit", draft: capture.draftCreated, runId, recipeId: null, source: "replay" });
+        } catch { /* the original error is the one to surface */ }
+        continue;
+      }
       try {
         addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_unread", {
           track, runId, reason: `the run's outcome could not be recorded, so the completion page's read was not either: ${capture.reason.slice(0, 160)}`,
