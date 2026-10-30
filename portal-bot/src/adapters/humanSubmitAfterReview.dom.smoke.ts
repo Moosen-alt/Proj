@@ -228,6 +228,10 @@
 //         over over a run that then fails by name. Kill (no check before handOverReviewPage): same.
 //     B14b a filing request recorded WHILE the arm runs (page-script fetch alongside it, the
 //         deterministic stand-in for a click inside the 12-19 ms arm). Red before / kill: as B14.
+//     B14c (round 5, Helm item 1) B14's shape, then the person clicks at the refusal line: the watch was
+//         armed, so that click is flagged, and the failing run must not say "click submit again". Red
+//         before: HUMAN_CLICK_HELD_NOTE on the failing run. Kill: heldHumanClick without its
+//         handedOverBackstop check (the same red).
 //     B2 (above) gains a GUARD check, green before by design: a click the watch SAW still hands over
 //         ("the page is yours", no NOT_HANDED_OVER_NOTE). Kill: refuse on ANY stopping abort.
 //   [B, Helm Should-fix 12] THE FAIL-CLOSED NOTE, PINNED ON ITS OWN CAUSE (a failed arm):
@@ -554,7 +558,7 @@ const reviewBody = (k: string): string => {
         }, 8000);
       });
     </script>`;
-  if (k === "B14" || k === "B14b") return `${summary}${FETCH_SUBMIT(k)}`;
+  if (k === "B14" || k === "B14b" || k === "B14c") return `${summary}${FETCH_SUBMIT(k)}`;
   if (k === "B8") return `${summary}${formSubmit(k)}<a id="older" href="/h/B8/record">Older application BLD-2026-900001</a>`;
   // B17: the review page links a contact form that opens in a popup (another tab, another Page).
   if (k === "B17") return `${summary}${formSubmit(k)}<a id="help" href="/h/B17/popup-form" target="_blank">Contact us</a>`;
@@ -1689,6 +1693,20 @@ const refusedHandOver = (k: string, r: Replay): void => {
   });
   check("B14b a filing request recorded during the arm is held unflagged", r.aborts.some((a) => /\/apply\/submit$/.test(a.where) && !a.human), JSON.stringify(r.aborts));
   refusedHandOver("B14b", r);
+}
+{
+  // B14c (round 5, Helm item 1): B14's refusal comes AFTER the watch is armed, so a person's click at the
+  // refusal's own progress line (NOT_HANDED_OVER_NOTE) IS flagged as theirs. That run fails by name and
+  // never let go of the page: it must not also say "click submit again". Red before: HUMAN_CLICK_HELD_NOTE
+  // on the failing run (refusedHandOver's last check).
+  let refusedAt = 0;
+  const r = await replay("B14c", {
+    onBeforeArm: async (page) => { await personClicks(page); await sleep(500); },
+    onRefused: async (page) => { refusedAt = Date.now(); await personClicks(page); await sleep(500); },
+  });
+  check("B14c the person's click at the refusal line is flagged as theirs (the watch was armed when the run refused)",
+    refusedAt > 0 && r.aborts.some((a) => /\/apply\/submit$/.test(a.where) && a.human && (a.at ?? 0) >= refusedAt), `refusedAt=${refusedAt} aborts=${JSON.stringify(r.aborts)}`);
+  refusedHandOver("B14c", r);
 }
 {
   // B12 (Helm Should-fix 12, "a failed arm and a click at the lock"): the input watch cannot be armed

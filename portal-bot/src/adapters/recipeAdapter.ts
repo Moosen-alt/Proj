@@ -1678,10 +1678,13 @@ export class RecipeAdapter extends BasePortalAdapter {
   }
 
   /** #333 — a person's click held back BEFORE the hand-over (a stopping abort flagged humanInput).
-   *  After it, a flagged abort is the person's own payment (rule 1 never lifts): not "click again". */
+   *  After it, a flagged abort is the person's own payment (rule 1 never lifts): not "click again".
+   *  Only on a run that DID hand the page over (round 5, Helm item 1): after a refused hand-over the
+   *  watch can still be armed, so a click at NOT_HANDED_OVER_NOTE is flagged too, but that run fails
+   *  and never let go of the page, so "click submit again" would be false. */
   private heldHumanClick(): boolean {
     const bs = this.backstop;
-    if (!bs) return false;
+    if (!bs || !this.handedOverBackstop) return false;
     const first = this.firstHumanDocument();
     return bs.aborts.some((a, i) => isStoppingAbort(a) && !!a.humanInput && !!a.beforeHandOver && i < first);
   }

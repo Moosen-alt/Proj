@@ -3,7 +3,8 @@
 // The hand-over lets a person's own request past the review lockdown. What the run reports afterwards
 // must still tell the page acting by itself from the person:
 //   1. a person's click held back BEFORE the hand-over (abort flagged humanInput): not a failure, and
-//      the run says plainly to click again;
+//      the run says plainly to click again; 1b (round 5): only on a run that handed the page over —
+//      after a REFUSED hand-over the same flagged click never says "click submit again";
 //   2. a page script trying to file with no person's input: a failure, named;
 //   3. a person's harmless click whose BACKGROUND request went (a same-origin fetch), then a page
 //      script trying to file: still a failure — only a request that LEFT the page (the person's own
@@ -60,11 +61,13 @@ interface Internals {
 // The run's page (a sentinel object): the page the backstop's record names for the run's own requests.
 const RUN_PAGE = {};
 // backstopStop is read WHILE the run holds the page (runAll, before its finally lets the backstop go),
-// so these cases set `backstop`.
-const stopFor = (aborts: BackstopAbort[], humanRequests: HumanRequest[]): { stop: string; notes: string[] } => {
+// so these cases set `backstop`. They read a run that handed the page over (handedOverBackstop is the
+// same backstop), unless `handedOver: false` (a refused hand-over: case 1b).
+const stopFor = (aborts: BackstopAbort[], humanRequests: HumanRequest[], opts: { handedOver?: boolean } = {}): { stop: string; notes: string[] } => {
   const adapter = new RecipeAdapter(recipe, {}, {}, {}) as unknown as Internals;
   adapter.page = RUN_PAGE;
   adapter.backstop = { aborts, humanRequests };
+  adapter.handedOverBackstop = opts.handedOver === false ? null : adapter.backstop;
   const stop = adapter.backstopStop();
   return { stop, notes: [...adapter.reviewHandoffNotes] };
 };
@@ -93,6 +96,14 @@ console.log("\n#333 backstopStop after the hand-over");
   const r = stopFor([filingDoc(true)], []);
   check("1. a person's click held back before the hand-over: the run is not failed", r.stop === "", r.stop);
   check("1. …and it says plainly to click again", r.notes.includes(HUMAN_CLICK_HELD_NOTE), JSON.stringify(r.notes));
+}
+{
+  // Round 5 (Helm item 1): the SAME flagged, held click on a run whose hand-over was REFUSED (the watch
+  // was armed, then the run refused to hand over: B14's shape, or a half-failed arm). That run never let
+  // go of the page, so "click submit again" would be false. Red before: heldHumanClick read only the
+  // abort's flags.
+  const r = stopFor([filingDoc(true)], [], { handedOver: false });
+  check("1b. a flagged held click on a run that did NOT hand the page over: never 'click submit again'", !r.notes.includes(HUMAN_CLICK_HELD_NOTE), JSON.stringify(r.notes));
 }
 {
   const r = stopFor([filingDoc(false)], []);
