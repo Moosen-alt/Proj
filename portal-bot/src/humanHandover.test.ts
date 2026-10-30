@@ -45,7 +45,60 @@ const methodBody = (src: string, signature: RegExp): string => {
   const close = body.lastIndexOf("\n  }");
   return close > 0 ? body.slice(0, close + 4) : body;
 };
-const INPUT_CALL = /\.(?:click|dblclick|tap|press|pressSequentially|type|fill|check|uncheck|setChecked|selectOption|setInputFiles|hover|dragTo|dragAndDrop|dispatchEvent|focus)\s*\(|\bkeyboard\.|\bmouse\.|\btouchscreen\.|guardedClick\s*\(|guardedPress\s*\(|executeStep\s*\(|dismissModalsGuarded\s*\(|clickResilient\s*\(/;
+// A call of any shape after a name: `m(`, `m!(`, `m?.(`, `m!?.(`, and `m.call(` / `.apply(` / `.bind(`
+// (each optional or non-null too). Helm Should-fix 8's nit and its verifier round: `.click?.()`,
+// `.click!()` and `.press?.("Enter")` are trusted clicks and key presses exactly like `.click()`.
+const CALL = String.raw`\s*(?:!\s*)?(?:\?\.\s*)?(?:\.\s*(?:call|apply|bind)\s*(?:!\s*)?(?:\?\.\s*)?)?\(`;
+// `clear` is the same write as `fill` (it fires input events on the field). `requestSubmit` is left out
+// on purpose: it makes no input event (the lockdown holds it, as A15 pins for untrusted events), and the
+// in-page source scanned whole names it in a comment.
+const INPUT_METHODS = "click|dblclick|tap|press|pressSequentially|type|fill|clear|check|uncheck|setChecked|selectOption|setInputFiles|hover|dragTo|dragAndDrop|dispatchEvent|focus";
+const INPUT_CALL = new RegExp([
+  `\\.\\s*(?:${INPUT_METHODS})${CALL}`,
+  // A bracket member named like one, CALLED (`el['click']()`): a bare `el["type"]` is an attribute read.
+  `\\[\\s*["'\`](?:${INPUT_METHODS})["'\`]\\s*\\]${CALL}`,
+  String.raw`\bkeyboard\.`, String.raw`\bmouse\.`, String.raw`\btouchscreen\.`,
+  `\\b(?:guardedClick|guardedPress|executeStep|dismissModalsGuarded|clickResilient)${CALL}`,
+].join("|"));
+const TYPING_CALL = new RegExp(`\\.\\s*(?:pressSequentially|type)${CALL}`);
+const TICK_CALL = new RegExp(`\\.\\s*(?:check|uncheck|setChecked)${CALL}`);
+
+console.log("\n0. THE INPUT PATTERNS READ EVERY CALL SHAPE (Helm Should-fix 8, the INPUT_CALL nit)");
+{
+  // A trusted input written as an optional call (`.click?.(`), a non-null call (`.click!(`), through
+  // `.call` / `.apply` / `.bind`, or as a called bracket member (`['click']()`) is the same click.
+  // Filter lists fail both ways, so the shapes that are NOT input are pinned too.
+  const mustMatch = [
+    "await this.page!.getByRole(\"button\").first().click?.();",
+    "await (this.page!.getByRole(\"button\").first() as any).click!();",
+    "await this.page!.locator(\"#x\").press?.(\"Enter\");",
+    "await this.page!.mainFrame()?.click?.(\"b\");",
+    "await this.page!.locator(\"#x\").clear();",
+    "document.querySelector('button')['click']()",
+    "HTMLElement.prototype.click.call(b)",
+    "el.dispatchEvent?.(new MouseEvent(\"click\"))",
+    "await this.guardedClick?.(step)",
+    "await this.executeStep!(step, true)",
+  ];
+  const mustNotMatch = [
+    "const label = v.click?.label;",
+    "if (inf?.type !== \"radio\") return true;",
+    "typeof scoped!.pressSequentially === \"function\"",
+    "const t = el[\"type\"];",
+    "step.type === \"click\"",
+    "this.page!.click",
+  ];
+  const missed = mustMatch.filter((s) => !INPUT_CALL.test(s));
+  const wrong = mustNotMatch.filter((s) => INPUT_CALL.test(s));
+  check("INPUT_CALL reads an optional, non-null, .call and called-bracket input as input, and a property read as none",
+    missed.length === 0 && wrong.length === 0, `missed: ${JSON.stringify(missed)} wrongly read: ${JSON.stringify(wrong)}`);
+  const typingMust = ["await scoped.type?.(v)", "await scoped!.type!(v, { delay: 35 })", "await loc.pressSequentially?.(v)"];
+  const tickMust = ["await box.setChecked?.(true)", "await box.check!()", "await box.uncheck?.()"];
+  const notTyping = ["typeof scoped!.type === \"function\"", "if (inf?.type !== \"radio\")"];
+  check("section 4's typing and checkbox patterns read optional and non-null calls (`.type?.(`, `.setChecked?.(`, `.check!(`)",
+    typingMust.every((s) => TYPING_CALL.test(s)) && tickMust.every((s) => TICK_CALL.test(s)) && !notTyping.some((s) => TYPING_CALL.test(s)),
+    JSON.stringify({ typing: typingMust.filter((s) => !TYPING_CALL.test(s)), ticks: tickMust.filter((s) => !TICK_CALL.test(s)), wrong: notTyping.filter((s) => TYPING_CALL.test(s)) }));
+}
 
 console.log("\n1. THE HAND-OVER HAS ONE DOOR");
 {
@@ -506,13 +559,13 @@ console.log("\n4. EVERY INPUT THE RUN MAKES IS FENCED");
   check("guardedClick's click runs inside withAutomationInput", /withAutomationInput\([^)]*\),?\s*\(\)\s*=>\s*\(target as \{ click/.test(clickBody), clickBody.slice(-400));
   const pressBody = methodBody(recipe, /  private async guardedPress\(/);
   check("both of guardedPress's presses run inside withAutomationInput", (pressBody.match(/withAutomationInput\(/g) || []).length >= 2, pressBody.slice(-500));
-  // A call is `.pressSequentially(` or `.pressSequentially!(` (a typeof guard has no call paren).
-  const typing = recipe.split("\n").filter((l) => /\.(?:pressSequentially|type)!?\s*\(/.test(l));
+  // A call of any shape (TYPING_CALL: `.type(`, `.type!(`, `.type?.(`; a typeof guard has no call paren).
+  const typing = recipe.split("\n").filter((l) => TYPING_CALL.test(l));
   const unfenced = typing.filter((l) => !/withAutomationInput\(/.test(l));
   check("every typing call (pressSequentially / type) in recipeAdapter.ts is fenced", typing.length >= 3 && unfenced.length === 0, JSON.stringify(unfenced.map((l) => l.trim().slice(0, 140))));
   // Checkbox writes too (skeptic round 1: check / uncheck were trusted input outside the fence; Helm's
   // nit: setChecked fires the same trusted pointerdown + mousedown).
-  const ticks = recipe.split("\n").filter((l) => /\.(?:check|uncheck|setChecked)\s*\(/.test(l));
+  const ticks = recipe.split("\n").filter((l) => TICK_CALL.test(l));
   const unfencedTicks = ticks.filter((l) => !/withAutomationInput\(/.test(l));
   check("every checkbox write (check / uncheck / setChecked) in recipeAdapter.ts is fenced", ticks.length >= 4 && unfencedTicks.length === 0, JSON.stringify(unfencedTicks.map((l) => l.trim().slice(0, 140))));
 }
