@@ -242,6 +242,15 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
     const end = /\n(?=[^\s})\]])/.exec(rest);
     return moduleSrc.slice(cn.index, cn.index + 1 + (end ? end.index : rest.length));
   };
+  // Any other module-level declaration (`const H = { … }`, `let x = new Y()`): from its line to the next
+  // line that starts a new statement at column 0.
+  const moduleDeclBody = (name: string): string => {
+    const d = new RegExp(`\\n(?:export )?(?:const|let|var) ${esc(name)}\\b`).exec(moduleSrc);
+    if (!d) return "";
+    const rest = moduleSrc.slice(d.index + 1);
+    const end = /\n(?=[^\s})\]])/.exec(rest);
+    return moduleSrc.slice(d.index, d.index + 1 + (end ? end.index : rest.length));
+  };
 
   // Comments blanked, string and template TEXT blanked, regex literals blanked, template expressions
   // KEPT. A string, comment-free regex or regex literal never spans a line, so a misread `/` costs at
@@ -435,6 +444,55 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
     return names;
   };
 
+  // The backstop's two fields, read off `this` (`this.`, `this!.`, `this?.`).
+  const BS_FIELD = String.raw`(?<![\w$.])this\s*[!?]?\s*\.\s*(?:backstop|handedOverBackstop)\b`;
+  // A type after `as` / `satisfies`: `FilingBackstop`, `FilingBackstop | null`, `X<Y>`, `X[]`.
+  const TYPE_TEXT = String.raw`[A-Za-z_$][\w$.]*(?:\s*<[^>\n]*>)?(?:\s*\[\])?(?:\s*\|\s*[A-Za-z_$][\w$.]*(?:\s*\[\])?)*`;
+  // A parameter or argument list split at its top-level commas.
+  const topLevelParts = (s: string): string[] => {
+    const parts: string[] = [];
+    let level = 0;
+    let from = 0;
+    for (let i = 0; i < s.length; i++) {
+      const c = s[i];
+      if (c === "(" || c === "[" || c === "{" || c === "<") level++;
+      else if (c === ")" || c === "]" || c === "}" || (c === ">" && s[i - 1] !== "=")) level--;
+      else if (c === "," && level === 0) { parts.push(s.slice(from, i)); from = i + 1; }
+    }
+    parts.push(s.slice(from));
+    return parts;
+  };
+  // A holder read at [at, end) that is a WHOLE positional argument of `this.X(…)`, where X is a method of
+  // the class whose parameter at that position is typed FilingBackstop: X is followed, and that
+  // parameter is an alias inside it, so the backstop's members stay read.
+  const backstopArgumentOfFollowedMember = (code: string, at: number, end: number): boolean => {
+    if (!/^\s*!?\s*[,)]/.test(code.slice(end))) return false;
+    let depth = 0;
+    let commas = 0;
+    let i = at - 1;
+    for (; i >= 0; i--) {
+      const c = code[i];
+      if (c === ")" || c === "]" || c === "}") depth++;
+      else if (c === "(" || c === "[" || c === "{") { if (depth === 0) break; depth--; }
+      else if (c === "," && depth === 0) commas++;
+    }
+    if (i < 0 || code[i] !== "(") return false;
+    const callee = /(?<![\w$.])this\s*[!?]?\s*\.\s*([A-Za-z_$][\w$]*)\s*!?\s*(?:\?\.)?\s*$/.exec(code.slice(Math.max(0, i - 160), i));
+    if (!callee) return false;
+    const found = memberBody(callee[1]);
+    if (!found || found.kind !== "method") return false;
+    const sig = codeOnly(found.body);
+    const open = sig.indexOf("(");
+    let level = 0;
+    let close = open;
+    for (; open >= 0 && close < sig.length; close++) {
+      if (sig[close] === "(") level++;
+      else if (sig[close] === ")" && --level === 0) break;
+    }
+    const param = topLevelParts(sig.slice(open + 1, close))[commas];
+    return !!param && /^\s*[A-Za-z_$][\w$]*\s*\??\s*:\s*FilingBackstop\b/.test(param);
+  };
+
   const runAllSig = /\n  private async runAll\(/;
   const runAllAt = (runAllSig.exec(recipe) || { index: -1 }).index;
   const runAllBody = runAllAt >= 0 ? methodBody(recipe, runAllSig) : "";
@@ -475,17 +533,80 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
     for (const m of code.matchAll(/\bthis\s*[!?]?\s*\.\s*([A-Za-z_$][\w$]*)(\s*!?\s*(?:\?\.)?\s*\()?/g)) {
       const member = m[1];
       const called = !!m[2];
+      // `this.constructor` is the class taken as a value: its statics would be called past the pass below.
+      if (member === "constructor") { problems.add(`${name} → this.constructor: the class taken as a value`); continue; }
       const found = memberBody(member);
       if (found && (found.kind === "method" || !called)) enqueue(member, name, found.body);
       else if (called) problems.add(`${name} → this.${member}(: no method body in recipeAdapter.ts (${found ? "a getter, called" : "a field holding a function, or an inherited method"})`);
     }
-    // The backstop and every local or parameter that holds it.
-    const aliases = ["this\\s*\\.\\s*backstop", "this\\s*\\.\\s*handedOverBackstop"];
-    for (const m of code.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]*)?=\s*this\s*\.\s*(?:backstop|handedOverBackstop)\b\s*(?:\?\?\s*this\s*\.\s*(?:backstop|handedOverBackstop)\b\s*)?[;\n]/g)) aliases.push(m[1]);
-    for (const m of code.matchAll(/([A-Za-z_$][\w$]*)\s*\??\s*:\s*FilingBackstop\b/g)) aliases.push(m[1]);
+    // A STATIC member called off the class name (`RecipeAdapter.siteOf(`) is a member of the class,
+    // followed the same way (verifier round: `RecipeAdapter.pokeX(this.page)` was read as a module
+    // constant). A static field read is not followed (as a `this.` field read is not); the class taken
+    // as a value fails.
+    for (const m of code.matchAll(new RegExp(`(?<![\\w$.])RecipeAdapter(?![\\w$])(\\s*[!?]?\\s*\\.\\s*([A-Za-z_$][\\w$]*)(${CALL})?)?`, "g"))) {
+      if (!m[1]) {
+        // A type position (`x: RecipeAdapter`, `as RecipeAdapter`, `<RecipeAdapter>`) is no value.
+        const pre = code.slice(Math.max(0, m.index! - 16), m.index!);
+        if (!/(?::|\bas|\bsatisfies|<|\|)\s*$/.test(pre)) problems.add(`${name} → RecipeAdapter: the class taken as a value (${code.slice(Math.max(0, m.index! - 30), m.index! + 30).replace(/\s+/g, " ")})`);
+        continue;
+      }
+      const member = m[2];
+      const called = !!m[3];
+      const found = memberBody(member);
+      if (found && (found.kind === "method" || !called)) enqueue(member, name, found.body);
+      else if (called) problems.add(`${name} → RecipeAdapter.${member}(: no static method body in recipeAdapter.ts`);
+    }
+    // The backstop (`this.backstop`, `this.handedOverBackstop`; `this!.` / `this?.` too), every parameter
+    // typed FilingBackstop, and every local declared from a holder: `= h`, `= h!`, `= h as T`,
+    // `= h satisfies T`, `= h ?? h2`, `= h ?? null` (a holder being the field or an alias already found).
+    const aliasNames: string[] = [];
+    for (const m of code.matchAll(/([A-Za-z_$][\w$]*)\s*\??\s*:\s*FilingBackstop\b/g)) aliasNames.push(m[1]);
+    const holders = (): string => [BS_FIELD, ...aliasNames.map((n) => `(?<![\\w$.])${esc(n)}(?![\\w$])`)].join("|");
+    const consumed: Array<[number, number]> = []; // the right-hand sides that declare or store a holder
+    for (let round = 0; round < 6; round++) {
+      const atom = `\\(?\\s*(?:${holders()})\\s*!?\\s*\\)?(?:\\s*(?:as|satisfies)\\s+${TYPE_TEXT})?`;
+      const rhs = `${atom}(?:\\s*\\?\\?\\s*(?:${atom}|null|undefined))*`;
+      const before = aliasNames.length;
+      for (const m of code.matchAll(new RegExp(`\\b(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\s*(?::[^=\\n]*)?=\\s*(${rhs})\\s*(?=[;\\n])`, "g"))) {
+        if (!aliasNames.includes(m[1])) aliasNames.push(m[1]);
+        const s = m.index! + m[0].lastIndexOf(m[2]);
+        consumed.push([s, s + m[2].length]);
+      }
+      // A holder stored back into the field (`this.handedOverBackstop = bs;`) is the same backstop.
+      for (const m of code.matchAll(new RegExp(`(?:${BS_FIELD})\\s*=(?![=>])\\s*(${rhs})\\s*(?=[;\\n])`, "g"))) {
+        const s = m.index! + m[0].lastIndexOf(m[1]);
+        consumed.push([s, s + m[1].length]);
+      }
+      if (aliasNames.length === before) break;
+    }
+    const aliases = [BS_FIELD, ...aliasNames.map(esc)];
+    // The backstop taken as a VALUE (Helm Should-fix 8, verifier round: `const b = this.backstop!` once
+    // left `b` unseen): every read of a holder that is not a member access (`.m`, `!.m`, `?.m`, read
+    // below) must be one of: an alias's own declaration or store (above); a write to it (`h = …`); a
+    // declared name or a FilingBackstop parameter; a positional argument of a `this.X(` whose parameter
+    // there is typed FilingBackstop (X's body is followed, and that parameter is an alias in it). Any
+    // other read (`run(bs)`, `[bs]`, `{ bs }`, `cond ? bs : x`, `!bs`) fails: its members cannot be followed.
+    for (const m of code.matchAll(new RegExp(`(?:${holders()})`, "g"))) {
+      const at = m.index!;
+      const end = at + m[0].length;
+      const after = code.slice(end);
+      if (/^\s*!?\s*(?:\?\.|\.)\s*[A-Za-z_$]/.test(after)) continue;
+      if (consumed.some(([s, e]) => at >= s && end <= e)) continue;
+      if (/^\s*(?::[^=\n;]*)?=(?![=>])/.test(after) || /^\s*\??\s*:\s*FilingBackstop\b/.test(after)) continue;
+      if (/\b(?:const|let|var)\s+$/.test(code.slice(Math.max(0, at - 12), at))) continue;
+      if (backstopArgumentOfFollowedMember(code, at, end)) continue;
+      // A TEST of it, whose value never leaves: `!h` / `!!h`, `typeof h`, `h && …` (yields h only when
+      // it is null), `h ? a : b`, `h === x` / `x !== h`, `if (h)`. Never `h || …` or `… && h`: those hand
+      // the backstop on.
+      const pre = code.slice(Math.max(0, at - 24), at);
+      if (/(?:^|[^!=])!!?\s*$/.test(pre) || /\btypeof\s+$/.test(pre) || /[!=]==?\s*$/.test(pre)) continue;
+      if (/^\s*(?:&&|\?(?![.?])|[!=]==?)/.test(after)) continue;
+      if (/\b(?:if|while)\s*\(\s*$/.test(pre) && /^\s*\)/.test(after)) continue;
+      problems.add(`${name} → the backstop taken as a value: its members cannot be followed (${code.slice(Math.max(0, at - 30), end + 30).replace(/\s+/g, " ")})`);
+    }
     // Every member the body touches on it: a call (or .call/.apply/.bind) must be on BACKSTOP_NO_INPUT, a
     // read on BACKSTOP_RECORDS — so a method taken as a value (`const w = bs.withAutomationInput`) fails too.
-    const onBackstop = new RegExp(`(?<![\\w$.])(?:${aliases.join("|")})\\s*[!?]?\\s*\\.\\s*([A-Za-z_$][\\w$]*)(\\s*(?:\\.\\s*(?:call|apply|bind)\\s*)?\\()?`, "g");
+    const onBackstop = new RegExp(`(?<![\\w$.])(?:${aliases.join("|")})\\s*[!?]?\\s*\\.\\s*([A-Za-z_$][\\w$]*)(${CALL})?`, "g");
     for (const m of code.matchAll(onBackstop)) {
       if (m[2]) {
         if (!backstopCalls.has(m[1])) backstopCalls.set(m[1], name);
@@ -511,7 +632,11 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
       }
       const own = moduleFnBody(fn);
       if (own) { if (called && !freeCalls.has(fn)) freeCalls.set(fn, name); enqueue(`function ${fn}`, name, own); continue; }
-      if (!called) continue; // a module constant, a property key, a type name
+      // A module-level object or value of recipeAdapter.ts (`const H = { async x(p) {…} }`, `H.x(page)`):
+      // its whole declaration is followed, on any reference (verifier round: members of module objects).
+      const decl = moduleDeclBody(fn);
+      if (decl) { enqueue(`const ${fn}`, name, decl); continue; }
+      if (!called) continue; // a property key, a type name
       if (!freeCalls.has(fn)) freeCalls.set(fn, name);
       if (!(fn in NO_INPUT_HELPERS)) problems.add(`${name} → ${fn}(: a call to a name that is not imported, local or followed, and not on NO_INPUT_HELPERS`);
     }
