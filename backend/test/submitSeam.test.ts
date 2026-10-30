@@ -470,6 +470,8 @@ check("1k. and the approve button stays available (a later track still needs it)
     "permitTargetKindLabel", "portalSaysFor", "renderPermitMonitor", "TRACK_STATE_WORDS", "trackStateWords", "kbConfidenceBadge",
     "permitTargetOptionLabel", "renderPermitStatusTargetPicker", "permitStatusTargetId", "recordPermitStatus", "handleStaleRecheckClick",
     "syncPermitForm",
+    // The per-card Edit / Record status (#411) that renderPermitMonitor now draws each card with.
+    "PERMIT_STATUS_PICKS", "permitTargetCardHtml",
     "plural", "statusBadge", "briefClass", "submitGateClass", "bandHead", "gateEvidenceSplit", "renderSubmitGate",
   ];
   const code = NAMES.map(lift).join("\n\n");

@@ -73,8 +73,9 @@ import { portalAutomationDisabled, resolveHeadless } from "../../portal-bot/src/
 import { findCompleteRecipeForProject, findAnyRecipeForProject, resolveRecipeFieldValues, markPortalRecipeForRerecord, demoteOnReplayFailure, collectHealedSteps, persistHealedSteps, getPortalRecipe, portalEntityEvidence, recipeHostFit, findBorrowableRecipe, replayFailureBlamesRecipe, recipeStepsSignature, isNotServedRecipe, recordPortalNotServed, type BorrowedRecipeChoice } from "./portalRecipes";
 import { notServedInResult } from "../../shared/src/portalNotServed";
 import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier";
-// detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget.
-import { publicPermitStatusCheck } from "./publicPermitStatus";
+// detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget; the
+// card's Edit (updatePermitCheckTarget) re-detects with the same function when the URL changes.
+import { detectPlatform, publicPermitStatusCheck } from "./publicPermitStatus";
 import { planSetTextForProject, projectDocsByType, DOCS_DIR, PLAN_TEXT_DOC_TYPES } from "./projectDocuments";
 import { activeStructuralLetterConfirmation, structuralLetterState } from "./structuralLetter";
 import type { DesignTextSource } from "./designCriteria";
@@ -103,6 +104,7 @@ import { claimSignatureRequestApproval, runningJobSignatureRequestApprovalId } f
 import { deleteProjectInfoPages } from "./infoPages";
 import { nemSignatureState, nemStageIsResume } from "./signatureTrack";
 import { siteKey } from "../../portal-bot/src/draftCreated";
+import { safeRecordLink } from "../../portal-bot/src/adapters/submissionLedger";
 import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, type HostFit, type PortalUrlSource } from "./portalChannel";
 import { isPortalPaused } from "./portalPause";
 // The ONE creator of permit_check_targets rows (extracted from markTrackSubmitted).
@@ -6343,6 +6345,111 @@ export function createPermitCheckTarget(
     // row was inserted or updated, so the knowledge event keeps its original type.
     // (learnFromPermitTarget reads jurisdiction/portal fields only — never the target type.)
     learnFromPermitTarget(db, detail.project, input);
+  });
+  return getProjectDetail(db, projectId);
+}
+
+// EDIT ONE TRACKED FILING FROM ITS CARD (#411). Owner 2026-10-29, West / Lincoln County: the building
+// permit was issued but its card read ACTIVE, because the filing went in before the record link was
+// captured and the monitor had no URL to read. The only way to fix a target was the add-target form,
+// which upserts by number — undiscoverable from the card. This edits the row the card shows.
+//
+// Only the fields the caller NAMES are touched (`undefined` = leave it). The status itself is never
+// a field here: a status is a reading, recorded through recordPermitStatusCheck so its provenance
+// (readingMayFinishTrack) still decides what it may finish.
+//   · scope — the target must belong to THIS project (else 404, like recordPermitStatusCheck); the
+//     project's own org scope is the /api/projects/:id guard's. Never 403.
+//   · rule 5 — the same predicate and message as creation (refuseUtilityUrlOnPermitTarget), judged
+//     by the row's own kind (trackKind); and a non-empty URL that is not http(s) is refused.
+//   · links — every URL written goes through safeRecordLink first, so a pasted session query string
+//     is never stored (the ids that make the record readable are kept).
+//   · identity — an edit that writes the numbers must leave an application or a permit number, or
+//     it is refused (clearing one never orphans the row).
+//   · cadence — a frequency change recomputes next_check_at the way a reading does (effectiveCheckDays).
+//   · platform — a new portal URL is re-detected (detectPlatform), as at creation.
+//   · audit — permit_target.edited names the CHANGED FIELDS only. Never the values: a record URL can
+//     carry a session token, and an audit row is read by people the URL was never meant for.
+export function updatePermitCheckTarget(
+  db: AppDb,
+  projectId: string,
+  targetId: string,
+  input: {
+    portalUrl?: string;
+    trackingUrl?: string;
+    applicationNumber?: string;
+    permitNumber?: string;
+    portalName?: string;
+    checkFrequencyDays?: number;
+    active?: boolean;
+  },
+  actorName = "operator",
+): ProjectDetail {
+  getProjectDetail(db, projectId); // an unknown project 404s before anything is read
+  const row = db.get<Row>("SELECT * FROM permit_check_targets WHERE id = ? AND project_id = ?", [targetId, projectId]);
+  if (!row) throw new HttpError(404, "Permit check target not found.");
+
+  const str = (v: unknown): string | undefined => (v === undefined || v === null ? undefined : String(v).trim());
+  // A URL pasted on the card is stored the way a captured record link is (safeRecordLink: origin +
+  // path + the record's own ids, never a session token, only http(s)). "" clears it; a non-empty
+  // paste that comes back empty is not a web address and is refused.
+  const link = (v: unknown): string | undefined => {
+    const raw = str(v);
+    if (!raw) return raw;
+    const safe = safeRecordLink(raw);
+    if (!safe) throw new HttpError(400, "A portal or status URL must be a web address starting with http:// or https://.");
+    return safe;
+  };
+  const next = {
+    portal_url: link(input.portalUrl) ?? text(row.portal_url),
+    tracking_url: link(input.trackingUrl) ?? text(row.tracking_url),
+    application_number: str(input.applicationNumber) ?? text(row.application_number),
+    permit_number: str(input.permitNumber) ?? text(row.permit_number),
+    portal_name: str(input.portalName) ?? text(row.portal_name),
+  };
+  // Only the URLs this edit WRITES are judged: a legacy row already holding a refused URL must still
+  // be retired (active:false) or have that URL cleared, not be frozen by its own bad value.
+  const urlsWritten = [input.portalUrl === undefined ? "" : next.portal_url, input.trackingUrl === undefined ? "" : next.tracking_url];
+  refuseUtilityUrlOnPermitTarget(trackKind(text(row.target_type), text(row.permit_type)), ...urlsWritten);
+  const numbersWritten = input.applicationNumber !== undefined || input.permitNumber !== undefined;
+  if (numbersWritten && !next.application_number && !next.permit_number) {
+    throw new HttpError(400, "A tracked filing needs an application number or a permit number. Keep one of them, or stop tracking this filing instead.");
+  }
+  let frequency: number | undefined;
+  if (input.checkFrequencyDays !== undefined && input.checkFrequencyDays !== null) {
+    frequency = Number(input.checkFrequencyDays);
+    if (!Number.isInteger(frequency) || frequency < 1 || frequency > 365) {
+      throw new HttpError(400, "Check frequency must be a whole number of days from 1 to 365.");
+    }
+  }
+  if (input.active !== undefined && input.active !== null && typeof input.active !== "boolean") {
+    throw new HttpError(400, "active must be true or false.");
+  }
+  const active = typeof input.active === "boolean" ? input.active : undefined;
+
+  const changed: string[] = [];
+  const sets: string[] = [];
+  const args: Array<string | number> = [];
+  const set = (field: string, column: string, value: string | number): void => { changed.push(field); sets.push(`${column} = ?`); args.push(value); };
+  if (next.portal_url !== text(row.portal_url)) {
+    set("portalUrl", "portal_url", next.portal_url);
+    sets.push("portal_platform = ?");
+    args.push(next.portal_url ? detectPlatform(next.portal_url) : "unknown");
+  }
+  if (next.tracking_url !== text(row.tracking_url)) set("trackingUrl", "tracking_url", next.tracking_url);
+  if (next.application_number !== text(row.application_number)) set("applicationNumber", "application_number", next.application_number);
+  if (next.permit_number !== text(row.permit_number)) set("permitNumber", "permit_number", next.permit_number);
+  if (next.portal_name !== text(row.portal_name)) set("portalName", "portal_name", next.portal_name);
+  if (frequency !== undefined && frequency !== Number(row.check_frequency_days)) {
+    set("checkFrequencyDays", "check_frequency_days", frequency);
+    sets.push("next_check_at = ?");
+    args.push(nextCheckIso(effectiveCheckDays(frequency, row.latest_outcome == null ? null : text(row.latest_outcome))));
+  }
+  if (active !== undefined && active !== bool(row.active)) set("active", "active", active ? 1 : 0);
+  if (!changed.length) return getProjectDetail(db, projectId);
+
+  db.transaction(() => {
+    db.run(`UPDATE permit_check_targets SET ${sets.join(", ")}, updated_at = ? WHERE id = ?`, [...args, nowIso(), targetId]);
+    addAuditLog(db, projectId, "human", actorName, "permit_target.edited", { targetId, fields: changed });
   });
   return getProjectDetail(db, projectId);
 }
