@@ -472,7 +472,7 @@ console.log("\n[0] the interstitial's forward control: what passes, what never d
 console.log("\n[1a] the captured Permitting Information page (MULTIPART POST form), NO verified page: held, captured");
 let candidate1a: InfoPageCandidateCapture | undefined;
 {
-  const w = await runLearn("/post", () => null, { infoPagePriorProgress: false });
+  const w = await runLearn("/post", () => null, { infoPagePriorProgress: false, infoPagePassUnavailable: false });
   candidate1a = w.candidate;
   check("premise: the walk entered through 'Apply For A Permit' and chose the Solar tile",
     w.notes.some((n) => /^application entry: Apply For A Permit/.test(n)) && w.notes.includes(`permit type: ${SOLAR}`), JSON.stringify(w.notes));
@@ -512,6 +512,36 @@ let candidate1a: InfoPageCandidateCapture | undefined;
   check("[1a] the evidence carries the page's prose and no field value", !!evidence && evidence.text.includes("A Permit Tech will review your submission")
     && evidence.forms.every((f) => f.fields.every((x) => x.length === 3)), JSON.stringify(evidence ? { ...evidence, text: evidence.text.slice(0, 120) } : null));
   check("[1a] a masked screenshot was taken before the click", !!c?.screenshotBase64 && c.screenshotBase64.length > 1000, String(c?.screenshotBase64?.length ?? 0));
+  check("[1a] a clean run's card carries no history stamp, and the message no history line",
+    !!c && c.capturedWithHistory !== true && !/THIS project already made progress/.test(w.message), `stamp=${c?.capturedWithHistory} message=${w.message}`);
+}
+
+// ===========================================================================================
+// [1h] #366 through the REAL learner: the same page on a project that already made progress on
+// this portal (priorProgress true, a real reading). Held exactly as [1a], and the card is still
+// captured — screenshot, observed request, the history stamp — and the message says this project
+// still needs "Allow once more". [1u]: no reading at all (the backend's fail-closed stand-in, or no
+// backend): held, and NO card.
+// ===========================================================================================
+console.log("\n[1h] #366: the same page on a project with history: held, the card captured with its stamp");
+{
+  const w = await runLearn("/post", () => null, { infoPagePriorProgress: true, infoPagePassUnavailable: false });
+  const posted = w.hits.some((h) => h.method === "POST" && h.url.startsWith("/post/sg"));
+  check("[1h] the Next's POST was HELD (never reached the server)", !posted, JSON.stringify(w.hits.map((h) => `${h.method} ${h.url}`)));
+  const c = w.candidate;
+  check("[1h] the card was captured through the real learner: the held request observed and a masked screenshot",
+    !!c && !!c.observed && !!c.screenshotBase64 && c.screenshotBase64.length > 1000, JSON.stringify(c ? { observed: !!c.observed, shot: c.screenshotBase64?.length ?? 0 } : null));
+  check("[1h] the card carries the history stamp (the person verifying it is warned)", !!c && c.capturedWithHistory === true, String(c?.capturedWithHistory));
+  check("[1h] the message says this project still stops at the verified page (never 'after that, runs pass it')",
+    w.stopReason === "backstop_abort" && /THIS project already made progress on this portal/.test(w.message) && !/after that, runs pass it/.test(w.message), w.message);
+}
+console.log("\n[1u] #366: no reading at all (the fail-closed stand-in): held, and no card");
+{
+  const w = await runLearn("/post", () => null, {});
+  const posted = w.hits.some((h) => h.method === "POST" && h.url.startsWith("/post/sg"));
+  check("[1u] the Next's POST was HELD (never reached the server)", !posted, JSON.stringify(w.hits.map((h) => `${h.method} ${h.url}`)));
+  check("[1u] no card: an unknown reading records no evidence and claims no history",
+    !w.candidate && !/THIS project already made progress/.test(w.message), JSON.stringify({ candidate: !!w.candidate, message: w.message }));
 }
 
 // ===========================================================================================
@@ -530,7 +560,7 @@ console.log("\n[1b] the same page, VERIFIED from [1a]'s candidate: Next passes, 
     if (at === "/post/project") return { fills: [{ selectorIndex: idx(req, "Site Address"), value: ADDRESS, field: "street" }], atReview: false, advanceSelectorIndex: idx(req, "Next") };
     if (at === "/post/review") return { fills: [], atReview: true, finalSubmitSelectorIndex: idx(req, "Submit Application") };
     return null;
-  }, { infoPagePasses: entry ? [entry] : [], infoPagePriorProgress: false, infoPageProofValues: { street: ADDRESS, city: "Springfield", zip: "62701" },
+  }, { infoPagePasses: entry ? [entry] : [], infoPagePriorProgress: false, infoPagePassUnavailable: false, infoPageProofValues: { street: ADDRESS, city: "Springfield", zip: "62701" },
     // Round 5: the backend reserves each use at the admission; here it always reserves (the
     // reservation's own refusals are pinned in infoPagePass.dom.smoke [R] and backend infoPages.test).
     reserveInfoPagePass: () => [] });
@@ -556,7 +586,7 @@ console.log("\n[1b] the same page, VERIFIED from [1a]'s candidate: Next passes, 
 // ===========================================================================================
 console.log("\n[1c] an ordinary interstitial (review wording rendered after load): no candidate");
 {
-  const w = await runLearn("/late", () => null, { infoPagePriorProgress: false });
+  const w = await runLearn("/late", () => null, { infoPagePriorProgress: false, infoPagePassUnavailable: false });
   const posted = w.hits.some((h) => h.method === "POST" && h.url.startsWith("/late/sg"));
   check("[1c] premise: the learner took the page as an interstitial and pressed Next",
     interstitialEvents(w).some((e) => e.forward === "Next") && w.notes.includes("advance: Next"), JSON.stringify(interstitialEvents(w)));
