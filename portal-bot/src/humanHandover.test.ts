@@ -406,7 +406,10 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   // built by concatenation), since the scan reads names, never values (a computed `x[…](` call fails
   // above, a `Reflect.get(…)(…)` does not); a name spelled with a string escape or built in a
   // template (`"Input.dispatch\x4beyEvent"`, `` `Input.${d}` ``, `el['cl\x69ck']()`), since the
-  // raw source is read, never the string's value; a programmatic submit
+  // raw source is read, never the string's value; an input call on a line that continues an
+  // expression at column 0 outside every bracket inside a followed module declaration (`\n+ f()`,
+  // `\n.concat(…)`: statementFrom reads it as the next statement; K-S8z9h, measured green, and this
+  // repo indents its continuations); a programmatic submit
   // (`form.requestSubmit()`, `form.submit()` in the page): it makes no input event, so the lockdown holds
   // it (as it holds A15's untrusted events), and the in-page source scanned whole names it in prose
   // (Helm's call whether to add it; see the step-21 report); a local, parameter or

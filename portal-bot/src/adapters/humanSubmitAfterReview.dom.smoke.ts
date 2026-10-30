@@ -375,8 +375,9 @@
 //         tier): C13 red.
 //       K-phrase (a new number needs wording the review did not show): C17a, C17b red.
 //       K-cells (completion wording read off table cells too): C18 x2 red.
-//       K-reopen (the capture never reopens the watch): C10's capture, C11's and C14's re-click, and
-//         C15/C16/C18 "does not stand" red (6/12).
+//       K-reopen (the capture never reopens the watch): C10's capture, C11's and C14's re-click red
+//         (3/12, re-measured at 44ec6455; C15/C16/C18's "does not stand" checks, red when this was
+//         first measured, are green under this kill at HEAD: another guard now holds them).
 //       K-nav (a page reached by GET navigation alone may yield a number): C3b red.
 //       K-sight (the sighting commits on sight, as before): C1's re-click, C2, C19, C3 red (the judged
 //         read alone still keeps C1's review id out).

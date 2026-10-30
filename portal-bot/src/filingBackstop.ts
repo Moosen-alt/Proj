@@ -74,7 +74,10 @@
 //      an addEventListener it wrapped before the arm (smoke A18-A21). RESIDUAL, stated: Chromium only
 //      (no DevTools session = not armed: the hand-over fails closed); a popup, or a cross-site iframe
 //      that appears or goes out of process after the arm, sees no input until its own session is
-//      attached (its requests are held meanwhile); out-of-process iframes are exercised headless under
+//      attached (its requests are held meanwhile); an in-process child frame whose world takes longer
+//      than the 1.5 s read budget is unarmed at the hand-over (the root's world is made first and the
+//      children concurrently, A25/A25c) and its input is held until its world is made — fail closed;
+//      a half-failed arm cannot retry; out-of-process iframes are exercised headless under
 //      --site-per-process (A19o, A22o, A22b — a headed window, production's, puts a cross-site iframe
 //      out of process too: a headed probe, not a pin); and the click detector (humanCapture's
 //      __alPatchStep) stays in the main world, so a page can still forge a "submit seen" — which is
