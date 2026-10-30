@@ -96,6 +96,33 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   // NOT FOLLOWED (stated, not pinned): an imported function taken as a value — copied into a local or
   // passed as an argument — whose later call reads as a local's; and calls off fields other than the
   // backstop (this.page.*, this.options.*), which only INPUT_CALL's method names cover.
+  // GUARD PINS: every check here is green on the tree by design. KILLS, each run once in a throwaway
+  // tree at b773db29 against this scan and against the fixed-list scan it replaced (2285c42a, 62
+  // checks), the slip put just after `lockReview(\`replay stopped at review` unless it says "move":
+  //   K-S8a move reassertBlanksOnce(false) below the lock → 25 FAIL, among them "reassertPass: reached
+  //         via reassertBlanksOnce, makes no input" (executeStep() and "never reaches" reassertBlanksOnce
+  //         / reassertPass / executeStep / guardedClick / guardedPress / dismissModalsGuarded. Old: green.
+  //   K-S8b move runGapFill(this.page) below the lock → 2 FAIL: "runGapFill → super.runGapFill" and
+  //         "never reaches runGapFill". Old: green.
+  //   K-S8c `await dismissPageModals(this.page, …)` → 1 FAIL: "<runAll tail> → dismissPageModals(: an
+  //         imported function not on NO_INPUT_HELPERS". Old: green; green at 63d3c829 too (localsOf read
+  //         the tail as a signature — b773db29 closed it).
+  //   K-S8d `(this as any)["guardedClick"](…)` → "a bracket call"; K-S8d2 `this["guardedClick"](…)` →
+  //         "a bracket member" and "a bracket call". Old: green.
+  //   K-S8e `this.backstop!.withAutomationInput(…)` → "backstop.withAutomationInput(: not on
+  //         BACKSTOP_NO_INPUT". Old: green.
+  //   K-S8f move answerUnrecordedRequired() below the lock → 24 FAIL, among them
+  //         "answerUnrecordedRequired: reached via <runAll tail>, makes no input" (executeStep(). Old: green.
+  //   K-S8g `const w = this.backstop!.withAutomationInput;` → "a member read that is not on
+  //         BACKSTOP_RECORDS". Old and 63d3c829: green.
+  //   K-S8h `dismissPageModals.call(null, …)` → "dismissPageModals(: … not on NO_INPUT_HELPERS". Old and
+  //         63d3c829: green.
+  //   K-nit-a an unfenced `.setChecked(true)` beside the last fenced `.check(` → section 4's checkbox
+  //         check. Old: green.
+  //   K-nit-b `this.page.dragAndDrop(…)` in verifyReviewScreen → "verifyReviewScreen: reached via
+  //         <runAll tail>, makes no input". Old: green. K-nit-c `.setChecked(true)` there → that and
+  //         section 4. Old: green. (`touchscreen.tap(` there is red on the old scan too, by `.tap(`:
+  //         `\btouchscreen\.` is a guard for a touchscreen method Playwright may add.)
   const classAt = recipe.indexOf("\nexport class RecipeAdapter ");
   const cls = classAt >= 0 ? recipe.slice(classAt, recipe.indexOf("\n}\n", classAt) + 3) : "";
   check("the RecipeAdapter class is found in recipeAdapter.ts", cls.length > 10_000, `len=${cls.length}`);
