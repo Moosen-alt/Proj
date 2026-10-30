@@ -81,8 +81,14 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //   - a call off the backstop (this.backstop, this.handedOverBackstop, or a local / parameter that
   //     holds one, `!` and `?.` included) not on BACKSTOP_NO_INPUT, or a read of one of its members
   //     not on BACKSTOP_RECORDS (a method taken as a value);
-  //   - a free call (`.call` / `.apply` / `.bind` included) to an imported function not on
-  //     NO_INPUT_HELPERS;
+  //   - ANY reference to a name recipeAdapter.ts imports as a value — a call of any shape (`f(`,
+  //     `f?.(`, `(f)(`, `f.call(`, `new f(`) or the function taken as a value (`const g = f`, `run(f)`,
+  //     `page.evaluate(f)`) — that is not on NO_INPUT_HELPERS or IMPORTED_VALUES (a module function or
+  //     class of recipeAdapter.ts is followed instead, on any reference); a call to a name that is not
+  //     imported, local, global or followed;
+  //   - `this` taken as a value (`const self = this`, `const { m } = this`, `f.call(this)`,
+  //     `(this as any).m`): only `this.` / `this!.` / `this?.` are followed;
+  //   - a module loaded at run time (`import(` / `require(`);
   //   - an INPUT_CALL in any body it reaches (read RAW, comments and strings included: an in-page
   //     `el.click()` in an evaluate string counts).
   // Call DISCOVERY reads each body with comments and string text blanked but template EXPRESSIONS kept
@@ -93,9 +99,15 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   // click either.
   // A helper a later change adds to the closure fails here BY NAME until it is added to the class (a
   // method is followed, never allowlisted) or to one of the lists below with its reason.
-  // NOT FOLLOWED (stated, not pinned): an imported function taken as a value — copied into a local or
-  // passed as an argument — whose later call reads as a local's; and calls off fields other than the
-  // backstop (this.page.*, this.options.*), which only INPUT_CALL's method names cover.
+  // The in-page readers the closure hands to page.evaluate, and the in-page source it evaluates, are
+  // covered by a raw INPUT_CALL scan of their whole module (submissionLedger.ts, portalSafety.ts).
+  // NOT FOLLOWED (stated, not pinned): calls off fields other than the backstop (this.page.*,
+  // this.options.*), which only INPUT_CALL's method names cover — and a page method taken as a VALUE
+  // (`const c = this.page.click`, `this.page.click.bind(…)`) is not seen at all, since INPUT_CALL needs
+  // the `(` right after the name and a bare `.click` cannot be told from prose; a local, parameter or
+  // destructuring key spelled like an import shadows that import for the body it is declared in (any
+  // identifier inside a `const {…} =` pattern counts as declared); the bodies of imported functions
+  // (NO_INPUT_HELPERS is read by hand, each with its reason), except the two modules scanned whole.
   // GUARD PINS: every check here is green on the tree by design. KILLS, each run once in a throwaway
   // tree at b773db29 against this scan and against the fixed-list scan it replaced (2285c42a, 62
   // checks), the slip put just after `lockReview(\`replay stopped at review` unless it says "move":
@@ -141,6 +153,9 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   const moduleFnBody = (name: string): string => {
     const fn = new RegExp(`\\n(?:export )?(?:async )?function\\s*\\*?\\s*${esc(name)}\\s*(?:<[^>]*>)?\\(`).exec(moduleSrc);
     if (fn) { const end = moduleSrc.indexOf("\n}\n", fn.index); return moduleSrc.slice(fn.index, end < 0 ? undefined : end + 3); }
+    // A module-level class (`new X(` follows it: its constructor and field initialisers run).
+    const kl = new RegExp(`\\n(?:export )?(?:abstract )?class ${esc(name)}\\b`).exec(moduleSrc);
+    if (kl) { const end = moduleSrc.indexOf("\n}\n", kl.index); return moduleSrc.slice(kl.index, end < 0 ? undefined : end + 3); }
     const cn = new RegExp(`\\n(?:export )?const ${esc(name)}\\b[^=\\n]*=\\s*(?:async\\s*)?(?:\\(|[A-Za-z_$][\\w$]*\\s*=>|function)`).exec(moduleSrc);
     if (!cn) return "";
     const rest = moduleSrc.slice(cn.index + 1);
@@ -233,7 +248,7 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   }
 
   const KEYWORDS = new Set(["if", "for", "while", "switch", "catch", "return", "typeof", "function", "await", "async", "super", "import", "void", "delete", "in", "of", "do", "else", "try", "yield", "throw", "case", "instanceof", "as", "satisfies", "new", "keyof"]);
-  const GLOBALS = new Set(["String", "Number", "Boolean", "Date", "Math", "JSON", "Array", "Object", "Promise", "Error", "RegExp", "Map", "Set", "WeakMap", "WeakSet", "URL", "URLSearchParams", "Buffer", "Symbol", "BigInt", "setTimeout", "setInterval", "clearTimeout", "clearInterval", "queueMicrotask", "fetch", "structuredClone", "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI", "require",
+  const GLOBALS = new Set(["String", "Number", "Boolean", "Date", "Math", "JSON", "Array", "Object", "Promise", "Error", "RegExp", "Map", "Set", "WeakMap", "WeakSet", "URL", "URLSearchParams", "Buffer", "Symbol", "BigInt", "setTimeout", "setInterval", "clearTimeout", "clearInterval", "queueMicrotask", "fetch", "structuredClone", "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURIComponent", "decodeURIComponent", "encodeURI", "decodeURI",
     // in-page reads inside an evaluate body (they run in the browser, never on the page's behalf of a click)
     "getComputedStyle"]);
   // The backstop's calls a body after the arm may make: none is an input on the page.
@@ -277,6 +292,42 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
     cleanRecordLink: "adapters/submissionLedger.ts: tidies a link (#401)",
     chooseSubmittedRecord: "adapters/submissionLedger.ts: picks a record off the ledger it read (#401)",
     draftTenantKey: "draftSubmitGate.ts: builds a key from a URL",
+    // Handed to page.evaluate (taken as values, run in the page): their module is scanned whole below.
+    readApplicationLedgerInPage: "adapters/submissionLedger.ts: reads the application ledger in the page (#401)",
+    recordLinkForNumberInPage: "adapters/submissionLedger.ts: reads a record's link in the page (#401)",
+  };
+  // The names recipeAdapter.ts imports as VALUES (`import type` and `type X` items left out), by their
+  // local name. ANY reference to one in the closure — a call of any shape (`f(`, `f?.(`, `(f)(`,
+  // `f.call(`), a `new f(`, or the function taken as a value (`const g = f`, `run(f)`) — must be on
+  // NO_INPUT_HELPERS or IMPORTED_VALUES (Helm Should-fix 8, verifier round: an optional or
+  // parenthesized call once read as no call at all).
+  const importedValues = new Map<string, string>(); // local name → module
+  for (const m of recipe.matchAll(/^import\s+(type\s+)?([^;]*?)\s+from\s+["']([^"']+)["']/gm)) {
+    if (m[1]) continue;
+    const [clause, from] = [m[2], m[3]];
+    for (const part of clause.split(",")) {
+      const p = part.replace(/[{}]/g, "").trim();
+      if (!p || /^type\s/.test(p)) continue;
+      const ns = /^\*\s*as\s+([A-Za-z_$][\w$]*)$/.exec(p);
+      const alias = /^[A-Za-z_$][\w$]*\s+as\s+([A-Za-z_$][\w$]*)$/.exec(p);
+      const bare = /^([A-Za-z_$][\w$]*)$/.exec(p);
+      const local = ns?.[1] ?? alias?.[1] ?? bare?.[1];
+      if (local) importedValues.set(local, from);
+    }
+  }
+  check("recipeAdapter.ts's value imports are read (dismissPageModals, ok, FilingBackstop left out as a type)",
+    importedValues.has("dismissPageModals") && importedValues.has("ok") && importedValues.has("fs") && !importedValues.has("FilingBackstop") && !importedValues.has("PortalRecipe"),
+    [...importedValues.keys()].join(", "));
+  // Imported values the closure names that are not functions it calls: constants and node modules.
+  // Each with what it is.
+  const IMPORTED_VALUES: Record<string, string> = {
+    HUMAN_REVIEW_MESSAGE: "adapter.ts: a string",
+    HUMAN_SUBMIT_OBSERVED_NOTE: "humanCapture.ts: a string",
+    RECORD_NUMBER_TIERS: "recordNumber.ts: an array of tier names",
+    PORTAL_SAFETY_GLOBAL: "shared/src/portalSafety.ts: the in-page global's name (a string)",
+    PORTAL_SAFETY_IN_PAGE_SOURCE: "shared/src/portalSafety.ts: the in-page predicates' source, evaluated in the page (the file is scanned whole below)",
+    fs: "node:fs: the capture's own files on disk",
+    path: "node:path: builds file paths",
   };
   // Identifiers a body declares itself (const / let / var / function / catch / parameters): a call to one
   // is a local callback (progress's `sink`, noteHumanSubmit's `fn`), never a helper of the module.
@@ -361,16 +412,31 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
         if (!(m[1] in BACKSTOP_NO_INPUT)) problems.add(`${name} → backstop.${m[1]}(: not on BACKSTOP_NO_INPUT`);
       } else if (!(m[1] in BACKSTOP_RECORDS) && !(m[1] in BACKSTOP_NO_INPUT)) problems.add(`${name} → backstop.${m[1]}: a member read that is not on BACKSTOP_RECORDS`);
     }
-    for (const m of code.matchAll(/(?<![.\w$])(new\s+)?([A-Za-z_$][\w$]*)\s*(?:<[^<>()]*>)?\s*(?:\.\s*(?:call|apply|bind)\s*)?\(/g)) {
+    // `this` taken as a value (`const self = this`, `const { m } = this`, `f.call(this)`, `(this as any)`)
+    // carries every method past the this-member discovery above: only `this.`, `this!.`, `this?.` and
+    // `this[` (which fails above) are read.
+    for (const m of code.matchAll(/(?<![\w$.])this(?![\w$])(?!\s*[!?]?\s*(?:\?\.)?\s*[.[])/g)) problems.add(`${name} → this as a value: its members cannot be followed (${code.slice(Math.max(0, m.index! - 30), m.index! + 30).replace(/\s+/g, " ")})`);
+    // A module loaded at run time (`await import(…)`, `require(…)`) brings names no import line lists.
+    for (const m of code.matchAll(/(?<![.\w$])(?:import|require)\s*\(/g)) problems.add(`${name} → ${m[0]}: a module loaded at run time cannot be followed`);
+    // Every name, called or not: a module function or class of recipeAdapter.ts is followed; an imported
+    // value must be allowlisted (a reference that is not a call is a function taken as a value).
+    for (const m of code.matchAll(/(?<![.\w$])(?:(new\s+)|(?<!\bnew\s+))([A-Za-z_$][\w$]*)(?![\w$])(\s*(?:<[^<>()]*>)?\s*(?:\?\.\s*)?(?:\.\s*(?:call|apply|bind)\s*(?:\?\.\s*)?)?\()?/g)) {
       const fn = m[2];
-      if (m[1] || KEYWORDS.has(fn) || GLOBALS.has(fn) || locals.has(fn)) continue;
-      if (!freeCalls.has(fn)) freeCalls.set(fn, name);
+      const called = !!m[1] || !!m[3];
+      if (KEYWORDS.has(fn) || GLOBALS.has(fn) || locals.has(fn)) continue;
+      if (importedValues.has(fn)) {
+        if (called && !freeCalls.has(fn)) freeCalls.set(fn, name);
+        if (!(fn in NO_INPUT_HELPERS) && !(fn in IMPORTED_VALUES)) problems.add(`${name} → ${fn}${called ? "(" : ""}: an imported ${called ? "function" : "value"} not on NO_INPUT_HELPERS / IMPORTED_VALUES`);
+        continue;
+      }
       const own = moduleFnBody(fn);
-      if (own) enqueue(`function ${fn}`, name, own);
-      else if (!(fn in NO_INPUT_HELPERS)) problems.add(`${name} → ${fn}(: an imported function not on NO_INPUT_HELPERS`);
+      if (own) { if (called && !freeCalls.has(fn)) freeCalls.set(fn, name); enqueue(`function ${fn}`, name, own); continue; }
+      if (!called) continue; // a module constant, a property key, a type name
+      if (!freeCalls.has(fn)) freeCalls.set(fn, name);
+      if (!(fn in NO_INPUT_HELPERS)) problems.add(`${name} → ${fn}(: a call to a name that is not imported, local or followed, and not on NO_INPUT_HELPERS`);
     }
   }
-  check("the closure makes no call it cannot follow (every this.X( has a body here, no super / bracket call, every backstop and imported call allowlisted)",
+  check("the closure makes no call it cannot follow (every this.X( has a body here, no super / bracket call, every backstop and imported call or reference allowlisted)",
     problems.size === 0, [...problems].join("\n         "));
   // The fixed list this scan replaced, kept as a FLOOR: a rename or a re-cut that stops reaching one fails.
   for (const name of [
@@ -399,6 +465,12 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   check("…and the person is told 'the page is yours' only AFTER the drain and the lock", yoursAt > lockAt && lockAt > drainAt, `drain=${drainAt} lock=${lockAt} yours=${yoursAt}`);
   const scraper = read("portal-bot/src/reviewScreenScraper.ts");
   check("reviewScreenScraper.ts (the review read-back) makes no input on the page", !INPUT_CALL.test(scraper), (scraper.match(INPUT_CALL) || [""])[0]);
+  // The modules whose functions or source the closure hands to the page to run (IMPORTED_VALUES,
+  // NO_INPUT_HELPERS' in-page readers): each whole file, read raw.
+  for (const rel of ["portal-bot/src/adapters/submissionLedger.ts", "shared/src/portalSafety.ts"]) {
+    const src = read(rel);
+    check(`${rel} (run in the page by the closure) makes no input on the page`, !INPUT_CALL.test(src), (src.match(INPUT_CALL) || [""])[0]);
+  }
 }
 
 console.log("\n4. EVERY INPUT THE RUN MAKES IS FENCED");
