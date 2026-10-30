@@ -109,7 +109,7 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   // identifier inside a `const {…} =` pattern counts as declared); the bodies of imported functions
   // (NO_INPUT_HELPERS is read by hand, each with its reason), except the two modules scanned whole.
   // GUARD PINS: every check here is green on the tree by design. KILLS, each run once in a throwaway
-  // tree at b773db29 against this scan and against the fixed-list scan it replaced (2285c42a, 62
+  // tree at b773db29 against the scan as it stood then and against the fixed-list scan it replaced (2285c42a, 62
   // checks), the slip put just after `lockReview(\`replay stopped at review` unless it says "move":
   //   K-S8a move reassertBlanksOnce(false) below the lock → 25 FAIL, among them "reassertPass: reached
   //         via reassertBlanksOnce, makes no input" (executeStep() and "never reaches" reassertBlanksOnce
@@ -156,6 +156,12 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //         "import(: a module loaded at run time cannot be followed". Old: green.
   //   K-S8c and K-S8h, re-run at 397b6b63, now read "dismissPageModals(: an imported function not on
   //         NO_INPUT_HELPERS / IMPORTED_VALUES".
+  //   K-S8p `document.querySelector("button")?.click();` as the first line of submissionLedger.ts's
+  //         readApplicationLedgerInPage (no slip in recipeAdapter.ts) → 1 FAIL of 129, "submissionLedger.ts
+  //         (run in the page by the closure) makes no input". Old: green (nothing read that file).
+  //   K-S8q the same line as the first line of portalSafety.ts's portalSafetyFactory → 1 FAIL of 129,
+  //         the portalSafety.ts whole-file check. Old: green.
+  //   The import-parser check ("value imports are read") is a self-check, like codeOnly's: no kill.
   const classAt = recipe.indexOf("\nexport class RecipeAdapter ");
   const cls = classAt >= 0 ? recipe.slice(classAt, recipe.indexOf("\n}\n", classAt) + 3) : "";
   check("the RecipeAdapter class is found in recipeAdapter.ts", cls.length > 10_000, `len=${cls.length}`);
