@@ -552,7 +552,7 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   // after an `if (…)` / `while (…)` / `for (…)` / `with (…)` head as a regex (`heads`), and blockFrom
   // takes a depth-0 `indent` + `}` line as the end only when the next code line can follow a block
   // (endsHere). On the tree every check reads exactly as at 48bdc9a3 (146/146, every ok and info line
-  // identical; all 211 members' bodies under both signature forms, the 30 module functions and classes
+  // identical but the bodyFaults check's label, reworded after these kills ran; all 211 members' bodies under both signature forms, the 30 module functions and classes
   // and the 64 module declarations byte-identical; codeOnly of recipeAdapter.ts, submissionLedger.ts and
   // portalSafety.ts identical). KILLS run once in a throwaway tree at 48bdc9a3, against this scan (146
   // checks), the scan at 48bdc9a3 ("Old"), and this scan with one rule switched off ("no heads": the
