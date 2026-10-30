@@ -1096,8 +1096,9 @@ for (const absent of [false, true]) {
   // with it, and a named property is an element or a window, never the boolean true.
   // Measured in a throwaway tree (kill-191) on a trim to A1, A23 and A24 (8 checks), with
   // humanHandover.test (144): the parent 6b12844e reddens A24's two filing checks (2/8: armed=true,
-  // the click aborted as filing-url, human false, 0 POSTs) and section 6's two marker checks (2/144);
-  // the fix is green 8/8 and 144/144. Kills on the fix: K-script191 (the script's early return by
+  // the click aborted as filing-url, human false, 0 POSTs) and section 6's two marker checks (2/144).
+  // A24's first check is a GUARD, green on the parent by design (armed=true IS the defect there); its
+  // kill is K-script191 below. The fix is green 8/8 and 144/144. Kills on the fix: K-script191 (the script's early return by
   // truthiness again, the read-back strict) reddens all three A24 checks (3/8: armed=false — the
   // watch is then not armed, which fails closed, never "the page is yours") and section 6's `=== true`
   // check (1/144); K-readback191 (the read-back `!!` again, the script strict) stays green 8/8 here —
