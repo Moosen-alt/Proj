@@ -247,8 +247,11 @@ const INPUT_CALL = new RegExp([
   // watch's own sessions are opened inside watchHumanInput, in filingBackstop.ts), and the Input
   // domain's methods by their raw names, read in strings too (a session handed in from elsewhere still
   // names the method it sends). A bare word "Input" is no match: only `Input.` plus one of these names.
+  // The DOM domain's two input-shaped methods too (round 5, Helm item 5): `DOM.setFileInputFiles` and
+  // `DOM.focus` do over a session what setInputFiles and focus do, and both are in INPUT_METHODS.
   String.raw`\bnew(?:Browser)?CDPSession\b`,
   String.raw`\bInput\.(?:dispatch\w*Event|insertText|imeSetComposition|synthesize\w+|emulateTouchFromMouseEvent)\b`,
+  String.raw`\bDOM\.(?:setFileInputFiles|focus)\b`,
 ].join("|"));
 const TYPING_CALL = new RegExp(`\\.\\s*(?:pressSequentially|type)${CALL}`);
 const TICK_CALL = new RegExp(`\\.\\s*(?:check|uncheck|setChecked)${CALL}`);
@@ -298,6 +301,8 @@ console.log("\n0. THE INPUT PATTERNS READ EVERY CALL SHAPE (Helm Should-fix 8, t
     "await s.send(\"Input.imeSetComposition\", { text: \"x\", selectionStart: 0, selectionEnd: 0 })",
     "await s.send(\"Input.synthesizeTapGesture\", { x: 1, y: 1 })",
     "await s.send(\"Input.emulateTouchFromMouseEvent\", { type: \"mousePressed\", x: 1, y: 1, button: \"left\" })",
+    "await (this.options as any).cdp?.send(\"DOM.setFileInputFiles\", { files: [\"x.pdf\"], nodeId: 1 })",
+    "await cdp.send('DOM.focus', { nodeId: 1 })",
   ];
   const cdpMustNot = [
     "// Input: the person's click is theirs once the watch is armed.",
@@ -306,10 +311,13 @@ console.log("\n0. THE INPUT PATTERNS READ EVERY CALL SHAPE (Helm Should-fix 8, t
     "Input.dispatched by a person is recorded",
     "the arm is watchHumanInput.dispatchMouseEvent-free",
     "const n = cdpSessionCount + newCDPSessions;",
+    "const f = DOM.focusable;",
+    "await cdp.send(\"DOM.getDocument\", { depth: 1 })",
+    "// the DOM focus ring stays where the person left it",
   ];
   const cdpMissed = cdpMust.filter((s) => !INPUT_CALL.test(s));
   const cdpWrong = cdpMustNot.filter((s) => INPUT_CALL.test(s));
-  check("INPUT_CALL reads a raw DevTools session (newCDPSession / newBrowserCDPSession, called or taken) and the Input domain's methods as input, and the word Input in prose as none",
+  check("INPUT_CALL reads a raw DevTools session (newCDPSession / newBrowserCDPSession, called or taken), the Input domain's methods and DOM.setFileInputFiles / DOM.focus as input, and the words Input or DOM in prose as none",
     cdpMissed.length === 0 && cdpWrong.length === 0, `missed: ${JSON.stringify(cdpMissed)} wrongly read: ${JSON.stringify(cdpWrong)}`);
   const typingMust = ["await scoped.type?.(v)", "await scoped!.type!(v, { delay: 35 })", "await loc.pressSequentially?.(v)"];
   const tickMust = ["await box.setChecked?.(true)", "await box.check!()", "await box.uncheck?.()"];
@@ -507,6 +515,10 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //         send) → the same line (newCDPSession). K-S8z8c a session off a field the scan does not
   //         follow, `(this.options as any).cdp?.send("Input.insertText", …)` → the same line
   //         (Input.insertText).
+  //   K-S8z8e (round 5, Helm item 5; measured at a76218ee + the DOM pattern) the same held session
+  //         sends `DOM.setFileInputFiles` just after the lock → 1 FAIL of 146, "…and makes no input
+  //         call"; with the DOM pattern taken out the slip passes the tail check (only section 0's
+  //         DevTools check is red, 1/146: K-sec0-dom, the pattern removed with no slip, the same).
   //   K-S8z8d (the stated residual, measured): `Reflect.get(ctxR, "newCDP" + "Session").call(ctxR, …)`
   //         and `send("Input." + "dispatchMouseEvent", …)` → GREEN 145/145. A name built at run time is
   //         not seen (NOT FOLLOWED above).
