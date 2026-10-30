@@ -42,11 +42,13 @@ const recipe = read("portal-bot/src/adapters/recipeAdapter.ts");
 // Comments blanked, string and template TEXT blanked, regex literals blanked, template expressions
 // KEPT. A string, comment-free regex or regex literal never spans a line, so a misread `/` costs at
 // most the rest of that line. `at[k]` is the source index the k-th character of `code` came from
-// (every `{`, `}` and line break is copied as it stands), so a position found in the code maps back
-// to the raw source (methodBody below). `inside[p]` is 1 where source index p is inside something:
-// string or template text, a template's own backticks and `${`, or any character while a `(`, `[` or
-// `{` (a template expression's included) is open. statementFrom below: a line at column 0 there is
-// no new statement.
+// (every line break, and every `{` and `}` outside strings, comments, regex literals and template text
+// — a block's, an object's, a type's — is copied as it stands; the one exception is a template
+// expression's own braces: its `${` is emitted as "` " and its closing `}` as " `", so blockFrom never
+// counts them), so a position found in the code maps back to the raw source (blockFrom below).
+// `inside[p]` is 1 where source index p is inside something: string or template text, a template's
+// own backticks and `${`, or any character while a `(`, `[` or `{` (a template expression's included)
+// is open. statementFrom below: a line at column 0 there is no new statement.
 const codeOnlyMapped = (src: string): { code: string; at: number[]; inside: Uint8Array } => {
   let out = "";
   const at: number[] = [];
@@ -943,9 +945,17 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   }
   check("the closure makes no call it cannot follow (every this.X( has a body here, no super / bracket call, every backstop and imported call or reference allowlisted)",
     problems.size === 0, [...problems].join("\n         "));
-  // Step 21.2: a body cut short hides what follows the cut, so a member whose end cannot be found by
-  // brace matching (methodBody above) fails here by its signature line.
-  check("every method body the scan read ends at its own closing brace (brace matching on the code, never the next-member text)",
+  // Step 21.2: a block cut short hides what follows the cut, so a block whose end cannot be found by
+  // brace matching fails here by its signature line. bodyFaults is filled by every blockFrom caller:
+  // the class's own extent (`export class RecipeAdapter …`), methodBody (each member followed, and
+  // section 2's guardedClick / guardedPress / executeStep, and runAll), and moduleFnBody's function and
+  // class forms (`function pruneCaptureDir(…`, a module class).
+  // GUARD PIN: green on the tree by design (no block there fails to close), and it has no red on the
+  // parent (80221dad had no bodyFaults to check). Its measured kill is K-S8z9k in the section-3
+  // header (a followed member, the class's last, closed `  };` → 1 FAIL, this check, "private
+  // zzLast(): void {: its braces go below depth 0 …"); K-S8z9e fired it too until the fix round read
+  // that `/` as a regex.
+  check("every block the scan read (the class, each member, each module function or class) ends at its own closing brace (brace matching on the code, never the next-member text)",
     bodyFaults.size === 0, [...bodyFaults].join("\n         "));
   // The fixed list this scan replaced, kept as a FLOOR: a rename or a re-cut that stops reaching one fails.
   for (const name of [
