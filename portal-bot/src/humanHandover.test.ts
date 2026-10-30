@@ -126,24 +126,36 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   // THE TAIL: from the line that closes the run's own input to the end of runAll (so the arm's receiver
   // `this.backstop!` and the stop decision's whereTheRunStopped are both inside it). Its CLOSURE is
   // everything it can reach: every `this.X` it names is followed into X's body in recipeAdapter.ts,
-  // transitively, and so is every module-level function of recipeAdapter.ts it calls. The scan FAILS
-  // (by caller → callee) on:
-  //   - a `this.X(` with no method body in recipeAdapter.ts's RecipeAdapter class (a getter called, a
-  //     field holding a function, or an inherited BasePortalAdapter method — none can be read here);
+  // transitively, and so is every module-level function, class, object or value of recipeAdapter.ts it
+  // names, and every static method it calls off the class name (`RecipeAdapter.X(`, followed into the
+  // class like a `this.X(`). The scan FAILS (by caller → callee) on:
+  //   - a `this.X(` or `RecipeAdapter.X(` with no method body in recipeAdapter.ts's RecipeAdapter class
+  //     (a getter called, a field holding a function, or an inherited BasePortalAdapter method — none can
+  //     be read here); `this.constructor`, or the class name taken as a value (a type position aside);
   //   - a `super.X`, a `this[…]`, a computed call `…](` or `…].call/apply/bind(`;
-  //   - a call off the backstop (this.backstop, this.handedOverBackstop, or a local / parameter that
-  //     holds one, `!` and `?.` included) not on BACKSTOP_NO_INPUT, or a read of one of its members
-  //     not on BACKSTOP_RECORDS (a method taken as a value);
+  //   - a call off the backstop (this.backstop, this.handedOverBackstop — `this!.` / `this?.` too — or a
+  //     local / parameter that holds one) not on BACKSTOP_NO_INPUT, or a read of one of its members not
+  //     on BACKSTOP_RECORDS (a method taken as a value). A HOLDER is the field, a parameter typed
+  //     FilingBackstop, or a local declared from a holder as `= h`, `= h!`, `= h as T`, `= h satisfies T`
+  //     or `= h ?? h2 / null / undefined`;
+  //   - the backstop taken as a VALUE: a read of a holder that is not a member access (`.m`, `!.m`,
+  //     `?.m`), and not one of: an alias's own declaration or a store back into the field; a write
+  //     (`h = …`); a declared name or FilingBackstop parameter; a whole positional argument of a followed
+  //     `this.X(` whose parameter there is typed FilingBackstop; a test whose value never leaves (`!h`,
+  //     `!!h`, `typeof h`, `h && …`, `h ? a : b`, `h === x`, `if (h)`). So `run(bs)`, `[bs]`, `{ bs }`,
+  //     `h || x`, `x && h`, `const { m } = bs` and an alias declared in any other shape all fail;
   //   - ANY reference to a name recipeAdapter.ts imports as a value — a call of any shape (`f(`,
   //     `f?.(`, `(f)(`, `f.call(`, `new f(`) or the function taken as a value (`const g = f`, `run(f)`,
-  //     `page.evaluate(f)`) — that is not on NO_INPUT_HELPERS or IMPORTED_VALUES (a module function or
-  //     class of recipeAdapter.ts is followed instead, on any reference); a call to a name that is not
-  //     imported, local, global or followed;
+  //     `page.evaluate(f)`) — that is not on NO_INPUT_HELPERS or IMPORTED_VALUES (a module function,
+  //     class, object or value of recipeAdapter.ts is followed instead, on any reference); a call to a
+  //     name that is not imported, local, global or followed;
   //   - `this` taken as a value (`const self = this`, `const { m } = this`, `f.call(this)`,
   //     `(this as any).m`): only `this.` / `this!.` / `this?.` are followed;
   //   - a module loaded at run time (`import(` / `require(`);
   //   - an INPUT_CALL in any body it reaches (read RAW, comments and strings included: an in-page
-  //     `el.click()` in an evaluate string counts).
+  //     `el.click()` or `el['click']()` in an evaluate string counts). INPUT_CALL takes every call shape
+  //     after the method name (CALL: `m(`, `m!(`, `m?.(`, and `.call(` / `.apply(` / `.bind(`), and a
+  //     CALLED bracket member named like one; section 0 pins it both ways.
   // Call DISCOVERY reads each body with comments and string text blanked but template EXPRESSIONS kept
   // (a `${this.pageLabelNow()}` is a real call): see codeOnly below and its self-check.
   // Two more roots, both run on the person's page after the hand-over: the review step (stopAtReview,
@@ -155,9 +167,14 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   // The in-page readers the closure hands to page.evaluate, and the in-page source it evaluates, are
   // covered by a raw INPUT_CALL scan of their whole module (submissionLedger.ts, portalSafety.ts).
   // NOT FOLLOWED (stated, not pinned): calls off fields other than the backstop (this.page.*,
-  // this.options.*), which only INPUT_CALL's method names cover — and a page method taken as a VALUE
-  // (`const c = this.page.click`, `this.page.click.bind(…)`) is not seen at all, since INPUT_CALL needs
-  // the `(` right after the name and a bare `.click` cannot be told from prose; a local, parameter or
+  // this.options.*) and off static fields (`RecipeAdapter.WRITE_ACTIONS.has(`), which only INPUT_CALL's
+  // method names cover — and an input method taken as a VALUE without a call (`const c =
+  // this.page.click`, `const c = el['click']` in the page, `HTMLElement.prototype.click` stored) is not
+  // seen at all, since a bare `.click` or `['click']` cannot be told from prose or an attribute read
+  // (`.click.call(`, `.click.bind(` and `['click'](` ARE seen); a programmatic submit
+  // (`form.requestSubmit()`, `form.submit()` in the page): it makes no input event, so the lockdown holds
+  // it (as it holds A15's untrusted events), and the in-page source scanned whole names it in prose
+  // (Helm's call whether to add it; see the step-21 report); a local, parameter or
   // destructuring key spelled like an import shadows that import for the body it is declared in (any
   // identifier inside a `const {…} =` pattern counts as declared); the bodies of imported functions
   // (NO_INPUT_HELPERS is read by hand, each with its reason), except the two modules scanned whole.
@@ -215,6 +232,43 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //   K-S8q the same line as the first line of portalSafety.ts's portalSafetyFactory → 1 FAIL of 129,
   //         the portalSafety.ts whole-file check. Old: green.
   //   The import-parser check ("value imports are read") is a self-check, like codeOnly's: no kill.
+  // STEP 21 VERIFIER ROUND (the scan above beat by the shapes below at 8aaf0997): KILLS run once in the
+  // throwaway tree at fd3a7c47 against this scan (143 checks), and at 8aaf0997 against the scan it
+  // replaced ("Old": 129 checks; 05c9d0f2 is 8aaf0997 with LF line endings, nothing else). Each slip is
+  // put just after the same lockReview line unless it says otherwise. Each is 1 FAIL; Old: all green
+  // (129/129) unless it says otherwise.
+  //   K-S8r `const bsW = this.backstop!; await bsW.withAutomationInput(this.page!, async () => null);`
+  //         (K-S8e's door through a `!` alias) → "backstop.withAutomationInput(: not on BACKSTOP_NO_INPUT".
+  //   K-S8s `const bsX = this.backstop!; bsX.allowApprovedFiling(30_000);` (the approved slot, a door),
+  //         K-S8t `const bsY = this.backstop ?? null; bsY?.allowApprovedFiling(30_000);` and K-S8u
+  //         `const bsZ = this.backstop as FilingBackstop; bsZ.allowApprovedFiling(30_000);` → each
+  //         "backstop.allowApprovedFiling(: not on BACKSTOP_NO_INPUT".
+  //   K-S8v `const passOn = (b: any) => b?.allowApprovedFiling(30_000); passOn(this.backstop);` and
+  //         K-S8v2 the same through `const bs2 = this.backstop; … passOn2(bs2);` → each "the backstop
+  //         taken as a value: its members cannot be followed".
+  //   K-S8w `static async pokeX(p: any) { await p.locator("#btnSubmit").click(); }` put in the class above
+  //         runAll, and `await RecipeAdapter.pokeX(this.page);` → 1 FAIL of 144, "pokeX: reached via
+  //         <runAll tail>, makes no input on the page" (.click(). K-S8x the same through a module object,
+  //         `const H_POKE = { async x(p: any) { … .click(); } };` above the class and `await
+  //         H_POKE.x(this.page);` → 1 FAIL of 144, "const H_POKE: reached via <runAll tail>, makes no input".
+  //   K-S8y pokeX as in K-S8w and `await (this.constructor as any).pokeX(this.page);` → "this.constructor:
+  //         the class taken as a value". Old: red BY ACCIDENT (1 FAIL of 130: the old scan followed
+  //         `this.constructor` into the constructor's body and failed on its imports, feeBracketCoverage),
+  //         never on the static it reached.
+  //   INPUT_CALL (the verifier's A5, A6, A7, A10, A1, A2, A4; the case ids in the verifier's report, not
+  //   the smoke's): each → "…and makes no input call", the matched text in brackets:
+  //   K-S8z1 `await this.page!.getByRole("button").first().click?.();` (.click?.(); K-S8z2 `await
+  //         (this.page!.getByRole("button").first() as any).click!();` (.click!(); K-S8z3 `await
+  //         this.page!.locator("#x").press?.("Enter");` (.press?.(); K-S8z4 `await
+  //         this.page!.mainFrame()?.click?.("b");` (.click?.(); K-S8z5 `await
+  //         this.page!.evaluate("document.querySelector('button')['click']()");` (['click'](); K-S8z6 an
+  //         evaluate whose body runs `HTMLElement.prototype.click.call(b)` (.click.call(); K-S8z7 `await
+  //         this.page!.locator("#x").clear();` (.clear().
+  //   K-nit-d `void (async (b: any) => { await b.setChecked?.(true); });` above the class (no slip in the
+  //         closure) → section 4's checkbox check. K-nit-e the same with `b.type?.("x")` → section 4's
+  //         typing check.
+  //   Section 0's two pattern self-checks were red on the old patterns (2 FAIL of 131: every mustMatch
+  //   shape missed, and `.type?.(`, `.pressSequentially?.(` and the three tick shapes) and are green now.
   const classAt = recipe.indexOf("\nexport class RecipeAdapter ");
   const cls = classAt >= 0 ? recipe.slice(classAt, recipe.indexOf("\n}\n", classAt) + 3) : "";
   check("the RecipeAdapter class is found in recipeAdapter.ts", cls.length > 10_000, `len=${cls.length}`);
@@ -592,7 +646,7 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
       const after = code.slice(end);
       if (/^\s*!?\s*(?:\?\.|\.)\s*[A-Za-z_$]/.test(after)) continue;
       if (consumed.some(([s, e]) => at >= s && end <= e)) continue;
-      if (/^\s*(?::[^=\n;]*)?=(?![=>])/.test(after) || /^\s*\??\s*:\s*FilingBackstop\b/.test(after)) continue;
+      if (/^\s*=(?![=>])/.test(after) || /^\s*\??\s*:\s*FilingBackstop\b/.test(after)) continue;
       if (/\b(?:const|let|var)\s+$/.test(code.slice(Math.max(0, at - 12), at))) continue;
       if (backstopArgumentOfFollowedMember(code, at, end)) continue;
       // A TEST of it, whose value never leaves: `!h` / `!!h`, `typeof h`, `h && …` (yields h only when
