@@ -2141,7 +2141,10 @@ app.post("/api/projects/:id/permit-checks", asyncHandler(async (req, res) => {
   // 400 — passed through, a garbage value would silently become no date at all — and an accepted
   // one reaches the stamp in one shape (ISO), whatever form the caller wrote it in.
   const body = req.body || {};
-  res.status(201).json(await recordPermitStatusCheck(db, String(req.params.id), { ...body, noticedAt: requestNoticedAt(body.noticedAt) }));
+  // A check that read nothing on a target with a known status records nothing (shouldSkipEmptyRead,
+  // #412): 200, not 201, and `unreadable` carries the sentence the dashboard shows.
+  const result = await recordPermitStatusCheck(db, String(req.params.id), { ...body, noticedAt: requestNoticedAt(body.noticedAt) });
+  res.status(result.unreadable ? 200 : 201).json(result);
 }));
 
 // WHICH OF THIS PROJECT'S STORED READINGS TODAY'S RULES WOULD CHANGE — and how to get a real one.

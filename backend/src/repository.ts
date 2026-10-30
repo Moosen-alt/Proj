@@ -37,6 +37,7 @@ import type {
   ProjectCommunicationDraft,
   ProjectCommunicationDraftPacket,
   ProjectDetail,
+  PermitStatusCheckResult,
   ProjectHandoffPacket,
   ProjectHandoffPacketSection,
   ProjectListItem,
@@ -145,7 +146,7 @@ import {
 import { canonicalAliasForVerifiedField, canonicalizeSnapshot, compactAlnum, divergedAliases, existingSystemFromSnapshot, fieldAliases, mergeEditOverSnapshot, MICRO_SUPERSEDED_KEY, normalizeProject, recordMicroSupersession, normalizeTokens, TRACK_ISSUER_SNAPSHOT_KEYS, withTrackIssuers } from "./normalize";
 import {
   classificationDrift, classifyPermitStatusText, effectiveCheckDays, extractStatusDate, isAuthWallText, isNemApprovalOutcome, nextCheckIso, outcomeTrack, portalStatedStatus,
-  readingMayFinishTrack, shouldRecordStatusCheck, trackKind, UNCONFIRMED_READING_LABEL,
+  readingMayFinishTrack, shouldRecordStatusCheck, shouldSkipEmptyRead, trackKind, UNCONFIRMED_READING_LABEL,
   type PermitStatusClassification, type ReadingProvenance, type TrackKind,
 } from "./permitMonitor";
 import { evidenceForTopic, evidenceLines, type EvidenceTopic } from "./projectEvidence";
@@ -6478,7 +6479,7 @@ export async function recordPermitStatusCheck(
      *  (permitMonitor.extractStatusDate), if any. */
     noticedAt?: string | null;
   },
-): Promise<ProjectDetail> {
+): Promise<PermitStatusCheckResult> {
   const detail = getProjectDetail(db, projectId);
   const target = input.targetId
     ? db.get<Row>("SELECT * FROM permit_check_targets WHERE id = ? AND project_id = ?", [input.targetId, projectId])
@@ -6486,7 +6487,26 @@ export async function recordPermitStatusCheck(
   if (input.targetId && !target) throw new HttpError(404, "Permit check target not found.");
 
   const source = input.source || "manual";
-  const rawStatusText = await resolveStatusText(target, input.rawStatusText || "", source);
+  const resolved = await resolveStatusText(target, input.rawStatusText || "", source);
+  // A RE-CHECK THAT READ NOTHING IS NOT A STATUS — the sweep's own rule, asked through the same
+  // predicate (shouldSkipEmptyRead). #412, live 7ddfbe48: the stale panel's public re-check of an
+  // issued building permit got "no results" from Accela's global search, and the placeholder it
+  // fell back to was written as the target's latest_outcome (needs_human_review) and the
+  // project's current_stage. On a target whose status is known nothing is written — no check
+  // row, no review item, no outcome or stage — the target is only rescheduled, and the caller is
+  // told in a sentence. Only a check against a TARGET takes this branch (no target: nothing to
+  // keep or reschedule), and never an email: it is its own evidence, and its match row links the
+  // check it wrote.
+  if (target && source !== "email" && shouldSkipEmptyRead({ gatheredNothing: resolved.gatheredNothing, source, alreadyKnown: Boolean(text(target.latest_outcome)) })) {
+    const track = trackKind(text(target.target_type), text(target.permit_type));
+    db.transaction(() => rescheduleUnreadTarget(db, projectId, target, track, resolved.why, nowIso()));
+    const kept = text(target.latest_status_label) || text(target.latest_outcome);
+    return {
+      ...getProjectDetail(db, projectId),
+      unreadable: `The portal gave no readable status (${resolved.why}) — nothing recorded.${kept ? ` The filing keeps its last known status: ${kept}.` : ""}`,
+    };
+  }
+  const rawStatusText = resolved.text;
   // The notice's own date: the caller's (an email's Date header), else the date the page itself
   // prints for its status (#58: the portal monitor passes none). Neither: null, and the cure clock
   // of a correction this reading raises starts at ingestion.
@@ -6789,9 +6809,30 @@ export async function recordPermitStatusCheck(
   return getProjectDetail(db, projectId);
 }
 
-async function resolveStatusText(target: Row | null, rawStatusText: string, source: PermitCheckSource): Promise<string> {
+/** WHAT A CHECK THAT READ NOTHING STILL DOES (shouldSkipEmptyRead), at both doors: it ALWAYS
+ *  reschedules — a skip that left next_check_at alone kept an unreadable target permanently due
+ *  and re-attempted on every sweep — and audits why. Nothing else on the target moves. */
+function rescheduleUnreadTarget(db: AppDb, projectId: string, target: Row, track: TrackKind | null, why: string, ts: string): void {
+  const days = effectiveCheckDays(target.check_frequency_days, text(target.latest_outcome));
+  db.run("UPDATE permit_check_targets SET last_checked_at = ?, next_check_at = ?, updated_at = ? WHERE id = ?", [
+    ts,
+    nextCheckIso(days, new Date(ts)),
+    ts,
+    text(target.id),
+  ]);
+  addAuditLog(db, projectId, "system", "permit monitor", "permit_status.unreadable", { targetId: text(target.id), track, reason: why });
+}
+
+/** The text a check classifies, and whether it GATHERED anything: `gatheredNothing` is true only
+ *  when the caller's text was blank and no fetch yielded a readable status (the placeholder, or a
+ *  login page — the sweep never counts a sign-in wall as a reading either). Never inferred from
+ *  the text: an operator who pastes the placeholder itself has pasted something. `why` words it. */
+type ResolvedStatusText = { text: string; gatheredNothing: boolean; why: string };
+
+async function resolveStatusText(target: Row | null, rawStatusText: string, source: PermitCheckSource): Promise<ResolvedStatusText> {
   const trimmed = rawStatusText.trim();
-  if (trimmed) return trimmed;
+  if (trimmed) return { text: trimmed, gatheredNothing: false, why: "" };
+  const nothing = (text: string, why: string): ResolvedStatusText => ({ text, gatheredNothing: true, why });
   // "mock" source = no portal URL and no recipe to check against. NEVER fabricate a
   // status here — a made-up "under review" classifies as a real outcome and can email
   // the client a fake update. Honest answer only, except in explicit offline/dev mode
@@ -6799,8 +6840,8 @@ async function resolveStatusText(target: Row | null, rawStatusText: string, sour
   if (source === "mock") {
     const offlineDev = isAutoSeedDisabled();
     return offlineDev
-      ? "Application is under review. Plans assigned to reviewer."
-      : "No status text available. Manual AHJ/utility portal check required.";
+      ? { text: "Application is under review. Plans assigned to reviewer.", gatheredNothing: false, why: "" }
+      : nothing("No status text available. Manual AHJ/utility portal check required.", "no portal URL or recipe to read");
   }
 
   // Rule 5 both ways at the fetch (resolution skeptic MF3): a permit target bound to a utility
@@ -6821,12 +6862,16 @@ async function resolveStatusText(target: Row | null, rawStatusText: string, sour
     // review" items, several are this. The same failure honest in one path and silent in
     // its sibling is the shape that keeps producing these.
     if (publicText && isAuthWallText(publicText)) {
-      return "The portal returned its LOGIN page, not a status — the stored session or credential for this portal is no longer valid. Refresh the credential, then re-check; nothing about the filing has been read.";
+      return nothing(
+        "The portal returned its LOGIN page, not a status — the stored session or credential for this portal is no longer valid. Refresh the credential, then re-check; nothing about the filing has been read.",
+        "the portal returned its login page — refresh the credential, then re-check",
+      );
     }
-    if (publicText && publicText.length > 40) return publicText;
+    if (publicText && publicText.length > 40) return { text: publicText, gatheredNothing: false, why: "" };
+    return nothing("No status text available. Manual AHJ/utility portal check required.", "the public page held no readable status");
   }
 
-  return "No status text available. Manual AHJ/utility portal check required.";
+  return nothing("No status text available. Manual AHJ/utility portal check required.", source === "public_url" || source === "portal" ? "no portal URL to read" : "no status text was given");
 }
 
 function insertMonitorCorrection(
@@ -7375,29 +7420,16 @@ export async function runDuePermitChecks(
         }
       }
     }
-    // A CHECK THAT READ NOTHING IS NOT A STATUS. Two ways a sweep gathers no evidence: it
-    // had nothing to check at all (source stays "mock"), or it had a URL that could not be
-    // read — a PowerClerk project page is behind a login, so an anonymous fetch returns
-    // nothing usable. Recording either as a status classifies the honest "no status
-    // available" text as needs_human_review, which on a target we ALREADY know the status of
-    // is a downgrade: one sweep turned three verified "In review" NEM rows into "Needs human
-    // review" and stomped each project's current_stage with it.
-    //
-    // So: skip whenever no text was gathered — but ALWAYS reschedule. The old skip `continue`d
-    // without touching next_check_at, leaving an unreadable target permanently due and
-    // re-attempted on every single sweep (live: Ivy's NEM, still due from a poll an hour
-    // earlier). A never-checked target is the one exception: recording the honest "manual
-    // check required" is how the operator learns the link needs a login.
+    // A CHECK THAT READ NOTHING IS NOT A STATUS — the rule and its history live on
+    // shouldSkipEmptyRead, which the manual/re-check door (recordPermitStatusCheck) asks too. A
+    // sweep gathers nothing when it had nothing to check at all (source stays "mock") or its URL
+    // could not be read (a PowerClerk project page behind a login). Skipped — but ALWAYS
+    // rescheduled (rescheduleUnreadTarget; live: Ivy's NEM stayed due from a poll an hour
+    // earlier). In offline dev a mock check fabricates its text downstream, so it is not
+    // "nothing" here.
     const gatheredNothing = !rawStatusText && !isAutoSeedDisabled();
     const alreadyKnown = Boolean(text(target.latest_outcome));
-    if (gatheredNothing && (source === "mock" || alreadyKnown)) {
-      const days = effectiveCheckDays(target.check_frequency_days, text(target.latest_outcome));
-      db.run("UPDATE permit_check_targets SET last_checked_at = ?, next_check_at = ?, updated_at = ? WHERE id = ?", [
-        now,
-        new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString(),
-        now,
-        text(target.id),
-      ]);
+    if (shouldSkipEmptyRead({ gatheredNothing, source, alreadyKnown })) {
       // Say WHY (issue #161). "No portal URL/recipe" only when nothing could be read at all; otherwise
       // the scraper's own reason (sign-in failed, MFA asked, where it looked and how far).
       const why = unreadableReason
@@ -7409,7 +7441,7 @@ export async function runDuePermitChecks(
           : `skipping status check for target ${text(target.id)}: ${why}`,
         { projectId },
       );
-      addAuditLog(db, projectId, "system", "permit monitor", "permit_status.unreadable", { targetId: text(target.id), track, reason: why });
+      rescheduleUnreadTarget(db, projectId, target, track, why, now);
       continue;
     }
     const detail = await recordPermitStatusCheck(db, projectId, {

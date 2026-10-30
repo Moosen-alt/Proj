@@ -10,8 +10,8 @@
 //   - each card renders Edit and Record status, carrying THAT card's target id, every value esc()'d;
 //   - a click on the second card's Record posts the second card's targetId with source "manual",
 //     never the project's first target (MUST-EXCLUDE);
-//   - each pick's words classify, through the REAL classifier, as the status it names — a bare
-//     "Issued" reads as needs_human_review, so the Issued pick must not post that;
+//   - each pick's words classify, through the REAL classifier, as the status it names (a bare
+//     "Issued" reads as issued too since #419; the pick still posts "Permit issued");
 //   - an untouched Edit form sends nothing (the card shows the EFFECTIVE cadence: sending it back
 //     would rewrite a stored 7 to 1).
 //
@@ -185,8 +185,8 @@ await check("Other posts the operator's own words", async () => {
 
 console.log("\n3. Each pick's words mean that status to the real classifier");
 const words = (key: string) => L.permitTargetStatusText(key);
-await check("a bare 'Issued' is NOT an issued reading — which is why the pick posts other words", () => {
-  assert.equal(classifyPermitStatusText("Issued", "permit").outcome, "needs_human_review");
+await check("a bare 'Issued' reads as issued (#419), the same outcome as the pick's own words", () => {
+  assert.equal(classifyPermitStatusText("Issued", "permit").outcome, "issued");
 });
 await check("permit track: Issued -> issued, Approved -> reviewed_by_ahj, In review -> waiting, Corrections -> correction_flagged, Fees due -> ready_for_issue", () => {
   const want: Record<string, string> = { issued: "issued", approved: "reviewed_by_ahj", in_review: "waiting", corrections: "correction_flagged", fees_due: "ready_for_issue" };
