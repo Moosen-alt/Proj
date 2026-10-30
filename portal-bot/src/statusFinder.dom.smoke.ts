@@ -44,6 +44,17 @@ const projectsPage = (p: number) => shell(`<h1>Projects</h1>
   <a href="/new">New Project</a>`);
 const listPage = (p: number) => shell(`<h1>My Applications</h1><table><tbody>${p === 2 ? row("APP-777001", "Interconnection Complete") : row("APP-300001", "In Review")}</tbody></table>
   ${p === 1 ? `<a href="/list?page=2">Next</a>` : `<a class="disabled" aria-disabled="true">Next</a>`}`);
+// AN ACCELA-SHAPED "MY RECORDS" GRID (#418): a header row of <th>, nested in a layout table, the
+// filing between two neighbours whose statuses must not speak for it. Its status cell is the bare
+// word "Issued", which the text window read as a word in prose.
+const accelaRow = (date: string, id: string, type: string, status: string, action: string) =>
+  `<tr><td>${date}</td><td><a href="#">${id}</a></td><td>${type}</td><td>${status}</td><td>${action}</td></tr>`;
+const RECORDS = shell(`<table class="layout"><tr><td><h1>My Records</h1>
+  <table class="ACA_GridView"><tr><th>Date</th><th>Record Number</th><th>Record Type</th><th>Status</th><th>Action</th></tr>
+  ${accelaRow("10/14/2026", "194-26-001489-ELEC", "Residential Electrical", "Corrections Required", "Resubmit")}
+  ${accelaRow("10/15/2026", "187-26-000328-STR", "Residential Structural", "Issued", "Request Inspection")}
+  ${accelaRow("10/16/2026", "194-26-001491-ELEC", "Residential Electrical", "In Review", "")}
+  </table></td></tr></table>`);
 const LOGIN = shell(`<h1>Login</h1><form><input name="username"><input type="password" name="password"><button>Sign in</button></form>`);
 
 // A PowerClerk-shaped list: 5 pages, the filing on page 4, and a search box with no "search" words of
@@ -90,6 +101,7 @@ const server = http.createServer((q, r) => {
     : u.pathname === "/apps" ? shell(`<h1>Home</h1><a href="/list?page=1">My Applications</a>`)
     : u.pathname === "/apps2" ? shell(`<h1>Home</h1><a href="/list2">Applications</a>`)
     : u.pathname === "/list2" ? shell(`<h1>Applications</h1><table><tbody>${row("APP-400001", "Draft")}</tbody></table><button onclick="location.href='/submit'">Next: Submit application</button>`)
+    : u.pathname === "/records" ? RECORDS
     : u.pathname === "/login" ? LOGIN
     : shell(`<h1>${u.pathname}</h1>`);
   r.writeHead(200, { "Content-Type": "text/html" });
@@ -209,6 +221,14 @@ await check("MUST-EXCLUDE a sign-in page is named as such, nothing is read", asy
   const r = await findFilingStatus(page, ["APP-123456"], { settleMs: 5000 });
   assert.equal(r.text, null);
   assert.match(r.reason, /sign-in page/);
+});
+
+await check("MUST-PASS a list grid with a header row reads the filing's OWN row, status first (#418)", async () => {
+  await page.goto(`${base}/records`);
+  const r = await findFilingStatus(page, ["187-26-000328-STR"], { settleMs: 5000 });
+  assert.ok(r.text && /^Status: Issued \| /.test(r.text), `status text: ${r.text} (${r.reason})`);
+  assert.match(r.text, /Record Type: Residential Structural/);
+  assert.ok(!/Corrections Required|In Review|Resubmit/.test(r.text), `a neighbouring row spoke for the filing: ${r.text}`);
 });
 
 await check("MUST-PASS RecipeAdapter.checkStatus stays on the signed-in page: portalUrl = /login is never reloaded", async () => {

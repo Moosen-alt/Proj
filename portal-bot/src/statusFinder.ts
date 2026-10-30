@@ -49,13 +49,47 @@ async function bodyText(page: Page): Promise<string> {
   return String(await page.locator("body").innerText().catch(() => ""));
 }
 
-/** The redacted snippet around the first application number on the page, or null when none is. */
+/** THE FILING'S OWN ROW, each cell labelled by its column header ("Status: Issued | Record Number:
+ *  …"), or null when the number is not in exactly one table row under a header row of the same width.
+ *  A list's cells carry no labels of their own: the window below read Oregon ePermitting's "Issued"
+ *  as a bare word (no rule reads a bare word in a page's prose), and it reached into the rows above
+ *  and below, so a neighbouring filing's status could speak for this one. Columns whose header says
+ *  "status" come first, so the snippet cap never cuts the status off. Arrow callbacks only. */
+async function labelledRowFor(page: Page, num: string): Promise<string | null> {
+  return page.evaluate((n: string) => {
+    const norm = (s: string | null | undefined) => String(s ?? "").replace(/\s+/g, " ").trim();
+    const cellsOf = (tr: Element) => Array.from(tr.children).filter((c) => c.tagName === "TD" || c.tagName === "TH") as HTMLElement[];
+    const rows = Array.from(document.querySelectorAll("tr")).filter((tr) => ((tr as HTMLElement).innerText || "").includes(n));
+    // The innermost row: portals nest their grids in layout tables, whose rows hold the grid's text too.
+    const own = rows.filter((tr) => !rows.some((o) => o !== tr && tr.contains(o)));
+    if (own.length !== 1) return null; // two rows name the number: never guess which is the filing
+    const tr = own[0] as HTMLTableRowElement;
+    const table = tr.closest("table");
+    if (!table) return null;
+    const header = Array.from(table.rows).find((r) => r !== tr && cellsOf(r).some((c) => c.tagName === "TH"));
+    if (!header) return null;
+    const heads = cellsOf(header).map((c) => norm(c.innerText).replace(/:+$/, ""));
+    const cells = cellsOf(tr).map((c) => norm(c.innerText));
+    if (heads.length !== cells.length) return null; // spanned or ragged: the labels would be wrong
+    const pairs = cells
+      .map((v, i) => ({ v, h: heads[i], status: /status/i.test(heads[i]) }))
+      .filter((c) => c.v)
+      .sort((a, b) => Number(b.status) - Number(a.status))
+      .map((c) => (c.h ? `${c.h}: ${c.v}` : c.v));
+    return pairs.length ? pairs.join(" | ") : null;
+  }, num).catch(() => null);
+}
+
+/** The redacted snippet for the first application number on the page — its own labelled row when it
+ *  sits in a table with a header row, else the text around it — or null when none is. */
 async function scanFor(page: Page, applicationNumbers: string[]): Promise<string | null> {
   const body = await bodyText(page);
   for (const num of applicationNumbers) {
     if (!num) continue;
     const idx = body.indexOf(num);
     if (idx === -1) continue;
+    const labelled = redactStatusText(await labelledRowFor(page, num));
+    if (labelled) return labelled;
     const snippet = redactStatusText(body.slice(Math.max(0, idx - 80), idx + 320));
     if (snippet) return snippet;
   }
