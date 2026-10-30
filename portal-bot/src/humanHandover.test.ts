@@ -56,9 +56,16 @@ const codeOnlyMapped = (src: string): { code: string; at: number[]; inside: Uint
   let depth = 0;
   let paren = 0;
   const tpl: number[] = [];
+  // One flag per open `(` / `[`: true for the `(` of an `if (…)`, `while (…)`, `for (…)` or `with (…)`
+  // head. After THAT `)` a `/` starts a regex literal (`if (x) /\{/.test(s)`); after any other `)` it
+  // is a division (verifier V-A1: two such regexes read as divisions counted their braces, a balanced
+  // pair, so a fake `  }` line ended a method before a click).
+  const heads: boolean[] = [];
+  let closedHead = false;
   const lastToken = (): string => (/([\w$]+|[^\s])\s*$/.exec(out) || ["", ""])[1];
   const regexMayStart = (): boolean => {
     const t = lastToken();
+    if (t === ")") return closedHead;
     return t === "" || /^[(,=:[!&|?{};+\-*%<>~^]$/.test(t) || /^(?:return|typeof|case|in|of|delete|void|throw|new|await|yield|instanceof)$/.test(t);
   };
   const template = (): void => {
@@ -115,8 +122,8 @@ const codeOnlyMapped = (src: string): { code: string; at: number[]; inside: Uint
         continue;
       }
     }
-    if (c === "(" || c === "[") paren++;
-    if (c === ")" || c === "]") paren--;
+    if (c === "(" || c === "[") { heads.push(c === "(" && /(?<![\w$.]|\.\s+)(?:if|while|for|with)\s*$/.test(out.slice(-24))); paren++; }
+    if (c === ")" || c === "]") { closedHead = heads.pop() === true; paren--; }
     if (c === "{") depth++;
     if (c === "}") {
       depth--;
@@ -132,9 +139,10 @@ const codeOnly = (src: string): string => codeOnlyMapped(src).code;
 // A block's text: from `start` (a declaration's signature) to its OWN closing brace, found by brace
 // matching on the code (codeOnly: comments, strings and template text blanked) and returned RAW (the
 // input scan reads strings and comments too). It ends at the first `}` that brings the brace depth
-// counted from `start` back to 0 on a line that is exactly `indent` + `}` (trailing blanks aside): a
-// return type's braces (`): Promise<{ … }> {`) and a multi-line parameter type's (`  }) {`) close
-// mid-line. Step 21.2 (the rule-1 verifier): a member's end was once found on the RAW text (the next-
+// counted from `start` back to 0 on a line that is exactly `indent` + `}` (trailing blanks aside) and
+// is followed by what can follow a block (endsHere below): a return type's braces (`): Promise<{ … }>
+// {`) and a multi-line parameter type's (`  }) {`) close mid-line, and one that closes on its own
+// `indent` + `}` line is followed by no next declaration. Step 21.2 (the rule-1 verifier): a member's end was once found on the RAW text (the next-
 // member regex, `\n}\n`), which also read a template literal's continuation line indented two spaces
 // (`` `review\n  note(s) follow` ``) or a "\n}\n" inside a template as the end, so a followed body was
 // cut short and an input call after the cut was never scanned. A block that never reaches that line,
@@ -152,6 +160,27 @@ const mappedAt = (src: string, start: number): ReturnType<typeof codeOnlyMapped>
   while (lo < hi) { const mid = (lo + hi) >> 1; if (m.at[mid] < start) lo = mid + 1; else hi = mid; }
   return { ...m, k0: lo };
 };
+// A depth-0 `indent` + `}` line is the block's end only if what comes next can follow one (verifier
+// V-A5: a return type written `): string & {` / `    readonly brand?: never;` / `  }` / `  {` closed
+// at that `  }`, so the body after it was never read): the next code line (comments are blank lines in
+// the code) is the end of the text, an enclosing `}` at a shorter indent, or a line at exactly `indent`
+// that starts the next declaration: for a class member, a member's signature (modifiers, then a name
+// that is no statement keyword, then `(`, `<`, `:`, `=`, `;`, `?` or `!`; or a decorator, or a static
+// block); at column 0, a name. Anything else (`  {`, `  > {`, `  ): T {`, `  & {`, `  await …`) means
+// that `}` closed a type or a block inside the body: the match reads on, so the scan reads more, never
+// less, and a block that then never closes FAILS below (unterminated, or its braces below depth 0).
+const STATEMENT_WORDS = /^(?:if|else|for|while|do|switch|case|default|return|void|await|yield|typeof|delete|new|throw|try|catch|finally|with|break|continue|debugger|super|this|const|let|var|function|class|import|export|in|of|instanceof)$/;
+const endsHere = (after: string, indent: string): boolean => {
+  const next = /\n([ \t]*)(\S[^\n]*)/.exec(after);
+  if (!next) return true; // only blanks to the end of the text
+  const [, lead, text] = next;
+  if (indent && lead.length < indent.length && text[0] === "}") return true;
+  if (lead !== indent) return false;
+  if (!indent) return /^[A-Za-z_$@]/.test(text);
+  if (/^@|^static\s*\{/.test(text)) return true;
+  const member = /^(?:(?:private|protected|public|static|readonly|override|abstract|declare|accessor|async|get|set)\s+)*\*?\s*#?([A-Za-z_$][\w$]*)\s*[?!]?\s*[(<:=;]/.exec(text);
+  return !!member && !STATEMENT_WORDS.test(member[1]);
+};
 const blockFrom = (src: string, start: number, indent: string): string => {
   const rest = src.slice(start);
   const { code, at, k0 } = mappedAt(src, start);
@@ -164,7 +193,8 @@ const blockFrom = (src: string, start: number, indent: string): string => {
     else if (c === "}") {
       depth--;
       if (depth < 0) { bodyFaults.add(`${sigLine}: its braces go below depth 0 before its body ends`); return rest; }
-      if (depth === 0 && code.slice(k - lineStart.length, k) === lineStart && /^[ \t]*(?:\n|$)/.test(code.slice(k + 1, k + 200))) return src.slice(start, at[k] + 1);
+      if (depth === 0 && code.slice(k - lineStart.length, k) === lineStart && /^[ \t]*(?:\n|$)/.test(code.slice(k + 1, k + 200))
+        && endsHere(code.slice(k + 1), indent)) return src.slice(start, at[k] + 1);
     }
   }
   bodyFaults.add(`${sigLine}: unterminated (no closing \`${indent}}\` line at depth 0 before the end of the text)`);
@@ -499,13 +529,13 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //   K-S8z9d the one-line arrow clickedLabel extended with `+ \`x` / `y\` + String(….click())`
   //         (a template line at column 0) → 1 FAIL of 146, "function clickedLabel: reached via
   //         humanClickReport, makes no input". Old: green, 145/145.
-  //   K-S8z9e `if (project) /x{/.test("");` (a regex literal after `)`, which codeOnly reads as a
-  //         division, so its `{` is counted): no `  }` line closes the class or the method → 41 FAIL of
-  //         368, among them "every method body the scan read ends at its own closing brace" naming
-  //         `export class RecipeAdapter …: unterminated`, and every body after the slip read as
-  //         verifyReviewScreen's. Old: green, 145/145. The scan FAILS CLOSED on a misread `/`: a body it
-  //         cannot close is read to the end, never cut. The fix is the code, not the scan (write
-  //         `void /x{/` or escape the brace).
+  //   K-S8z9e `if (project) /x{/.test("");` (a regex literal after `)`, which codeOnly then read as a
+  //         division, so its `{` was counted): no `  }` line closed the class or the method → 41 FAIL
+  //         of 368, among them the bodyFaults check naming `export class RecipeAdapter …:
+  //         unterminated`. Old: green, 145/145. Its claim that the scan fails closed on ANY misread `/`
+  //         was disproved (the fix round's V-A1 below: a balanced pair cut a method and stayed green);
+  //         since the fix round the `/` after an `if (…)` head is read as a regex, and K-S8z9e is GREEN
+  //         (146/146: the slip makes no input, and nothing is misread).
   //   K-S8z9f clickedLabel extended with `+ \`x` / `\` + String(….click())` (the template's CLOSING
   //         backtick at column 0) → 1 FAIL of 146, the clickedLabel line. Old: green, 145/145.
   //   K-S8z9g ERROR_PAGE_GO_BACK written `String(` / `// a note` / `  (….click()) + " The window …"`
@@ -515,7 +545,51 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   //         continued on a new line `+ String(….click());` at column 0 → GREEN 146/146 (Old: green,
   //         145/145). An expression continued at column 0 outside every bracket reads as the next
   //         statement.
-  const classAt = recipe.indexOf("\nexport class RecipeAdapter ");
+  // STEP 21.2 FIX ROUND (the rule-1 verifier: two shapes ended a followed body at a balanced, wrong
+  // `  }` that the parent's raw-text end did not stop at). Two rules: codeOnlyMapped reads the `/`
+  // after an `if (…)` / `while (…)` / `for (…)` / `with (…)` head as a regex (`heads`), and blockFrom
+  // takes a depth-0 `indent` + `}` line as the end only when the next code line can follow a block
+  // (endsHere). On the tree every check reads exactly as at 48bdc9a3 (146/146, every ok and info line
+  // identical; all 211 members' bodies under both signature forms, the 30 module functions and classes
+  // and the 64 module declarations byte-identical; codeOnly of recipeAdapter.ts, submissionLedger.ts and
+  // portalSafety.ts identical). KILLS run once in a throwaway tree at 48bdc9a3, against this scan (146
+  // checks), the scan at 48bdc9a3 ("Old"), and this scan with one rule switched off ("no heads": the
+  // `)` rule; "no ends": endsHere always true); the slip in verifyReviewScreen's final `catch` unless it
+  // says otherwise:
+  //   V-A5 (the verifier's) pageUrlNoHash written `  private pageUrlNoHash(): string & {` /
+  //         `    readonly brand?: never;` / `  }` / `  {` and `void this.page?.locator("#btnSubmit")
+  //         .click();` in its body → 1 FAIL of 146, "pageUrlNoHash: reached via <runAll tail>, makes no
+  //         input on the page" (.click(). Old: green, 146/146. No ends: green. No heads: the same 1 FAIL.
+  //   V-A1 (the verifier's) `if (project) /\}\}/.test("");` / `{` / `  }` / the click / `if (project)
+  //         /\{\{/.test("");` → 1 FAIL of 146, "verifyReviewScreen: … makes no input on the page"
+  //         (.click(). Old: green, 146/146. Each rule alone catches it (no heads and no ends: the same
+  //         1 FAIL). V-A1c the same with `  sleep(0);` after the fake `  }` (a line endsHere reads as a
+  //         member's signature) → the same 1 FAIL. Old: green. No heads: green. No ends: the same 1 FAIL.
+  //   V-A2 (the verifier's: the return type `Promise<{` / `  }` / `  > {`) and V-A3 (a parameter type
+  //         whose `}` sits alone on an indent-2 line), each with a click in the catch → 1 FAIL of 146 on
+  //         the click (.click(). Old: red BY ACCIDENT (2 FAIL of 141, "the closure reaches
+  //         writeSanitizedCapture" and "…reviewValuesOnPage", never the click); no ends: the same accident.
+  //   V-A4 (the verifier's) `function zzUnfollowed(x: boolean): void { if (x) /\)/.test(""); }` put
+  //         before K-S8z9g's ERROR_PAGE_GO_BACK (its misread `)` drove the paren count below 0) → 1 FAIL
+  //         of 146, the ERROR_PAGE_GO_BACK line. Old: green, 146/146. No heads: green.
+  //   K-S8z9e2 K-S8z9e plus a click on the next line → 1 FAIL of 146 on the click. Old: 41 FAIL of 368.
+  //   K-S8z9i (legal TS) verifyReviewScreen closed `  };` → its end line is no bare `  }`, so the read
+  //         goes on through reviewValuesOnPage → 1 FAIL of 146, the closure check ("verifyReviewScreen →
+  //         reviewValuesOnPage(: a call to a name that is not imported, local or followed": the next
+  //         member's signature read as a call). Old: the same.
+  //   K-S8z9j (legal TS) the CLASS closed `};` → GREEN 146/146 (Old: the same): the class's text runs on
+  //         to the next module function's `}` line, and every member is still found in it.
+  //   K-S8z9k (legal TS) a new last member `  private zzLast(): void {` / `  };` and `this.zzLast();` →
+  //         1 FAIL of 147, the bodyFaults check, "private zzLast(): void {: its braces go below depth 0
+  //         before its body ends". Old, no heads, no ends: the same (the bodyFaults guard's kill).
+  //   Re-run unchanged on this scan: K-S8z9, K-S8z9b, K-S8z9c, K-S8z9d, K-S8z9f, K-S8z9g (each the same
+  //   1 FAIL as above) and K-S8z9h (GREEN, the stated residual); V-A0 and V-A6 (the controls: a plain
+  //   click in verifyReviewScreen and in pageUrlNoHash) → 1 FAIL on the click, Old the same.
+  //   NOT SEEN (stated, not pinned): a `/` misread in a shape the two rules do not cover (after a
+  //   keyword read as a property name, `x.return / 2`, a postfix `x++ / y /` or a non-null `x! / y`),
+  //   paired so the braces still balance and a fake `indent` + `}` line is followed by a line that
+  //   reads as a declaration.
+  const classAt =recipe.indexOf("\nexport class RecipeAdapter ");
   const cls = classAt >= 0 ? blockFrom(recipe, classAt, "") : "";
   check("the RecipeAdapter class is found in recipeAdapter.ts", cls.length > 10_000, `len=${cls.length}`);
   const esc = (s: string): string => s.replace(/[$]/g, "\\$");
