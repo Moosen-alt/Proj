@@ -181,12 +181,17 @@ await check("(b) three outcomes, three lines: filed under <name>, stopped at rev
   assert.ok(![stopped, none, plain].some((t) => /filed by automation/.test(t)), "MUST-EXCLUDE: a run that filed nothing reads as filed");
 });
 
-await check("(b2) the confirm states the three conditions and that a stop at review is not a failure", async () => {
+await check("(b2) the confirm states the three conditions, that a stop at review is not a failure, and that it is its own run (#435)", async () => {
   const lede = new Function(`${lift("APPROVE_AUTO_SUBMIT_LEDE")}\nreturn APPROVE_AUTO_SUBMIT_LEDE;`)() as string;
   assert.match(lede, /named approver/);
   assert.match(lede, /PORTAL_ALLOW_FINAL_SUBMIT/);
   assert.match(lede, /recipe recorded through submit/);
   assert.match(lede, /not a failure/);
+  // #435: on the NEM track an approved run after a Stage stops on Stage's draft, so the button is
+  // described as its own run from the start and never as submitting what a Stage left.
+  assert.match(lede, /starts its own run from the beginning/);
+  assert.match(lede, /does not submit an application an earlier Stage left/);
+  assert.doesNotMatch(lede, /submit(s|ting)? the staged/i, "MUST-EXCLUDE: the confirm promises a click on the staged application");
 });
 
 // ── (d) the job result of an approved run the gate declined ──────────────────────────────────

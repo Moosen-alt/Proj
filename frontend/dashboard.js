@@ -5258,7 +5258,7 @@ function renderSubmittalTracks() {
 // never a nameless approval and never a default name. With sign-in on the server records the
 // signed-in person and ignores any name sent. Nothing here decides a click: the server's gate
 // (mayClickFinalSubmit / automaticSubmitRefusals) is unchanged.
-const APPROVE_AUTO_SUBMIT_LEDE = "Approve & auto-submit this filing?\n\nThis is your approval of THIS run, recorded under your name. The bot clicks the portal's application submit (never fee payment, and it stops for any CAPTCHA/MFA) only when all three hold: a named approver, the server's PORTAL_ALLOW_FINAL_SUBMIT switch on, and a recipe recorded through submit for this portal. Otherwise it stops at the review screen for you to submit; that stop is not a failure.";
+const APPROVE_AUTO_SUBMIT_LEDE = "Approve & auto-submit this filing?\n\nThis is your approval of THIS run, recorded under your name. It starts its own run from the beginning of the portal; it does not submit an application an earlier Stage left on the portal. The bot clicks the portal's application submit (never fee payment, and it stops for any CAPTCHA/MFA) only when all three hold: a named approver, the server's PORTAL_ALLOW_FINAL_SUBMIT switch on, and a recipe recorded through submit for this portal. Otherwise it stops at the review screen for you to submit; that stop is not a failure.";
 // The name namedPersonConsent remembers: one person, one name per browser.
 const APPROVER_NAME_KEY = "feeConfirmName";
 
