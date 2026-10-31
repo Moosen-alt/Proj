@@ -14,6 +14,10 @@ others share its org/API-key plumbing and are "expose + meter" away from sale.
 | `permit-tracking.md` | Permit/PTO status tracking + correction alerts | Monitor built; wrapper + webhooks to expose |
 | `plan-parsing.md` | Plan-set PDF → structured fields + split sheets | Parser built; wrapper to expose |
 
+**Filing NEM applications for a client (the service-bureau work, not a packet):** the team's
+step-by-step runbook is [`docs/NEM_OPERATOR_RUNBOOK.md`](../NEM_OPERATOR_RUNBOOK.md) — intake,
+Approve & auto-submit, the review-page hand-over, PSE, tracking, and when to stop and ask.
+
 ## Provisioning a customer (operator runbook — same for every product)
 
 1. Create the org: `POST /api/orgs {"name":"City of X Building Dept","role":"review_gate"}`

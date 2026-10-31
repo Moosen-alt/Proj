@@ -12,6 +12,8 @@ Read first, in this order:
    which is what the provisioning script actually consumes.
 3. `docs/onboarding/CAPABILITIES.md` — the measured detail behind what we can and cannot do.
 4. This file — the runbook that ties them together.
+5. `docs/NEM_OPERATOR_RUNBOOK.md` — for the team member who files: what to click on a NEM
+   filing, what the tool does after each click, and what to do when a run stops.
 
 If you only remember one thing, remember this: **we stage, a human files.** Every number,
 promise and caveat below follows from that.
@@ -891,6 +893,9 @@ per-run decision, not part of onboarding. There is no per-recipe "trusted" arm.
 ## 7. The first real filing, end to end
 
 Do the first one yourself, watching, with the customer told it is a supervised first run.
+
+For a NEM filing, the click-by-click version (Approve & auto-submit, the hand-over fallback, PSE,
+tracking) is `docs/NEM_OPERATOR_RUNBOOK.md`.
 
 1. **Intake.** Create the project from the parsed plan set, then bind the client:
    `POST /api/projects/:id/client {"clientId":"..."}`. Until a client is bound, staging refuses
