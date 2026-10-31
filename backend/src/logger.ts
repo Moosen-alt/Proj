@@ -11,6 +11,7 @@
 import { performance } from "node:perf_hooks";
 import fs from "node:fs";
 import path from "node:path";
+import { logFilePath } from "./statePaths";
 import type { Request, Response, NextFunction } from "express";
 import type { AppDb } from "./db";
 import type { BuildInfo } from "./buildInfo";
@@ -69,18 +70,9 @@ function emit(level: Level, scope: string, message: string, extra?: Record<strin
 // this installation's server, so by default it logs beside its own database instead. Production,
 // the demo kit and the comparison checkouts all use a relative path inside their own folder and
 // are unaffected.
-function defaultLogFile(): string {
-  const cwd = process.cwd();
-  const dbPath = path.resolve(cwd, process.env.AUTOPILOT_DB_PATH || "backend/data/autopilot.sqlite");
-  const rel = path.relative(cwd, dbPath);
-  const dbOutsideInstall = rel.startsWith("..") || path.isAbsolute(rel);
-  return dbOutsideInstall
-    ? path.join(path.dirname(dbPath), "logs", "backend.log")
-    : path.join(cwd, "data", "logs", "backend.log");
-}
-const LOG_FILE = process.env.AUTOPILOT_LOG_FILE === ""
-  ? "" // explicitly disabled
-  : (process.env.AUTOPILOT_LOG_FILE || defaultLogFile());
+// The rule itself lives in statePaths.ts (logFilePath) so AUTOPILOT_STATE_DIR moves the log with
+// the rest of the state (#430); unset, it is exactly the rule above.
+const LOG_FILE = logFilePath();
 const LOG_MAX_BYTES = Number(process.env.AUTOPILOT_LOG_MAX_BYTES || 8 * 1024 * 1024);
 let logDirReady = false;
 // A failed write used to silence the file for the life of the process. On 2026-10-25 a nearly full

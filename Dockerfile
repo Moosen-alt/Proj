@@ -61,8 +61,12 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/app/.playwright-cache
 RUN node -e "require('playwright')" \
  && npx playwright install chromium
 
-# Data dir for SQLite DB, backups, uploaded docs, portal profiles.
-# Mount a persistent volume at /app/backend/data in production.
+# ONE STATE ROOT (#430): the database, documents, backups, portal login profiles, the draft
+# ledger, learn/replay runs, screenshots, portal-debug and logs all resolve under
+# AUTOPILOT_STATE_DIR (backend/src/statePaths.ts). Mount a persistent volume at exactly this path
+# in production. It is the old backend/data path on purpose: an existing volume keeps its
+# database, documents and backups where they are.
+ENV AUTOPILOT_STATE_DIR=/app/backend/data
 RUN mkdir -p backend/data backend/data/backups \
  && chown -R node:node /app
 

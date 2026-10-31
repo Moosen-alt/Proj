@@ -67,6 +67,7 @@ import type {
 import { correctionFilingStamp, correctionOverdueSql, touchProjectMetrics, type CorrectionFilingInput } from "./kpi";
 import fs from "node:fs";
 import path from "node:path";
+import { portalProfilesDir } from "./statePaths";
 import os from "node:os";
 import { checkStatusWithAdapter, runCorrectionReopen, stageWithAccela, stageWithMockPortal, stageWithPowerClerk, stageWithRecipe } from "../../portal-bot/src/index";
 import { portalAutomationDisabled, resolveHeadless } from "../../portal-bot/src/browser";
@@ -6123,7 +6124,7 @@ export async function reopenCorrectionOnPortal(
 
   // 4) Credential/session conventions shared with the learner/replay/monitor.
   const clientId = detail.project.clientId ?? "";
-  const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  const profileBase = portalProfilesDir();
   const portalType = scopeType === "utility" ? "utility" : "AHJ";
   const userDataDir = portalProfileDir(profileBase, clientId || null, portalType, portalUrl);
   const credential = clientId
@@ -7353,7 +7354,7 @@ export async function runDuePermitChecks(
     const applicationNumbers = [text(target.application_number), text(target.permit_number)].filter(Boolean);
     const projectDetail = getProjectDetail(db, projectId);
     const clientId = projectDetail.project.clientId ?? "";
-    const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+    const profileBase = portalProfilesDir();
     // WHAT THIS SWEEP LEARNED ABOUT READING THE FILING ON ITS OWN (#413): the facts the card's one
     // line is worded from (statusLinkGap.statusReadGap), and the record link a signed-in read found.
     const gap: Omit<ReadGapFacts, "entityName" | "clientName" | "hasNumber" | "track"> = {
@@ -9130,7 +9131,7 @@ export async function prepareSubmission(
     : undefined;
 
   // Per-client browser profile so sessions never bleed across clients.
-  const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  const profileBase = portalProfilesDir();
   const userDataDir = clientId
     ? path.join(profileBase, clientId, portalType)
     : path.join(profileBase, portalType);

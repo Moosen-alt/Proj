@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { portalDebugDir } from "../../../backend/src/statePaths";
 import type { ProjectRecord, ReviewerReport } from "../../../shared/src/types";
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, ok, fail, type PortalContext, type PortalStepResult } from "../adapter";
 import { openPortal } from "../browser";
@@ -571,7 +572,7 @@ export class PowerClerkAdapter extends BasePortalAdapter {
           return out.slice(0, 8);
         }).catch(() => []);
         try {
-          const dir = process.env.POWERCLERK_DEBUG_DIR || path.join("data", "portal-debug");
+          const dir = portalDebugDir();
           fs.mkdirSync(dir, { recursive: true });
           await page.screenshot({ path: path.join(dir, `stall-${(section || "section").replace(/[^a-z0-9]+/gi, "-")}-${Date.now()}.png`), fullPage: true }).catch(() => null);
         } catch { /* best-effort */ }

@@ -14,6 +14,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import { learnRunsDir } from "./statePaths";
 import type { AppDb } from "./db";
 import type { AgentToolDef, ProjectRecord } from "../../shared/src/types";
 import { createLLMProvider } from "./llm";
@@ -51,7 +52,7 @@ export interface TriageResult {
 // ---- bundle location + safe reads ----------------------------------------
 
 function runsBase(): string {
-  return process.env.AUTOLEARN_RUN_DIR ? path.resolve(process.env.AUTOLEARN_RUN_DIR) : path.resolve(process.cwd(), "data", "learn-runs");
+  return learnRunsDir();
 }
 
 function runDir(runId: string): string | null {

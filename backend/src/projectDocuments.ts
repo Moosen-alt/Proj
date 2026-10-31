@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { projectDocsDir } from "./statePaths";
 import type { AppDb } from "./db";
 import { HttpError } from "./httpError";
 import { addAuditLog } from "./audit";
@@ -138,7 +139,7 @@ export function planSetTextForProject(db: AppDb, projectId: string): string {
 
 // Uploaded files live OUTSIDE the SQLite database, so anything that backs the system
 // up has to know where they are. Exported for backup.ts — the two must never drift.
-export const DOCS_DIR = path.resolve(process.cwd(), process.env.PROJECT_DOCS_DIR || "backend/data/project-documents");
+export const DOCS_DIR = projectDocsDir();
 
 export interface ProjectDocumentView {
   id: string;

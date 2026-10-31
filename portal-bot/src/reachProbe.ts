@@ -16,6 +16,7 @@
 // reported, never retried. Always exits 0 — a partial result is a finding, not a failure.
 import "dotenv/config";
 import path from "node:path";
+import { portalProfilesDir, screenshotsDir } from "../../backend/src/statePaths";
 import fs from "node:fs";
 
 process.env.AUTOPILOT_DB_PATH = process.env.AUTOPILOT_DB_PATH || "backend/data/autopilot.sqlite";
@@ -48,7 +49,7 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  const outDir = path.join(process.cwd(), "data", "screenshots");
+  const outDir = screenshotsDir();
   fs.mkdirSync(outDir, { recursive: true });
   const db = await openDatabase();
   const results: Outcome[] = [];
@@ -62,7 +63,7 @@ async function main(): Promise<void> {
     console.log(`  credential resolved (user=${cred.username})`);
 
     const opened = await openPortal({
-      userDataDir: path.join(process.cwd(), "portal-profiles", clientId, `reach_${tag}`),
+      userDataDir: path.join(portalProfilesDir(), clientId, `reach_${tag}`),
       headless: !headed,
     }).catch((e) => { console.log(`  browser open failed: ${(e as Error).message}`); return null; });
     if (!opened) { out.loginStatus = "browser-open-failed"; results.push(out); continue; }

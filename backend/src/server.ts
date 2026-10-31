@@ -6,6 +6,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import cors from "cors";
 import fs from "node:fs";
 import path from "node:path";
+import { applyStateDirEnvDefaults, dbPath as stateDbPath, learnRunsDir, portalProfilesDir } from "./statePaths";
 import { openDatabase } from "./db";
 import { HttpError } from "./httpError";
 import { llmUsageForProject, runWithLlmContext } from "./llmAccounting";
@@ -249,7 +250,8 @@ logger.info("build", `Running ${BUILD.label}`, {
   version: BUILD.version, sha: BUILD.sha, commitDate: BUILD.commitDate, dirty: BUILD.dirty,
   pinned: BUILD.pinned, source: BUILD.source, codeRoot: BUILD.codeRoot,
 });
-const dbPath = path.resolve(process.cwd(), process.env.AUTOPILOT_DB_PATH || "backend/data/autopilot.sqlite");
+const dbPath = stateDbPath();
+applyStateDirEnvDefaults(); // replay output under AUTOPILOT_STATE_DIR too (statePaths.ts)
 
 const asyncHandler =
   (handler: (req: Request, res: Response, next: NextFunction) => Promise<unknown>) =>
@@ -1882,7 +1884,7 @@ app.put("/api/portal-recipes/:id/steps", (req, res) => {
 function closeReviewBrowsers(clientId: string, scope: "utility" | "ahj"): void {
   const safeClientId = clientId.replace(/[^A-Za-z0-9_-]/g, "");
   if (!safeClientId || !db.get("SELECT id FROM clients WHERE id = ?", [safeClientId])) return;
-  const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  const profileBase = portalProfilesDir();
   void import("../../portal-bot/src/index")
     .then(({ closeStagingBrowsersForTrack }) => closeStagingBrowsersForTrack(path.join(profileBase, safeClientId), scope))
     .catch(() => { /* browser close is best-effort — it may already be closed */ });
@@ -3559,8 +3561,7 @@ app.get("/api/projects/:id/portal-runs/:runId/review-screenshot", (req, res) => 
 // These two endpoints are the troubleshooting handoff: list the runs, download one
 // zipped, and paste/send the zip when asking for help with a failed learn.
 // ---------------------------------------------------------------------------
-const learnRunsBase = (): string =>
-  process.env.AUTOLEARN_RUN_DIR ? path.resolve(process.env.AUTOLEARN_RUN_DIR) : path.resolve(process.cwd(), "data", "learn-runs");
+const learnRunsBase = (): string => learnRunsDir();
 const SAFE_RUN_ID = /^[A-Za-z0-9._-]+$/;
 
 app.get("/api/learn-runs", (req, res) => {
@@ -3769,7 +3770,7 @@ const server = app.listen(port, listen.host, () => {
   if (process.env.BACKGROUND_WORKERS !== "off") void (async () => {
     try {
       const { reapOrphanedProfileBrowsers } = await import("../../portal-bot/src/browser");
-      const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+      const profileBase = portalProfilesDir();
       const killed = await reapOrphanedProfileBrowsers(profileBase);
       if (killed > 0) logger.warn("portal", `Reaped ${killed} orphaned portal browser(s) left by a previous run — their profiles are free again.`);
     } catch { /* cleanup is best-effort; never block startup */ }

@@ -46,6 +46,7 @@
 // ---------------------------------------------------------------------------
 import fs from "fs";
 import path from "path";
+import { learnRunsDir } from "../../backend/src/statePaths";
 import type { Locator, Page } from "playwright";
 
 const flagOff = (name: string): boolean => {
@@ -54,9 +55,7 @@ const flagOff = (name: string): boolean => {
 };
 
 function baseDir(): string {
-  return process.env.AUTOLEARN_RUN_DIR
-    ? path.resolve(process.env.AUTOLEARN_RUN_DIR)
-    : path.resolve(process.cwd(), "data", "learn-runs");
+  return learnRunsDir();
 }
 
 // Timestamped, filesystem-safe run id: sorts chronologically so retention
