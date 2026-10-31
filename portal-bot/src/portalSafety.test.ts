@@ -268,7 +268,14 @@ await check("isReviewPageText: the page NAMES itself the review step (MUST-MATCH
     "Please review all information before you submit.", "Review the details below and submit",
     "Review and Confirm\nPermit type: Residential Solar", "Please review and confirm your application.", "Review and certify",
     // The captured review page names itself AND carries locked sections: still the review page.
-    "Step 4 : Review Site Address (Read-only) Parcel (Read-only) Owner (Read-only) Continue Application »"];
+    "Step 4 : Review Site Address (Read-only) Parcel (Read-only) Owner (Read-only) Continue Application »",
+    // #403: the imperative and heading forms stay review, and so does a review page that ALSO says
+    // what the utility does after submission.
+    "Please review your application before submitting", "Review the application below, then click Submit",
+    "Once submitted, we will review your application. Review your application below, then click Submit.",
+    // PacifiCorp's PowerClerk SUBMIT page (captured replica pacific-power page 18) names itself only
+    // through "Once we review the application": a bare `we` must keep counting.
+    "Press Submit below to submit your Interconnection Application. Once we review the application and confirm it is eligible for interconnection, we will send a request for signatures through DocuSign."];
   const NOT = ["Please review the terms and conditions below", "I accept the terms and conditions", "Plan Review Fee", "Review Type",
     // A bare "please review" is the entry disclaimer's; a review noun in a heading is not the step.
     "Please review before continuing", "Plan Review Details", "Review Comments", "Review Status: In Review",
@@ -281,6 +288,11 @@ await check("isReviewPageText: the page NAMES itself the review step (MUST-MATCH
     // A locked section is not the page naming itself — Oregon ePermitting Step 1 after the address pick
     // (production false stop, City of Jefferson 2026-09-26), with the wizard bar listing Review and Pay Fees ahead.
     "Contact Information (Read-only)",
+    // #403: the utility describing what it does AFTER submission is not the page naming itself
+    // (PGE's PowerClerk welcome page, step 1 of 10: a production false stop, 2026-10-27).
+    "When a project is submitted, we will review the application to verify it is complete within 3 business days.",
+    "PGE will review your application", "Our staff shall review the submission", "We'll review your application within 3 business days.",
+    "We’ll review the details you entered once you submit.",
     "ePermit 1 General Info 2 Services 3 Review 4 Pay Fees 5 Completion Step 1 : General Info > Site Address Information Site Address (Read-only) Parcel (Read-only) Owner (Read-only) Continue Application » Save and resume later"];
   for (const t of MUST) { assert.ok(isReviewPageText(t), `"${t}" is not a review page`); assert.ok(pageCopy.isReviewPageText(t), `page copy: "${t}"`); }
   for (const t of NOT) { assert.ok(!isReviewPageText(t), `"${t}" wrongly reads as a review page`); assert.ok(!pageCopy.isReviewPageText(t), `page copy: "${t}"`); }

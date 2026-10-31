@@ -331,8 +331,20 @@ export function portalSafetyFactory() {
   // production false stop as the "(Read-only)" marker. "Review and Confirm" counts only as a
   // heading (end of line / sentence) or followed by the application / submission / permit /
   // request it confirms.
+  // NOT a "review" whose subject is the utility, later (#403): PGE's PowerClerk WELCOME page (step
+  // 1 of 10, nothing filled) says "When a project is submitted, we will review the application to
+  // verify it is complete", and reading that as the review step refused its ordinary Next on a
+  // production replay (2026-10-27, a new empty draft left behind). In the `review (your|the)
+  // application…` alternative only, a "review" right after `will`, `shall` or `we'll` is the portal
+  // describing what happens after submission, not the page naming itself; every imperative and
+  // heading form ("Please review your application", "Review the application below", "Step 4:
+  // Review") still reads as review, and so does a review page that ALSO carries such a sentence.
+  // NOT a bare `we` ("we review"): PacifiCorp's PowerClerk SUBMIT page (captured replica
+  // pacific-power page 18) names itself only through "Press Submit below to submit your
+  // Interconnection Application. Once we review the application and confirm it is eligible…", and it
+  // must keep reading as review; excluding `we` dropped it (the 94-captured-page check).
   const REVIEW_PAGE =
-    /\bstep\s*\d+\s*[:.\-–—]?\s*review\b|\breview\s+(and|&)\s+(submit|sign|file|certify|finish)\b|\breview\s+(and|&)\s+confirm\b(?=\s*($|[\n.:!])|\s+(your|the|this)\s+(application|submission|permit|request)\b)|\breview\s+(all\s+(of\s+)?(your\s+|the\s+)?|(your|the)\s+)(application|information|details|entries|submission)\b|\bwill\s+not\s+be\s+submitted\s+until\b/i;
+    /\bstep\s*\d+\s*[:.\-–—]?\s*review\b|\breview\s+(and|&)\s+(submit|sign|file|certify|finish)\b|\breview\s+(and|&)\s+confirm\b(?=\s*($|[\n.:!])|\s+(your|the|this)\s+(application|submission|permit|request)\b)|(?<!\b(?:will|shall|we['’]ll)\s+)\breview\s+(all\s+(of\s+)?(your\s+|the\s+)?|(your|the)\s+)(application|information|details|entries|submission)\b|\bwill\s+not\s+be\s+submitted\s+until\b/i;
   const isReviewPageText = (text: string | null | undefined): boolean => REVIEW_PAGE.test(String(text ?? ""));
   /** A URL that names the review step: Accela's CapConfirm / Confirm.aspx, a "/review" path
    *  segment (bounded — "/reviewer", "/review-comments" are not it). */

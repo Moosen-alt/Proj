@@ -66,6 +66,16 @@ const PAGES: Record<string, string> = {
     <dl><dt>Job Description</dt><dd>Rooftop PV</dd></dl>
     <label><input type="checkbox" id="cert"> I certify that the information above is correct</label>
     <a href="#" id="cont" role="button" onclick="return false">Continue Application »</a>`),
+  // #403: PGE's PowerClerk WELCOME page (step 1 of 10, nothing to fill), modelled on the 2026-10-29
+  // capture with no account data: the form title, the 10-step bar (with "Review Type" and "Submit"
+  // ahead), and the welcome text, which says what PGE does AFTER submission ("we will review the
+  // application"). A production replay read it as the review step and refused its Next.
+  "/pge-welcome": page(`<h1 class="h4"><div data-test-role="form-title">Application for Net Metering Facility Interconnection</div></h1>
+    <div data-test-role="pagination-tabs-container"><div class="d-flex">${["Interconnection Information", "Preparer Information", "PGE Customer Information", "Installer Information", "Description of Service", "System Information", "Options", "Review Type", "Documents", "Submit"].map((t, i) => `<div class="p-2"><div id="page-header${i + 1}" class="use-hover d-flex flex-column"><div class="pagination-num">${i + 1}</div><div data-test-role="page-title" class="pagination-text">${t}</div></div></div>`).join("")}</div></div>
+    <div id="formPage1" class="form-page"><div class="literal-element"><h1><b>Welcome to PGE’s Application for <br>Customer Interconnection</b></h1>All new renewable and renewable + storage installations need to have an application submitted for PGE's Net Metering program. This keeps our system safe and reliable and ensures that you will receive an offset for purchased power. When a project is submitted, we will review the application to verify it is complete within 3 business days. Complete applications will be reviewed by PGE to ensure that the interconnection is safe.<br><br>We recommend that you wait for the results of the review before starting construction of your project.<br><br>When you apply using PowerClerk your progress will be automatically saved.</div></div>
+    <button type="button" id="next">Next</button>`),
+  // #403 (Helm's MUST-PASS): a real review page that ALSO says what happens after submission.
+  "/review-future-plus-heading": page(`${HEADER}<h2>Review your application</h2><p>Once submitted, we will review your application.</p>${SUMMARY_DL}<p>Review your application below, then click Submit.</p><button type="button" id="next">Submit</button>`),
   // ONE REVIEW PREDICATE (portal-run-close MF2): a combined confirm-and-sign page — "Please
   // review and sign" with a live consent box and a Next that files. The learner stops here and
   // the backstop's lockdown reads the SAME answer: terminal (reviewPage true).
@@ -270,6 +280,12 @@ try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return p.evaluate(() => { const ps = (globalThis as any).__portalSafety; return { ...ps.terminalPageInPage(), navOnly: ps.navigatorOnlyControlLabelsInPage(), sig: ps.signatureStepInPage().kind }; });
     };
+    // #403: the PGE welcome page is NOT the review step (red before: its "we will review the application"
+    // read as the page naming itself), and a review page that also says so still IS.
+    const pw = await terminal("/pge-welcome");
+    check("#403 MUST-EXCLUDE: PGE's welcome page (\"we will review the application\" after submission) is not the review page, and its Next is not terminal", pw.reviewPage === false && pw.terminal === false, JSON.stringify(pw));
+    const rf = await terminal("/review-future-plus-heading");
+    check("#403 MUST-PASS: a review page that also says \"we will review your application\" still reads as the review page (terminal)", rf.reviewPage === true && rf.terminal === true, JSON.stringify(rf));
     const rs = await terminal("/review-sign");
     check("MF2: a combined 'Please review and sign' page reads as the review page to the backstop (terminalPageInPage.reviewPage) — the learner stops on the same answer", rs.reviewPage === true, JSON.stringify(rs));
     check("MF2: its live consent box is still the typed signature step (signed there, then the stop)", rs.sig === "typed", JSON.stringify(rs));
