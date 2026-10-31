@@ -1127,6 +1127,22 @@ export type SubmittalTrackStatus =
   | "ready_for_issue"
   | "issued";
 
+/** #445: one input a recipe will fill that THIS job has no value for (backend recipeStageGaps) — the
+ *  stage gate's 409 and the track card read the same list. Never carries a value (rule 2). */
+export interface RecipeStageGap {
+  kind: "question" | "field" | "document";
+  /** The field key the replay reads, or the docType for a document. One entry per key. */
+  key: string;
+  /** The portal's own words for the box, or a fixed label for a secret field. */
+  label: string;
+  /** The project/client field (or document) to fill, in plain words. */
+  fieldName: string;
+  /** Where a person fills it. */
+  where: "project" | "client" | "documents" | "portal_questions";
+  /** A secret field (account, meter…): named by its fixed label only. */
+  secret: boolean;
+}
+
 export interface SubmittalTrack {
   type: SubmittalTrackType;
   label: string;
@@ -1168,6 +1184,10 @@ export interface SubmittalTrack {
   /** No recipe of its own: the recipe this project's LAST run of this track borrowed (another entity's,
    *  same portal — portalRecipes.findBorrowableRecipe), read from that run's result. null = none used. */
   borrowedRecipe?: { recipeId: string; recipeVersion: number | null; learnedFor: string; recordType: string; portalHost: string; lastUsedAt: string } | null;
+  /** #445: what this track's recipe will fill that the job has no value for — the same reading the
+   *  stage gate refuses on (backend recipeStageGaps), one entry per key. Labels and keys only, never a
+   *  value (rule 2). Absent when the track has no complete recipe of its own or nothing is missing. */
+  stageGaps?: RecipeStageGap[];
   /** NEM only (#308, #310): where the track stands between the signature request and the filing
    *  (backend signatureTrack.nemSignatureState) — "awaiting_signature_request" (stopped in front of
    *  Request Signatures: a person clicks it, or approves a run that does), "signature_request_unconfirmed"

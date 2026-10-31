@@ -26,6 +26,7 @@ import type {
 import { findApplicationProfile, describePermitType, permitStructureAnswer, permitStructureIsCitedOrVerified, type PermitPrerequisiteStep, type PermitStructureAnswer } from "./applicationDocs";
 import { findAhjProcessProfile, jurisdictionKind, jurisdictionKindsCompatible } from "./processProfiles";
 import { findAnyRecipeForProject, findCompleteRecipeForProject } from "./portalRecipes";
+import { stageGapsForTrack } from "./recipeStageGapsView";
 import { detectPlatform } from "./publicPermitStatus";
 import { NEM_APPROVAL_OUTCOME, isNemApprovalOutcome, trackKind } from "./permitMonitor";
 import { HttpError } from "./httpError";
@@ -762,7 +763,14 @@ export function getSubmittalTracks(db: AppDb, project: ProjectRecord): Submittal
     type CardRecipe = { id: string; status: string; portal_url: string };
     const cardRecipe = (r: { id: string; status?: unknown; portalUrl?: unknown } | null): CardRecipe | null =>
       r ? { id: r.id, status: s(r.status), portal_url: s(r.portalUrl) } : null;
-    let recipeRow: CardRecipe | null = cardRecipe(findCompleteRecipeForProject(db, resolverInput));
+    const completeRecipe = findCompleteRecipeForProject(db, resolverInput);
+    let recipeRow: CardRecipe | null = cardRecipe(completeRecipe);
+    // WHAT THAT RECIPE WILL FILL THAT THIS JOB HAS NO VALUE FOR (#445) — the stage gate's own reading,
+    // shown before anyone clicks Stage. Only for a complete recipe of the track's own (what the next
+    // stage replays), and only before the filing (not started, or staged and not yet submitted).
+    const stageGaps = completeRecipe && (status === "not_started" || status === "staged")
+      ? stageGapsForTrack(db, project, type, completeRecipe)
+      : [];
     // NO RECIPE OF ITS OWN IS NOT "NOTHING RAN" (operator 09-28: "if we're using the Coos Bay recipe can
     // we make it say that somewhere? They just look blank"). Stage borrows a recipe learned for another
     // entity on the same portal (portalRecipes.findBorrowableRecipe) and records it on the run
@@ -865,6 +873,7 @@ export function getSubmittalTracks(db: AppDb, project: ProjectRecord): Submittal
       recipeId: recipeRow ? s(recipeRow.id) : undefined,
       recipeScopeType: scopeType,
       borrowedRecipe,
+      ...(stageGaps.length ? { stageGaps } : {}),
       ...(type === "nem" ? { signatureRequest } : {}),
       ...(issuer ? { issuer } : {}),
     };

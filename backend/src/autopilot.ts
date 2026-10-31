@@ -225,6 +225,13 @@ function blockersFromHttpError(err: HttpError): AutopilotBlocker[] {
   for (const q of (Array.isArray(d.unansweredPortalQuestions) ? d.unansweredPortalQuestions : []) as Array<{ label?: string; key?: string }>) {
     out.push({ code: "portal_question", detail: `Answer the portal's question for this job: "${String(q.label ?? q.key ?? "a per-job question")}" (portal questions on the project, or the intake link).` });
   }
+  // A box the recipe fills that this job has no value for (#445) — the portal's label and the
+  // project/client field (or document) to fill. Labels only, never a value (rule 2).
+  for (const g of (Array.isArray(d.missingRecipeInputs) ? d.missingRecipeInputs : []) as Array<{ kind?: string; label?: string; fieldName?: string; where?: string }>) {
+    out.push(g.kind === "document"
+      ? { code: "recipe_document_missing", detail: `Upload a ${String(g.fieldName ?? "required")} document: the portal asks for it at "${String(g.label ?? g.fieldName ?? "an upload")}".` }
+      : { code: "recipe_field_missing", detail: `Fill ${String(g.fieldName ?? "a field")} on the ${g.where === "client" ? "client record" : "project"}: the portal's "${String(g.label ?? g.fieldName ?? "box")}" would be filed blank.` });
+  }
   if (out.length === 0) out.push({ code: "blocked", detail: err.message });
   return out;
 }
@@ -699,11 +706,15 @@ export async function runAutopilotSegmentA(
         // one filing, not a project-wide gate. requiredTracks lists NEM first, so returning here left
         // the building/electrical permits unstaged. Recorded like a failed stage (the stageOutcome path
         // below) and the run goes on to the next track. Only that gate sets unansweredPortalQuestions.
+        // So does a box THIS track's recipe fills that the job has no value for (#445): the same gate,
+        // the same one filing.
         const perJobQuestions = (err.details as { unansweredPortalQuestions?: unknown } | undefined)?.unansweredPortalQuestions;
-        if (Array.isArray(perJobQuestions) && perJobQuestions.length) {
+        const missingInputs = (err.details as { missingRecipeInputs?: unknown } | undefined)?.missingRecipeInputs;
+        if ((Array.isArray(perJobQuestions) && perJobQuestions.length) || (Array.isArray(missingInputs) && missingInputs.length)) {
           trackBlockers.push(...blockers);
-          logger.warn("autopilot", "Segment A: this track's portal asks a per-job question the job has not answered — holding this track, staging the rest", {
-            project: projectId, track: t, ms: `${Math.round(performance.now() - t0)}ms`, questions: perJobQuestions.length,
+          logger.warn("autopilot", "Segment A: this track's recipe needs per-job answers or fields the job does not have — holding this track, staging the rest", {
+            project: projectId, track: t, ms: `${Math.round(performance.now() - t0)}ms`,
+            questions: Array.isArray(perJobQuestions) ? perJobQuestions.length : 0, missing: Array.isArray(missingInputs) ? missingInputs.length : 0,
           });
           continue;
         }
