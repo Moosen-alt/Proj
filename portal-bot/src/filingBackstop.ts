@@ -792,7 +792,7 @@ type Verdict = "continue" | "fail";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Cover = { session: any | null; outcome: "on" | "shared" | "failed" };
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-type GuardState = { ready: Promise<any | null>; judges: Set<PausedJudge>; closed: boolean; covers: Map<object, Promise<Cover>>; seen: Map<string, { verdicts: Promise<Verdict>[]; counts: Map<object, number>; at: number }> };
+type GuardState = { ready: Promise<any | null>; judges: Set<PausedJudge>; closed: boolean; covers: Map<object | string, Promise<Cover>>; seen: Map<string, { verdicts: Promise<Verdict>[]; counts: Map<object, number>; at: number }> };
 const GUARDS = new WeakMap<object, GuardState>();
 const FETCH_RESPONSE_STAGE = { patterns: [{ urlPattern: "*", requestStage: "Response" }] };
 /** One verdict for a paused response, from the first judge that owns it. */
@@ -857,12 +857,132 @@ async function coverTarget(g: GuardState, ctx: any, target: object): Promise<Cov
   if (outcome !== "on" && g.covers.get(target) === p) g.covers.delete(target);
   return outcome;
 }
+// A SERVICE WORKER ALREADY RUNNING AT JOIN (#405). Its own fetch (made on a page's behalf) is not a
+// page's: it has no page target to re-bind, and the browser-level pause does not re-bind it either
+// (#394 skeptic sw-pre: its 307 → /payment/charge was followed). Playwright gives a worker no CDP
+// session of its own (newCDPSession takes a page or a frame), so the guard's browser-level session
+// attaches to the worker's target itself — CDP's own session-in-session messaging
+// (Target.attachToTarget, flatten false; Target.sendMessageToTarget / receivedMessageFromTarget) —
+// and turns the same response pause on there. Its pauses go through the same verdictFor dedupe as
+// every other session's, so a response the browser session pauses too is judged once. Never a
+// reload, a restart or an unregistering of the portal's worker. A worker whose pause does not come
+// on in time stays NAMED (the run's note), never silent. One started after the join is created
+// under the browser-level pause and is judged.
+const WORKER_REPLY_MS = 5000;
+/** A CDP session to `targetId`, carried inside the browser-level `parent` session: the same
+ *  on / off / send / detach surface pauseResponses and leave use on a Playwright CDPSession. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function attachThrough(parent: any, targetId: string): Promise<any> {
+  const { sessionId } = (await parent.send("Target.attachToTarget", { targetId, flatten: false })) ?? {};
+  if (!sessionId) throw new Error("no session id for the worker target");
+  let nextId = 1;
+  let gone = false;
+  const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  const listeners = new Map<string, Set<(params: unknown) => void>>();
+  const settleAll = (why: string): void => {
+    gone = true;
+    for (const [, p] of pending) { clearTimeout(p.timer); p.reject(new Error(why)); }
+    pending.clear();
+  };
+  const onMessage = (e: { sessionId?: string; message?: string }): void => {
+    if (e?.sessionId !== sessionId) return;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let m: any;
+    try { m = JSON.parse(String(e.message)); } catch { return; }
+    if (typeof m?.id === "number") {
+      const p = pending.get(m.id);
+      if (!p) return;
+      pending.delete(m.id);
+      clearTimeout(p.timer);
+      if (m.error) p.reject(new Error(String(m.error.message || "protocol error")));
+      else p.resolve(m.result ?? {});
+      return;
+    }
+    if (typeof m?.method === "string") for (const fn of [...(listeners.get(m.method) ?? [])]) fn(m.params);
+  };
+  const onDetached = (e: { sessionId?: string }): void => { if (e?.sessionId === sessionId) unhook("the worker target is gone"); };
+  const unhook = (why: string): void => {
+    settleAll(why);
+    try { parent.off?.("Target.receivedMessageFromTarget", onMessage); parent.off?.("Target.detachedFromTarget", onDetached); } catch { /* parent gone */ }
+  };
+  parent.on("Target.receivedMessageFromTarget", onMessage);
+  parent.on("Target.detachedFromTarget", onDetached);
+  return {
+    on(method: string, fn: (params: unknown) => void) { const s = listeners.get(method) ?? new Set(); s.add(fn); listeners.set(method, s); },
+    send(method: string, params: unknown = {}): Promise<unknown> {
+      if (gone) return Promise.reject(new Error("the worker session is detached"));
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { pending.delete(id); reject(new Error(`no answer to ${method} from the worker`)); }, WORKER_REPLY_MS);
+        pending.set(id, { resolve, reject, timer });
+        Promise.resolve(parent.send("Target.sendMessageToTarget", { sessionId, message: JSON.stringify({ id, method, params }) })).catch((err: unknown) => {
+          const p = pending.get(id);
+          if (!p) return;
+          pending.delete(id);
+          clearTimeout(p.timer);
+          p.reject(err instanceof Error ? err : new Error(String(err)));
+        });
+      });
+    },
+    async detach() {
+      if (gone) return;
+      unhook("detached");
+      await Promise.resolve(parent.send("Target.detachFromTarget", { sessionId })).catch(() => null);
+    },
+  };
+}
+/** Turn the response pause on in an already-running service worker's target: "on" or "failed". */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function coverWorker(g: GuardState, parent: any, targetId: string): Promise<Cover["outcome"]> {
+  const key = `service_worker:${targetId}`;
+  let p = g.covers.get(key);
+  if (!p) {
+    p = (async (): Promise<Cover> => {
+      const session = await attachThrough(parent, targetId);
+      try {
+        pauseResponses(g, session);
+        await session.send("Fetch.enable", FETCH_RESPONSE_STAGE);
+      } catch (e) { await session.detach().catch(() => null); throw e; }
+      return { session, outcome: "on" };
+    })().catch((): Cover => ({ session: null, outcome: "failed" }));
+    g.covers.set(key, p);
+  }
+  const { outcome } = await p;
+  if (outcome !== "on" && g.covers.get(key) === p) g.covers.delete(key);
+  return outcome;
+}
+/** The service workers already running in `ctx` whose response pause could not be turned on (0
+ *  when every one is covered). A worker is matched to its target by its script URL, within the
+ *  run's browser context when a page's session can say which one that is. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function coverRunningWorkers(g: GuardState, parent: any, ctx: any, pages: any[]): Promise<number> {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let workers: any[] = [];
+  try { workers = ctx && typeof ctx.serviceWorkers === "function" ? ctx.serviceWorkers() : []; } catch { workers = []; }
+  if (!workers.length) return 0;
+  const urlOf = (w: unknown): string => { try { return String((w as { url: () => string }).url() || ""); } catch { return ""; } };
+  // The run's browser context, read through a page's own (covered) session.
+  let contextId = "";
+  for (const pg of pages) {
+    const c = await g.covers.get(pg);
+    if (!c?.session) continue;
+    try { contextId = String((await c.session.send("Target.getTargetInfo"))?.targetInfo?.browserContextId || ""); } catch { contextId = ""; }
+    if (contextId) break;
+  }
+  const urls = new Set(workers.map(urlOf).filter(Boolean));
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let infos: any[] = [];
+  try { infos = (await parent.send("Target.getTargets"))?.targetInfos ?? []; } catch { infos = []; }
+  const targets = (Array.isArray(infos) ? infos : []).filter((t) => t && t.type === "service_worker" && typeof t.targetId === "string"
+    && (contextId ? t.browserContextId === contextId : urls.has(String(t.url || ""))));
+  const on = new Set<string>();
+  await Promise.all(targets.map(async (t) => { if ((await coverWorker(g, parent, t.targetId)) === "on") on.add(String(t.url || "")); }));
+  return workers.filter((w) => { const u = urlOf(w); return !u || !on.has(u); }).length;
+}
 /** A joined run: `leave` when it is done; `uncovered` = the pages open at join whose documents
  *  could not be re-bound (their redirects are followed unjudged until they load a new document);
- *  `workers` = service workers already running at join. A service worker's own fetch is not a
- *  page's, has no page target to re-bind, and the browser-level pause does not re-bind it either
- *  (#394 skeptic sw-pre: its 307 → /payment/charge was followed) — named, never silent. One
- *  started after the join is created under the browser-level pause and is judged. */
+ *  `workers` = service workers already running at join whose own response pause could not be
+ *  turned on (#405, above) — named, never silent. */
 type GuardMembership = { leave: () => Promise<void>; uncovered: Set<object>; workers: number };
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function joinRedirectGuard(browser: any, judge: PausedJudge, ctx?: any): Promise<GuardMembership | null> {
@@ -903,8 +1023,9 @@ async function joinRedirectGuard(browser: any, judge: PausedJudge, ctx?: any): P
   if (ctx && typeof ctx.pages === "function" && typeof ctx.newCDPSession !== "function") {
     try { for (const pg of ctx.pages()) uncovered.add(pg); } catch { /* no pages */ }
   }
-  let workers = 0;
-  try { workers = ctx && typeof ctx.serviceWorkers === "function" ? ctx.serviceWorkers().length : 0; } catch { workers = 0; }
+  const workers = await coverRunningWorkers(guard, session, ctx, pages).catch(() => {
+    try { return ctx && typeof ctx.serviceWorkers === "function" ? ctx.serviceWorkers().length : 0; } catch { return 0; }
+  });
   return {
     uncovered,
     workers,
@@ -915,7 +1036,8 @@ async function joinRedirectGuard(browser: any, judge: PausedJudge, ctx?: any): P
       if (GUARDS.get(browser) === guard) GUARDS.delete(browser);
       const covers = [...guard.covers.values()];
       guard.covers.clear();
-      for (const s of [session, ...(await Promise.all(covers)).map((c) => c.session)]) {
+      // The browser session last: a worker's cover is carried inside it.
+      for (const s of [...(await Promise.all(covers)).map((c) => c.session), session]) {
         if (!s) continue;
         await s.send("Fetch.disable").catch(() => null);
         await s.detach().catch(() => null);
@@ -1236,8 +1358,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // an SPA's posts are fetch/XHR, which are read live.
   const lastReading = new WeakMap<object, boolean>();
   // #394: the pages open at install whose loaded document the redirect guard could not re-bind,
-  // and the service workers already running then (sticky for the run: the worker that was running
-  // is not known to be gone when a new one starts).
+  // and the service workers already running then whose own response pause could not be turned on
+  // (#405; sticky for the run: the worker that was running is not known to be gone when a new one
+  // starts).
   const uncoveredPages = new Set<object>();
   let preInstallWorkers = 0;
   const unwatch: Array<() => void> = [];

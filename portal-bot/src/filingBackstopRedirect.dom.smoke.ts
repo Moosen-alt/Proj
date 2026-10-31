@@ -44,8 +44,9 @@
 //                 307 goes to /payment/charge or /SubmitApplication (normal and preloaded install;
 //                 two slow saves) — a response two sessions pause is judged once
 //   swPreDirect/swPost — a service worker's own POST to /payment/charge; one started after install
-//   swPre       — NAMED, NOT CLOSED: a service worker already running at install — its fetch's 307
-//                 is still followed; the run is told (redirectsJudged false + redirectGuardNote)
+//   swPre*      — #405: a service worker already running at install — its fetch's 307 →
+//                 /payment/charge and → /SubmitApplication: the guard attaches to the worker's own
+//                 target, so the hop is refused (named, stopping) and nothing is named as uncovered
 // MUST-PASS:
 //   ok307       — 307 → /next-step: the body arrives there, the page is the next step
 //   see303      — 303 → /next-step: the browser follows it as a GET
@@ -89,6 +90,7 @@ const REDIRECTS: Record<string, [number, string, number?, Record<string, string>
   "/hop/a": [307, "/hop/b"],
   "/hop/b": [307, "/checkout/pay"],
   "/step/xhrPay": [307, "/payment/charge"],
+  "/step/swFile": [307, "/SubmitApplication"],
   "/step/put301": [301, "/SubmitApplication"],
   "/step/loop": [307, "/step/loop"],
   "/step/emptyFile": [307, "/SubmitApplication"],
@@ -529,12 +531,16 @@ try {
   }
   {
     // #394 SKEPTIC — A SERVICE WORKER. Its own fetch on a page's behalf has no page target to
-    // re-bind: one running BEFORE install is NAMED (not closed — the hop is still followed); one
-    // started after install is created under the browser-level pause and judged.
+    // re-bind. #405: one running BEFORE install gets the response pause on its own target, so its
+    // hop is judged (on main it was only named: redirectsJudged false + the note, and the 307 was
+    // followed); one started after install is created under the browser-level pause and judged.
     const swFetch = (to: string) => (page: Page) => page.evaluate((u) => fetch(u, { method: "POST", body: "x=1" }).then((r) => `status ${r.status}`, () => "rejected"), to);
-    const pre = await run("sw", swFetch("/step/xhrPay"), { installAfter: true, afterGoto: (page) => page.evaluate(() => (window as unknown as { swReady: Promise<string> }).swReady) });
-    check("swPre: a service worker running at install is NAMED — redirectsJudged false, and the note says so",
-      pre.judged === false && /a service worker was already running when the redirect smoke began/.test(pre.note), `judged=${pre.judged} note=${pre.note} ${show(pre)}`);
+    for (const [variant, from, target] of [["swPre", "/step/xhrPay", "/payment/charge"], ["swPreFile", "/step/swFile", "/SubmitApplication"]] as const) {
+      const pre = await run("sw", swFetch(from), { installAfter: true, afterGoto: (page) => page.evaluate(() => (window as unknown as { swReady: Promise<string> }).swReady) });
+      check(`MUST-EXCLUDE ${variant}: a service worker running at install — its fetch's 307 → ${target} never reaches it, the refusal stops the run named, and nothing is named as uncovered`,
+        hitsOn(from) === 1 && hitsOn(target) === 0 && hopStop(pre, target) && pre.actResult === "rejected" && pre.judged === true && pre.note === "",
+        `judged=${pre.judged} note=${pre.note} act=${pre.actResult} ${show(pre)}`);
+    }
     const direct = await run("sw", swFetch("/payment/charge"), { installAfter: true, afterGoto: (page) => page.evaluate(() => (window as unknown as { swReady: Promise<string> }).swReady) });
     check("MUST-EXCLUDE swPreDirect: the same worker's own POST straight to /payment/charge is refused (the first leg is routed)", hitsOn("/payment/charge") === 0, show(direct));
     const post = await run("sw", async (page) => { await page.evaluate(() => (window as unknown as { swReady: Promise<string> }).swReady); return swFetch("/step/xhrPay")(page); });
