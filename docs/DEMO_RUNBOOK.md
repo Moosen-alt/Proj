@@ -112,9 +112,10 @@ mapped offline and the page will say so in amber — a dead end on stage.
 ### Act 4 — through the stages (5 min)
 
 - **Lena Okafor (Submit).** Staged up to the portal's review screen; the banner says a
-  person must file it. Show that **Approve & Submit** refuses here — *portal automation is
-  off on this installation* — and say why that is the point: nothing is filed without a
-  person. Then play the filer: in **Submittal tracks**, record each filing (NEM, then the
+  person must file it. Show that **Approve & auto-submit** (the rail's button, the same action
+  as the track card's) files nothing here: on a staged NEM draft it is held, and on a permit
+  draft its run is refused — *portal automation is off on this installation* — and say why that
+  is the point: nothing is filed without a named person's approval of that run. Then play the filer: in **Submittal tracks**, record each filing (NEM, then the
   permit) with any application number. She moves to **Track Approvals**.
 - **Walt Brennan (Track Approvals).** Each filing is tracked on its own: the building permit
   is *ready to issue* — the fee is a person's to pay — while NEM and electrical are in review.
@@ -206,7 +207,7 @@ and deleted afterwards. Every PGE recipe is `needs_rerecord`, so beat 1 is not o
   `PORTAL_ALLOW_FINAL_SUBMIT is set on this process` when it is not. The running server keeps
   its `=1` unless you comment the line and restart 4173 (a restart migrates; a second start
   EADDRINUSEs) — acceptable only because the server never clicks anything in this session: beat 1
-  is a human's hands, beat 2 runs in the recorder's own process, and no Approve & Submit is pressed.
+  is a human's hands, beat 2 runs in the recorder's own process, and no Approve & auto-submit is pressed.
 - Auto-submit off on every PGE recipe (Portal Recipes admin; both PGE recipes, `481c00f4` v15 and
   `e9efa4a3` v1, were `auto_submit_enabled=0` on 2026-09-24). The PGE credential's last login was
   accepted 2026-09-21 and a password rotation was planned — confirm it still logs in before the day.
@@ -301,7 +302,7 @@ Everything a presenter is likely to press is safe, and RESET-DEMO undoes all of 
 |---|---|
 | Run QC | The chain re-runs locally (split check, documents, reviewer gate). A filed or closed project stays where it is. |
 | Stage portals · Autopilot | Every gate gives its verdict, then it stops: *portal automation is off on this installation*. No browser opens. |
-| Approve & Submit | Refused offline with a plain message. Nothing is recorded as filed. |
+| Approve & auto-submit (rail or track card) | The same action from either button: held on a staged NEM draft; otherwise it asks for the approver's name and its run is refused offline with a plain message. Nothing is recorded as filed. |
 | Record a filing / paste a status | Real product behaviour — moves the project. Reset afterwards. |
 | Fill a form (upload) | Stores the form for that AHJ. Reset afterwards. |
 | Find & fill (lookup) | Answers that lookup is off (no API key) and lists the forms already stored. |

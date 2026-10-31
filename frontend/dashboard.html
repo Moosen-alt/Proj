@@ -439,7 +439,8 @@
           <div class="actions autopilot-actions">
             <span class="actions-label">Autopilot:</span>
             <button id="startAutopilotBtn" class="primary"><i data-lucide="rocket"></i><span>Stage portals · Autopilot</span></button>
-            <button id="approveSubmitBtn" class="primary" disabled><i data-lucide="check-circle-2"></i><span>Approve &amp; Submit</span></button>
+            <!-- #423: the SAME action as the track card's Approve & auto-submit (one door, one meaning). -->
+            <button id="approveSubmitBtn" class="primary" disabled><i data-lucide="check-check"></i><span>Approve &amp; auto-submit</span></button>
             <span id="autopilotStatus" class="badge">idle</span>
             <!-- The badge's reason, as TEXT. It used to exist only as the Approve
                  button's tooltip, so "Blocked" said nothing about why. Written by
@@ -449,7 +450,7 @@
                  this line says so, so "off with no reason" never reads as a verdict. Written by
                  refreshAutopilot via textContent; cleared when a state arrives. -->
             <p id="autopilotLoadFailed" class="autopilot-reason" role="status" hidden></p>
-            <!-- Why Stage portals / Approve & Submit are switched off, as TEXT (the server's
+            <!-- Why Stage portals / Approve & auto-submit are switched off, as TEXT (the server's
                  stageDisabledReason / approveDisabledReason, written via textContent). -->
             <ul id="autopilotOffReasons" class="autopilot-off" hidden></ul>
           </div>

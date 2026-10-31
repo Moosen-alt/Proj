@@ -147,9 +147,10 @@ Two things to know about this button today:
   (`recipeAdapter.ts:1325-1349`, `repository.ts:9031-9038`; #435). Finish such a filing through
   the hand-over (section 5).
 
-**The other Approve button.** The left rail has **Approve & Submit** next to **Stage portals ·
-Autopilot**. On a real portal it records an approval and never clicks: you still file by hand
-(`backend/src/autopilot.ts:847-879`, #423). Use the track card's button to file.
+**The rail's Approve button.** The left rail's **Approve & auto-submit**, next to **Stage portals ·
+Autopilot**, is the same action as the track card's: it opens the card's prompt for the newest
+staged draft's filing and posts the same request (`frontend/dashboard.js:5629`, #423). On NEM it
+is held while a draft is staged, exactly like the card's button, so finish that draft by hand.
 
 ## 5. The fallback: Stage, and the review page is yours
 
