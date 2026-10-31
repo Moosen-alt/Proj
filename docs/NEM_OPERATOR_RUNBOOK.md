@@ -153,6 +153,11 @@ Autopilot**. On a real portal it records an approval and never clicks: you still
 
 ## 5. The fallback: Stage, and the review page is yours
 
+**Stage in portal** is a look-only run: it leaves a draft on the client's utility account and never
+files. Finish that draft through the hand-over below (headed install), or by staging again, which
+continues the draft and stops before its Submit for a person. Never with Approve & auto-submit on
+the same NEM filing: that starts a new run (#435, open).
+
 Use this when the run in section 4 stopped short, when the utility's recipe is not yet recorded
 through submit, when you want to look before filing, or on a headless install where the hand-over
 works differently (below).
