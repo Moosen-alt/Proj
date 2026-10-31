@@ -75,7 +75,7 @@ import { notServedInResult } from "../../shared/src/portalNotServed";
 import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier";
 // detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget; the
 // card's Edit (updatePermitCheckTarget) re-detects with the same function when the URL changes.
-import { detectPlatform, publicPermitStatusCheck } from "./publicPermitStatus";
+import { accelaModulesForNumber, detectPlatform, publicPermitStatusCheck, searchAccelaRecordByNumber } from "./publicPermitStatus";
 import { planSetTextForProject, projectDocsByType, DOCS_DIR, PLAN_TEXT_DOC_TYPES } from "./projectDocuments";
 import { activeStructuralLetterConfirmation, structuralLetterState } from "./structuralLetter";
 import type { DesignTextSource } from "./designCriteria";
@@ -179,7 +179,8 @@ export function setRecipeStageRunnerForTests(runner: RecipeStageRunner | null): 
 // THE STATUS MONITOR'S TWO DOORS TO THE OUTSIDE — the authenticated scrape (a browser) and the
 // public fetch (the network) — behind the same kind of seam, so the sweep's own resolution (which
 // recipe, which URL, the track/entity judgment) runs for real in a test with nothing opened.
-type StatusCheckSeams = { checkStatus?: typeof checkStatusWithAdapter | null; publicCheck?: typeof publicPermitStatusCheck | null };
+// The third, recordSearch, is the Accela module search by record number (#443) — also the network.
+type StatusCheckSeams = { checkStatus?: typeof checkStatusWithAdapter | null; publicCheck?: typeof publicPermitStatusCheck | null; recordSearch?: typeof searchAccelaRecordByNumber | null };
 let statusCheckSeams: StatusCheckSeams = {};
 export function setStatusCheckSeamsForTests(seams: StatusCheckSeams | null): void {
   if (process.env.AUTOPILOT_TEST_SEAMS !== "1") throw new Error("setStatusCheckSeamsForTests needs AUTOPILOT_TEST_SEAMS=1 — it is a test seam only.");
@@ -187,6 +188,7 @@ export function setStatusCheckSeamsForTests(seams: StatusCheckSeams | null): voi
 }
 const statusScrape: typeof checkStatusWithAdapter = (...args) => (statusCheckSeams.checkStatus ?? checkStatusWithAdapter)(...args);
 const publicStatusFetch: typeof publicPermitStatusCheck = (...args) => (statusCheckSeams.publicCheck ?? publicPermitStatusCheck)(...args);
+const accelaRecordSearch: typeof searchAccelaRecordByNumber = (...args) => (statusCheckSeams.recordSearch ?? searchAccelaRecordByNumber)(...args);
 
 // THE FAILURE TEXT LIVES ON THE FAILING STEP, NOT THE SUMMARY. stageWithRecipe's failure
 // result carries no top-level message - "Recipe step failed (fill - inverter quantity)" rides
@@ -7285,9 +7287,12 @@ function triggerHandoffIfReady(db: AppDb, projectId: string, ts: string): void {
  *   · on the portal the recipe that read it was judged fit for (recipeHostFit, the
  *     hostFitsTrackAndEntity answer): its host, and on a permit track its tenant too (one Accela host
  *     serves many agencies by path). A utility's record pages sit beside its login on the same host.
+ *     A link the AHJ portal's public record search found (#443) is held to the target's own portal
+ *     the same way (`from` says which read found it).
  * Every refusal is audited with its reason; nothing else on the target moves.
  */
-function storeFoundStatusLink(db: AppDb, projectId: string, target: Row, track: TrackKind, found: string, recipePortalUrl: string, ts: string): string {
+function storeFoundStatusLink(db: AppDb, projectId: string, target: Row, track: TrackKind, found: string, recipePortalUrl: string, ts: string,
+  from: "record_list" | "public_search" = "record_list"): string {
   const link = safeRecordLink(found);
   const refuse = (reason: string): string => {
     addAuditLog(db, projectId, "system", "permit monitor", "permit_target.status_link_refused", { targetId: text(target.id), track, url: link || String(found).slice(0, 300), reason });
@@ -7295,11 +7300,11 @@ function storeFoundStatusLink(db: AppDb, projectId: string, target: Row, track: 
   };
   if (!link) return refuse("not an http(s) record link");
   if (!trackSafeUrl(track, link)) return refuse(track === "nem" ? "the link is an AHJ permit portal, and this is a NEM filing" : "the link is a utility interconnection portal, and this is a permit filing");
-  if (!sameHost(link, recipePortalUrl) || (track === "permit" && !samePortal(link, recipePortalUrl))) return refuse("the link is not on the portal that was signed in to");
+  if (!sameHost(link, recipePortalUrl) || (track === "permit" && !samePortal(link, recipePortalUrl))) return refuse(from === "public_search" ? "the link is not on this filing's AHJ portal" : "the link is not on the portal that was signed in to");
   const current = db.get<{ tracking_url?: string }>("SELECT tracking_url FROM permit_check_targets WHERE id = ?", [text(target.id)]);
   if (text(current?.tracking_url)) return "";
   db.run("UPDATE permit_check_targets SET tracking_url = ?, updated_at = ? WHERE id = ? AND COALESCE(tracking_url, '') = ''", [link, ts, text(target.id)]);
-  addAuditLog(db, projectId, "system", "permit monitor", "permit_target.status_link_found", { targetId: text(target.id), track, url: link, from: "the account's record list (signed-in read)" });
+  addAuditLog(db, projectId, "system", "permit monitor", "permit_target.status_link_found", { targetId: text(target.id), track, url: link, from: from === "public_search" ? "the AHJ portal's public record search" : "the account's record list (signed-in read)" });
   return link;
 }
 
@@ -7489,6 +7494,42 @@ export async function runDuePermitChecks(
         noteReason("the portal page read was a sign-in wall");
       }
     }
+    // A PERMIT FILING WITH A NUMBER AND NO LINK, ON AN ACCELA PORTAL: FIND ITS RECORD THROUGH THE
+    // MODULE'S OWN PUBLIC SEARCH (#443) — the filings with no recipe and no portal login, which no
+    // signed-in read can reach. A query, never a filing (rule 1: searchAccelaRecordByNumber); only the
+    // target's own track-safe AHJ portal and tenant, every hop asked (rule 5). Go gently: ONE search
+    // per check, in ONE module (the number's own by suffix first, then the next one on the next
+    // check), and none inside a day of any link lookup for this target (link_lookup_at, shared with
+    // the record-list lookup above). A record found is read now and its CapDetail kept as the
+    // tracking_url through storeFoundStatusLink, so every later check is a plain GET of that page.
+    const searchNumber = text(target.permit_number) || text(target.application_number);
+    if (!rawStatusText && track === "permit" && !text(target.tracking_url) && searchNumber && safeTargetPortalUrl
+      && detectPlatform(safeTargetPortalUrl) === "accela" && !linkLookupStamp
+      && !linkLookupRanRecently(target.link_lookup_at == null ? null : text(target.link_lookup_at), new Date(now))) {
+      const searchPortal = safeTargetPortalUrl;
+      const modules = accelaModulesForNumber(searchNumber, searchPortal);
+      const searchedBefore = Number(db.get<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM audit_logs WHERE project_id = ? AND action = 'permit_target.status_link_search' AND json_extract(details, '$.targetId') = ?",
+        [projectId, text(target.id)],
+      )?.n ?? 0);
+      const module = modules[searchedBefore % modules.length]!;
+      linkLookupStamp = now;
+      const result = await accelaRecordSearch(searchPortal, searchNumber, {
+        module,
+        allowUrl: (u: string) => Boolean(trackSafeUrl("permit", u)) && samePortal(u, searchPortal),
+      }).catch((err) => ({ found: false as const, module, reason: `the search failed: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}` }));
+      addAuditLog(db, projectId, "system", "permit monitor", "permit_target.status_link_search", {
+        targetId: text(target.id), track, module, number: searchNumber, found: result.found, ...(result.found ? { url: result.link } : { reason: result.reason }),
+      });
+      if (result.found) {
+        rawStatusText = result.text;
+        source = "public_url";
+        foundLink = storeFoundStatusLink(db, projectId, target, track, result.link, searchPortal, now, "public_search");
+      } else if (!signedInRan) {
+        // (Not after a signed-in read: its own reason words the card's sign-in outcome.)
+        noteReason(`the portal's ${module} record search did not find it: ${result.reason}`);
+      }
+    }
     // No authenticated scrape — try the public tracking URL (exact CapDetail / record-detail
     // link that requires no login), then fall back to the generic portal_url.
     if (!rawStatusText) {
@@ -7528,7 +7569,7 @@ export async function runDuePermitChecks(
         })
       : "";
     db.run("UPDATE permit_check_targets SET read_gap = ?, link_lookup_at = COALESCE(?, link_lookup_at) WHERE id = ?", [readGap, linkLookupStamp, text(target.id)]);
-    if (foundLink) logger.info("monitor", `status link found for target ${text(target.id)} in the account's record list`, { projectId });
+    if (foundLink) logger.info("monitor", `status link found for target ${text(target.id)}`, { projectId });
     if (shouldSkipEmptyRead({ gatheredNothing, source, alreadyKnown })) {
       // Say WHY (issue #161). "No portal URL/recipe" only when nothing could be read at all; otherwise
       // the scraper's own reason (sign-in failed, MFA asked, where it looked and how far).
