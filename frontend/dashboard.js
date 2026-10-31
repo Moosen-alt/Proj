@@ -6832,6 +6832,7 @@ function renderFilledForms(projectId) {
         </div>` : ""}
       ${builtIn ? `<p class="muted">Built-in map written for this exact official revision (matched by the blank's fingerprint) — no mapping verification needed. Review the filled PDF before filing.</p>` : ""}
       ${ok && !isStored && !f.signaturesLocked ? `<p class="muted"><button type="button" class="secondary" data-detect-sign="${esc(f.formId)}" style="font-size:12px">Detect signature lines (AI)</button> — stamp your stored signature on this form.</p>` : ""}
+      ${ok ? `<p class="muted"><button type="button" class="secondary" data-verify-vision="${esc(f.formId)}" style="font-size:12px">Verify fill with vision</button> — reads the filled PDF back and lists each value under the printed label it sits beside. Reports only; it never changes the form.</p><div data-vision-result="${esc(f.formId)}"></div>` : ""}
       ${ok && !isStored && f.signaturesLocked ? `<p class="muted">✓ Built-in form — signature + date auto-placed on the authorized-signature line. No verification needed.</p>` : ""}
       ${f.documentStale ? `<p class="muted"><strong>This blank dates itself “${esc(f.documentDate)}”</strong> — over two years old. Re-check the AHJ's current forms page before filing${f.sourceUrl ? ` (<a href="${esc(f.sourceUrl)}" target="_blank" rel="noopener noreferrer">source</a>)` : ""}. Check any printed fee rates against the current schedule.</p>` : ""}
       ${extra ? `<p class="muted">${esc(extra)}</p>` : ""}
@@ -7239,6 +7240,32 @@ function bindFilledFormControls() {
   document.querySelectorAll("[data-verify-form]").forEach((b) => b.addEventListener("click", () => verifyFilledForm(b.getAttribute("data-verify-form"))));
   document.querySelectorAll("[data-remap-form]").forEach((b) => b.addEventListener("click", () => remapFilledForm(b.getAttribute("data-remap-form"), b)));
   document.querySelectorAll("[data-detect-sign]").forEach((b) => b.addEventListener("click", () => detectRegistrySignatures(b.getAttribute("data-detect-sign"))));
+  document.querySelectorAll("[data-verify-vision]").forEach((b) => b.addEventListener("click", () => verifyFillWithVision(b.getAttribute("data-verify-vision"), b)));
+}
+
+/** The "Verify fill with vision" table (issue #428): one row per filled value, what vision read and
+ *  under which printed label, and the verdict. Shared by the filled-form card and nothing else. */
+function fillVisionTableHtml(report) {
+  const rows = (report.rows || []).map((r) => `<tr><td>${esc(String((r.page ?? 0) + 1))}</td><td>${esc(r.label || "—")}</td><td>${esc(r.intended)}</td><td>${esc(r.read || "—")}</td><td>${esc(r.readUnder || "—")}</td><td><strong>${esc(r.verdict)}</strong></td></tr>`).join("");
+  const extra = (report.unexpected || []).map((u) => `<tr><td>${esc(String((u.page ?? 0) + 1))}</td><td>—</td><td>—</td><td>${esc(u.read)}</td><td>${esc(u.label || "—")}</td><td><strong>not intended</strong></td></tr>`).join("");
+  const skipped = (report.skippedPages || []).map((p) => `<li>Page ${esc(String(p.page + 1))}: ${esc(p.reason)}</li>`).join("");
+  const wrong = (report.rows || []).filter((r) => r.verdict !== "right" && r.verdict !== "read (no intended label)").length;
+  return `<p class="muted">${esc(`${(report.checkedPages || []).length} page(s) read, ${report.calls || 0} vision call(s). ${wrong ? `${wrong} value(s) need a look.` : "Every intended value read back under its label."}`)}</p>
+    ${skipped ? `<ul class="muted" style="margin:2px 0 6px 18px">${skipped}</ul>` : ""}
+    ${rows || extra ? `<table style="font-size:12px;border-collapse:collapse;width:100%"><thead><tr><th>Page</th><th>Printed label</th><th>Filled</th><th>Vision read</th><th>Read under</th><th>Verdict</th></tr></thead><tbody>${rows}${extra}</tbody></table>` : ""}`;
+}
+
+async function verifyFillWithVision(formId, btn) {
+  if (!formId || !state.selectedProjectId) return;
+  const out = document.querySelector(`[data-vision-result="${CSS.escape(formId)}"]`);
+  if (btn) btn.disabled = true;
+  if (out) out.innerHTML = `<p class="muted">Reading the filled form back with vision (one call per page)…</p>`;
+  try {
+    const report = await api(`/api/projects/${encodeURIComponent(state.selectedProjectId)}/filled-forms/${encodeURIComponent(formId)}/verify-vision`, { method: "POST", body: "{}" });
+    if (out) out.innerHTML = fillVisionTableHtml(report);
+  } catch (err) {
+    if (out) out.innerHTML = `<p class="muted">${esc(err.message || "Vision check failed.")}</p>`;
+  } finally { if (btn) btn.disabled = false; }
 }
 
 // Rebuild the filled forms after a change (verify/remap/detect) and refresh the
