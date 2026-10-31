@@ -705,6 +705,9 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
     cleanRecordLink: "adapters/submissionLedger.ts: tidies a link (#401)",
     chooseSubmittedRecord: "adapters/submissionLedger.ts: picks a record off the ledger it read (#401)",
     draftTenantKey: "draftSubmitGate.ts: builds a key from a URL",
+    // #381: the tail's reads go through readUnlessDialog (personDialogs.ts, scanned whole below).
+    readUnlessDialog: "personDialogs.ts: runs a read unless a native dialog is open on the page (never answers it)",
+    dialogOpenedSince: "personDialogs.ts: reads when a dialog last opened on the page",
     // Handed to page.evaluate (taken as values, run in the page): their module is scanned whole below.
     readApplicationLedgerInPage: "adapters/submissionLedger.ts: reads the application ledger in the page (#401)",
     recordLinkForNumberInPage: "adapters/submissionLedger.ts: reads a record's link in the page (#401)",
@@ -1008,7 +1011,7 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
   check("reviewScreenScraper.ts (the review read-back) makes no input on the page", !INPUT_CALL.test(scraper), (scraper.match(INPUT_CALL) || [""])[0]);
   // The modules whose functions or source the closure hands to the page to run (IMPORTED_VALUES,
   // NO_INPUT_HELPERS' in-page readers): each whole file, read raw.
-  for (const rel of ["portal-bot/src/adapters/submissionLedger.ts", "shared/src/portalSafety.ts"]) {
+  for (const rel of ["portal-bot/src/adapters/submissionLedger.ts", "shared/src/portalSafety.ts", "portal-bot/src/personDialogs.ts"]) {
     const src = read(rel);
     check(`${rel} (run in the page by the closure) makes no input on the page`, !INPUT_CALL.test(src), (src.match(INPUT_CALL) || [""])[0]);
   }
