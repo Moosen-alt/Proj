@@ -4364,7 +4364,7 @@ async function launchRecordSession() {
 function downloadRecordBat() {
   const cmd = buildRecordCommand();
   if (!cmd) { showMessage("Open a project first.", "warning"); return; }
-  const bat = `@echo off\r\nREM Record this portal and save the recipe to the central server.\r\nREM Save this file in your SOLAR-Proj folder, then double-click it.\r\ncd /d "%~dp0"\r\n${cmd}\r\npause\r\n`;
+  const bat = `@echo off\r\nREM Record this portal and save the recipe to the central server.\r\nREM Save this file in your SOLAR-Proj folder, then double-click it.\r\n${sharedServerBatLines()}cd /d "%~dp0"\r\n${cmd}\r\npause\r\n`;
   const blob = new Blob([bat], { type: "application/octet-stream" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -4373,6 +4373,72 @@ function downloadRecordBat() {
   a.click();
   a.remove();
   URL.revokeObjectURL(a.href);
+}
+
+// ----- Shared server posture (#439) -----
+// On the owner's own PC "the server" and "my computer" are the same box, so pasting a local MBOX
+// path, scanning a folder, or launching a recorder window "here" just works. On a shared server
+// every one of those reads the SERVER'S disk or opens a window nobody can see. GET /api/auth/me
+// says which (serverIsShared, backend/src/serverPosture.ts); with it on, body.server-shared hides
+// the .local-disk-only controls and shows the .shared-server-note lines (styles.css), and the
+// record helper names the server URL and the recorder token. With it off nothing changes.
+function serverIsSharedNow() {
+  return !!(state.authMe && state.authMe.serverIsShared === true);
+}
+
+function recordSharedNoteText() {
+  const origin = window.location.origin;
+  let text = `This dashboard runs on a shared server, so the recorder runs on your own computer, not here: download record.bat or copy the command, and run it in your SOLAR-Proj folder. It saves the recipe to this server: ${origin}.`;
+  if (state.authMe && state.authMe.enabled) {
+    text += " Sign-in is on here, so the recorder needs your personal recorder token. Recorder tokens are not built yet (issue #433); until then this server refuses a recording sent from your computer.";
+  }
+  return text;
+}
+
+function sharedServerBatLines() {
+  if (!serverIsSharedNow()) return "";
+  // REM lines are inert; the origin comes from the browser's own location bar, never the server.
+  const origin = window.location.origin.replace(/[\r\n%^&|<>]/g, "");
+  let lines = `REM Saves to the shared server ${origin} (the --api flag below).\r\n`;
+  if (state.authMe && state.authMe.enabled) lines += "REM Sign-in is on there: the recorder needs your personal recorder token (issue #433).\r\n";
+  return lines;
+}
+
+function applyServerPosture() {
+  const shared = serverIsSharedNow();
+  document.body.classList.toggle("server-shared", shared);
+  const note = shared ? recordSharedNoteText() : "";
+  for (const id of ["recordSharedNote", "recordCmdSharedNote"]) {
+    const el = $(id);
+    if (el) el.textContent = note;
+  }
+  // Say "on the server" in the controls that stay (an admin may put a file there on purpose).
+  // Off: put back exactly what dashboard.html shipped.
+  const relabel = (id, prop, sharedText) => {
+    const el = $(id);
+    if (!el) return;
+    const key = `localText_${prop}`;
+    if (el.dataset[key] === undefined) el.dataset[key] = el[prop];
+    el[prop] = shared ? sharedText : el.dataset[key];
+  };
+  relabel("batchFolderPath", "placeholder", "Folder path ON THE SERVER (not your computer)");
+  relabel("emailWatchPath", "placeholder", "MBOX path ON THE SERVER to watch (not your computer)");
+  const scanLabel = $("startBatchScanBtn")?.querySelector("span");
+  if (scanLabel) {
+    if (scanLabel.dataset.localText === undefined) scanLabel.dataset.localText = scanLabel.textContent;
+    scanLabel.textContent = shared ? "Scan Server Folder" : scanLabel.dataset.localText;
+  }
+}
+
+async function loadServerPosture() {
+  try { state.authMe = await api("/api/auth/me"); } catch { /* an older server: treat as not shared */ }
+  applyServerPosture();
+}
+
+// The MBOX upload's own error text used to send everyone to Import Path; on a shared server that
+// control is hidden (it would read the server's disk), so the hint is left out there.
+function mboxPathFallbackHint(text) {
+  return serverIsSharedNow() ? "" : text;
 }
 
 // Run a render step in isolation: a failure in one panel (e.g. unexpected project
@@ -9251,7 +9317,7 @@ function uploadMboxFile(file) {
       }
       resolve(data);
     };
-    xhr.onerror = () => reject(new Error("Browser could not upload the selected MBOX file. Paste the local file path below and use Import Path."));
+    xhr.onerror = () => reject(new Error(`Browser could not upload the selected MBOX file.${mboxPathFallbackHint(" Paste the local file path below and use Import Path.")}`));
     xhr.onabort = () => reject(new Error("MBOX import was canceled."));
     setMboxProgress(1, `Starting upload for ${file.name} (${formatBytes(file.size)})...`);
     xhr.send(file);
@@ -9285,7 +9351,7 @@ async function importMbox(event) {
   } catch (err) {
     event.target.value = "";
     setMboxProgress(0, "Import failed.", true);
-    showMessage(`${err.message || "MBOX import failed."}\nIf the file is cloud-only, locked by Outlook, or too large for browser upload, paste its full local path and click Import Path.`, "error");
+    showMessage(`${err.message || "MBOX import failed."}${mboxPathFallbackHint("\nIf the file is cloud-only, locked by Outlook, or too large for browser upload, paste its full local path and click Import Path.")}`, "error");
   }
 }
 
@@ -11224,6 +11290,7 @@ $("kpiModal").addEventListener("click", (e) => { if (e.target.id === "kpiModal")
   if (bootPage !== "project") showPage(VALID_PAGES.includes(bootPage) ? bootPage : "dashboard", { skipLoad: true });
 }
 await checkHealth();
+await loadServerPosture();
 // Independent loads, in parallel: the board no longer waits on clients and users in series.
 await Promise.all([loadProjects(), loadClients(), loadUsers()]);
 // Users arrive in parallel with the board, so repaint once for the assignee dots.

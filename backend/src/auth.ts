@@ -3,6 +3,7 @@ import type { NextFunction, Request, Response } from "express";
 import type { AppDb, SqlParam } from "./db";
 import { DEFAULT_ORG_ID } from "./db";
 import { apiKeyAuthPrefixes, orgEntitlements, productsAllowPath } from "./entitlements";
+import { serverIsShared } from "./serverPosture";
 
 type Row = Record<string, SqlParam>;
 
@@ -263,8 +264,11 @@ export function logout(_req: Request, res: Response): void {
   res.json({ ok: true });
 }
 
+// serverIsShared rides along (#439): the dashboard already reads this at boot, and it decides
+// whether the controls that read the SERVER'S disk are shown as if the server were the user's PC.
+// A boolean about the deployment, nothing about the caller, so it is safe before sign-in too.
 export function me(db: AppDb, req: Request, res: Response): void {
-  res.json({ enabled: AUTH_ENABLED, user: AUTH_ENABLED ? currentUser(db, req) : null });
+  res.json({ enabled: AUTH_ENABLED, user: AUTH_ENABLED ? currentUser(db, req) : null, serverIsShared: serverIsShared(process.env) });
 }
 
 /** Brand images and vendored fonts a logged-out page needs. A single file name, no leading dot. */

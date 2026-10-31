@@ -43,6 +43,7 @@ Create `/etc/solar-autopilot.env` (chmod 600):
 ```
 AUTH_ENABLED=true
 SERVER_HOST=0.0.0.0                     # listen beyond loopback ON PURPOSE (the default is 127.0.0.1)
+SERVER_IS_SHARED=1                      # dashboard hides/relabels controls that read the SERVER'S disk (#439); detected anyway with the two lines above
 ADMIN_EMAIL=you@company.com
 ADMIN_PASSWORD=<strong password>        # first login; change after
 ANTHROPIC_API_KEY=sk-ant-...
