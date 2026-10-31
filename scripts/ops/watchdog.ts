@@ -37,6 +37,7 @@
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
+import { backupDir, opsDir } from "../../backend/src/statePaths";
 import { composeMessage, loadState, runOnce, saveState, type WatchdogConfig } from "./watchdogCore";
 import { configuredChannels, deliver } from "./mailer";
 
@@ -64,13 +65,13 @@ const config: WatchdogConfig = {
   repeatHours: numEnv("WATCHDOG_REPEAT_HOURS", 6),
   intervalSec: numEnv("WATCHDOG_INTERVAL_SECONDS", 300),
   // Same default and resolution as backend/src/backup.ts, so it watches the folder the server writes.
-  backupDir: env.WATCHDOG_BACKUP_DIR === "off" ? null : path.resolve(process.cwd(), env.WATCHDOG_BACKUP_DIR || env.BACKUP_DIR || "backend/data/backups"),
+  backupDir: env.WATCHDOG_BACKUP_DIR === "off" ? null : env.WATCHDOG_BACKUP_DIR ? path.resolve(process.cwd(), env.WATCHDOG_BACKUP_DIR) : backupDir(),
   backupMaxAgeHours: backupMax,
   offboxDir: offboxRaw ? path.resolve(process.cwd(), offboxRaw) : null,
   offboxMaxAgeHours: numEnv("WATCHDOG_OFFBOX_MAX_AGE_HOURS", backupMax + 6),
 };
-const stateFile = path.resolve(process.cwd(), env.WATCHDOG_STATE_FILE || "data/ops/watchdog-state.json");
-const logFile = path.resolve(process.cwd(), env.WATCHDOG_LOG_FILE || "data/ops/watchdog.log");
+const stateFile = env.WATCHDOG_STATE_FILE ? path.resolve(process.cwd(), env.WATCHDOG_STATE_FILE) : path.join(opsDir(), "watchdog-state.json");
+const logFile = env.WATCHDOG_LOG_FILE ? path.resolve(process.cwd(), env.WATCHDOG_LOG_FILE) : path.join(opsDir(), "watchdog.log");
 
 function log(message: string): void {
   const stamped = `${new Date().toISOString()} ${message}`;

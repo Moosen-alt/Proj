@@ -30,7 +30,8 @@ Key variables (see `.env.example` for the full list):
 | Variable | Purpose |
 |---|---|
 | `PORT` | HTTP port (default 4173) |
-| `AUTOPILOT_DB_PATH` | SQLite file path (default `backend/data/autopilot.sqlite`) |
+| `AUTOPILOT_STATE_DIR` | One root for every piece of state (see §3). Unset = the folder layout below the working directory |
+| `AUTOPILOT_DB_PATH` | SQLite file path (default `backend/data/autopilot.sqlite`, or `<AUTOPILOT_STATE_DIR>/autopilot.sqlite`) |
 | `SESSION_ENCRYPTION_KEY` | **Required.** Encrypts portal storage-state blobs |
 | `ANTHROPIC_API_KEY` | Enables Claude AI (vision parsing, extraction, drafting) |
 | `AUTH_ENABLED` / `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Turn on dashboard login |
@@ -52,8 +53,13 @@ docker compose up -d --build
 ```
 
 - Serves on `http://localhost:${PORT:-4173}`.
-- The SQLite DB + backups persist in the named volume `solar-data`
-  (mounted at `/app/backend/data`).
+- **All state persists in the named volume `solar-data`**, mounted at `/app/backend/data`.
+  The image sets `AUTOPILOT_STATE_DIR=/app/backend/data`, so the database, project documents,
+  backups, portal login profiles (`portal-profiles/`), the draft ledger (`portal-drafts.jsonl`,
+  the record of drafts left on real portals), learn and replay runs, screenshots, `portal-debug/`
+  and `logs/` all land in it (`backend/src/statePaths.ts`). Before this, everything except the
+  database, documents and backups was written into the container and lost on every redeploy.
+  If you mount the volume somewhere else, set `AUTOPILOT_STATE_DIR` to that same path.
 - Container health is wired to `/health`; `docker ps` shows healthy/unhealthy.
 
 Plain Docker (no compose):
@@ -67,6 +73,10 @@ docker run -d --name solar -p 4173:4173 --env-file .env \
   -v solar-data:/app/backend/data solar-submission-autopilot
 ```
 
+Leave the per-path settings (`AUTOPILOT_DB_PATH`, `PROJECT_DOCS_DIR`, `PORTAL_PROFILES_DIR`,
+`BACKUP_DIR`, …) out of a container's `.env`: each one still wins over `AUTOPILOT_STATE_DIR`, so a
+path set there can put that piece of state back outside the volume.
+
 ### Option B — bare Node
 
 ```bash
@@ -76,6 +86,12 @@ npm start          # = tsx backend/src/server.ts
 
 Run it under a process manager (systemd, pm2) so it restarts on crash/reboot.
 `tsx` is a runtime dependency, so `npm ci --omit=dev` is also fine for production.
+
+On a server, set `AUTOPILOT_STATE_DIR` to the persistent disk (for example `/var/lib/solar`) so
+every piece of state lives in one folder you can back up and move. Unset, the app keeps today's
+layout under the working directory: `backend/data/`, `data/` and `portal-profiles/`. An install
+that turns it on with a draft ledger already at `data/portal-drafts.jsonl` keeps writing that file
+and logs a warning until you move it into the new folder; it is never moved for you.
 
 ---
 

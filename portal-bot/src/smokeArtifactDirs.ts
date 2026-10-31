@@ -15,6 +15,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { runDataDir } from "../../backend/src/statePaths";
 
 /** Every env var portal-bot reads to decide where a run's artifacts land (same list as the runner). */
 export const SMOKE_ARTIFACT_ENV = [
@@ -45,7 +46,7 @@ export function defaultSmokeArtifactDirs(
   env: Record<string, string | undefined> = process.env,
   opts: { cwd?: string; tmpRoot?: string } = {},
 ): SmokeArtifactDefaults {
-  const dataDir = path.join(opts.cwd ?? process.cwd(), "data");
+  const dataDir = opts.cwd ? path.join(opts.cwd, "data") : runDataDir();
   const needs = SMOKE_ARTIFACT_ENV.filter((k) => {
     const v = String(env[k] ?? "").trim();
     return !v || inside(v, dataDir);

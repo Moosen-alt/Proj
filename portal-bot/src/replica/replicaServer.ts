@@ -18,6 +18,7 @@
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
+import { runDataDir } from "../../../backend/src/statePaths";
 import type { ReplicaBundle } from "./extractFromTrace";
 
 export interface ReplicaSubmission {
@@ -40,7 +41,7 @@ export function loadBundle(file: string): ReplicaBundle {
 }
 
 export function bundleDir(): string {
-  return path.resolve(process.cwd(), "data/portal-replicas");
+  return path.join(runDataDir(), "portal-replicas");
 }
 
 export function listBundles(): string[] {

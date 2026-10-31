@@ -49,7 +49,7 @@ ADMIN_PASSWORD=<strong password>        # first login; change after
 ANTHROPIC_API_KEY=sk-ant-...
 SESSION_ENCRYPTION_KEY=<openssl rand -hex 32>   # portal credentials at rest — LOSING THIS LOSES STORED LOGINS
 ALLOWED_ORIGINS=https://autopilot.yourco.com     # lock CORS to your domain
-AUTOPILOT_DB_PATH=/var/lib/solar/autopilot.db   # persistent disk
+AUTOPILOT_STATE_DIR=/var/lib/solar            # persistent disk: database, documents, backups, portal logins, draft ledger, runs, logs
 PORTAL_HEADLESS=true
 DOCUMENT_FETCH_BROWSER=0                # no headed-browser fallback for walled documents: a server has no display
 PUBLIC_BASE_URL=https://autopilot.yourco.com   # client-facing links in emails; NEVER leave the localhost default in production
@@ -69,6 +69,14 @@ WantedBy=multi-user.target
 
 HTTPS front door (Caddy — automatic certificates):
 `caddy reverse-proxy --from autopilot.yourco.com --to localhost:4000`
+
+One state root: `AUTOPILOT_STATE_DIR` puts every piece of state under one folder
+(`backend/src/statePaths.ts`): `autopilot.sqlite`, `project-documents/`, `backups/`,
+`portal-profiles/` (the live portal logins), `portal-drafts.jsonl` (the draft ledger),
+`learn-runs/`, `replay-runs/`, `screenshots/`, `portal-debug/` and `logs/`. Back up and move that
+one folder. Do not also set `AUTOPILOT_DB_PATH`, `PROJECT_DOCS_DIR` or `PORTAL_PROFILES_DIR`: each
+still wins over the root and splits the state again. In Docker the image already sets it to the
+mounted volume, `/app/backend/data` (DEPLOY.md §3).
 
 Rules: ONE instance only (SQLite). Updates: `git pull && npm install
 && npm run smoke && systemctl restart solar` — migrations self-apply.
@@ -113,7 +121,9 @@ snapshot does both:
 
 `litestream.yml` replicates **only the SQLite file** — continuous DB replication,
 not files. So the off-box copy still matters: nightly `restic`/`rclone` of the
-whole data dir (or at minimum `backups/`) to S3/R2. Restore = `litestream restore`
+whole `AUTOPILOT_STATE_DIR` (or at minimum `backups/`) to S3/R2. The backup, the
+restore drill (`scripts/ops/restore-drill.ts`), preflight and the watchdog read the
+same resolver as the server, so they find the database and folders under it. Restore = `litestream restore`
 (or the newest snapshot) **plus** the document tree; do the files first, so the
 restored rows point at something.
 

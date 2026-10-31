@@ -27,6 +27,7 @@ process.env.SKIP_CODE_RESEARCH = "1";
 process.env.AUTOPILOT_AUTO_START = "0";
 import fs from "node:fs";
 import path from "node:path";
+import { portalProfilesDir, runDataDir } from "./statePaths";
 import { openDatabase } from "./db";
 import { createProject, deleteProject } from "./repository";
 import { findCompleteRecipeForProject, resolveRecipeFieldValues } from "./portalRecipes";
@@ -42,7 +43,7 @@ import {
 } from "./crossProjectReplay";
 import type { ProjectRecord, RecipeStep } from "../../shared/src/types";
 
-const OUT_DIR = path.resolve(process.cwd(), "data", "cross-project-replay");
+const OUT_DIR = path.join(runDataDir(), "cross-project-replay");
 const CLIENT = process.env.BENCHMARK_CLIENT_ID || "tml-international-llc";
 
 const arg = (name: string): string | undefined => {
@@ -391,7 +392,7 @@ async function main(): Promise<void> {
     // One browser profile per PORTAL (not per portal type) — the replay benchmark's
     // isolation discipline: PowerClerk allows one session per account, and a shared
     // profile let one portal's session kill another's run.
-    const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+    const profileBase = portalProfilesDir();
     const userDataDir = path.join(profileBase, CLIENT, credPortalType, host.replace(/[^a-z0-9.-]+/gi, "_"));
 
     // Placeholder documents for every upload slot the recipe asks for, each page headed

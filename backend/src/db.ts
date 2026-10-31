@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { dbPath as stateDbPath } from "./statePaths";
 import Database, { type Database as DB, type Statement } from "better-sqlite3";
 import { baselineRuleDefinitions } from "./baselineRules";
 import { knowledgeProfileKey, purgeCredentialNoteSegments, purgeForeignKnownTenantPortals, seedInitialKnowledgeBase } from "./knowledgeBase";
@@ -110,7 +111,7 @@ export class AppDb {
 }
 
 export async function openDatabase(): Promise<AppDb> {
-  const dbPath = path.resolve(process.cwd(), process.env.AUTOPILOT_DB_PATH || "backend/data/autopilot.sqlite");
+  const dbPath = stateDbPath();
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   const db = new Database(dbPath);

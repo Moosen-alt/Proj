@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { portalProfilesDir } from "./statePaths";
 import type { ClientPartnerContact, ClientPortalIdentity, ClientRecord, ClientStateLicense, LicenceAnswer, LicenceKind } from "../../shared/src/types";
 import { canonicalLicenceKind, kindForSlot, LICENCE_KIND_SET, LICENCE_KINDS, licenceKindWords } from "../../shared/src/licenceKinds";
 import type { AppDb } from "./db";
@@ -740,7 +741,7 @@ function sessionKeyState(): { ok: boolean; reason: string } {
 /** Resolved the same way repository.ts resolves it for every live run — read, not guessed.
  *  If these two ever disagree the purge cleans a directory nobody writes to. */
 function portalProfilesBase(): string {
-  return process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  return portalProfilesDir();
 }
 
 /** Every browser profile under this client's tree. repository.ts nests them

@@ -12,6 +12,7 @@
 // Each run creates a new draft application on that portal — fine for a demo, worth
 // clearing afterwards.
 import path from "node:path";
+import { portalProfilesDir } from "../../backend/src/statePaths";
 import url from "node:url";
 import type { PortalRecipe } from "../../shared/src/types";
 
@@ -105,7 +106,7 @@ async function main(): Promise<void> {
     credential: cred,
     headless: false,              // VISIBLE — this is the whole point
     autoSubmit: false,            // never submits
-    userDataDir: path.join(process.cwd(), "portal-profiles", CLIENT, `demo_${t.key}`),
+    userDataDir: path.join(portalProfilesDir(), CLIENT, `demo_${t.key}`),
   } as never).catch((e) => { console.error(`\n   run error: ${(e as Error).message.slice(0, 200)}`); return null; });
 
   const secs = ((Date.now() - started) / 1000).toFixed(0);
