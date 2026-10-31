@@ -41,7 +41,7 @@ const names = [
   "esc", "httpUrl", "linkifyText", "fmtDate", "humanize", "statusBadge",
   "TRACK_STATUS_CLASS", "TRACK_CHANNEL_BASIS", "OFF_TOOL_CHANNEL", "offToolChannelHtml", "trackChannelHtml",
   "trackPrerequisitesHtml", "ESS_STEP_BASIS", "trackEssStepHtml", "trackNextActionText", "screenshotMisses", "screenshotKey",
-  "TRACK_ISSUER_KEY", "TRACK_ISSUER_SOURCE", "trackIssuerHtml", "trackIssuerEditHtml", "saveTrackIssuer", "trackCardHtml",
+  "TRACK_ISSUER_KEY", "TRACK_ISSUER_SOURCE", "trackIssuerHtml", "trackIssuerEditHtml", "saveTrackIssuer", "STAGE_GAP_LINK", "trackStageGapsHtml", "trackCardHtml",
 ];
 const bundle = names.map(cut).join("\n;\n");
 

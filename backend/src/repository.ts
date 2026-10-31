@@ -82,7 +82,8 @@ import type { DesignTextSource } from "./designCriteria";
 import { describeCited, lookedUpRecordType, issuingAgencyFor, permitAnswerForTrack, stateRulesFor, isStatewidePortalUrl, permitProcessKey, projectForTrack, refuseTrackIssuerValue, trackIssuer } from "./permitProcess";
 import { statewideDecisionFor, statewideUrlRefusal } from "./statewideEvidence";
 import { RESEARCH_UNCONFIRMED_REASON, researchNamedPlatform, researchSaysPortalUnconfirmed, researchWithFittedUrl } from "./researchedPortalUrl";
-import { bindRecipeForReplay, describeReplayBinding, openPerJobQuestions } from "./recipeReplayBinding";
+import { bindRecipeForReplay, describeReplayBinding } from "./recipeReplayBinding";
+import { recipeStageGaps, stageGapsRefusal, type RecipeStageGap } from "./recipeStageGaps";
 import { agencyListStatusResolver, documentInventory, missingFilledAtStaging, owedDocumentAction, owedMissingDocuments, requiredListCheck, type DocumentInventory, type DocPresence } from "./requiredDocuments";
 import { deadLinkSentence, formDeadLinks, startedAtLabel, type StageAcquiredForm } from "./formAcquisitionPlan";
 import { agencyListReplacesLine, issuingAgencyDocumentList } from "./applicationDocsAgency";
@@ -9486,9 +9487,18 @@ export async function prepareSubmission(
   // (R10) now binds that control to the job's key, and an unanswered key would replay a blank — so
   // the question is asked first, named, the way the question bank lists it for intake. Same
   // predicate as the bank, the binders and the planner (shared/src/perJobQuestions).
+  //
+  // AND EVERY OTHER BOX THE RECIPE WILL FILL (#445, owner 2026-10-31: "automated fill is right every
+  // time"). validatePortalFields above is a fixed list; the recipe binds far more (a preparer phone,
+  // an inverter model, a contractor licence, an uploaded document), and a blank one only showed at
+  // the portal — after a full run. The same bound steps and the same value dictionary the replay
+  // below is handed are read once here (recipeStageGaps): every non-optional fill/select bound to a
+  // field this job has no value for, and every upload whose document is not on file, refuses the
+  // stage with each one named. Literal steps and steps the replay answers itself never count. It
+  // refuses earlier and never answers a field; it reads and writes no row but the audit line.
   if (recipe && runActorLabel === "RecipeAdapter" && !channelDecision.blocked
       && !recipeTrackConflict && !recipeEntityMisfit && !recipeDisciplineConflict) {
-    let open: Array<{ key: string; label: string }> = [];
+    let gaps: RecipeStageGap[] = [];
     try {
       const gateValues = resolveRecipeFieldValues(db, stagedProject, portalType, track ?? null);
       const gateBinding = bindRecipeForReplay({
@@ -9496,20 +9506,31 @@ export async function prepareSubmission(
         borrowed: borrowed ? { learnedFor: borrowed.learnedFor, discipline: borrowed.discipline } : null,
         agency: issuingAgencyFor(portalProject, track),
       });
-      open = openPerJobQuestions(gateBinding.steps, { ...gateValues, ...gateBinding.fieldValues });
+      gaps = recipeStageGaps(gateBinding.steps, { ...gateValues, ...gateBinding.fieldValues }, docsByType, { clientKeys: Object.keys(overlay) });
     } catch (err) {
       // The replay path binds the same steps again inside the run below and records its own failure.
-      logger.warn("prepare-submission", `per-job question check could not read the recipe: ${err instanceof Error ? err.message : String(err)}`);
+      logger.warn("prepare-submission", `recipe input check could not read the recipe: ${err instanceof Error ? err.message : String(err)}`);
     }
-    if (open.length) {
-      addAuditLog(db, projectId, "system", "submit gate", "portal.per_job_question_open", {
-        track: track ?? "permit", recipeId: recipe.id, questions: open,
+    if (gaps.length) {
+      const open = gaps.filter((g) => g.kind === "question").map((g) => ({ key: g.key, label: g.label }));
+      // Labels and keys only — never a value (rule 2: a secret gap carries its fixed label).
+      const missingRecipeInputs = gaps.filter((g) => g.kind !== "question")
+        .map((g) => ({ kind: g.kind, key: g.key, label: g.label, fieldName: g.fieldName, where: g.where, secret: g.secret }));
+      if (open.length) {
+        addAuditLog(db, projectId, "system", "submit gate", "portal.per_job_question_open", {
+          track: track ?? "permit", recipeId: recipe.id, questions: open,
+        });
+      }
+      if (missingRecipeInputs.length) {
+        addAuditLog(db, projectId, "system", "submit gate", "portal.recipe_inputs_missing", {
+          track: track ?? "permit", recipeId: recipe.id, missing: missingRecipeInputs.map((g) => ({ kind: g.kind, key: g.key, label: g.label })),
+        });
+      }
+      throw new HttpError(409, stageGapsRefusal(gaps, portalLabel), {
+        ...(open.length ? { unansweredPortalQuestions: open } : {}),
+        ...(missingRecipeInputs.length ? { missingRecipeInputs } : {}),
+        track: track ?? "permit", recipeId: recipe.id,
       });
-      throw new HttpError(409,
-        `Staging paused before opening the portal: ${portalLabel} asks ${open.length === 1 ? "a question" : `${open.length} questions`} only a person can answer for this job — `
-        + `${open.map((q) => `"${q.label}"`).join("; ")}. The recorded answer belonged to another job, so it is never replayed; `
-        + "answer it under the project's portal questions (or send the intake link), then stage again. Nothing was opened.",
-        { unansweredPortalQuestions: open, track: track ?? "permit", recipeId: recipe.id });
     }
   }
   let result: Record<string, unknown>;

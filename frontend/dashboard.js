@@ -5024,6 +5024,67 @@ async function saveTrackIssuer(type, value, btn) {
   }
 }
 
+// WHAT THIS TRACK'S RECIPE WILL FILL THAT THE JOB HAS NO VALUE FOR (#445, owner 2026-10-31: "automated
+// fill is right every time"). The server's own reading (backend recipeStageGaps — the list the stage
+// gate refuses on), shown before anyone clicks Stage: each box in the portal's words, what to fill,
+// and a link to where it is filled. Labels and keys only; the server never sends a value (rule 2).
+// Untrusted text: esc() everything.
+const STAGE_GAP_LINK = {
+  project: "Fill it on the project",
+  client: "Fill it on the client",
+  documents: "Upload it",
+  portal_questions: "Answer it",
+};
+function trackStageGapsHtml(t) {
+  const gaps = Array.isArray(t && t.stageGaps) ? t.stageGaps : [];
+  if (!gaps.length) return "";
+  const what = (g) => g.kind === "document"
+    ? `needs a ${g.fieldName} document`
+    : g.kind === "question"
+      ? "a question only a person can answer for this job"
+      : `needs ${g.fieldName}${g.where === "client" ? " (client record)" : ""}`;
+  const items = gaps.map((g) => `<li data-stage-gap="${esc(g.key)}" data-stage-gap-kind="${esc(g.kind)}">
+        <span>“${esc(g.label || g.fieldName)}” — ${esc(what(g))}</span>
+        <a href="#" data-stage-gap-open="${esc(g.where)}" data-stage-gap-key="${esc(g.key)}">${esc(STAGE_GAP_LINK[g.where] || "Open")}</a>
+      </li>`).join("");
+  return `<div class="track-stage-gaps" data-track-stage-gaps="${esc(t.type)}" style="margin:0 0 6px;font-size:12px;color:var(--warning)">
+    <strong>Fill before staging — the recipe fills ${gaps.length === 1 ? "this box" : `these ${gaps.length} boxes`} and this job has no value, so staging will stop here:</strong>
+    <ul style="margin:2px 0 0 18px;padding:0">${items}</ul>
+  </div>`;
+}
+// Where each gap is filled. A project field with its own box on the project-data form is focused;
+// anything else opens the form it lives on.
+const STAGE_GAP_PROJECT_INPUT = {
+  homeownerEmail: "manualHomeownerEmail", ubAccountHolderEmail: "manualHomeownerEmail",
+  homeownerPhone: "manualHomeownerPhone", ubAccountHolderPhone: "manualHomeownerPhone",
+  workDescription: "manualDescription", jobValue: "manualJobValue",
+};
+function openStageGap(where, key) {
+  const reveal = (el) => {
+    if (!el) return;
+    // Every collapsed section it sits in (the stage accordion and the project-data panel) opens.
+    for (let d = el.closest ? el.closest("details") : null; d; d = d.parentElement ? d.parentElement.closest("details") : null) d.open = true;
+    if (el.scrollIntoView) el.scrollIntoView({ block: "center" });
+    if (el.focus) el.focus();
+  };
+  if (where === "documents") {
+    const sel = $("docUploadType");
+    if (sel && Array.from(sel.options || []).some((o) => o.value === key)) sel.value = key;
+    reveal(sel);
+    return;
+  }
+  if (where === "client") {
+    const clientId = state.detail && state.detail.project ? state.detail.project.clientId : "";
+    Promise.resolve(openClientsModal()).then(() => { if (clientId) editClient(clientId); }).catch(() => {});
+    return;
+  }
+  if (where === "portal_questions") {
+    reveal(document.getElementById("portalQuestionsChip") || document.querySelector(".intake-link-row"));
+    return;
+  }
+  reveal($(STAGE_GAP_PROJECT_INPUT[key] || "") || $("manualEntryForm"));
+}
+
 function trackCardHtml(t) {
   const cls = TRACK_STATUS_CLASS[t.status] || "info";
   // Captured numbers — only the fields this track actually uses (NEM has no permit #).
@@ -5095,6 +5156,7 @@ function trackCardHtml(t) {
     ${trackPrerequisitesHtml(t)}
     ${trackEssStepHtml(t)}
     <p style="margin:0 0 6px;font-size:12px">→ ${linkifyText(trackNextActionText(t))}</p>
+    ${trackStageGapsHtml(t)}
     ${captured ? `<p style="margin:0 0 4px">${captured} ${trackLink ? "&nbsp;·&nbsp; " + trackLink : ""}</p>` : (trackLink ? `<p style="margin:0 0 4px">${trackLink}</p>` : "")}
     ${t.recipeId && (t.recipeStatus === "complete" || t.recipeStatus === "recording")
       && !screenshotMisses.has(screenshotKey(state.selectedProjectId, t.recipeId, t.recipeStatus))
@@ -5227,6 +5289,9 @@ function renderSubmittalTracks() {
   });
   wrap.querySelectorAll("button[data-track-stage]").forEach((btn) => {
     btn.addEventListener("click", () => stageSubmittalTrack(btn.dataset.trackStage, btn));
+  });
+  wrap.querySelectorAll("a[data-stage-gap-open]").forEach((a) => {
+    a.addEventListener("click", (ev) => { ev.preventDefault(); openStageGap(a.dataset.stageGapOpen, a.dataset.stageGapKey); });
   });
   wrap.querySelectorAll("button[data-track-open-recorder]").forEach((btn) => {
     btn.addEventListener("click", () => launchTrackRecorder(btn.dataset.trackOpenRecorder, btn.dataset.scope, btn));
