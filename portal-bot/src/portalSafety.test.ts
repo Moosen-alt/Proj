@@ -42,6 +42,7 @@ import {
   isSubmitIntent,
   isSubmitOrPayRequestUrl,
   isPayRequestUrl,
+  isFilingOrPaymentRequest,
   mayClickFinalSubmit,
   PORTAL_SAFETY_IN_PAGE_SOURCE,
   recordingHasFormData,
@@ -899,6 +900,63 @@ await check("rule 1 (isPayRequestUrl) knows the processors a person's 4 s window
     assert.ok(!isPayRequestUrl(u), u);
     assert.ok(!pageCopy.isPayRequestUrl(u), `page copy: ${u}`);
   }
+});
+
+await check("#379: a percent-encoded letter does not hide a filing or payment word, and a bare /pay segment is a payment (Node and page copy)", () => {
+  // Many servers decode the path before routing (IIS/ASP.NET does), so these land on the filing or
+  // payment handler. Red before: every one of them read as neither.
+  const filing = [
+    "https://x.test/S%75bmitApplication",
+    "https://x.test/%53ubmit",
+    "https://x.test/Project/%73%75%62%6d%69%74",
+    "https://x.test/api/%46inalize",
+    "https://x.test/Cap/Continue%41pplication.aspx",
+    "https://x.test/%zzsubmit", // a malformed escape: the raw form still reads
+    "https://x.test/%zz/S%75bmitApplication", // a malformed escape does not stop the rest decoding
+  ];
+  const payment = [
+    "https://x.test/%70ayment",
+    "https://x.test/%70ayment/charge",
+    "https://x.test/cart/check%6Fut",
+    "https://x.test/pay",
+    "https://x.test/pay/fee",
+    "https://x.test/Permits/PAY?id=7",
+    "https://x.test/fees/pay#top",
+    "https://x.test/pay;jsessionid=abc",
+    "https://x.test/%70ay/fee", // an encoded letter in the bare segment
+    "https://x.test/fees%2Fpay", // an encoded slash makes it a segment once decoded
+  ];
+  for (const u of filing) {
+    assert.ok(isSubmitOrPayRequestUrl(u), u);
+    assert.ok(pageCopy.isSubmitOrPayRequestUrl(u), `page copy: ${u}`);
+    assert.ok(isFilingOrPaymentRequest("POST", u), `POST ${u}`);
+  }
+  for (const u of payment) {
+    assert.ok(isPayRequestUrl(u), u);
+    assert.ok(pageCopy.isPayRequestUrl(u), `page copy: ${u}`);
+    assert.ok(isSubmitOrPayRequestUrl(u), `submit-or-pay: ${u}`);
+    assert.ok(pageCopy.isSubmitOrPayRequestUrl(u), `page copy submit-or-pay: ${u}`);
+    assert.ok(isFilingOrPaymentRequest("POST", u), `POST ${u}`);
+  }
+  // "pay" inside a word is not a segment; a "/pay" inside a query value is not a path segment; an
+  // encoded ordinary save stays ordinary; a GET is still not a filing request.
+  for (const u of [
+    "https://x.test/payload",
+    "https://x.test/api/payload/upload",
+    "https://x.test/hr/paystub",
+    "https://x.test/display",
+    "https://x.test/Project/Payee",
+    "https://x.test/repay-schedule",
+    "https://x.test/login?next=/pay",
+    "https://x.test/api/Save%46ield",
+    "https://x.test/Project/%55pdateSection",
+  ]) {
+    assert.ok(!isPayRequestUrl(u), u);
+    assert.ok(!pageCopy.isPayRequestUrl(u), `page copy: ${u}`);
+    assert.ok(!isSubmitOrPayRequestUrl(u), `submit-or-pay: ${u}`);
+    assert.ok(!pageCopy.isSubmitOrPayRequestUrl(u), `page copy submit-or-pay: ${u}`);
+  }
+  assert.ok(!isFilingOrPaymentRequest("GET", "https://x.test/S%75bmitApplication"), "a GET is not a filing request");
 });
 
 console.log(failures === 0
