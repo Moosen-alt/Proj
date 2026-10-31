@@ -12,8 +12,12 @@ import fs from "node:fs";
 import os from "node:os";
 import { pathToFileURL } from "node:url";
 import path from "node:path";
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
-import { FIELD_SYNONYMS, normLabel, checkboxLabels } from "./formTextLayer";
+import { PDFDocument, PDFTextField, StandardFonts, rgb } from "pdf-lib";
+import {
+  FIELD_SYNONYMS, normLabel, checkboxLabels, extractLabels, captionsForRect, calibrateCaptionSide, primaryCaption, captionAgreesWithName,
+  type WidgetCaptions, type WidgetRect,
+} from "./formTextLayer";
+import { partyOfSlot, pickSlots, sectionHeaders, sectionOf, type Slot } from "./formFillSlots";
 
 /** A single text value drawn on a page. Coordinates are PDF points with the
  *  ORIGIN AT THE BOTTOM-LEFT (pdf-lib's native convention); the browser converts
@@ -94,9 +98,13 @@ function matchCheckbox(fields: { name: string; norm: string; kind: string; label
   return bestScore >= 1 ? best : null;
 }
 
-/** Auto-fill an AcroForm by matching provided data keys (name/street/city/…) to
- *  the form's field NAMES via synonyms, then setting each text field. Perfectly
- *  accurate (no coordinate guessing) — the right path whenever a form is fillable.
+/** Auto-fill an AcroForm by matching provided data keys (name/street/city/…) to its text boxes.
+ *  WHICH box (issue #428): what the box IS on the printed page — its printed caption when the form's
+ *  captions disagree with its widget name (BCD 5952's city box is NAMED "State  Oregon"; the
+ *  Waltham shape, formTextLayer.calibrateCaptionSide), else its name and caption together — and
+ *  the party it sits in (formFillSlots.pickSlots: whole words, never an office-use/fee box, the
+ *  homeowner in the owner block, the company in the contractor block, one combined
+ *  City/State/ZIP). A form with no text layer is matched by widget names alone, as before.
  *  Returns the filled bytes plus which fields matched and the full field list. */
 export async function autoFillByFieldName(
   bytes: Uint8Array,
@@ -105,29 +113,34 @@ export async function autoFillByFieldName(
   const doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
   const form = doc.getForm();
   const fields = form.getFields().map((f) => ({ name: f.getName(), norm: normLabel(f.getName()), kind: f.constructor.name }));
+  const items = await extractLabels(bytes);
+  const headers = sectionHeaders(items);
+  const pages = doc.getPages();
+  const widgets: Array<{ name: string; page: number; rect: WidgetRect; captions: WidgetCaptions }> = [];
+  for (const f of form.getFields()) {
+    if (!(f instanceof PDFTextField)) continue;
+    const w = f.acroField.getWidgets()[0];
+    if (!w) { widgets.push({ name: f.getName(), page: 0, rect: { x: 0, y: 0, width: 0, height: 0 }, captions: {} }); continue; }
+    const at = pages.findIndex((p) => p.ref === w.P());
+    const page = at < 0 ? 0 : at;
+    const rect = w.getRectangle();
+    widgets.push({ name: f.getName(), page, rect, captions: captionsForRect(items, page, rect) });
+  }
+  const side = calibrateCaptionSide(widgets);
+  const slots: Slot[] = widgets.map((w) => {
+    const caption = primaryCaption(w.captions, side);
+    const label = caption && !captionAgreesWithName(w.name, caption) ? caption : caption ? `${w.name} ${caption}` : w.name;
+    const base = { page: w.page, x: w.rect.x, y: w.rect.y, width: w.rect.width, height: w.rect.height, label };
+    return { id: w.name, ...base, party: items.length ? partyOfSlot(items, headers, base) : null, section: sectionOf(headers, base) };
+  });
   const matched: FieldMatch[] = [];
   const used = new Set<string>();
-  for (const [key, raw] of Object.entries(data)) {
-    const value = (raw ?? "").trim();
-    if (!value) continue;
-    const cands = FIELD_SYNONYMS[key] ?? [key];
-    let best: { name: string } | null = null;
-    let bestScore = Infinity;
-    for (const cand of cands) {
-      for (const f of fields) {
-        if (used.has(f.name) || f.kind !== "PDFTextField") continue;
-        let score = Infinity;
-        if (f.norm === cand) score = 0;
-        else if (f.norm.includes(cand) || cand.includes(f.norm)) score = Math.abs(f.norm.length - cand.length) + 1;
-        if (score < bestScore) { best = { name: f.name }; bestScore = score; }
-      }
-      if (best && bestScore === 0) break; // exact match on a higher-priority synonym wins
-    }
-    if (best) {
-      used.add(best.name);
-      try { form.getTextField(best.name).setText(value); matched.push({ key, field: best.name, value }); }
-      catch { /* not settable as text — skip */ }
-    }
+  for (const pick of pickSlots(slots, data, FIELD_SYNONYMS)) {
+    try {
+      form.getTextField(pick.slot.id).setText(pick.value);
+      used.add(pick.slot.id);
+      matched.push({ key: pick.key, field: pick.slot.id, value: pick.value });
+    } catch { /* not settable as text — skip */ }
   }
   // Checkboxes: a `reason` (why the refund) and/or `permitType` (residential/
   // commercial) phrase ticks the best-matching checkbox by keyword overlap.

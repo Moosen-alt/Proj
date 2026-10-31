@@ -14,6 +14,7 @@
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { StandardFontEmbedder, StandardFonts } from "pdf-lib";
 import { pdfjsDocumentOptions } from "./pdfjsOptions";
+import { partyOfSlot, pickSlots, sectionHeaders, sectionOf, slotTokens, type Slot } from "./formFillSlots";
 
 export interface LabelItem {
   page: number;
@@ -274,13 +275,16 @@ export function sideForLabel(labelStr: string): "right" | "above" {
 }
 
 // Candidate label strings per data key, most-specific first. Used to auto-place
-// provided data (name, address, …) onto whatever labels a given AHJ form uses.
+// provided data (name, address, …) onto whatever labels a given AHJ form uses. A label matches by
+// WHOLE WORDS and only inside the party the key belongs to (formFillSlots.pickSlots, issue #428).
 export const FIELD_SYNONYMS: Record<string, string[]> = {
-  name: ["property owner name", "person requesting refund", "applicant name", "owner name", "printed name", "print name", "name of applicant", "homeowner name", "name"],
+  // "Print name" last: a signature block's printed name is the signer's, the owner block's "Name:" the owner's.
+  name: ["property owner name", "person requesting refund", "applicant name", "owner name", "homeowner name", "name of applicant", "name", "printed name", "print name"],
   // Project/install address (per-row). Deliberately NOT "mailing address" —
-  // that's the requester's own address (boilerplate), a separate field/key.
-  street: ["installation address", "project address", "property address", "site address", "street address"],
-  mailingAddress: ["mailing address"],
+  // that's the requester's own address (boilerplate), a separate field/key. A bare "Address:" is
+  // the site's only inside the owner / job-site block (formFillSlots SECTION_ONLY).
+  street: ["installation address", "project address", "property address", "job site address", "site address", "construction address", "street address", "address"],
+  mailingAddress: ["mailing address", "address"],
   city: ["city"],
   state: ["state"],
   zip: ["zip code", "zip", "postal code"],
@@ -288,7 +292,9 @@ export const FIELD_SYNONYMS: Record<string, string[]> = {
   email: ["email address", "e-mail", "email"],
   permitNumber: ["permit number", "permit no", "permit #", "permit"],
   date: ["issue intake payment date", "date"],
-  installer: ["contractorowneragent", "installer", "contractor name", "company name", "business name", "contractor"],
+  // A bare "Name:" is the company's only inside the contractor block (formFillSlots SECTION_ONLY), and
+  // it outranks the block's own header ("CONTRACTOR:" heads the lines the name goes on).
+  installer: ["contractorowneragent", "installer", "contractor name", "company name", "business name", "name", "contractor", "company"],
   // A refund reason: fills a "reason" field, OR the long narrative field many
   // refund forms use ("…my request meets the refund policy criteria…").
   reason: ["reason for refund", "reason for request", "reason", "meets the refund", "criteria as explained", "explained below"],
@@ -296,30 +302,88 @@ export const FIELD_SYNONYMS: Record<string, string[]> = {
 
 export interface AutoPlacement { page: number; x: number; y: number; text: string; size: number; label: string; key: string }
 
-/** Given a form's text layer and a bag of data (name/street/city/…), find each
- *  value's label and compute its placement. Returns one placement per matched
- *  field; unmatched keys (the form has no such label) are skipped. Values land on
- *  the label's real baseline, so no vertical float. */
-export function autoPlaceFromData(items: LabelItem[], data: Record<string, string>, size = 10): AutoPlacement[] {
+/** Measure a value at a size in Helvetica (the overlay's font, formFiller.overlayText). */
+const valueWidth = (text: string, size: number): number => helveticaMetrics.widthOfTextAtSize(measurable(text), size);
+
+/**
+ * Given a FLAT form's text layer and a bag of data (name/street/city/…), place each value beside
+ * its printed label. One placement per matched key; a key the form has no box for is skipped.
+ *
+ * WHICH label (issue #428, read back on eight public blanks): the label of the key's party
+ * (formFillSlots.pickSlots: whole words, never an office-use/fee box, the homeowner in the owner
+ * block and the company in the contractor block, one combined City/State/ZIP). A printed title (a
+ * label printed well above the form's body size: "City of Tigard") and a sideways label are not
+ * captions; a row printed as one run of words and underscores is split first (splitBlankRuns).
+ *
+ * WHERE: "LABEL:" or a label followed by a printed writing line → to the right on the label's
+ * baseline; a bare caption → on the line above (only there, in a row of bare captions); "Phone: (
+ * )" → after the printed ")". A value NEVER overprints printed text or another value:
+ * if its natural side would, the other side is tried, then the next-best label, then nothing.
+ */
+export function autoPlaceFromData(rawItems: LabelItem[], data: Record<string, string>, size = 10): AutoPlacement[] {
+  const items = splitBlankRuns(rawItems);
+  const heights = items.filter((i) => !i.blank && !i.angle && i.height > 0).map((i) => i.height).sort((a, b) => a - b);
+  const body = heights.length ? heights[Math.floor(heights.length / 2)] : 10;
+  const headers = sectionHeaders(items);
+  const slots: Slot[] = [];
+  items.forEach((it, n) => {
+    if (it.blank || it.angle || !it.str.trim() || it.height > body * 1.6) return;
+    const words = slotTokens(it.str);
+    if (!words.length || words.length > 8) return;
+    const base = { page: it.page, x: it.x, y: it.y, width: it.width, height: it.height, label: it.str, item: it };
+    slots.push({ id: `t${n}`, ...base, party: partyOfSlot(items, headers, base), section: sectionOf(headers, base) });
+  });
+  // WHICH SIDE THIS FORM WRITES BESIDE A BARE CAPTION. Captions printed UNDER their writing line
+  // (Valencia's "PROPERTY OWNER NAME") have free space above them; captions printed at the LEFT of
+  // a drawn line and stacked a line apart (Albuquerque's "NAME / ADDRESS / ZIP  PHONE") each have
+  // another caption right above. The form decides, by its own bare captions, not one at a time.
+  const bare = (str: string) => !/[:#(]\s*$/.test(str.trim()) && slotTokens(str).length <= 4;
+  const bareCaptions = items.filter((i) => !i.blank && !i.angle && i.str.trim() && i.height <= body * 1.6 && bare(i.str) && /[a-z]/i.test(i.str));
+  const stacked = bareCaptions.filter((c) => items.some((o) => o !== c && o.page === c.page && !o.blank && o.str.trim()
+    && o.y > c.y + 2 && o.y <= c.y + (c.height || 9) + 6 && o.x < c.x + Math.max(c.width, 40) && o.x + o.width > c.x)).length;
+  const bareSide: "above" | "right" = bareCaptions.length >= 4 && stacked >= bareCaptions.length * 0.5 ? "right" : "above";
+  const drawn: Array<{ page: number; x0: number; x1: number; y0: number; y1: number }> = [];
+  const boxOf = (it: LabelItem) => ({ x0: it.x, x1: it.x + it.width, y0: it.y - 1, y1: it.y + Math.max(it.height, 4) * 0.75 });
+  const clear = (page: number, own: LabelItem, b: { x0: number; x1: number; y0: number; y1: number }): boolean => {
+    const hit = (o: { x0: number; x1: number; y0: number; y1: number }) => b.x0 < o.x1 - 0.5 && b.x1 > o.x0 + 0.5 && b.y0 < o.y1 - 0.5 && b.y1 > o.y0 + 0.5;
+    if (b.x0 < 0 || b.y0 < 0) return false;
+    if (items.some((i) => i !== own && i.page === page && !i.blank && !/^[\s_.]*$/.test(i.str) && hit(boxOf(i)))) return false;
+    return !drawn.some((d) => d.page === page && hit(d));
+  };
   const out: AutoPlacement[] = [];
-  for (const [key, value] of Object.entries(data)) {
-    const v = (value ?? "").trim();
-    if (!v) continue;
-    const candidates = FIELD_SYNONYMS[key] ?? [key];
-    let placed: AutoPlacement | null = null;
-    for (const cand of candidates) {
-      // Search every page; take the first (most-specific) candidate that matches.
-      for (let page = 0; page < 1 + Math.max(0, ...items.map((i) => i.page)); page++) {
-        const lbl = findLabel(items, cand, page);
-        if (!lbl) continue;
-        // "LABEL:" → value to the right; a bare caption → value on the line above.
-        const p = anchorPlacement(items, { page, label: cand, side: sideForLabel(lbl.str), size });
-        if (p) { placed = { page, x: p.x, y: p.y, text: v, size, label: lbl.str, key }; break; }
-      }
-      if (placed) break;
+  pickSlots(slots, data, FIELD_SYNONYMS, (pick) => {
+    const lbl = pick.slot.item as LabelItem;
+    const text = pick.value;
+    const w = valueWidth(text, size);
+    const lh = lbl.height || size;
+    const opens = /\(\s*$/.test(lbl.str);
+    let rightX = lbl.x + lbl.width + 5;
+    if (opens) {
+      // "Phone: (   )" — the value goes after the printed area-code brackets.
+      const close = items.filter((i) => i.page === lbl.page && Math.abs(i.y - lbl.y) <= 3 && i.x >= lbl.x + lbl.width - 1 && i.x - (lbl.x + lbl.width) <= 80 && /\)/.test(i.str))
+        .sort((a, b) => a.x - b.x)[0];
+      if (close) rightX = close.x + close.width + 4;
     }
-    if (placed) out.push(placed);
-  }
+    const sameLine = items.filter((i) => i !== lbl && i.page === lbl.page && !i.angle && Math.abs(i.y - lbl.y) <= 2);
+    // "Permit No.______": the writing line printed right after the label is where the value goes.
+    const blankAfter = sameLine.filter((i) => i.blank && i.x >= lbl.x + lbl.width - 1 && i.x - (lbl.x + lbl.width) <= 15).sort((a, b) => a.x - b.x)[0];
+    if (blankAfter && !opens) rightX = blankAfter.x + 2;
+    const right = { x: rightX, y: lbl.y };
+    const above = { x: lbl.x, y: lbl.y + lh + 3 };
+    // A row of three or more bare captions ("MAILING ADDRESS  SPACE  CITY  STATE  ZIP") is a caption
+    // row: its values sit on the line above, never beside a caption in the next one's cell.
+    const captionRow = bare(lbl.str) && sameLine.filter((i) => !i.blank && bare(i.str) && Math.abs(i.x - (lbl.x + lbl.width)) <= 220).length >= 2;
+    const order = opens || blankAfter || sideForLabel(lbl.str) === "right" || (bare(lbl.str) && bareSide === "right") ? [right, above]
+      : captionRow ? [above] : [above, right];
+    for (const p of order) {
+      const b = { x0: p.x, x1: p.x + w, y0: p.y - 1.5, y1: p.y + size * 0.75 };
+      if (!clear(lbl.page, lbl, b)) continue;
+      drawn.push({ page: lbl.page, ...b });
+      out.push({ page: lbl.page, x: p.x, y: p.y, text, size, label: lbl.str, key: pick.key });
+      return true;
+    }
+    return false;
+  });
   return out;
 }
 
