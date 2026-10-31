@@ -1007,6 +1007,29 @@ tbody tr:hover, tbody tr.active { background: var(--tint-select); }
 .clients-modal-body .clients-creds-block > .actions { margin: 0 0 10px; gap: 8px; }
 .clients-modal-body .clients-creds-block > label { margin-bottom: 10px; }
 
+/* --- Team Members: list column + ONE editor pane holding the member form and its sign-in
+   sections (#431). Same two-column shape as the Clients modal, scoped to .users-modal-body. */
+.users-modal-body { grid-template-columns: 260px minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); flex: 1 1 auto; }
+.users-modal-body [hidden] { display: none !important; }
+.users-modal-body button { white-space: nowrap; }
+.users-modal-body .users-editor-pane { min-width: 0; min-height: 0; overflow-y: auto; }
+.users-modal-body .clients-form-pane { overflow: visible; }
+.users-modal-body label { min-width: 0; }
+.users-modal-body input, .users-modal-body select { width: 100%; min-width: 0; box-sizing: border-box; }
+.users-modal-body input[type="color"] { width: 64px; }
+.users-modal-body .users-signin { padding: 16px 20px 20px; border-top: 1px solid var(--line); }
+.users-modal-body .users-signin h3 { margin: 0 0 6px; font-size: 14px; font-weight: 700; color: var(--text); }
+.users-modal-body .users-signin p { font-size: 13px; margin: 0 0 8px; }
+.users-modal-body .users-signin p:empty { display: none; }
+.users-modal-body .users-signin label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; flex: 1 1 0; }
+.users-modal-body .users-signin input { padding: 7px 9px; border: 1px solid var(--line); border-radius: var(--radius-sm); font: inherit; color: var(--text); background: var(--surface); }
+.users-modal-body .users-signin .actions { gap: 8px; flex-wrap: wrap; }
+/* Narrow screens: .split-modal-body (further down) stacks the two columns; the sign-in rows stack too. */
+@media (max-width: 720px) {
+  .users-modal-body .users-signin { padding: 14px; }
+  .users-modal-body .users-signin .form-row { flex-direction: column; gap: 10px; }
+}
+
 .clients-modal-body .cred-list { display: flex; flex-direction: column; gap: 6px; margin: 0 0 12px; }
 .clients-modal-body .cred-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; padding: 8px 8px 8px 12px; border: 1px solid var(--line); border-radius: var(--radius-md); background: var(--surface); }
 .clients-modal-body .cred-row-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; font-size: 13px; }
