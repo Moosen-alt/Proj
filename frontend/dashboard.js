@@ -7503,6 +7503,7 @@ function permitTargetCardHtml(target, checks, ui) {
       <p>${esc([target.applicationNumber && `Application ${target.applicationNumber}`, target.permitNumber && `Permit ${target.permitNumber}`].filter(Boolean).join(" | ") || "No application/permit number recorded yet.")}</p>
       ${target.portalUrl ? `<p class="muted" style="word-break:break-all">${esc(target.portalUrl)}</p>` : ""}
       ${target.trackingUrl && target.trackingUrl !== target.portalUrl ? `<p class="muted" style="word-break:break-all">Status link: ${esc(target.trackingUrl)}</p>` : ""}
+      ${target.readGap && !stopped ? `<p data-read-gap style="border-left:3px solid var(--warn, #b7791f);padding-left:6px"><strong>Can't read on its own:</strong> ${esc(target.readGap)}</p>` : ""}
       <p class="muted">${stopped ? "Tracking stopped — the monitor no longer reads this filing." : `Checks every ${esc(target.checkFrequencyDays)} day(s) · Next: ${target.nextCheckAt ? esc(new Date(target.nextCheckAt).toLocaleString()) : "not scheduled"}`} · Source strategy: ${esc(target.portalPlatform || "auto")}</p>
       ${ui?.editing || ui?.recording ? "" : `<div style="margin-top:6px">
         <button type="button" class="secondary" style="font-size:12px" data-target-action="edit" data-target-id="${id}">Edit</button>

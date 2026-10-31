@@ -1041,7 +1041,11 @@ export async function learnPortal(input: {
 export async function checkStatusWithAdapter(
   adapterType: "accela" | "powerclerk" | "recipe",
   applicationNumbers: string[],
-  options: StageOptions & { recipe?: PortalRecipe; fieldValues?: Record<string, string>; docsByType?: Record<string, string>; onReason?: (reason: string) => void },
+  options: StageOptions & {
+    recipe?: PortalRecipe; fieldValues?: Record<string, string>; docsByType?: Record<string, string>; onReason?: (reason: string) => void;
+    /** The found filing's own record link (#413), reported only beside a status that was read. */
+    onRecordLink?: (link: string) => void;
+  },
 ): Promise<string | null> {
   let tmpStatePath: string | undefined;
   let adapter: import("./adapter").PortalAdapter | null = null;
@@ -1070,6 +1074,8 @@ export async function checkStatusWithAdapter(
 
     const text = await adapter.checkStatus(applicationNumbers);
     if (!text) report(adapter.lastStatusReason || "the portal page held no status for this application");
+    const recordLink = text ? String(adapter.lastStatusRecordLink || "") : "";
+    if (recordLink) { try { options.onRecordLink?.(recordLink); } catch { /* reporting never breaks a check */ } }
     return text;
   } catch (err) {
     report(`the status read failed: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);

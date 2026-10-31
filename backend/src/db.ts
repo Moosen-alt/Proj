@@ -857,6 +857,12 @@ function migrate(db: AppDb): void {
   // for unauthenticated status checks (e.g. Accela ACA CapDetail.aspx links).
   addColumnIfMissing(db, "portal_runs", "tracking_url", "TEXT NOT NULL DEFAULT ''");
   addColumnIfMissing(db, "permit_check_targets", "tracking_url", "TEXT NOT NULL DEFAULT ''");
+  // A STATUS LINK THE MONITOR CAN READ ON ITS OWN (#413). read_gap: the last sweep's one actionable
+  // line on why it read nothing (statusLinkGap.statusReadGap), '' once a status is read. link_lookup_at:
+  // when the signed-in record list was last searched for a filing that has no link — at most once a
+  // day per target, so a filing the list never shows is not re-walked on every sweep.
+  addColumnIfMissing(db, "permit_check_targets", "read_gap", "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, "permit_check_targets", "link_lookup_at", "TEXT");
   // UNSURE RECORD NUMBERS read after a person's submit in the left-open window (#400): JSON
   // { at, reason, candidates: [{ recordNumber, recordLink, source }] }, or ''. Shown on the
   // next-step panel for one-click confirmation; never written as the filing's number. Its own
