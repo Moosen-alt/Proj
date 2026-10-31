@@ -3439,7 +3439,7 @@ const NEXT_STEP_BUTTON_LABELS = {
   applyStatusOverrideBtn: "Change status",
   runQcBtn: "Run QC",
   openReviewerPacketBtn: "Open Correction Packet",
-  approveSubmitBtn: "Approve & Submit",
+  approveSubmitBtn: "Approve & auto-submit",
   startAutopilotBtn: "Stage portals · Autopilot",
   addPermitTargetBtn: "Add tracking target",
   copyHandoffPacketBtn: "Copy handoff packet",
@@ -5393,15 +5393,15 @@ function applyAutopilotState(s) {
     badge.title = s.message || "";
   }
   const approveBtn = $("approveSubmitBtn");
+  // ONE DOOR (#423): the rail's Approve & auto-submit is the track card's button for the newest
+  // draft's filing (s.approveTrack), held exactly where the card holds it (#435).
+  const approveOff = s.canApprove ? railApproveHold(s) : (s.approveDisabledReason
+    || (s.blockers && s.blockers.length
+      ? `Blocked: ${reasonList(s.blockers.map((b) => b.detail))}`
+      : "Available once the project is staged to the portal review screen."));
   if (approveBtn) {
-    approveBtn.disabled = !s.canApprove;
-    const approveOff = s.canApprove ? "" : (s.approveDisabledReason
-      || (s.blockers && s.blockers.length
-        ? `Blocked: ${reasonList(s.blockers.map((b) => b.detail))}`
-        : "Available once the project is staged to the portal review screen."));
-    approveBtn.title = s.canApprove
-      ? "Authorize and file. The system completes the portal submit (or you finish it in the portal)."
-      : approveOff;
+    approveBtn.disabled = Boolean(approveOff);
+    approveBtn.title = approveOff || RAIL_APPROVE_TITLE;
     if (approveBtn.dataset) approveBtn.dataset.disabledReason = approveOff;
   }
   // S8 — "Stage portals" is switched off when the server says a run would do nothing useful
@@ -5419,7 +5419,8 @@ function applyAutopilotState(s) {
   if (offEl && typeof offEl.replaceChildren === "function") {
     const lines = [];
     if (typeof s.canStage === "boolean" && !s.canStage) lines.push(`Stage portals is off: ${s.stageDisabledReason || "staging is not available right now."}`);
-    if (!s.canApprove && s.approveDisabledReason) lines.push(`Approve & Submit is off: ${s.approveDisabledReason}`);
+    if (!s.canApprove && s.approveDisabledReason) lines.push(`Approve & auto-submit is off: ${s.approveDisabledReason}`);
+    else if (s.canApprove && approveOff) lines.push(`Approve & auto-submit is off: ${approveOff}`);
     offEl.replaceChildren(...lines.map((line) => { const li = document.createElement("li"); li.textContent = line; return li; }));
     offEl.hidden = lines.length === 0;
   }
@@ -5591,7 +5592,7 @@ async function startAutopilot() {
   try {
     await api(`/api/projects/${state.selectedProjectId}/autopilot/start`, { method: "POST", body: "{}" });
     const s = await pollAutopilot();
-    if (s && s.phase === "awaiting_approval") showMessage("Staged to portal review. Verify, then click Approve & Submit to file.", "info");
+    if (s && s.phase === "awaiting_approval") showMessage("Staged to portal review. Verify every field, then click its submit on the portal yourself and capture the number here.", "info");
     else if (s && s.phase === "blocked") showMessage(`Autopilot blocked: ${(s.blockers || []).map((b) => String(b.detail || "").trim().replace(/[.;\s]+$/, "")).filter(Boolean).join("; ")}.`, "error");
     else if (s && s.phase === "failed") showMessage(s.message || "Staging failed — see the portal run.", "error");
   } catch (err) {
@@ -5603,25 +5604,42 @@ async function startAutopilot() {
   }
 }
 
+// THE RAIL'S APPROVE IS THE CARD'S APPROVE (#423). It used to post /autopilot/approve, which on
+// every real portal records an approval and files nothing, under a label ("Approve & Submit") an
+// operator reads as the track card's "Approve & auto-submit", which may file. Now there is one
+// approval action with one meaning: this button opens the card's own door for the newest staged
+// draft's filing (state.autopilot.approveTrack) — approveAndAutoSubmitTrack: the confirm, the
+// approver prompt with sign-in off, then prepare-submission { track, autoSubmit: true,
+// approverName }, with the card's refusals (#435: held while a NEM draft is staged). It decides no
+// click: the server's gate (mayClickFinalSubmit / automaticSubmitRefusals,
+// PORTAL_ALLOW_FINAL_SUBMIT, the recipe shape) is the one answer, unchanged. /autopilot/approve
+// stays on the server as it was; no dashboard button posts to it.
+const RAIL_APPROVE_TITLE = "Same as the track card's Approve & auto-submit, for the newest staged draft's filing. It starts its own run from the start of the application; your approval of THIS run lets the bot click the portal's application submit only with the server switch PORTAL_ALLOW_FINAL_SUBMIT=1 and a recipe recorded through submit, otherwise it stops at review for you. Never pays fees; stops for CAPTCHA/MFA.";
+const RAIL_APPROVE_NO_TRACK = "This draft is not one filing's track; approve it from its track card.";
+
+/** The card's hold for the filing the rail's Approve & auto-submit acts on ("" = none), asked only
+ *  once the server says the draft is approvable (canApprove). */
+function railApproveHold(s) {
+  if (!s || !s.approveTrack) return RAIL_APPROVE_NO_TRACK;
+  // An awaiting NEM draft IS a staged NEM track: the card's #435 hold, in the card's words.
+  if (s.approveTrack === "nem") return APPROVE_HELD_BY_STAGED_DRAFT;
+  return "";
+}
+
 async function approveAndSubmit() {
   if (!state.selectedProjectId) return;
-  if (!confirm("Authorize this regulatory submission? This records your approval and files (or stages for your final click in) the portal.")) return;
   const btn = $("approveSubmitBtn");
-  btn.disabled = true;
-  showMessage("Approval recorded — completing the portal submission…", "info");
+  const s = state.autopilot;
+  const off = !s || !s.canApprove
+    ? ((s && s.approveDisabledReason) || "Available once the project is staged to the portal review screen.")
+    : railApproveHold(s);
+  if (off) { showMessage(off, "warning"); return; }
+  if (btn) btn.disabled = true;
   try {
-    const { state: s } = await api(`/api/projects/${state.selectedProjectId}/autopilot/approve`, { method: "POST", body: "{}" });
-    applyAutopilotState(s);
-    if (state.detail) state.detail = await api(`/api/projects/${state.selectedProjectId}`);
-    renderDetail();
-    // A toast disappears; the banner renderDetail just drew does not. Say the same thing both
-    // places and point at the banner, so an operator who blinks still has the instruction.
-    showMessage(s.phase === "submitted"
-      ? "Approved & submitted — confirmation captured."
-      : "Approval recorded — NOT submitted. Open the portal, click its submit yourself, then use Capture Confirmation. The banner at the top of this project keeps the instruction.", "warning");
-  } catch (err) {
-    showMessage(err.message || "Could not approve.", "error");
-    btn.disabled = !(state.autopilot && state.autopilot.canApprove);
+    await approveAndAutoSubmitTrack(state.autopilot.approveTrack, null);
+  } finally {
+    // Re-enable only what the server allows now, never blindly.
+    await refreshAutopilot();
   }
 }
 

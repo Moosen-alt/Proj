@@ -820,23 +820,42 @@ export function decideNextStep(facts: NextStepFacts): NextStep {
       const what = awaitingApproval.length === 1
         ? `The ${trackWithAgency(facts, awaitingApproval[0])} application is staged on its portal`
         : `Staged for review: the ${tracksWithAgency(facts, awaitingApproval)}`;
-      const ask = awaitingApproval.length === 1
-        ? (gateChecked ? "review it, approve, then click its submit yourself." : "review it (the project page checks the gate before approval).")
-        : (gateChecked ? "review each on its own portal, approve, then click its submit yourself." : "review each on its own portal (the project page checks the gate before approval).");
+      // ONE APPROVE ACTION, ONE MEANING (#423). The button below takes the operator to the rail's
+      // Approve & auto-submit, which opens the track card's own door (the approver prompt, then
+      // prepare-submission { track, autoSubmit: true, approverName }): it starts its own run of the
+      // newest draft's filing from the start of the application, and the bot clicks submit only
+      // through the one gate (rule 1). It used to read "Approve & Submit" and record an approval that
+      // filed nothing. On NEM the door is HELD while a draft is staged (#435, owner ruling 2026-10-31
+      // "One click now"): a run from the start would stop on that draft or open a second
+      // application, so the draft is finished by hand and no Approve button is offered.
+      const approveHeld = newest.track === "nem";
+      const ask = approveHeld
+        ? (awaitingApproval.length === 1
+          ? (gateChecked ? "review it and click its submit on the portal yourself." : "review it (the project page checks the gate first), then click its submit on the portal yourself.")
+          : (gateChecked ? "review each on its own portal and click its submit yourself." : "review each on its own portal (the project page checks the gate first) and click its submit yourself."))
+        : awaitingApproval.length === 1
+          ? (gateChecked ? "review it, then click its submit yourself or press Approve & auto-submit." : "review it (the project page checks the gate before approval).")
+          : (gateChecked ? "review each on its own portal, then click its submit yourself or press Approve & auto-submit for the newest." : "review each on its own portal (the project page checks the gate before approval).");
+      const many = awaitingApproval.length > 1;
+      const newestName = TRACK_NAME[newest.track];
+      const approveWhy = approveHeld
+        ? why(many
+          ? `Approve & auto-submit acts on the newest draft only — the ${newestName} — and is held while that draft is staged: it would start a new run from the start of the application. Finish each draft on its portal yourself.`
+          : `Approve & auto-submit is held while the ${newestName} has a staged draft: it would start a new run from the start of the application. Finish the draft on the portal yourself.`, "portalRunsPinned")
+        : why(`${many ? `Approve & auto-submit acts on the newest draft only — the ${newestName} — and starts its own run of it` : `Approve & auto-submit starts its own run of the ${newestName}`} under your named approval; the bot clicks submit only with the server switch on and a recipe recorded through submit, otherwise it stops at review.${many ? " Each other draft needs its own review and its own submit." : ""}`, "portalRunsPinned");
       return make("staged_awaiting_submit", "me", "today",
         `${what} — ${ask}${notStagedTail}`,
         [
           // What is left to stage first: make() keeps three whys, and the per-track lines fill them.
           ...notStagedWhy,
-          // One button, one draft: Approve & Submit acts on the NEWEST awaiting draft only.
-          ...(awaitingApproval.length > 1 && !approveRefused
-            ? [why(`Approve & Submit acts on the newest draft only — the ${TRACK_NAME[newest.track]}. Each other draft needs its own review and its own submit.`, "portalRunsPinned")]
-            : []),
+          // What the one Approve action does here, or why it is held (only when it is not refused).
+          ...(approveRefused ? [] : [approveWhy]),
           // The PINNED card: the staged draft renders there, not in the folded history (#portalRuns).
-          ...awaitingApproval.map((t) => why(`${TRACK_NAME[t.track]} staged ${t.stagedRun!.startedAt.slice(0, 10)} — automation never clicks the final submit.`, "portalRunsPinned")),
-          ...(approved.length ? [why(`Approval already recorded for the ${trackList(approved)} — file it and capture the confirmation.`, "confirmationForm")] : []),
+          ...awaitingApproval.map((t) => why(`${TRACK_NAME[t.track]} staged ${t.stagedRun!.startedAt.slice(0, 10)} — automation never clicks this draft's final submit.`, "portalRunsPinned")),
+          // An approval the old rail button recorded (POST /autopilot/approve) filed nothing: say so.
+          ...(approved.length ? [why(`An approval on record for the ${trackList(approved)} filed nothing — click its submit on the portal yourself, then capture the confirmation.`, "confirmationForm")] : []),
         ],
-        approveRefused ? null : btn("approveSubmitBtn", "Approve & Submit"),
+        approveRefused || approveHeld ? null : btn("approveSubmitBtn", "Approve & auto-submit"),
         awaitingApproval[0].stagedRun!.startedAt);
     }
     return make("approved_awaiting_filing", "me", "today",

@@ -82,8 +82,13 @@ export interface AutopilotState {
   /** What the person taking the staged review page must know before submitting (dryrun-0928
    *  B3 / B14): answers the portal may not have saved; the portal's own calls held back. */
   reviewHandoffNotes: string[];
-  /** Why Approve & Submit is disabled, in words (null when canApprove). */
+  /** Why the rail's Approve is disabled, in words (null when canApprove). */
   approveDisabledReason: string | null;
+  /** The filing the rail's Approve & auto-submit acts on: the newest awaiting draft's track (#423).
+   *  The rail opens the track card's door for THIS track (the approver prompt, then
+   *  prepare-submission with autoSubmit), so both buttons are one action. Set only while a draft
+   *  awaits approval; absent (or null) otherwise, and the rail button is then off. */
+  approveTrack?: SubmittalTrackType | null;
   /** S8 — may "Stage portals · Autopilot" start a run? False with a reason when the project is
    *  operator-blocked, a run is in flight, it is past Submit, every required track is
    *  already staged or filed (re-staging opens a duplicate draft), or the submit gate holds
@@ -442,11 +447,16 @@ export function getAutopilotState(db: AppDb, projectId: string): AutopilotState 
         ? `Approval recorded. Automation stops here — open the portal, click its submit yourself, then capture the confirmation number below.${canApprove ? "" : ` Not approvable again yet: ${approveRefusals.join("; ")}.`}`
         : !canApprove
           ? `Staged, but not approvable yet: ${approveRefusals.join("; ")}.`
-          : "Staged to portal review. Click Approve & Submit to file.";
+          : awaitingTrack === "nem"
+            // #423/#435: the one Approve action is held while a NEM draft is staged; this draft is
+            // finished by a person on the portal.
+            ? "Staged to portal review. Verify it, then click its submit on the portal yourself."
+            : "Staged to portal review. Verify it, then click its submit on the portal yourself, or press Approve & auto-submit to file it under your approval through the one gate.";
     return {
       projectId, phase: "awaiting_approval", stage: approvedAwaitingFiling ? "Approved — awaiting your filing" : "Awaiting approval",
       message: baseMsg + siblingNote + gapAdvisory + engineAdvisory,
       blockers, canApprove, approveDisabledReason: canApprove ? null : `Not approvable: ${approveRefusals.join("; ")}.`,
+      approveTrack: awaitingTrack,
       pauseReason: null, portalRunId: run ? String(run.id) : null, updatedAt: ts,
       ...reviewInfo, ...stageInfo,
     };

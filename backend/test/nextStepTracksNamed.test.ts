@@ -93,7 +93,7 @@ console.log("\nb. THREE DRAFTS: EACH WITH ITS OWN ISSUER");
     /the building permit \(City of Testport\), electrical permit \(Test County\) and interconnection \(NEM\) with Test Power/.test(step.headline), step.headline);
   check("b2. MUST-EXCLUDE: no merged 'application is staged on the A and B portal'",
     !/application is staged on the .+ and .+ portal/.test(step.headline) && /review each on its own portal/.test(step.headline), step.headline);
-  check("b3. Approve & Submit is said to act on the newest draft only (the interconnection)",
+  check("b3. Approve & auto-submit is said to act on the newest draft only (the interconnection)",
     step.why.some((w) => /newest draft only — the interconnection/.test(w.text)), JSON.stringify(step.why.map((w) => w.text)));
   check("b4. MUST-EXCLUDE: nothing left to stage -> no 'not staged' text", !/not staged/i.test(step.headline + step.why.map((w) => w.text).join(" ")));
 }
@@ -102,7 +102,9 @@ console.log("\nc. ONE DRAFT, NOTHING ELSE LEFT");
 {
   const step = decideNextStep(facts([staged("nem", "PGE"), track("combo", { filed: true })], { utility: "PGE" }));
   check("c1. MUST-PASS: the one-draft wording names the utility and asks for its review",
-    /^The interconnection \(NEM\) with PGE application is staged on its portal — review it, approve, then click its submit yourself\.$/.test(step.headline), step.headline);
+    // #423/#435: a staged NEM draft is finished by hand (Approve & auto-submit is held), so the ask is
+    // to review it and click its submit, never "approve" (which used to record an approval that filed nothing).
+    /^The interconnection \(NEM\) with PGE application is staged on its portal — review it and click its submit on the portal yourself\.$/.test(step.headline), step.headline);
   check("c2. no 'not staged' why and no newest-draft note with one draft",
     !step.why.some((w) => /Not staged yet|newest draft/.test(w.text)), JSON.stringify(step.why.map((w) => w.text)));
   const b = staged("building", "City of Testport");
