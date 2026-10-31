@@ -483,6 +483,33 @@ Production runs a pinned checkout, `.probe\prod-pinned`, so edits in the develop
 
 8. **Roll back** if needed: repeat steps 5–7 with `$old`. If a migration must be undone, restore the named snapshot from step 4. Run the restore drill on it first, and ask before overwriting the live database.
 
+### 7.1 Launch re-pin: before the team files NEM applications
+
+The October NEM fixes (#378 the review-page hand-over, #354, #400, #401, #385, #387, #343, #414, #415, #419) reach the operator's box only through a re-pin. Check what the install runs first: `git -C .probe\prod-pinned rev-parse --short HEAD`, and compare it with `main`. The team's runbook is [NEM_OPERATOR_RUNBOOK.md](NEM_OPERATOR_RUNBOOK.md). Do these in this order; each step waits for the one before it.
+
+1. **Snapshot.** Steps 1–4 above: a commit that passed, the rollback point, quiet, and the named restore point.
+2. **Re-pin to current `main`.** Steps 5–7 above. The first start applies the migrations; `scripts/restore-demoted-recipes.ts --apply` refuses a database older than its code (`docs/HANDOFF.md`, "RESTORE SCRIPT"). `frontend\` is served from the development tree (above), so bring that tree to the same commit too.
+3. **Set the `.env` posture** in the same stop (the server reads `.env` only at start):
+
+   ```ini
+   AUTH_ENABLED=true              # §4.1: each operator signs in; the signed-in user is the approver of record
+   PORTAL_ALLOW_FINAL_SUBMIT=1    # §4.3: lets Approve & auto-submit click a portal's application submit (never a fee)
+   PORTAL_HEADLESS=false          # office desktop only: leaves the review window open for the hand-over
+   ```
+
+   `PORTAL_ALLOW_FINAL_SUBMIT=1` with `AUTH_ENABLED` off is a preflight FAIL (§4.3), and with sign-in off the track card's Approve & auto-submit never names an approver, so it stages to review instead of filing (#422). A shared server leaves `PORTAL_HEADLESS` unset (headless): no review window, so Approve & auto-submit is the path and every fallback is a person signing in to the portal in their own browser.
+4. **Restore the demoted recipes.** Stop the server (step 5 above), dry-run, then apply, then start it again (step 7):
+
+   ```powershell
+   $env:AUTOPILOT_DB_PATH = "backend\data\autopilot.sqlite"     # or the AUTOPILOT_DB_PATH your .env sets
+   npx tsx scripts/restore-demoted-recipes.ts                   # report only; lists RESTORE / KEEP per recipe
+   npx tsx scripts/restore-demoted-recipes.ts --apply
+   Remove-Item Env:AUTOPILOT_DB_PATH
+   ```
+
+   The dry run opens the database read-only; a live WAL database may refuse that, so dry-run on a `.backup` copy if it does (the script's header).
+5. **One supervised PacifiCorp replay** (`docs/HANDOFF.md`, "RESTORE SCRIPT": one supervised replay each). With the owner watching, on a real project ready to file: **Stage in portal** on the NEM track (not Approve & auto-submit), check the review page in the window, and submit by hand or leave the draft and note it. It proves the restored recipe replays on this build before anyone approves an automatic filing on it. PGE waits for #403 (its welcome page reads as the review step) and #410. The end-to-end proof through Approve & auto-submit is #427.
+
 ## 8. Routine
 
 | When | What | Look for |

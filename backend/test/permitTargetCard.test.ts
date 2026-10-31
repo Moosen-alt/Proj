@@ -123,12 +123,20 @@ await check("the Record form offers the six picks", () => {
 });
 await check("every interpolated value is esc()'d (an injected tag reaches the HTML only escaped)", () => {
   const evil = '"><img src=x onerror=alert(1)>';
-  const t = { ...ELEC, id: `t${evil}`, portalName: evil, portalUrl: `https://x.test/${evil}`, trackingUrl: `https://y.test/${evil}`, applicationNumber: evil, permitNumber: evil, portalPlatform: evil };
+  const t = { ...ELEC, id: `t${evil}`, portalName: evil, portalUrl: `https://x.test/${evil}`, trackingUrl: `https://y.test/${evil}`, applicationNumber: evil, permitNumber: evil, portalPlatform: evil, readGap: evil };
   for (const ui of [{}, { editing: true }, { recording: true }]) {
     const html = L.permitTargetCardHtml(t, [], ui);
     assert.ok(!html.includes("<img"), `raw tag in ${JSON.stringify(ui)}`);
     assert.ok(!html.includes(evil) && !html.includes("alert(1)>"), `attribute break-out in ${JSON.stringify(ui)}`);
   }
+});
+
+await check("the card says why the monitor cannot read the filing on its own (#413), and says nothing once it can", () => {
+  const gap = "No portal recipe learned for Pacific Power yet, and its record pages need a login, so the monitor cannot read this filing. Record the status by hand until the portal is learned.";
+  const html = L.permitTargetCardHtml({ ...ELEC, readGap: gap }, [], {});
+  assert.ok(html.includes(`<strong>Can't read on its own:</strong> ${gap}`), html);
+  assert.doesNotMatch(L.permitTargetCardHtml(ELEC, [], {}), /data-read-gap/, "a readable filing shows a gap line");
+  assert.doesNotMatch(L.permitTargetCardHtml({ ...ELEC, readGap: gap, active: false }, [], {}), /data-read-gap/, "a stopped filing shows a gap line");
 });
 
 console.log("\n2. Record status posts THIS card's targetId");

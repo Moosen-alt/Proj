@@ -22,10 +22,14 @@
 // instead of "no portal URL/recipe".
 import type { Page } from "playwright";
 import { loginFormPresent } from "./adapters/loginFlow";
+import { cleanRecordLink, draftReferenceFromUrl } from "./adapters/submissionLedger";
 import { redactStatusText } from "./safeAction";
 import { installSettleProbe, waitForSettled } from "./settle";
 
-export type StatusFind = { text: string | null; reason: string; pagesScanned: number };
+/** `recordLink` (#413): the found filing's own record link, read off the page it was found on, when
+ *  exactly one link on that page belongs to exactly that number ("" otherwise). The monitor stores it
+ *  as the target's tracking_url, so later checks read the record without signing in. */
+export type StatusFind = { text: string | null; reason: string; pagesScanned: number; recordLink?: string };
 
 /** A list of filings, by the words on its link. Exact-ish: "Projects", "My Applications", "All Records". */
 export const LIST_LINK = /^(?:my\s+|all\s+)?(?:projects?|applications?|submissions?|requests?|records?|permits?|cases?)(?:\s+list)?$/i;
@@ -60,7 +64,10 @@ async function labelledRowFor(page: Page, num: string): Promise<string | null> {
   return page.evaluate((n: string) => {
     const norm = (s: string | null | undefined) => String(s ?? "").replace(/\s+/g, " ").trim();
     const cellsOf = (tr: Element) => Array.from(tr.children).filter((c) => c.tagName === "TD" || c.tagName === "TH") as HTMLElement[];
-    const rows = Array.from(document.querySelectorAll("tr")).filter((tr) => ((tr as HTMLElement).innerText || "").includes(n));
+    // The WHOLE number (#413): "APP-1116" is not a row of "APP-11168", nor "…-STR" of "…-STR-REV".
+    const esc = n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const whole = new RegExp(`(?<![A-Za-z0-9-])${esc}(?![A-Za-z0-9-])`, "i");
+    const rows = Array.from(document.querySelectorAll("tr")).filter((tr) => whole.test((tr as HTMLElement).innerText || ""));
     // The innermost row: portals nest their grids in layout tables, whose rows hold the grid's text too.
     const own = rows.filter((tr) => !rows.some((o) => o !== tr && tr.contains(o)));
     if (own.length !== 1) return null; // two rows name the number: never guess which is the filing
@@ -90,7 +97,7 @@ async function scanFor(page: Page, applicationNumbers: string[]): Promise<string
   const body = await bodyText(page);
   for (const num of applicationNumbers) {
     if (!num) continue;
-    const idx = body.indexOf(num);
+    const idx = wholeNumberIndex(body, num);
     if (idx === -1) continue;
     const labelled = redactStatusText(await labelledRowFor(page, num));
     if (labelled) return labelled;
@@ -98,6 +105,53 @@ async function scanFor(page: Page, applicationNumbers: string[]): Promise<string
     if (snippet) return snippet;
   }
   return null;
+}
+
+/** Where the WHOLE number sits in `text`, or -1 (#413). A bare indexOf found "APP-1116" inside
+ *  "APP-11168", so a list holding only the neighbour read the neighbour's status as this filing's.
+ *  A number's edge is a character that cannot continue it: not a letter, digit or dash. */
+export function wholeNumberIndex(text: string, num: string): number {
+  const want = String(num ?? "").trim();
+  if (!want) return -1;
+  const esc = want.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const m = new RegExp(`(?<![A-Za-z0-9-])${esc}(?![A-Za-z0-9-])`, "i").exec(String(text ?? ""));
+  return m ? m.index : -1;
+}
+
+/**
+ * THE FOUND FILING'S OWN RECORD LINK (#413), read in the page (page.evaluate: self-contained, arrow
+ * callbacks only, and it only reads). Strict on purpose, because the link is stored and every later
+ * check reads it as THIS filing:
+ *   1. the anchors whose whole text IS the number (Accela's My Records renders the record number as
+ *      the link to CapDetail): used when they all go to one place;
+ *   2. else the one table/list row with a cell that is exactly the number, when that row carries
+ *      exactly one distinct link (PowerClerk's "View" beside APP-…);
+ *   3. else "". A number that is only part of an anchor's text ("APP-1116" in "APP-11168") is
+ *      never a match, and neither is site chrome (nav, header, footer).
+ */
+export function exactRecordLinkInPage(recordNumber: string): string {
+  const want = String(recordNumber || "").replace(/\s+/g, " ").trim().toUpperCase();
+  if (!want) return "";
+  const textOf = (el: Element): string => ((el as HTMLElement).innerText || el.textContent || "").replace(/\s+/g, " ").trim();
+  const inChrome = (el: Element): boolean => Boolean(el.closest("nav, header, footer, [role='navigation'], [role='banner'], [role='contentinfo']"));
+  const webHref = (a: Element): string => {
+    const href = (a as HTMLAnchorElement).href || "";
+    return /^https?:/i.test(href) && !/#$/.test(href) ? href : "";
+  };
+  const exact = Array.from(document.querySelectorAll("a[href]")).filter((a) => !inChrome(a) && textOf(a).toUpperCase() === want);
+  const exactHrefs = [...new Set(exact.map(webHref).filter(Boolean))];
+  if (exactHrefs.length === 1) return exactHrefs[0];
+  if (exactHrefs.length > 1) return "";
+  const rows = Array.from(document.querySelectorAll("tr, li, [role='row']")).filter((row) => {
+    if (inChrome(row)) return false;
+    const cells = Array.from(row.querySelectorAll("td, th, [role='cell'], [role='gridcell']"));
+    return cells.some((c) => textOf(c).toUpperCase() === want);
+  });
+  // The innermost rows only: a layout table's row holds the grid's row too.
+  const own = rows.filter((r) => !rows.some((o) => o !== r && r.contains(o)));
+  if (own.length !== 1) return "";
+  const hrefs = [...new Set(Array.from(own[0].querySelectorAll("a[href]")).map(webHref).filter(Boolean))];
+  return hrefs.length === 1 ? hrefs[0] : "";
 }
 
 /** The host a URL loads from ("" for about:blank, data:, chrome-error:...). */
@@ -236,11 +290,29 @@ async function nextControl(page: Page, host: string) {
  * Find this filing's status on the portal the browser is signed in to. Read-only navigation only.
  * `text` is the redacted snippet around the application number; `reason` always says what happened.
  */
-export async function findFilingStatus(
-  page: Page,
-  applicationNumbers: string[],
-  opts: { maxPages?: number; settleMs?: number; budgetMs?: number; onProgress?: (message: string) => void } = {},
-): Promise<StatusFind> {
+type FindOptions = { maxPages?: number; settleMs?: number; budgetMs?: number; onProgress?: (message: string) => void };
+
+/** Find the filing's status (findOnPortal), then — on the page it was found on, before anything else
+ *  moves — its own record link (#413). Reading a link is not a click: nothing is touched to get it. A
+ *  record page found directly (the search landed on it) is its own link when its URL names a record. */
+export async function findFilingStatus(page: Page, applicationNumbers: string[], opts: FindOptions = {}): Promise<StatusFind> {
+  const found = await findOnPortal(page, applicationNumbers, opts);
+  if (!found.text) return found;
+  const host = hostOf(page.url());
+  let recordLink = "";
+  for (const num of applicationNumbers.map((n) => String(n ?? "").trim()).filter(Boolean)) {
+    const href = String(await page.evaluate(exactRecordLinkInPage, num).catch(() => "") || "");
+    // Never a link to another host: the read stays on the portal it signed in to, and so does its link.
+    if (href && hostOf(href) === host) { recordLink = href; break; }
+  }
+  if (!recordLink) {
+    const here = draftReferenceFromUrl(page.url());
+    if (here.id && hostOf(here.link) === host) recordLink = here.link;
+  }
+  return { ...found, recordLink: recordLink ? cleanRecordLink(recordLink) : "" };
+}
+
+async function findOnPortal(page: Page, applicationNumbers: string[], opts: FindOptions): Promise<StatusFind> {
   const maxPages = Math.max(1, opts.maxPages ?? 25);
   const settleMs = opts.settleMs ?? 10_000;
   // A status read must never stall the monitor's sweep (targets are read one after another).

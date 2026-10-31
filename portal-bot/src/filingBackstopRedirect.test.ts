@@ -91,5 +91,91 @@ check("a later hop says how many redirects in a row", /redirect 3 in a row/.test
   }
 }
 
+// #405: a service worker already running at install gets the response pause on its OWN target,
+// attached through the browser-level session (Target.attachToTarget, flatten false). Covered → the
+// run is judged and nothing is named; a worker whose pause does not come on stays NAMED.
+{
+  type Sent = { method: string; params: Record<string, unknown> };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const bed = (opts: { attach?: "ok" | "throws"; enable?: "ok" | "error" | "silent"; ctxOfWorker?: string }): { page: any; sent: Sent[]; inner: Sent[]; emitFromWorker: (method: string, params: unknown) => void } => {
+    const sent: Sent[] = [];
+    const inner: Sent[] = [];
+    const handlers = new Map<string, Set<(p: unknown) => void>>();
+    const emit = (ev: string, p: unknown): void => { for (const fn of [...(handlers.get(ev) ?? [])]) fn(p); };
+    const browserSession = {
+      on: (ev: string, fn: (p: unknown) => void) => { const s = handlers.get(ev) ?? new Set(); s.add(fn); handlers.set(ev, s); },
+      off: (ev: string, fn: (p: unknown) => void) => { handlers.get(ev)?.delete(fn); },
+      send: async (method: string, params: Record<string, unknown> = {}) => {
+        sent.push({ method, params });
+        if (method === "Target.getTargets") return { targetInfos: [
+          { targetId: "PAGE1", type: "page", url: "http://127.0.0.1:9/home", browserContextId: "CTX-A" },
+          { targetId: "SW1", type: "service_worker", url: "http://127.0.0.1:9/sw.js", browserContextId: opts.ctxOfWorker ?? "CTX-A" },
+        ] };
+        if (method === "Target.attachToTarget") {
+          if (opts.attach === "throws") throw new Error("Protocol error: No target with given id found");
+          return { sessionId: "S-SW1" };
+        }
+        if (method === "Target.sendMessageToTarget") {
+          const m = JSON.parse(String(params.message));
+          inner.push({ method: m.method, params: m.params });
+          if (m.method === "Fetch.enable" && opts.enable === "silent") return {};
+          const reply = m.method === "Fetch.enable" && opts.enable === "error" ? { id: m.id, error: { message: "Fetch.enable wasn't found" } } : { id: m.id, result: {} };
+          setTimeout(() => emit("Target.receivedMessageFromTarget", { sessionId: "S-SW1", message: JSON.stringify(reply) }), 5);
+          return {};
+        }
+        return {};
+      },
+      detach: async () => undefined,
+    };
+    const pageSession = { on: () => undefined, send: async (method: string) => (method === "Target.getTargetInfo" ? { targetInfo: { targetId: "PAGE1", browserContextId: "CTX-A" } } : {}), detach: async () => undefined };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const page: any = {
+      on: () => undefined, off: () => undefined,
+      mainFrame: () => ({ evaluate: async () => false, url: () => "http://127.0.0.1:9/home" }),
+      frames: () => [],
+      url: () => "http://127.0.0.1:9/home",
+    };
+    const ctx = {
+      route: async () => undefined, unroute: async () => undefined, on: () => undefined, off: () => undefined,
+      pages: () => [page],
+      newCDPSession: async () => pageSession,
+      browser: () => ({ newBrowserCDPSession: async () => browserSession }),
+      serviceWorkers: () => [{ url: () => "http://127.0.0.1:9/sw.js" }],
+    };
+    page.context = () => ctx;
+    return { page, sent, inner, emitFromWorker: (method, params) => emit("Target.receivedMessageFromTarget", { sessionId: "S-SW1", message: JSON.stringify({ method, params }) }) };
+  };
+  const { installFilingBackstop } = await import("./filingBackstop");
+  {
+    const t = bed({ attach: "ok", enable: "ok" });
+    const bs = (await installFilingBackstop(t.page, "replay run"))!;
+    const attach = t.sent.find((x) => x.method === "Target.attachToTarget");
+    check("a running worker: the guard attaches to its own target (not flattened)", attach?.params.targetId === "SW1" && attach?.params.flatten === false, JSON.stringify(attach));
+    const enable = t.inner.find((x) => x.method === "Fetch.enable");
+    check("…and turns the response-stage pause on inside it", JSON.stringify(enable?.params) === JSON.stringify({ patterns: [{ urlPattern: "*", requestStage: "Response" }] }), JSON.stringify(enable));
+    check("…so the run is judged and nothing is named", bs.redirectsJudged === true && bs.redirectGuardNote === "", `${bs.redirectsJudged} ${bs.redirectGuardNote}`);
+    // A response the worker pauses that no run owns continues, answered inside the worker's session.
+    t.emitFromWorker("Fetch.requestPaused", { requestId: "R1", networkId: "N1", request: { url: "http://127.0.0.1:9/other", method: "GET" }, responseStatusCode: 200, responseHeaders: [] });
+    await new Promise((r) => setTimeout(r, 30));
+    check("…a worker's pause is answered through the worker's own session", t.inner.some((x) => x.method === "Fetch.continueResponse" && x.params.requestId === "R1"), JSON.stringify(t.inner.map((x) => x.method)));
+    await bs.dispose();
+    check("…and at dispose the worker's pause is turned off and its session detached",
+      t.inner.some((x) => x.method === "Fetch.disable") && t.sent.some((x) => x.method === "Target.detachFromTarget" && x.params.sessionId === "S-SW1"), JSON.stringify(t.sent.map((x) => x.method)));
+  }
+  for (const [variant, opts] of [
+    ["the attach is refused", { attach: "throws" }],
+    ["the worker refuses the pause", { attach: "ok", enable: "error" }],
+    ["the worker never answers", { attach: "ok", enable: "silent" }],
+    ["the only worker target is another context's", { attach: "ok", enable: "ok", ctxOfWorker: "CTX-B" }],
+  ] as const) {
+    const t = bed(opts);
+    const bs = (await installFilingBackstop(t.page, "replay run"))!;
+    check(`a running worker not covered (${variant}): not judged, and the note still names it`,
+      bs.redirectsJudged === false && /a service worker was already running when the replay run began/.test(bs.redirectGuardNote), `${bs.redirectsJudged} ${bs.redirectGuardNote}`);
+    if (variant === "the only worker target is another context's") check("…and another context's worker is never attached", !t.sent.some((x) => x.method === "Target.attachToTarget"));
+    await bs.dispose();
+  }
+}
+
 if (failures) { console.error(`\nfilingBackstopRedirect: ${failures} FAILED`); process.exit(1); }
 console.log("\nfilingBackstopRedirect: all checks passed");

@@ -138,8 +138,10 @@
     </div>
     <span class="hint">click a page to add · drag ⠿ to move</span>
     <span id="ff2status">No form loaded</span>
+    <button class="secondary" id="ff2verify" disabled title="Read the filled form back with vision: one call per page, reports only">Verify fill with vision</button>
     <button class="primary" id="ff2download" disabled>Download filled PDF</button>
   </div>
+  <div id="ff2verifyOut" style="display:none;background:var(--surface);border-bottom:1px solid var(--line);padding:12px 18px;font-size:var(--text-xs)"></div>
 
   <div id="ff2lookup" style="display:none;background:var(--surface);border-bottom:1px solid var(--line);padding:10px 18px;align-items:center;gap:8px">
     <span class="hint">Look up the blank form from the AHJ site:</span>
@@ -236,6 +238,7 @@
       pdfBytes = bytes;
       await renderAll();
       document.getElementById("ff2download").disabled = false;
+      document.getElementById("ff2verify").disabled = false;
       document.getElementById("ff2tplSave").disabled = false;
       document.getElementById("ff2auto").disabled = false;
       setStatus("Loaded · auto-fill or click to add values", "ok");
@@ -407,7 +410,7 @@
       }
     }
 
-    function addField(page, fx, fy, sizePt, text) {
+    function addField(page, fx, fy, sizePt, text, label) {
       const meta = pageMeta[page];
       const el = document.createElement("div"); el.className = "ff2-field";
       const grip = document.createElement("div"); grip.className = "grip"; grip.textContent = "⠿";
@@ -416,7 +419,7 @@
       const size = document.createElement("input"); size.className = "size"; size.type = "number"; size.min = "5"; size.max = "48"; size.value = String(sizePt); size.title = "Font size (pt)";
       const del = document.createElement("div"); del.className = "del"; del.textContent = "×"; del.title = "Remove";
       el.append(grip, input, size, del); meta.wrap.appendChild(el);
-      const rec = { page, fx, fy, sizePt, get text() { return input.value; }, el };
+      const rec = { page, fx, fy, sizePt, label: label || "", get text() { return input.value; }, el };
       size.addEventListener("input", () => {
         const v = Number(size.value); if (Number.isFinite(v) && v >= 5 && v <= 48) { rec.sizePt = v; input.style.fontSize = (v * RENDER_SCALE) + "px"; }
       });
@@ -469,6 +472,30 @@
       } catch (err) { setStatus("Error: " + err.message, "error"); }
     });
 
+    // "Verify fill with vision" (issue #428): fill exactly what Download would, then read it back —
+    // one vision call per page with a value; it reports, it never moves a value.
+    const escHtml = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+    document.getElementById("ff2verify").addEventListener("click", async () => {
+      if (!pdfBytes) return;
+      const out = document.getElementById("ff2verifyOut");
+      out.style.display = "block"; out.textContent = "Reading the filled form back with vision…";
+      try {
+        const filledRes = await fetch("/api/tools/form-fill/fill", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pdfBase64: u8ToBase64(pdfBytes), placements: toPlacements() }) });
+        if (!filledRes.ok) { out.textContent = "Could not build the filled PDF."; return; }
+        const filled = new Uint8Array(await filledRes.arrayBuffer());
+        const placements = fields.filter((f) => f.text.trim()).map((f) => ({ page: f.page, label: f.label || "", text: f.text }));
+        const res = await fetch("/api/tools/form-fill/verify", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ pdfBase64: u8ToBase64(filled), placements }) });
+        const r = await res.json().catch(() => ({}));
+        if (!res.ok) { out.textContent = r.error || "Vision check failed."; return; }
+        const rows = (r.rows || []).map((x) => `<tr><td>${escHtml(x.page + 1)}</td><td>${escHtml(x.label || "—")}</td><td>${escHtml(x.intended)}</td><td>${escHtml(x.read || "—")}</td><td>${escHtml(x.readUnder || "—")}</td><td><strong>${escHtml(x.verdict)}</strong></td></tr>`).join("");
+        const extra = (r.unexpected || []).map((u) => `<tr><td>${escHtml(u.page + 1)}</td><td>—</td><td>—</td><td>${escHtml(u.read)}</td><td>${escHtml(u.label || "—")}</td><td><strong>not intended</strong></td></tr>`).join("");
+        const skipped = (r.skippedPages || []).map((p) => `<li>Page ${escHtml(p.page + 1)}: ${escHtml(p.reason)}</li>`).join("");
+        out.innerHTML = `<div class="ff2-eyebrow" style="margin-bottom:6px">Vision read-back · ${escHtml((r.checkedPages || []).length)} page(s), ${escHtml(r.calls || 0)} call(s)</div>`
+          + (skipped ? `<ul style="margin:0 0 6px 18px">${skipped}</ul>` : "")
+          + (rows || extra ? `<table style="border-collapse:collapse;width:100%"><thead><tr><th align="left">Page</th><th align="left">Printed label</th><th align="left">Filled</th><th align="left">Vision read</th><th align="left">Read under</th><th align="left">Verdict</th></tr></thead><tbody>${rows}${extra}</tbody></table>` : "");
+      } catch (err) { out.textContent = "Error: " + err.message; }
+    });
+
     // Template = the field layout (page + fractional pos + size + value), reusable
     // across forms of the same type. Values are saved too so recurring text sticks.
     document.getElementById("ff2tplSave").addEventListener("click", () => {
@@ -517,7 +544,7 @@
         } else if (out.mode === "overlay") {
           // Flat form: drop the anchored placements as draggable fields to review.
           const pl = out.placements || [];
-          for (const p of pl) { const m = pageMeta[p.page]; if (!m) continue; addField(p.page, p.x / m.widthPt, 1 - (p.y + p.size) / m.heightPt, p.size, p.text); }
+          for (const p of pl) { const m = pageMeta[p.page]; if (!m) continue; addField(p.page, p.x / m.widthPt, 1 - (p.y + p.size) / m.heightPt, p.size, p.text, p.label); }
           setStatus(pl.length ? `Placed ${pl.length} value(s) — drag to fine-tune, then Download.` : "No matching labels found — place values manually.", pl.length ? "ok" : "error");
         } else {
           setStatus(out.message || "Place values manually.", "error");

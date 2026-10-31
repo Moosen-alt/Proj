@@ -105,7 +105,7 @@ import { deleteProjectInfoPages } from "./infoPages";
 import { nemSignatureState, nemStageIsResume } from "./signatureTrack";
 import { siteKey } from "../../portal-bot/src/draftCreated";
 import { safeRecordLink } from "../../portal-bot/src/adapters/submissionLedger";
-import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, type HostFit, type PortalUrlSource } from "./portalChannel";
+import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, sameHost, samePortal, type HostFit, type PortalUrlSource } from "./portalChannel";
 import { isPortalPaused } from "./portalPause";
 // The ONE creator of permit_check_targets rows (extracted from markTrackSubmitted).
 // Direction matters: submittalTracks must never import repository — jobQueue statically
@@ -149,6 +149,7 @@ import {
   readingMayFinishTrack, shouldRecordStatusCheck, shouldSkipEmptyRead, trackKind, UNCONFIRMED_READING_LABEL,
   type PermitStatusClassification, type ReadingProvenance, type TrackKind,
 } from "./permitMonitor";
+import { linkLookupRanRecently, signedInOutcome, statusReadGap, type ReadGapFacts } from "./statusLinkGap";
 import { evidenceForTopic, evidenceLines, type EvidenceTopic } from "./projectEvidence";
 import { customerBillOnFile, runQcForProject, WAITING_ON_BILL_ISSUE_TYPE, type QcRunOptions } from "./qc";
 import { loadStoredTemplates, formAllowedForPath } from "./ahjForms";
@@ -514,6 +515,7 @@ function mapPermitTarget(row: Row): PermitCheckTarget {
     permitType: text(row.permit_type),
     portalPlatform: text(row.portal_platform),
     trackingUrl: row.tracking_url ? text(row.tracking_url) : undefined,
+    readGap: text(row.read_gap) || undefined,
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
   };
@@ -7274,6 +7276,33 @@ function triggerHandoffIfReady(db: AppDb, projectId: string, ts: string): void {
   });
 }
 
+/**
+ * STORE THE RECORD LINK A SIGNED-IN READ FOUND (#413) as the target's tracking_url — so the next
+ * check reads the record's own page without signing in. Returns the stored link, or "".
+ *   · only a target with NO link: a captured (#400) or pasted link is never overwritten;
+ *   · through safeRecordLink: identifiers only, never session material, only http(s);
+ *   · rule 5 (trackSafeUrl): a permit target never takes a utility URL, nor a NEM target an AHJ one;
+ *   · on the portal the recipe that read it was judged fit for (recipeHostFit, the
+ *     hostFitsTrackAndEntity answer): its host, and on a permit track its tenant too (one Accela host
+ *     serves many agencies by path). A utility's record pages sit beside its login on the same host.
+ * Every refusal is audited with its reason; nothing else on the target moves.
+ */
+function storeFoundStatusLink(db: AppDb, projectId: string, target: Row, track: TrackKind, found: string, recipePortalUrl: string, ts: string): string {
+  const link = safeRecordLink(found);
+  const refuse = (reason: string): string => {
+    addAuditLog(db, projectId, "system", "permit monitor", "permit_target.status_link_refused", { targetId: text(target.id), track, url: link || String(found).slice(0, 300), reason });
+    return "";
+  };
+  if (!link) return refuse("not an http(s) record link");
+  if (!trackSafeUrl(track, link)) return refuse(track === "nem" ? "the link is an AHJ permit portal, and this is a NEM filing" : "the link is a utility interconnection portal, and this is a permit filing");
+  if (!sameHost(link, recipePortalUrl) || (track === "permit" && !samePortal(link, recipePortalUrl))) return refuse("the link is not on the portal that was signed in to");
+  const current = db.get<{ tracking_url?: string }>("SELECT tracking_url FROM permit_check_targets WHERE id = ?", [text(target.id)]);
+  if (text(current?.tracking_url)) return "";
+  db.run("UPDATE permit_check_targets SET tracking_url = ?, updated_at = ? WHERE id = ? AND COALESCE(tracking_url, '') = ''", [link, ts, text(target.id)]);
+  addAuditLog(db, projectId, "system", "permit monitor", "permit_target.status_link_found", { targetId: text(target.id), track, url: link, from: "the account's record list (signed-in read)" });
+  return link;
+}
+
 export async function runDuePermitChecks(
   db: AppDb,
   targetType: "permit" | "nem" | "all" = "all",
@@ -7325,12 +7354,37 @@ export async function runDuePermitChecks(
     const projectDetail = getProjectDetail(db, projectId);
     const clientId = projectDetail.project.clientId ?? "";
     const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+    // WHAT THIS SWEEP LEARNED ABOUT READING THE FILING ON ITS OWN (#413): the facts the card's one
+    // line is worded from (statusLinkGap.statusReadGap), and the record link a signed-in read found.
+    const gap: Omit<ReadGapFacts, "entityName" | "clientName" | "hasNumber" | "track"> = {
+      recipe: "none", profileUsed: false, portalHost: "", signedIn: "not_tried", hasCredential: false, publicLink: "none",
+    };
+    let signedInRan = false;
+    let foundLink = "";
+    let linkLookupStamp: string | null = null;
+    let publicReadUrl = "";
 
-    if (applicationNumbers.length > 0) {
+    // 0. A PERMIT FILING WITH A STATUS LINK IS READ ANONYMOUSLY FIRST (#413). The link is the record's
+    //    own public page (an Accela CapDetail, captured at filing by #400, pasted on the card, or found
+    //    in the account's record list below), so no sign-in is needed and none is spent. A NEM filing
+    //    keeps the signed-in read first: a utility's record page (PowerClerk) is behind a login.
+    if (track === "permit" && safeTrackingUrl && applicationNumbers.length > 0) {
+      publicReadUrl = safeTrackingUrl;
+      const publicText = await publicStatusFetch(safeTrackingUrl, applicationNumbers).catch(() => null);
+      if (publicText && publicText.length > 40 && !isAuthWallText(publicText)) {
+        rawStatusText = publicText;
+        source = "public_url";
+      } else {
+        gap.publicLink = publicText && isAuthWallText(publicText) ? "wall" : "no_status";
+      }
+    }
+
+    if (applicationNumbers.length > 0 && !rawStatusText) {
       const scopeType: "ahj" | "utility" = targetType === "nem" ? "utility" : "ahj";
       let recipe =
         findCompleteRecipeForProject(db, { scopeType, state: projectDetail.project.state, ahj: projectDetail.project.ahj, utility: projectDetail.project.utility })
         ?? findAnyRecipeForProject(db, { scopeType, state: projectDetail.project.state, ahj: projectDetail.project.ahj, utility: projectDetail.project.utility });
+      if (recipe) gap.recipe = "used";
       if (recipe) {
         const entityInput = { scope: scopeType, state: projectDetail.project.state, name: scopeType === "utility" ? projectDetail.project.utility : projectDetail.project.ahj, excludeRecipeIds: [recipe.id] };
         const fit = recipeHostFit(track, portalEntityEvidence(db, entityInput), recipe);
@@ -7340,7 +7394,16 @@ export async function runDuePermitChecks(
           });
           noteReason(`the recorded portal was not used for this filing: ${fit.reason}`);
           recipe = null;
+          gap.recipe = "refused";
         }
+      }
+      // AT MOST ONE RECORD-LIST LOOKUP A DAY for a filing with no link (#413: go gently on live
+      // portals). A filing the account's list never shows is not walked again on every sweep.
+      if (recipe?.portalUrl && !safeTrackingUrl && linkLookupRanRecently(target.link_lookup_at == null ? null : text(target.link_lookup_at), new Date(now))) {
+        gap.signedIn = "throttled";
+        gap.portalHost = portalHostOf(recipe.portalUrl);
+        noteReason("the account's record list was already searched for this filing in the last day");
+        recipe = null;
       }
       if (recipe?.portalUrl) {
         // Same credential/profile conventions as the learner/replay: portalType key is
@@ -7354,6 +7417,12 @@ export async function runDuePermitChecks(
             ?? undefined
           : undefined;
         portalRead = true;
+        signedInRan = true;
+        gap.portalHost = portalHostOf(recipe.portalUrl);
+        gap.hasCredential = Boolean(credential);
+        if (!safeTrackingUrl) linkLookupStamp = now;
+        const recipeUrl = recipe.portalUrl;
+        let reportedLink = "";
         const scraped = await statusScrape("recipe", applicationNumbers, {
           recipe,
           fieldValues: {},
@@ -7362,23 +7431,32 @@ export async function runDuePermitChecks(
           credential,
           userDataDir,
           onReason: noteReason,
+          // THE FILING'S OWN RECORD LINK, read off the account's list where the status was found
+          // (#413). Kept only for a filing with no link yet, and only on the portal this recipe was
+          // judged fit for (storeFoundStatusLink).
+          onRecordLink: (link: string) => { reportedLink = link; },
         }).catch((err) => { noteReason(`the status read failed: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`); return null; });
         if (scraped && !isAuthWallText(scraped)) {
           rawStatusText = scraped;
           source = "portal";
+          // Only beside a status that was really read: a link from a sign-in wall is no record's.
+          if (reportedLink && !safeTrackingUrl) foundLink = storeFoundStatusLink(db, projectId, target, track, reportedLink, recipeUrl, now);
         } else if (scraped) {
           noteReason("the portal page read was a sign-in wall");
         }
       }
-    } else {
+    } else if (applicationNumbers.length === 0) {
       noteReason("the filing has no application or permit number to look up");
     }
 
     const portalType = targetType === "nem" ? "powerclerk_pge" : "accela_oregon";
     // The legacy platform adapter logs in at the target's own URL — only a track-safe one.
+    // RULE 6 (#413): only THIS project's client's profile, or a legacy profile no client owns —
+    // never another client's stored session. (It read the newest profile of the type, whoever's.)
     const portalProfile = rawStatusText || (text(target.portal_url) && !safeTargetPortalUrl) ? null : db.get<{ id: string; portal_type: string; encrypted_storage_state?: string }>(
-      "SELECT * FROM portal_profiles WHERE portal_type = ? ORDER BY created_at DESC LIMIT 1",
-      [portalType],
+      `SELECT * FROM portal_profiles WHERE portal_type = ? AND (client_id = ? OR client_id IS NULL OR client_id = '')
+       ORDER BY CASE WHEN client_id = ? THEN 0 ELSE 1 END, created_at DESC LIMIT 1`,
+      [portalType, clientId, clientId],
     );
     if (portalProfile?.encrypted_storage_state) {
       const userDataDir = portalProfileDir(profileBase, clientId ?? null, portalType, safeTargetPortalUrl);
@@ -7390,6 +7468,10 @@ export async function runDuePermitChecks(
         : undefined;
       const adapterType = portalType === "powerclerk_pge" ? "powerclerk" : "accela";
       portalRead = true;
+      signedInRan = true;
+      gap.profileUsed = true;
+      gap.portalHost ||= portalHostOf(safeTargetPortalUrl);
+      gap.hasCredential ||= Boolean(credential);
       const scraped = await statusScrape(adapterType, applicationNumbers, {
         encryptedStorageStatePath: portalProfile.encrypted_storage_state,
         headless: true,
@@ -7412,11 +7494,14 @@ export async function runDuePermitChecks(
     if (!rawStatusText) {
       const checkUrl = safeTrackingUrl || safeTargetPortalUrl;
       const appNums = [text(target.application_number), text(target.permit_number)].filter(Boolean);
-      if (checkUrl) {
+      // Not twice: the anonymous-first read above already fetched the status link.
+      if (checkUrl && checkUrl !== publicReadUrl) {
         const publicText = await publicStatusFetch(checkUrl, appNums).catch(() => null);
         if (publicText && publicText.length > 40 && !isAuthWallText(publicText)) {
           rawStatusText = publicText;
           source = "public_url";
+        } else {
+          gap.publicLink = publicText && isAuthWallText(publicText) ? "wall" : "no_status";
         }
       }
     }
@@ -7429,6 +7514,21 @@ export async function runDuePermitChecks(
     // "nothing" here.
     const gatheredNothing = !rawStatusText && !isAutoSeedDisabled();
     const alreadyKnown = Boolean(text(target.latest_outcome));
+    // THE CARD SAYS WHY (#413): one actionable line while the filing cannot be read on its own,
+    // cleared by the first sweep that reads a status. Written on both branches below — a skipped
+    // read and a never-checked target's honest "manual check required" alike.
+    if (gap.signedIn !== "throttled") gap.signedIn = signedInOutcome(signedInRan, unreadableReason);
+    const readGap = gatheredNothing
+      ? statusReadGap({
+          ...gap,
+          track,
+          entityName: track === "nem" ? projectDetail.project.utility : projectDetail.project.ahj,
+          clientName: clientId ? text(db.get<{ company_name?: string }>("SELECT company_name FROM clients WHERE id = ?", [clientId])?.company_name) : "",
+          hasNumber: applicationNumbers.length > 0,
+        })
+      : "";
+    db.run("UPDATE permit_check_targets SET read_gap = ?, link_lookup_at = COALESCE(?, link_lookup_at) WHERE id = ?", [readGap, linkLookupStamp, text(target.id)]);
+    if (foundLink) logger.info("monitor", `status link found for target ${text(target.id)} in the account's record list`, { projectId });
     if (shouldSkipEmptyRead({ gatheredNothing, source, alreadyKnown })) {
       // Say WHY (issue #161). "No portal URL/recipe" only when nothing could be read at all; otherwise
       // the scraper's own reason (sign-in failed, MFA asked, where it looked and how far).
@@ -7656,6 +7756,28 @@ export function finalSubmitJobPayload(input: {
     allowFinalSubmit: minted && input.allowFinalSubmit === true,
     approvalId: minted ? String(input.approval!.id).trim() : null,
   };
+}
+
+/**
+ * WHY THIS APPROVED RUN DID NOT CLICK THE SUBMIT (#422), for the operator's result line. Reads
+ * what the gate already wrote (`portal.auto_submit_declined`, below in prepareSubmission) for
+ * THIS run id; null when the gate did not decline this run. Reads only: it decides nothing, and
+ * an empty answer is never read as permission (the click is the adapter's gate, not this).
+ */
+export function autoSubmitDeclineReasons(db: AppDb, projectId: string, runId: string): string[] | null {
+  const wanted = String(runId || "").trim();
+  if (!wanted) return null;
+  const rows = db.query<{ details: string }>(
+    "SELECT details FROM audit_logs WHERE project_id = ? AND action = 'portal.auto_submit_declined' ORDER BY created_at DESC, rowid DESC LIMIT 20",
+    [projectId],
+  );
+  for (const row of rows) {
+    let details: { runId?: unknown; reasons?: unknown } = {};
+    try { details = JSON.parse(String(row.details || "{}")); } catch { continue; }
+    if (String(details.runId ?? "") !== wanted) continue;
+    return Array.isArray(details.reasons) ? details.reasons.map((r) => String(r)).filter(Boolean) : [];
+  }
+  return null;
 }
 
 /**

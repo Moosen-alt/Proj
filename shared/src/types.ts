@@ -1106,6 +1106,9 @@ export interface PermitCheckTarget {
   portalPlatform?: string;
   /** Public AHJ portal record URL — no login required. Paste into browser to check status. */
   trackingUrl?: string;
+  /** WHY THE MONITOR COULD NOT READ THIS FILING on its last check (#413), one actionable line ("No
+   *  portal recipe learned for … yet", "Login wall: …"); absent once a status is read. */
+  readGap?: string;
   createdAt: string;
   updatedAt: string;
 }

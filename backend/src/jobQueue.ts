@@ -784,7 +784,17 @@ async function runClaimedJob(db: AppDb, job: JobRecord): Promise<boolean> {
       const detail = await prepareSubmission(db, String(job.projectId), track as never, autoSubmit, allowFinalSubmit);
       const run = detail.portalRuns?.[0];
       // Carry the run's failure text so the dashboard toast can say WHY, not just "failed".
-      result = { status: run?.status ?? null, pauseReason: run?.pauseReason ?? null, message: run?.errorMessage || null };
+      // AN APPROVED RUN THAT STOPPED AT REVIEW SAYS WHY (#422): the gate's own refusal reasons for
+      // THIS run (switch off, recipe stops short…), so the operator reads "stopped at review: …"
+      // and not a bare "staged". Read from what the gate audited; it decides nothing here.
+      const { autoSubmitDeclineReasons } = await import("./repository");
+      const autoSubmitDeclined = (autoSubmit || allowFinalSubmit) && run?.id
+        ? autoSubmitDeclineReasons(db, String(job.projectId), String(run.id))
+        : null;
+      result = {
+        status: run?.status ?? null, pauseReason: run?.pauseReason ?? null, message: run?.errorMessage || null,
+        ...(autoSubmitDeclined ? { autoSubmitDeclined } : {}),
+      };
     } else if (job.jobType === "auto_learn") {
       // Manual "Learn this portal" run, off the HTTP request path — a live LLM-driven
       // browser pass routinely takes minutes, which hung or proxy-timed-out the old

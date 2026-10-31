@@ -62,6 +62,8 @@ export interface PortalAdapter {
   checkStatus?(applicationNumbers: string[]): Promise<string | null>;
   /** Why the last checkStatus() returned nothing (issue #161), for an adapter that can say. */
   lastStatusReason?: string;
+  /** The found filing's own record link from the last checkStatus() (#413), "" when none was read. */
+  lastStatusRecordLink?: string;
   /** Enable LLM-assisted gap-fill: after the adapter's fixed fills on each page, an LLM
    *  planner fills any REQUIRED field the fixed selectors missed — from real project data
    *  only (never invented). Optional; a no-op for adapters that don't implement it. */
