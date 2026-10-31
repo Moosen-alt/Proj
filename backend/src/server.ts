@@ -667,6 +667,30 @@ app.post("/api/projects/:id/filled-forms", asyncHandler(async (req, res) => {
   res.json(await buildFilledFormsForProject(db, detail.project));
 }));
 
+// "VERIFY FILL WITH VISION" on a filled-form card (issue #428): read the filled PDF back page by
+// page and table each value against the printed label it sits under. Opt-in (the operator's
+// click), one vision call per page with a value, reports only — never corrects (rule 4). The
+// prompt carries printed labels, never values; a page printing a secret field is not sent (rule 2).
+app.post("/api/projects/:id/filled-forms/:formId/verify-vision", asyncHandler(async (req, res) => {
+  const projectId = String(req.params.id);
+  getProjectDetail(db, projectId); // 404 for a project out of scope
+  const formId = String(req.params.formId);
+  const file = filledFormPath(projectId, formId);
+  if (!fs.existsSync(file)) throw new HttpError(404, "Filled form not found. Build it first.");
+  const filled = new Uint8Array(fs.readFileSync(file));
+  const { intendedFromAcroForm, intendedFromOverlay, verifyFilledForm } = await import("./formFillVision");
+  let intended = await intendedFromAcroForm(filled);
+  if (!intended.length) {
+    // An overlay fill: what it drew is what the filled page prints and its blank does not.
+    const row = db.get<{ pdf_blob?: Uint8Array | null }>("SELECT pdf_blob FROM ahj_form_templates WHERE id = ?", [formId.replace(/^tmpl-/, "")]);
+    if (row?.pdf_blob) intended = await intendedFromOverlay(new Uint8Array(row.pdf_blob), filled);
+  }
+  if (!intended.length) throw new HttpError(422, "Nothing to verify: no filled values could be read from this form.");
+  const { createLLMProvider } = await import("./llm");
+  try { res.json(await verifyFilledForm(createLLMProvider(), filled, intended)); }
+  catch (err) { throw normalizeLlmError(err); }
+}));
+
 app.get("/api/projects/:id/filled-forms/:formId", (req, res) => {
   const formId = String(req.params.formId);
   const file = filledFormPath(String(req.params.id), formId);
@@ -2628,6 +2652,28 @@ app.post("/api/tools/form-fill/auto", express.json({ limit: "60mb" }), asyncHand
     return;
   }
   res.json({ mode: "manual", placements: [], message: "This form has no fillable fields or text layer — place values manually." });
+}));
+
+// "Verify fill with vision" for the standalone tool (issue #428): the filled PDF, plus — for a
+// flat form — the placements the auto-fill made ({page, label, text}); a fillable form's values
+// and printed captions are read off the PDF itself. Opt-in, one vision call per page with a
+// value, reports only (rule 4); labels only in the prompt and no page that prints a secret field
+// (rule 2). Stateless like every other /api/tools/form-fill route: nothing is stored.
+app.post("/api/tools/form-fill/verify", express.json({ limit: "60mb" }), asyncHandler(async (req, res) => {
+  const pdfBase64 = String(req.body?.pdfBase64 || "");
+  if (!pdfBase64) throw new HttpError(400, "pdfBase64 required.");
+  const bytes = new Uint8Array(Buffer.from(pdfBase64, "base64"));
+  const { isPdf } = await import("./formFiller");
+  if (!isPdf(bytes)) throw new HttpError(400, "pdfBase64 is not a PDF.");
+  const { intendedFromAcroForm, verifyFilledForm } = await import("./formFillVision");
+  const given = Array.isArray(req.body?.placements) ? req.body.placements as Array<Record<string, unknown>> : [];
+  const intended = given.length
+    ? given.slice(0, 400).map((p) => ({ page: Number(p.page) || 0, label: String(p.label ?? ""), value: String(p.text ?? p.value ?? "") })).filter((r) => r.value.trim())
+    : await intendedFromAcroForm(bytes);
+  if (!intended.length) throw new HttpError(422, "Nothing to verify: auto-fill the form first.");
+  const { createLLMProvider } = await import("./llm");
+  try { res.json(await verifyFilledForm(createLLMProvider(), bytes, intended)); }
+  catch (err) { throw normalizeLlmError(err); }
 }));
 
 app.post("/api/tools/form-fill/fill", express.json({ limit: "60mb" }), asyncHandler(async (req, res) => {
