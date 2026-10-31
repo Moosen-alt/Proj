@@ -3237,7 +3237,7 @@ app.post("/api/projects/:id/prepare-submission", (req, res) => {
   // THE APPROVAL IS BOUND TO THIS REQUEST (trust skeptic M1): the job carries the flag AND the
   // approval's id only when this request minted one; a request that named nobody is enqueued as
   // an ordinary run (autoSubmit false) — it can never pick up an approval someone else minted.
-  let approval: { id: string } | null = null;
+  let approval: { id: string; approver: string } | null = null;
   if (autoSubmit || allowFinalSubmit) {
     const user = currentUser(db, req);
     if (AUTH_ENABLED && !user) throw new HttpError(401, "Sign in to approve a final submit.");
@@ -3318,7 +3318,13 @@ app.post("/api/projects/:id/prepare-submission", (req, res) => {
       logger.warn("prepare-submission", `staging error: ${reason}`, { projectId });
     });
   sseBroadcast({ type: "staging_started", projectId, message: "Staging started — preparing the portal application." });
-  res.status(202).json({ jobId: job.id, state: getAutopilotState(db, projectId) });
+  // SAY WHETHER AN APPROVAL WAS RECORDED (#422): with sign-in off a request that named nobody used
+  // to stage silently to review after the dashboard promised the click. The answer is this
+  // request's own: recorded only when THIS request minted an approval, with the name it carries.
+  const finalSubmitApproval = autoSubmit || allowFinalSubmit
+    ? { recorded: Boolean(approval), approver: approval ? approval.approver : null }
+    : undefined;
+  res.status(202).json({ jobId: job.id, state: getAutopilotState(db, projectId), ...(finalSubmitApproval ? { finalSubmitApproval } : {}) });
 });
 
 // AUTOPILOT — autonomous run to the approval gate. Start enqueues Segment A (QC →
