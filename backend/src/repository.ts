@@ -7303,6 +7303,20 @@ function storeFoundStatusLink(db: AppDb, projectId: string, target: Row, track: 
   return link;
 }
 
+/**
+ * WHICH RECIPE DISCIPLINE A TRACKED FILING READS ITS STATUS WITH (#426) — staging's own answer
+ * (recipeDisciplineForTrack), never a second list. A target's permit_type is the track it was
+ * filed on (ensureCheckTarget writes the track), so a track name maps directly; anything else
+ * ("structural" from an older door) goes through trackForTarget, the ONE target → track answer
+ * (structural → building). A NEM filing reads the utility's recipe, which has no discipline.
+ */
+export function recipeDisciplineForTarget(targetType: string, permitType: string): string {
+  if (trackKind(targetType, permitType) === "nem") return "";
+  const permit = text(permitType).trim().toLowerCase();
+  const track = (SUBMITTAL_TRACK_TYPES as string[]).includes(permit) ? permit : trackForTarget(targetType, permit);
+  return recipeDisciplineForTrack(track);
+}
+
 export async function runDuePermitChecks(
   db: AppDb,
   targetType: "permit" | "nem" | "all" = "all",
@@ -7381,9 +7395,12 @@ export async function runDuePermitChecks(
 
     if (applicationNumbers.length > 0 && !rawStatusText) {
       const scopeType: "ahj" | "utility" = targetType === "nem" ? "utility" : "ahj";
-      let recipe =
-        findCompleteRecipeForProject(db, { scopeType, state: projectDetail.project.state, ahj: projectDetail.project.ahj, utility: projectDetail.project.utility })
-        ?? findAnyRecipeForProject(db, { scopeType, state: projectDetail.project.state, ahj: projectDetail.project.ahj, utility: projectDetail.project.utility });
+      // THE FILING'S OWN DISCIPLINE (#426): a per-discipline AHJ (City of Coos Bay: a structural and
+      // an electrical recipe, no '' row) has no recipe for a discipline-less lookup, so the monitor
+      // never signed in and fell back to a public page that read nothing.
+      const discipline = recipeDisciplineForTarget(text(target.target_type), text(target.permit_type));
+      const recipeInput = { scopeType, state: projectDetail.project.state, ahj: projectDetail.project.ahj, utility: projectDetail.project.utility, discipline };
+      let recipe = findCompleteRecipeForProject(db, recipeInput) ?? findAnyRecipeForProject(db, recipeInput);
       if (recipe) gap.recipe = "used";
       if (recipe) {
         const entityInput = { scope: scopeType, state: projectDetail.project.state, name: scopeType === "utility" ? projectDetail.project.utility : projectDetail.project.ahj, excludeRecipeIds: [recipe.id] };
