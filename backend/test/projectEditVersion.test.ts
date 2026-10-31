@@ -127,6 +127,13 @@ await check("(e) the v51 migration is idempotent: a replay leaves one column and
 });
 
 // ── (d) the route, on a real server with sign-in off ─────────────────────────────────────────
+// THIS PROCESS WRITES NOTHING WHILE THE SERVER IS UP. Both write the same WAL file, and a deferred
+// transaction here (fx.newProject) that reads, then loses the race to the server's post-save commit,
+// gets SQLITE_BUSY_SNAPSHOT at once — busy_timeout never applies — so the run went red now and then
+// ("database is locked"). Every (d) project, and every write it needs, is made BEFORE the spawn;
+// from here on this process only reads.
+const routePids = { d1: fx.newProject(), d2: fx.newProject(), d3: fx.newProject() };
+db.run("UPDATE projects SET parser_json = json_set(parser_json, '$.jobValue', '9000') WHERE id = ?", [routePids.d3]); // a background data write before the editor's save
 const dbPath = String(process.env.AUTOPILOT_DB_PATH);
 const PORT = 5410 + Math.floor(Math.random() * 15); // never 4173 / 4270
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -154,7 +161,7 @@ try {
     fetch(`${BASE}/api/projects/${pid}`, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
 
   await check("(d1) PUT with a stale expectedVersion is a 409 with editConflict, and the DB is unchanged", async () => {
-    const pid = fx.newProject();
+    const pid = routePids.d1;
     const loaded = versionOf(pid);
     const first = await put(pid, { homeownerPhone: "(503) 555-0111", expectedVersion: loaded });
     assert.equal(first.status, 200, await first.text());
@@ -170,7 +177,7 @@ try {
   });
 
   await check("(d2) PUT with the current expectedVersion saves, bumps, and keeps expectedVersion out of the snapshot", async () => {
-    const pid = fx.newProject();
+    const pid = routePids.d2;
     const v = versionOf(pid);
     const res = await put(pid, { homeownerPhone: "(503) 555-0133", expectedVersion: v });
     const body = JSON.parse(await res.text()) as { project: { editVersion: number } };
@@ -184,8 +191,7 @@ try {
   });
 
   await check("(d3) PUT without expectedVersion stays unconditional (the parser and API keys); a malformed one is a 400", async () => {
-    const pid = fx.newProject();
-    db.run("UPDATE projects SET current_stage = ? WHERE id = ?", ["moved by a background writer", pid]);
+    const pid = routePids.d3; // its version was moved by a background data write before the spawn
     const res = await put(pid, { homeownerPhone: "(503) 555-0144" });
     assert.equal(res.status, 200, await res.text());
     assert.equal(snap(pid).homeownerPhone, "(503) 555-0144");
