@@ -1444,7 +1444,11 @@
         <h2 id="usersModalTitle">Team Members</h2>
         <button id="closeUsersBtn" class="secondary"><i data-lucide="x"></i><span>Close</span></button>
       </div>
-      <div class="modal-body split-modal-body">
+      <!-- Two columns: the member LIST, and the selected member's editor. The editor pane holds the
+           member form AND the sign-in sections (#431), wrapped in ONE element so .modal-body's
+           two-column grid never gets a third child (the Clients modal's old layout bug). The
+           sign-in sections stay OUTSIDE #userForm so Enter in a password box never saves the member. -->
+      <div class="modal-body split-modal-body users-modal-body">
         <div class="clients-list-pane">
           <div class="section-head">
             <h3>Operators</h3>
@@ -1452,6 +1456,7 @@
           </div>
           <div id="usersList" class="stack compact"></div>
         </div>
+        <div class="users-editor-pane">
         <form id="userForm" class="clients-form-pane stack">
           <input type="hidden" id="userId" />
           <div id="userFormStatus" class="message" hidden></div>
@@ -1467,10 +1472,40 @@
             <label>Color<input id="u_color" type="color" value="#6366f1" /></label>
           </div>
           <p id="u_roleHint" class="muted field-hint" hidden>New members start as Operator; promote them after saving.</p>
+          <label id="u_passwordWrap" hidden>Sign-in password (optional)<input id="u_password" type="password" autocomplete="new-password" minlength="10" /></label>
+          <p id="u_passwordHint" class="muted field-hint" hidden>Give a password of 10 or more characters to create their sign-in now. Tell it to them privately; they can change it under Change my password.</p>
           <div class="actions">
             <button type="submit" class="primary"><i data-lucide="save"></i><span>Save</span></button>
           </div>
         </form>
+        <section id="staffSignIn" class="users-signin" aria-labelledby="staffSignInTitle">
+          <h3 id="staffSignInTitle">Sign-in</h3>
+          <p id="staffSignInState" class="muted"></p>
+          <div id="staffSignInControls" class="stack" hidden>
+            <label>New password<input id="sl_password" type="password" autocomplete="new-password" minlength="10" /></label>
+            <div class="actions">
+              <button type="button" id="sl_setPasswordBtn" class="secondary"><i data-lucide="key-round"></i><span>Set password</span></button>
+              <button type="button" id="sl_toggleActiveBtn" class="secondary" hidden><span>Deactivate login</span></button>
+            </div>
+          </div>
+          <p id="staffSignInStatus" class="muted" role="status"></p>
+        </section>
+        <section id="myPasswordPane" class="users-signin" aria-labelledby="myPasswordTitle">
+          <h3 id="myPasswordTitle">Change my password</h3>
+          <p id="myPasswordState" class="muted"></p>
+          <div id="myPasswordControls" class="stack" hidden>
+            <label>Current password<input id="mp_current" type="password" autocomplete="current-password" /></label>
+            <div class="form-row">
+              <label>New password<input id="mp_new" type="password" autocomplete="new-password" minlength="10" /></label>
+              <label>Repeat new password<input id="mp_repeat" type="password" autocomplete="new-password" minlength="10" /></label>
+            </div>
+            <div class="actions">
+              <button type="button" id="mp_saveBtn" class="secondary"><i data-lucide="lock"></i><span>Change my password</span></button>
+            </div>
+          </div>
+          <p id="myPasswordStatus" class="muted" role="status"></p>
+        </section>
+        </div>
       </div>
     </div>
   </div>

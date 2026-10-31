@@ -45,14 +45,23 @@ function verifyPassword(password: string, stored: string): boolean {
 }
 
 /**
- * The ONE writer of users.password_hash outside the raw INSERT in seedAdminUser and
- * POST /api/orgs/:id/users. Exported so scripts (scripts/onboard-company.ts) do not
- * re-implement the hasher: the stored format is scrypt(password, 16-byte salt, 64) as
+ * The ONE writer of users.password_hash outside the raw INSERT in seedAdminUser. Used by
+ * POST /api/orgs/:id/users and the dashboard's staff-login routes (staffLogins.ts, #431), and
+ * exported so scripts (scripts/onboard-company.ts) do not re-implement the hasher: the stored format is scrypt(password, 16-byte salt, 64) as
  * "salthex:hashhex", and verifyPassword above is the only reader. A second, drifting
  * copy of that format is a login that cannot log in and nothing that says why.
  */
 export function setUserPassword(db: AppDb, userId: string, password: string): void {
   db.run("UPDATE users SET password_hash = ? WHERE id = ?", [hashPassword(password), userId]);
+}
+
+/**
+ * Whether `password` is this user's current password (self-service password change, #431). The
+ * only other reader of the stored format is login(); neither ever returns the hash.
+ */
+export function passwordMatchesForUser(db: AppDb, userId: string, password: string): boolean {
+  const row = db.get<Row>("SELECT password_hash FROM users WHERE id = ? AND active = 1", [userId]);
+  return Boolean(row?.password_hash) && verifyPassword(password, String(row?.password_hash));
 }
 
 // Create the first admin from env if no user has a password yet.
