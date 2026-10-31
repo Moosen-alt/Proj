@@ -17,6 +17,9 @@
 //   (c) THE ROUTE, on a real server with sign-in off: a nameless autoSubmit mints no approval and
 //       its 202 says so (finalSubmitApproval.recorded false); a named one mints exactly one approval
 //       under that name and says so; a plain stage carries no approval answer at all.
+//   (e) #435 (owner ruling "One click now"): while the NEM track holds a staged draft, the card's
+//       Approve & auto-submit is disabled with the reason, and a stale card's click posts nothing;
+//       a NEM track with no draft and a staged permit track keep the one-click button.
 //   (d) THE JOB RESULT of an approved run the gate declined carries the gate's reasons for THAT run
 //       (autoSubmitDeclined), read from the gate's own audit row; a plain run carries none.
 //
@@ -28,6 +31,7 @@
 //   K2 dashboard: send autoSubmit true on a blank name → (a2) fails.
 //   K3 server: drop finalSubmitApproval from the 202 → (c1)(c2) fail.
 //   K4 jobQueue: drop autoSubmitDeclined from the prepare_submission result → (d) fails.
+//   K5 dashboard trackCardHtml: approveHeld always "" → (e1) fails; the handler guard removed → (e3) fails.
 //
 // Run: npx tsx backend/test/approveAutoSubmitName.test.ts
 import "./_isolate"; // FIRST
@@ -60,7 +64,7 @@ const lift = (name: string): string => {
   return dashboard.slice(m.index, i) + (isConst ? ";" : "");
 };
 const NAMES = [
-  "humanize", "authForDecision", "APPROVE_AUTO_SUBMIT_LEDE", "APPROVER_NAME_KEY", "approveAndAutoSubmitTrack",
+  "humanize", "authForDecision", "APPROVE_AUTO_SUBMIT_LEDE", "APPROVE_HELD_BY_STAGED_DRAFT", "APPROVER_NAME_KEY", "approveAndAutoSubmitTrack",
   "stagedResultLine", "NO_APPROVAL_RECORDED_TEXT", "stageSubmittalTrack",
 ];
 const code = NAMES.map(lift).join("\n\n");
@@ -75,12 +79,13 @@ const harness = (opts: {
   auth: { enabled: boolean; user?: { name?: string; email?: string } | null };
   confirmAnswer?: boolean; promptAnswer?: string | null; remembered?: string;
   approvalAnswer?: Record<string, unknown> | undefined; jobResult?: Record<string, unknown>;
+  tracks?: Array<Record<string, unknown>>;
 }): Harness => {
   const posted: Posted[] = [];
   const messages: Array<{ text: string; kind: string }> = [];
   const prompts: Array<{ text: string; def: string }> = [];
   const store = new Map<string, string>(opts.remembered ? [["feeConfirmName", opts.remembered]] : []);
-  const state: Record<string, unknown> = { selectedProjectId: "proj-under-test", authMe: null, submittalTracks: [] };
+  const state: Record<string, unknown> = { selectedProjectId: "proj-under-test", authMe: null, submittalTracks: opts.tracks ?? [] };
   const stubs: Record<string, unknown> = {
     api: async (p: string, init?: { method?: string; body?: string }) => {
       if (p === "/api/auth/me") return opts.auth;
@@ -189,9 +194,55 @@ await check("(b2) the confirm states the three conditions, that a stop at review
   assert.match(lede, /not a failure/);
   // #435: on the NEM track an approved run after a Stage stops on Stage's draft, so the button is
   // described as its own run from the start and never as submitting what a Stage left.
-  assert.match(lede, /starts its own run from the beginning/);
+  assert.match(lede, /starts its own run from the start of the application/);
   assert.match(lede, /does not submit an application an earlier Stage left/);
   assert.doesNotMatch(lede, /submit(s|ting)? the staged/i, "MUST-EXCLUDE: the confirm promises a click on the staged application");
+});
+
+// ── (e) #435: the card holds Approve & auto-submit while a NEM draft is staged ───────────────
+// The SHIPPED renderer, lifted with every helper it calls (feeTracksDisplay.test's list).
+const CARD_NAMES = [
+  "esc", "humanize", "fmtDate", "statusBadge", "httpUrl", "portalHostname",
+  "TRACK_STATUS_CLASS", "TRACK_CHANNEL_BASIS", "linkifyText", "trackChannelHtml", "OFF_TOOL_CHANNEL", "offToolChannelHtml", "trackPrerequisitesHtml", "ESS_STEP_BASIS", "trackEssStepHtml", "trackNextActionText",
+  "TRACK_ISSUER_KEY", "TRACK_ISSUER_SOURCE", "trackIssuerHtml", "trackIssuerEditHtml", "trackCardHtml",
+];
+const cardCode = `const screenshotMisses = new Set(); const screenshotKey = (a, b, c) => \`\${a}:\${b}:\${c}\`;\n${CARD_NAMES.map(lift).join("\n\n")}\n${lift("APPROVE_HELD_BY_STAGED_DRAFT")}`;
+// eslint-disable-next-line no-new-func
+const card = new Function("$", "state", "window", `${cardCode}\nreturn { trackCardHtml, APPROVE_HELD_BY_STAGED_DRAFT };`)(() => null, { selectedProjectId: "p1" }, {}) as {
+  trackCardHtml: (t: Record<string, unknown>) => string; APPROVE_HELD_BY_STAGED_DRAFT: string;
+};
+const nemTrack = {
+  type: "nem", label: "Utility net metering (NEM) / interconnection", category: "utility", status: "not_started", statusLabel: "Not started", nextAction: "Approve it.",
+  captureFields: [], applicationNumber: "", permitNumber: "", confirmationNumber: "", trackingUrl: "", submittedAt: null, lastCheckedAt: null,
+  outstanding: true, hasRecipe: true, recipeStatus: "complete", recipeScopeType: "utility",
+};
+const approveButton = (html: string): string => /<button[^>]*data-track-approve="[^"]*"[^>]*>/.exec(html)?.[0] ?? "";
+
+await check("(e1) a NEM track with a staged draft holds Approve & auto-submit and says how to finish the draft", async () => {
+  const html = card.trackCardHtml({ ...nemTrack, status: "staged", statusLabel: "Staged" });
+  const btn = approveButton(html);
+  assert.ok(btn, "the button is gone: the operator cannot see why there is no one-click filing");
+  assert.match(btn, /\sdisabled[\s>]/, `MUST-EXCLUDE: Approve starts a second run over the staged draft: ${btn}`);
+  assert.ok(html.includes(card.APPROVE_HELD_BY_STAGED_DRAFT), "the reason is not shown on the card");
+  assert.match(card.APPROVE_HELD_BY_STAGED_DRAFT, /staged draft; finish it from the review window or by staging again, then a person submits/);
+});
+
+await check("(e2) MUST-PASS: a NEM track with no staged draft, and a staged PERMIT track, keep the one-click button", async () => {
+  for (const t of [{ ...nemTrack }, { ...nemTrack, type: "combo", category: "permit", label: "AHJ permit", status: "staged", recipeScopeType: "ahj" }]) {
+    const html = card.trackCardHtml(t);
+    const btn = approveButton(html);
+    assert.ok(btn && !/\sdisabled[\s>]/.test(btn), `${t.type}/${t.status}: ${btn}`);
+    assert.ok(!html.includes(card.APPROVE_HELD_BY_STAGED_DRAFT), `${t.type}/${t.status} shows the hold`);
+    assert.match(btn, /Starts its own run from the start of the application/);
+  }
+});
+
+await check("(e3) a click from a card drawn before the Stage finished is held too: nothing is posted", async () => {
+  const h = harness({ auth: OFF, promptAnswer: "Pat Approver", tracks: [{ type: "nem", status: "staged" }] });
+  await h.run("nem");
+  assert.equal(h.posted.length, 0, "MUST-EXCLUDE: a second NEM run was started over the staged draft");
+  assert.equal(h.prompts.length, 0);
+  assert.ok(h.messages.some((m) => /staged draft/.test(m.text) && m.kind === "warning"), JSON.stringify(h.messages));
 });
 
 // ── (d) the job result of an approved run the gate declined ──────────────────────────────────
