@@ -987,6 +987,10 @@ console.log("\n3. AFTER THE WATCH IS ARMED THE RUN ONLY READS (Helm Should-fix 8
     "sightHumanSubmit", "startJudging", "judgeHumanClick", "commitHumanClick", "reopenHumanSubmit", "hookLateHumanRequests",
     "scheduleCompletionReread", "rereadForCompletion", "readPageForCapture", "readReviewForCapture", "judgeCompletion",
     "followUpHeldOnErrorPage", "reportedHumanClick", "humanClickVerdict", "humanClickReport", "reviewValuesOnPage",
+    // #417 (Helm Should-fix 5 and 7 on #378): the tail and the review step read the held payment and build
+    // the request-went note. Followed, never allowlisted (methods and module functions of this file); on
+    // the floor so a re-cut that stops reaching them fails by name. Readers and string builders only.
+    "heldHumanPayment", "personRequestWentNoteNow", "function personRequestWentNote", "function originAndPath",
   ]) check(`the closure reaches ${name}`, closure.has(name), [...closure.keys()].join(", "));
   // …and the doors and fill paths the run makes its input through are NOT reached (the durable form of
   // the round's fence inventory: main's #353 / #362 / #387 fill paths all run above inputsClosed).

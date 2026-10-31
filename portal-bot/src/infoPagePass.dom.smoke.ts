@@ -21,6 +21,9 @@
 //       watch, no candidate, nothing hashed into the shared table; a CSRF token still is a candidate.
 //   [E] SLOT LIFETIME: an opened slot that is not used within 20 s is gone; a GET reload closes it;
 //       a second matching POST after the admission is held (the same page served again: d8).
+//       E5 (#417, Helm nit :99 on #378, a GUARD pin): the hand-over closes it — opened, the watch armed,
+//       handOverToHuman, then a page script's synthetic el.click() on Next: held (review-lockdown), no
+//       admission, no reservation asked. Kill: remove closeInfo() from handOverToHuman.
 //   [N] NEAR MISSES with DevHub's entry live, the variant served at the SAME origin + path: every
 //       one is HELD, nothing reaches the server, no admission — c1-c28 (c21 under amendment [8]).
 //       The toggle INSIDE a <header> landmark is the one mask: c21h passes for another tenant.
@@ -375,6 +378,41 @@ if (want("E")) {
     const posts = hits.slice(before).filter((h) => h.method === "POST" && h.path.startsWith("/E4/"));
     check("[E] d8: the same verified page served again after its admitted Next: the second open is refused and its POST HELD",
       !!first?.opened && !!second && !second.opened && posts.length === 1, JSON.stringify({ first, second, posts }));
+    await bs?.dispose();
+    await ctx.close();
+  }
+  // E5 (#417, Helm nit :99 on #378 — GUARD pin, green before by design): the hand-over closes the
+  // information-page pass. A pass opened on the run's page must not outlive handOverToHuman: from there
+  // only a person's own input lifts the lockdown. The pass opens on the exact verified page, the input
+  // watch is armed (the CDP isolated-world arm) and the page handed over; then a page script's SYNTHETIC
+  // el.click() on Next (no input event of a person's): its POST never reaches the server, it is held by
+  // the review lockdown, no admission is recorded and no reservation is asked. Kill: remove closeInfo()
+  // from handOverToHuman (the still-open slot admits the Next).
+  {
+    const e5 = await devhubEntryAt("/E5");
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    const bs = await installFilingBackstop(page, "e5 hand-over");
+    await page.goto(`${base}/E5/permits/sfjsp`);
+    await page.waitForLoadState("load");
+    await sleep(400);
+    const before = hits.length;
+    const reservedBefore = reserveCalls.length;
+    const run = cleanRun(devhubPrefix(startUrlOf("/E5")));
+    const open = bs ? await bs.openInfoPagePass(page, page.locator(NEXT), { entries: e5 ? [e5] : [], run, reserve: okReserve }) : null;
+    const armed = bs ? await bs.watchHumanInput() : false;
+    const handed = bs ? bs.handOverToHuman("e5 smoke") : false;
+    await page.evaluate((sel) => { (document.querySelector(sel) as HTMLElement | null)?.click(); }, NEXT);
+    await page.waitForLoadState("load").catch(() => null);
+    await sleep(900);
+    const posts = hits.slice(before).filter((h) => h.method === "POST" && h.path.startsWith("/E5/permits/"));
+    const aborts = (bs?.aborts ?? []).map((a) => ({ rule: a.rule, where: a.where.replace(base, ""), stopping: isStoppingAbort(a), human: !!a.humanInput }));
+    check("[E] E5 premise: the pass opened on the verified page, the input watch armed, and the hand-over was accepted",
+      !!open?.opened && armed === true && handed === true, JSON.stringify({ open, armed, handed }));
+    check("[E] E5 the hand-over closes the pass: a page script's synthetic el.click() on Next sends nothing (0 POSTs), held by the review lockdown",
+      posts.length === 0 && aborts.some((a) => a.rule === "review-lockdown" && /\/E5\/permits\/sfjsp$/.test(a.where) && !a.human), JSON.stringify({ posts, aborts }));
+    check("[E] E5 …no admission is recorded and no reservation is asked",
+      (bs?.infoPageAdmissions ?? []).length === 0 && reserveCalls.length === reservedBefore, JSON.stringify({ admissions: bs?.infoPageAdmissions, reserve: reserveCalls.slice(reservedBefore) }));
     await bs?.dispose();
     await ctx.close();
   }
