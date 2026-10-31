@@ -122,7 +122,8 @@ async function personClicksSubmit(page: Page, person: Person): Promise<boolean> 
 }
 /** The person presses the dialog's own button: OK / Yes (true) or Cancel (false). */
 async function personAnswers(page: Page, person: Person, yes: boolean): Promise<void> {
-  await person.session.send("Page.handleJavaScriptDialog", { accept: yes });
+  // No dialog showing (it was already answered — by Playwright, before #381) fails the checks, never the smoke.
+  await person.session.send("Page.handleJavaScriptDialog", { accept: yes }).catch(() => null);
   await person.clicking;
   if (yes) await page.waitForLoadState("load", { timeout: 5000 }).catch(() => null);
 }

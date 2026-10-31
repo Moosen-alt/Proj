@@ -266,7 +266,7 @@
 //   also asserts the review step's message is whole (wholeMessage: the portal named once, no "., ").
 //   B1 and B10 gain that check (GUARDS, green before by design; their kills are below). B10's is the
 //   stopped-before-review template Helm's nit (helm-review.md:102) names:
-//     B18 a Submit on a form with an empty required box, and B19 one whose confirm() is dismissed: 0
+//     B18 a Submit on a form with an empty required box, and B19 one whose confirm() is cancelled: 0
 //         POSTs, never "has been filed"; the note says YOU CLICKED "Submit Application", the run saw no
 //         request go from it, check the portal; never "nothing was sent", never "click submit again".
 //     B20 PSE Part 1: the Submit is answered "Your draft application NEM-90017 has been created": the
@@ -337,7 +337,7 @@
 //   go and after a capture of the first click would have read the page.
 //     C1  an Accela review with an empty required box: the tail click sends nothing, then LATE the person
 //         types their initials and clicks again: 26TMP-004411 never recorded, 187-26-000328-STR recorded.
-//     C2  a dismissed confirm() on a review showing APP-7734120, and C19 the same on PSE Part 2's header
+//     C2  a cancelled confirm() on a review showing APP-7734120, and C19 the same on PSE Part 2's header
 //         (NEM-204411): 0 POSTs, nothing recorded, no submit handed on.
 //     C3  a Submit that sends nothing, then "My Applications" (status cells, ANOTHER application's
 //         187-26-000100-STR) by GET: nothing recorded, no submit handed on. C3b: the Submit's only request
@@ -462,7 +462,8 @@ const C_COMPLETIONS: Record<string, string> = {
 const C_REVIEWS: Record<string, string> = {
   // An Accela review with an EMPTY required box: the first click sends nothing (the browser holds it).
   C1: `${SUMMARY}<p>Record Number: ${TMP_ID}</p>${submitForm("/h/C1/apply/submit", `<label for="initials">Initials</label> <input id="initials" name="initials" required> `)}`,
-  // A native confirm() Playwright dismisses: nothing is sent. C19 is PSE Part 2's header id (labelled).
+  // A native confirm() the person cancels (#381: it waits for them): nothing is sent. C19 is PSE Part 2's
+  // header id (labelled).
   C2: `${SUMMARY}<p>Application APP-7734120</p>${submitForm("/h/C2/apply/submit", "", "btnSubmit", ` onsubmit="return confirm('Submit this application?')"`)}`,
   C19: `${SUMMARY}<p>Application NEM-204411 (Part 2: Interconnection Agreement)</p>${submitForm("/h/C19/apply/submit", "", "btnSubmit", ` onsubmit="return confirm('Submit this application?')"`)}`,
   // A Submit that sends nothing, and the portal's "My Applications" list one GET away.
@@ -510,7 +511,7 @@ const C_RERENDERS: Record<string, string> = {
 const B_REVIEWS: Record<string, string> = {
   // An empty required box: the browser holds the submit (nothing sent).
   B18: `${SUMMARY}${submitForm("/h/B18/apply/submit", `<label for="initials">Initials</label> <input id="initials" name="initials" required> `)}`,
-  // A native confirm() Playwright dismisses: nothing sent.
+  // A native confirm() the person cancels (#381: it waits for them): nothing sent.
   B19: `${SUMMARY}${submitForm("/h/B19/apply/submit", "", "btnSubmit", ` onsubmit="return confirm('Submit this application?')"`)}`,
   // PSE Part 1: the Submit is answered with the draft-created page (B_ANSWERS).
   B20: `${SUMMARY}${submitForm("/h/B20/apply/submit")}`,
@@ -677,6 +678,26 @@ async function personClicks(page: Page, css = "#btnSubmit"): Promise<void> {
   const box = await page.locator(css).first().boundingBox();
   if (!box) throw new Error(`no box for ${css}`);
   await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+}
+/** #381 — A PERSON'S click on a Submit whose confirm() the browser shows, and their CANCEL on that
+ *  dialog. From the hand-over a native dialog waits for the person (it is no longer dismissed by
+ *  Playwright, and automation never answers it), so the person answers: their own button in the
+ *  browser's dialog, through a DevTools session of theirs opened before the click. The click is not
+ *  awaited until then (a click whose page opened a dialog returns only once it is answered). */
+async function personClicksAndCancels(page: Page, css = "#btnSubmit"): Promise<void> {
+  const session = await page.context().newCDPSession(page);
+  let opened = false;
+  session.on("Page.javascriptDialogOpening", () => { opened = true; });
+  await session.send("Page.enable");
+  const box = await page.locator(css).first().boundingBox();
+  if (!box) throw new Error(`no box for ${css}`);
+  const clicking = page.mouse.click(box.x + box.width / 2, box.y + box.height / 2).catch(() => null);
+  const t0 = Date.now();
+  while (!opened && Date.now() - t0 < 5000) await sleep(20);
+  if (!opened) throw new Error("the browser showed no confirm dialog");
+  await session.send("Page.handleJavaScriptDialog", { accept: false });
+  await clicking;
+  await session.detach().catch(() => null);
 }
 /** A person's click on an empty part of the page (an input that sends nothing). */
 async function personTouchesPage(page: Page): Promise<void> {
@@ -1855,10 +1876,11 @@ const refusedHandOver = (k: string, r: Replay): void => {
 
 // [B, Helm Blocking 2] "FILED" ONLY FOR A COMMITTED SUBMIT WHOSE PAGE READS AS A COMPLETION.
 console.log("\n[B, Helm Blocking 2] THE REVIEW STEP SAYS WHAT BECAME OF THE PERSON'S CLICK");
-for (const [k, how] of [["B18", "a Submit on a form with an empty required box"], ["B19", "a Submit whose confirm() the browser dismissed"]] as const) {
+for (const [k, how] of [["B18", "a Submit on a form with an empty required box"], ["B19", "a Submit whose confirm() the person cancelled"]] as const) {
   // B18 / B19: the click sends nothing. The run saw no request go from it, so it cannot say "filed",
-  // and it cannot say "nothing was sent" either: "you clicked X; check the portal".
-  const r = await replay(k, { onHandOver: (page) => personClicks(page) });
+  // and it cannot say "nothing was sent" either: "you clicked X; check the portal". (#381: B19's
+  // confirm() waits for the person — no longer dismissed by Playwright — and the person cancels it.)
+  const r = await replay(k, { onHandOver: (page) => (k === "B19" ? personClicksAndCancels(page) : personClicks(page)) });
   check(`${k} ${how}: nothing reached the portal, never "has been filed", no submit handed on`,
     r.posts.length === 0 && neverFiled(r) && r.observed.length === 0, wbrief(r));
   check(`${k} …the hand-off says YOU CLICKED "Submit Application", the run saw no request go from it: check the portal`,
@@ -2033,11 +2055,11 @@ const captureCase = (k: string, first: (page: Page) => Promise<unknown>, late?: 
     recorded(r).includes("187-26-000328-STR") && r.posts.filter((p) => /\/apply\/submit$/.test(p)).length === 1, cbrief(r));
 }
 for (const [k, id] of [["C2", "APP-7734120"], ["C19", "NEM-204411"]] as const) {
-  // C2 / C19: a dismissed confirm() on a review page showing a PowerClerk APP- id (C2) or PSE Part 2's
+  // C2 / C19: a cancelled confirm() on a review page showing a PowerClerk APP- id (C2) or PSE Part 2's
   // NEM- header (C19): nothing is sent. Red before: the click spent the detector and the review's own
-  // id was recorded HIGH off the review page.
-  const r = await captureCase(k, (page) => personClicks(page));
-  check(`${k} a dismissed confirm() (nothing sent): no number recorded (never ${id}) and no submit handed on`,
+  // id was recorded HIGH off the review page. (#381: the confirm() waits for the person, who cancels.)
+  const r = await captureCase(k, (page) => personClicksAndCancels(page));
+  check(`${k} a cancelled confirm() (nothing sent): no number recorded (never ${id}) and no submit handed on`,
     r.posts.length === 0 && recorded(r).length === 0 && r.observed.length === 0, cbrief(r));
 }
 {
