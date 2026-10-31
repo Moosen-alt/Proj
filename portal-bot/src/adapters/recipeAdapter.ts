@@ -2306,6 +2306,8 @@ export class RecipeAdapter extends BasePortalAdapter {
   // account/meter numbers) is masked and the text is capped to a short snippet.
   /** Why the last checkStatus() read nothing usable (issue #161); the status checker reports it. */
   lastStatusReason = "";
+  /** The found filing's own record link (#413; statusFinder.exactRecordLinkInPage), "" when none. */
+  lastStatusRecordLink = "";
 
   // READ THE STATUS WHERE THE SIGN-IN LEFT US (issue #161). This used to reload recipe.portalUrl
   // first. For a recipe recorded from the portal's LOGIN page (every PowerClerk recipe ends in
@@ -2315,6 +2317,7 @@ export class RecipeAdapter extends BasePortalAdapter {
   // projects/applications list, and that list's pages, by read-only navigation only.
   async checkStatus(applicationNumbers: string[]): Promise<string | null> {
     this.lastStatusReason = "";
+    this.lastStatusRecordLink = "";
     if (!this.page) { this.lastStatusReason = "the portal never opened"; return null; }
     if (!applicationNumbers.length) { this.lastStatusReason = "no application number to look for"; return null; }
     try {
@@ -2328,6 +2331,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         onProgress: (m) => this.progress("wait", `Status read: ${m}`, Date.now() - t0),
       });
       this.lastStatusReason = found.reason;
+      this.lastStatusRecordLink = found.text ? String(found.recordLink || "") : "";
       return found.text;
     } catch (err) {
       this.lastStatusReason = `the status read failed: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`;
