@@ -777,6 +777,12 @@ export interface ProjectRecord {
   assignedUserId?: string | null;
   createdAt: string;
   updatedAt: string;
+  /** The project's edit version (#440): a counter every write to the project's DATA moves (a
+   *  trigger, so background data writers move it too; status/stage ticks don't). A dashboard editor sends back the one it loaded as
+   *  `expectedVersion` on PUT /api/projects/:id; a stale one is refused with a 409 and nothing is
+   *  written. Optional only because normalizeProject builds an in-memory record before any row
+   *  exists; every record read from the database carries it. */
+  editVersion?: number;
   /** Which permit discipline to file: "structural" (BLD) or "electrical" (ELE).
    *  Drives jurisdiction row selection (city vs county) and app-type checkbox
    *  in the Accela ACA flow. Undefined defaults to structural. */
