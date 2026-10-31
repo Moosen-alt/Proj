@@ -204,7 +204,7 @@ await check("(b2) the confirm states the three conditions, that a stop at review
 const CARD_NAMES = [
   "esc", "humanize", "fmtDate", "statusBadge", "httpUrl", "portalHostname",
   "TRACK_STATUS_CLASS", "TRACK_CHANNEL_BASIS", "linkifyText", "trackChannelHtml", "OFF_TOOL_CHANNEL", "offToolChannelHtml", "trackPrerequisitesHtml", "ESS_STEP_BASIS", "trackEssStepHtml", "trackNextActionText",
-  "TRACK_ISSUER_KEY", "TRACK_ISSUER_SOURCE", "trackIssuerHtml", "trackIssuerEditHtml", "trackCardHtml",
+  "TRACK_ISSUER_KEY", "TRACK_ISSUER_SOURCE", "trackIssuerHtml", "trackIssuerEditHtml", "STAGE_GAP_LINK", "trackStageGapsHtml", "trackCardHtml",
 ];
 const cardCode = `const screenshotMisses = new Set(); const screenshotKey = (a, b, c) => \`\${a}:\${b}:\${c}\`;\n${CARD_NAMES.map(lift).join("\n\n")}\n${lift("APPROVE_HELD_BY_STAGED_DRAFT")}`;
 // eslint-disable-next-line no-new-func

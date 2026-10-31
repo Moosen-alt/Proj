@@ -5024,6 +5024,67 @@ async function saveTrackIssuer(type, value, btn) {
   }
 }
 
+// WHAT THIS TRACK'S RECIPE WILL FILL THAT THE JOB HAS NO VALUE FOR (#445, owner 2026-10-31: "automated
+// fill is right every time"). The server's own reading (backend recipeStageGaps — the list the stage
+// gate refuses on), shown before anyone clicks Stage: each box in the portal's words, what to fill,
+// and a link to where it is filled. Labels and keys only; the server never sends a value (rule 2).
+// Untrusted text: esc() everything.
+const STAGE_GAP_LINK = {
+  project: "Fill it on the project",
+  client: "Fill it on the client",
+  documents: "Upload it",
+  portal_questions: "Answer it",
+};
+function trackStageGapsHtml(t) {
+  const gaps = Array.isArray(t && t.stageGaps) ? t.stageGaps : [];
+  if (!gaps.length) return "";
+  const what = (g) => g.kind === "document"
+    ? `needs a ${g.fieldName} document`
+    : g.kind === "question"
+      ? "a question only a person can answer for this job"
+      : `needs ${g.fieldName}${g.where === "client" ? " (client record)" : ""}`;
+  const items = gaps.map((g) => `<li data-stage-gap="${esc(g.key)}" data-stage-gap-kind="${esc(g.kind)}">
+        <span>“${esc(g.label || g.fieldName)}” — ${esc(what(g))}</span>
+        <a href="#" data-stage-gap-open="${esc(g.where)}" data-stage-gap-key="${esc(g.key)}">${esc(STAGE_GAP_LINK[g.where] || "Open")}</a>
+      </li>`).join("");
+  return `<div class="track-stage-gaps" data-track-stage-gaps="${esc(t.type)}" style="margin:0 0 6px;font-size:12px;color:var(--warning)">
+    <strong>Fill before staging — the recipe fills ${gaps.length === 1 ? "this box" : `these ${gaps.length} boxes`} and this job has no value, so staging will stop here:</strong>
+    <ul style="margin:2px 0 0 18px;padding:0">${items}</ul>
+  </div>`;
+}
+// Where each gap is filled. A project field with its own box on the project-data form is focused;
+// anything else opens the form it lives on.
+const STAGE_GAP_PROJECT_INPUT = {
+  homeownerEmail: "manualHomeownerEmail", ubAccountHolderEmail: "manualHomeownerEmail",
+  homeownerPhone: "manualHomeownerPhone", ubAccountHolderPhone: "manualHomeownerPhone",
+  workDescription: "manualDescription", jobValue: "manualJobValue",
+};
+function openStageGap(where, key) {
+  const reveal = (el) => {
+    if (!el) return;
+    // Every collapsed section it sits in (the stage accordion and the project-data panel) opens.
+    for (let d = el.closest ? el.closest("details") : null; d; d = d.parentElement ? d.parentElement.closest("details") : null) d.open = true;
+    if (el.scrollIntoView) el.scrollIntoView({ block: "center" });
+    if (el.focus) el.focus();
+  };
+  if (where === "documents") {
+    const sel = $("docUploadType");
+    if (sel && Array.from(sel.options || []).some((o) => o.value === key)) sel.value = key;
+    reveal(sel);
+    return;
+  }
+  if (where === "client") {
+    const clientId = state.detail && state.detail.project ? state.detail.project.clientId : "";
+    Promise.resolve(openClientsModal()).then(() => { if (clientId) editClient(clientId); }).catch(() => {});
+    return;
+  }
+  if (where === "portal_questions") {
+    reveal(document.getElementById("portalQuestionsChip") || document.querySelector(".intake-link-row"));
+    return;
+  }
+  reveal($(STAGE_GAP_PROJECT_INPUT[key] || "") || $("manualEntryForm"));
+}
+
 function trackCardHtml(t) {
   const cls = TRACK_STATUS_CLASS[t.status] || "info";
   // Captured numbers — only the fields this track actually uses (NEM has no permit #).
@@ -5095,6 +5156,7 @@ function trackCardHtml(t) {
     ${trackPrerequisitesHtml(t)}
     ${trackEssStepHtml(t)}
     <p style="margin:0 0 6px;font-size:12px">→ ${linkifyText(trackNextActionText(t))}</p>
+    ${trackStageGapsHtml(t)}
     ${captured ? `<p style="margin:0 0 4px">${captured} ${trackLink ? "&nbsp;·&nbsp; " + trackLink : ""}</p>` : (trackLink ? `<p style="margin:0 0 4px">${trackLink}</p>` : "")}
     ${t.recipeId && (t.recipeStatus === "complete" || t.recipeStatus === "recording")
       && !screenshotMisses.has(screenshotKey(state.selectedProjectId, t.recipeId, t.recipeStatus))
@@ -5227,6 +5289,9 @@ function renderSubmittalTracks() {
   });
   wrap.querySelectorAll("button[data-track-stage]").forEach((btn) => {
     btn.addEventListener("click", () => stageSubmittalTrack(btn.dataset.trackStage, btn));
+  });
+  wrap.querySelectorAll("a[data-stage-gap-open]").forEach((a) => {
+    a.addEventListener("click", (ev) => { ev.preventDefault(); openStageGap(a.dataset.stageGapOpen, a.dataset.stageGapKey); });
   });
   wrap.querySelectorAll("button[data-track-open-recorder]").forEach((btn) => {
     btn.addEventListener("click", () => launchTrackRecorder(btn.dataset.trackOpenRecorder, btn.dataset.scope, btn));
@@ -10735,16 +10800,21 @@ function editUser(userId) {
   $("u_role").value = user.role;
   $("u_color").value = user.color;
   renderUsersList();
+  staffSignInStatus("");
+  renderStaffSignIn();
 }
 
 // A NEW member is always created as an Operator (users.ts createUser — creation is not an
 // elevation path). Offering "Admin" on the Add form saved an Operator and still said "Saved.",
 // so the choice is shut on a new member and opens once they exist (promotion is an edit).
+// One exception (#431): a new member given a sign-in password is created through the admin-gated
+// POST /api/staff/logins, which takes the role, so Admin opens for that case only.
 function syncUserRoleChoice(isNew) {
+  const withLogin = !!isNew && newMemberGetsLogin();
   const admin = $("u_role")?.querySelector('option[value="admin"]');
-  if (admin) admin.disabled = !!isNew;
-  if (isNew && $("u_role")) $("u_role").value = "operator";
-  if ($("u_roleHint")) $("u_roleHint").hidden = !isNew;
+  if (admin) admin.disabled = !!isNew && !withLogin;
+  if (isNew && !withLogin && $("u_role")) $("u_role").value = "operator";
+  if ($("u_roleHint")) $("u_roleHint").hidden = !isNew || withLogin;
 }
 
 function blankUserForm() {
@@ -10755,7 +10825,10 @@ function blankUserForm() {
   $("u_email").value = "";
   syncUserRoleChoice(true);
   $("u_color").value = "#6366f1";
+  if ($("u_password")) $("u_password").value = "";
   renderUsersList();
+  staffSignInStatus("");
+  renderStaffSignIn();
 }
 
 // The Team modal is opened from the dashboard, where #message (inside the project view) is
@@ -10777,8 +10850,9 @@ async function saveUser(event) {
     color: $("u_color").value,
   };
   if (!payload.name || !payload.email) { userFormStatus("Name and email are required.", "warning"); return; }
+  const userId = $("userId").value;
+  if (!userId && newMemberGetsLogin()) { await createMemberWithLogin(payload); return; }
   try {
-    const userId = $("userId").value;
     if (userId) {
       await api(`/api/users/${userId}`, { method: "PUT", body: JSON.stringify(payload) });
     } else {
@@ -10796,8 +10870,153 @@ async function saveUser(event) {
   }
 }
 
+// ----- Staff sign-ins (#431) -----
+// The Team modal's "Sign-in" section: an admin sets or resets a teammate's password and switches
+// a login off or on; "Change my password" lets anyone signed in change their own (current password
+// required). With sign-in off on the server there is nothing to manage, and both sections say so
+// rather than offering buttons that would write passwords nobody uses. A password typed here goes
+// to the server once and is cleared from the box; it is never shown back or kept in state.
+const STAFF_MIN_PASSWORD = 10;
+
+async function loadStaffSignIn() {
+  const auth = await authForDecision();
+  if (!auth || !auth.enabled) { state.staffSignIn = { mode: "off", me: null, logins: [] }; return; }
+  try {
+    const data = await api("/api/staff/logins");
+    state.staffSignIn = { mode: data.authEnabled ? "admin" : "off", me: auth.user, logins: Array.isArray(data.logins) ? data.logins : [] };
+  } catch {
+    state.staffSignIn = { mode: "member", me: auth.user, logins: [] };
+  }
+}
+
+function newMemberGetsLogin() {
+  return state.staffSignIn?.mode === "admin" && Boolean($("u_password")?.value);
+}
+
+function staffSignInStatus(text, kind) {
+  const el = $("staffSignInStatus");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = kind === "error" ? "message error" : "muted";
+}
+
+function myPasswordStatus(text, kind) {
+  const el = $("myPasswordStatus");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = kind === "error" ? "message error" : "muted";
+}
+
+function renderStaffSignIn() {
+  const info = state.staffSignIn || { mode: "off", me: null, logins: [] };
+  const off = info.mode === "off";
+  const offText = "Sign-in is off on this server, so there are no logins or passwords to manage here. An admin turns it on with AUTH_ENABLED=true (see docs/SERVER_SETUP.md).";
+  const isNew = !$("userId")?.value;
+  if ($("u_passwordWrap")) $("u_passwordWrap").hidden = !(isNew && info.mode === "admin");
+  if ($("u_passwordHint")) $("u_passwordHint").hidden = !(isNew && info.mode === "admin");
+  syncUserRoleChoice(isNew);
+
+  // Change my password: anyone signed in.
+  $("myPasswordState").textContent = off ? offText : `Signed in as ${(info.me && (info.me.name || info.me.email)) || "you"}.`;
+  $("myPasswordControls").hidden = off || !info.me;
+
+  // The selected member's sign-in.
+  const stateEl = $("staffSignInState");
+  const controls = $("staffSignInControls");
+  const toggle = $("sl_toggleActiveBtn");
+  controls.hidden = true;
+  toggle.hidden = true;
+  if (off) { stateEl.textContent = offText; return; }
+  if (info.mode !== "admin") { stateEl.textContent = "Only an admin can set or reset team sign-ins."; return; }
+  const userId = $("userId").value;
+  if (!userId) { stateEl.textContent = "Add a sign-in password above to give a new member a login when you save them."; return; }
+  const login = info.logins.find((l) => l.id === userId);
+  if (!login) { stateEl.textContent = "This member is not in your organization's sign-in list."; return; }
+  if (info.me && login.id === info.me.id) { stateEl.textContent = "This is you. Use Change my password below."; return; }
+  if (login.role === "superadmin" && info.me?.role !== "superadmin") { stateEl.textContent = "Only a superadmin can manage this login."; return; }
+  stateEl.textContent = !login.hasLogin
+    ? `${login.name} has no sign-in yet. Set a password to give them one.`
+    : login.active ? `${login.name} can sign in.` : `${login.name}'s sign-in is switched off.`;
+  controls.hidden = false;
+  $("sl_setPasswordBtn").querySelector("span").textContent = login.hasLogin ? "Reset password" : "Set password";
+  if (login.hasLogin || !login.active) {
+    toggle.hidden = false;
+    toggle.querySelector("span").textContent = login.active ? "Deactivate login" : "Reactivate login";
+  }
+}
+
+async function refreshStaffSignIn() {
+  await loadStaffSignIn();
+  renderStaffSignIn();
+}
+
+async function createMemberWithLogin(payload) {
+  const password = $("u_password").value;
+  if (password.length < STAFF_MIN_PASSWORD) { userFormStatus(`The sign-in password must be at least ${STAFF_MIN_PASSWORD} characters.`, "warning"); return; }
+  try {
+    const created = await api("/api/staff/logins", { method: "POST", body: JSON.stringify({ name: payload.name, email: payload.email, role: payload.role, password }) });
+    $("u_password").value = "";
+    await loadUsers();
+    await refreshStaffSignIn();
+    if (created?.login?.id) editUser(created.login.id);
+    userFormStatus(`Added with a sign-in as ${created?.login?.role === "admin" ? "an Admin" : "an Operator"}. Tell them the password privately.`, "info");
+  } catch (err) {
+    userFormStatus(err.message || "Could not create the sign-in.", "error");
+  }
+}
+
+async function setStaffPassword() {
+  const userId = $("userId").value;
+  const password = $("sl_password").value;
+  if (!userId) return;
+  if (password.length < STAFF_MIN_PASSWORD) { staffSignInStatus(`The password must be at least ${STAFF_MIN_PASSWORD} characters.`, "error"); return; }
+  try {
+    await api(`/api/staff/logins/${encodeURIComponent(userId)}/password`, { method: "POST", body: JSON.stringify({ password }) });
+    $("sl_password").value = "";
+    await refreshStaffSignIn();
+    staffSignInStatus("Password set. Tell it to them privately; they can change it under Change my password.");
+  } catch (err) {
+    staffSignInStatus(err.message || "Could not set the password.", "error");
+  }
+}
+
+async function toggleStaffActive() {
+  const userId = $("userId").value;
+  const login = (state.staffSignIn?.logins || []).find((l) => l.id === userId);
+  if (!login) return;
+  const turnOff = login.active;
+  if (turnOff && !confirm(`Switch off ${login.name}'s sign-in? They are signed out at once and can't sign in until an admin switches it back on.`)) return;
+  try {
+    await api(`/api/staff/logins/${encodeURIComponent(userId)}/active`, { method: "POST", body: JSON.stringify({ active: !turnOff }) });
+    await loadUsers();
+    await refreshStaffSignIn();
+    staffSignInStatus(turnOff ? "Sign-in switched off." : "Sign-in switched back on.");
+  } catch (err) {
+    staffSignInStatus(err.message || "Could not change the sign-in.", "error");
+  }
+}
+
+async function changeMyPassword() {
+  const currentPassword = $("mp_current").value;
+  const newPassword = $("mp_new").value;
+  if (!currentPassword) { myPasswordStatus("Enter your current password.", "error"); return; }
+  if (newPassword.length < STAFF_MIN_PASSWORD) { myPasswordStatus(`The new password must be at least ${STAFF_MIN_PASSWORD} characters.`, "error"); return; }
+  if (newPassword !== $("mp_repeat").value) { myPasswordStatus("The two new passwords don't match.", "error"); return; }
+  try {
+    await api("/api/auth/password", { method: "POST", body: JSON.stringify({ currentPassword, newPassword }) });
+    myPasswordStatus("Your password is changed. Use the new one next time you sign in.");
+  } catch (err) {
+    myPasswordStatus(err.message || "Could not change your password.", "error");
+  } finally {
+    $("mp_current").value = "";
+    $("mp_new").value = "";
+    $("mp_repeat").value = "";
+  }
+}
+
 async function openUsersModal() {
   $("usersModal").hidden = false;
+  await loadStaffSignIn();
   await loadUsers();
   if ((state.users || []).length > 0) editUser(state.users[0].id);
   else blankUserForm();
@@ -10810,6 +11029,10 @@ $("openUsersBtn").addEventListener("click", openUsersModal);
 $("closeUsersBtn").addEventListener("click", closeUsersModal);
 $("newUserBtn").addEventListener("click", blankUserForm);
 $("userForm").addEventListener("submit", saveUser);
+$("u_password").addEventListener("input", () => syncUserRoleChoice(!$("userId").value));
+$("sl_setPasswordBtn").addEventListener("click", setStaffPassword);
+$("sl_toggleActiveBtn").addEventListener("click", toggleStaffActive);
+$("mp_saveBtn").addEventListener("click", changeMyPassword);
 $("usersModal").addEventListener("click", (e) => { if (e.target.id === "usersModal") closeUsersModal(); });
 
 // ----- KPI Dashboard -----

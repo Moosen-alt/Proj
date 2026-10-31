@@ -50,6 +50,8 @@ const NAMES = [
   "TRACK_STATUS_CLASS", "TRACK_CHANNEL_BASIS", "linkifyText", "trackChannelHtml", "OFF_TOOL_CHANNEL", "offToolChannelHtml", "trackPrerequisitesHtml", "ESS_STEP_BASIS", "trackEssStepHtml", "trackNextActionText",
   // The permit card's issuer line and its set/clear control (split issuer) — trackCardHtml calls both.
   "TRACK_ISSUER_KEY", "TRACK_ISSUER_SOURCE", "trackIssuerHtml", "trackIssuerEditHtml", "saveTrackIssuer",
+  // What the recipe will fill that the job has no value for (#445) — trackCardHtml calls it.
+  "STAGE_GAP_LINK", "trackStageGapsHtml",
   "trackCardHtml", "utilityGroupTitle", "renderSubmittalTracks",
 ];
 const preamble = "const screenshotMisses = new Set(); const screenshotKey = (a, b, c) => `${a}:${b}:${c}`;";

@@ -56,7 +56,8 @@ import { startMonitorScheduler } from "./scheduler";
 import { startAhjFormRefreshScheduler, startKbLinkCheckScheduler } from "./ahjFormRefresh";
 import { startCecSyncScheduler, primeCecCache, syncCecEquipment } from "./cecEquipment";
 import { extractZipToWorkdir } from "./batchZip";
-import { AUTH_ENABLED, currentUser, login, logout, me, requireAuth, seedAdminUser, entitlementGate, requestOrg, createApiKey, ADMIN_ROLES, ROLE_SUPERADMIN } from "./auth";
+import { AUTH_ENABLED, currentUser, login, logout, me, requireAuth, seedAdminUser, setUserPassword, entitlementGate, requestOrg, createApiKey, ADMIN_ROLES, ROLE_SUPERADMIN, type SessionUser } from "./auth";
+import { changeOwnPassword, createStaffLogin, listStaffLogins, resetStaffPassword, setStaffLoginActive } from "./staffLogins";
 import { PRODUCTS, PRODUCT_KEYS, grantProduct, revokeProduct, orgEntitlements, productsForEdition } from "./entitlements";
 import { requestScope, orgFilter, orgClause, reqOrgFilter, assertInScope, auditCrossOrgAccess } from "./scope";
 import { folderScanPayload } from "./batchZip";
@@ -1188,12 +1189,12 @@ app.post("/api/orgs/:id/users", (req, res) => {
   if (!email || !password) throw new HttpError(400, "email and password are required.");
   if (db.get("SELECT id FROM users WHERE email = ?", [email])) throw new HttpError(409, "A user with that email already exists.");
   const userId = crypto.randomUUID();
-  const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(password, salt, 64);
   db.run(
-    "INSERT INTO users (id, name, email, role, color, active, created_at, password_hash, org_id) VALUES (?, ?, ?, 'operator', '#0ea5e9', 1, ?, ?, ?)",
-    [userId, name, email, new Date().toISOString(), `${salt.toString("hex")}:${hash.toString("hex")}`, orgId],
+    "INSERT INTO users (id, name, email, role, color, active, created_at, org_id) VALUES (?, ?, ?, 'operator', '#0ea5e9', 1, ?, ?)",
+    [userId, name, email, new Date().toISOString(), orgId],
   );
+  // The one hash writer (auth.ts). This route used to inline its own copy of the scrypt format.
+  setUserPassword(db, userId, password);
   addAuditLog(db, null, "human", currentUser(db, req)?.email || "operator", "org.user_created", { orgId, email });
   res.status(201).json({ user: { id: userId, name, email, orgId } });
 });
@@ -1205,6 +1206,55 @@ app.post("/api/orgs/:id/api-keys", (req, res) => {
   const created = createApiKey(db, orgId, String(req.body?.name || "api key"));
   addAuditLog(db, null, "human", currentUser(db, req)?.email || "operator", "org.api_key_created", { orgId, keyId: created.id });
   res.status(201).json({ id: created.id, key: created.key, note: "Store this key now — it is shown only once." });
+});
+
+// ---------------------------------------------------------------------------
+// Staff logins (issue #431): the dashboard's Team panel makes, resets and switches off
+// teammates' sign-ins. Admin-gated (requireAdmin) and scoped to the ADMIN'S OWN ORG inside
+// staffLogins.ts: another org's user id is a 404, never a 403 (rule 6), and nobody
+// administers across orgs (owner ruling 2026-10-10). With sign-in off there is nothing to
+// manage, so these say so (409 auth_disabled) instead of quietly writing passwords nobody uses.
+// ---------------------------------------------------------------------------
+const SIGN_IN_OFF = "Sign-in is off on this server (AUTH_ENABLED is not true), so logins and passwords are not used here.";
+
+function requireStaffAdmin(req: Request): SessionUser {
+  if (!AUTH_ENABLED) throw new HttpError(409, SIGN_IN_OFF, { code: "auth_disabled" });
+  requireAdmin(req);
+  const actor = currentUser(db, req);
+  if (!actor) throw new HttpError(401, "Not authenticated.");
+  return actor;
+}
+
+app.get("/api/staff/logins", (req, res) => {
+  if (!AUTH_ENABLED) { res.json({ authEnabled: false, logins: [] }); return; }
+  const actor = requireStaffAdmin(req);
+  res.json({ authEnabled: true, logins: listStaffLogins(db, actor) });
+});
+
+app.post("/api/staff/logins", (req, res) => {
+  const actor = requireStaffAdmin(req);
+  res.status(201).json({ login: createStaffLogin(db, actor, req.body || {}) });
+});
+
+app.post("/api/staff/logins/:id/password", (req, res) => {
+  const actor = requireStaffAdmin(req);
+  res.json({ login: resetStaffPassword(db, actor, String(req.params.id), req.body?.password) });
+});
+
+app.post("/api/staff/logins/:id/active", (req, res) => {
+  const actor = requireStaffAdmin(req);
+  if (typeof req.body?.active !== "boolean") throw new HttpError(400, "active must be true or false.");
+  res.json({ login: setStaffLoginActive(db, actor, String(req.params.id), req.body.active) });
+});
+
+// Self-service password change. It sits under /api/auth/, which the sign-in gate lets through
+// (the login route lives there), so THIS HANDLER is the gate: no session, no change.
+app.post("/api/auth/password", (req, res) => {
+  if (!AUTH_ENABLED) throw new HttpError(409, SIGN_IN_OFF, { code: "auth_disabled" });
+  const user = currentUser(db, req);
+  if (!user) throw new HttpError(401, "Not authenticated.");
+  changeOwnPassword(db, user, req.body?.currentPassword, req.body?.newPassword);
+  res.json({ ok: true });
 });
 
 // Shareable read-only report link (e.g. the AHJ forwards a pre-review to an applicant).
