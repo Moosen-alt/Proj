@@ -2459,6 +2459,7 @@ const FEE_SOURCE_LABELS = {
   published_schedule: "published fee schedule",
   learned_history: "learned from past submissions here",
   valuation_estimate: "estimate from valuation",
+  printed_form: "fee table printed on the AHJ's form (may be out of date)",
   unknown: "unknown — enter the portal fee",
 };
 
@@ -2478,6 +2479,7 @@ function renderPaymentQuoteCard(quote) {
         <tr style="border-top:1px solid var(--border)"><td style="padding:3px 14px 1px 0"><strong>Client total</strong></td><td style="text-align:right"><strong>${money(quote.totalUsd)}</strong></td><td></td></tr>
       </table>
       <p class="muted" style="margin:2px 0;font-size:11px">${esc(quote.permitFeeBasis || "")}</p>
+      ${printedFormCheckHtml(quote.printedFormCheck)}
       ${status === "paid" ? `<p style="margin:2px 0;font-size:12px">Paid ${p.paidAt ? new Date(p.paidAt).toLocaleString() : ""}${p.paymentReference ? ` — ref: ${esc(p.paymentReference)}` : ""}</p>` : ""}
       ${status !== "paid" ? `
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">
@@ -2620,6 +2622,7 @@ const FEE_SOURCE_TEXT = {
   published_schedule: "the jurisdiction's published fee schedule",
   learned_history: "the median of real fees seen here before",
   valuation_estimate: "a percentage of the project valuation",
+  printed_form: "the fee table printed on the AHJ's own form, which may be out of date",
   unknown: "nowhere yet",
 };
 
@@ -2819,6 +2822,19 @@ function feeComparisonHtml(line) {
     </div>`;
 }
 
+// THE FEE TABLE PRINTED ON THE AHJ'S OWN FORM, BESIDE THE AMOUNT (#454) — a dated, lower-trust
+// cross-check. Drawn only when it agrees or disagrees: "no printed table" is not news on a card.
+// A disagreement is a note under the amount, never a second amount. Every value escaped.
+function printedFormCheckHtml(check) {
+  if (!check || (check.verdict !== "agrees" && check.verdict !== "disagrees")) return "";
+  const lines = Array.isArray(check.lines) ? check.lines : [];
+  const fmt = (v) => `$${Number(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return `<details class="provenance fee-printed-check" style="margin:2px 0;font-size:12px">
+      <summary>${check.verdict === "disagrees" ? `<span class="badge badge-warning">printed form disagrees</span> ` : `<span class="badge badge-pass">printed form agrees</span> `}${esc(check.note || "")}</summary>
+      <ul>${lines.map((l) => `<li>${esc(l.label)}: ${esc(fmt(l.amountUsd))}</li>`).join("")}</ul>
+    </details>`;
+}
+
 // WHAT THE PERMIT MONITOR READ OFF EACH FILED RECORD, one click away: the invoices it saw, when,
 // and — for a record it could not read — why (never a $0).
 function feePortalRecordsHtml(line) {
@@ -2891,6 +2907,7 @@ function renderFeeSheetLine(line) {
       ${portalProvenance}
       ${verifiedNote}
       ${feeComparisonHtml(line)}
+      ${printedFormCheckHtml(line.printedFormCheck)}
       ${confirmControl}
       ${renderFeeCharges(line)}
       ${feePortalRecordsHtml(line)}
