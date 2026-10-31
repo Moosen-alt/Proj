@@ -5181,10 +5181,7 @@ function renderSubmittalTracks() {
     btn.addEventListener("click", () => saveTrackIssuer(btn.dataset.trackIssuerClear, "", btn));
   });
   wrap.querySelectorAll("button[data-track-approve]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      if (!confirm("Approve & auto-submit this filing?\n\nThis is your approval of THIS run, recorded under your name: with the server's PORTAL_ALLOW_FINAL_SUBMIT switch on and a recipe recorded through submit, the bot clicks the portal's application submit (never fee payment) and stops for any CAPTCHA/MFA. If the switch is off or the recipe stops short, it stages to the review screen for you to submit.")) return;
-      stageSubmittalTrack(btn.dataset.trackApprove, btn, true);
-    });
+    btn.addEventListener("click", () => approveAndAutoSubmitTrack(btn.dataset.trackApprove, btn));
   });
   wrap.querySelectorAll("button[data-track-request-signatures]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -5252,17 +5249,75 @@ function renderSubmittalTracks() {
   if (window.lucide) window.lucide.createIcons();
 }
 
-async function stageSubmittalTrack(type, btn, autoSubmit = false, extra = null) {
+// APPROVE & AUTO-SUBMIT NAMES A PERSON (#422). The owner's "click Stage and Submit from the CRM and
+// it does it all" (2026-10-31) makes this button the team's primary path. With sign-in off the
+// server records an approval only under a name the dashboard sends; this button used to send none,
+// so every click staged to review after promising the submit. Now: with sign-in off the person types
+// (or confirms, prefilled from the last name typed in this browser) their name for THIS run, exactly
+// as the signature-request button asks; a blank or cancelled name stages a plain run and says so,
+// never a nameless approval and never a default name. With sign-in on the server records the
+// signed-in person and ignores any name sent. Nothing here decides a click: the server's gate
+// (mayClickFinalSubmit / automaticSubmitRefusals) is unchanged.
+const APPROVE_AUTO_SUBMIT_LEDE = "Approve & auto-submit this filing?\n\nThis is your approval of THIS run, recorded under your name. The bot clicks the portal's application submit (never fee payment, and it stops for any CAPTCHA/MFA) only when all three hold: a named approver, the server's PORTAL_ALLOW_FINAL_SUBMIT switch on, and a recipe recorded through submit for this portal. Otherwise it stops at the review screen for you to submit; that stop is not a failure.";
+// The name namedPersonConsent remembers: one person, one name per browser.
+const APPROVER_NAME_KEY = "feeConfirmName";
+
+async function approveAndAutoSubmitTrack(type, btn) {
+  if (!state.selectedProjectId || !type) return;
+  const auth = await authForDecision();
+  if (auth && auth.enabled) {
+    if (!confirm(`${APPROVE_AUTO_SUBMIT_LEDE}\n\nRecorded as: ${(auth.user && (auth.user.name || auth.user.email)) || "you"}`)) return;
+    return stageSubmittalTrack(type, btn, true);
+  }
+  if (!confirm(APPROVE_AUTO_SUBMIT_LEDE)) return;
+  let last = "";
+  try { last = localStorage.getItem(APPROVER_NAME_KEY) || ""; } catch { last = ""; }
+  const typed = prompt("Your name, recorded as the approver of this run:", last);
+  const approverName = String(typed == null ? "" : typed).trim();
+  if (!approverName) {
+    // No name, no approval: a plain run that stops at review, and the operator is told so.
+    return stageSubmittalTrack(type, btn, false, null, { noApproval: true });
+  }
+  try { localStorage.setItem(APPROVER_NAME_KEY, approverName); } catch { /* per-viewer convenience only */ }
+  return stageSubmittalTrack(type, btn, true, { approverName });
+}
+
+// THREE OUTCOMES, THREE LINES (#422): filed by automation under a named approval; stopped at review
+// with the gate's own reason (not a failure); or no approval recorded. A plain Stage keeps its line.
+function stagedResultLine(type, result, { autoSubmit = false, approvalMissing = false, approvedBy = "" } = {}) {
+  const label = humanize(type);
+  if (result && result.status === "submitted") {
+    return `${label} filed by automation under ${approvedBy || "your"}${approvedBy ? "'s" : ""} approval of this run (application submit only — no fees paid). Capture/verify the record number below.`;
+  }
+  if (approvalMissing) return `${label}: ${NO_APPROVAL_RECORDED_TEXT}`;
+  if (autoSubmit) {
+    const reasons = result && Array.isArray(result.autoSubmitDeclined) && result.autoSubmitDeclined.length
+      ? result.autoSubmitDeclined.join("; ")
+      : (result && result.message) || "the run did not reach the recorded submit";
+    return `${label} stopped at review: ${reasons}. Nothing was filed and this is not a failure — verify every field, then submit manually in the portal and capture the number here.`;
+  }
+  return `${label} staged to final review. Verify every field, then submit manually in the portal and capture the number here.`;
+}
+
+const NO_APPROVAL_RECORDED_TEXT = "No approval recorded (no name given); staged to the review screen for your manual submit.";
+
+async function stageSubmittalTrack(type, btn, autoSubmit = false, extra = null, ui = null) {
   if (!state.selectedProjectId || !type) return;
   if (btn) { btn.disabled = true; }
+  const named = extra && typeof extra.approverName === "string" && extra.approverName ? ` under ${extra.approverName}'s approval` : "";
   showMessage(autoSubmit
-    ? `Approving ${humanize(type)} — replaying the portal; it will submit only if this portal is trusted, and never pays fees…`
-    : `Staging ${humanize(type)} in its portal — automation stops at the final review screen for your manual submit…`, "info");
+    ? `Approving ${humanize(type)}${named} — replaying the portal; it files only if the switch is on and the recipe reaches submit, and never pays fees…`
+    : ui && ui.noApproval
+      ? `No approval recorded (no name given) — staging ${humanize(type)} to the review screen for your manual submit…`
+      : `Staging ${humanize(type)} in its portal — automation stops at the final review screen for your manual submit…`, "info");
   try {
     // Staging runs as a background job (202 + jobId); poll to completion, then refetch detail.
-    const { jobId } = await api(`/api/projects/${state.selectedProjectId}/prepare-submission`, {
+    const { jobId, finalSubmitApproval } = await api(`/api/projects/${state.selectedProjectId}/prepare-submission`, {
       method: "POST", body: JSON.stringify({ track: type, autoSubmit, ...(extra || {}) }),
     });
+    // The server's answer, not the button's hope: an approval exists only when THIS request minted one.
+    const approvalMissing = (ui && ui.noApproval) || (autoSubmit && finalSubmitApproval && finalSubmitApproval.recorded === false);
+    const approvedBy = autoSubmit && finalSubmitApproval && finalSubmitApproval.recorded ? String(finalSubmitApproval.approver || "") : "";
     const job = await waitForStagingJob(jobId);
     if (job.status === "failed") {
       showMessage(job.error || `Could not stage ${type}.`, "error");
@@ -5291,9 +5346,7 @@ async function stageSubmittalTrack(type, btn, autoSubmit = false, extra = null) 
     if (detail && detail.project) state.detail = detail;
     await loadSubmittalTracks();
     renderDetail();
-    showMessage(job.result && job.result.status === "submitted"
-      ? `${humanize(type)} submitted by the bot under your approval of this run (application submit only — no fees paid). Capture/verify the record number below.`
-      : `${humanize(type)} staged to final review. Verify every field, then submit manually in the portal and capture the number here.`, "info");
+    showMessage(stagedResultLine(type, job.result, { autoSubmit, approvalMissing, approvedBy }), approvalMissing ? "warning" : "info");
   } catch (err) {
     showMessage(err.message || `Could not stage ${type}.`, "error");
   } finally {

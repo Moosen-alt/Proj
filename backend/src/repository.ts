@@ -7659,6 +7659,28 @@ export function finalSubmitJobPayload(input: {
 }
 
 /**
+ * WHY THIS APPROVED RUN DID NOT CLICK THE SUBMIT (#422), for the operator's result line. Reads
+ * what the gate already wrote (`portal.auto_submit_declined`, below in prepareSubmission) for
+ * THIS run id; null when the gate did not decline this run. Reads only: it decides nothing, and
+ * an empty answer is never read as permission (the click is the adapter's gate, not this).
+ */
+export function autoSubmitDeclineReasons(db: AppDb, projectId: string, runId: string): string[] | null {
+  const wanted = String(runId || "").trim();
+  if (!wanted) return null;
+  const rows = db.query<{ details: string }>(
+    "SELECT details FROM audit_logs WHERE project_id = ? AND action = 'portal.auto_submit_declined' ORDER BY created_at DESC, rowid DESC LIMIT 20",
+    [projectId],
+  );
+  for (const row of rows) {
+    let details: { runId?: unknown; reasons?: unknown } = {};
+    try { details = JSON.parse(String(row.details || "{}")); } catch { continue; }
+    if (String(details.runId ?? "") !== wanted) continue;
+    return Array.isArray(details.reasons) ? details.reasons.map((r) => String(r)).filter(Boolean) : [];
+  }
+  return null;
+}
+
+/**
  * EVERY REASON automation may NOT click the final submit in this run. Empty only when all hold.
  * Reads the recipe FROM THE DATABASE (status and steps as they are now, not as the caller last
  * saw them) and the environment switch at call time. Never reads auto_submit_enabled.
