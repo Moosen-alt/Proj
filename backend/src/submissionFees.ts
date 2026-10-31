@@ -51,6 +51,7 @@ import { isServiceLineBaseKind, serviceLineCounts, SERVICE_FEEDER_200A_LABEL, SE
 import { stateRulesFor } from "./permitProcess";
 import { localPermitReview, permitFeeProject } from "./feeIssuer";
 import { portalFeeSummary } from "./portalFeeReadings";
+import { printedFormCheck, printedFormQuote } from "./printedFormFees";
 
 /** The portal's own total for the filing — typed by a person ("actual") or read off the record
  *  ("portal_record"). Either already contains every line the jurisdiction billed. */
@@ -306,6 +307,9 @@ interface ScheduleFee {
    *  the producer's per-line split. Empty when every line carries one, or when the filing already
    *  holds a surcharge charge of its own. See stateSurchargeNotice. */
   surchargeGaps: string[];
+  /** The amount split by permit, read off the producer's per-line split — what the printed-form
+   *  cross-check (#454) holds each printed form up against. */
+  disciplineLines: Array<{ discipline: string; feeUsd: number | null }>;
 }
 
 const PAYMENT_METHODS: FeePaymentMethod[] = ["portal", "mailed_check", "none", "unknown"];
@@ -432,7 +436,17 @@ function normalizeScheduleResult(raw: unknown): ScheduleFee | null {
     reason: text(r.reason).trim().slice(0, 400),
     charges: normalizeCharges(r.charges),
     surchargeGaps: surchargeGapsOf(r),
+    disciplineLines: disciplineLinesOf(r),
   };
+}
+
+/** The producer's per-permit amounts ({discipline, feeUsd}), read defensively like every field here. */
+function disciplineLinesOf(r: Record<string, unknown>): Array<{ discipline: string; feeUsd: number | null }> {
+  const lines = Array.isArray(r.lines) ? (r.lines as Array<Record<string, unknown>>) : [];
+  return lines.filter((l) => l && typeof l === "object").slice(0, 6).map((l) => {
+    const fee = l.feeUsd == null || l.feeUsd === "" ? NaN : Number(l.feeUsd);
+    return { discipline: text(l.discipline).trim().slice(0, 40), feeUsd: Number.isFinite(fee) && fee >= 0 ? round2(fee) : null };
+  });
 }
 
 /** One item a Confirm would verify, before the row's version is read (feeConfirmRows). */
@@ -763,15 +777,21 @@ export function buildPaymentQuote(db: AppDb, project: ProjectRecord, trackInput?
         + (track === "permit" ? stateSurchargeNotice(project.state, schedule.surchargeGaps) : "");
     } else {
       const est = estimatedFee(db, project, track);
-      permitFeeUsd = est.fee;
-      permitFeeSource = est.fee == null ? "unknown" : "valuation_estimate";
-      permitFeeConfidence = est.fee == null ? "unknown" : "estimated";
+      // THE PRINTED FORM IS THE LAST RUNG (#454), below the valuation estimate: it answers only
+      // where NO saved schedule row exists at all (a held-but-unresolved one keeps its reason), no
+      // history, and not even a valuation to estimate from. It never stands in front of anything
+      // the ladder already ranks, and #421's Portland work owns any re-ranking above it.
+      const printed = est.fee == null && track === "permit" && !schedule ? printedFormQuote(feeProject) : null;
+      permitFeeUsd = printed ? printed.feeUsd : est.fee;
+      permitFeeSource = printed ? "printed_form" : est.fee == null ? "unknown" : "valuation_estimate";
+      permitFeeConfidence = printed || est.fee != null ? "estimated" : "unknown";
+      const estBasis = printed ? printed.basis : est.basis;
       // A schedule that was found but would not evaluate is the most useful thing
       // we can say here: "no size on the project yet" is a fixable answer, where
       // a bare guess just hides it.
       permitFeeBasis = schedule?.reason && !scheduleConflicted
-        ? `${est.basis} A published schedule for ${schedule.matchedName || "this jurisdiction"} was found but did not resolve: ${schedule.reason}${schedule.sourceUrl ? ` (${schedule.sourceUrl})` : ""}`
-        : est.basis;
+        ? `${estBasis} A published schedule for ${schedule.matchedName || "this jurisdiction"} was found but did not resolve: ${schedule.reason}${schedule.sourceUrl ? ` (${schedule.sourceUrl})` : ""}`
+        : estBasis;
       // A bracket label describes a schedule line we did not use — do not let it
       // ride along on a guess and read as though the guess were bracketed.
       permitFeeBracketLabel = null;
@@ -832,6 +852,12 @@ export function buildPaymentQuote(db: AppDb, project: ProjectRecord, trackInput?
         ? `Read so far: $${portalRead.toFixed(2)} (${portalFeeRecords.provenance}); not yet read: ${unread}. The amount above stays the researched figure until every filed record is read.`
         : `The portal has invoiced $${portalRead.toFixed(2)} so far (${portalFeeRecords.provenance}), below the researched figure, and the record is not issued yet — more may be invoiced. The amount above stays the researched figure.`);
   }
+
+  // THE FEE TABLE PRINTED ON THE AHJ'S OWN FORM, BESIDE THE AMOUNT (#454) — whichever tier won it,
+  // the portal's figure included. A disagreement is a note; the amount above never moves for it.
+  const printedCheck = track === "permit"
+    ? printedFormCheck(feeProject, permitFeeUsd, permitFeeSource, schedule?.disciplineLines ?? [])
+    : null;
 
   // A CONFLICT IS A FACT ABOUT THE JURISDICTION, NOT ABOUT WHICH TIER WON — so it
   // is prepended after the ladder, not inside one of its branches. A learned
@@ -901,6 +927,7 @@ export function buildPaymentQuote(db: AppDb, project: ProjectRecord, trackInput?
     permitFeeVerifiedBy,
     permitFeeVerifiedAt,
     permitFeeComparison,
+    printedFormCheck: printedCheck,
     portalFeeRecords,
     paymentMethod,
     serviceFeeUsd,
@@ -1097,6 +1124,7 @@ export function buildProjectFeeSheet(db: AppDb, project: ProjectRecord): Project
     verifiedBy: quote.permitFeeVerifiedBy,
     verifiedAt: quote.permitFeeVerifiedAt,
     comparison: quote.permitFeeComparison,
+    printedFormCheck: quote.printedFormCheck,
     portalRecords: quote.portalFeeRecords,
     paymentMethod: quote.paymentMethod,
     serviceFeeUsd: quote.serviceFeeUsd,
@@ -1159,6 +1187,10 @@ export function buildProjectFeeSheet(db: AppDb, project: ProjectRecord): Project
             + `not priced (named below), so the schedule gives no total and the $${line.feeUsd.toFixed(2)} shown is a valuation `
             + `heuristic. Price ${unpricedCharges.length === 1 ? "that charge" : "those charges"} (or enter the portal's own fee) `
             + `and this becomes the schedule's figure. ${line.basis}`
+          : line.source === "printed_form"
+          ? `${label} for ${who} is an ESTIMATE, not a known fee — the only figure on file is the fee table printed on `
+            + `${who}'s own form, which can be years out of date. No published schedule, portal figure, observed history or `
+            + `valuation is on file. Enter the portal's own fee to true it up. ${line.basis}`
           : line.source === "published_schedule"
           ? `${label} for ${who} is an ESTIMATE because this project carries NO JOB VALUATION. `
             + `${who}'s published schedule prices this filing off the job's valuation, so the $${line.feeUsd.toFixed(2)} `
