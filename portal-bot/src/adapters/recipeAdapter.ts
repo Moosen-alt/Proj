@@ -3,7 +3,7 @@ import path from "path";
 import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep } from "../../../shared/src/types";
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, ok, fail, type PortalContext, type PortalStepResult } from "../adapter";
 import { applyFormatHint } from "../formatHint";
-import { extractRecordNumber, pageConfirmsSubmission } from "../recordNumber";
+import { extractRecordNumber, pageConfirmsSubmission, recordNumberCandidates, RECORD_NUMBER_TIERS } from "../recordNumber";
 import { findSiteDraft, readDraftCreated } from "../draftCreated";
 import { completeStamp, draftCreatingClickRefusals, draftLabelKey, draftStepLabel, draftTenantKey, readDraftAfterClick, type DraftCreatingStamp } from "../draftSubmitGate";
 import { armHumanCaptureOnPage, HUMAN_SUBMIT_OBSERVED_NOTE } from "../humanCapture";
@@ -84,7 +84,7 @@ export function looksLikeProjectData(label: string, value: string): boolean {
 import { rankAddressVersions } from "../addressVersion";
 import { isCompanyIdentityLabel } from "../../../shared/src/companyFacts";
 import { licenceKeyForLabel } from "../../../shared/src/licenceKinds";
-import { labelWords } from "../../../shared/src/portalSafety";
+import { completionEvidence, labelWords } from "../../../shared/src/portalSafety";
 import { batteryControlKind, batteryControlOfStep, batteryDeclarationAnswer, parseHasBattery } from "../../../shared/src/batteryControls";
 import { imageToPdfBytes, shouldConvertToPdf } from "../imageToPdf";
 import { removeUploadStaging, uploadPayloadFor, type PreparedUpload } from "./uploadPayload";
@@ -97,12 +97,144 @@ import { openPortal } from "../browser";
 import { selectWithFallback, comboboxFaceInPage, type ComboboxPick } from "../comboboxFill";
 import {
   classifySubmissionText, finalSubmitEnvAllows, finalSubmitRefusals, isFinalSubmitControl, isPayFee, isPayNowDialogText, mayClickFinalSubmit,
-  isRecipeShapeValid, isSignatureNameLabel, isSignatureRequestControl, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
+  isPayRequestUrl, isRecipeShapeValid, isSignatureNameLabel, isSignatureRequestControl, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
   type HealedStep, type RunApproval, type SubmissionOutcome,
 } from "../../../shared/src/portalSafety";
 import { commitField, installSettleProbe, waitForSettled } from "../settle";
 import { siteOfUrl } from "../siteOf";
-import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopSentLine, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, type FilingBackstop } from "../filingBackstop";
+import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, withAutomationInput, describeBackstopAbort, backstopSentLine, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, isStoppingAbort, type BackstopAbort, type FilingBackstop, type BackstopHumanRequest } from "../filingBackstop";
+
+/** #333: the run did not hand the review page over — its input watch could not be armed, or (Helm
+ *  Should-fix 3) a stopping abort the watch did not flag as the person's is on record, so the run
+ *  fails by name — and the review lockdown holds until the stage finishes: said plainly, never
+ *  silently, and never "the page is yours". */
+export const NOT_HANDED_OVER_NOTE = "THE RUN COULD NOT HAND THE REVIEW PAGE OVER TO YOU: the review lockdown holds until the stage says it has finished, so click submit only then (an earlier click is held back, and nothing is sent).";
+/** #333: why the run's own input is refused once it has started handing the page over. */
+const INPUT_CLOSED = "the run has stopped at review and is handing the page to a person — it makes no input of its own on the page from here";
+
+/** #333: what the person is told when their own click on the review page came before the run had
+ *  handed it over — a click the ARMED watch saw (the abort is flagged humanInput + beforeHandOver);
+ *  the backstop held it, nothing was sent, and the run is still handed over. A click before the watch
+ *  listened (during the run's last writes or its arm) is held unflagged: the run is not handed over
+ *  (NOT_HANDED_OVER_NOTE) and fails by name, and this note is never said (Helm Should-fix 3). */
+export const HUMAN_CLICK_HELD_NOTE ="YOUR CLICK WAS HELD BACK: you clicked on the review page before the run had handed it over to you, so that request was stopped and nothing was sent. If the window shows an error page, go Back to the review page; then click submit again — the run has let go of the page now.";
+/** #333 round 3 (skeptic r2b): a request the person sent from the handed-over page went through, and
+ *  the click detector did not see it as the portal's final submit (an unknown label, a fetch submit).
+ *  It may have been the filing: never "click submit" or "nothing was filed" to someone who may have. */
+export const PERSON_REQUEST_WENT_NOTE = "A REQUEST YOU SENT FROM THE REVIEW PAGE WENT THROUGH while the stage was finishing (automation clicked nothing). If it was the submit, the filing went: check the portal and enter its record number with the capture form — do not stage this track again before you have. If it was not, finish in the open window.";
+/** #333 round 2 (skeptic r2 F5): the person filed from the review window while the stage finished —
+ *  on the record in the hand-off notes (the project's next-step panel), whether or not the
+ *  completion page's number can be read. */
+export const HUMAN_SUBMITTED_NOTE = "YOU SUBMITTED FROM THE REVIEW WINDOW while the stage was finishing (automation clicked nothing). The record number is read off the completion page and recorded only when it is read confidently — if the project does not show it, enter it with the capture form. Do not stage this track again: it has been filed.";
+
+// #333 round 4 (Helm Blocking 2) — WHAT THE REVIEW STEP SAYS ABOUT THE PERSON'S CLICK, BUILT WHOLE.
+// "Filed" (HUMAN_SUBMITTED_NOTE) only for a committed submit whose page read as a completion; every
+// other outcome has its own whole note below. Each names the click by its label and says only what the
+// run saw: never "nothing was sent" when it saw no request (it cannot know), "click again" only beside
+// what the window shows, and never a note saying the filing went beside a held or unsent click.
+/** The person's submit went, then a request the page it led to made was held back, and the window shows
+ *  Chromium's error page. */
+export const HUMAN_FOLLOW_UP_HELD_NOTE = "YOUR SUBMIT WENT TO THE PORTAL, BUT A REQUEST THE NEXT PAGE MADE WAS HELD BACK and the window shows an error page (automation clicked nothing). Check the portal: if the application shows as submitted, enter its record number with the capture form; if it does not, go Back to the review page and submit again.";
+const clickedLabel = (label: string | undefined): string => `"${String(label || "the submit").slice(0, 60)}"`;
+/** "YOU CLICKED "X" ON THE REVIEW PAGE" — or, for a click with no input of the person's in the 2 s
+ *  before it (a page script's el.click()), "A CLICK ON "X" WAS SEEN ON THE REVIEW PAGE". */
+const clickedOnReview = (label: string | undefined, personInput: boolean | undefined): string =>
+  personInput === false ? `A CLICK ON ${clickedLabel(label)} WAS SEEN ON THE REVIEW PAGE` : `YOU CLICKED ${clickedLabel(label)} ON THE REVIEW PAGE`;
+const ERROR_PAGE_GO_BACK = " The window shows an error page: go Back to the review page first.";
+/** A sighting the run saw no request of the person's follow. */
+export function humanClickUnconfirmedNote(label: string | undefined, errorPage: boolean, personInput?: boolean): string {
+  return `${clickedOnReview(label, personInput)} while the stage was finishing (automation clicked nothing), and the run saw no request go from that click. Check the portal: if the application shows as submitted, enter its record number with the capture form; if it does not, finish in the open window.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
+}
+/** A committed click (a request of the person's went after it) whose page did not read as a completion. */
+export function humanClickStandsNote(label: string | undefined, personInput?: boolean): string {
+  return `${clickedOnReview(label, personInput)} while the stage was finishing (automation clicked nothing), and a request of yours went to the portal, but no completion page was read. The filing may have gone: check the portal before you click again; if it shows as submitted, enter its record number with the capture form.`;
+}
+/** A click a stopping abort held, with no filing-shaped request of the person's after it. Never begins
+ *  "YOUR CLICK WAS HELD BACK" (HUMAN_CLICK_HELD_NOTE: a click before the hand-over). */
+export function humanClickHeldNote(label: string | undefined, abort: BackstopAbort, errorPage: boolean, personInput?: boolean): string {
+  return `${personInput === false ? "A CLICK ON" : "YOUR CLICK ON"} ${clickedLabel(label)} ON THE REVIEW PAGE WAS HELD BACK: the submit itself was not sent — ${describeBackstopAbort(abort)}. Check the portal before you click again.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
+}
+/** A payment request after the person's click, held by rule 1 (automation never pays). Stands in for
+ *  Should-fix 5's payment note until that lands; no "click again" on a payment. */
+export function humanPaymentHeldNote(abort: BackstopAbort, errorPage: boolean): string {
+  return `A PAYMENT REQUEST FROM THE REVIEW PAGE WAS HELD BACK — ${describeBackstopAbort(abort)}. Automation never pays, and nothing was paid: check the portal, and pay there yourself once you have seen whether the application was submitted.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
+}
+/** The person's submit was answered with a draft (PSE Part 1): nothing is filed, the track is staged
+ *  again (the next run continues the draft), and the draft's number is never entered as a filing. */
+export function humanDraftCreatedNote(applicationNumber: string, nextForm: string): string {
+  return `YOUR SUBMIT FROM THE REVIEW WINDOW CREATED DRAFT ${applicationNumber || "(no number shown)"}, not a filing (automation clicked nothing). NOTHING WAS FILED.${nextForm ? ` The filing is in "${nextForm}".` : ""} Stage this track again: the next run opens this draft and continues it. Do not enter the draft's number in the capture form.`;
+}
+
+// #333 round 4 (Helm Blocking 1) — THE PERSON'S SUBMIT CLICK IS A SIGHTING, COMMITTED ON EVIDENCE.
+/** A final-submit click the replay's own watch saw after the hand-over: provisional until a request
+ *  of the person's that followed it commits it (RecipeAdapter.judgeHumanClick). */
+interface HumanClickSighting {
+  label?: string;
+  /** When the sighting reached the run (Date.now()). */
+  at: number;
+  /** The handed-over backstop's record sizes when it was seen. */
+  abortsBefore: number;
+  requestsBefore: number;
+  /** The person's own input reached the page in the 2 s before it: true / false while a live,
+   *  handed-over backstop could tell; undefined once the run had let the page go. */
+  personInput: boolean | undefined;
+  /** Set when a capture found the review (or error) page and reopened the watch: only evidence that
+   *  completed after this may commit it again. */
+  evidenceAfter?: number;
+  /** The commit rested on a document or filing-shaped request (the slow-server re-read's condition). */
+  filingEvidence?: boolean;
+  /** The one slow-server re-read after a reopen was scheduled. */
+  slowRereadDone?: boolean;
+}
+/** #333 round 4 (Helm Blocking 2) — what became of the person's click, as the review step reports it
+ *  (RecipeAdapter.humanClickVerdict). */
+interface HumanClickVerdict {
+  verdict: "followUpHeld" | "filed" | "draft" | "stands" | "held" | "unconfirmed";
+  click: { label?: string; at: number; personInput?: boolean } | null;
+  /** The stopping abort that held the click (held only). */
+  held: BackstopAbort | null;
+  /** A payment request held after the click (rule 1). */
+  payment: BackstopAbort | null;
+  /** The window shows Chromium's error page now. */
+  errorPage: boolean;
+  draft?: { applicationNumber: string; nextForm: string };
+}
+/** The review page's own reading, taken at the hand-over while the lockdown still held the page: what
+ *  the capture judges a later page against (never its URL). */
+interface ReviewReading {
+  /** Every record-number candidate the review page showed. */
+  numbers: Set<string>;
+  /** The review's submit control ("" = none found, or the read failed). */
+  filingControl: string;
+  reviewPage?: boolean;
+  /** Completion wording the review page itself showed ("Once your application has been submitted…"). */
+  completionPhrase: string | null;
+}
+/** A page read for the capture: its text, the same text with table cells taken out, and its controls. */
+interface CapturePageRead { text: string; cellFree: string; filingControl: string; reviewPage?: boolean }
+/** How long after a sighting a request of the person's may still commit it (Helm's 2.5 s / 4 s / 8 s
+ *  shapes fit inside). */
+const HUMAN_CLICK_COMMIT_MS = 10_000;
+/** A main-frame document or filing-shaped request may precede its sighting by this much (the click's
+ *  form POST and its sighting travel different CDP event streams). A plain fetch must follow it. */
+const HUMAN_CLICK_EARLY_MS = 300;
+/** A sighting with only a plain fetch, or with a stopping abort, is judged only this long after it:
+ *  the click's filing request may still be on its way. */
+const HUMAN_CLICK_SETTLE_MS = 1_500;
+/** A capture that reopened a click committed on a filing request reads the page once more this much
+ *  later (the slow-server shape). */
+const HUMAN_CLICK_SLOW_REREAD_MS = 6_000;
+/** A late plain fetch is followed by one page read this much later (an in-place SPA submit). */
+const HUMAN_CLICK_SPA_REREAD_MS = 1_200;
+
+/** #333 round 4 — THE ONE "IS THIS REQUEST OF THE PERSON'S FILING-SHAPED?" PREDICATE: a main-frame
+ *  document request (a form submission, to any URL), or a fetch/XHR to a submit or payment URL —
+ *  never a GET and never a beacon or other resource type, whatever its URL says. */
+function filingShapedHumanRequest(r: { document?: boolean; method?: string; resourceType?: string; where: string }): boolean {
+  return String(r.method ?? "").toUpperCase() !== "GET"
+    && (!!r.document || (/^(fetch|xhr)$/i.test(String(r.resourceType ?? "")) && isSubmitOrPayRequestUrl(r.where)));
+}
+const normPhrase = (s: string | null | undefined): string => String(s ?? "").toLowerCase().replace(/\s+/g, " ").trim();
 
 // How long the drift precheck waits for an async-rendered form to paint before concluding
 // the replay is on the wrong page. PowerClerk's Ameren form reports zero inputs for several
@@ -1008,6 +1140,9 @@ export class RecipeAdapter extends BasePortalAdapter {
   /** runs-finish item 3: the run ended on a page NOT verified as the review page — where, in the
    *  page's own words. stopAtReview then says so instead of "staged to the review screen". */
   private stoppedBeforeReview = "";
+  /** …and the reading it was built from: stopAtReview re-words it with what it knows by then (a
+   *  request of the person's that landed after the tail read it is said, never "Nothing was filed"). */
+  private stoppedBeforeReviewAt: { where: string; refused: string[] } | null = null;
   /** Policy-default steps whose control was absent when their turn came — re-tried once
    *  just before the page's advance, when a conditional section has had every chance to
    *  render. Cleared on each advance. */
@@ -1098,6 +1233,11 @@ export class RecipeAdapter extends BasePortalAdapter {
        *  after it must read as draft-created. Not an approval to file: the final-submit gate never
        *  reads it. */
       draftSubmitStamp?: DraftCreatingStamp | null;
+      /** A PERSON WILL TAKE THE REVIEW PAGE, AND THE CALLER WATCHES FOR THEIR SUBMIT (#333, Helm
+       *  Should-fix 4). index.ts stageWithRecipe passes it only when StageOptions.onSubmitCaptured is a
+       *  function; the learn self-test, the cross-project replay, the benchmark and the correction /
+       *  status constructions never hand over, so a click in their tail is held as on main. */
+      handOverReview?: boolean;
     } = {},
   ) {
     super();
@@ -1352,6 +1492,20 @@ export class RecipeAdapter extends BasePortalAdapter {
 
   private backstop: FilingBackstop | null = null;
   private backstopReported = 0;
+  /** #333 — set the moment the input watch is armed (before the hand-over): from then on the run's own
+   *  guarded clicks, presses and steps refuse, so a trusted input the watch sees can only be a
+   *  person's. Never cleared on a run. */
+  private inputsClosed = "";
+  /** #333: after the hand-over, a person's own main-frame form request went (their submit, or a
+   *  postback they made) — the run's end page is theirs now, not where the run "stopped". */
+  private personMovedOn = false;
+  /** #333 round 2 — the address of the page the run handed over (no #fragment). */
+  private handOverUrl = "";
+  /** #333 round 3 — a request the person's own input sent went through after the hand-over. */
+  private personRequestWent = false;
+  /** #333 round 3 — the backstop the run handed over: its record of the person's requests is read
+   *  when the run reports (stopAtReview), after the run has let it go (its record stays). */
+  private handedOverBackstop: FilingBackstop | null = null;
   /** What the person taking the review page must know before submitting (B3 / B14) — carried into
    *  stopAtReview's hand-off message and data. */
   private reviewHandoffNotes: string[] = [];
@@ -1384,6 +1538,169 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  filing/payment request (the filing-URL rule), else "". A window abort (a dismisser click or
    *  a terminal-page Enter fired a state-changing request — often a consent XHR) is reported and
    *  the run goes on: nothing was sent. */
+  /** #333 — the abort index at the first request a person's input sent OFF THE HANDED-OVER PAGE
+   *  (their own document submit or navigation there): what follows is the page their own action led
+   *  to. A popup's or another tab's document request is not it (Helm nit :97). */
+  private firstHumanDocument(): number {
+    const r = this.humanDocumentFromHandedOverPage(this.backstop);
+    return r ? r.abortsBefore : Infinity;
+  }
+
+  /** #333 (Helm nit :97) — THE ONE PREDICATE for "the person's own main-frame document request from the
+   *  page the run handed over" (their submit or navigation there): the first such entry in `bs`'s
+   *  record, or null. The record names the requesting Page (request.frame().page()); the run's page is
+   *  `this.page`, the page the backstop was installed on and handed over. A popup's or another tab's
+   *  document request (a contact form the person sent) is another Page and never counts, and neither
+   *  does an entry whose page could not be read (null never matches, even with no page in hand). */
+  private humanDocumentFromHandedOverPage(bs: FilingBackstop | null): BackstopHumanRequest | null {
+    const runPage = this.page;
+    if (runPage == null) return null;
+    return (bs?.humanRequests ?? []).find((h) => h.document && h.page === runPage) ?? null;
+  }
+
+  /** #333 round 4 — THE ONE PREDICATE for "a FILING-SHAPED request of the person's went at or after
+   *  `at`" (the capture's committed/held split and the review step's wording both read it): a
+   *  main-frame document request (a form submission, to any URL), or a fetch/XHR to a submit or
+   *  payment URL — never a GET (a navigation is not evidence of a filing) and never a beacon or any
+   *  other resource type, whatever its URL says (an analytics "/form_submit" beacon matches the
+   *  filing-URL vocabulary). Read off the HANDED-OVER backstop's record only: by the time the run
+   *  reports, fillApplication's finally has let `this.backstop` go. And from the RUN'S OWN PAGE only
+   *  (round 5, Helm item 2), as humanDocumentFromHandedOverPage: a popup's contact-form POST after
+   *  the click must not turn a held click into "stands". */
+  private personFilingShapedRequestAfter(at: number): boolean {
+    const runPage = this.page;
+    if (runPage == null) return false;
+    const rs = this.handedOverBackstop?.humanRequests ?? [];
+    return rs.some((r) => r.page === runPage && typeof r.at === "number" && r.at >= at && filingShapedHumanRequest(r));
+  }
+
+  /** #333 round 4 (Helm Blocking 2) — the person's own document request from the handed-over page went,
+   *  a stopping abort came after it, and the window shows Chromium's error page now: the page their
+   *  submit led to made a follow-up request the backstop held. Read at report time, off the HANDED-OVER
+   *  backstop only (fillApplication's finally has let `this.backstop` go by then). */
+  private followUpHeldOnErrorPage(): boolean {
+    const bs = this.handedOverBackstop;
+    const doc = this.humanDocumentFromHandedOverPage(bs);
+    if (!bs || !doc || !/^chrome-error:/i.test(this.pageUrlNoHash())) return false;
+    return bs.aborts.some((a, i) => i >= doc.abortsBefore && isStoppingAbort(a));
+  }
+
+  /** #333 round 4 (Helm Blocking 2) — the person's click the review step reports: the latest sighting,
+   *  whatever became of it — committed (humanSubmit), still pending (a reopened one included), or held.
+   *  null: the watch saw no final-submit click. */
+  private reportedHumanClick(): { click: { label?: string; at: number; personInput?: boolean; evidenceAfter?: number }; state: "committed" | "pending" | "held" } | null {
+    const seen: Array<{ click: { label?: string; at: number; personInput?: boolean; evidenceAfter?: number }; state: "committed" | "pending" | "held" }> = [];
+    if (this.humanSubmit) seen.push({ click: { label: this.humanSubmit.label, at: this.humanSubmit.at ?? 0, personInput: this.humanSubmit.personInput }, state: "committed" });
+    if (this.pendingHumanClick) seen.push({ click: this.pendingHumanClick, state: "pending" });
+    if (this.heldHumanClickAfterHandOver) seen.push({ click: this.heldHumanClickAfterHandOver, state: "held" });
+    return seen.sort((a, b) => b.click.at - a.click.at)[0] ?? null;
+  }
+
+  /** #333 round 4 (Helm Blocking 2) — WHAT BECAME OF THE PERSON'S CLICK, read when the run reports. In
+   *  order: the follow-up held on an error page; HELD (a stopping abort on the handed-over backstop after
+   *  the click, flagged as the person's or not, with no filing-shaped request of theirs after it); a
+   *  DRAFT the page reads as created; FILED (committed, and the page read as the completion — the
+   *  capture's judgeCompletion, read here once more because the runner's capture reads only after the
+   *  run reports); STANDS (committed, or a request of theirs went after it, with no completion read);
+   *  UNCONFIRMED (no request of theirs seen after it). A pending click is never "filed". Read-only: the
+   *  page is read, never touched, and the capture's state is not moved. */
+  private async humanClickVerdict(): Promise<HumanClickVerdict | null> {
+    const errorPage = /^chrome-error:/i.test(this.pageUrlNoHash());
+    const seen = this.reportedHumanClick();
+    if (this.followUpHeldOnErrorPage()) return { verdict: "followUpHeld", click: seen?.click ?? null, held: null, payment: null, errorPage };
+    if (!seen) return null;
+    const { click, state } = seen;
+    // The click's form POST and its sighting travel different event streams: an abort, or a filing-shaped
+    // request, may land just before the sighting (the capture's own allowance).
+    const early = click.at - HUMAN_CLICK_EARLY_MS;
+    const stoppedAfter = (this.handedOverBackstop?.aborts ?? []).filter((a) => isStoppingAbort(a) && !a.beforeHandOver && typeof a.at === "number" && a.at >= early);
+    const payment = stoppedAfter.find((a) => isPayRequestUrl(a.where)) ?? null;
+    const filingWent = this.personFilingShapedRequestAfter(early);
+    const runPage = this.page;
+    const requestWent = filingWent || (this.handedOverBackstop?.humanRequests ?? []).some((r) => r.page === runPage && typeof r.at === "number" && r.at >= click.at && String(r.method ?? "").toUpperCase() !== "GET");
+    const base = { click, payment, errorPage };
+    if (state === "held" || (state === "pending" && click.evidenceAfter === undefined && stoppedAfter.length > 0 && !filingWent)) {
+      return { ...base, verdict: "held", held: payment ?? stoppedAfter[0] ?? null };
+    }
+    if (state === "committed") {
+      const read = errorPage ? null : await this.readPageForCapture();
+      if (read) {
+        const d = readDraftCreated(read.text);
+        if (d.draft) return { ...base, verdict: "draft", held: null, draft: { applicationNumber: d.applicationNumber, nextForm: d.nextForm } };
+        if (!this.completionConfirmed) this.judgeCompletion(read, click.at);
+      }
+      return { ...base, verdict: this.completionConfirmed ? "filed" : "stands", held: null };
+    }
+    // Pending: a reopened click (a request went, the page came back as the review), or one a request of
+    // the person's followed that the capture has not committed yet, stands; else the run saw nothing go.
+    return { ...base, verdict: click.evidenceAfter !== undefined || requestWent ? "stands" : "unconfirmed", held: null };
+  }
+
+  /** #333 round 4 (Helm Blocking 2) — the review step's report for a verdict, each built WHOLE: the note
+   *  for the hand-off (and the payment note beside a click that stands), the one sentence the caller
+   *  puts between "handed it to you; " and " No fee payment was automated.", and the step's data. The
+   *  portal is named only by the caller. */
+  private humanClickReport(v: HumanClickVerdict): { notes: string[]; sentence: string; data: Record<string, unknown> } {
+    const label = v.click?.label;
+    const pi = v.click?.personInput;
+    const clicked = pi === false ? `a click on ${clickedLabel(label)} was seen on the review page` : `you clicked ${clickedLabel(label)} on the review page`;
+    const yourClick = pi === false ? `a click on ${clickedLabel(label)}` : `your click on ${clickedLabel(label)}`;
+    const data: Record<string, unknown> = {
+      humanSubmittedInReviewWindow: v.verdict === "filed",
+      ...(v.click ? { humanClick: { label: String(label ?? ""), verdict: v.verdict }, humanSubmitPersonInput: pi } : { humanClick: { label: "", verdict: v.verdict } }),
+    };
+    switch (v.verdict) {
+      case "followUpHeld":
+        return { notes: [HUMAN_FOLLOW_UP_HELD_NOTE], data, sentence: "your submit went, then a request the next page made was held back and the window shows an error page — check the portal, then go Back and submit again if the application is not there." };
+      case "filed":
+        return { notes: [HUMAN_SUBMITTED_NOTE], data, sentence: "you submitted from the review window while the run was finishing — automation clicked nothing. The completion page was read: its record number is recorded on the project only when it is read confidently — if the project does not show it, enter it with the capture form." };
+      case "draft": {
+        const n = v.draft?.applicationNumber || "(no number shown)";
+        return {
+          notes: [humanDraftCreatedNote(v.draft?.applicationNumber ?? "", v.draft?.nextForm ?? "")],
+          data: { ...data, humanDraftCreated: { applicationNumber: v.draft?.applicationNumber ?? "", nextForm: v.draft?.nextForm ?? "" } },
+          sentence: `your submit from the review window created draft ${n} — the submit this portal answers with a draft, never the filing. NOTHING WAS FILED: stage this track again, and the next run opens this draft.`,
+        };
+      }
+      case "stands":
+        return {
+          notes: [humanClickStandsNote(label, pi), ...(v.payment ? [humanPaymentHeldNote(v.payment, v.errorPage)] : [])], data,
+          sentence: `${clicked} and a request of yours went to the portal, but no completion page was read — the filing may have gone: check the portal before you click again.`,
+        };
+      case "held":
+        // A held payment gets ONE note, the payment's; any other held request, the held-click note.
+        if (v.payment) {
+          return { notes: [humanPaymentHeldNote(v.payment, v.errorPage)], data, sentence: `${yourClick} was held back with the payment request it sent — automation never pays, and no filing request went from it; check the portal.` };
+        }
+        return {
+          notes: v.held ? [humanClickHeldNote(label, v.held, v.errorPage, pi)] : [humanClickUnconfirmedNote(label, v.errorPage, pi)], data,
+          sentence: `${yourClick} was held back — the submit itself was not sent; check the portal before you click again.`,
+        };
+      default:
+        return { notes: [humanClickUnconfirmedNote(label, v.errorPage, pi)], data, sentence: `${clicked} and the run saw no request go from that click — check the portal before anything else.` };
+    }
+  }
+
+  /** #333 — a person's click held back BEFORE the hand-over (a stopping abort flagged humanInput).
+   *  After it, a flagged abort is the person's own payment (rule 1 never lifts): not "click again".
+   *  Only on a run that DID hand the page over (round 5, Helm item 1): after a refused hand-over the
+   *  watch can still be armed, so a click at NOT_HANDED_OVER_NOTE is flagged too, but that run fails
+   *  and never let go of the page, so "click submit again" would be false. */
+  private heldHumanClick(): boolean {
+    const bs = this.backstop;
+    if (!bs || !this.handedOverBackstop) return false;
+    const first = this.firstHumanDocument();
+    return bs.aborts.some((a, i) => isStoppingAbort(a) && !!a.humanInput && !!a.beforeHandOver && i < first);
+  }
+
+  /** The run's page address without its #fragment ("" when unreadable). */
+  private pageUrlNoHash(): string {
+    try {
+      const p = this.page as { url?: () => string } | null;
+      return typeof p?.url === "function" ? String(p.url() ?? "").split("#")[0] : "";
+    } catch { return ""; }
+  }
+
   private backstopStop(): string {
     const bs = this.backstop;
     if (!bs) return "";
@@ -1392,7 +1709,18 @@ export class RecipeAdapter extends BasePortalAdapter {
       this.guardRefusals.push(line);
       this.driftWarnings.push(line);
     }
-    const stopping = bs.stoppingAborts();
+    // #333 — NEITHER OF THESE IS THE PAGE ACTING BY ITSELF: an abort that followed a person's own
+    // input (their click came before the run handed the page over: nothing was sent, and they are
+    // told to click again), and anything after a request a person's input sent past the hand-over
+    // (the page their own submit led to). Neither fails a run that reached review.
+    // Only a request that LEFT the page counts (skeptic round 1): a person's harmless click whose
+    // background fetch went must not hide a page script that tries to file afterwards.
+    const firstHuman = this.firstHumanDocument();
+    const stopping = bs.aborts.filter((a, i) => isStoppingAbort(a) && !a.humanInput && i < firstHuman);
+    if (this.heldHumanClick()) {
+      if (!this.reviewHandoffNotes.includes(HUMAN_CLICK_HELD_NOTE)) this.reviewHandoffNotes.push(HUMAN_CLICK_HELD_NOTE);
+      if (!this.driftWarnings.includes(HUMAN_CLICK_HELD_NOTE)) this.driftWarnings.push(HUMAN_CLICK_HELD_NOTE);
+    }
     if (!stopping.length) return "";
     const first = stopping[0];
     // A REFUSED REDIRECT (#358): the run's own request went and the portal redirected it somewhere the
@@ -1414,7 +1742,12 @@ export class RecipeAdapter extends BasePortalAdapter {
   // POST (bypass-reload.log: 2 POSTs). Now: only navigation RESPONSES that commit a document are
   // kept (not 204/205, not a 3xx hop, not an attachment), and the method is the one whose URL is
   // the page's current URL. A URL no committing response produced (a pushState) is unknown.
-  private navDocuments: Array<{ url: string; method: string }> = [];
+  // #333 round 4: each entry also says WHEN the document committed (`at`, Date.now() at its response —
+  // not when its request went), which the capture's "a main-frame document committed by a non-GET
+  // request within a short bound" reads.
+  // `sentAt` is when its request went (Playwright's request timing; absent when unreadable): a slow
+  // server's document commits long after the click whose request it answers.
+  private navDocuments: Array<{ url: string; method: string; at: number; sentAt?: number }> = [];
   private get lastDocumentMethod(): string | null {
     const here = typeof this.page?.url === "function" ? String(this.page.url() ?? "").split("#")[0] : "";
     if (!here) return null;
@@ -1430,14 +1763,17 @@ export class RecipeAdapter extends BasePortalAdapter {
     this.documentMethodHooked = true;
     page.on("response", (resp: unknown) => {
       try {
-        const r = resp as { url: () => string; status: () => number; headers: () => Record<string, string>; request: () => { isNavigationRequest: () => boolean; frame: () => unknown; method: () => string } };
+        const r = resp as { url: () => string; status: () => number; headers: () => Record<string, string>; request: () => { isNavigationRequest: () => boolean; frame: () => unknown; method: () => string; timing?: () => { startTime?: number } } };
         const req = r.request();
         if (!req.isNavigationRequest() || req.frame() !== page.mainFrame!()) return;
         const status = Number(r.status());
         const cd = String((r.headers() || {})["content-disposition"] || "");
         if (status === 204 || status === 205 || (status >= 300 && status < 400) || /\battachment\b/i.test(cd)) return;
-        this.navDocuments.push({ url: String(r.url() || "").split("#")[0], method: String(req.method() || "").toUpperCase() });
+        const started = Number((typeof req.timing === "function" ? req.timing() : null)?.startTime ?? 0);
+        this.navDocuments.push({ url: String(r.url() || "").split("#")[0], method: String(req.method() || "").toUpperCase(), at: Date.now(), ...(started > 0 ? { sentAt: Math.round(started) } : {}) });
         if (this.navDocuments.length > 60) this.navDocuments.shift();
+        // A document the person's click committed is evidence for a pending sighting (round 4).
+        this.judgeHumanClick();
       } catch { /* a response we cannot read adds nothing: the method stays unknown */ }
     });
   }
@@ -1463,16 +1799,58 @@ export class RecipeAdapter extends BasePortalAdapter {
         { finalSubmitClicked: false, draftSubmitClickedByAutomation: true },
       );
     }
+    // A request the person sent may land after the run's tail read it, and before the run let the page
+    // go: the handed-over backstop's record is read again now (round 3).
+    if ((this.handedOverBackstop?.humanRequests.length ?? 0) > 0) this.personRequestWent = true;
+    // Never "staged to the review screen" for a run that did not verifiably reach it (runs-finish 3) —
+    // even when the person moved on from that page (Helm Should-fix 4). The stop message is the one
+    // sentence about a request that went (no second note naming "the review page" it never was).
+    if (this.stoppedBeforeReview && !this.humanSubmit) {
+      const notes = this.reviewHandoffNotes;
+      const handoff = notes.length ? ` ${notes.join(" ")}` : "";
+      const handoffData = notes.length ? { reviewHandoffNotes: [...notes], reviewPageBlockedCalls: [...this.reviewPageBlockedCalls] } : {};
+      const at = this.stoppedBeforeReviewAt;
+      const stopped = at ? this.stoppedBeforeReviewMessage(at.where, at.refused, this.personRequestWent) : this.stoppedBeforeReview;
+      return ok(
+        `${HUMAN_REVIEW_MESSAGE} The recipe did NOT stage ${this.portalName} at its review screen — it ${stopped}${handoff} AUTOMATION HAS STOPPED.`,
+        { finalSubmitClicked: false, stoppedBeforeReview: true, personMovedOn: this.personMovedOn, ...handoffData },
+      );
+    }
+    // THE PERSON CLICKED THE SUBMIT (OR MOVED ON) FROM THE REVIEW WINDOW WHILE THE RUN WAS FINISHING
+    // (#333). Automation clicked nothing; the run staged the page and handed it over. Round 4 (Helm
+    // Blocking 2): what the step says comes from what became of the click (humanClickVerdict) — "filed"
+    // only for a committed submit whose page read as the completion — each outcome built whole, with
+    // the portal named once, by this frame. The outcome's note leads the hand-off notes (nextStep keeps
+    // the first six). PERSON_REQUEST_WENT_NOTE is said only when the watch saw no click at all.
+    const verdict = await this.humanClickVerdict();
+    if (verdict || this.personMovedOn) {
+      const report: { notes: string[]; sentence: string; data: Record<string, unknown> } = verdict ? this.humanClickReport(verdict) : {
+        notes: this.personRequestWent ? [PERSON_REQUEST_WENT_NOTE] : [], data: { humanSubmittedInReviewWindow: false },
+        sentence: "you moved on from the review window while the run was finishing — automation clicked nothing. If that was the submit, the filing went: check the portal and enter its record number with the capture form; if not, finish in the open window.",
+      };
+      // On the record (skeptic r2 F5): the hand-off notes reach the project's next-step panel.
+      for (const n of [...report.notes].reverse()) if (!this.reviewHandoffNotes.includes(n)) this.reviewHandoffNotes.unshift(n);
+      return ok(
+        `${this.portalName}: the recipe staged the review screen and handed it to you; ${report.sentence} No fee payment was automated. AUTOMATION HAS STOPPED.`,
+        {
+          finalSubmitClicked: false, ...report.data,
+          ...(this.reviewHandoffNotes.length ? { reviewHandoffNotes: [...this.reviewHandoffNotes] } : {}),
+        },
+      );
+    }
+    // A request the person sent went through and the click detector did not see a final submit
+    // (round 3): on the record, and never "click submit manually" as if nothing had happened. (No
+    // sighting exists here: a click the watch saw is reported above.)
+    if (this.personRequestWent && !this.reviewHandoffNotes.includes(PERSON_REQUEST_WENT_NOTE)) this.reviewHandoffNotes.push(PERSON_REQUEST_WENT_NOTE);
     // WHAT THE PERSON MUST KNOW BEFORE SUBMITTING (dryrun-0928 B3 / B14): answers the portal may
     // not have saved, and the portal's own background calls the lockdown held back on this page.
     const notes = this.reviewHandoffNotes;
     const handoff = notes.length ? ` ${notes.join(" ")}` : "";
     const handoffData = notes.length ? { reviewHandoffNotes: [...notes], reviewPageBlockedCalls: [...this.reviewPageBlockedCalls] } : {};
-    // Never "staged to the review screen" for a run that did not verifiably reach it (runs-finish 3).
-    if (this.stoppedBeforeReview) {
+    if (this.personRequestWent) {
       return ok(
-        `${HUMAN_REVIEW_MESSAGE} The recipe did NOT stage ${this.portalName} at its review screen — it ${this.stoppedBeforeReview}${handoff} AUTOMATION HAS STOPPED.`,
-        { finalSubmitClicked: false, stoppedBeforeReview: true, ...handoffData },
+        `${this.portalName}: the recipe staged the review screen and handed it to you, and a request you sent from it went through while the run was finishing — automation clicked nothing. If that was the submit, the filing went: check the portal and enter its record number with the capture form. If not, verify every field and uploaded file, handle any MFA/fee, then click submit.${handoff} AUTOMATION HAS STOPPED.`,
+        { finalSubmitClicked: false, personRequestWent: true, ...handoffData },
       );
     }
     return ok(
@@ -1493,11 +1871,319 @@ export class RecipeAdapter extends BasePortalAdapter {
    */
   async armSubmitWatch(onSubmitObserved: (clickedLabel?: string) => void): Promise<boolean> {
     if (!this.page) return false;
-    return armHumanCaptureOnPage(this.page, (step) => {
-      // The detector emits one submitObserved step when the final submit is clicked; every
-      // other captured step belongs to the learn path and is ignored here.
-      if (String(step.note || "").includes(HUMAN_SUBMIT_OBSERVED_NOTE)) onSubmitObserved(step.value || undefined);
-    }).catch(() => false);
+    // A submit the person made after the hand-over, before the runner asked (#333), is handed on now.
+    const seen = this.humanSubmit;
+    this.submitObservers.push(onSubmitObserved);
+    const armed = await this.armOwnSubmitWatch();
+    if (seen) { try { onSubmitObserved(seen.label); } catch { /* an observer never breaks the run */ } }
+    return armed;
+  }
+
+  /** #333 — THE PERSON'S OWN SUBMIT, COMMITTED, whoever asks (the hand-over arms the watch; the runner's
+   *  armSubmitWatch later registers on the same watch — the page binding can be exposed only once).
+   *  Round 4 (Helm Blocking 1): after a hand-over this is set only when evidence committed the click
+   *  (judgeHumanClick), and a capture that finds the review or error page clears it again
+   *  (reopenHumanSubmit). Never handed over: the click commits on sight, as on main. */
+  private humanSubmit: { label?: string; at?: number; personInput?: boolean } | null = null;
+  private submitObservers: Array<(clickedLabel?: string) => void> = [];
+  private submitWatch: Promise<boolean> | null = null;
+  /** Round 4 — the click seen and not yet committed or held. */
+  private pendingHumanClick: HumanClickSighting | null = null;
+  /** Round 4 — the last committed click (what a reopen restores). */
+  private lastCommittedClick: HumanClickSighting | null = null;
+  /** Round 4 — a click after the hand-over that a stopping abort held with no filing-shaped request of
+   *  the person's after it (the review step's wording reads it; nothing was sent from it). */
+  private heldHumanClickAfterHandOver: HumanClickSighting | null = null;
+  /** Round 4 — set ONLY by judgeCompletion: a page after the person's click read as their completion.
+   *  Separate from humanSubmit: production reports (stopAtReview) before the capture reads the page. */
+  private completionConfirmed = false;
+  /** Round 4 — the review page's own reading, taken at the hand-over (null: never handed over — the
+   *  approved path and every other caller keep today's read). */
+  private reviewReading: ReviewReading | null = null;
+  /** Round 4 — filing-shaped requests of the person's that went AFTER the backstop let the page go. */
+  private lateHumanRequests: Array<{ where: string; document: boolean; method: string; resourceType: string; at: number; doneAt: number }> = [];
+  /** Round 4 — no evidence before this may commit a later sighting (the previous click's moment). */
+  private clickFloor = 0;
+  private judgeTimer: ReturnType<typeof setInterval> | null = null;
+  private rereadTimer: ReturnType<typeof setTimeout> | null = null;
+  private lateHooked = false;
+  private noteHumanSubmit(label?: string, at?: number, personInput?: boolean): void {
+    if (this.humanSubmit) return;
+    this.humanSubmit = { label, at: at ?? Date.now(), personInput };
+    for (const fn of this.submitObservers) { try { fn(label); } catch { /* an observer never breaks the run */ } }
+  }
+
+  /** Round 4 — the watch saw a final-submit click. After a hand-over it is PROVISIONAL: it does not set
+   *  humanSubmit, notify the observers or disarm the watch (the sink keeps reporting, oneShot:false);
+   *  the evidence that follows commits it (judgeHumanClick). With no hand-over (an approved run, a
+   *  refused hand-over: the runner arms after the run), the click commits on sight, as on main. */
+  private sightHumanSubmit(label?: string): void {
+    if (this.humanSubmit) return;
+    const live = this.backstop;
+    const personInput = live && typeof live.handedOver === "function" && live.handedOver() && typeof live.personActedSinceHandOver === "function"
+      ? live.personActedSinceHandOver(this.page, 2000) : undefined;
+    const at = Date.now();
+    const bs = this.handedOverBackstop;
+    if (!bs) { this.noteHumanSubmit(label, at, personInput); return; }
+    if (this.pendingHumanClick) this.clickFloor = Math.max(this.clickFloor, this.pendingHumanClick.at);
+    this.pendingHumanClick = { label, at, abortsBefore: bs.aborts.length, requestsBefore: bs.humanRequests.length, personInput };
+    this.judgeHumanClick();
+    this.startJudging();
+  }
+
+  /** Round 4 — re-judge the pending click every 200 ms until it is committed or held, or its bound
+   *  lapsed: the backstop's record (humanRequests, aborts) grows with no callback to the run. */
+  private startJudging(): void {
+    if (this.judgeTimer) return;
+    const t = setInterval(() => {
+      const p = this.pendingHumanClick;
+      if (!p || this.humanSubmit || Date.now() - p.at > HUMAN_CLICK_COMMIT_MS + HUMAN_CLICK_SETTLE_MS) {
+        clearInterval(t);
+        this.judgeTimer = null;
+        return;
+      }
+      this.judgeHumanClick();
+    }, 200);
+    (t as { unref?: () => void }).unref?.();
+    this.judgeTimer = t;
+  }
+
+  /** Round 4 (Helm Blocking 1) — JUDGE THE PENDING CLICK ON WHAT FOLLOWED IT. Evidence: a non-GET
+   *  request of the person's (the handed-over backstop's record, or a filing-shaped one that went after
+   *  it let go) or a main-frame document a non-GET request committed — on ANY URL, the review page's own
+   *  included (a postback); never a GET navigation, never on Chromium's error page. A document or
+   *  filing-shaped request may precede the sighting by HUMAN_CLICK_EARLY_MS; a plain fetch must follow
+   *  it, and commits only once HUMAN_CLICK_SETTLE_MS passed with no stopping abort. A stopping abort
+   *  after the click with no filing-shaped request of the person's makes it HELD. */
+  private judgeHumanClick(): "committed" | "held" | "pending" | null {
+    const p = this.pendingHumanClick;
+    const bs = this.handedOverBackstop;
+    if (!p || !bs || this.humanSubmit) return null;
+    const now = Date.now();
+    const after = Math.max(p.evidenceAfter ?? 0, this.clickFloor);
+    const early = Math.max(p.at - HUMAN_CLICK_EARLY_MS, after);
+    const until = p.at + HUMAN_CLICK_COMMIT_MS;
+    const runPage = this.page;
+    const evidence: Array<{ sent: number; done: number; filing: boolean }> = [];
+    for (const r of bs.humanRequests) {
+      if (r.page !== runPage || typeof r.at !== "number" || String(r.method ?? "").toUpperCase() === "GET") continue;
+      evidence.push({ sent: r.at, done: r.at, filing: filingShapedHumanRequest(r) });
+    }
+    for (const r of this.lateHumanRequests) evidence.push({ sent: r.at, done: r.doneAt, filing: true });
+    for (const d of this.navDocuments) if (d.method && d.method !== "GET") evidence.push({ sent: d.sentAt ?? d.at, done: d.at, filing: true });
+    const counts = (e: { sent: number; done: number; filing: boolean }): boolean => e.done > after && e.sent <= until && e.sent >= (e.filing ? early : Math.max(p.at, after));
+    const filingEv = evidence.some((e) => e.filing && counts(e));
+    const plainEv = evidence.some((e) => !e.filing && counts(e));
+    const onErrorPage = /^chrome-error:/i.test(this.pageUrlNoHash());
+    if (filingEv && !onErrorPage) return this.commitHumanClick(p, true);
+    const settled = now - p.at >= HUMAN_CLICK_SETTLE_MS;
+    const held = bs.aborts.some((a) => isStoppingAbort(a) && !a.beforeHandOver && typeof a.at === "number" && a.at >= early && a.at > after);
+    if (held && !this.personFilingShapedRequestAfter(early)) {
+      if (!settled) return "pending";
+      this.heldHumanClickAfterHandOver = p;
+      this.pendingHumanClick = null;
+      return "held";
+    }
+    if (plainEv && !held && !onErrorPage && settled) return this.commitHumanClick(p, false);
+    return "pending";
+  }
+
+  /** Round 4 — commit a judged click: humanSubmit is set and the observers (the runner's capture) told. */
+  private commitHumanClick(p: HumanClickSighting, filing: boolean): "committed" {
+    this.pendingHumanClick = null;
+    this.lastCommittedClick = { ...p, filingEvidence: filing };
+    this.noteHumanSubmit(p.label, p.at, p.personInput);
+    return "committed";
+  }
+
+  /** Round 4 — the capture found the review (or Chromium's error) page after a committed click: the
+   *  watch reopens. Only evidence completed after now, a new sighting, or (when the commit rested on a
+   *  filing request) one slow-server re-read may commit it again — never the same evidence. */
+  private reopenHumanSubmit(): void {
+    const last = this.lastCommittedClick;
+    if (!last || !this.humanSubmit) return;
+    this.humanSubmit = null;
+    this.completionConfirmed = false;
+    const p: HumanClickSighting = { ...last, evidenceAfter: Date.now() };
+    this.pendingHumanClick = p;
+    if (last.filingEvidence && !last.slowRereadDone) {
+      p.slowRereadDone = true;
+      this.scheduleCompletionReread(HUMAN_CLICK_SLOW_REREAD_MS);
+    }
+  }
+
+  /** Round 4 — hook the person's requests that were answered after the backstop let the page go: on the
+   *  response or requestfinished, whichever comes (a fetch answered 204 may raise no requestfinished),
+   *  never on "request", which fires before the route handler would have judged it — an aborted request
+   *  is never answered, so it never counts. A filing-shaped one is late evidence; a plain fetch
+   *  schedules one page read (an in-place SPA submit commits only if that read holds). While the
+   *  backstop still holds the page, its record is the evidence: the hooks only re-judge. Listeners
+   *  only: nothing is routed, aborted or clicked. */
+  private hookLateHumanRequests(): void {
+    const page = this.page as { on?: (ev: string, fn: (x: unknown) => void) => void; mainFrame?: () => unknown } | null;
+    if (this.lateHooked || !page || typeof page.on !== "function") return;
+    this.lateHooked = true;
+    const seen = new WeakSet<object>();
+    const onAnswered = (request: unknown): void => {
+      try {
+        const p = this.pendingHumanClick;
+        if (!p || this.humanSubmit || !request || typeof request !== "object" || seen.has(request)) return;
+        seen.add(request);
+        const req = request as { method: () => string; url: () => string; resourceType: () => string; isNavigationRequest: () => boolean; frame: () => { page?: () => unknown }; timing?: () => { startTime?: number } };
+        const method = String(req.method() || "").toUpperCase();
+        if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
+        const frame = req.frame();
+        if (typeof frame?.page !== "function" || frame.page() !== this.page) return;
+        if (this.handedOverBackstop?.handedOver()) { this.judgeHumanClick(); return; }
+        const started = Number((typeof req.timing === "function" ? req.timing() : null)?.startTime ?? 0);
+        const sent = started > 0 ? Math.round(started) : Date.now();
+        if (sent > p.at + HUMAN_CLICK_COMMIT_MS || sent < p.at - HUMAN_CLICK_EARLY_MS) return;
+        let where = "";
+        try { const u = new URL(String(req.url() || "")); where = `${u.origin}${u.pathname}`; } catch { return; }
+        const entry = { where, document: req.isNavigationRequest() && typeof page.mainFrame === "function" && frame === page.mainFrame(), method, resourceType: String(req.resourceType() || ""), at: sent, doneAt: Date.now() };
+        if (filingShapedHumanRequest(entry)) {
+          this.lateHumanRequests.push(entry);
+          this.judgeHumanClick();
+        } else {
+          this.scheduleCompletionReread(HUMAN_CLICK_SPA_REREAD_MS);
+        }
+      } catch { /* a request we cannot read adds no evidence */ }
+    };
+    page.on("requestfinished", onAnswered);
+    page.on("response", (resp: unknown) => {
+      try { onAnswered((resp as { request: () => unknown }).request()); } catch { /* no request: no evidence */ }
+    });
+    page.on("requestfailed", () => { try { this.judgeHumanClick(); } catch { /* nothing to judge */ } });
+  }
+
+  /** Round 4 — one page read later (one at a time), for an in-place SPA submit or a slow server. */
+  private scheduleCompletionReread(ms: number): void {
+    if (this.rereadTimer) return;
+    const t = setTimeout(() => { this.rereadTimer = null; void this.rereadForCompletion(); }, ms);
+    (t as { unref?: () => void }).unref?.();
+    this.rereadTimer = t;
+  }
+
+  /** Round 4 — read the page for the pending click: it commits only when the completion reading holds. */
+  private async rereadForCompletion(): Promise<void> {
+    const p = this.pendingHumanClick;
+    if (!p || this.humanSubmit || !this.reviewReading) return;
+    const read = await this.readPageForCapture();
+    if (!read || /^chrome-error:/i.test(this.pageUrlNoHash()) || this.pendingHumanClick !== p || this.humanSubmit) return;
+    const judged = this.judgeCompletion(read, p.at);
+    if (judged.number || judged.confirmed) this.commitHumanClick(p, !!p.filingEvidence);
+  }
+
+  /** Round 4 — the page's text, the same text with every attached table cell's own text taken out (a
+   *  list's status cells never count as completion wording; nothing on the page is changed), and its
+   *  submit control. null when it cannot be read (the page is gone or navigating). */
+  private async readPageForCapture(): Promise<CapturePageRead | null> {
+    const page = this.page;
+    if (!page || typeof page.evaluate !== "function") return null;
+    try {
+      const texts = await Promise.race([
+        page.evaluate(() => {
+          const body = document.body;
+          const text = body ? body.innerText : "";
+          let cellFree = text;
+          if (body) {
+            for (const cell of Array.from(body.querySelectorAll("td, th, [role=cell], [role=gridcell]"))) {
+              const own = String((cell as HTMLElement).innerText || "").trim();
+              if (own) cellFree = cellFree.replace(own, " ");
+            }
+          }
+          return { text, cellFree };
+        }),
+        sleep(3000).then(() => null),
+      ]) as { text?: string; cellFree?: string } | null;
+      if (!texts) return null;
+      const ctx = await this.pageSafetyContext();
+      return { text: String(texts.text ?? ""), cellFree: String(texts.cellFree ?? ""), filingControl: String(ctx.filingControl ?? ""), reviewPage: ctx.reviewPage };
+    } catch { return null; }
+  }
+
+  /** Round 4 — the review page's own reading for the capture; on a failed read, no numbers and no known
+   *  control (only completion wording with its veto clear can then count — never today's loose read). */
+  private async readReviewForCapture(): Promise<ReviewReading> {
+    const read = await this.readPageForCapture().catch(() => null);
+    if (!read) return { numbers: new Set(), filingControl: "", completionPhrase: null };
+    return {
+      numbers: new Set(recordNumberCandidates(read.text).map((c) => c.value)),
+      filingControl: read.filingControl,
+      reviewPage: read.reviewPage,
+      completionPhrase: completionEvidence(read.cellFree).phrase,
+    };
+  }
+
+  /** Round 4 (Helm Blocking 1) — JUDGE A PAGE AFTER THE PERSON'S CLICK AGAINST THE REVIEW'S OWN READING,
+   *  by number and content, never by URL. Numbers: the strongest shape tier with a candidate, never a
+   *  weaker one; in it, the first number the review did not show — which counts when the review's form
+   *  is gone (formLost) or completion wording stands with its veto clear — else the review's own number,
+   *  only beside formLost AND wording the review page did not already show. A page reached by a GET
+   *  navigation after the click, with no document request of the person's since, yields no number. */
+  private judgeCompletion(read: CapturePageRead, clickAt: number): { number: string; confirmed: boolean; stillReview: boolean } {
+    const rr = this.reviewReading ?? { numbers: new Set<string>(), filingControl: "", completionPhrase: null };
+    const formLost = rr.filingControl !== "" && read.filingControl === "" && read.reviewPage !== true;
+    const words = completionEvidence(read.cellFree);
+    const phraseOk = !!words.phrase && !words.veto;
+    const phraseFresh = phraseOk && normPhrase(words.phrase) !== normPhrase(rr.completionPhrase);
+    const here = this.pageUrlNoHash();
+    let doc: { method: string; at: number } | null = null;
+    for (let i = this.navDocuments.length - 1; i >= 0 && !doc; i--) if (this.navDocuments[i].url === here) doc = this.navDocuments[i];
+    const documentPostSince = (this.handedOverBackstop?.humanRequests ?? []).some((h) => h.document && h.page === this.page && typeof h.at === "number" && h.at >= clickAt - HUMAN_CLICK_EARLY_MS && String(h.method ?? "").toUpperCase() !== "GET")
+      || this.lateHumanRequests.some((h) => h.document && h.at >= clickAt - HUMAN_CLICK_EARLY_MS);
+    const navigationOnly = !!doc && doc.method === "GET" && doc.at > clickAt && !documentPostSince;
+    const candidates = recordNumberCandidates(read.text);
+    const tier = RECORD_NUMBER_TIERS.find((t) => candidates.some((c) => c.source === t));
+    const inTier = tier ? candidates.filter((c) => c.source === tier).map((c) => c.value) : [];
+    const fresh = inTier.filter((v) => !rr.numbers.has(v));
+    const own = inTier.filter((v) => rr.numbers.has(v));
+    let number = "";
+    if (!navigationOnly) {
+      if (fresh.length) { if (formLost || phraseOk) number = fresh[0]; }
+      else if (own.length && formLost && phraseFresh) number = own[0];
+    }
+    const confirmed = !navigationOnly && (number !== "" || (phraseOk && formLost));
+    if (confirmed) this.completionConfirmed = true;
+    return { number, confirmed, stillReview: number === "" && read.filingControl !== "" };
+  }
+
+  private armOwnSubmitWatch(): Promise<boolean> {
+    if (this.submitWatch) return this.submitWatch;
+    const page = this.page;
+    if (!page) return Promise.resolve(false);
+    this.hookLateHumanRequests();
+    // ONLY THE CLICK DETECTOR SAYS "THE PERSON SUBMITTED" (#333 skeptic r2b). A page-text signal — a
+    // completion-looking page after a person's request — failed both ways: a step page reading "once
+    // your application is submitted…" after the person's own Previous click read as a filing (with a
+    // draft's id), and real completion pages with a "* required field" legend did not. What a page
+    // says is never what made the filing; a request the person sent is said plainly instead
+    // (PERSON_REQUEST_WENT_NOTE), and the number is theirs to enter.
+    // The click detector the learn path already uses: a submitObserved step when the FINAL submit is
+    // clicked; every other captured step belongs to the learn path and is ignored here. Round 4: it
+    // keeps watching (oneShot:false) — a click is a sighting, committed on the evidence after it.
+    this.submitWatch = armHumanCaptureOnPage(page, (step) => {
+      if (String(step.note || "").includes(HUMAN_SUBMIT_OBSERVED_NOTE)) this.sightHumanSubmit(step.value || undefined);
+    }, { oneShot: false }).catch(() => false);
+    return this.submitWatch;
+  }
+
+  /** #333 — HAND THE REVIEW PAGE TO THE PERSON, before the run's read-only housekeeping. The backstop
+   *  lets their own click through from here (filingBackstop handOverToHuman), and the submit watch is
+   *  armed now, not after the run returns: a filing made in the run's last seconds is captured. */
+  private async handOverReviewPage(): Promise<boolean> {
+    // Round 4: FIRST, while the lockdown still holds the page, the review page's own reading — what the
+    // capture judges every later page against (a fast click's completion must never land in it).
+    const reading = await this.readReviewForCapture();
+    const bs = this.backstop;
+    if (!bs || !bs.handOverToHuman(`replay staged ${this.recipe.id} to review`)) return false;
+    this.reviewReading = reading;
+    // The page handed over: a person who acted and left it moved on (runAll's report).
+    this.handOverUrl = this.pageUrlNoHash();
+    this.handedOverBackstop = bs;
+    const armed = this.armOwnSubmitWatch();
+    await Promise.race([armed, sleep(3000)]);
+    return true;
   }
 
   async captureSubmissionConfirmation(): Promise<PortalStepResult> {
@@ -1525,10 +2211,6 @@ export class RecipeAdapter extends BasePortalAdapter {
           draftTenantKey: draftTenantKey(here),
         });
       }
-      const read = extractRecordNumber(bodyText);
-      const permitNumber = read.value;
-      // Accela record suffix encodes the discipline: -STR (structural), -ELE (electrical), etc.
-      const discipline = permitNumber.match(/-([A-Z]{2,4})$/)?.[1] ?? null;
       // Keep origin+path only — completion-page URLs can embed session-scoped query tokens
       // (capId/agency/auth tickets) that would persist session material in the stored run
       // result and won't work when clicked later anyway.
@@ -1541,12 +2223,62 @@ export class RecipeAdapter extends BasePortalAdapter {
       // confident number, the before/after list diff. READ ONLY: both reads look at the page the
       // person is left on — nothing navigates, clicks or opens a tab to reach a list.
       const canRead = typeof this.page.evaluate === "function";
-      const numberHref = permitNumber && canRead
-        ? String((await this.page.evaluate(recordLinkForNumberInPage, permitNumber).catch(() => "")) || "")
-        : "";
-      const after = canRead ? ((await this.page.evaluate(readApplicationLedgerInPage).catch(() => null)) as LedgerEntry[] | null) : null;
-      // The site (NEM tracks: siteDraft) holds the one new row to this project's address.
-      const recordRead = chooseSubmittedRecord({ read, numberHref, before: this.ledgerBefore, after, pageUrl: rawUrl, site: this.options.siteDraft ?? null });
+      const page = this.page;
+      const chooseRecord = async (read: { value: string; confidence: "high" | "low"; reason: string }) => {
+        const numberHref = read.value && canRead
+          ? String((await page.evaluate(recordLinkForNumberInPage, read.value).catch(() => "")) || "")
+          : "";
+        const after = canRead ? ((await page.evaluate(readApplicationLedgerInPage).catch(() => null)) as LedgerEntry[] | null) : null;
+        // The site (NEM tracks: siteDraft) holds the one new row to this project's address.
+        return chooseSubmittedRecord({ read, numberHref, before: this.ledgerBefore, after, pageUrl: rawUrl, site: this.options.siteDraft ?? null });
+      };
+      // #333 round 4 (Helm Blocking 1): A PAGE AFTER THE PERSON'S OWN CLICK ON A HANDED-OVER REVIEW is
+      // judged against the review's own reading (judgeCompletion), never read loosely: the review's
+      // own id, a list's numbers, a duplicate's or a validation re-render's are not the filing's. The
+      // review (its submit control still there, no number) or Chromium's error page reopens the watch.
+      // #400's list diff and link choice apply on top of that judgement, never in place of it: a new
+      // row in the account list is taken as the filing only on a page judged to be the completion;
+      // on any other page it is offered as a candidate for a person to confirm (a draft lists too).
+      if (this.reviewReading) {
+        const errorPage = /^chrome-error:/i.test(rawUrl);
+        const read = errorPage ? null : await this.readPageForCapture();
+        const judged = read ? this.judgeCompletion(read, this.lastCommittedClick?.at ?? 0) : { number: "", confirmed: false, stillReview: false };
+        if (judged.number) {
+          const recordRead = await chooseRecord({ value: judged.number, confidence: "high", reason: `Captured submission confirmation: ${judged.number}.` });
+          return ok(`Captured submission confirmation: ${judged.number}.`, {
+            permitNumber: judged.number, confirmationNumber: judged.number,
+            discipline: judged.number.match(/-([A-Z]{2,4})$/)?.[1] ?? null, recordLink: recordRead.recordLink, recordRead,
+          });
+        }
+        if (judged.stillReview || errorPage) {
+          this.reopenHumanSubmit();
+          return ok(
+            errorPage ? "The window shows the browser's error page: nothing recorded, and the submit watch is open again."
+              : "The page still reads as the review page: nothing recorded, and the submit watch is open again.",
+            { permitNumber: "", recordLink: cleanRecordLink(rawUrl), stillReview: judged.stillReview, errorPage },
+          );
+        }
+        const unread = judged.confirmed ? "Submitted; no record number found on the completion page yet."
+          : "This page does not read as the application's completion: no record number recorded.";
+        const listed = await chooseRecord({ value: "", confidence: "low", reason: unread });
+        const recordRead = listed.confidence === "high" && !judged.confirmed
+          ? {
+            ...listed, recordNumber: "", confidence: "low" as const, source: "none" as const,
+            reason: "One new application appeared in the account's list, but the page after the submit does not read as the application's completion — a person confirms whether it is this filing.",
+            candidates: [{ recordNumber: listed.recordNumber, recordLink: listed.recordLink, source: "account_list" as const }],
+          }
+          // With nothing in the list to offer, the reason is the page's judgement, as before #400.
+          : listed.confidence === "low" && !listed.candidates.length ? { ...listed, reason: unread } : listed;
+        return ok(
+          recordRead.confidence === "high" ? `Submitted; ${recordRead.recordNumber} is the one new application in the account's list.` : unread,
+          { permitNumber: "", recordLink: recordRead.recordLink || cleanRecordLink(rawUrl), stillReview: false, errorPage: false, recordRead },
+        );
+      }
+      const read = extractRecordNumber(bodyText);
+      const permitNumber = read.value;
+      // Accela record suffix encodes the discipline: -STR (structural), -ELE (electrical), etc.
+      const discipline = permitNumber.match(/-([A-Z]{2,4})$/)?.[1] ?? null;
+      const recordRead = await chooseRecord(read);
       const recordLink = permitNumber
         ? (recordRead.recordNumber === permitNumber ? recordRead.recordLink : recordRead.candidates.find((c) => c.recordNumber === permitNumber)?.recordLink || cleanRecordLink(rawUrl))
         : recordRead.recordLink || cleanRecordLink(rawUrl);
@@ -1793,8 +2525,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     const none = { summary: "", fieldsSeen: 0, confirmed: 0, mismatches: [] as ReviewMismatch[] };
     if (!this.page || !project) return none;
     try {
-      const fields = await scrapeReviewScreenShared(this.page);
-      const body = String(await this.page.locator("body").innerText().catch(() => ""));
+      const { fields, body, confirmed, mismatches } = await this.reviewValuesOnPage(project);
       // A REVIEW SCREEN WE COULD NOT READ MUST LEAVE ITS PAGE BEHIND.
       //
       // The first live replay benchmark scored PacifiCorp `replayed_clean` — 98 steps, no
@@ -1812,16 +2543,12 @@ export class RecipeAdapter extends BasePortalAdapter {
           await this.page.screenshot({ path: path.join(dir, `review-unreadable-${stamp}.png`), fullPage: true }).catch(() => {});
         } catch { /* diagnostics must never change the outcome */ }
       }
-      // A utility identifier is checked only when THIS recipe typed it (B8) — never a meter on a
-      // permit application that has no meter field.
-      const cmp = reviewComparison(fields, project, utilityIdentifiersEnteredBySteps(this.recipe.steps), body);
-      const mismatches = cmp.mismatches;
       if (!mismatches.length) {
         // SAY WHAT WAS CONFIRMED, NOT JUST THAT NOTHING COMPLAINED. Zero mismatches on a page
         // where nothing could be compared is not a verified filing.
         return {
-          summary: ` Review screen checked against the project: ${fields.length} field(s) read, ${cmp.confirmed} project value(s) confirmed present, no mismatch.`,
-          fieldsSeen: fields.length, confirmed: cmp.confirmed, mismatches,
+          summary: ` Review screen checked against the project: ${fields.length} field(s) read, ${confirmed} project value(s) confirmed present, no mismatch.`,
+          fieldsSeen: fields.length, confirmed, mismatches,
         };
       }
       const named = mismatches.slice(0, 4)
@@ -1830,12 +2557,28 @@ export class RecipeAdapter extends BasePortalAdapter {
       return {
         summary: ` VERIFY BEFORE SUBMITTING — the review screen does not match the project on ${mismatches.length} field(s): ${named}${mismatches.length > 4 ? ", …" : ""}.`,
         fieldsSeen: fields.length,
-        confirmed: cmp.confirmed,
+        confirmed,
         mismatches,
       };
     } catch {
       return none;
     }
+  }
+
+  /** THE PROJECT'S VALUES ON THE PAGE NOW — the review read-back's comparison, READ ONLY (no capture
+   *  written, no input). verifyReviewScreen reports from it; the hand-over's early "where did the run
+   *  stop" read (Helm Should-fix 4) takes the same `confirmed`, so both readings of one page carry the
+   *  same evidence. Throws only what the scrape throws; callers catch. */
+  private async reviewValuesOnPage(
+    project: ProjectRecord,
+  ): Promise<{ fields: Awaited<ReturnType<typeof scrapeReviewScreenShared>>; body: string; confirmed: number; mismatches: ReviewMismatch[] }> {
+    if (!this.page) return { fields: [], body: "", confirmed: 0, mismatches: [] };
+    const fields = await scrapeReviewScreenShared(this.page);
+    const body = String(await this.page.locator("body").innerText().catch(() => ""));
+    // A utility identifier is checked only when THIS recipe typed it (B8) — never a meter on a
+    // permit application that has no meter field.
+    const cmp = reviewComparison(fields, project, utilityIdentifiersEnteredBySteps(this.recipe.steps), body);
+    return { fields, body, confirmed: cmp.confirmed, mismatches: cmp.mismatches };
   }
 
   private async runAll(project?: ProjectRecord): Promise<PortalStepResult> {
@@ -2822,8 +3565,62 @@ export class RecipeAdapter extends BasePortalAdapter {
     // aborted and stops the run, named. ...BUT NOT BEFORE THE PORTAL HAS SAVED WHAT THE RUN WROTE
     // (dryrun-0928 B3): PowerClerk batches a page's answers into one save seconds after the first
     // change; the final-submit refusal and stopForReview exits both arrive here with it pending.
+    // #333 — FROM HERE THE RUN MAKES NO INPUT ON THIS PAGE, so a person's own click can be told from
+    // it: the backstop's input watch is armed now (a guided-manual run only — an approved run clicks
+    // its own final submit and is never handed over) — and only for a caller that watches for the
+    // person's submit (Helm Should-fix 4: handOverReview, which index.ts passes only with
+    // onSubmitCaptured). The learn self-test, the cross-project replay and the benchmark never see that
+    // submit, so a click in their tail is held by the lockdown and fails the run by name, as on main.
+    const handingOver = this.options.handOverReview === true && !this.options.autoSubmit && !this.finalSubmitClicked && !!this.backstop;
+    let handedOver = false;
+    // WHERE THE RUN STOPPED, READ BEFORE THE PAGE IS HANDED OVER (Helm Should-fix 4): once the person
+    // acts, the page is theirs and no longer where the run stopped. Read-only, with the same evidence
+    // as the review read-back (the project's values on the page).
+    let earlyStop: { where: string; refused: string[]; message: string } | null = null;
+    if (handingOver) {
+      earlyStop = !pastReview && !this.stoppedAtPayment
+        ? await this.whereTheRunStopped(project ? (await this.reviewValuesOnPage(project).catch(() => ({ confirmed: 0 }))).confirmed : 0)
+        : null;
+      // THE RUN'S OWN INPUT ENDS HERE (#333): its guarded clicks, presses and steps refuse from now on,
+      // so the input watch armed next can only ever record a person's input.
+      this.inputsClosed = `${INPUT_CLOSED} (${this.recipe.id})`;
+      // A FAILING RUN IS NEVER HANDED OVER (Helm Should-fix 3): a stopping abort the input watch did
+      // not flag as the person's (a click before the watch listened — during the run's last writes or
+      // its arm — or the page acting by itself) fails the run by name below. Asked BEFORE the arm (an
+      // armed watch would flag the person's next click as a held one, and the failing run would tell
+      // them to click again) and again just before the hand-over (an abort recorded during the arm).
+      // A click the armed watch saw is flagged, so it still hands over. Never asked earlier: the run's
+      // own helper input is not fenced, so arming sooner would flag automation's aborts as the person's.
+      const unflaggedStop = (): boolean => !!this.backstop && this.backstop.stoppingAborts().some((a) => !a.humanInput);
+      const handOverArmed = !unflaggedStop() && await this.backstop!.watchHumanInput().catch(() => false);
+      // THE HAND-OVER (#333, owner ruling 2026-10-14) — BEFORE the drain and the read-only
+      // housekeeping below (skeptic r2 F2): a person who clicks while the portal is still saving the
+      // run's last answer is let through and their request recorded as theirs — the drain's and the
+      // own-write window's own-save exemptions never take it. The page's own scripts posting with no
+      // input of the person's still meet the lockdown below until fillApplication returns, and they
+      // cannot forge that input: the watch runs in a CDP isolated world no page script can reach or
+      // drive (Helm Should-fix 1; the filingBackstop.ts header states its residual).
+      handedOver = handOverArmed && !unflaggedStop() && await this.handOverReviewPage();
+    }
     await this.drainBeforeReviewLock();
     this.backstop?.lockReview(`replay stopped at review (${this.recipe.id})`);
+    if (handingOver) {
+      // Told only once the run's own save has drained — not an invitation to click while the portal
+      // reads "Saving…" (an eager click is still let through, and recorded).
+      // A run that stopped before review says so here too — never "Staged to review" (Should-fix 4).
+      if (handedOver) {
+        this.progress("wait", earlyStop
+          ? `Stopped on "${earlyStop.where}" — NOT the review page; the page is yours to finish, continue to review, verify and submit`
+          : "Staged to review — the page is yours to verify and submit", 0);
+      }
+      else {
+        // Fail closed AND say so, now and in the hand-off: the lockdown holds until the stage finishes
+        // (a failed arm, or an unflagged stop on record — the run then fails by name).
+        if (!this.reviewHandoffNotes.includes(NOT_HANDED_OVER_NOTE)) this.reviewHandoffNotes.push(NOT_HANDED_OVER_NOTE);
+        if (!this.driftWarnings.includes(NOT_HANDED_OVER_NOTE)) this.driftWarnings.push(NOT_HANDED_OVER_NOTE);
+        this.progress("wait", NOT_HANDED_OVER_NOTE, 0);
+      }
+    }
     const review = await this.verifyReviewScreen(project);
     const data = {
       executed, skipped, finalSubmitClicked: false, gapFill: this.gapFillReport,
@@ -2837,9 +3634,32 @@ export class RecipeAdapter extends BasePortalAdapter {
     // attachments page with 0 of 5 project values found, and was recorded ready-to-submit. A run
     // that ends on a page the shared reading says is NOT the review page, showing none of the
     // project's values, pauses for a person, named — never "staged to the review screen".
-    const stop = !pastReview && !this.stoppedAtPayment ? await this.whereTheRunStopped(review.confirmed) : null;
+    // A page the person already moved on from (their own submit or postback went) is not where the
+    // run stopped: the run did reach it and handed it over.
+    // Moved on (skeptic r2 F3): their own request left the page (a document submit or postback),
+    // their own submit was seen, or they acted after the hand-over and the page is no longer the one
+    // handed over (a fetch submit that then loads its completion page; a GET to "My Records"). A
+    // harmless touch that only rode along with the run's own autosave is none of these. And a click
+    // of theirs HELD BACK before the hand-over can leave Chromium's error page in the window: that is
+    // not where the run stopped either (F6) — that page only (round 3).
+    const bsNow = this.backstop;
+    const hereNow = this.pageUrlNoHash();
+    const personMovedOn = !!this.humanDocumentFromHandedOverPage(bsNow) || !!this.humanSubmit
+      || (!!bsNow && this.handOverUrl !== "" && hereNow !== "" && hereNow !== this.handOverUrl && bsNow.personActedSinceHandOver(this.page));
+    this.personMovedOn = personMovedOn;
+    this.personRequestWent = (bsNow?.humanRequests ?? []).length > 0;
+    const onHeldErrorPage = this.heldHumanClick() && /^chrome-error:/i.test(hereNow);
+    // A person who moved on from a page the run did NOT stage at review (Helm Should-fix 4: their
+    // Continue on an attachments step) is told where the run stopped, from the reading taken before the
+    // hand-over. A final submit the click detector saw is not decided here (the review step's wording).
+    const stop = !pastReview && !this.stoppedAtPayment && !onHeldErrorPage
+      ? (personMovedOn && !this.humanSubmit
+        ? (earlyStop && { where: earlyStop.where, refused: earlyStop.refused, message: this.stoppedBeforeReviewMessage(earlyStop.where, earlyStop.refused, this.personRequestWent) })
+        : (personMovedOn ? null : await this.whereTheRunStopped(review.confirmed, this.personRequestWent)))
+      : null;
     if (stop) {
       this.stoppedBeforeReview = stop.message;
+      this.stoppedBeforeReviewAt = { where: stop.where, refused: stop.refused };
       // THE PICKS FIRST (#362): the run card and the stage line read this message's first line (the
       // backend's pausedRunSentence), so what automation picked leads it, before the where-it-stopped.
       return { ...ok(`${this.draftPickTell ? `${this.draftPickTell} ` : ""}Replayed ${executed} recorded step(s); ${stop.message}${review.summary}`, { ...data, stoppedBeforeReview: stop.where }), pauseReason: "stopped_before_review" };
@@ -2853,7 +3673,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  say "not review" — a page that cannot be read (a unit-test double) keeps today's report.
    *  Otherwise: the page is readable, is not the review page, and shows none of the project's
    *  values — the run stopped before review, and says where in the page's own words. */
-  private async whereTheRunStopped(confirmed: number): Promise<{ where: string; message: string } | null> {
+  private async whereTheRunStopped(confirmed: number, personRequestWent = false): Promise<{ where: string; refused: string[]; message: string } | null> {
     if (confirmed > 0) return null;
     const at = await this.pageSafetyContext();
     if (at.reviewPage !== false) return null;
@@ -2872,12 +3692,20 @@ export class RecipeAdapter extends BasePortalAdapter {
     }).catch(() => "")) : "";
     const where = titled || (await this.pageLabelNow().catch(() => "")) || "the last page the recipe reached";
     const refused = (await this.readPortalRefusal().catch(() => [] as string[])).slice(0, 3).map((t) => t.replace(/[.\s]+$/, ""));
-    return {
-      where,
-      message: `STOPPED on "${where}" — NOT the review page (the page does not read as the portal's review step, and none of the project's values are on it), so the application is NOT staged at review.`
-        + `${refused.length ? ` The portal says: ${refused.join(" | ")}.` : ""}`
-        + ` Next: in the portal, finish that page (check every attachment is listed and nothing is flagged required), continue to the review page, verify every field there, then submit. Nothing was filed.`,
-    };
+    return { where, refused, message: this.stoppedBeforeReviewMessage(where, refused, personRequestWent) };
+  }
+
+  /** THE STOPPED-BEFORE-REVIEW SENTENCE, whole (pure). Built from a reading taken before the hand-over
+   *  too (Helm Should-fix 4): a person who moved on from the page the run stopped on is told where the
+   *  run stopped, never that it staged the review screen. */
+  private stoppedBeforeReviewMessage(where: string, refused: string[], personRequestWent: boolean): string {
+    return `STOPPED on "${where}" — NOT the review page (the page does not read as the portal's review step, and none of the project's values are on it), so the application is NOT staged at review.`
+      + `${refused.length ? ` The portal says: ${refused.join(" | ")}.` : ""}`
+      // A request the person sent went through after the hand-over (round 3): it may have been the
+      // filing — never "Nothing was filed"; this sentence is the one that says so.
+      + (personRequestWent
+        ? ` A request you sent from the page went through while the stage was finishing — check the portal before anything else.`
+        : ` Next: in the portal, finish that page (check every attachment is listed and nothing is flagged required), continue to the review page, verify every field there, then submit. Nothing was filed.`);
   }
 
   /** Binding keys the planner invented that the dictionary does not define — reported once
@@ -4637,6 +5465,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  review lockdown's live reading let it through. Its filing/payment rules and the run's own
    *  review lock (set at stopForReview) are untouched. Clicks, presses and gotos get no window. */
   private async executeStep(step: RecipeStep, pastReview: boolean): Promise<boolean> {
+    if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (step ${String(step.note || step.action)})`);
     // Which view each recorded write ran in (#362: a re-assert from another page is a pick).
     if (RecipeAdapter.WRITE_ACTIONS.has(step.action) && !this.inPolicyRetry) {
       const idx = this.recipe.steps.indexOf(step);
@@ -4730,14 +5559,14 @@ export class RecipeAdapter extends BasePortalAdapter {
         exactCount = await exact.count().catch(() => 0);
       }
       if (exactCount === 1) {
-        await exact.first().check({ timeout: 10000 });
+        await withAutomationInput(this.page, () => exact.first().check({ timeout: 10000 }));
         this.driftWarnings.push(`record type "${wanted}" selected by label (positional fallback refused)`);
         return true;
       }
       const loose = this.page.getByRole("checkbox", { name: wanted, exact: false });
       const looseCount = exactCount > 1 ? exactCount : await loose.count().catch(() => 0);
       if (looseCount === 1) {
-        await loose.first().check({ timeout: 10000 });
+        await withAutomationInput(this.page, () => loose.first().check({ timeout: 10000 }));
         this.driftWarnings.push(`record type "${wanted}" selected by label (positional fallback refused)`);
         return true;
       }
@@ -4963,8 +5792,8 @@ export class RecipeAdapter extends BasePortalAdapter {
         if (maskedStep) {
           if (typeof scoped!.focus === "function") await scoped!.focus().catch(() => null);
           await scoped!.fill("").catch(() => null);
-          if (typeof scoped!.pressSequentially === "function") await scoped!.pressSequentially(v, { delay: 35 }).catch(() => null);
-          else if (typeof scoped!.type === "function") await scoped!.type(v, { delay: 35 }).catch(() => null);
+          if (typeof scoped!.pressSequentially === "function") await withAutomationInput(this.page, () => scoped!.pressSequentially!(v, { delay: 35 })).catch(() => null);
+          else if (typeof scoped!.type === "function") await withAutomationInput(this.page, () => scoped!.type!(v, { delay: 35 })).catch(() => null);
           else await scoped!.fill(v, { timeout: FILL_TIMEOUT_MS });
         } else {
           // BOUNDED. Replay does NOT go through the learner's applyFill, so the visibility
@@ -5017,7 +5846,7 @@ export class RecipeAdapter extends BasePortalAdapter {
           if (maskedStep && typeof scoped!.pressSequentially === "function") {
             if (typeof scoped!.focus === "function") await scoped!.focus().catch(() => null);
             await scoped!.fill("").catch(() => null);
-            await scoped!.pressSequentially(v, { delay: 35 }).catch(() => null);
+            await withAutomationInput(this.page, () => scoped!.pressSequentially!(v, { delay: 35 })).catch(() => null);
           } else {
             await scoped!.fill(v, { timeout: FILL_TIMEOUT_MS }).catch(() => null);
           }
@@ -5358,7 +6187,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         // the recorded id was unusable) — force must follow !usable alone, or the check
         // waits out its full actionability timeout on an element that can never be visible.
         try {
-          await target!.check({ force: !usable });
+          await withAutomationInput(this.page, () => target!.check({ force: !usable }));
         } catch (err) {
           // "CLICKING THE CHECKBOX DID NOT CHANGE ITS STATE" IS NOT A MISSING CONTROL.
           //
@@ -5389,7 +6218,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       }
       case "uncheck":
         await waitForElement(scoped);
-        await scoped!.uncheck();
+        await withAutomationInput(this.page, () => scoped!.uncheck());
         this.writtenTarget = scoped;
         return true;
       case "press":
@@ -6150,6 +6979,7 @@ export class RecipeAdapter extends BasePortalAdapter {
 
   /** Every click in replay. Refused → throws ReplayGuardRefusal (named), nothing clicked. */
   private async guardedClick(target: unknown, why: string, opts?: { timeout?: number; force?: boolean }, flags: { passThrough?: boolean; finalSubmitApproved?: boolean; draftCreatingApproved?: boolean } = {}): Promise<void> {
+    if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (${why})`);
     const reason = await this.guardAction({ kind: "click", target, why, ...flags });
     if (reason) throw new ReplayGuardRefusal(reason);
     // THE APPROVED FINAL SUBMIT (and its confirm dialog) is the one click whose FILING request
@@ -6161,11 +6991,21 @@ export class RecipeAdapter extends BasePortalAdapter {
     // portal's "submit" endpoint too (the backstop's filing-URL rule would abort it otherwise), and
     // it is checked after the click by the page it produced, not by its URL.
     if (flags.finalSubmitApproved || flags.draftCreatingApproved) this.backstop?.allowApprovedFiling(20_000, { page: this.page });
-    await (target as { click: (o?: unknown) => Promise<void> }).click(opts);
+    // #333 — THE FENCE: the run's own click is never recorded as a person's input.
+    await withAutomationInput(this.inputPageOf(target), () => (target as { click: (o?: unknown) => Promise<void> }).click(opts));
+  }
+
+  /** The page a target acts on (a locator in a popup acts on the popup), else the run's page. */
+  private inputPageOf(target: unknown): unknown {
+    try {
+      const p = target && typeof (target as { page?: unknown }).page === "function" ? (target as { page: () => unknown }).page() : null;
+      return p && typeof p === "object" ? p : this.page;
+    } catch { return this.page; }
   }
 
   /** Every key press in replay. Enter/Space are clicks on the focused control. */
   private async guardedPress(target: unknown, key: string, why: string): Promise<void> {
+    if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (${why})`);
     const focused = /^(enter|numpadenter|space| )$/i.test(key) && this.page && typeof this.page.locator === "function"
       ? (target && typeof (target as { evaluate?: unknown }).evaluate === "function" ? target : this.page.locator(":focus"))
       : target;
@@ -6178,11 +7018,11 @@ export class RecipeAdapter extends BasePortalAdapter {
       const ctx = await this.pageSafetyContext();
       if (ctx.reviewPage === true || (ctx.readOnlyPage === true && !!ctx.filingControl)) {
         await withBackstopWindow(this.page, "enter-window", `${why} on a ${ctx.reviewPage ? "review" : "read-only terminal"} page`,
-          () => (target as { press: (k: string) => Promise<void> }).press(key));
+          () => withAutomationInput(this.inputPageOf(target), () => (target as { press: (k: string) => Promise<void> }).press(key)));
         return;
       }
     }
-    await (target as { press: (k: string) => Promise<void> }).press(key);
+    await withAutomationInput(this.inputPageOf(target), () => (target as { press: (k: string) => Promise<void> }).press(key));
   }
 
   /** The overlay dismisser, with every click it makes routed through guardAction. It was the one
@@ -7901,7 +8741,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         // Masked boxes validate KEYSTROKES (the learner's typeMasked).
         const typed = b.kind === "zip" ? want.replace(/\D/g, "").slice(0, 5) || want : want;
         await loc.fill("", { timeout: FILL_TIMEOUT_MS }).catch(() => null);
-        ok = await loc.pressSequentially(typed, { delay: 25 }).then(() => true).catch(() => false);
+        ok = await withAutomationInput(this.page, () => loc.pressSequentially(typed, { delay: 25 })).then(() => true).catch(() => false);
       } else {
         ok = await loc.fill(want, { timeout: FILL_TIMEOUT_MS }).then(() => true).catch(() => false);
       }

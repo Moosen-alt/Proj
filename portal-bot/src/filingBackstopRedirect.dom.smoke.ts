@@ -15,7 +15,8 @@
 //   chain       — 307 → /hop/a → 307 → /hop/b → 307 → /checkout/pay (every hop is judged)
 //   xhrPay      — a fetch POST answered 307 → /payment/charge
 //   put301      — a fetch PUT answered 301 (a PUT keeps its method) → /SubmitApplication
-//   loop        — 307 to itself: followed MAX_REDIRECT_HOPS times, then refused (named, stopping)
+//   loop        — 307 to itself: followed MAX_REDIRECT_HOPS times, then refused (named, stopping);
+//                 the refusal is stamped with when it was refused (`at`, #333 round 4)
 //   ownWriteFile— the run's own write on a review page: its autosave answered 307 → /SubmitApplication
 //   emptyFile   — a fetch POST with NO body (form media type) answered 307 → /SubmitApplication
 //   upload      — an <input type=file> multipart upload answered 307 → /SubmitApplication (#371)
@@ -263,6 +264,10 @@ try {
     const sent = o.hits.filter((h) => h.path === "/step/loop").length;
     check(`MUST-EXCLUDE loop: a 307 to itself is followed ${MAX_REDIRECT_HOPS} times, then refused (named, stopping, not read as a filing)`,
       sent === MAX_REDIRECT_HOPS + 1 && o.stopping.some((a) => /more than \d+ redirects in a row/.test(a.why) && !/filing endpoint/.test(a.why)), `sent=${sent} ${show(o)}`);
+    // #333 round 4: a refusal at the response stage is stamped with when it was refused, like every
+    // other abort (the capture reads "a stopping abort after the click").
+    const refused = o.stopping.find((a) => /more than \d+ redirects in a row/.test(a.why));
+    check("MUST-EXCLUDE loop: …and the refusal is stamped with when it was refused (`at`)", !!refused && typeof refused.at === "number" && refused.at > 0, show(o));
   }
   {
     // THE RUN'S OWN WRITE ON A REVIEW PAGE: its autosave passes 4(b) through the own-write window —

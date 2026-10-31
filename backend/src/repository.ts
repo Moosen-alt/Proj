@@ -9102,6 +9102,58 @@ export async function prepareSubmission(
     ? { street: portalProject.projectAddress, city: portalProject.city, zip: portalProject.zip, siblingAtSameStreet }
     : undefined;
 
+  // #333 — A PERSON CAN FILE FROM THE REVIEW WINDOW BEFORE THIS RUN IS RECORDED. The replay hands
+  // the review page over before its own read-only housekeeping, and the left-open window is watched
+  // from that moment, so the completion page can be read while this run's row still says 'running'
+  // and no awaiting_human_submit submission exists yet. captureConfirmation then would stamp an
+  // OLDER staging row and the outcome below would overwrite the run's 'submitted' (live 2026-10-14,
+  // Lincoln County: the filing went, the run read failed, the number was typed by hand). So a capture
+  // that arrives first waits here, and is recorded right after the outcome, through the same door.
+  type SubmitCapture = { recordNumber: string; confidence: string; source?: string; reason: string; recordLink: string; candidates?: Array<{ recordNumber: string; recordLink: string; source: string }>; draftCreated?: ObservedDraft };
+  let runOutcomeRecorded = false;
+  const capturesBeforeOutcome: SubmitCapture[] = [];
+  const recordSubmitCapture = (capture: SubmitCapture): void => {
+    try {
+      // THE CLICK ONLY MADE A DRAFT (#302: PSE's Part 1 Submit). Nothing was filed: no submission,
+      // no record number. The draft is written down for the next stage to continue, and the
+      // replayed recipe's final-submit flag comes off the step that made it (portalDraft.ts).
+      if (capture.draftCreated) {
+        const healed = recordPortalDraft(db, { projectId, track: track ?? "permit", draft: capture.draftCreated, runId, recipeId: recipe?.id ?? null, source: "replay" });
+        logger.info("submit-capture", "the submit created a draft, not a filing — recorded for the next stage", {
+          project: projectId, track, healed: healed.healed, why: healed.why,
+        });
+        return;
+      }
+      if (capture.confidence === "high" && capture.recordNumber) {
+        // runId is minted above, before staging, and its outcome is recorded before this runs
+        // (capturesBeforeOutcome). captureConfirmation is the SAME function the manual form calls,
+        // so the filing is recorded through one path whoever supplied the number.
+        // THE LINK GOES THROUGH THE SAME DOOR (#400): the run's and the track target's
+        // tracking_url, exactly the columns the automatic-submit path writes.
+        const fromList = capture.source === "account_list";
+        captureConfirmation(db, runId, {
+          applicationNumber: capture.recordNumber,
+          recordLink: capture.recordLink,
+          submittedBy: fromList ? "read from the portal's application list" : "read from the portal's completion page",
+          notes: capture.reason.slice(0, 300),
+        });
+        addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_read", {
+          track, runId, source: fromList ? "account_list" : "completion_page", reason: capture.reason.slice(0, 200),
+        });
+        logger.info("submit-capture", "record number read off the completion page — no typing needed", {
+          project: projectId, track,
+        });
+      } else {
+        // Not confident — say so where the operator will see it, and leave the form alone. What
+        // was seen goes on the next-step panel as candidates for a person to confirm (#400).
+        const held = recordSubmitCaptureCandidates(db, runId, capture.candidates ?? [], capture.reason);
+        addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_unread", {
+          track, reason: capture.reason.slice(0, 200), candidates: held,
+        });
+      }
+    } catch { /* capture is a convenience; it must never disturb the run */ }
+  };
+
   const stageOptions = {
     beforeUpload: uploadDocumentGuard(db, projectId, track !== "nem"),
     encryptedStorageStatePath: portalProfile?.encrypted_storage_state ?? undefined,
@@ -9137,47 +9189,10 @@ export async function prepareSubmission(
     // WRITTEN ONLY WHEN THE READ IS CONFIDENT. Every downstream check keys on this value,
     // so a low-confidence read is recorded as a NOTE for the operator to confirm rather
     // than written as fact — the manual capture form keeps working exactly as it does now.
-    onSubmitCaptured: (capture: { recordNumber: string; confidence: string; source?: string; reason: string; recordLink: string; candidates?: Array<{ recordNumber: string; recordLink: string; source: string }>; draftCreated?: ObservedDraft }) => {
-      try {
-        // THE CLICK ONLY MADE A DRAFT (#302: PSE's Part 1 Submit). Nothing was filed: no submission,
-        // no record number. The draft is written down for the next stage to continue, and the
-        // replayed recipe's final-submit flag comes off the step that made it (portalDraft.ts).
-        if (capture.draftCreated) {
-          const healed = recordPortalDraft(db, { projectId, track: track ?? "permit", draft: capture.draftCreated, runId, recipeId: recipe?.id ?? null, source: "replay" });
-          logger.info("submit-capture", "the submit created a draft, not a filing — recorded for the next stage", {
-            project: projectId, track, healed: healed.healed, why: healed.why,
-          });
-          return;
-        }
-        if (capture.confidence === "high" && capture.recordNumber) {
-          // runId is minted above, before staging, and the row exists by the time a human
-          // gets round to clicking submit — this fires from the left-open window, minutes
-          // later. captureConfirmation is the SAME function the manual form calls, so the
-          // filing is recorded through one path whoever supplied the number.
-          // THE LINK GOES THROUGH THE SAME DOOR (#400): the run's and the track target's
-          // tracking_url, exactly the columns the automatic-submit path writes.
-          const fromList = capture.source === "account_list";
-          captureConfirmation(db, runId, {
-            applicationNumber: capture.recordNumber,
-            recordLink: capture.recordLink,
-            submittedBy: fromList ? "read from the portal's application list" : "read from the portal's completion page",
-            notes: capture.reason.slice(0, 300),
-          });
-          addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_read", {
-            track, runId, source: fromList ? "account_list" : "completion_page", reason: capture.reason.slice(0, 200),
-          });
-          logger.info("submit-capture", "record number read off the completion page — no typing needed", {
-            project: projectId, track,
-          });
-        } else {
-          // Not confident — say so where the operator will see it, and leave the form alone. What
-          // was seen goes on the next-step panel as candidates for a person to confirm (#400).
-          const held = recordSubmitCaptureCandidates(db, runId, capture.candidates ?? [], capture.reason);
-          addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_unread", {
-            track, reason: capture.reason.slice(0, 200), candidates: held,
-          });
-        }
-      } catch { /* capture is a convenience; it must never disturb the run */ }
+    onSubmitCaptured: (capture: SubmitCapture) => {
+      // Before this run's outcome is recorded: held, and recorded right after it (see above).
+      if (!runOutcomeRecorded) { capturesBeforeOutcome.push(capture); return; }
+      recordSubmitCapture(capture);
     },
     gapFillPlanner,
     gapFillFields,
@@ -10061,7 +10076,33 @@ export async function prepareSubmission(
         });
     });
 
+    // #333: a filing the person made from the review window while this run was finishing — recorded
+    // now, on top of the outcome (an awaiting_human_submit row, or the run's own failed row), never
+    // under it. Whatever the run reported, a filing that went is recorded as submitted.
+    runOutcomeRecorded = true;
+    for (const capture of capturesBeforeOutcome.splice(0)) recordSubmitCapture(capture);
   } catch (err) {
+    // A capture that arrived before the outcome cannot be recorded against a run that was not:
+    // say so where the operator looks, so the number is entered by hand (the manual form).
+    runOutcomeRecorded = true;
+    for (const capture of capturesBeforeOutcome.splice(0)) {
+      // A held DRAFT is not a filing and needs no recorded outcome: it is written down (audit +
+      // result_json; the status write below leaves result_json alone), and a failed-outcome run with
+      // a recorded draft is the next stage's to continue. WITHOUT a recipe (round 5, Helm item 3):
+      // healDraftCreatingFinalSubmit is click authority under the #330 carve-out, and it never runs
+      // off a run whose outcome could not be recorded. The happy path keeps the heal.
+      if (capture.draftCreated) {
+        try {
+          recordPortalDraft(db, { projectId, track: track ?? "permit", draft: capture.draftCreated, runId, recipeId: null, source: "replay" });
+        } catch { /* the original error is the one to surface */ }
+        continue;
+      }
+      try {
+        addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_unread", {
+          track, runId, reason: `the run's outcome could not be recorded, so the completion page's read was not either: ${capture.reason.slice(0, 160)}`,
+        });
+      } catch { /* the original error is the one to surface */ }
+    }
     // Recording the outcome failed. The row must not stay 'running': this process is alive, so
     // the next stage of the track would read it as a run in flight and refuse forever.
     try {

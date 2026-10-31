@@ -10,7 +10,9 @@
 // a form posted into an iframe, XHR, fetch, a beacon) — and aborts:
 //
 //   1. PAYMENT RULE: a request whose URL reads as a fee payment (isPayRequestUrl). Always, in any
-//      frame, of any type, even under a named approval: automation never pays.
+//      frame, of any type, even under a named approval: automation never pays. It is only as wide
+//      as isPayRequestUrl (PAY_FEE_URL): payment stays blocked only for URLs rule 1 knows; a processor
+//      it does not name passes inside a person's HUMAN_INPUT_MS window like any other request.
 //   2. FILING-URL RULE: a request whose URL — for a form POST, the form's action — reads as a
 //      filing (isFilingOrPaymentRequest, the same predicate the demo recorder's abort asks). A
 //      named approval admits ONE state-changing request in a short window after THE approved
@@ -33,7 +35,57 @@
 //      the page's reading at its last load, since a navigating page cannot be asked), so a page
 //      script that posts a second after the review page loads is caught however fast the run
 //      is. Lifted only by the approved
-//      final submit's window (non-payment URLs) and by dispose() — the hand-off to a person.
+//      final submit's window (non-payment URLs), by dispose(), and — for a PERSON'S OWN click only —
+//      by the hand-over (#333, owner ruling 2026-10-14 "we'll have to allow that in the future").
+//      HAND-OVER (handOverToHuman): a guided-manual replay stopped at review hands the page to a
+//      person BEFORE it drains its own pending save and before its read-only housekeeping (the
+//      review read-back, screenshots), not after them.
+//      From that moment a state-changing request whose page saw a TRUSTED pointer / Enter / Space
+//      input within HUMAN_INPUT_MS passes rules 2 and 4 (the filing-URL rule and this lockdown):
+//      the person's own submit. How a person's request is told apart from automation's — a
+//      Playwright click or key press is a TRUSTED event in the page too:
+//        (1) ORDERING — THE GUARANTEE: the input watch (watchHumanInput) is armed only after the
+//            run's LAST input on the page, the replay refuses any input of its own from that moment
+//            (recipeAdapter inputsClosed), and everything after it is reads (a source scan pins it);
+//        (2) THE FENCE — A SECOND LINE for the replay's own input doors: its guarded clicks, presses,
+//            typing and checkbox writes run inside withAutomationInput, and input the watch sees
+//            while one is in flight is never recorded as a person's — only while in flight, no grace
+//            after it (Helm's measurement: 150 of 150 fenced reports arrived in flight, even at 20x
+//            CPU throttle; a 1.5 s grace ate a person's click 432 ms after the run's last tick and
+//            failed the run, #333 again; A13 pins it, A2 the in-flight half). Helper modules'
+//            input (combobox fill, gap fill, login, signature) is not fenced: the ordering covers it (all of it is awaited before the run's input closes).
+//      THE TRADE-OFF, STATED (#333 skeptic round 1): for HUMAN_INPUT_MS after a person's input, ANY
+//      state-changing request from that page passes rules 2 and 4 — the page's own scripts included.
+//      It cannot be narrowed to "the click's own request" or "a click on a control" without holding
+//      back a person's submit whose click first fires an analytics fetch, or whose control is a
+//      styled div (DevHub's tiles). It lasts only until dispose() — seconds — after which main lets
+//      everything through anyway. Automation's own input never opens it (the ordering).
+//      Only input that arrives AFTER the hand-over counts (an input just before it is not carried
+//      over), and only for the page that saw it — and only for the DOCUMENT that saw it (Helm
+//      Should-fix 2): each main-frame navigation request is stamped, and a request is judged against
+//      the stamp BEFORE it, so the person's own form POST (itself a navigation) still counts their
+//      click while the next document's posts do not. The cost: an interstitial that auto-posts the
+//      filing after the person's click is held, as on main. A page script posting with no PERSON'S
+//      input meets the lockdown exactly as before, and it cannot forge that input (Helm Should-fix 1):
+//      the watch runs in a CDP ISOLATED WORLD — its binding is exposed only to that world, its
+//      listener is registered through that world's own addEventListener, and "armed" is read back
+//      from that world — so no page script can find the binding by its name, read it off Playwright's
+//      binding controller, call it from a cross-origin iframe, or drive the watch's listener through
+//      an addEventListener it wrapped before the arm (smoke A18-A21). RESIDUAL, stated: Chromium only
+//      (no DevTools session = not armed: the hand-over fails closed); a popup, or a cross-site iframe
+//      that appears or goes out of process after the arm, sees no input until its own session is
+//      attached (its requests are held meanwhile); an in-process child frame whose world takes longer
+//      than the 1.5 s read budget is unarmed at the hand-over (the root's world is made first and the
+//      children concurrently, A25/A25c) and its input is held until its world is made — fail closed;
+//      a half-failed arm cannot retry; out-of-process iframes are exercised headless under
+//      --site-per-process (A19o, A22o, A22b — a headed window, production's, puts a cross-site iframe
+//      out of process too: a headed probe, not a pin); and the click detector (humanCapture's
+//      __alPatchStep) stays in the main world, so a page can still forge a "submit seen" — which is
+//      why a sighting stays provisional until a request of the person's is seen. Payment (rule 1) and
+//      an open dismisser / Enter window (rule 3, the run's own action in flight) are never lifted —
+//      but payment stays blocked only for URLs rule 1 knows (PAY_FEE_URL; Helm Should-fix 13 added
+//      Authorize.net, Point & Pay, fees/settle, GovPayNet). An abort that follows such an input is
+//      flagged humanInput, so the run can say "your click was held back — click again".
 //      (b) exempts the RUN'S OWN recorded write on that page while it is in flight
 //      (withOwnWriteWindow: a fill / select / check whose per-field autosave posts — PowerClerk's
 //      Terms checkbox at review); (a), the filing-URL rule and payment never exempt anything.
@@ -75,6 +127,7 @@
 // joinRedirectGuard).
 //
 // Known cost: Playwright disables the browser's HTTP cache while any route is installed.
+import { randomBytes } from "node:crypto";
 import { isFilingOrPaymentRequest, isPayRequestUrl, paymentDialogVerdict, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE } from "../../shared/src/portalSafety";
 import {
   digestInfoPageIdentity, infoPageAfterClickAckWording, infoPageAfterClickRefusals, infoPageDriftedEntries, infoPageNumberTokens, infoPageMatchRefusals, infoPageObservedRequest, infoPagePassEntry, infoPagePassRefusals,
@@ -132,14 +185,54 @@ export interface BackstopAbort {
   /** What was in flight (the window's reason), or the filing-URL rule's reason. */
   why: string;
   resourceType: string;
+  /** #333: the requesting page saw a person's own input (watchHumanInput) within HUMAN_INPUT_MS —
+   *  the held request was most likely their click, not the page acting by itself. */
+  humanInput?: boolean;
+  /** #333: …and that input came BEFORE the hand-over (or there was none): "your click was held back,
+   *  click again" is true of it — of a click the ARMED watch saw. A click before the watch listened
+   *  leaves an abort with no humanInput at all, and the run refuses the hand-over and fails by name
+   *  (Helm Should-fix 3). A flagged abort after the hand-over is the person's own payment. */
+  beforeHandOver?: boolean;
   /** #358: a REDIRECT the backstop refused to follow. `where` is the Location; the request to `from`
    *  (origin + path) REACHED the portal, which answered `status`; `hop` counts the redirects. */
   redirect?: { from: string; status: number; hop: number };
+  /** #333 round 4: when it was held (Date.now()) — "a stopping abort AFTER the person's click" is read
+   *  against it. Set on every abort the backstop records; optional so a record built elsewhere (a
+   *  test's literal) still types. */
+  at?: number;
+}
+
+/** #333 — a request a person's own input let through after the hand-over (FilingBackstop.humanRequests).
+ *  The stamps (round 4) are optional so a record built elsewhere still types; the backstop sets every
+ *  one. */
+export interface BackstopHumanRequest {
+  /** origin + pathname only. */
+  where: string;
+  /** A main-frame document request (a form submission or a navigation) of the requesting page. */
+  document: boolean;
+  /** How many aborts had been recorded before it (aborts after it are the page the click led to). */
+  abortsBefore: number;
+  /** When it went (Date.now(), as the backstop let it through). */
+  at?: number;
+  /** Its HTTP method (upper case; "?" when unreadable). A GET navigation is never evidence of a filing. */
+  method?: string;
+  /** Chromium's resource type ("document", "fetch", "xhr", "ping" for a beacon…). */
+  resourceType?: string;
+  /** The page that sent it (a Playwright Page; null when unreadable) — compared by identity only,
+   *  never serialised (it is circular). */
+  page?: unknown;
 }
 
 /** A redirect hop being judged (#358): which hop, what answered it, and the own-write / drain
- *  exemption its first leg had (a hop is judged after that window may have closed). */
-interface RedirectHop { hop: number; from: string; status: number; ownWrite: boolean; drain: boolean }
+ *  exemption and the person's verdict its first leg had (a hop is judged after that window may have
+ *  closed). */
+interface RedirectHop {
+  hop: number; from: string; status: number; ownWrite: boolean; drain: boolean;
+  /** #333 × #370: the FIRST leg's person verdict, carried — never recomputed at the hop. A person's
+   *  submit answered 307 five seconds later is still theirs; the portal's own save that hops to a
+   *  filing URL just after a touch is still not. Payment (rule 1) is checked before it is read. */
+  human: boolean;
+}
 
 export interface FilingBackstop {
   readonly aborts: BackstopAbort[];
@@ -199,6 +292,39 @@ export interface FilingBackstop {
   /** The run is at review: abort every state-changing request until dispose() hands the page to
    *  a person. Sticky. */
   lockReview(why: string): void;
+  /** #333 — WATCH FOR A PERSON'S OWN INPUT: from now on a trusted pointerdown / mousedown /
+   *  touchstart, or an Enter / Space keydown, in any frame of any page of the run's context is
+   *  recorded against its page — by a watch in a CDP isolated world that the page's own scripts
+   *  cannot reach or drive (Helm Should-fix 1; Chromium only). A page or frame that appears later is
+   *  watched once its session is attached. Call it only once the run has made its LAST input on the
+   *  page (the run's own clicks are trusted input too). false = no DevTools session (a double, a
+   *  browser that gives none), or the run's page's world did not read back as listening: the
+   *  hand-over then lets nothing through (fail closed). */
+  watchHumanInput(): Promise<boolean>;
+  /** #333 — THE HAND-OVER: the run is done acting on the page and gives it to a person. From here a
+   *  request that follows that person's own input (watchHumanInput) passes the filing-URL rule and
+   *  the review lockdown; nothing else changes. Payment (rule 1) is never lifted, and it stays blocked
+   *  only for URLs rule 1 knows (PAY_FEE_URL): a processor it does not name passes in that window.
+   *  false = disposed, or the input watch is not armed. */
+  handOverToHuman(why: string): boolean;
+  /** Has the run handed the page over (and not been disposed)? */
+  handedOver(): boolean;
+  /** #333 round 2 — did a person's own input reach `pg` (default: the run's page) at any time after
+   *  the hand-over? Not time-limited (unlike the exemption): it tells "the person acted here" for
+   *  the run's report, never lets anything through. `withinMs` (#333 round 4) asks instead whether
+   *  that input was in the last `withinMs` ms: the replay stamps a submit sighting with it (a page
+   *  script's el.click() on the submit comes with no input of the person's). */
+  personActedSinceHandOver(pg?: unknown, withinMs?: number): boolean;
+  /** #333 — THE FENCE: run `fn` (an input the run itself makes on `pg`: a click, a key press,
+   *  typing) so the input watch never records it as a person's — while it is in flight, and only
+   *  then: no grace after it (the trusted event and its binding report arrive before the Playwright
+   *  call returns). Nested calls are counted. */
+  withAutomationInput<T>(pg: unknown, fn: () => Promise<T>): Promise<T>;
+  /** Each request a person's own input let through after the hand-over: where it went (origin +
+   *  path), whether it was a main-frame document request (a form submission), how many aborts had
+   *  been recorded before it (aborts after it are the page the person's click led to), and (round 4)
+   *  when it went, its method, its resource type and the page that sent it. */
+  readonly humanRequests: BackstopHumanRequest[];
   /** Aborts that stop the run: filing, payment, review lockdown. */
   stoppingAborts(): BackstopAbort[];
   /** #358: a 307 / 308 of a request this run let through is judged before Chromium follows it (the
@@ -245,6 +371,9 @@ export interface FilingBackstop {
   readonly infoPageAdmissions: Array<{ entryId: string; where: string; exempted: boolean }>;
   /** Each request that took the info-page slot and did NOT match (origin + path, why). */
   readonly infoPageRefusedRequests: Array<{ where: string; refusals: string[] }>;
+  /** Let go: from its first line on, the handler lets every request that arrives through unjudged
+   *  (none reaching it between `disposed` and the route coming off is aborted), then the route is
+   *  removed. */
   dispose(): Promise<void>;
 }
 
@@ -272,6 +401,52 @@ export const isStoppingAbort = (a: BackstopAbort): boolean => a.rule === "filing
   || (a.rule === "review-lockdown" && (/^document$/i.test(String(a.resourceType || "")) || isFilingOrPaymentRequest(a.method, a.where)));
 
 const REGISTRY = new WeakMap<object, FilingBackstop>();
+
+/** #333: how long after a person's own input a state-changing request is theirs. A click's form
+ *  POST follows its pointerdown by well under a second; a confirm() answered first takes longer. */
+const HUMAN_INPUT_MS = 4_000;
+/** The binding the input watch reports through. It exists ONLY in the CDP isolated world
+ *  HUMAN_INPUT_WORLD (Runtime.addBinding with executionContextName — Helm Should-fix 1), never on any
+ *  frame's main-world global: a page script cannot find it by its prefix, read its name off
+ *  Playwright's binding controller (the watch exposes nothing through Playwright), or call it from a
+ *  cross-origin iframe; and a main world that wrapped addEventListener / patched
+ *  getOwnPropertyDescriptor before the arm never sees the world's listener (the world registers
+ *  through its own). No keys, no retry: there is nothing page-side to harvest. Still named per
+ *  process (hardening only now: no page can reach it whatever its name). A SECOND BACKSTOP ON THE
+ *  SAME PAGE (a later run in the same window) also hears an earlier run's world, whose listener
+ *  outlives that run's detached session: the binding call reaches every session with that name
+ *  active. It is still a trusted input on that page, so it is stamped, not filtered by context id. */
+const HUMAN_INPUT_BINDING = `__solarBackstopHumanInput_${randomBytes(6).toString("hex")}`;
+/** The isolated world the watch runs in (its name is the DevTools' own; no page can enter it). */
+const HUMAN_INPUT_WORLD = "__solarBackstopHumanInput";
+/** The watch, run in that world. A string, not a function: tsx's __name wrapper does not exist in
+ *  the page. The binding takes exactly ONE string (a raw CDP binding throws on none, and this catch
+ *  would swallow every click while the read-back still said armed). THE MARKER IS THE BOOLEAN true,
+ *  TESTED AS SUCH (`=== true`, here and in the read-back; #333 step 19.1). A world shares no expando
+ *  with the main world, so no page script can set it; but a Window's NAMED properties (an element
+ *  with that id or name, a child frame with that name) are seen from every world, and a named
+ *  property is an element or a window, never the boolean true. Tested by truthiness, a review page
+ *  carrying `<div id="__solarBackstopHumanInputArmed">` made this script return before it added a
+ *  listener while the read-back said armed: the person's own click was held (smoke A24). The
+ *  assignment below makes an own property of this world's window, which shadows the named one. */
+const HUMAN_INPUT_SCRIPT = `(() => { const w = window; if (w.__solarBackstopHumanInputArmed === true) return; w.__solarBackstopHumanInputArmed = true;
+  const note = (e) => { if (!e || !e.isTrusted) return; if (e.type === "keydown" && e.key !== "Enter" && e.key !== " ") return;
+    try { if (typeof w.${HUMAN_INPUT_BINDING} === "function") w.${HUMAN_INPUT_BINDING}(e.type); } catch (_) { /* the watch never breaks the page */ } };
+  for (const t of ["pointerdown", "mousedown", "touchstart", "keydown"]) w.addEventListener(t, note, true); })();`;
+
+/** `p`, or null once `ms` pass first (the timer is cleared either way). */
+async function settleWithin<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  try {
+    return await Promise.race([p, new Promise<null>((r) => { timer = setTimeout(() => r(null), ms); })]);
+  } finally { if (timer) clearTimeout(timer); }
+}
+
+/** #333 — run one of the run's own inputs on `page` inside its backstop's fence (no backstop: as is). */
+export async function withAutomationInput<T>(page: unknown, fn: () => Promise<T>): Promise<T> {
+  const bs = backstopFor(page);
+  return bs ? bs.withAutomationInput(page, fn) : fn();
+}
 
 /** The backstop installed on this page's run, or null (a page no run owns: human capture). */
 export function backstopFor(page: unknown): FilingBackstop | null {
@@ -563,7 +738,8 @@ function pageOfRequest(request: any): any {
 // Chromium follows it (Fetch.continueResponse) or the leg fails, named and stopping. Chromium keeps
 // doing the follow, so cookies, HSTS, CSP, redirect modes, the body and the committed URL stay its
 // own. A hop never takes the approved or the information-page slot, and keeps only the own-write or
-// drain exemption its first leg had.
+// drain exemption its first leg had, and the person's verdict its first leg had (#333) — both for
+// letting it through and for flagging its refusal; payment (rule 1) is still checked before either.
 /** Method-keeping hops followed after the first request; one more is refused (stopping, named). */
 export const MAX_REDIRECT_HOPS = 3;
 /** Does a redirect with this status re-send `method` (and its body) to the Location? The Fetch
@@ -843,6 +1019,157 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   const drainRequests: string[] = [];
   let locked = "";
   let disposed = false;
+  // #333 — THE HAND-OVER. When each page last saw a person's own input (watchHumanInput), and when
+  // the run handed the page over (0 = not yet).
+  const humanInputAt = new WeakMap<object, number>();
+  let humanWatchArmed = false;
+  let handedOverAt = 0;
+  const humanRequests: BackstopHumanRequest[] = [];
+  // AN INPUT COVERS ONLY THE DOCUMENT THAT SAW IT (Helm Should-fix 2): when each page's main frame
+  // last asked for a new document (request time, stamped at the handler's top; never on a hop).
+  // `navBefore` is the stamp BEFORE the request being judged — strict `t > navBefore`, so an input
+  // and a navigation in the same millisecond read as not covered (held, the safe side).
+  const mainFrameNavAt = new WeakMap<object, number>();
+  const recentHumanInput = (pg: unknown, navBefore = 0): boolean => {
+    if (!pg || typeof pg !== "object") return false;
+    const t = humanInputAt.get(pg as object) ?? 0;
+    return t > 0 && t > navBefore && Date.now() - t <= HUMAN_INPUT_MS;
+  };
+  // A PERSON'S INPUT THAT COUNTS for the hand-over: on this page and this document, AFTER the
+  // hand-over (an input just before it is never carried over), and recent.
+  const humanInputSinceHandOver = (pg: unknown, navBefore = 0): boolean => {
+    if (!pg || typeof pg !== "object" || !handedOverAt) return false;
+    const t = humanInputAt.get(pg as object) ?? 0;
+    return t > handedOverAt && t > navBefore && Date.now() - t <= HUMAN_INPUT_MS;
+  };
+  // THE FENCE (#333): per page, how many of the run's own inputs are in flight. Fenced only while one
+  // is in flight — no grace after it (Helm Should-fix 6: a grace ate a person's click 432 ms after
+  // the run's last tick, and every fenced report measured arrived in flight).
+  const automationDepth = new WeakMap<object, number>();
+  const automationFenced = (pg: object): boolean => (automationDepth.get(pg) ?? 0) > 0;
+  // #333 Helm Should-fix 1 — THE INPUT WATCH LIVES IN A CDP ISOLATED WORLD. Its own DevTools session
+  // per page of the context, and per OUT-OF-PROCESS frame (a cross-site iframe in a headed window),
+  // carries the binding (exposed only to HUMAN_INPUT_WORLD), the watch for every new document, and
+  // the watch in an isolated world of each frame already loaded. Never the redirect guard's sessions
+  // (#404): no domain is enabled or disabled on those here, and none of them is detached here.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  type HumanWorld = { session: any; rootWorld: number; frames: Promise<void> };
+  /** Per page / out-of-process frame: its session, the context id of its ROOT frame's world, and its
+   *  in-process child frames' worlds (settled when every one is made or has failed). */
+  const humanWorlds = new Map<object, Promise<HumanWorld | null>>();
+  /** Every session the watch opened (dispose detaches them, after the route comes off). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const humanSessions = new Set<any>();
+  /** Per page: its out-of-process frames' arms, as first asked (watchHumanInput waits on them, bounded). */
+  const humanFramesArmed = new WeakMap<object, Promise<void>>();
+  /** Per frame: the re-ask in flight (one at a time, so a burst of navigations opens one session). */
+  const humanFrameAsks = new WeakMap<object, Promise<void>>();
+  /** An arm was asked for: from now on a page that opens (a popup) is armed too. */
+  let humanArming = false;
+  /** A person's own input reached `pg` — never one the run itself is making (the fence). */
+  const noteHumanInput = (pg: unknown): void => {
+    if (!disposed && pg && typeof pg === "object" && !automationFenced(pg as object)) humanInputAt.set(pg as object, Date.now());
+  };
+  /** Open the watch's world on `target` — a page, or an out-of-process frame of the page `owner` —
+   *  and report its input against `owner`. null = not armed: no session (newCDPSession throws for a
+   *  frame that shares its page's process, or a closed target), or the ROOT frame's world could not
+   *  be made. Returned as soon as the ROOT frame's world is made; the target's in-process child frames
+   *  are armed concurrently after it (`frames`). A child frame's world failing never fails the target
+   *  (a navigating frame; a third-party tracker's, as Oregon ePermitting's walkme frame at review). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const openHumanWorld = async (target: any, owner: unknown): Promise<HumanWorld | null> => {
+    const session = await ctx.newCDPSession(target);
+    if (disposed) { await session.detach().catch(() => null); return null; }
+    humanSessions.add(session);
+    try {
+      session.on("Runtime.bindingCalled", (e: { name?: string }) => { if (e && e.name === HUMAN_INPUT_BINDING) noteHumanInput(owner); });
+      // Playwright's own order for a binding with a script: Runtime first (a context created after
+      // addBinding gets the binding only while Runtime is enabled on the session), and Page enabled
+      // before the script for new documents (no new document runs it otherwise).
+      await session.send("Runtime.enable");
+      await session.send("Runtime.addBinding", { name: HUMAN_INPUT_BINDING, executionContextName: HUMAN_INPUT_WORLD });
+      await session.send("Page.enable");
+      await session.send("Page.addScriptToEvaluateOnNewDocument", { source: HUMAN_INPUT_SCRIPT, worldName: HUMAN_INPUT_WORLD });
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const tree: any = (await session.send("Page.getFrameTree"))?.frameTree;
+      const inWorld = async (frameId: string): Promise<number> => {
+        const made = await session.send("Page.createIsolatedWorld", { frameId, worldName: HUMAN_INPUT_WORLD });
+        const contextId = Number(made?.executionContextId);
+        await session.send("Runtime.evaluate", { expression: HUMAN_INPUT_SCRIPT, contextId });
+        return contextId;
+      };
+      const rootWorld = await inWorld(String(tree?.frame?.id ?? ""));
+      if (disposed) throw new Error("disposed while arming");
+      // The target's other frames in its own process (a frame out of process is not in this tree):
+      // AFTER the root's world is made, and all at once (#333 step 19.2) — one after another, a page
+      // with many iframes spent the read budget before its root's world was returned, and the
+      // hand-over refused the person's own submit. Each in its own catch, so a child never fails the
+      // target; the caller waits for `frames` within the budget, never for "armed".
+      const children: string[] = [];
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const walk = (n: any): void => { for (const c of Array.isArray(n?.childFrames) ? n.childFrames : []) { children.push(String(c?.frame?.id ?? "")); walk(c); } };
+      walk(tree);
+      const frames = Promise.allSettled(children.map((id) => inWorld(id).catch(() => null))).then(() => undefined);
+      return { session, rootWorld, frames };
+    } catch {
+      humanSessions.delete(session);
+      await session.detach().catch(() => null);
+      return null;
+    }
+  };
+  /** A non-main frame of `pg`: give it a session of its own if it is out of process. Asked when the
+   *  page is armed and again each time the frame commits a navigation: a frame that went out of
+   *  process gets its session; one whose session still answers keeps it (its script for new
+   *  documents covers the frame's next document — a cross-site hop within out-of-process frames
+   *  keeps its target); one whose session died (it came back into its page's process) is covered by
+   *  the page's session again. newCDPSession's "does not have a separate CDP session" throw is the
+   *  branch selector, as for the redirect guard's covers (#404). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const armFrameWorld = (f: any, pg: unknown): Promise<void> => {
+    const ask = async (): Promise<void> => {
+      if (disposed) return;
+      const held = humanWorlds.get(f);
+      if (held) {
+        const w = await held;
+        if (w && await w.session.send("Page.getFrameTree").then(() => true, () => false)) return;
+        if (humanWorlds.get(f) === held) humanWorlds.delete(f);
+        if (w) { humanSessions.delete(w.session); await w.session.detach().catch(() => null); }
+      }
+      if (disposed) return;
+      const p = openHumanWorld(f, pg).catch(() => null);
+      humanWorlds.set(f, p);
+      const w = await p;
+      if (!w) { if (humanWorlds.get(f) === p) humanWorlds.delete(f); return; }
+      // The frame's own in-process children, armed concurrently after its root (openHumanWorld).
+      await w.frames;
+    };
+    const next = (humanFrameAsks.get(f) ?? Promise.resolve()).then(ask, ask).catch(() => undefined);
+    humanFrameAsks.set(f, next);
+    return next;
+  };
+  /** Arm `pg` (a page of the run's context), once: its own session and root frame's world first (all
+   *  that "armed" waits on), then — concurrently — its in-process child frames' worlds and each
+   *  out-of-process frame of it, and from then on each frame navigation re-asks. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const armPageWorld = (pg: any): Promise<HumanWorld | null> => {
+    const held = humanWorlds.get(pg);
+    if (held) return held;
+    const p = openHumanWorld(pg, pg).catch(() => null);
+    humanWorlds.set(pg, p);
+    humanFramesArmed.set(pg, p.then(async (w) => {
+      if (!w) { if (humanWorlds.get(pg) === p) humanWorlds.delete(pg); return; }
+      if (disposed) return;
+      if (typeof pg.on === "function" && typeof pg.off === "function") {
+        const onFrame = (f: unknown): void => { try { if (f !== pg.mainFrame()) void armFrameWorld(f, pg); } catch { /* page gone */ } };
+        pg.on("framenavigated", onFrame);
+        unwatch.push(() => { try { pg.off("framenavigated", onFrame); } catch { /* page gone */ } });
+      }
+      let frames: unknown[] = [];
+      try { frames = pg.frames().filter((f: unknown) => f !== pg.mainFrame()); } catch { frames = []; }
+      await Promise.all([w.frames, ...frames.map((f) => armFrameWorld(f, pg))]);
+    }).catch(() => undefined));
+    return p;
+  };
   // #344 — THE INFORMATION-PAGE PASS. Run-wide facts its predicate asks (the run wrote through an
   // own-write window; an approved final-submit slot was ever opened), its ONE slot, its candidate
   // watch, and what each admitted. Every closer below also closes these.
@@ -933,6 +1260,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     pg.on("load", onLoad);
     unwatch.push(() => { try { pg.off("domcontentloaded", onDocument); pg.off("domcontentloaded", onLoad); pg.off("load", onLoad); } catch { /* page gone */ } });
     refresh(pg);
+    // #333: a page that opens once the input watch was asked for (a popup) is watched too — none of
+    // its input counts until its session is attached (the residual, stated in the header).
+    if (humanArming && !disposed) void armPageWorld(pg);
   };
   try {
     if (ctx && typeof ctx.pages === "function" && typeof ctx.on === "function") {
@@ -947,27 +1277,55 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // THE RUN'S OWN REQUESTS THAT WENT (#358): each state-changing request the handler let through,
   // keyed by method + URL, until its response pauses at the response stage (judgePaused) — with the
   // own-write / drain exemption it had when it was judged.
-  const sentLegs: Array<{ key: string; request: any; hop: number; from: string; ownWrite: boolean; drain: boolean; at: number }> = [];
+  const sentLegs: Array<{ key: string; request: any; hop: number; from: string; ownWrite: boolean; drain: boolean; human: boolean; at: number }> = [];
   const legKey = (method: string, url: string): string => `${String(method || "").toUpperCase()} ${String(url || "").split("#")[0]}`;
   const drainOn = (pg: unknown): boolean => !!pg && [...drains.values()].some((d) => d.page === pg);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const letThrough = async (route: any, request: any, via: RedirectHop | null): Promise<void> => {
+  // `human`: the handler's verdict on THIS pass (#333) — recorded with the first leg so a hop inherits it.
+  // Only the handler's final pass passes it; a leg let through by an exemption (own write, drain,
+  // information page) went by that exemption, never by the person's verdict.
+  const letThrough = async (route: any, request: any, via: RedirectHop | null, human = false): Promise<void> => {
     if (!via) {
       try {
         const pg = pageOfRequest(request);
         const now = Date.now();
         for (let i = sentLegs.length - 1; i >= 0; i--) if (now - sentLegs[i].at > 600_000) sentLegs.splice(i, 1);
-        sentLegs.push({ key: legKey(request.method(), request.url()), request, hop: 0, from: "", ownWrite: ownWriteOn(pg), drain: drainOn(pg), at: now });
+        sentLegs.push({ key: legKey(request.method(), request.url()), request, hop: 0, from: "", ownWrite: ownWriteOn(pg), drain: drainOn(pg), human, at: now });
       } catch { /* unreadable: its redirect cannot be judged as this run's (it continues, as on main) */ }
     }
     await route.fallback().catch(() => null);
   };
   // `via`: a redirect's Location, judged as a fresh request (#358, judgePaused). A hop never takes the
-  // approved or the information-page slot, and its own-write / drain exemption is its first leg's.
+  // approved or the information-page slot, and its own-write / drain exemption and the person's
+  // verdict (#333) are its first leg's.
   const handler = async (route: any, request: any, via: RedirectHop | null = null): Promise<void> => {
+    // A DISPOSED BACKSTOP JUDGES NOTHING (#333, Helm Blocking 1): dispose sets `disposed` first and
+    // takes the route off last, and in that gap the person's verdict already reads false: their
+    // filing to a filing URL was aborted by the run that had just let go of the page. Now a request
+    // arriving between `disposed` and the route coming off is let through UNJUDGED — a payment URL
+    // included — exactly as every request is once the route is off: the moment main lets everything
+    // through starts a few ms sooner (dispose's first line, not its last). The other shape Helm named
+    // (keep judging until unroute, lifting nothing) would keep rule 1 on in that gap. A hop in the gap
+    // is followed (judgePaused returns null).
+    if (disposed) { await route.fallback().catch(() => null); return; }
     let method = "";
     let url = "";
     try { method = String(request.method() || "").toUpperCase(); url = String(request.url() || ""); } catch { /* unreadable: fall through as not-GET */ }
+    // THE DOCUMENT BOUNDARY (Helm Should-fix 2): read the stamp BEFORE this request, THEN stamp if it
+    // is the page's main-frame navigation — in that order, or the person's own form POST (itself a
+    // navigation) would be judged against its own stamp and refused. Synchronous, ahead of any await,
+    // so concurrent requests read the stamps in arrival order. A hop is never stamped (asRedirectedTo
+    // keeps isNavigationRequest()); its verdict and abort flag are its first leg's (`via`).
+    let navBefore = 0;
+    if (!via) {
+      try {
+        const pg = pageOfRequest(request);
+        if (pg && typeof pg === "object") {
+          navBefore = mainFrameNavAt.get(pg) ?? 0;
+          if (request.isNavigationRequest() && request.frame() === pg.mainFrame()) mainFrameNavAt.set(pg, Date.now());
+        }
+      } catch { /* unreadable: judged against the stamp read so far */ }
+    }
     if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
       // The clicked page's main frame navigating by GET ends the approved click's slot: its own
       // request was that navigation (nothing state-changing to admit), and the next document's
@@ -1007,10 +1365,31 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     }
     let resourceType = "";
     try { resourceType = String(request.resourceType() || ""); } catch { /* keep "" */ }
+    const requestPage = pageOfRequest(request);
     const abort = async (rule: BackstopRule, why: string): Promise<void> => {
-      aborts.push({ rule, method: method || "?", where: whereOf(url), why, resourceType, ...(via ? { redirect: { from: via.from, status: via.status, hop: via.hop } } : {}) });
+      // A refused hop's flag is its first leg's verdict too, never the input clock read when the 307
+      // arrives: the person's own submit answered 307 → a payment URL after HUMAN_INPUT_MS is still
+      // theirs (held, not the recipe's failure), and the run's own save refused at its hop just after
+      // a touch is still the run's (it fails by name, as on main). A carried-true verdict's input came
+      // after the hand-over by construction, so `beforeHandOver` falls out false for it.
+      const heldInput = via ? via.human : recentHumanInput(requestPage, navBefore);
+      const beforeHandOver = heldInput && (!handedOverAt || (humanInputAt.get(requestPage as object) ?? 0) <= handedOverAt);
+      aborts.push({
+        rule, method: method || "?", where: whereOf(url), why, resourceType,
+        ...(heldInput ? { humanInput: true, ...(beforeHandOver ? { beforeHandOver: true } : {}) } : {}),
+        ...(via ? { redirect: { from: via.from, status: via.status, hop: via.hop } } : {}),
+        at: Date.now(),
+      });
       await route.abort("blockedbyclient").catch(() => null);
     };
+    // #333 — A PERSON'S OWN REQUEST AFTER THE HAND-OVER: the requesting page saw their input (the
+    // watch is armed only after the run's last input, and the run makes none after the hand-over)
+    // and no run action is in flight (a dismisser / Enter window). It passes the filing-URL rule and
+    // the review lockdown below; payment and the windows still apply.
+    // A REDIRECT HOP CARRIES ITS FIRST LEG'S VERDICT (#370 merge order): judged live, a person's submit
+    // answered 307 more than HUMAN_INPUT_MS later would read as not theirs (their filing cut off),
+    // and the portal's own save hopping to a filing URL just after a touch would read as theirs.
+    const human = handedOverAt > 0 && !disposed && windows.size === 0 && (via ? via.human : humanInputSinceHandOver(requestPage, navBefore));
     // R0 — THE INFORMATION-PAGE SLOT IS CONSUMED by the FIRST request that could be the verified
     // control's (#344): the bound page's own main-frame document navigation. Matched or not, the
     // slot is gone, and consuming it changes no rule's outcome: the request meets payment, the
@@ -1074,7 +1453,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       }
     }
     // 2. FILING URL: only inside THE approved final submit's window.
-    if (isFilingOrPaymentRequest(method || "POST", url) && !approved) {
+    if (isFilingOrPaymentRequest(method || "POST", url) && !approved && !human) {
       await abort("filing-url", `a filing endpoint, and no named approval covers this request (${label})`);
       return;
     }
@@ -1152,7 +1531,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       }
     }
     // 4. REVIEW-PAGE LOCKDOWN: the run locked it, or the requesting page reads as terminal now.
-    if (!approved) {
+    if (!approved && !human) {
       if (locked) { await abort("review-lockdown", locked); return; }
       const pg = pageOfRequest(request);
       let navigation = true;
@@ -1250,7 +1629,18 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     }
     // The slot's request was not one 4(b) would have held: it passes as on main (recorded).
     if (infoAdmit && infoAdmit.refusals.length === 0) infoPageAdmissions.push({ entryId: infoAdmit.entryId, where: whereOf(url), exempted: false });
-    await letThrough(route, request, via);
+    // The person's request is recorded once, on its first leg: a hop is the same request going on.
+    // Round 4: stamped with when it went, its method and resource type, and the page that sent it —
+    // recorded on a request whose verdict is already decided (the stamps change no rule's outcome).
+    if (human && !via) {
+      let mainFrame = false;
+      try { mainFrame = !!requestPage && typeof requestPage.mainFrame === "function" && request.frame() === requestPage.mainFrame(); } catch { mainFrame = false; }
+      humanRequests.push({
+        where: whereOf(url), document: mainFrame && /^document$/i.test(resourceType), abortsBefore: aborts.length,
+        at: Date.now(), method: method || "?", resourceType, page: requestPage ?? null,
+      });
+    }
+    await letThrough(route, request, via, human);
   };
 
   await target.route("**/*", handler);
@@ -1260,7 +1650,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
   // request through. Every other response of the chain ends it and continues at once. A response
   // this run did not send is not its to judge (null). Matched by method + URL on the first pause,
   // then by the chain's network id (the same for every leg of one redirect chain).
-  const chains = new Map<string, { request: any; hop: number; ownWrite: boolean; drain: boolean; at: number }>();
+  const chains = new Map<string, { request: any; hop: number; ownWrite: boolean; drain: boolean; human: boolean; at: number }>();
   const judgePaused: PausedJudge = async (e) => {
     if (disposed) return null;
     const method = String(e.request?.method || "").toUpperCase();
@@ -1271,7 +1661,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       const i = sentLegs.findIndex((l) => l.key === legKey(method, url));
       if (i < 0) return null;
       const leg = sentLegs.splice(i, 1)[0];
-      chain = { request: leg.request, hop: leg.hop, ownWrite: leg.ownWrite, drain: leg.drain, at: leg.at };
+      chain = { request: leg.request, hop: leg.hop, ownWrite: leg.ownWrite, drain: leg.drain, human: leg.human, at: leg.at };
     }
     if (net) chains.delete(net);
     const status = Number(e.responseStatusCode || 0);
@@ -1284,7 +1674,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     let next = "";
     try { next = new URL(location, url).href.split("#")[0]; } catch { next = ""; }
     const refuse = (where: string, why: string): "fail" => {
-      aborts.push({ rule: "filing-url", method: method || "?", where, why, resourceType, redirect: { from, status, hop } });
+      aborts.push({ rule: "filing-url", method: method || "?", where, why, resourceType, redirect: { from, status, hop }, at: Date.now() });
       return "fail";
     };
     if (!/^https?:\/\//i.test(next)) {
@@ -1298,13 +1688,13 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       fallback: async () => { outcome.verdict = "continue"; },
       abort: async () => { outcome.verdict = "fail"; },
     };
-    await handler(hopRoute, asRedirectedTo(chain.request, next), { hop, from, status, ownWrite: chain.ownWrite, drain: chain.drain });
+    await handler(hopRoute, asRedirectedTo(chain.request, next), { hop, from, status, ownWrite: chain.ownWrite, drain: chain.drain, human: chain.human });
     const verdict = outcome.verdict;
     if (verdict === "continue") {
       const now = Date.now();
       for (const [k, c] of chains) if (now - c.at > 600_000) chains.delete(k);
       if (net) chains.set(net, { ...chain, hop, at: now });
-      else sentLegs.push({ key: legKey(method, next), request: chain.request, hop, from, ownWrite: chain.ownWrite, drain: chain.drain, at: now });
+      else sentLegs.push({ key: legKey(method, next), request: chain.request, hop, from, ownWrite: chain.ownWrite, drain: chain.drain, human: chain.human, at: now });
     }
     return verdict;
   };
@@ -1429,6 +1819,70 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       closeInfo();
       if (!locked) locked = `the run is at review (${String(why || label).slice(0, 100)}) — nothing legitimate posts from here until a person takes the page`;
     },
+    async watchHumanInput() {
+      if (disposed) return false;
+      if (humanWatchArmed) return true;
+      // FAIL CLOSED WITH NO DEVTOOLS SESSION (Chromium only): a double, or a browser that has none,
+      // is never armed — the hand-over then lets nothing through.
+      if (!ctx || typeof ctx.newCDPSession !== "function") return false;
+      humanArming = true;
+      // The run's own page first: its root frame's world is what "armed" reads back from.
+      const own = armPageWorld(page);
+      let ownWorld: HumanWorld | null | undefined;
+      void own.then((w) => { ownWorld = w; });
+      // Then every other page of the context (a popup already open) and every page's child frames, in
+      // its process and out of it — waited for within the read budget, never needed for "armed" (a
+      // navigating frame cannot answer; the script for new documents covers what it is loading).
+      const everyPage = (async (): Promise<void> => {
+        let pages: unknown[] = [];
+        try { pages = typeof ctx.pages === "function" ? ctx.pages() : []; } catch { pages = []; }
+        await Promise.all([page, ...pages.filter((p) => p !== page)].map(async (p) => {
+          await armPageWorld(p);
+          await humanFramesArmed.get(p as object);
+        }));
+      })().catch(() => undefined);
+      await settleWithin(everyPage, TERMINAL_READ_TIMEOUT_MS);
+      // ARMED MEANS THE RUN'S OWN PAGE IS LISTENING (#333 skeptic rounds 1 and 2): the marker is read
+      // back from the ISOLATED WORLD of its root frame — never its main world, where a page script
+      // could have set it. A page whose world is not made in time (navigating, hung) is NOT armed —
+      // the hand-over then fails closed and says so (NOT_HANDED_OVER_NOTE), never "the page is
+      // yours" over a document that cannot see the person's click. `=== true`, never truthiness: an
+      // element named like the marker is visible from this world too (HUMAN_INPUT_SCRIPT's comment).
+      let listening = false;
+      try {
+        const w = ownWorld;
+        if (w) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const read: any = await settleWithin(Promise.resolve(w.session.send("Runtime.evaluate", { expression: "window.__solarBackstopHumanInputArmed === true", contextId: w.rootWorld, returnByValue: true })).catch(() => null), TERMINAL_READ_TIMEOUT_MS);
+          listening = read?.result?.value === true;
+        }
+      } catch { listening = false; }
+      humanWatchArmed = !disposed && listening;
+      return humanWatchArmed;
+    },
+    handOverToHuman(_why: string) {
+      if (disposed || !humanWatchArmed) return false;
+      closeSlot();
+      closeInfo();
+      if (!handedOverAt) handedOverAt = Date.now();
+      return true;
+    },
+    handedOver() { return handedOverAt > 0 && !disposed; },
+    personActedSinceHandOver(pg?: unknown, withinMs?: number) {
+      const p = (pg && typeof pg === "object" ? pg : page) as object;
+      const t = humanInputAt.get(p) ?? 0;
+      return handedOverAt > 0 && !disposed && t > handedOverAt && (withinMs === undefined || Date.now() - t <= withinMs);
+    },
+    async withAutomationInput<T>(pg: unknown, fn: () => Promise<T>): Promise<T> {
+      const p = (pg && typeof pg === "object" ? pg : page) as object;
+      automationDepth.set(p, (automationDepth.get(p) ?? 0) + 1);
+      try {
+        return await fn();
+      } finally {
+        automationDepth.set(p, Math.max(0, (automationDepth.get(p) ?? 1) - 1));
+      }
+    },
+    humanRequests,
     stoppingAborts() { return aborts.filter(isStoppingAbort); },
     get redirectsJudged() { return !!leaveGuard && !preInstallWorkers && !uncoveredPages.has(page); },
     redirectsJudgedOn(pg?: unknown) { return !!leaveGuard && !preInstallWorkers && !uncoveredPages.has((pg && typeof pg === "object" ? pg : page) as object); },
@@ -1578,6 +2032,14 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       sentLegs.length = 0;
       chains.clear();
       await target.unroute("**/*", handler).catch(() => null);
+      // THE INPUT WATCH'S SESSIONS COME OFF LAST, after the route (Helm Blocking 1: a watch torn down
+      // while the route still judged once held a person's filing in that gap). Detaching a session
+      // removes its binding and its script for new documents; a world already made keeps its listener,
+      // which now reports to no session of this run. An arm still in flight detaches itself
+      // (openHumanWorld reads `disposed`).
+      for (const s of [...humanSessions]) await s.detach().catch(() => null);
+      humanSessions.clear();
+      humanWorlds.clear();
     },
   };
   REGISTRY.set(page, bs);

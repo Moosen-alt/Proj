@@ -22,6 +22,7 @@ import vm from "node:vm";
 import {
   classifyRecordedClick,
   classifySubmissionText,
+  completionEvidence,
   finalSubmitEnvAllows,
   finalSubmitRefusals,
   isFinalSubmitControl,
@@ -40,6 +41,7 @@ import {
   isSecretField,
   isSubmitIntent,
   isSubmitOrPayRequestUrl,
+  isPayRequestUrl,
   mayClickFinalSubmit,
   PORTAL_SAFETY_IN_PAGE_SOURCE,
   recordingHasFormData,
@@ -675,6 +677,37 @@ await check("humanCapture sink: the filing click signals ONCE and disarms; a mid
   assert.equal(signals.length, 1, `expected one submitObserved signal, got ${signals.length}`);
   assert.equal(got.length, 3, "nothing is captured after the filing click");
 });
+await check("humanCapture sink, oneShot:false (the replay's own watch, #333): EVERY filing click signals; nothing disarms", () => {
+  const got: RecipeStep[] = [];
+  const sink = createHumanCaptureSink((s) => got.push(s), { oneShot: false });
+  sink({ kind: "click", selector: {}, label: "Submit" });
+  sink({ kind: "fill", selector: { label: "Initials" }, label: "Initials", value: "AB", identity: { label: "Initials" } });
+  sink({ kind: "click", selector: {}, label: "Submit" });
+  const signals = got.filter((s) => s.note === HUMAN_SUBMIT_OBSERVED_NOTE);
+  assert.equal(signals.length, 2, `expected two submitObserved signals, got ${signals.length}`);
+  assert.equal(got.length, 3, "the fill between the clicks is still reported");
+});
+await check("completionEvidence (#333): the person's application as the subject, vetoed by its context (its sentence and the neighbours)", () => {
+  const ok1 = completionEvidence("Application Submitted\nYour application has been successfully submitted.\nRecord Number: BLD-2026-900123");
+  assert.ok(ok1.phrase && !ok1.veto, JSON.stringify(ok1));
+  const far = completionEvidence("Your application has been submitted. Your permit will be reviewed. Inspections follow. Report site errors to the webmaster.");
+  assert.ok(far.phrase && !far.veto, `a footer's "errors" two sentences away is not context: ${JSON.stringify(far)}`);
+  for (const t of [
+    "Step 3: Review. The form was submitted with errors. Record Number: 26TMP-004411",
+    "An application was submitted for this address on 10/01/2026 under record 187-26-000100-STR. This application was not filed.",
+    "Your application was received. It is a duplicate of record 187-26-000100-STR.",
+    "Your application has been submitted already.",
+    "Your application was submitted but could not be processed.",
+    "The application was rejected. Your application was received on 10/01/2026.",
+  ]) {
+    const e = completionEvidence(t);
+    assert.ok(e.phrase && e.veto, `vetoed: "${t}" -> ${JSON.stringify(e)}`);
+  }
+  for (const t of ["Application Submitted", "Record Number: 26TMP-004411", "Status: Submitted", "Record Issued. Permit Number: BLD-2026-900777", ""]) {
+    const e = completionEvidence(t);
+    assert.equal(e.phrase, null, `no subject phrase in "${t}" (status words and a record label are not completion wording): ${JSON.stringify(e)}`);
+  }
+});
 await check("humanCapture: secret identity marks the fill sensitive; ordinary identity does not", () => {
   const acct = payloadToStep({ kind: "fill", selector: { label: "Utility Account Number" }, label: "Utility Account Number", value: "3091", identity: { label: "Utility Account Number", name: "account_number" } });
   assert.equal(acct?.sensitive, true);
@@ -834,6 +867,38 @@ await check("network recorder flags filing and payment URLs through the shared p
   const built = rec.build({ scopeType: "ahj", profileKey: "k", state: "", ahj: "", utility: "", portalPlatform: "", portalUrl: "", createdBy: "t", nowIso: "2026-01-01" });
   assert.equal(built.requests[0].isFinalSubmit, true, "ContinueApplication request not flagged");
   assert.notEqual(built.requests[1].isFinalSubmit, true, "an ordinary save was flagged");
+});
+
+await check("rule 1 (isPayRequestUrl) knows the processors a person's 4 s window would otherwise pass (Helm Should-fix 13; Node and page copy)", () => {
+  // After the hand-over a person's input lifts rules 2 and 4 for HUMAN_INPUT_MS; rule 1 is the only
+  // payment line left, and it is only as wide as PAY_FEE_URL. Red before: none of these matched it.
+  for (const u of [
+    "https://api.authorize.net/xml/v1/request.api",
+    "https://pay.pointandpay.net/api/v1/transactions",
+    "https://permits.example.gov/api/fees/settle",
+    "https://www.govpaynow.com/gps/user/cyg/submit",
+    // HOST tokens alone (no path token in these): pin authorize.net, pointandpay and govpay
+    // themselves, so dropping a host token goes red here (kill K-SF13c).
+    "https://secure.authorize.net/gateway/transact.dll",
+    "https://www.pointandpay.net/pay",
+    "https://www.govpaynow.com/gps/pay",
+  ]) {
+    assert.ok(isPayRequestUrl(u), u);
+    assert.ok(pageCopy.isPayRequestUrl(u), `page copy: ${u}`);
+  }
+  // Anchored tokens: a portal's own filing and save URLs, and an unversioned list endpoint, are not payment.
+  for (const u of [
+    "https://x.test/Project/SubmitApplication",
+    "https://x.test/apply/submit",
+    "https://x.test/api/application",
+    "https://x.test/Project/SaveChanges",
+    "https://x.test/Cap/ContinueApplication.aspx",
+    "https://x.test/api/SaveField",
+    "https://x.test/api/transactions/list",
+  ]) {
+    assert.ok(!isPayRequestUrl(u), u);
+    assert.ok(!pageCopy.isPayRequestUrl(u), `page copy: ${u}`);
+  }
 });
 
 console.log(failures === 0

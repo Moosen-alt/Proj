@@ -725,6 +725,8 @@ export async function stageWithRecipe(
     owedAttachments: options.owedAttachments,
     siteDraft: options.siteDraft,
     draftSubmitStamp: options.draftSubmitStamp ?? null,
+    // The review page is handed to a person only when this caller watches for their submit (#333).
+    handOverReview: typeof options.onSubmitCaptured === "function",
   }), project, files, options));
 }
 
