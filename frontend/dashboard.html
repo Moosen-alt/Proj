@@ -721,9 +721,10 @@
                 </label>
               </div>
               <div class="record-launch">
-                <button id="launchRecordBtn" class="primary"><i data-lucide="play"></i><span>Launch record session</span></button>
+                <!-- #439: opens a terminal on the SERVER — hidden when the server is shared (body.server-shared). -->
+                <button id="launchRecordBtn" class="primary local-disk-only"><i data-lucide="play"></i><span>Launch record session</span></button>
                 <div class="record-alt">
-                  <span class="muted">No launcher here?</span>
+                  <span class="muted local-disk-only">No launcher here?</span>
                   <button id="downloadRecordBatBtn" class="secondary ghost"><i data-lucide="download"></i><span>Download record.bat</span></button>
                   <button id="copyRecordCmdBtn" class="secondary ghost"><i data-lucide="clipboard-copy"></i><span>Copy command</span></button>
                 </div>
@@ -732,6 +733,8 @@
                 <button id="autoLearnBtn" class="secondary" title="The bot logs in with this client's stored credential, fills the form from the project data up to the review screen, records a reusable recipe, and verifies the fill. It NEVER clicks final submit — you authorize that with one click on the track card."><i data-lucide="sparkles"></i><span>Auto-learn this portal (AI)</span></button>
                 <span class="muted" style="font-size:12px">No recording needed — the bot fills it to the review screen and verifies. Final submit always stays your one-click approval.</span>
               </div>
+              <!-- #439: shown only on a shared server; dashboard.js fills it (server URL + recorder token). -->
+              <div id="recordSharedNote" class="shared-server-note"></div>
               <div id="autoLearnStatus" style="display:none;margin:6px 0;font-size:13px"></div>
               <div id="launchRecordStatus" style="display:none;margin:6px 0;font-size:13px"></div>
               <details class="kb-accordion" style="margin-top:6px">
@@ -825,6 +828,7 @@
               </details>
               <details class="kb-accordion" style="margin-top:4px">
                 <summary class="kb-summary"><span>Record command (advanced)</span></summary>
+                <div id="recordCmdSharedNote" class="shared-server-note"></div>
                 <pre id="recordCmdPreview" class="record-cmd"></pre>
               </details>
                 </div>
@@ -1023,7 +1027,8 @@
           </div>
           <div class="progress-track"><div id="mboxProgressBar" class="progress-bar"></div></div>
         </div>
-        <div class="mbox-path-form">
+        <!-- #439: Import Path reads a file on the SERVER — hidden when the server is shared. -->
+        <div class="mbox-path-form local-disk-only">
           <input id="mboxPath" placeholder="Optional local MBOX path if browser upload fails" />
           <button id="importMboxPathBtn" class="secondary"><i data-lucide="folder-input"></i><span>Import Path</span></button>
         </div>
@@ -1032,6 +1037,7 @@
           <button id="saveEmailWatchBtn" class="secondary"><i data-lucide="mail-check"></i><span>Watch</span></button>
           <button id="runEmailTrackerBtn" class="secondary"><i data-lucide="radio-tower"></i><span>Scan Email</span></button>
         </div>
+        <div id="emailWatchSharedNote" class="shared-server-note">Watch and Scan Email read an MBOX file on the server, not on your computer. To import mail from your computer, drop the .mbox file above.</div>
         <div id="emailTrackerStatus" class="email-tracker-status muted">No email watch source configured.</div>
 
         <!-- Batch PDF import -->
@@ -1054,6 +1060,7 @@
           </label>
           <button id="startBatchScanBtn" class="primary"><i data-lucide="folder-search"></i><span>Scan Folder</span></button>
         </div>
+        <div id="batchFolderSharedNote" class="shared-server-note">Scan Folder reads a folder on the server, not on your computer. To learn from PDFs on your computer, drop a .zip of them above.</div>
         <div id="batchScanStatus" class="muted" style="font-size:13px;padding:6px 0"></div>
         <div id="batchScanResults" hidden></div>
 

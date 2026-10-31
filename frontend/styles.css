@@ -1090,6 +1090,15 @@ tbody tr:hover, tbody tr.active { background: var(--tint-select); }
 .record-data-section:last-child { margin-bottom: 0; }
 .record-data-heading { font-size: 11px; font-weight: 600; letter-spacing: .01em; color: var(--muted); margin: 6px 0 2px; }
 
+/* SHARED SERVER POSTURE (#439). body.server-shared is set by dashboard.js from GET /api/auth/me
+   (serverIsShared). Controls that read the SERVER'S disk or open a window on it carry
+   .local-disk-only and disappear; .shared-server-note lines say plainly what reads the server.
+   Without the class (the owner's own PC) the notes never show and nothing else changes. */
+.shared-server-note { display: none; }
+body.server-shared .shared-server-note { display: block; margin: 6px 0; padding: 6px 9px; font-size: 12px; color: var(--muted); border: 1px dashed var(--line); border-radius: var(--radius-sm); }
+body.server-shared .local-disk-only,
+body.server-shared [data-track-open-recorder] { display: none !important; }
+
 /* KPI dashboard */
 .kpi-body { padding: 20px; overflow-y: auto; }
 .kpi-period { font-size: 13px; color: var(--muted); margin-bottom: 16px; }
