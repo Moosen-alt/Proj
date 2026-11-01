@@ -88,6 +88,12 @@
 //     touchstart dispatch (green 41/41 at b6adf660 and on the parent 3ab2827d): K-trusted, M-touch,
 //     M-pointer, M-mouse and M-key each redden A15 x3 (3/41, nothing else). Without the touchstart
 //     dispatch (the smoke as committed at b6adf660), M-touch stayed green 41/41: that was the gap.
+//   [A, #417 — Helm nit :99 on #378] THE HAND-OVER CLOSES THE APPROVED SLOT (GUARD pin, green before by
+//   design; filingBackstop handOverToHuman's `closeSlot();`):
+//     A17 locked and armed, not handed over; allowApprovedFiling(30 s, {page}) opens the slot, then
+//         handOverToHuman (true), then a page script's document.forms[0].submit() (no input event): 0
+//         POSTs, approvedRequests / approvedAdmissions empty, a stopping abort NOT flagged humanInput,
+//         humanRequests empty. Kill: remove closeSlot() from handOverToHuman.
 //   [A, Helm Should-fix 1] A PAGE SCRIPT CANNOT FORGE THE PERSON'S INPUT: the watch runs in a CDP isolated
 //   world (its binding exposed only there, its listener registered through that world's own
 //   addEventListener, "armed" read back from there). Each route Helm named is held; a person's real
@@ -187,18 +193,31 @@
 //     B4  an approved run (autoSubmit) is never handed over (the watch is never armed).
 //   [B, skeptic rounds 2-3] — ONLY THE CLICK DETECTOR SAYS "THE PERSON SUBMITTED" (main's detector, armed
 //   at the hand-over); what a page reads never does. A request the person sent that went through is
-//   said plainly instead (PERSON_REQUEST_WENT_NOTE: "if it was the submit, enter its number"):
+//   said plainly instead (the request-went note — personRequestWentNote since #417, read by its prefix
+//   PERSON_REQUEST_WENT_PREFIX: "if it was your submit, enter its number"):
 //     B5  a person's request, then "My Records" (a list headed "Record Number" with ANOTHER
 //         application's number): not a filing; the request is said plainly.
 //     B6  a fetch submit + location.href to the completion page under a label the click detector does
 //         not know: never "stopped before review", never "click submit manually"; said plainly.
 //     B7  the person's fetch submit WHILE the run drains its own save: recorded as theirs (never the
-//         drain's own-save exemption), never "stopped before review"; said plainly.
+//         drain's own-save exemption), never "stopped before review"; said plainly. #417 (Helm
+//         Should-fix 7 on #378): the note names the handed-over page and the first request recorded as
+//         the person's (origin + path) and is hedged ("it may also have been the portal saving the
+//         stage's answers"), never "A REQUEST YOU SENT"; the attribution checks are unchanged.
 //     B8  an older record ("Your application has been received") opened after the run let go: not
 //         this run's filing.
 //     B9  the person's payment click after the hand-over: aborted (automation never pays, and the
 //         run still holds the page), the run is not failed, and never "your click before the
-//         hand-over was held back".
+//         hand-over was held back". #417 (Helm Should-fix 5 on #378): also PAYMENT_HELD_NOTE leads the
+//         hand-off and the drift warnings, the review step is the whole-built payment branch (NOTHING
+//         WAS PAID), never "moved on" / "click submit manually" / "click submit again". Red before: no
+//         note, and "… then click submit manually".
+//     B15 / B16 (#417) the person's "Pay Fees" is a FORM posting to a payment URL, so the held request
+//         leaves Chromium's error page in the window; B15 clicks it at "the page is yours", B16 at the
+//         start of the review read-back (verifyReviewScreen): 0 POSTs (flagged as the person's), the run
+//         is not failed and not stopped before review, PAYMENT_HELD_NOTE leads the hand-off, never "you
+//         moved on … If that was the submit, the filing went". Red before: the error page met
+//         personMovedOn's third clause (a page other than the handed-over one, after the person acted).
 //     B2 also: a held click's error page is not "where the run stopped".
 //   [B, Helm Should-fix 4] A RUN THAT STOPPED BEFORE REVIEW NEVER READS AS STAGED, AND ONLY A CALLER
 //   THAT WATCHES FOR THE SUBMIT IS HANDED THE PAGE (index.ts passes handOverReview only when the
@@ -274,7 +293,8 @@
 //         never "Do not stage this track again". The adapter's own capture still reads the draft (a
 //         GUARD check, green before by design: captureSubmissionConfirmation is unchanged).
 //     B21 "Submit Application" posting straight to /payment/charge: rule 1 holds it, the run is not
-//         failed, exactly one note (the held payment), never PERSON_REQUEST_WENT_NOTE.
+//         failed, exactly one note (the held payment), never the request-went note, and (#417) never
+//         PAYMENT_HELD_NOTE beside it (B24 too: the verdict's payment note replaces the general one).
 //     B22 a validate fetch, then the payment it chains held: one note (the payment's), never "the filing
 //         went", never "nothing was sent".
 //     B23 a two-phase submit (stage fetch, then a document POST to /payment/checkout, held): one note,
@@ -397,7 +417,7 @@ import http from "node:http";
 import { chromium, type Browser, type Frame, type Page } from "playwright";
 import type { PortalRecipe, ProjectRecord, RecipeStep } from "../../../shared/src/types";
 import { backstopFor, installFilingBackstop, isStoppingAbort, withBackstopWindow, withOwnWriteWindow, type FilingBackstop } from "../filingBackstop";
-import { HUMAN_CLICK_HELD_NOTE, HUMAN_SUBMITTED_NOTE, NOT_HANDED_OVER_NOTE, PERSON_REQUEST_WENT_NOTE, RecipeAdapter } from "./recipeAdapter";
+import { HUMAN_CLICK_HELD_NOTE, HUMAN_SUBMITTED_NOTE, NOT_HANDED_OVER_NOTE, PAYMENT_HELD_NOTE, PERSON_REQUEST_WENT_PREFIX, RecipeAdapter } from "./recipeAdapter";
 // Read by namespace: a constant this round adds is then undefined on older code (a FAIL by name),
 // never a link-time SyntaxError that would take the whole smoke down.
 import * as recipeAdapterModule from "./recipeAdapter";
@@ -563,6 +583,9 @@ const reviewBody = (k: string): string => {
   if (k === "B8") return `${summary}${formSubmit(k)}<a id="older" href="/h/B8/record">Older application BLD-2026-900001</a>`;
   // B17: the review page links a contact form that opens in a popup (another tab, another Page).
   if (k === "B17") return `${summary}${formSubmit(k)}<a id="help" href="/h/B17/popup-form" target="_blank">Contact us</a>`;
+  // B15 / B16 (#417): "Pay Fees" is a form posting to a payment URL (a held document request: the window
+  // shows Chromium's error page).
+  if (k === "B15" || k === "B16") return `${summary}${formSubmit(k)}<form method="post" action="/h/${k}/payment/charge"><button type="submit" id="pay">Pay Fees</button></form>`;
   if (k === "B9") return `${summary}${formSubmit(k)}<button type="button" id="pay" onclick="fetch('/h/B9/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function () {})">Pay Fees</button>`;
   if (k === "A4") return `${summary}<button type="button" id="btnSubmit" onclick="window.open('/h/A4/popup', '_blank')">Submit Application</button>`;
   if (k === "A5") return `${summary}<button type="button" id="btnSubmit" onclick="fetch('/h/A5/payment/charge', { method: 'POST', body: 'amt=150' }).catch(function(){})">Submit Application</button>`;
@@ -974,6 +997,28 @@ console.log("\n[A, #370] A REDIRECT HOP CARRIES THE FIRST LEG'S PERSON VERDICT")
     b.bs.personActedSinceHandOver(b.page) === true, brief(b, "A16", from));
   await b.close();
 }
+{
+  // A17 (#417, Helm nit :99 on #378 — GUARD pin, green before by design): handOverToHuman closes the
+  // APPROVED filing slot. A slot an approved click opened must not outlive a hand-over: from there only a
+  // person's own input lifts the lockdown. The bed is locked and armed, not handed over; the slot is
+  // opened, THEN the page is handed over, then a page script submits the filing form (no input event):
+  // 0 POSTs, no approved request or admission, a stopping abort not flagged as the person's, nothing in
+  // humanRequests. Kill: remove closeSlot() from handOverToHuman (the slot admits the submit).
+  const from = posts.length;
+  const b = await bed("A17", { handOver: false });
+  b.bs.allowApprovedFiling(30_000, { page: b.page });
+  const slotOpened = b.bs.approvedSlotOpen();
+  const handed = b.bs.handOverToHuman("smoke A17");
+  await b.page.evaluate(() => { (document.forms[0] as HTMLFormElement).submit(); });
+  await sleep(900);
+  check("A17 premise: the approved slot was open and the hand-over was accepted (an armed watch)", slotOpened && handed === true, `slot=${slotOpened} handed=${handed}`);
+  check("A17 the hand-over closes the approved slot: a page script's form submit after it reaches nothing (0 POSTs), no approved request or admission",
+    postsFor("A17", from).length === 0 && b.bs.approvedRequests.length === 0 && b.bs.approvedAdmissions.length === 0 && !b.bs.approvedSlotOpen(),
+    `${JSON.stringify({ approvedRequests: b.bs.approvedRequests, approvedAdmissions: b.bs.approvedAdmissions })} ${brief(b, "A17", from)}`);
+  check("A17 …held as a stopping abort NOT flagged as the person's input, and nothing in humanRequests",
+    b.bs.aborts.some((a) => isStoppingAbort(a) && /\/apply\/submit$/.test(a.where) && !a.humanInput) && b.bs.humanRequests.length === 0, brief(b, "A17", from));
+  await b.close();
+}
 
 // [A, Helm Should-fix 1] A PAGE SCRIPT CANNOT FORGE THE PERSON'S INPUT: the watch runs in a CDP
 // isolated world. Each route Helm named is held, and a person's real input still counts.
@@ -1344,7 +1389,9 @@ type Track = (p: Promise<unknown>) => void;
  *   onArmed        fires after a successful arm, before the hand-over.
  *   onDrain        fires when the run opens its first own-save drain.
  *   onLock         fires right after the real lockReview (pushed through track).
- *   onReviewRead   fires at the start of the run's review read-back (verifyReviewScreen).
+ *   onReviewRead   fires at the start of the run's review read-back (verifyReviewScreen); a promise it
+ *                  returns is awaited before the read (B16: the person's held payment has left Chromium's
+ *                  error page in the window by then).
  *   afterFill      fires after fillApplication returned and the submit watch is armed.
  *   onUnroute      fires inside the dispose gap (disposed set, route still on).
  *   capture        also arms index.ts armSubmitCapture and waits up to captureWaitMs for its reports.
@@ -1364,7 +1411,7 @@ async function replay(k: string, opts: {
   onArmed?: (page: Page, track: Track) => Promise<void>;
   onDrain?: (page: Page, track: Track) => void;
   onLock?: (page: Page, track: Track) => void;
-  onReviewRead?: (page: Page, track: Track) => void;
+  onReviewRead?: (page: Page, track: Track) => void | Promise<unknown>;
   afterFill?: (page: Page) => Promise<unknown>;
   onUnroute?: (page: Page) => Promise<unknown>;
   capture?: boolean; captureWaitMs?: number; settleMs?: number;
@@ -1425,7 +1472,7 @@ async function replay(k: string, opts: {
   if (opts.onReviewRead) {
     const a = adapter as unknown as { verifyReviewScreen: (...x: unknown[]) => Promise<unknown> };
     const verify = a.verifyReviewScreen.bind(adapter);
-    a.verifyReviewScreen = (...x: unknown[]) => { opts.onReviewRead!(page, track); return verify(...x); };
+    a.verifyReviewScreen = async (...x: unknown[]) => { await opts.onReviewRead!(page, track); return verify(...x); };
   }
   // Spy the backstop the run installs: note when its input watch is armed (and run onArmed then).
   const spy = setInterval(() => {
@@ -1507,11 +1554,12 @@ async function replay(k: string, opts: {
     reported,
   };
 }
-/** The person's request was said plainly, and nobody was told to "click submit manually". */
-const saidPlainly = (r: Replay): boolean => {
-  const notes = (r.review.data.reviewHandoffNotes as string[] | undefined) ?? [];
-  return notes.includes(PERSON_REQUEST_WENT_NOTE) && !/click submit manually/i.test(r.review.message);
-};
+/** The hand-off notes that are the request-went note (#417: built by personRequestWentNote, read by its
+ *  prefix — every push dedupes on it). */
+const requestWentNotes = (r: Replay): string[] => ((r.review.data.reviewHandoffNotes as string[] | undefined) ?? []).filter((n) => n.startsWith(PERSON_REQUEST_WENT_PREFIX));
+/** The person's request was said plainly (the request-went note, once), and nobody was told to "click
+ *  submit manually". */
+const saidPlainly = (r: Replay): boolean => requestWentNotes(r).length === 1 && !/click submit manually/i.test(r.review.message);
 // Helm's whole-message nit: the review step's message names the portal ONCE (its "Recipe: …" prefix)
 // and stitches no fragment ending "." onto a clause that continues with ","; never "it Recipe:".
 // (Not "it STOPPED": the stopped-before-review template says that, and it is whole.)
@@ -1784,6 +1832,16 @@ const refusedHandOver = (k: string, r: Replay): void => {
   check("B7 …and is recorded as the person's request (never taken by the drain's own-save exemption)", r.humanRequests.some((w) => /\/api\/application$/.test(w)), rbrief(r));
   check("B7 …the run is not failed and not 'stopped before review'", r.ok === true && r.pauseReason !== "stopped_before_review", rbrief(r));
   check("B7 …and the request that went is said plainly, never 'click submit manually'", saidPlainly(r), rbrief(r));
+  // #417 (Helm Should-fix 7 on #378): the request recorded as the person's may be the portal's own
+  // drained save, so the note names the handed-over page and the first request recorded as theirs (by
+  // origin + path) and hedges; it never says "A REQUEST YOU SENT". The backstop's attribution is
+  // unchanged (the two checks above). Red before: the note was the constant PERSON_REQUEST_WENT_NOTE.
+  const went = requestWentNotes(r)[0] ?? "";
+  const first = r.humanRequests[0] ?? "";
+  check("B7 …the note names the handed-over page and where the first request recorded as the person's went (origin + path)",
+    went.includes(`(${base}/h/B7/review)`) && first.startsWith("/h/B7/") && went.includes(`, to ${base}${first}.`), `first=${first} note=${went}`);
+  check("B7 …and is hedged: it may also have been the portal saving the stage's answers; never 'A REQUEST YOU SENT'",
+    went.includes("it may also have been the portal saving the stage's answers") && !/A REQUEST YOU SENT/.test(said(r)), went);
 }
 {
   // B8 (skeptic r2 F1): after the run has let go (its backstop disposed), the person opens an OLDER
@@ -1799,6 +1857,42 @@ const refusedHandOver = (k: string, r: Replay): void => {
   const all = JSON.stringify({ m: r.message, d: r.data, rm: r.review.message, rd: r.review.data });
   check("B9 the person's payment click after the hand-over is aborted (automation never pays; the run still holds the page)", r.posts.length === 0, rbrief(r));
   check("B9 …the run is not failed, and never says the click came before the hand-over", r.ok === true && !all.includes("YOUR CLICK WAS HELD BACK"), rbrief(r));
+  // #417 (Helm Should-fix 5 on #378): the held payment is SAID — PAYMENT_HELD_NOTE leads the hand-off and
+  // is in the drift warnings, and the review step is the whole-built payment branch. Red before: no note,
+  // and the step said "Verify every field … then click submit manually".
+  check("B9 …PAYMENT_HELD_NOTE leads the hand-off and is in the drift warnings; the review step says NOTHING WAS PAID",
+    notesOf(r)[0] === PAYMENT_HELD_NOTE && ((r.data.driftWarnings as string[] | undefined) ?? []).includes(PAYMENT_HELD_NOTE)
+      && r.review.data.humanPaymentHeld === true && /NOTHING WAS PAID/.test(r.review.message), wbrief(r));
+  check("B9 …never 'moved on', 'click submit manually', 'click submit again', 'the filing went' or 'has been filed'; no request-went note",
+    !/moved on|click submit manually|click submit again|the filing went|has been filed/i.test(all) && requestWentNotes(r).length === 0, wbrief(r));
+  check("B9 …the review step's message is built whole", wholeMessage(r), r.review.message);
+}
+{
+  // B15 / B16 (#417, Helm Should-fix 5 on #378): the person's "Pay Fees" is a FORM posting to a payment
+  // URL, so the held request leaves Chromium's error page in the window. B15 clicks it at "the page is
+  // yours"; B16 at the start of the run's review read-back (verifyReviewScreen), which waits for it, so the
+  // error page is in the window when the run's tail asks whether the person moved on. Rule 1 holds it (0
+  // POSTs, flagged as the person's), the run is not failed and not stopped before review,
+  // PAYMENT_HELD_NOTE leads the hand-off, and the error page is never "you moved on" (which said "If that
+  // was the submit, the filing went" over a payment that was held). Red before: no note, and the step
+  // said "… then click submit manually" (B15) or "you moved on … the filing went" (B16).
+  for (const k of ["B15", "B16"]) {
+    const clickPay = (page: Page): Promise<unknown> => personClicks(page, "#pay").then(() => sleep(1500));
+    const r = await replay(k, {
+      ...(k === "B15" ? { onHandOver: (page: Page) => clickPay(page) } : { onReviewRead: (page: Page, track: Track) => { const p = clickPay(page); track(p); return p; } }),
+      afterReport: async (page) => page.url(),
+    });
+    const all = JSON.stringify({ m: r.message, d: r.data, rm: r.review.message, rd: r.review.data });
+    check(`${k} premise: the window shows Chromium's error page after the held payment form`, /^chrome-error:/i.test(String(r.reported ?? "")), `url=${String(r.reported)} ${wbrief(r)}`);
+    check(`${k} the person's payment form at ${k === "B15" ? "'the page is yours'" : "the start of the review read"}: rule 1 holds it (0 POSTs, flagged as the person's), the run is not failed or stopped before review`,
+      r.posts.length === 0 && r.aborts.some((a) => /\/payment\/charge$/.test(a.where) && a.rule === "filing-url" && a.human) && r.ok === true && r.pauseReason !== "stopped_before_review", wbrief(r));
+    check(`${k} …PAYMENT_HELD_NOTE leads the hand-off and is in the drift warnings; the review step says NOTHING WAS PAID`,
+      notesOf(r)[0] === PAYMENT_HELD_NOTE && ((r.data.driftWarnings as string[] | undefined) ?? []).includes(PAYMENT_HELD_NOTE)
+        && r.review.data.humanPaymentHeld === true && /NOTHING WAS PAID/.test(r.review.message), wbrief(r));
+    check(`${k} …never 'moved on', 'the filing went', 'click submit manually', 'click submit again', 'YOUR CLICK WAS HELD BACK' or 'has been filed'; no request-went note`,
+      !/moved on|the filing went|click submit manually|click submit again|YOUR CLICK WAS HELD BACK|has been filed/i.test(all) && requestWentNotes(r).length === 0 && r.review.data.personMovedOn !== true, wbrief(r));
+    check(`${k} …the review step's message is built whole`, wholeMessage(r), r.review.message);
+  }
 }
 
 {
@@ -1890,8 +1984,11 @@ for (const [k, how] of [["B18", "a Submit on a form with an empty required box"]
   check("B21 a 'Submit Application' that posts to a payment URL: rule 1 holds it (0 POSTs), the run is not failed",
     r.posts.length === 0 && r.ok === true && r.aborts.some((a) => /\/payment\/charge$/.test(a.where) && a.rule === "filing-url"), wbrief(r));
   check("B21 …never 'has been filed', no submit handed on", neverFiled(r) && r.observed.length === 0, wbrief(r));
-  check("B21 …exactly one note names the held payment, and never PERSON_REQUEST_WENT_NOTE",
-    paymentNotes(r).length === 1 && !notesOf(r).includes(PERSON_REQUEST_WENT_NOTE) && clickVerdict(r) === "held", wbrief(r));
+  check("B21 …exactly one note names the held payment, and never the request-went note",
+    paymentNotes(r).length === 1 && requestWentNotes(r).length === 0 && clickVerdict(r) === "held", wbrief(r));
+  // #417: the verdict's payment note replaces PAYMENT_HELD_NOTE (one payment note, never two). Red while
+  // stopAtReview kept backstopStop's general note beside humanPaymentHeldNote.
+  check("B21 …and never PAYMENT_HELD_NOTE beside the verdict's payment note (#417)", !notesOf(r).includes(PAYMENT_HELD_NOTE), wbrief(r));
   check("B21 …the review step's message is built whole", wholeMessage(r), r.review.message);
 }
 {
@@ -1900,8 +1997,8 @@ for (const [k, how] of [["B18", "a Submit on a form with an empty required box"]
   const r = await replay("B22", { onHandOver: (page) => personClicks(page) });
   check("B22 a validate fetch went, then the payment it chained was held: only the validate reached the portal",
     r.posts.length === 1 && /\/api\/validate$/.test(r.posts[0]) && r.aborts.some((a) => /\/payment\/charge$/.test(a.where)), wbrief(r));
-  check("B22 …one note, the payment's; never PERSON_REQUEST_WENT_NOTE, never 'has been filed', never 'nothing was sent'",
-    paymentNotes(r).length === 1 && !notesOf(r).includes(PERSON_REQUEST_WENT_NOTE) && neverFiled(r) && !/nothing was sent/i.test(said(r)) && clickVerdict(r) === "held", wbrief(r));
+  check("B22 …one note, the payment's; never the request-went note, never 'has been filed', never 'nothing was sent'",
+    paymentNotes(r).length === 1 && requestWentNotes(r).length === 0 && neverFiled(r) && !/nothing was sent/i.test(said(r)) && clickVerdict(r) === "held", wbrief(r));
   check("B22 …the review step's message is built whole", wholeMessage(r), r.review.message);
 }
 {
@@ -1910,8 +2007,8 @@ for (const [k, how] of [["B18", "a Submit on a form with an empty required box"]
   const r = await replay("B23", { onHandOver: async (page) => { await personClicks(page); await sleep(1500); } });
   check("B23 a two-phase submit: the stage fetch went, the payment form it then posted was held (rule 1)",
     r.posts.length === 1 && /\/api\/stage$/.test(r.posts[0]) && r.aborts.some((a) => /\/payment\/checkout$/.test(a.where)), wbrief(r));
-  check("B23 …exactly one note (the held payment), never PERSON_REQUEST_WENT_NOTE, never 'has been filed'",
-    paymentNotes(r).length === 1 && !notesOf(r).includes(PERSON_REQUEST_WENT_NOTE) && neverFiled(r) && clickVerdict(r) === "held", wbrief(r));
+  check("B23 …exactly one note (the held payment), never the request-went note, never 'has been filed'",
+    paymentNotes(r).length === 1 && requestWentNotes(r).length === 0 && neverFiled(r) && clickVerdict(r) === "held", wbrief(r));
   check("B23 …and the window's error page is named: go Back to the review page", /go Back to the review page/.test(paymentNotes(r)[0] ?? ""), wbrief(r));
   check("B23 …the review step's message is built whole", wholeMessage(r), r.review.message);
 }
@@ -1924,8 +2021,9 @@ for (const [k, how] of [["B18", "a Submit on a form with an empty required box"]
     r.posts.length === 1 && /\/apply\/submit$/.test(r.posts[0]) && r.aborts.some((a) => /\/payment\/charge$/.test(a.where)), wbrief(r));
   check("B24 …the click stands: YOU CLICKED \"Submit Application\", the filing may have gone, check the portal before you click again",
     notesOf(r).some((n) => n.startsWith('YOU CLICKED "Submit Application"') && /may have gone/.test(n) && /check the portal before you click again/i.test(n)) && clickVerdict(r) === "stands", wbrief(r));
-  check("B24 …plus the payment note; never PERSON_REQUEST_WENT_NOTE, never 'has been filed', never 'nothing was sent'",
-    paymentNotes(r).length === 1 && !notesOf(r).includes(PERSON_REQUEST_WENT_NOTE) && neverFiled(r) && !/nothing was sent/i.test(said(r)), wbrief(r));
+  check("B24 …plus the payment note; never the request-went note, never 'has been filed', never 'nothing was sent'",
+    paymentNotes(r).length === 1 && requestWentNotes(r).length === 0 && neverFiled(r) && !/nothing was sent/i.test(said(r)), wbrief(r));
+  check("B24 …and never PAYMENT_HELD_NOTE beside the verdict's payment note (#417)", !notesOf(r).includes(PAYMENT_HELD_NOTE), wbrief(r));
   check("B24 …the review step's message is built whole", wholeMessage(r), r.review.message);
 }
 {

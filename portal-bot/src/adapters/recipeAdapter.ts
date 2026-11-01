@@ -118,10 +118,30 @@ const INPUT_CLOSED = "the run has stopped at review and is handing the page to a
  *  listened (during the run's last writes or its arm) is held unflagged: the run is not handed over
  *  (NOT_HANDED_OVER_NOTE) and fails by name, and this note is never said (Helm Should-fix 3). */
 export const HUMAN_CLICK_HELD_NOTE ="YOUR CLICK WAS HELD BACK: you clicked on the review page before the run had handed it over to you, so that request was stopped and nothing was sent. If the window shows an error page, go Back to the review page; then click submit again — the run has let go of the page now.";
-/** #333 round 3 (skeptic r2b): a request the person sent from the handed-over page went through, and
- *  the click detector did not see it as the portal's final submit (an unknown label, a fetch submit).
- *  It may have been the filing: never "click submit" or "nothing was filed" to someone who may have. */
-export const PERSON_REQUEST_WENT_NOTE = "A REQUEST YOU SENT FROM THE REVIEW PAGE WENT THROUGH while the stage was finishing (automation clicked nothing). If it was the submit, the filing went: check the portal and enter its record number with the capture form — do not stage this track again before you have. If it was not, finish in the open window.";
+/** #333 round 3 (skeptic r2b): a request from the handed-over page went through after the person
+ *  touched it, and the click detector did not see a final submit (an unknown label, a fetch submit). It
+ *  may have been the filing: never "click submit" or "nothing was filed" to someone who may have.
+ *  #417 (Helm Should-fix 7 on #378): the backstop records a request as the person's when it follows
+ *  their input on the page, so the portal's OWN batched save of the stage's answers, drained after the
+ *  hand-over, can be one (B7). The record stays (judging by the drain first breaks B7); the note no
+ *  longer says "you sent" it. It names the handed-over page and where the request went, each by origin
+ *  and path only (never a query: rule 2, a portal can carry an account number there), and hedges. Every
+ *  push dedupes on this prefix. */
+export const PERSON_REQUEST_WENT_PREFIX = "A REQUEST FROM THE REVIEW PAGE WENT THROUGH";
+/** scheme://host:port/path of an address: no query, no #fragment (rule 2). */
+const originAndPath = (url: string): string => {
+  try { const u = new URL(url); return u.origin && u.origin !== "null" ? `${u.origin}${u.pathname}` : ""; } catch { return String(url || "").split(/[?#]/)[0].slice(0, 200); }
+};
+export function personRequestWentNote(fromPage: string, where: string): string {
+  const page = originAndPath(fromPage);
+  const to = originAndPath(where);
+  return `${PERSON_REQUEST_WENT_PREFIX}${page ? ` (${page})` : ""} while the stage was finishing (automation clicked nothing)${to ? `, to ${to}` : ""}. It followed your input on the page, but it may also have been the portal saving the stage's answers. If it was your submit, the filing may have gone: check the portal and enter its record number with the capture form — do not stage this track again before you have. If it was not, finish in the open window.`;
+}
+/** #417 (Helm Should-fix 5 on #378): the person's own PAYMENT click after the hand-over was held — rule 1
+ *  never lifts (automation never pays), and the run still held the page. Said whole: never "you moved
+ *  on", never "click submit again" or "click submit manually" on a payment. A click the watch saw as the
+ *  final submit gets humanPaymentHeldNote from its verdict instead (one payment note, never two). */
+export const PAYMENT_HELD_NOTE = "YOUR PAYMENT WAS HELD BACK: automation never pays, and the run still held the review page, so the payment request from your click was stopped. NOTHING WAS PAID. Check the portal before you click anything again, and pay there yourself once you have seen whether the application was submitted. If the window shows an error page, go Back to the review page first.";
 /** #333 round 2 (skeptic r2 F5): the person filed from the review window while the stage finished —
  *  on the record in the hand-off notes (the project's next-step panel), whether or not the
  *  completion page's number can be read. */
@@ -154,8 +174,8 @@ export function humanClickStandsNote(label: string | undefined, personInput?: bo
 export function humanClickHeldNote(label: string | undefined, abort: BackstopAbort, errorPage: boolean, personInput?: boolean): string {
   return `${personInput === false ? "A CLICK ON" : "YOUR CLICK ON"} ${clickedLabel(label)} ON THE REVIEW PAGE WAS HELD BACK: the submit itself was not sent — ${describeBackstopAbort(abort)}. Check the portal before you click again.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
 }
-/** A payment request after the person's click, held by rule 1 (automation never pays). Stands in for
- *  Should-fix 5's payment note until that lands; no "click again" on a payment. */
+/** A payment request after the person's final-submit click, held by rule 1 (automation never pays); no
+ *  "click again" on a payment. A payment click the watch did not see as a submit: PAYMENT_HELD_NOTE. */
 export function humanPaymentHeldNote(abort: BackstopAbort, errorPage: boolean): string {
   return `A PAYMENT REQUEST FROM THE REVIEW PAGE WAS HELD BACK — ${describeBackstopAbort(abort)}. Automation never pays, and nothing was paid: check the portal, and pay there yourself once you have seen whether the application was submitted.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
 }
@@ -1693,6 +1713,23 @@ export class RecipeAdapter extends BasePortalAdapter {
     return bs.aborts.some((a, i) => isStoppingAbort(a) && !!a.humanInput && !!a.beforeHandOver && i < first);
   }
 
+  /** #417 (Helm Should-fix 5 on #378) — the person's own payment click AFTER the hand-over was held: a
+   *  stopping abort flagged as the person's input, not before the hand-over, to a URL rule 1 knows as a
+   *  payment. Read off the handed-over backstop when there is one (at report time fillApplication's
+   *  finally has let `this.backstop` go), else the live one. A refused hand-over has none: every flagged
+   *  abort there is `beforeHandOver`. Read-only; the abort stands (rule 1). */
+  private heldHumanPayment(): boolean {
+    const bs = this.handedOverBackstop ?? this.backstop;
+    if (!bs) return false;
+    return bs.aborts.some((a) => isStoppingAbort(a) && !!a.humanInput && !a.beforeHandOver && isPayRequestUrl(a.where));
+  }
+
+  /** #417 — the request-went note for this run: the handed-over page and the first request recorded as
+   *  the person's, each by origin and path (personRequestWentNote strips any query). */
+  private personRequestWentNoteNow(): string {
+    return personRequestWentNote(this.handOverUrl, this.handedOverBackstop?.humanRequests[0]?.where ?? "");
+  }
+
   /** The run's page address without its #fragment ("" when unreadable). */
   private pageUrlNoHash(): string {
     try {
@@ -1720,6 +1757,12 @@ export class RecipeAdapter extends BasePortalAdapter {
     if (this.heldHumanClick()) {
       if (!this.reviewHandoffNotes.includes(HUMAN_CLICK_HELD_NOTE)) this.reviewHandoffNotes.push(HUMAN_CLICK_HELD_NOTE);
       if (!this.driftWarnings.includes(HUMAN_CLICK_HELD_NOTE)) this.driftWarnings.push(HUMAN_CLICK_HELD_NOTE);
+    }
+    // #417: the person's payment after the hand-over, held (rule 1) — said, never silent. Not a failure:
+    // a flagged abort is never in `stopping` above.
+    if (this.heldHumanPayment()) {
+      if (!this.reviewHandoffNotes.includes(PAYMENT_HELD_NOTE)) this.reviewHandoffNotes.push(PAYMENT_HELD_NOTE);
+      if (!this.driftWarnings.includes(PAYMENT_HELD_NOTE)) this.driftWarnings.push(PAYMENT_HELD_NOTE);
     }
     if (!stopping.length) return "";
     const first = stopping[0];
@@ -1821,13 +1864,19 @@ export class RecipeAdapter extends BasePortalAdapter {
     // Blocking 2): what the step says comes from what became of the click (humanClickVerdict) — "filed"
     // only for a committed submit whose page read as the completion — each outcome built whole, with
     // the portal named once, by this frame. The outcome's note leads the hand-off notes (nextStep keeps
-    // the first six). PERSON_REQUEST_WENT_NOTE is said only when the watch saw no click at all.
+    // the first six). The request-went note (personRequestWentNote) is said only when the watch saw no
+    // click at all, once (deduped on its prefix).
     const verdict = await this.humanClickVerdict();
+    const requestWentSaid = (): boolean => this.reviewHandoffNotes.some((n) => n.startsWith(PERSON_REQUEST_WENT_PREFIX));
     if (verdict || this.personMovedOn) {
       const report: { notes: string[]; sentence: string; data: Record<string, unknown> } = verdict ? this.humanClickReport(verdict) : {
-        notes: this.personRequestWent ? [PERSON_REQUEST_WENT_NOTE] : [], data: { humanSubmittedInReviewWindow: false },
-        sentence: "you moved on from the review window while the run was finishing — automation clicked nothing. If that was the submit, the filing went: check the portal and enter its record number with the capture form; if not, finish in the open window.",
+        notes: this.personRequestWent && !requestWentSaid() ? [this.personRequestWentNoteNow()] : [], data: { humanSubmittedInReviewWindow: false },
+        // Hedged (#417): moving on is not proof of a filing — "may have gone", never "the filing went".
+        sentence: "you moved on from the review window while the run was finishing — automation clicked nothing. If that was the submit, the filing may have gone: check the portal and enter its record number with the capture form; if not, finish in the open window.",
       };
+      // ONE PAYMENT NOTE (#417): a verdict that names the held payment (humanPaymentHeldNote, beside a
+      // click that is held or stands) replaces the general PAYMENT_HELD_NOTE backstopStop pushed.
+      if (verdict?.payment && (verdict.verdict === "held" || verdict.verdict === "stands")) this.reviewHandoffNotes = this.reviewHandoffNotes.filter((n) => n !== PAYMENT_HELD_NOTE);
       // On the record (skeptic r2 F5): the hand-off notes reach the project's next-step panel.
       for (const n of [...report.notes].reverse()) if (!this.reviewHandoffNotes.includes(n)) this.reviewHandoffNotes.unshift(n);
       return ok(
@@ -1838,10 +1887,24 @@ export class RecipeAdapter extends BasePortalAdapter {
         },
       );
     }
-    // A request the person sent went through and the click detector did not see a final submit
-    // (round 3): on the record, and never "click submit manually" as if nothing had happened. (No
-    // sighting exists here: a click the watch saw is reported above.)
-    if (this.personRequestWent && !this.reviewHandoffNotes.includes(PERSON_REQUEST_WENT_NOTE)) this.reviewHandoffNotes.push(PERSON_REQUEST_WENT_NOTE);
+    // A request went through after the person touched the page and the click detector did not see a
+    // final submit (round 3): on the record, and never "click submit manually" as if nothing had
+    // happened. (No sighting exists here: a click the watch saw is reported above.)
+    if (this.personRequestWent && !requestWentSaid()) this.reviewHandoffNotes.push(this.personRequestWentNoteNow());
+    // THE PERSON'S PAYMENT AFTER THE HAND-OVER WAS HELD (#417, Helm Should-fix 5 on #378), with no click
+    // the watch saw as the final submit: built whole — PAYMENT_HELD_NOTE leads the hand-off, and the step
+    // never says "click submit manually" or "click again" over a payment. Rule 1 is unchanged: the
+    // payment stayed aborted; this only names it.
+    if (this.heldHumanPayment()) {
+      this.reviewHandoffNotes = [PAYMENT_HELD_NOTE, ...this.reviewHandoffNotes.filter((n) => n !== PAYMENT_HELD_NOTE)];
+      const pNotes = this.reviewHandoffNotes;
+      // The sentence says what PAYMENT_HELD_NOTE says; the message carries the other notes after it.
+      const rest = pNotes.slice(1);
+      return ok(
+        `${this.portalName}: the recipe staged the review screen and handed it to you; a payment request from your click on it was held back — automation never pays, and NOTHING WAS PAID. Check the portal before anything else, and pay there yourself once you have seen whether the application was submitted.${rest.length ? ` ${rest.join(" ")}` : ""} AUTOMATION HAS STOPPED.`,
+        { finalSubmitClicked: false, humanPaymentHeld: true, ...(this.personRequestWent ? { personRequestWent: true } : {}), reviewHandoffNotes: [...pNotes], reviewPageBlockedCalls: [...this.reviewPageBlockedCalls] },
+      );
+    }
     // WHAT THE PERSON MUST KNOW BEFORE SUBMITTING (dryrun-0928 B3 / B14): answers the portal may
     // not have saved, and the portal's own background calls the lockdown held back on this page.
     const notes = this.reviewHandoffNotes;
@@ -1849,7 +1912,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     const handoffData = notes.length ? { reviewHandoffNotes: [...notes], reviewPageBlockedCalls: [...this.reviewPageBlockedCalls] } : {};
     if (this.personRequestWent) {
       return ok(
-        `${this.portalName}: the recipe staged the review screen and handed it to you, and a request you sent from it went through while the run was finishing — automation clicked nothing. If that was the submit, the filing went: check the portal and enter its record number with the capture form. If not, verify every field and uploaded file, handle any MFA/fee, then click submit.${handoff} AUTOMATION HAS STOPPED.`,
+        `${this.portalName}: the recipe staged the review screen and handed it to you, and a request from it went through after you touched the page while the run was finishing (it may also have been the portal saving the stage's answers) — automation clicked nothing. If that was your submit, the filing may have gone: check the portal and enter its record number with the capture form. If not, verify every field and uploaded file, handle any MFA/fee, then click submit.${handoff} AUTOMATION HAS STOPPED.`,
         { finalSubmitClicked: false, personRequestWent: true, ...handoffData },
       );
     }
@@ -2158,7 +2221,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // your application is submitted…" after the person's own Previous click read as a filing (with a
     // draft's id), and real completion pages with a "* required field" legend did not. What a page
     // says is never what made the filing; a request the person sent is said plainly instead
-    // (PERSON_REQUEST_WENT_NOTE), and the number is theirs to enter.
+    // (personRequestWentNote), and the number is theirs to enter.
     // The click detector the learn path already uses: a submitObserved step when the FINAL submit is
     // clicked; every other captured step belongs to the learn path and is ignored here. Round 4: it
     // keeps watching (oneShot:false) — a click is a sighting, committed on the evidence after it.
@@ -3646,13 +3709,19 @@ export class RecipeAdapter extends BasePortalAdapter {
     // harmless touch that only rode along with the run's own autosave is none of these. And a click
     // of theirs HELD BACK before the hand-over can leave Chromium's error page in the window: that is
     // not where the run stopped either (F6) — that page only (round 3).
+    // #417 (Helm Should-fix 5 on #378): Chromium's error page is never "a page the person moved on to".
+    // A held request (their payment after the hand-over, held by rule 1) leaves it in the window; read
+    // before personMovedOn, so the third clause below cannot take it for the person's own navigation
+    // (which said "If that was the submit, the filing went" over a payment that was held).
     const bsNow = this.backstop;
     const hereNow = this.pageUrlNoHash();
+    const onErrorPage = /^chrome-error:/i.test(hereNow);
     const personMovedOn = !!this.humanDocumentFromHandedOverPage(bsNow) || !!this.humanSubmit
-      || (!!bsNow && this.handOverUrl !== "" && hereNow !== "" && hereNow !== this.handOverUrl && bsNow.personActedSinceHandOver(this.page));
+      || (!!bsNow && this.handOverUrl !== "" && hereNow !== "" && hereNow !== this.handOverUrl && !onErrorPage && bsNow.personActedSinceHandOver(this.page));
     this.personMovedOn = personMovedOn;
     this.personRequestWent = (bsNow?.humanRequests ?? []).length > 0;
-    const onHeldErrorPage = this.heldHumanClick() && /^chrome-error:/i.test(hereNow);
+    // …nor where the run stopped: a held click before the hand-over, or a held payment after it.
+    const onHeldErrorPage = (this.heldHumanClick() || this.heldHumanPayment()) && onErrorPage;
     // A person who moved on from a page the run did NOT stage at review (Helm Should-fix 4: their
     // Continue on an attachments step) is told where the run stopped, from the reading taken before the
     // hand-over. A final submit the click detector saw is not decided here (the review step's wording).
@@ -3705,10 +3774,11 @@ export class RecipeAdapter extends BasePortalAdapter {
   private stoppedBeforeReviewMessage(where: string, refused: string[], personRequestWent: boolean): string {
     return `STOPPED on "${where}" — NOT the review page (the page does not read as the portal's review step, and none of the project's values are on it), so the application is NOT staged at review.`
       + `${refused.length ? ` The portal says: ${refused.join(" | ")}.` : ""}`
-      // A request the person sent went through after the hand-over (round 3): it may have been the
-      // filing — never "Nothing was filed"; this sentence is the one that says so.
+      // A request went through after the person touched the page past the hand-over (round 3): it may
+      // have been the filing — never "Nothing was filed"; this sentence is the one that says so. Hedged
+      // (#417): it may also have been the portal's own save.
       + (personRequestWent
-        ? ` A request you sent from the page went through while the stage was finishing — check the portal before anything else.`
+        ? ` A request from the page went through after you touched it while the stage was finishing (it may also have been the portal saving the stage's answers) — check the portal before anything else.`
         : ` Next: in the portal, finish that page (check every attachment is listed and nothing is flagged required), continue to the review page, verify every field there, then submit. Nothing was filed.`);
   }
 

@@ -24,18 +24,27 @@
 //      abort followed, and the window shows Chromium's error page: true; on a portal page, or read off
 //      this.backstop instead of the handed-over backstop: false. Red before: no such predicate.
 //  10. (round 4, Helm Blocking 2) stopAtReview at report time (backstop null): a held payment after a
-//      validate fetch gets ONE note (the payment's), never PERSON_REQUEST_WENT_NOTE; a pending click with
+//      validate fetch gets ONE note (the payment's), never the request-went note; a pending click with
 //      an unflagged stopping abort after it reads as held, never "saw no request go". Red before: the
-//      validate made it PERSON_REQUEST_WENT_NOTE and no payment note; the pending click had no note. The
-//      no-sighting case (PERSON_REQUEST_WENT_NOTE still said) is a GUARD, green before by design; its
-//      kill: push PERSON_REQUEST_WENT_NOTE only with a sighting.
+//      validate made it the request-went note and no payment note; the pending click had no note. The
+//      no-sighting case (the request-went note still said) is a GUARD, green before by design; its
+//      kill: push the request-went note only with a sighting. (#417: the note is built by
+//      personRequestWentNote and read by its prefix, PERSON_REQUEST_WENT_PREFIX.)
 //   9. (round 4) NOT_HANDED_OVER_NOTE fits one progress line: at most 200 characters, and a progress
 //      sink receives the constant whole (progress() cuts at 200).
+//  11. (#417, Helm Should-fix 5 on #378) the person's own payment after the hand-over, held: the run is
+//      still not failed, and PAYMENT_HELD_NOTE is pushed (hand-off + drift warnings) — never for a click
+//      held BEFORE the hand-over, never on a refused hand-over; at report time stopAtReview's payment
+//      branch leads with it, whole: never "moved on", "click submit manually" or "click submit again".
+//      Red before: no note at all, and the step said "click submit manually".
+//  12. (#417, Helm Should-fix 7 on #378) personRequestWentNote names the handed-over page and where the
+//      request went by origin + path only — a query (rule 2) and a #fragment are stripped — and is
+//      hedged ("it may also have been the portal saving the stage's answers"). Red before: no builder.
 //
 //   npx tsx portal-bot/src/adapters/backstopStopHuman.test.ts
 import type { PortalRecipe } from "../../../shared/src/types";
 import type { BackstopAbort } from "../filingBackstop";
-import { RecipeAdapter, HUMAN_CLICK_HELD_NOTE, HUMAN_SUBMITTED_NOTE, NOT_HANDED_OVER_NOTE, PERSON_REQUEST_WENT_NOTE } from "./recipeAdapter";
+import { RecipeAdapter, HUMAN_CLICK_HELD_NOTE, HUMAN_SUBMITTED_NOTE, NOT_HANDED_OVER_NOTE, PAYMENT_HELD_NOTE, PERSON_REQUEST_WENT_PREFIX, personRequestWentNote } from "./recipeAdapter";
 
 let failures = 0;
 let total = 0;
@@ -63,13 +72,13 @@ const RUN_PAGE = {};
 // backstopStop is read WHILE the run holds the page (runAll, before its finally lets the backstop go),
 // so these cases set `backstop`. They read a run that handed the page over (handedOverBackstop is the
 // same backstop), unless `handedOver: false` (a refused hand-over: case 1b).
-const stopFor = (aborts: BackstopAbort[], humanRequests: HumanRequest[], opts: { handedOver?: boolean } = {}): { stop: string; notes: string[] } => {
-  const adapter = new RecipeAdapter(recipe, {}, {}, {}) as unknown as Internals;
+const stopFor = (aborts: BackstopAbort[], humanRequests: HumanRequest[], opts: { handedOver?: boolean } = {}): { stop: string; notes: string[]; drift: string[] } => {
+  const adapter = new RecipeAdapter(recipe, {}, {}, {}) as unknown as Internals & { driftWarnings: string[] };
   adapter.page = RUN_PAGE;
   adapter.backstop = { aborts, humanRequests };
   adapter.handedOverBackstop = opts.handedOver === false ? null : adapter.backstop;
   const stop = adapter.backstopStop();
-  return { stop, notes: [...adapter.reviewHandoffNotes] };
+  return { stop, notes: [...adapter.reviewHandoffNotes], drift: [...adapter.driftWarnings] };
 };
 // What the run reads WHEN IT REPORTS (stopAtReview): fillApplication's finally has already let the
 // backstop go (this.backstop is null), so only the handed-over backstop's record is there. `backstop`
@@ -220,8 +229,8 @@ console.log("\n#333 round 4 — what the review step says about the person's cli
     const r = await report([{ ...payment(), at: 13 } as BackstopAbort], [validate], { held: click(10) });
     check("10. a validate fetch went, then the person's payment was held: exactly one note, the payment's",
       r.notes.filter((n) => /\/payment\//.test(n)).length === 1, JSON.stringify(r.notes));
-    check("10. …never PERSON_REQUEST_WENT_NOTE beside it, never 'has been filed'",
-      !r.notes.includes(PERSON_REQUEST_WENT_NOTE) && !r.all.includes("has been filed") && !r.notes.includes(HUMAN_SUBMITTED_NOTE) && r.data.humanSubmittedInReviewWindow !== true, JSON.stringify(r.notes));
+    check("10. …never the request-went note beside it, never 'has been filed'",
+      !r.notes.some((n) => n.startsWith(PERSON_REQUEST_WENT_PREFIX)) && !r.all.includes("has been filed") && !r.notes.includes(HUMAN_SUBMITTED_NOTE) && r.data.humanSubmittedInReviewWindow !== true, JSON.stringify(r.notes));
   }
   {
     // The judge may still be inside its settle when the run reports: a pending click with an UNFLAGGED
@@ -233,8 +242,44 @@ console.log("\n#333 round 4 — what the review step says about the person's cli
   {
     // No sighting at all: the request that went is still said plainly (B5-B7's shape).
     const r = await report([], [validate], {});
-    check("10. no sighting, a request of the person's went: PERSON_REQUEST_WENT_NOTE (GUARD)", r.notes.includes(PERSON_REQUEST_WENT_NOTE), JSON.stringify(r.notes));
+    check("10. no sighting, a request of the person's went: the request-went note, once (GUARD)", r.notes.filter((n) => n.startsWith(PERSON_REQUEST_WENT_PREFIX)).length === 1, JSON.stringify(r.notes));
   }
+}
+
+console.log("\n#417 — the person's payment after the hand-over, held, is said (PAYMENT_HELD_NOTE)");
+{
+  const r = stopFor([payment()], []);
+  check("11. the person's own payment after the hand-over, held: PAYMENT_HELD_NOTE pushed (hand-off and drift warnings), still not a failure",
+    r.stop === "" && r.notes.includes(PAYMENT_HELD_NOTE) && r.drift.includes(PAYMENT_HELD_NOTE), JSON.stringify({ stop: r.stop, notes: r.notes }));
+  const before = stopFor([{ ...payment(), beforeHandOver: true } as BackstopAbort], []);
+  check("11. …a payment click held BEFORE the hand-over is not this note (it is the held click's)",
+    !before.notes.includes(PAYMENT_HELD_NOTE) && before.notes.includes(HUMAN_CLICK_HELD_NOTE), JSON.stringify(before.notes));
+  const unflagged = stopFor([{ ...payment(), humanInput: undefined } as BackstopAbort], []);
+  check("11. …a page script's payment (not flagged as the person's) still fails the run by name, with no payment note",
+    /STOPPED BY THE NETWORK BACKSTOP/.test(unflagged.stop) && !unflagged.notes.includes(PAYMENT_HELD_NOTE), JSON.stringify(unflagged));
+  // At report time (backstop null, the handed-over record): stopAtReview's payment branch, built whole.
+  const a = atReportTime([{ ...payment(), at: 13 } as BackstopAbort], []) as unknown as Internals & { stopAtReview(): Promise<{ ok?: boolean; message?: string; data?: Record<string, unknown> }> };
+  a.page = { url: () => "https://portal.example/review" };
+  const rep = await a.stopAtReview();
+  const notes = (rep.data?.reviewHandoffNotes as string[] | undefined) ?? [];
+  const all = JSON.stringify({ m: rep.message, d: rep.data });
+  check("11. at report time the review step leads with PAYMENT_HELD_NOTE and says nothing was paid",
+    rep.ok === true && notes[0] === PAYMENT_HELD_NOTE && /NOTHING WAS PAID/.test(String(rep.message)) && rep.data?.humanPaymentHeld === true, all);
+  check("11. …never 'moved on', 'click submit manually', 'click submit again', 'the filing went' or 'has been filed'",
+    !/moved on|click submit manually|click submit again|the filing went|has been filed/i.test(all), all);
+}
+
+console.log("\n#417 — the request-went note names the page and the request by origin + path, hedged (personRequestWentNote)");
+{
+  const n = personRequestWentNote("https://portal.example/apply/review?acct=55512345678&step=9#top", "https://portal.example:8443/Project/SaveChanges?token=abc123");
+  check("12. it starts with the prefix every push dedupes on", n.startsWith(PERSON_REQUEST_WENT_PREFIX), n);
+  check("12. …names the handed-over page and where the request went, by origin + path",
+    n.includes("https://portal.example/apply/review") && n.includes("https://portal.example:8443/Project/SaveChanges"), n);
+  check("12. …never a query or fragment (rule 2: no account digits, no token)", !/\?|acct|55512345678|token|abc123|#top|step=9/.test(n), n);
+  check("12. …hedged: it may also have been the portal saving the stage's answers, and never 'A REQUEST YOU SENT'",
+    n.includes("it may also have been the portal saving the stage's answers") && !/YOU SENT/.test(n), n);
+  const bare = personRequestWentNote("", "not a url?x=1");
+  check("12. …an unreadable address names nothing after a '?' either", bare.startsWith(PERSON_REQUEST_WENT_PREFIX) && !/x=1/.test(bare), bare);
 }
 
 console.log("\n#333 round 4 — the 'could not hand over' note fits one progress line (NOT_HANDED_OVER_NOTE)");
