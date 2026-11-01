@@ -1098,7 +1098,9 @@ console.log("\n6. THE INPUT WATCH LIVES IN A CDP ISOLATED WORLD (Helm Should-fix
   // source pin is its only cover.
   const disposeAt = backstop.indexOf("async dispose() {");
   const disposeBody = disposeAt >= 0 ? backstop.slice(disposeAt) : "";
-  const unrouteAt = disposeBody.indexOf("await target.unroute(");
+  // #381: the unroute is awaited through `settle` (bounded only after the hand-over, when an open dialog
+  // stalls it); the order is the same.
+  const unrouteAt = disposeBody.indexOf("await settle(Promise.resolve(target.unroute(");
   const detachAt = disposeBody.indexOf("humanSessions");
   check("dispose detaches the watch's DevTools sessions only AFTER the route comes off",
     unrouteAt > 0 && detachAt > unrouteAt, `unroute=${unrouteAt} detach=${detachAt}`);
