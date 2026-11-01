@@ -136,6 +136,7 @@ import {
   type InfoPageObservedRequest, type InfoPagePrefixStep, type InfoPageRunState,
 } from "../../shared/src/infoPagePass";
 import type { VerifiedInfoPage } from "../../shared/src/types";
+import { dialogsLeftToPerson, leaveDialogsToPerson, readUnlessDialog } from "./personDialogs";
 
 export type BackstopRule = "filing-url" | "dismisser-window" | "enter-window" | "review-lockdown";
 
@@ -305,7 +306,10 @@ export interface FilingBackstop {
    *  request that follows that person's own input (watchHumanInput) passes the filing-URL rule and
    *  the review lockdown; nothing else changes. Payment (rule 1) is never lifted, and it stays blocked
    *  only for URLs rule 1 knows (PAY_FEE_URL): a processor it does not name passes in that window.
-   *  false = disposed, or the input watch is not armed. */
+   *  false = disposed, or the input watch is not armed.
+   *  #381: from here a native dialog on the window waits for the person (personDialogs
+   *  leaveDialogsToPerson) — automation never answers one — and the person's own Yes / OK on it
+   *  counts as their input, as their click does. */
   handOverToHuman(why: string): boolean;
   /** Has the run handed the page over (and not been disposed)? */
   handedOver(): boolean;
@@ -576,12 +580,14 @@ export async function drainOwnWrites(
   let quiet = 0;
   try {
     while (Date.now() - t0 < budget) {
-      const saving = await isSaving(page).catch(() => false);
+      // #381: after the hand-over an open dialog stalls the page read — the drain then reads "not
+      // saving" and ends, never answering the dialog.
+      const saving = await readUnlessDialog(page, () => isSaving(page), false).catch(() => false);
       quiet = saving ? 0 : quiet + 1;
       if (quiet >= 3) break;
       await new Promise((r) => setTimeout(r, 250));
     }
-    const stillSaving = await isSaving(page).catch(() => false);
+    const stillSaving = await readUnlessDialog(page, () => isSaving(page), false).catch(() => false);
     return { drained: true, stillSaving, waitedMs: Date.now() - t0 };
   } finally {
     close();
@@ -983,7 +989,7 @@ async function coverRunningWorkers(g: GuardState, parent: any, ctx: any, pages: 
  *  could not be re-bound (their redirects are followed unjudged until they load a new document);
  *  `workers` = service workers already running at join whose own response pause could not be
  *  turned on (#405, above) — named, never silent. */
-type GuardMembership = { leave: () => Promise<void>; uncovered: Set<object>; workers: number };
+type GuardMembership = { leave: (settle?: <T>(p: Promise<T>) => Promise<T | null>) => Promise<void>; uncovered: Set<object>; workers: number };
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 async function joinRedirectGuard(browser: any, judge: PausedJudge, ctx?: any): Promise<GuardMembership | null> {
   if (!browser || typeof browser !== "object" || typeof browser.newBrowserCDPSession !== "function") return null;
@@ -1029,7 +1035,8 @@ async function joinRedirectGuard(browser: any, judge: PausedJudge, ctx?: any): P
   return {
     uncovered,
     workers,
-    leave: async () => {
+    // `settle` (#381): how long each teardown command is waited for — by default to its end, as before.
+    leave: async (settle = <T>(p: Promise<T>): Promise<T | null> => p) => {
       guard.judges.delete(judge);
       if (guard.judges.size || guard.closed) return;
       guard.closed = true;
@@ -1039,8 +1046,8 @@ async function joinRedirectGuard(browser: any, judge: PausedJudge, ctx?: any): P
       // The browser session last: a worker's cover is carried inside it.
       for (const s of [...(await Promise.all(covers)).map((c) => c.session), session]) {
         if (!s) continue;
-        await s.send("Fetch.disable").catch(() => null);
-        await s.detach().catch(() => null);
+        await settle(Promise.resolve(s.send("Fetch.disable")).catch(() => null));
+        await settle(Promise.resolve(s.detach()).catch(() => null));
       }
     },
   };
@@ -1205,6 +1212,17 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
     humanSessions.add(session);
     try {
       session.on("Runtime.bindingCalled", (e: { name?: string }) => { if (e && e.name === HUMAN_INPUT_BINDING) noteHumanInput(owner); });
+      // #381 — THE PERSON'S ANSWER TO A NATIVE DIALOG IS THEIR INPUT. A confirm() the portal asks after
+      // the person's Submit is answered in the browser's own dialog, which no page script — and no
+      // isolated-world listener — sees; the form posts only after that answer, often more than
+      // HUMAN_INPUT_MS after the click. Only an ACCEPTED dialog (result true: Yes / OK), only after
+      // the hand-over, and only on a window whose dialogs are left to the person — there nothing else
+      // can accept one (automation never answers a dialog, and Playwright's own auto-answer, which
+      // accepts a beforeunload, is off while that window's listener is on). A page script cannot open
+      // and accept a dialog itself. A Cancel (result false) sends nothing and is not counted.
+      session.on("Page.javascriptDialogClosed", (e: { result?: boolean }) => {
+        if (e && e.result === true && handedOverAt > 0 && dialogsLeftToPerson(owner)) noteHumanInput(owner);
+      });
       // Playwright's own order for a binding with a script: Runtime first (a context created after
       // addBinding gets the binding only while Runtime is enabled on the session), and Page enabled
       // before the script for new documents (no new document runs it otherwise).
@@ -1830,7 +1848,7 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       unwatch.push(() => { try { ctx.off("requestfailed", forgetLeg); } catch { /* context gone */ } });
     }
   } catch { /* no events (a double) */ }
-  let leaveGuard: (() => Promise<void>) | null = null;
+  let leaveGuard: GuardMembership["leave"] | null = null;
   try {
     const browser = ctx && typeof ctx.browser === "function" ? ctx.browser() : null;
     const joined = await joinRedirectGuard(browser, judgePaused, ctx);
@@ -1858,7 +1876,10 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       // A run that ever opened the approved final-submit door never passes an information page.
       approvedEverOpened = true;
       closeInfo();
-      if (disposed) return;
+      // #381: never after the hand-over — the slot's dialog handler is the one place automation answers
+      // a dialog, and a handed-over window's dialogs are the person's (an approved run is never handed
+      // over, so nothing that ran before changes).
+      if (disposed || handedOverAt > 0) return;
       // Bound to the page the caller clicked on — by default the page this backstop was installed
       // for, never "any page" (an unbound slot is how a completion page's POST took it).
       const clicked = opts && opts.page && typeof opts.page === "object" ? opts.page : page;
@@ -1988,6 +2009,9 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       closeSlot();
       closeInfo();
       if (!handedOverAt) handedOverAt = Date.now();
+      // #381 — FROM HERE A NATIVE DIALOG WAITS FOR THE PERSON: a listener that never answers keeps
+      // Playwright from dismissing it (before this line dialogs behave exactly as before).
+      leaveDialogsToPerson(page);
       return true;
     },
     handedOver() { return handedOverAt > 0 && !disposed; },
@@ -2151,16 +2175,25 @@ export async function installFilingBackstop(page: any, label = "run"): Promise<F
       drains.clear();
       locked = "";
       for (const u of unwatch.splice(0)) u();
-      if (leaveGuard) await leaveGuard();
+      // #381 — A DIALOG LEFT TO THE PERSON STALLS DEVTOOLS COMMANDS ON ITS PAGE (measured: Fetch.disable,
+      // a session's detach and the context's unroute never return while a native dialog is open, and
+      // a run left waiting on them saw the dialog dismissed ~60-100 s later). After the hand-over each
+      // teardown command is waited for at most TERMINAL_READ_TIMEOUT_MS and left to finish when the
+      // person answers; `disposed` is already set, so the handler lets every request through as it does
+      // after the route comes off (the dispose gap, C9). Before the hand-over: waited to its end, as before.
+      const settle = dialogsLeftToPerson(page)
+        ? <T>(p: Promise<T>): Promise<T | null> => settleWithin(p, TERMINAL_READ_TIMEOUT_MS)
+        : <T>(p: Promise<T>): Promise<T | null> => p;
+      if (leaveGuard) await leaveGuard(settle);
       sentLegs.length = 0;
       chains.clear();
-      await target.unroute("**/*", handler).catch(() => null);
+      await settle(Promise.resolve(target.unroute("**/*", handler)).catch(() => null));
       // THE INPUT WATCH'S SESSIONS COME OFF LAST, after the route (Helm Blocking 1: a watch torn down
       // while the route still judged once held a person's filing in that gap). Detaching a session
       // removes its binding and its script for new documents; a world already made keeps its listener,
       // which now reports to no session of this run. An arm still in flight detaches itself
       // (openHumanWorld reads `disposed`).
-      for (const s of [...humanSessions]) await s.detach().catch(() => null);
+      for (const s of [...humanSessions]) await settle(Promise.resolve(s.detach()).catch(() => null));
       humanSessions.clear();
       humanWorlds.clear();
     },

@@ -11,6 +11,7 @@ import { decryptStorageState } from "./cryptoStorage";
 import { resolveHeadless } from "./browser";
 import { HUMAN_REVIEW_MESSAGE } from "./adapter";
 import { clearReviewOpen, markReviewOpen } from "./reviewSession";
+import { leaveDialogsToPerson } from "./personDialogs";
 import { draftReferenceFromUrl } from "./adapters/submissionLedger";
 import { readDraftCreated, type DraftCreatedRead } from "./draftCreated";
 import type { SubmitRecordRead } from "./adapters/submissionLedger";
@@ -410,6 +411,11 @@ export function trackOpenAdapter(userDataDir: string, adapter: import("./adapter
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const page = (adapter as any).page;
+    // #381 — THE WINDOW IS THE PERSON'S NOW: a native dialog on it (a Submit's confirm()) waits for
+    // their answer instead of being dismissed by Playwright. Automation never answers one. (A replay
+    // that handed its review page over did this at the hand-over already; this covers every other
+    // window left open — a refused hand-over, a hand-coded adapter, a paused run, the learner.)
+    leaveDialogsToPerson(page);
     const ctx = page && typeof page.context === "function" ? page.context() : null;
     if (ctx && typeof ctx.on === "function") {
       ctx.on("close", () => {

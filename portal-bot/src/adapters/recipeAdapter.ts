@@ -102,6 +102,7 @@ import {
 } from "../../../shared/src/portalSafety";
 import { commitField, installSettleProbe, waitForSettled } from "../settle";
 import { siteOfUrl } from "../siteOf";
+import { dialogOpenedSince, readUnlessDialog } from "../personDialogs";
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, withAutomationInput, describeBackstopAbort, backstopSentLine, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, isStoppingAbort, type BackstopAbort, type FilingBackstop, type BackstopHumanRequest } from "../filingBackstop";
 
 /** #333: the run did not hand the review page over — its input watch could not be armed, or (Helm
@@ -109,6 +110,14 @@ import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, withAuto
  *  fails by name — and the review lockdown holds until the stage finishes: said plainly, never
  *  silently, and never "the page is yours". */
 export const NOT_HANDED_OVER_NOTE = "THE RUN COULD NOT HAND THE REVIEW PAGE OVER TO YOU: the review lockdown holds until the stage says it has finished, so click submit only then (an earlier click is held back, and nothing is sent).";
+/** #381: the review read-back was skipped — a native dialog waits for the person on the handed-over
+ *  window (automation never answers one, and an open dialog stalls every page read). Appended to the
+ *  run's "stopped at review." sentence. */
+export const REVIEW_READ_SKIPPED_SUMMARY = " The review screen was not read back: a dialog the portal opened is waiting in the window for your answer (automation never answers one), so verify every field yourself.";
+/** #381: what the capture says when a native dialog waits for the person on the window. */
+export const DIALOG_WAITING_CAPTURE = "A dialog the portal opened is waiting in the window for your answer (automation never answers one): the page was not read and nothing was recorded.";
+/** #381: said beside a click the portal answered with a native dialog — never "click again" there. */
+const CONFIRMATION_ASKED = " The portal asked for a confirmation after that click: only you answer it, in the window (automation never answers one).";
 /** #333: why the run's own input is refused once it has started handing the page over. */
 const INPUT_CLOSED = "the run has stopped at review and is handing the page to a person — it makes no input of its own on the page from here";
 
@@ -155,24 +164,30 @@ export const HUMAN_SUBMITTED_NOTE = "YOU SUBMITTED FROM THE REVIEW WINDOW while 
 /** The person's submit went, then a request the page it led to made was held back, and the window shows
  *  Chromium's error page. */
 export const HUMAN_FOLLOW_UP_HELD_NOTE = "YOUR SUBMIT WENT TO THE PORTAL, BUT A REQUEST THE NEXT PAGE MADE WAS HELD BACK and the window shows an error page (automation clicked nothing). Check the portal: if the application shows as submitted, enter its record number with the capture form; if it does not, go Back to the review page and submit again.";
+/** #381: the same when the portal asked for a confirmation after the click — no "submit again". */
+export const HUMAN_FOLLOW_UP_HELD_CONFIRM_NOTE = "YOUR SUBMIT WENT TO THE PORTAL, BUT A REQUEST THE NEXT PAGE MADE WAS HELD BACK and the window shows an error page (automation clicked nothing). Check the portal: if the application shows as submitted, enter its record number with the capture form; if it does not, go Back to the review page and check it there.";
 const clickedLabel = (label: string | undefined): string => `"${String(label || "the submit").slice(0, 60)}"`;
 /** "YOU CLICKED "X" ON THE REVIEW PAGE" — or, for a click with no input of the person's in the 2 s
  *  before it (a page script's el.click()), "A CLICK ON "X" WAS SEEN ON THE REVIEW PAGE". */
 const clickedOnReview = (label: string | undefined, personInput: boolean | undefined): string =>
   personInput === false ? `A CLICK ON ${clickedLabel(label)} WAS SEEN ON THE REVIEW PAGE` : `YOU CLICKED ${clickedLabel(label)} ON THE REVIEW PAGE`;
 const ERROR_PAGE_GO_BACK = " The window shows an error page: go Back to the review page first.";
-/** A sighting the run saw no request of the person's follow. */
-export function humanClickUnconfirmedNote(label: string | undefined, errorPage: boolean, personInput?: boolean): string {
-  return `${clickedOnReview(label, personInput)} while the stage was finishing (automation clicked nothing), and the run saw no request go from that click. Check the portal: if the application shows as submitted, enter its record number with the capture form; if it does not, finish in the open window.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
+/** A sighting the run saw no request of the person's follow. `confirmation` (#381): the portal opened a
+ *  native dialog after the click — it waits for the person, and the note says so. */
+export function humanClickUnconfirmedNote(label: string | undefined, errorPage: boolean, personInput?: boolean, confirmation = false): string {
+  return `${clickedOnReview(label, personInput)} while the stage was finishing (automation clicked nothing), and the run saw no request go from that click.${confirmation ? CONFIRMATION_ASKED : ""} Check the portal: if the application shows as submitted, enter its record number with the capture form; if it does not, finish in the open window.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
 }
-/** A committed click (a request of the person's went after it) whose page did not read as a completion. */
-export function humanClickStandsNote(label: string | undefined, personInput?: boolean): string {
-  return `${clickedOnReview(label, personInput)} while the stage was finishing (automation clicked nothing), and a request of yours went to the portal, but no completion page was read. The filing may have gone: check the portal before you click again; if it shows as submitted, enter its record number with the capture form.`;
+/** A committed click (a request of the person's went after it) whose page did not read as a completion.
+ *  `confirmation` (#381): a native dialog followed the click — never "click again" beside it. */
+export function humanClickStandsNote(label: string | undefined, personInput?: boolean, confirmation = false): string {
+  return confirmation
+    ? `${clickedOnReview(label, personInput)} while the stage was finishing (automation clicked nothing), and a request of yours went to the portal, but no completion page was read.${CONFIRMATION_ASKED} The filing may have gone: check the portal; if it shows as submitted, enter its record number with the capture form.`
+    : `${clickedOnReview(label, personInput)} while the stage was finishing (automation clicked nothing), and a request of yours went to the portal, but no completion page was read. The filing may have gone: check the portal before you click again; if it shows as submitted, enter its record number with the capture form.`;
 }
 /** A click a stopping abort held, with no filing-shaped request of the person's after it. Never begins
  *  "YOUR CLICK WAS HELD BACK" (HUMAN_CLICK_HELD_NOTE: a click before the hand-over). */
-export function humanClickHeldNote(label: string | undefined, abort: BackstopAbort, errorPage: boolean, personInput?: boolean): string {
-  return `${personInput === false ? "A CLICK ON" : "YOUR CLICK ON"} ${clickedLabel(label)} ON THE REVIEW PAGE WAS HELD BACK: the submit itself was not sent — ${describeBackstopAbort(abort)}. Check the portal before you click again.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
+export function humanClickHeldNote(label: string | undefined, abort: BackstopAbort, errorPage: boolean, personInput?: boolean, confirmation = false): string {
+  return `${personInput === false ? "A CLICK ON" : "YOUR CLICK ON"} ${clickedLabel(label)} ON THE REVIEW PAGE WAS HELD BACK: the submit itself was not sent — ${describeBackstopAbort(abort)}.${confirmation ? `${CONFIRMATION_ASKED} Check the portal.` : " Check the portal before you click again."}${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
 }
 /** A payment request after the person's final-submit click, held by rule 1 (automation never pays); no
  *  "click again" on a payment. A payment click the watch did not see as a submit: PAYMENT_HELD_NOTE. */
@@ -238,6 +253,9 @@ const HUMAN_CLICK_COMMIT_MS = 10_000;
 /** A main-frame document or filing-shaped request may precede its sighting by this much (the click's
  *  form POST and its sighting travel different CDP event streams). A plain fetch must follow it. */
 const HUMAN_CLICK_EARLY_MS = 300;
+/** #381 — a native dialog that opened this long before the click's sighting still answers that click
+ *  (the dialog and the sighting reach the run on different event streams). */
+const CONFIRMATION_EARLY_MS = 1_000;
 /** A sighting with only a plain fetch, or with a stopping abort, is judged only this long after it:
  *  the click's filing request may still be on its way. */
 const HUMAN_CLICK_SETTLE_MS = 1_500;
@@ -1663,6 +1681,10 @@ export class RecipeAdapter extends BasePortalAdapter {
   private humanClickReport(v: HumanClickVerdict): { notes: string[]; sentence: string; data: Record<string, unknown> } {
     const label = v.click?.label;
     const pi = v.click?.personInput;
+    // #381 — A CONFIRMATION WAS INVOLVED: the portal opened a native dialog after the click (it waits for
+    // the person; automation never answers it). "Click again" is never the advice beside it.
+    const confirmation = !!v.click && dialogOpenedSince(this.page, v.click.at - CONFIRMATION_EARLY_MS);
+    const thenCheck = confirmation ? "check the portal." : "check the portal before you click again.";
     const clicked = pi === false ? `a click on ${clickedLabel(label)} was seen on the review page` : `you clicked ${clickedLabel(label)} on the review page`;
     const yourClick = pi === false ? `a click on ${clickedLabel(label)}` : `your click on ${clickedLabel(label)}`;
     const data: Record<string, unknown> = {
@@ -1671,7 +1693,9 @@ export class RecipeAdapter extends BasePortalAdapter {
     };
     switch (v.verdict) {
       case "followUpHeld":
-        return { notes: [HUMAN_FOLLOW_UP_HELD_NOTE], data, sentence: "your submit went, then a request the next page made was held back and the window shows an error page — check the portal, then go Back and submit again if the application is not there." };
+        return confirmation
+          ? { notes: [HUMAN_FOLLOW_UP_HELD_CONFIRM_NOTE], data, sentence: "your submit went, then a request the next page made was held back and the window shows an error page — check the portal, then go Back to the review page if the application is not there." }
+          : { notes: [HUMAN_FOLLOW_UP_HELD_NOTE], data, sentence: "your submit went, then a request the next page made was held back and the window shows an error page — check the portal, then go Back and submit again if the application is not there." };
       case "filed":
         return { notes: [HUMAN_SUBMITTED_NOTE], data, sentence: "you submitted from the review window while the run was finishing — automation clicked nothing. The completion page was read: its record number is recorded on the project only when it is read confidently — if the project does not show it, enter it with the capture form." };
       case "draft": {
@@ -1684,8 +1708,8 @@ export class RecipeAdapter extends BasePortalAdapter {
       }
       case "stands":
         return {
-          notes: [humanClickStandsNote(label, pi), ...(v.payment ? [humanPaymentHeldNote(v.payment, v.errorPage)] : [])], data,
-          sentence: `${clicked} and a request of yours went to the portal, but no completion page was read — the filing may have gone: check the portal before you click again.`,
+          notes: [humanClickStandsNote(label, pi, confirmation), ...(v.payment ? [humanPaymentHeldNote(v.payment, v.errorPage)] : [])], data,
+          sentence: `${clicked} and a request of yours went to the portal, but no completion page was read — the filing may have gone: ${thenCheck}`,
         };
       case "held":
         // A held payment gets ONE note, the payment's; any other held request, the held-click note.
@@ -1693,11 +1717,11 @@ export class RecipeAdapter extends BasePortalAdapter {
           return { notes: [humanPaymentHeldNote(v.payment, v.errorPage)], data, sentence: `${yourClick} was held back with the payment request it sent — automation never pays, and no filing request went from it; check the portal.` };
         }
         return {
-          notes: v.held ? [humanClickHeldNote(label, v.held, v.errorPage, pi)] : [humanClickUnconfirmedNote(label, v.errorPage, pi)], data,
-          sentence: `${yourClick} was held back — the submit itself was not sent; check the portal before you click again.`,
+          notes: v.held ? [humanClickHeldNote(label, v.held, v.errorPage, pi, confirmation)] : [humanClickUnconfirmedNote(label, v.errorPage, pi, confirmation)], data,
+          sentence: `${yourClick} was held back — the submit itself was not sent; ${thenCheck}`,
         };
       default:
-        return { notes: [humanClickUnconfirmedNote(label, v.errorPage, pi)], data, sentence: `${clicked} and the run saw no request go from that click — check the portal before anything else.` };
+        return { notes: [humanClickUnconfirmedNote(label, v.errorPage, pi, confirmation)], data, sentence: `${clicked} and the run saw no request go from that click — check the portal before anything else.` };
     }
   }
 
@@ -2143,6 +2167,13 @@ export class RecipeAdapter extends BasePortalAdapter {
   private async readPageForCapture(): Promise<CapturePageRead | null> {
     const page = this.page;
     if (!page || typeof page.evaluate !== "function") return null;
+    // #381: skipped (null: "cannot be read") while a dialog waits for the person, never answered.
+    return readUnlessDialog(page, () => this.readPageForCaptureNow(), null);
+  }
+
+  private async readPageForCaptureNow(): Promise<CapturePageRead | null> {
+    const page = this.page;
+    if (!page || typeof page.evaluate !== "function") return null;
     try {
       const texts = await Promise.race([
         page.evaluate(() => {
@@ -2249,7 +2280,15 @@ export class RecipeAdapter extends BasePortalAdapter {
     return true;
   }
 
+  /** #381 — THE CAPTURE TOLERATES AN OPEN DIALOG: while a native dialog waits for the person on the
+   *  window (or one opens during the read), the page is not read and nothing is recorded — never
+   *  "answered so the read can go on". */
   async captureSubmissionConfirmation(): Promise<PortalStepResult> {
+    if (!this.page) return ok("No open page to capture confirmation from.", { permitNumber: "", recordLink: "" });
+    return readUnlessDialog(this.page, () => this.readSubmissionConfirmation(), ok(DIALOG_WAITING_CAPTURE, { permitNumber: "", recordLink: "", dialogOpen: true }));
+  }
+
+  private async readSubmissionConfirmation(): Promise<PortalStepResult> {
     if (!this.page) return ok("No open page to capture confirmation from.", { permitNumber: "", recordLink: "" });
     try {
       await smartWait(this.page);
@@ -3688,13 +3727,19 @@ export class RecipeAdapter extends BasePortalAdapter {
         this.progress("wait", NOT_HANDED_OVER_NOTE, 0);
       }
     }
-    const review = await this.verifyReviewScreen(project);
+    // #381 — THE REVIEW READ-BACK TOLERATES AN OPEN DIALOG: after the hand-over a native dialog on the
+    // window waits for the person (automation never answers it) and stalls every page read, so the
+    // read is skipped — said so in the summary — and never decides where the run stopped.
+    const reviewSkipped = { summary: REVIEW_READ_SKIPPED_SUMMARY, fieldsSeen: 0, confirmed: 0, mismatches: [] as ReviewMismatch[], skipped: true };
+    const review: { summary: string; fieldsSeen: number; confirmed: number; mismatches: ReviewMismatch[]; skipped?: boolean } =
+      await readUnlessDialog(this.page, () => this.verifyReviewScreen(project), reviewSkipped);
     const data = {
       executed, skipped, finalSubmitClicked: false, gapFill: this.gapFillReport,
       healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, slowSteps,
       requiredStillEmpty: this.requiredStillEmpty, unresolvedFields: this.unresolvedFields, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, requiredFieldsSeen: this.requiredFieldsSeen, stoppedAtPayment: this.stoppedAtPayment, pageShotDir: this.pageShotDir,
       outcomeShotPath: this.outcomeShotPath,
       reviewFieldsSeen: review.fieldsSeen, reviewFieldsConfirmed: review.confirmed, reviewMismatches: review.mismatches,
+      ...(review.skipped ? { reviewReadSkipped: "a dialog waits for the person in the window" } : {}),
       attachmentLedger: this.attachmentLedger, unrecordedAnswered: this.unrecordedAnswered,
     };
     // HONEST STATUS (runs-finish item 3). Live run 191e45c8 said "stopped at review" on Accela's
@@ -3728,7 +3773,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     const stop = !pastReview && !this.stoppedAtPayment && !onHeldErrorPage
       ? (personMovedOn && !this.humanSubmit
         ? (earlyStop && { where: earlyStop.where, refused: earlyStop.refused, message: this.stoppedBeforeReviewMessage(earlyStop.where, earlyStop.refused, this.personRequestWent) })
-        : (personMovedOn ? null : await this.whereTheRunStopped(review.confirmed, this.personRequestWent)))
+        : (personMovedOn || review.skipped ? null : await readUnlessDialog(this.page, () => this.whereTheRunStopped(review.confirmed, this.personRequestWent), null)))
       : null;
     if (stop) {
       this.stoppedBeforeReview = stop.message;
