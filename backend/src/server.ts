@@ -6,6 +6,7 @@ import express, { type NextFunction, type Request, type Response } from "express
 import cors from "cors";
 import fs from "node:fs";
 import path from "node:path";
+import { applyStateDirEnvDefaults, dbPath as stateDbPath, learnRunsDir, portalProfilesDir } from "./statePaths";
 import { openDatabase } from "./db";
 import { HttpError } from "./httpError";
 import { llmUsageForProject, runWithLlmContext } from "./llmAccounting";
@@ -56,7 +57,8 @@ import { startMonitorScheduler } from "./scheduler";
 import { startAhjFormRefreshScheduler, startKbLinkCheckScheduler } from "./ahjFormRefresh";
 import { startCecSyncScheduler, primeCecCache, syncCecEquipment } from "./cecEquipment";
 import { extractZipToWorkdir } from "./batchZip";
-import { AUTH_ENABLED, currentUser, login, logout, me, requireAuth, seedAdminUser, entitlementGate, requestOrg, createApiKey, ADMIN_ROLES, ROLE_SUPERADMIN } from "./auth";
+import { AUTH_ENABLED, currentUser, login, logout, me, requireAuth, seedAdminUser, setUserPassword, entitlementGate, requestOrg, createApiKey, ADMIN_ROLES, ROLE_SUPERADMIN, type SessionUser } from "./auth";
+import { changeOwnPassword, createStaffLogin, listStaffLogins, resetStaffPassword, setStaffLoginActive } from "./staffLogins";
 import { PRODUCTS, PRODUCT_KEYS, grantProduct, revokeProduct, orgEntitlements, productsForEdition } from "./entitlements";
 import { requestScope, orgFilter, orgClause, reqOrgFilter, assertInScope, auditCrossOrgAccess } from "./scope";
 import { folderScanPayload } from "./batchZip";
@@ -249,7 +251,8 @@ logger.info("build", `Running ${BUILD.label}`, {
   version: BUILD.version, sha: BUILD.sha, commitDate: BUILD.commitDate, dirty: BUILD.dirty,
   pinned: BUILD.pinned, source: BUILD.source, codeRoot: BUILD.codeRoot,
 });
-const dbPath = path.resolve(process.cwd(), process.env.AUTOPILOT_DB_PATH || "backend/data/autopilot.sqlite");
+const dbPath = stateDbPath();
+applyStateDirEnvDefaults(); // replay output under AUTOPILOT_STATE_DIR too (statePaths.ts)
 
 const asyncHandler =
   (handler: (req: Request, res: Response, next: NextFunction) => Promise<unknown>) =>
@@ -665,6 +668,30 @@ app.post("/api/ahj-forms/inspect", asyncHandler(async (req, res) => {
 app.post("/api/projects/:id/filled-forms", asyncHandler(async (req, res) => {
   const detail = getProjectDetail(db, String(req.params.id));
   res.json(await buildFilledFormsForProject(db, detail.project));
+}));
+
+// "VERIFY FILL WITH VISION" on a filled-form card (issue #428): read the filled PDF back page by
+// page and table each value against the printed label it sits under. Opt-in (the operator's
+// click), one vision call per page with a value, reports only — never corrects (rule 4). The
+// prompt carries printed labels, never values; a page printing a secret field is not sent (rule 2).
+app.post("/api/projects/:id/filled-forms/:formId/verify-vision", asyncHandler(async (req, res) => {
+  const projectId = String(req.params.id);
+  getProjectDetail(db, projectId); // 404 for a project out of scope
+  const formId = String(req.params.formId);
+  const file = filledFormPath(projectId, formId);
+  if (!fs.existsSync(file)) throw new HttpError(404, "Filled form not found. Build it first.");
+  const filled = new Uint8Array(fs.readFileSync(file));
+  const { intendedFromAcroForm, intendedFromOverlay, verifyFilledForm } = await import("./formFillVision");
+  let intended = await intendedFromAcroForm(filled);
+  if (!intended.length) {
+    // An overlay fill: what it drew is what the filled page prints and its blank does not.
+    const row = db.get<{ pdf_blob?: Uint8Array | null }>("SELECT pdf_blob FROM ahj_form_templates WHERE id = ?", [formId.replace(/^tmpl-/, "")]);
+    if (row?.pdf_blob) intended = await intendedFromOverlay(new Uint8Array(row.pdf_blob), filled);
+  }
+  if (!intended.length) throw new HttpError(422, "Nothing to verify: no filled values could be read from this form.");
+  const { createLLMProvider } = await import("./llm");
+  try { res.json(await verifyFilledForm(createLLMProvider(), filled, intended)); }
+  catch (err) { throw normalizeLlmError(err); }
 }));
 
 app.get("/api/projects/:id/filled-forms/:formId", (req, res) => {
@@ -1164,12 +1191,12 @@ app.post("/api/orgs/:id/users", (req, res) => {
   if (!email || !password) throw new HttpError(400, "email and password are required.");
   if (db.get("SELECT id FROM users WHERE email = ?", [email])) throw new HttpError(409, "A user with that email already exists.");
   const userId = crypto.randomUUID();
-  const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(password, salt, 64);
   db.run(
-    "INSERT INTO users (id, name, email, role, color, active, created_at, password_hash, org_id) VALUES (?, ?, ?, 'operator', '#0ea5e9', 1, ?, ?, ?)",
-    [userId, name, email, new Date().toISOString(), `${salt.toString("hex")}:${hash.toString("hex")}`, orgId],
+    "INSERT INTO users (id, name, email, role, color, active, created_at, org_id) VALUES (?, ?, ?, 'operator', '#0ea5e9', 1, ?, ?)",
+    [userId, name, email, new Date().toISOString(), orgId],
   );
+  // The one hash writer (auth.ts). This route used to inline its own copy of the scrypt format.
+  setUserPassword(db, userId, password);
   addAuditLog(db, null, "human", currentUser(db, req)?.email || "operator", "org.user_created", { orgId, email });
   res.status(201).json({ user: { id: userId, name, email, orgId } });
 });
@@ -1181,6 +1208,55 @@ app.post("/api/orgs/:id/api-keys", (req, res) => {
   const created = createApiKey(db, orgId, String(req.body?.name || "api key"));
   addAuditLog(db, null, "human", currentUser(db, req)?.email || "operator", "org.api_key_created", { orgId, keyId: created.id });
   res.status(201).json({ id: created.id, key: created.key, note: "Store this key now — it is shown only once." });
+});
+
+// ---------------------------------------------------------------------------
+// Staff logins (issue #431): the dashboard's Team panel makes, resets and switches off
+// teammates' sign-ins. Admin-gated (requireAdmin) and scoped to the ADMIN'S OWN ORG inside
+// staffLogins.ts: another org's user id is a 404, never a 403 (rule 6), and nobody
+// administers across orgs (owner ruling 2026-10-10). With sign-in off there is nothing to
+// manage, so these say so (409 auth_disabled) instead of quietly writing passwords nobody uses.
+// ---------------------------------------------------------------------------
+const SIGN_IN_OFF = "Sign-in is off on this server (AUTH_ENABLED is not true), so logins and passwords are not used here.";
+
+function requireStaffAdmin(req: Request): SessionUser {
+  if (!AUTH_ENABLED) throw new HttpError(409, SIGN_IN_OFF, { code: "auth_disabled" });
+  requireAdmin(req);
+  const actor = currentUser(db, req);
+  if (!actor) throw new HttpError(401, "Not authenticated.");
+  return actor;
+}
+
+app.get("/api/staff/logins", (req, res) => {
+  if (!AUTH_ENABLED) { res.json({ authEnabled: false, logins: [] }); return; }
+  const actor = requireStaffAdmin(req);
+  res.json({ authEnabled: true, logins: listStaffLogins(db, actor) });
+});
+
+app.post("/api/staff/logins", (req, res) => {
+  const actor = requireStaffAdmin(req);
+  res.status(201).json({ login: createStaffLogin(db, actor, req.body || {}) });
+});
+
+app.post("/api/staff/logins/:id/password", (req, res) => {
+  const actor = requireStaffAdmin(req);
+  res.json({ login: resetStaffPassword(db, actor, String(req.params.id), req.body?.password) });
+});
+
+app.post("/api/staff/logins/:id/active", (req, res) => {
+  const actor = requireStaffAdmin(req);
+  if (typeof req.body?.active !== "boolean") throw new HttpError(400, "active must be true or false.");
+  res.json({ login: setStaffLoginActive(db, actor, String(req.params.id), req.body.active) });
+});
+
+// Self-service password change. It sits under /api/auth/, which the sign-in gate lets through
+// (the login route lives there), so THIS HANDLER is the gate: no session, no change.
+app.post("/api/auth/password", (req, res) => {
+  if (!AUTH_ENABLED) throw new HttpError(409, SIGN_IN_OFF, { code: "auth_disabled" });
+  const user = currentUser(db, req);
+  if (!user) throw new HttpError(401, "Not authenticated.");
+  changeOwnPassword(db, user, req.body?.currentPassword, req.body?.newPassword);
+  res.json({ ok: true });
 });
 
 // Shareable read-only report link (e.g. the AHJ forwards a pre-review to an applicant).
@@ -1858,7 +1934,7 @@ app.put("/api/portal-recipes/:id/steps", (req, res) => {
 function closeReviewBrowsers(clientId: string, scope: "utility" | "ahj"): void {
   const safeClientId = clientId.replace(/[^A-Za-z0-9_-]/g, "");
   if (!safeClientId || !db.get("SELECT id FROM clients WHERE id = ?", [safeClientId])) return;
-  const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  const profileBase = portalProfilesDir();
   void import("../../portal-bot/src/index")
     .then(({ closeStagingBrowsersForTrack }) => closeStagingBrowsersForTrack(path.join(profileBase, safeClientId), scope))
     .catch(() => { /* browser close is best-effort — it may already be closed */ });
@@ -2628,6 +2704,28 @@ app.post("/api/tools/form-fill/auto", express.json({ limit: "60mb" }), asyncHand
     return;
   }
   res.json({ mode: "manual", placements: [], message: "This form has no fillable fields or text layer — place values manually." });
+}));
+
+// "Verify fill with vision" for the standalone tool (issue #428): the filled PDF, plus — for a
+// flat form — the placements the auto-fill made ({page, label, text}); a fillable form's values
+// and printed captions are read off the PDF itself. Opt-in, one vision call per page with a
+// value, reports only (rule 4); labels only in the prompt and no page that prints a secret field
+// (rule 2). Stateless like every other /api/tools/form-fill route: nothing is stored.
+app.post("/api/tools/form-fill/verify", express.json({ limit: "60mb" }), asyncHandler(async (req, res) => {
+  const pdfBase64 = String(req.body?.pdfBase64 || "");
+  if (!pdfBase64) throw new HttpError(400, "pdfBase64 required.");
+  const bytes = new Uint8Array(Buffer.from(pdfBase64, "base64"));
+  const { isPdf } = await import("./formFiller");
+  if (!isPdf(bytes)) throw new HttpError(400, "pdfBase64 is not a PDF.");
+  const { intendedFromAcroForm, verifyFilledForm } = await import("./formFillVision");
+  const given = Array.isArray(req.body?.placements) ? req.body.placements as Array<Record<string, unknown>> : [];
+  const intended = given.length
+    ? given.slice(0, 400).map((p) => ({ page: Number(p.page) || 0, label: String(p.label ?? ""), value: String(p.text ?? p.value ?? "") })).filter((r) => r.value.trim())
+    : await intendedFromAcroForm(bytes);
+  if (!intended.length) throw new HttpError(422, "Nothing to verify: auto-fill the form first.");
+  const { createLLMProvider } = await import("./llm");
+  try { res.json(await verifyFilledForm(createLLMProvider(), bytes, intended)); }
+  catch (err) { throw normalizeLlmError(err); }
 }));
 
 app.post("/api/tools/form-fill/fill", express.json({ limit: "60mb" }), asyncHandler(async (req, res) => {
@@ -3513,8 +3611,7 @@ app.get("/api/projects/:id/portal-runs/:runId/review-screenshot", (req, res) => 
 // These two endpoints are the troubleshooting handoff: list the runs, download one
 // zipped, and paste/send the zip when asking for help with a failed learn.
 // ---------------------------------------------------------------------------
-const learnRunsBase = (): string =>
-  process.env.AUTOLEARN_RUN_DIR ? path.resolve(process.env.AUTOLEARN_RUN_DIR) : path.resolve(process.cwd(), "data", "learn-runs");
+const learnRunsBase = (): string => learnRunsDir();
 const SAFE_RUN_ID = /^[A-Za-z0-9._-]+$/;
 
 app.get("/api/learn-runs", (req, res) => {
@@ -3723,7 +3820,7 @@ const server = app.listen(port, listen.host, () => {
   if (process.env.BACKGROUND_WORKERS !== "off") void (async () => {
     try {
       const { reapOrphanedProfileBrowsers } = await import("../../portal-bot/src/browser");
-      const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+      const profileBase = portalProfilesDir();
       const killed = await reapOrphanedProfileBrowsers(profileBase);
       if (killed > 0) logger.warn("portal", `Reaped ${killed} orphaned portal browser(s) left by a previous run — their profiles are free again.`);
     } catch { /* cleanup is best-effort; never block startup */ }

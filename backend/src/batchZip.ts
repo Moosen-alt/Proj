@@ -1,10 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
+import { backendDataDir } from "./statePaths";
 import AdmZip from "adm-zip";
 import { AUTH_ENABLED } from "./auth";
 
 // Where uploaded zips get extracted before the folder scan runs.
-const UPLOAD_ROOT = path.resolve(process.cwd(), process.env.BATCH_UPLOAD_DIR || "backend/data/batch-uploads");
+const UPLOAD_ROOT = process.env.BATCH_UPLOAD_DIR ? path.resolve(process.env.BATCH_UPLOAD_DIR) : path.join(backendDataDir(), "batch-uploads");
 
 export interface ExtractedZip {
   folderPath: string;

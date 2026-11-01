@@ -43,12 +43,13 @@ Create `/etc/solar-autopilot.env` (chmod 600):
 ```
 AUTH_ENABLED=true
 SERVER_HOST=0.0.0.0                     # listen beyond loopback ON PURPOSE (the default is 127.0.0.1)
+SERVER_IS_SHARED=1                      # dashboard hides/relabels controls that read the SERVER'S disk (#439); detected anyway with the two lines above
 ADMIN_EMAIL=you@company.com
 ADMIN_PASSWORD=<strong password>        # first login; change after
 ANTHROPIC_API_KEY=sk-ant-...
 SESSION_ENCRYPTION_KEY=<openssl rand -hex 32>   # portal credentials at rest — LOSING THIS LOSES STORED LOGINS
 ALLOWED_ORIGINS=https://autopilot.yourco.com     # lock CORS to your domain
-AUTOPILOT_DB_PATH=/var/lib/solar/autopilot.db   # persistent disk
+AUTOPILOT_STATE_DIR=/var/lib/solar            # persistent disk: database, documents, backups, portal logins, draft ledger, runs, logs
 PORTAL_HEADLESS=true
 DOCUMENT_FETCH_BROWSER=0                # no headed-browser fallback for walled documents: a server has no display
 PUBLIC_BASE_URL=https://autopilot.yourco.com   # client-facing links in emails; NEVER leave the localhost default in production
@@ -68,6 +69,14 @@ WantedBy=multi-user.target
 
 HTTPS front door (Caddy — automatic certificates):
 `caddy reverse-proxy --from autopilot.yourco.com --to localhost:4000`
+
+One state root: `AUTOPILOT_STATE_DIR` puts every piece of state under one folder
+(`backend/src/statePaths.ts`): `autopilot.sqlite`, `project-documents/`, `backups/`,
+`portal-profiles/` (the live portal logins), `portal-drafts.jsonl` (the draft ledger),
+`learn-runs/`, `replay-runs/`, `screenshots/`, `portal-debug/` and `logs/`. Back up and move that
+one folder. Do not also set `AUTOPILOT_DB_PATH`, `PROJECT_DOCS_DIR` or `PORTAL_PROFILES_DIR`: each
+still wins over the root and splits the state again. In Docker the image already sets it to the
+mounted volume, `/app/backend/data` (DEPLOY.md §3).
 
 Rules: ONE instance only (SQLite). Updates: `git pull && npm install
 && npm run smoke && systemctl restart solar` — migrations self-apply.
@@ -112,7 +121,9 @@ snapshot does both:
 
 `litestream.yml` replicates **only the SQLite file** — continuous DB replication,
 not files. So the off-box copy still matters: nightly `restic`/`rclone` of the
-whole data dir (or at minimum `backups/`) to S3/R2. Restore = `litestream restore`
+whole `AUTOPILOT_STATE_DIR` (or at minimum `backups/`) to S3/R2. The backup, the
+restore drill (`scripts/ops/restore-drill.ts`), preflight and the watchdog read the
+same resolver as the server, so they find the database and folders under it. Restore = `litestream restore`
 (or the newest snapshot) **plus** the document tree; do the files first, so the
 restored rows point at something.
 
@@ -122,11 +133,24 @@ Env: `BACKUP_DIR`, `BACKUP_KEEP` (snapshots, default 14), `BACKUP_INTERVAL_HOURS
 ## Employee logins
 
 - Log in as admin (ADMIN_EMAIL/PASSWORD) at the dashboard → session cookie.
-- Create login-capable workers with the org users API:
-  `POST /api/orgs/:id/users {"email","name","password"}` (your own org's id is
-  `org-default`). NOTE: the plain `POST /api/users` route and the dashboard
-  Users panel create directory entries only — they take no password and cannot
-  produce a login. Passwords hashed; API keys sha256 + shown once.
+- Give teammates logins from the dashboard: **Team** → **Add**, fill name and
+  email, type a **Sign-in password** (10+ characters; Operator or Admin), Save.
+  Tell them the password privately. For someone already on the team without a
+  login, select them and use **Set password** in the **Sign-in** section; the
+  same section resets a password and switches a login off (they are signed out
+  on their next click) or back on. Everyone changes their own password under
+  **Change my password** (asks for the current one). Admins only, your own org
+  only, every action in the audit log with who did it. With sign-in off these
+  sections say so and do nothing.
+  API behind it: `GET/POST /api/staff/logins`,
+  `POST /api/staff/logins/:id/password {"password"}`,
+  `POST /api/staff/logins/:id/active {"active"}`,
+  `POST /api/auth/password {"currentPassword","newPassword"}`.
+  The older `POST /api/orgs/:id/users {"email","name","password"}` still works.
+  Passwords hashed; API keys sha256 + shown once.
+- A password reset does not end a session already open elsewhere (sessions are
+  signed cookies, up to AUTH_SESSION_HOURS). To cut someone off at once,
+  deactivate the login.
 - Assign projects per user (`projects.assigned_user_id`, dashboard selector).
 - `/api/auth/login` / `/api/auth/logout`; everything else 401s without a
   session or `x-api-key`.

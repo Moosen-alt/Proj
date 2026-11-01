@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { backendDataDir } from "./statePaths";
 import type { AppDb } from "./db";
 import { learnFromHistoricalDocument } from "./knowledgeBase";
 import { pdfjsDocumentOptions } from "./pdfjsOptions";
@@ -489,7 +490,7 @@ export async function scanFolder(
 // Reporting — terminal + on-disk, for troubleshooting as the dataset grows
 // ---------------------------------------------------------------------------
 
-const REPORT_DIR = process.env.BATCH_REPORT_DIR || path.join(process.cwd(), "backend", "data", "batch-reports");
+const REPORT_DIR = process.env.BATCH_REPORT_DIR || path.join(backendDataDir(), "batch-reports");
 
 function writeScanReport(folderPath: string, summary: ScanSummary): string | undefined {
   try {

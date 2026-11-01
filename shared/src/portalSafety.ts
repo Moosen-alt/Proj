@@ -1451,13 +1451,33 @@ export function portalSafetyFactory() {
   // /gps/user/). Keep every token anchored: a loose one aborts a portal's own filing
   // (approvedFinalSubmit.dom.smoke.ts). Plain regex syntax only: this source also runs in the page.
   const PAY_FEE_URL = /(payment|checkout|invoice|paymentus|payfee|placeorder|authorize\.net|\/xml\/v\d+\/request\.api|pointandpay|\/api\/v\d+\/transactions|fees?\/settle|govpay|\/gps\/user\/)/i;
+  // A bare "pay" counts only as a WHOLE PATH SEGMENT (/pay, /pay/fee, …/pay?x, …/pay;jsessionid=…),
+  // never inside a word: /payload, /paystub, /display, /payee stay negative (#379). Tested on the
+  // path only (the URL before "?" / "#"), so a "/pay" inside a query value is not a segment.
+  const PAY_SEGMENT_URL = /\/pay(?=[\/?#;]|$)/i;
+  // #379: a percent-encoded letter must not hide a word. Many servers decode the path before
+  // routing (IIS/ASP.NET does), so "/S%75bmitApplication" or "/%70ayment/charge" lands on the
+  // filing or payment handler. Decode every ASCII %XX escape ONCE, escape by escape (one pass, so
+  // "%2575" becomes "%75" and no more): a malformed escape such as "%zz" stays as written and does
+  // not stop the rest of the URL decoding, which a whole-string decodeURIComponent would. Only
+  // ASCII escapes (%00-%7F) can spell an ASCII word, so this decodes everything a per-segment
+  // decodeURIComponent could turn into one. Both forms are tested, so this only WIDENS.
+  const urlForms = (u: string): string[] => {
+    const decoded = u.replace(/%([0-7][0-9a-f])/gi, (_m: string, hex: string) => String.fromCharCode(parseInt(hex, 16)));
+    return decoded === u ? [u] : [u, decoded];
+  };
+  const isPayUrlText = (u: string): boolean => {
+    if (urlForms(u).some((f) => PAY_FEE_URL.test(f))) return true;
+    const path = u.split(/[?#]/)[0];
+    return urlForms(path).some((f) => PAY_SEGMENT_URL.test(f));
+  };
   const isSubmitOrPayRequestUrl = (url: string | null | undefined): boolean => {
     const u = String(url ?? "");
-    return !!u && (FINAL_SUBMIT_URL.test(u) || PAY_FEE_URL.test(u));
+    return !!u && (urlForms(u).some((f) => FINAL_SUBMIT_URL.test(f)) || isPayUrlText(u));
   };
   const isPayRequestUrl = (url: string | null | undefined): boolean => {
     const u = String(url ?? "");
-    return !!u && PAY_FEE_URL.test(u);
+    return !!u && isPayUrlText(u);
   };
 
   /**

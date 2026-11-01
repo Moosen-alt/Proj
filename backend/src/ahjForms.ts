@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { backendDataDir } from "./statePaths";
 import { PDFDocument, PDFName, PDFRadioGroup, StandardFonts, degrees, rgb } from "pdf-lib";
 import type { ProjectRecord } from "../../shared/src/types";
 import type { AppDb } from "./db";
@@ -148,8 +149,8 @@ export function formAllowedForPath(
 //    sign; automation only pre-fills.
 // =============================================================================
 
-const TEMPLATE_DIR = path.resolve(process.cwd(), "backend/data/ahj-forms");
-const FILLED_DIR = path.resolve(process.cwd(), "backend/data/filled");
+const TEMPLATE_DIR = path.join(backendDataDir(), "ahj-forms");
+const FILLED_DIR = path.join(backendDataDir(), "filled");
 
 // A value source mini-language used by field maps:
 //   "project.<field>"  -> ProjectRecord field

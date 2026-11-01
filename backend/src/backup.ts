@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { backupDir, dbPath as stateDbPath, portalProfilesDir, projectDocsDir } from "./statePaths";
 import type { AppDb } from "./db";
 import { DOCS_DIR } from "./projectDocuments";
 import { logger } from "./logger";
@@ -8,7 +9,7 @@ import {
 } from "./offboxBackup";
 
 // Where snapshots go, and how many to keep. Both overridable via env.
-const BACKUP_DIR = path.resolve(process.cwd(), process.env.BACKUP_DIR || "backend/data/backups");
+const BACKUP_DIR = backupDir();
 const KEEP = Number(process.env.BACKUP_KEEP || 14);
 const INTERVAL_HOURS = Number(process.env.BACKUP_INTERVAL_HOURS || 24);
 
@@ -42,7 +43,7 @@ const DOCS_MIRROR = path.join(BACKUP_DIR, "documents");
 // Only session state is mirrored (Cookies, Local/Session Storage, Login Data, Preferences).
 // A Chrome profile is mostly cache — hundreds of MB of it — and copying that would make
 // every backup enormous while restoring nothing of value.
-const PROFILES_DIR = path.resolve(process.cwd(), process.env.PORTAL_PROFILES_DIR || "portal-profiles");
+const PROFILES_DIR = portalProfilesDir();
 const PROFILES_MIRROR = path.join(BACKUP_DIR, "portal-profiles");
 const SESSION_FILE_RE = /(^|[\\/])(Cookies|Cookies-journal|Login Data|Login Data-journal|Web Data|Preferences|Local State|Secure Preferences)$|[\\/](Local Storage|Session Storage|IndexedDB)[\\/]/i;
 
@@ -68,9 +69,12 @@ const SESSION_FILE_RE = /(^|[\\/])(Cookies|Cookies-journal|Login Data|Login Data
  * A production database moved off the default with its trees left behind would stop mirroring —
  * so a skip is never silent: it is named on the run result, in the status file, and in the log.
  */
-const DEFAULT_DB_PATH = path.resolve(process.cwd(), "backend/data/autopilot.sqlite"); // db.ts's default
-const DEFAULT_DOCS_DIR = path.resolve(process.cwd(), "backend/data/project-documents"); // projectDocuments.ts's default
-const DEFAULT_PROFILES_DIR = path.resolve(process.cwd(), "portal-profiles");
+// The defaults come from statePaths.ts with the per-path overrides stripped, so they follow
+// AUTOPILOT_STATE_DIR (#430): under it the default trees are the state dir's, and travel together.
+const DEFAULTS_ONLY = { env: { AUTOPILOT_STATE_DIR: process.env.AUTOPILOT_STATE_DIR } };
+const DEFAULT_DB_PATH = stateDbPath(DEFAULTS_ONLY); // db.ts's default
+const DEFAULT_DOCS_DIR = projectDocsDir(DEFAULTS_ONLY); // projectDocuments.ts's default
+const DEFAULT_PROFILES_DIR = portalProfilesDir(DEFAULTS_ONLY);
 
 /**
  * May a backup of the database at `dbPath` mirror the source tree at `tree`?

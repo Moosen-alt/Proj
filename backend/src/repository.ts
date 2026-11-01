@@ -67,6 +67,7 @@ import type {
 import { correctionFilingStamp, correctionOverdueSql, touchProjectMetrics, type CorrectionFilingInput } from "./kpi";
 import fs from "node:fs";
 import path from "node:path";
+import { portalProfilesDir } from "./statePaths";
 import os from "node:os";
 import { checkStatusWithAdapter, runCorrectionReopen, stageWithAccela, stageWithMockPortal, stageWithPowerClerk, stageWithRecipe } from "../../portal-bot/src/index";
 import { portalAutomationDisabled, resolveHeadless } from "../../portal-bot/src/browser";
@@ -82,7 +83,8 @@ import type { DesignTextSource } from "./designCriteria";
 import { describeCited, lookedUpRecordType, issuingAgencyFor, permitAnswerForTrack, stateRulesFor, isStatewidePortalUrl, permitProcessKey, projectForTrack, refuseTrackIssuerValue, trackIssuer } from "./permitProcess";
 import { statewideDecisionFor, statewideUrlRefusal } from "./statewideEvidence";
 import { RESEARCH_UNCONFIRMED_REASON, researchNamedPlatform, researchSaysPortalUnconfirmed, researchWithFittedUrl } from "./researchedPortalUrl";
-import { bindRecipeForReplay, describeReplayBinding, openPerJobQuestions } from "./recipeReplayBinding";
+import { bindRecipeForReplay, describeReplayBinding } from "./recipeReplayBinding";
+import { recipeStageGaps, stageGapsRefusal, type RecipeStageGap } from "./recipeStageGaps";
 import { agencyListStatusResolver, documentInventory, missingFilledAtStaging, owedDocumentAction, owedMissingDocuments, requiredListCheck, type DocumentInventory, type DocPresence } from "./requiredDocuments";
 import { deadLinkSentence, formDeadLinks, startedAtLabel, type StageAcquiredForm } from "./formAcquisitionPlan";
 import { agencyListReplacesLine, issuingAgencyDocumentList } from "./applicationDocsAgency";
@@ -6123,7 +6125,7 @@ export async function reopenCorrectionOnPortal(
 
   // 4) Credential/session conventions shared with the learner/replay/monitor.
   const clientId = detail.project.clientId ?? "";
-  const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  const profileBase = portalProfilesDir();
   const portalType = scopeType === "utility" ? "utility" : "AHJ";
   const userDataDir = portalProfileDir(profileBase, clientId || null, portalType, portalUrl);
   const credential = clientId
@@ -7303,6 +7305,20 @@ function storeFoundStatusLink(db: AppDb, projectId: string, target: Row, track: 
   return link;
 }
 
+/**
+ * WHICH RECIPE DISCIPLINE A TRACKED FILING READS ITS STATUS WITH (#426) — staging's own answer
+ * (recipeDisciplineForTrack), never a second list. A target's permit_type is the track it was
+ * filed on (ensureCheckTarget writes the track), so a track name maps directly; anything else
+ * ("structural" from an older door) goes through trackForTarget, the ONE target → track answer
+ * (structural → building). A NEM filing reads the utility's recipe, which has no discipline.
+ */
+export function recipeDisciplineForTarget(targetType: string, permitType: string): string {
+  if (trackKind(targetType, permitType) === "nem") return "";
+  const permit = text(permitType).trim().toLowerCase();
+  const track = (SUBMITTAL_TRACK_TYPES as string[]).includes(permit) ? permit : trackForTarget(targetType, permit);
+  return recipeDisciplineForTrack(track);
+}
+
 export async function runDuePermitChecks(
   db: AppDb,
   targetType: "permit" | "nem" | "all" = "all",
@@ -7353,7 +7369,7 @@ export async function runDuePermitChecks(
     const applicationNumbers = [text(target.application_number), text(target.permit_number)].filter(Boolean);
     const projectDetail = getProjectDetail(db, projectId);
     const clientId = projectDetail.project.clientId ?? "";
-    const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+    const profileBase = portalProfilesDir();
     // WHAT THIS SWEEP LEARNED ABOUT READING THE FILING ON ITS OWN (#413): the facts the card's one
     // line is worded from (statusLinkGap.statusReadGap), and the record link a signed-in read found.
     const gap: Omit<ReadGapFacts, "entityName" | "clientName" | "hasNumber" | "track"> = {
@@ -7381,9 +7397,12 @@ export async function runDuePermitChecks(
 
     if (applicationNumbers.length > 0 && !rawStatusText) {
       const scopeType: "ahj" | "utility" = targetType === "nem" ? "utility" : "ahj";
-      let recipe =
-        findCompleteRecipeForProject(db, { scopeType, state: projectDetail.project.state, ahj: projectDetail.project.ahj, utility: projectDetail.project.utility })
-        ?? findAnyRecipeForProject(db, { scopeType, state: projectDetail.project.state, ahj: projectDetail.project.ahj, utility: projectDetail.project.utility });
+      // THE FILING'S OWN DISCIPLINE (#426): a per-discipline AHJ (City of Coos Bay: a structural and
+      // an electrical recipe, no '' row) has no recipe for a discipline-less lookup, so the monitor
+      // never signed in and fell back to a public page that read nothing.
+      const discipline = recipeDisciplineForTarget(text(target.target_type), text(target.permit_type));
+      const recipeInput = { scopeType, state: projectDetail.project.state, ahj: projectDetail.project.ahj, utility: projectDetail.project.utility, discipline };
+      let recipe = findCompleteRecipeForProject(db, recipeInput) ?? findAnyRecipeForProject(db, recipeInput);
       if (recipe) gap.recipe = "used";
       if (recipe) {
         const entityInput = { scope: scopeType, state: projectDetail.project.state, name: scopeType === "utility" ? projectDetail.project.utility : projectDetail.project.ahj, excludeRecipeIds: [recipe.id] };
@@ -9130,7 +9149,7 @@ export async function prepareSubmission(
     : undefined;
 
   // Per-client browser profile so sessions never bleed across clients.
-  const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  const profileBase = portalProfilesDir();
   const userDataDir = clientId
     ? path.join(profileBase, clientId, portalType)
     : path.join(profileBase, portalType);
@@ -9469,9 +9488,18 @@ export async function prepareSubmission(
   // (R10) now binds that control to the job's key, and an unanswered key would replay a blank — so
   // the question is asked first, named, the way the question bank lists it for intake. Same
   // predicate as the bank, the binders and the planner (shared/src/perJobQuestions).
+  //
+  // AND EVERY OTHER BOX THE RECIPE WILL FILL (#445, owner 2026-10-31: "automated fill is right every
+  // time"). validatePortalFields above is a fixed list; the recipe binds far more (a preparer phone,
+  // an inverter model, a contractor licence, an uploaded document), and a blank one only showed at
+  // the portal — after a full run. The same bound steps and the same value dictionary the replay
+  // below is handed are read once here (recipeStageGaps): every non-optional fill/select bound to a
+  // field this job has no value for, and every upload whose document is not on file, refuses the
+  // stage with each one named. Literal steps and steps the replay answers itself never count. It
+  // refuses earlier and never answers a field; it reads and writes no row but the audit line.
   if (recipe && runActorLabel === "RecipeAdapter" && !channelDecision.blocked
       && !recipeTrackConflict && !recipeEntityMisfit && !recipeDisciplineConflict) {
-    let open: Array<{ key: string; label: string }> = [];
+    let gaps: RecipeStageGap[] = [];
     try {
       const gateValues = resolveRecipeFieldValues(db, stagedProject, portalType, track ?? null);
       const gateBinding = bindRecipeForReplay({
@@ -9479,20 +9507,31 @@ export async function prepareSubmission(
         borrowed: borrowed ? { learnedFor: borrowed.learnedFor, discipline: borrowed.discipline } : null,
         agency: issuingAgencyFor(portalProject, track),
       });
-      open = openPerJobQuestions(gateBinding.steps, { ...gateValues, ...gateBinding.fieldValues });
+      gaps = recipeStageGaps(gateBinding.steps, { ...gateValues, ...gateBinding.fieldValues }, docsByType, { clientKeys: Object.keys(overlay) });
     } catch (err) {
       // The replay path binds the same steps again inside the run below and records its own failure.
-      logger.warn("prepare-submission", `per-job question check could not read the recipe: ${err instanceof Error ? err.message : String(err)}`);
+      logger.warn("prepare-submission", `recipe input check could not read the recipe: ${err instanceof Error ? err.message : String(err)}`);
     }
-    if (open.length) {
-      addAuditLog(db, projectId, "system", "submit gate", "portal.per_job_question_open", {
-        track: track ?? "permit", recipeId: recipe.id, questions: open,
+    if (gaps.length) {
+      const open = gaps.filter((g) => g.kind === "question").map((g) => ({ key: g.key, label: g.label }));
+      // Labels and keys only — never a value (rule 2: a secret gap carries its fixed label).
+      const missingRecipeInputs = gaps.filter((g) => g.kind !== "question")
+        .map((g) => ({ kind: g.kind, key: g.key, label: g.label, fieldName: g.fieldName, where: g.where, secret: g.secret }));
+      if (open.length) {
+        addAuditLog(db, projectId, "system", "submit gate", "portal.per_job_question_open", {
+          track: track ?? "permit", recipeId: recipe.id, questions: open,
+        });
+      }
+      if (missingRecipeInputs.length) {
+        addAuditLog(db, projectId, "system", "submit gate", "portal.recipe_inputs_missing", {
+          track: track ?? "permit", recipeId: recipe.id, missing: missingRecipeInputs.map((g) => ({ kind: g.kind, key: g.key, label: g.label })),
+        });
+      }
+      throw new HttpError(409, stageGapsRefusal(gaps, portalLabel), {
+        ...(open.length ? { unansweredPortalQuestions: open } : {}),
+        ...(missingRecipeInputs.length ? { missingRecipeInputs } : {}),
+        track: track ?? "permit", recipeId: recipe.id,
       });
-      throw new HttpError(409,
-        `Staging paused before opening the portal: ${portalLabel} asks ${open.length === 1 ? "a question" : `${open.length} questions`} only a person can answer for this job — `
-        + `${open.map((q) => `"${q.label}"`).join("; ")}. The recorded answer belonged to another job, so it is never replayed; `
-        + "answer it under the project's portal questions (or send the intake link), then stage again. Nothing was opened.",
-        { unansweredPortalQuestions: open, track: track ?? "permit", recipeId: recipe.id });
     }
   }
   let result: Record<string, unknown>;

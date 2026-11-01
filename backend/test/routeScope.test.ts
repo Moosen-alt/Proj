@@ -72,6 +72,18 @@ const UNSCOPED_BY_DESIGN: Record<string, string> = {
   "/api/auth/login": "establishes the session",
   "/api/auth/logout": "ends the session",
   "/api/auth/me": "reports the current session",
+  // Self-service password change (#431). Under /api/auth/, which the sign-in gate lets through,
+  // so the handler itself refuses a request with no session (asserted below) and only ever
+  // touches the signed-in user's own row.
+  "/api/auth/password": "self-service: the handler requires a session and changes only that user's own password",
+
+  // Staff logins (#431): admin-gated (requireStaffAdmin = sign-in on + requireAdmin) and scoped
+  // INSIDE staffLogins.ts to the acting admin's own org, where another org's id is a 404.
+  // Each route is asserted below to call requireStaffAdmin; staffLogins.test.ts boots the
+  // server and proves the 404.
+  "/api/staff/logins": "admin-gated; listStaffLogins reads only the admin's own org",
+  "/api/staff/logins/:id/password": "admin-gated; resetStaffPassword 404s on an id outside the admin's org",
+  "/api/staff/logins/:id/active": "admin-gated; setStaffLoginActive 404s on an id outside the admin's org",
 
   // Org/licence administration. Gated by requireAdmin (role + autopilot entitlement),
   // which is a stronger check than org scoping.
@@ -239,6 +251,31 @@ run(
   apiRoutes.some((r) => r.verb === "post" && r.path === "/api/projects/:id/status"),
   `POST /api/projects/:id/status is not registered at that path: ${JSON.stringify(apiRoutes.filter((r) => r.path.endsWith("/status")))}`,
 );
+
+// STAFF LOGINS (#431). Exempted above by name, so assert what the exemption leans on: every
+// /api/staff route goes through requireStaffAdmin, and the self-service change refuses a
+// request with no session (it sits under /api/auth/, which the sign-in gate waves through).
+{
+  const staffRoutes = apiRoutes.filter((r) => r.path.startsWith("/api/staff"));
+  run("the staff-login routes are registered", staffRoutes.length >= 4, JSON.stringify(staffRoutes));
+  for (const route of staffRoutes) {
+    const start = source.indexOf(`app.${route.verb}("${route.path}"`);
+    const body = start < 0 ? "" : source.slice(start, source.indexOf("\napp.", start + 10));
+    run(`${route.verb.toUpperCase()} ${route.path} is admin-gated`, /requireStaffAdmin\(req\)/.test(body), body.slice(0, 300));
+  }
+  run(
+    "requireStaffAdmin runs requireAdmin and refuses when sign-in is off",
+    /function requireStaffAdmin\(req: Request\)[\s\S]{0,300}!AUTH_ENABLED[\s\S]{0,200}requireAdmin\(req\)/.test(source),
+    "requireStaffAdmin must check AUTH_ENABLED and call requireAdmin",
+  );
+  const start = source.indexOf('app.post("/api/auth/password"');
+  const body = start < 0 ? "" : source.slice(start, source.indexOf("\napp.", start + 10));
+  run(
+    "POST /api/auth/password refuses without a session",
+    /const user = currentUser\(db, req\);\s*if \(!user\) throw new HttpError\(401/.test(body),
+    body.slice(0, 300),
+  );
+}
 
 // The guards must not have been quietly removed.
 for (const expected of ["/api/projects", "/api/clients", "/api/customers"]) {

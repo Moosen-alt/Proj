@@ -18,6 +18,7 @@
 // Read it with: npx tsx scripts/draft-ledger.ts
 import fs from "node:fs";
 import path from "node:path";
+import { draftLedgerPath as resolveDraftLedgerPath } from "./statePaths";
 
 export interface DraftTouch {
   /** ISO timestamp of the moment we opened the portal. */
@@ -42,8 +43,9 @@ export interface DraftTouch {
   note?: string;
 }
 
-const LEDGER_PATH = (): string =>
-  process.env.PORTAL_DRAFT_LEDGER || path.resolve(process.cwd(), "data", "portal-drafts.jsonl");
+// PORTAL_DRAFT_LEDGER, else data/portal-drafts.jsonl — never silently moved by AUTOPILOT_STATE_DIR
+// on an install that already has one (statePaths.ts draftLedgerLocation).
+const LEDGER_PATH = (): string => resolveDraftLedgerPath();
 
 /**
  * Record that a run touched a live portal and may have left a draft.

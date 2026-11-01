@@ -10,6 +10,7 @@
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
+import { logFilePath } from "../backend/src/statePaths";
 
 process.env.AUTOPILOT_DB_PATH = process.env.AUTOPILOT_DB_PATH || "backend/data/autopilot.sqlite";
 const { openDatabase } = await import("../backend/src/db");
@@ -23,7 +24,7 @@ const rule = (t: string) => { line(); line(`── ${t} ${"─".repeat(Math.max(
 
 // --- Backend liveness --------------------------------------------------------
 rule("BACKEND");
-const logFile = process.env.AUTOPILOT_LOG_FILE || path.join(process.cwd(), "data", "logs", "backend.log");
+const logFile = logFilePath();
 if (fs.existsSync(logFile)) {
   const st = fs.statSync(logFile);
   const ageMin = (Date.now() - st.mtimeMs) / 60000;

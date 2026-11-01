@@ -10,6 +10,7 @@
 // evidence of the failure they are investigating.
 import fs from "node:fs";
 import path from "node:path";
+import { runDataDir } from "./statePaths";
 import { logger } from "./logger";
 
 interface Target {
@@ -23,7 +24,7 @@ interface Target {
 }
 
 function targets(): Target[] {
-  const base = path.resolve(process.cwd(), "data");
+  const base = runDataDir();
   const n = (env: string, fallback: number) => {
     const v = Number(process.env[env]);
     return Number.isFinite(v) && v >= 0 ? v : fallback;

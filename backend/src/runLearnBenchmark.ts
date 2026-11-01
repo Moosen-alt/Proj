@@ -16,6 +16,7 @@ process.env.SKIP_CODE_RESEARCH = "1";
 process.env.AUTOPILOT_AUTO_START = "0";
 import fs from "node:fs";
 import path from "node:path";
+import { runDataDir } from "./statePaths";
 import { openDatabase } from "./db";
 import { createProject, deleteProject } from "./repository";
 import { autoLearnPortal } from "./autoLearn";
@@ -24,7 +25,7 @@ import { isUtilityPlatformUrl } from "./portalChannel";
 import { recordDraftTouch } from "./draftLedger";
 import { reachedReviewFromEvents, scoreLearnOutcome, summarize, compareRuns, compareDepth, markUnreachableBursts, isMeasured, type BenchmarkRow } from "./learnBenchmark";
 
-const OUT_DIR = path.resolve(process.cwd(), "data", "learn-benchmark");
+const OUT_DIR = path.join(runDataDir(), "learn-benchmark");
 // The learn stops itself at budgetMs; the walk checks its deadline BETWEEN pages, so a run
 // legitimately overruns by the length of its last page (uploads and slow postbacks can be a
 // couple of minutes). This slack keeps the outer backstop from firing on an orderly finish —

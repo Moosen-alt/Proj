@@ -22,6 +22,7 @@
 // ---------------------------------------------------------------------------
 
 import path from "node:path";
+import { portalProfilesDir, screenshotsDir } from "./statePaths";
 import fs from "node:fs";
 import type { AppDb } from "./db";
 import type { InfoPageIncident, PortalRecipe, ProjectRecord, RecipeStep } from "../../shared/src/types";
@@ -1045,7 +1046,7 @@ async function autoLearnPortalInner(
   const credential = project.clientId
     ? getDecryptedCredentialForPortal(db, project.clientId, portalType, portalUrl) ?? undefined
     : undefined;
-  const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  const profileBase = portalProfilesDir();
   const userDataDir = project.clientId
     ? path.join(profileBase, project.clientId, learnProfileName(portalType, portalUrl))
     : path.join(profileBase, learnProfileName(portalType, portalUrl));
@@ -2339,7 +2340,7 @@ async function autoLearnPortalInner(
       if (debugDir) {
         dest = path.join(debugDir, "verdict.json");
       } else {
-        const screenshotDir = path.join(process.cwd(), "data", "screenshots");
+        const screenshotDir = screenshotsDir();
         fs.mkdirSync(screenshotDir, { recursive: true });
         dest = path.join(screenshotDir, `verdict-${stub.id}-${Date.now()}.json`);
       }
@@ -2399,7 +2400,7 @@ async function autoLearnPortalInner(
   }
 
     try {
-      const screenshotDir = path.join(process.cwd(), "data", "screenshots");
+      const screenshotDir = screenshotsDir();
       fs.mkdirSync(screenshotDir, { recursive: true });
       const screenshotPath = path.join(screenshotDir, `review-${stub.id}-${Date.now()}.png`);
       const pngBuf = Buffer.from(learn.reviewScreenshotBase64, "base64");

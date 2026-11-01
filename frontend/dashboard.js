@@ -2459,6 +2459,7 @@ const FEE_SOURCE_LABELS = {
   published_schedule: "published fee schedule",
   learned_history: "learned from past submissions here",
   valuation_estimate: "estimate from valuation",
+  printed_form: "fee table printed on the AHJ's form (may be out of date)",
   unknown: "unknown — enter the portal fee",
 };
 
@@ -2478,6 +2479,7 @@ function renderPaymentQuoteCard(quote) {
         <tr style="border-top:1px solid var(--border)"><td style="padding:3px 14px 1px 0"><strong>Client total</strong></td><td style="text-align:right"><strong>${money(quote.totalUsd)}</strong></td><td></td></tr>
       </table>
       <p class="muted" style="margin:2px 0;font-size:11px">${esc(quote.permitFeeBasis || "")}</p>
+      ${printedFormCheckHtml(quote.printedFormCheck)}
       ${status === "paid" ? `<p style="margin:2px 0;font-size:12px">Paid ${p.paidAt ? new Date(p.paidAt).toLocaleString() : ""}${p.paymentReference ? ` — ref: ${esc(p.paymentReference)}` : ""}</p>` : ""}
       ${status !== "paid" ? `
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">
@@ -2620,6 +2622,7 @@ const FEE_SOURCE_TEXT = {
   published_schedule: "the jurisdiction's published fee schedule",
   learned_history: "the median of real fees seen here before",
   valuation_estimate: "a percentage of the project valuation",
+  printed_form: "the fee table printed on the AHJ's own form, which may be out of date",
   unknown: "nowhere yet",
 };
 
@@ -2819,6 +2822,19 @@ function feeComparisonHtml(line) {
     </div>`;
 }
 
+// THE FEE TABLE PRINTED ON THE AHJ'S OWN FORM, BESIDE THE AMOUNT (#454) — a dated, lower-trust
+// cross-check. Drawn only when it agrees or disagrees: "no printed table" is not news on a card.
+// A disagreement is a note under the amount, never a second amount. Every value escaped.
+function printedFormCheckHtml(check) {
+  if (!check || (check.verdict !== "agrees" && check.verdict !== "disagrees")) return "";
+  const lines = Array.isArray(check.lines) ? check.lines : [];
+  const fmt = (v) => `$${Number(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return `<details class="provenance fee-printed-check" style="margin:2px 0;font-size:12px">
+      <summary>${check.verdict === "disagrees" ? `<span class="badge badge-warning">printed form disagrees</span> ` : `<span class="badge badge-pass">printed form agrees</span> `}${esc(check.note || "")}</summary>
+      <ul>${lines.map((l) => `<li>${esc(l.label)}: ${esc(fmt(l.amountUsd))}</li>`).join("")}</ul>
+    </details>`;
+}
+
 // WHAT THE PERMIT MONITOR READ OFF EACH FILED RECORD, one click away: the invoices it saw, when,
 // and — for a record it could not read — why (never a $0).
 function feePortalRecordsHtml(line) {
@@ -2891,6 +2907,7 @@ function renderFeeSheetLine(line) {
       ${portalProvenance}
       ${verifiedNote}
       ${feeComparisonHtml(line)}
+      ${printedFormCheckHtml(line.printedFormCheck)}
       ${confirmControl}
       ${renderFeeCharges(line)}
       ${feePortalRecordsHtml(line)}
@@ -4364,7 +4381,7 @@ async function launchRecordSession() {
 function downloadRecordBat() {
   const cmd = buildRecordCommand();
   if (!cmd) { showMessage("Open a project first.", "warning"); return; }
-  const bat = `@echo off\r\nREM Record this portal and save the recipe to the central server.\r\nREM Save this file in your SOLAR-Proj folder, then double-click it.\r\ncd /d "%~dp0"\r\n${cmd}\r\npause\r\n`;
+  const bat = `@echo off\r\nREM Record this portal and save the recipe to the central server.\r\nREM Save this file in your SOLAR-Proj folder, then double-click it.\r\n${sharedServerBatLines()}cd /d "%~dp0"\r\n${cmd}\r\npause\r\n`;
   const blob = new Blob([bat], { type: "application/octet-stream" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -4373,6 +4390,72 @@ function downloadRecordBat() {
   a.click();
   a.remove();
   URL.revokeObjectURL(a.href);
+}
+
+// ----- Shared server posture (#439) -----
+// On the owner's own PC "the server" and "my computer" are the same box, so pasting a local MBOX
+// path, scanning a folder, or launching a recorder window "here" just works. On a shared server
+// every one of those reads the SERVER'S disk or opens a window nobody can see. GET /api/auth/me
+// says which (serverIsShared, backend/src/serverPosture.ts); with it on, body.server-shared hides
+// the .local-disk-only controls and shows the .shared-server-note lines (styles.css), and the
+// record helper names the server URL and the recorder token. With it off nothing changes.
+function serverIsSharedNow() {
+  return !!(state.authMe && state.authMe.serverIsShared === true);
+}
+
+function recordSharedNoteText() {
+  const origin = window.location.origin;
+  let text = `This dashboard runs on a shared server, so the recorder runs on your own computer, not here: download record.bat or copy the command, and run it in your SOLAR-Proj folder. It saves the recipe to this server: ${origin}.`;
+  if (state.authMe && state.authMe.enabled) {
+    text += " Sign-in is on here, so the recorder needs your personal recorder token. Recorder tokens are not built yet (issue #433); until then this server refuses a recording sent from your computer.";
+  }
+  return text;
+}
+
+function sharedServerBatLines() {
+  if (!serverIsSharedNow()) return "";
+  // REM lines are inert; the origin comes from the browser's own location bar, never the server.
+  const origin = window.location.origin.replace(/[\r\n%^&|<>]/g, "");
+  let lines = `REM Saves to the shared server ${origin} (the --api flag below).\r\n`;
+  if (state.authMe && state.authMe.enabled) lines += "REM Sign-in is on there: the recorder needs your personal recorder token (issue #433).\r\n";
+  return lines;
+}
+
+function applyServerPosture() {
+  const shared = serverIsSharedNow();
+  document.body.classList.toggle("server-shared", shared);
+  const note = shared ? recordSharedNoteText() : "";
+  for (const id of ["recordSharedNote", "recordCmdSharedNote"]) {
+    const el = $(id);
+    if (el) el.textContent = note;
+  }
+  // Say "on the server" in the controls that stay (an admin may put a file there on purpose).
+  // Off: put back exactly what dashboard.html shipped.
+  const relabel = (id, prop, sharedText) => {
+    const el = $(id);
+    if (!el) return;
+    const key = `localText_${prop}`;
+    if (el.dataset[key] === undefined) el.dataset[key] = el[prop];
+    el[prop] = shared ? sharedText : el.dataset[key];
+  };
+  relabel("batchFolderPath", "placeholder", "Folder path ON THE SERVER (not your computer)");
+  relabel("emailWatchPath", "placeholder", "MBOX path ON THE SERVER to watch (not your computer)");
+  const scanLabel = $("startBatchScanBtn")?.querySelector("span");
+  if (scanLabel) {
+    if (scanLabel.dataset.localText === undefined) scanLabel.dataset.localText = scanLabel.textContent;
+    scanLabel.textContent = shared ? "Scan Server Folder" : scanLabel.dataset.localText;
+  }
+}
+
+async function loadServerPosture() {
+  try { state.authMe = await api("/api/auth/me"); } catch { /* an older server: treat as not shared */ }
+  applyServerPosture();
+}
+
+// The MBOX upload's own error text used to send everyone to Import Path; on a shared server that
+// control is hidden (it would read the server's disk), so the hint is left out there.
+function mboxPathFallbackHint(text) {
+  return serverIsSharedNow() ? "" : text;
 }
 
 // Run a render step in isolation: a failure in one panel (e.g. unexpected project
@@ -5024,6 +5107,67 @@ async function saveTrackIssuer(type, value, btn) {
   }
 }
 
+// WHAT THIS TRACK'S RECIPE WILL FILL THAT THE JOB HAS NO VALUE FOR (#445, owner 2026-10-31: "automated
+// fill is right every time"). The server's own reading (backend recipeStageGaps — the list the stage
+// gate refuses on), shown before anyone clicks Stage: each box in the portal's words, what to fill,
+// and a link to where it is filled. Labels and keys only; the server never sends a value (rule 2).
+// Untrusted text: esc() everything.
+const STAGE_GAP_LINK = {
+  project: "Fill it on the project",
+  client: "Fill it on the client",
+  documents: "Upload it",
+  portal_questions: "Answer it",
+};
+function trackStageGapsHtml(t) {
+  const gaps = Array.isArray(t && t.stageGaps) ? t.stageGaps : [];
+  if (!gaps.length) return "";
+  const what = (g) => g.kind === "document"
+    ? `needs a ${g.fieldName} document`
+    : g.kind === "question"
+      ? "a question only a person can answer for this job"
+      : `needs ${g.fieldName}${g.where === "client" ? " (client record)" : ""}`;
+  const items = gaps.map((g) => `<li data-stage-gap="${esc(g.key)}" data-stage-gap-kind="${esc(g.kind)}">
+        <span>“${esc(g.label || g.fieldName)}” — ${esc(what(g))}</span>
+        <a href="#" data-stage-gap-open="${esc(g.where)}" data-stage-gap-key="${esc(g.key)}">${esc(STAGE_GAP_LINK[g.where] || "Open")}</a>
+      </li>`).join("");
+  return `<div class="track-stage-gaps" data-track-stage-gaps="${esc(t.type)}" style="margin:0 0 6px;font-size:12px;color:var(--warning)">
+    <strong>Fill before staging — the recipe fills ${gaps.length === 1 ? "this box" : `these ${gaps.length} boxes`} and this job has no value, so staging will stop here:</strong>
+    <ul style="margin:2px 0 0 18px;padding:0">${items}</ul>
+  </div>`;
+}
+// Where each gap is filled. A project field with its own box on the project-data form is focused;
+// anything else opens the form it lives on.
+const STAGE_GAP_PROJECT_INPUT = {
+  homeownerEmail: "manualHomeownerEmail", ubAccountHolderEmail: "manualHomeownerEmail",
+  homeownerPhone: "manualHomeownerPhone", ubAccountHolderPhone: "manualHomeownerPhone",
+  workDescription: "manualDescription", jobValue: "manualJobValue",
+};
+function openStageGap(where, key) {
+  const reveal = (el) => {
+    if (!el) return;
+    // Every collapsed section it sits in (the stage accordion and the project-data panel) opens.
+    for (let d = el.closest ? el.closest("details") : null; d; d = d.parentElement ? d.parentElement.closest("details") : null) d.open = true;
+    if (el.scrollIntoView) el.scrollIntoView({ block: "center" });
+    if (el.focus) el.focus();
+  };
+  if (where === "documents") {
+    const sel = $("docUploadType");
+    if (sel && Array.from(sel.options || []).some((o) => o.value === key)) sel.value = key;
+    reveal(sel);
+    return;
+  }
+  if (where === "client") {
+    const clientId = state.detail && state.detail.project ? state.detail.project.clientId : "";
+    Promise.resolve(openClientsModal()).then(() => { if (clientId) editClient(clientId); }).catch(() => {});
+    return;
+  }
+  if (where === "portal_questions") {
+    reveal(document.getElementById("portalQuestionsChip") || document.querySelector(".intake-link-row"));
+    return;
+  }
+  reveal($(STAGE_GAP_PROJECT_INPUT[key] || "") || $("manualEntryForm"));
+}
+
 function trackCardHtml(t) {
   const cls = TRACK_STATUS_CLASS[t.status] || "info";
   // Captured numbers — only the fields this track actually uses (NEM has no permit #).
@@ -5095,6 +5239,7 @@ function trackCardHtml(t) {
     ${trackPrerequisitesHtml(t)}
     ${trackEssStepHtml(t)}
     <p style="margin:0 0 6px;font-size:12px">→ ${linkifyText(trackNextActionText(t))}</p>
+    ${trackStageGapsHtml(t)}
     ${captured ? `<p style="margin:0 0 4px">${captured} ${trackLink ? "&nbsp;·&nbsp; " + trackLink : ""}</p>` : (trackLink ? `<p style="margin:0 0 4px">${trackLink}</p>` : "")}
     ${t.recipeId && (t.recipeStatus === "complete" || t.recipeStatus === "recording")
       && !screenshotMisses.has(screenshotKey(state.selectedProjectId, t.recipeId, t.recipeStatus))
@@ -5227,6 +5372,9 @@ function renderSubmittalTracks() {
   });
   wrap.querySelectorAll("button[data-track-stage]").forEach((btn) => {
     btn.addEventListener("click", () => stageSubmittalTrack(btn.dataset.trackStage, btn));
+  });
+  wrap.querySelectorAll("a[data-stage-gap-open]").forEach((a) => {
+    a.addEventListener("click", (ev) => { ev.preventDefault(); openStageGap(a.dataset.stageGapOpen, a.dataset.stageGapKey); });
   });
   wrap.querySelectorAll("button[data-track-open-recorder]").forEach((btn) => {
     btn.addEventListener("click", () => launchTrackRecorder(btn.dataset.trackOpenRecorder, btn.dataset.scope, btn));
@@ -6832,6 +6980,7 @@ function renderFilledForms(projectId) {
         </div>` : ""}
       ${builtIn ? `<p class="muted">Built-in map written for this exact official revision (matched by the blank's fingerprint) — no mapping verification needed. Review the filled PDF before filing.</p>` : ""}
       ${ok && !isStored && !f.signaturesLocked ? `<p class="muted"><button type="button" class="secondary" data-detect-sign="${esc(f.formId)}" style="font-size:12px">Detect signature lines (AI)</button> — stamp your stored signature on this form.</p>` : ""}
+      ${ok ? `<p class="muted"><button type="button" class="secondary" data-verify-vision="${esc(f.formId)}" style="font-size:12px">Verify fill with vision</button> — reads the filled PDF back and lists each value under the printed label it sits beside. Reports only; it never changes the form.</p><div data-vision-result="${esc(f.formId)}"></div>` : ""}
       ${ok && !isStored && f.signaturesLocked ? `<p class="muted">✓ Built-in form — signature + date auto-placed on the authorized-signature line. No verification needed.</p>` : ""}
       ${f.documentStale ? `<p class="muted"><strong>This blank dates itself “${esc(f.documentDate)}”</strong> — over two years old. Re-check the AHJ's current forms page before filing${f.sourceUrl ? ` (<a href="${esc(f.sourceUrl)}" target="_blank" rel="noopener noreferrer">source</a>)` : ""}. Check any printed fee rates against the current schedule.</p>` : ""}
       ${extra ? `<p class="muted">${esc(extra)}</p>` : ""}
@@ -7239,6 +7388,32 @@ function bindFilledFormControls() {
   document.querySelectorAll("[data-verify-form]").forEach((b) => b.addEventListener("click", () => verifyFilledForm(b.getAttribute("data-verify-form"))));
   document.querySelectorAll("[data-remap-form]").forEach((b) => b.addEventListener("click", () => remapFilledForm(b.getAttribute("data-remap-form"), b)));
   document.querySelectorAll("[data-detect-sign]").forEach((b) => b.addEventListener("click", () => detectRegistrySignatures(b.getAttribute("data-detect-sign"))));
+  document.querySelectorAll("[data-verify-vision]").forEach((b) => b.addEventListener("click", () => verifyFillWithVision(b.getAttribute("data-verify-vision"), b)));
+}
+
+/** The "Verify fill with vision" table (issue #428): one row per filled value, what vision read and
+ *  under which printed label, and the verdict. Shared by the filled-form card and nothing else. */
+function fillVisionTableHtml(report) {
+  const rows = (report.rows || []).map((r) => `<tr><td>${esc(String((r.page ?? 0) + 1))}</td><td>${esc(r.label || "—")}</td><td>${esc(r.intended)}</td><td>${esc(r.read || "—")}</td><td>${esc(r.readUnder || "—")}</td><td><strong>${esc(r.verdict)}</strong></td></tr>`).join("");
+  const extra = (report.unexpected || []).map((u) => `<tr><td>${esc(String((u.page ?? 0) + 1))}</td><td>—</td><td>—</td><td>${esc(u.read)}</td><td>${esc(u.label || "—")}</td><td><strong>not intended</strong></td></tr>`).join("");
+  const skipped = (report.skippedPages || []).map((p) => `<li>Page ${esc(String(p.page + 1))}: ${esc(p.reason)}</li>`).join("");
+  const wrong = (report.rows || []).filter((r) => r.verdict !== "right" && r.verdict !== "read (no intended label)").length;
+  return `<p class="muted">${esc(`${(report.checkedPages || []).length} page(s) read, ${report.calls || 0} vision call(s). ${wrong ? `${wrong} value(s) need a look.` : "Every intended value read back under its label."}`)}</p>
+    ${skipped ? `<ul class="muted" style="margin:2px 0 6px 18px">${skipped}</ul>` : ""}
+    ${rows || extra ? `<table style="font-size:12px;border-collapse:collapse;width:100%"><thead><tr><th>Page</th><th>Printed label</th><th>Filled</th><th>Vision read</th><th>Read under</th><th>Verdict</th></tr></thead><tbody>${rows}${extra}</tbody></table>` : ""}`;
+}
+
+async function verifyFillWithVision(formId, btn) {
+  if (!formId || !state.selectedProjectId) return;
+  const out = document.querySelector(`[data-vision-result="${CSS.escape(formId)}"]`);
+  if (btn) btn.disabled = true;
+  if (out) out.innerHTML = `<p class="muted">Reading the filled form back with vision (one call per page)…</p>`;
+  try {
+    const report = await api(`/api/projects/${encodeURIComponent(state.selectedProjectId)}/filled-forms/${encodeURIComponent(formId)}/verify-vision`, { method: "POST", body: "{}" });
+    if (out) out.innerHTML = fillVisionTableHtml(report);
+  } catch (err) {
+    if (out) out.innerHTML = `<p class="muted">${esc(err.message || "Vision check failed.")}</p>`;
+  } finally { if (btn) btn.disabled = false; }
 }
 
 // Rebuild the filled forms after a change (verify/remap/detect) and refresh the
@@ -9159,7 +9334,7 @@ function uploadMboxFile(file) {
       }
       resolve(data);
     };
-    xhr.onerror = () => reject(new Error("Browser could not upload the selected MBOX file. Paste the local file path below and use Import Path."));
+    xhr.onerror = () => reject(new Error(`Browser could not upload the selected MBOX file.${mboxPathFallbackHint(" Paste the local file path below and use Import Path.")}`));
     xhr.onabort = () => reject(new Error("MBOX import was canceled."));
     setMboxProgress(1, `Starting upload for ${file.name} (${formatBytes(file.size)})...`);
     xhr.send(file);
@@ -9193,7 +9368,7 @@ async function importMbox(event) {
   } catch (err) {
     event.target.value = "";
     setMboxProgress(0, "Import failed.", true);
-    showMessage(`${err.message || "MBOX import failed."}\nIf the file is cloud-only, locked by Outlook, or too large for browser upload, paste its full local path and click Import Path.`, "error");
+    showMessage(`${err.message || "MBOX import failed."}${mboxPathFallbackHint("\nIf the file is cloud-only, locked by Outlook, or too large for browser upload, paste its full local path and click Import Path.")}`, "error");
   }
 }
 
@@ -10708,16 +10883,21 @@ function editUser(userId) {
   $("u_role").value = user.role;
   $("u_color").value = user.color;
   renderUsersList();
+  staffSignInStatus("");
+  renderStaffSignIn();
 }
 
 // A NEW member is always created as an Operator (users.ts createUser — creation is not an
 // elevation path). Offering "Admin" on the Add form saved an Operator and still said "Saved.",
 // so the choice is shut on a new member and opens once they exist (promotion is an edit).
+// One exception (#431): a new member given a sign-in password is created through the admin-gated
+// POST /api/staff/logins, which takes the role, so Admin opens for that case only.
 function syncUserRoleChoice(isNew) {
+  const withLogin = !!isNew && newMemberGetsLogin();
   const admin = $("u_role")?.querySelector('option[value="admin"]');
-  if (admin) admin.disabled = !!isNew;
-  if (isNew && $("u_role")) $("u_role").value = "operator";
-  if ($("u_roleHint")) $("u_roleHint").hidden = !isNew;
+  if (admin) admin.disabled = !!isNew && !withLogin;
+  if (isNew && !withLogin && $("u_role")) $("u_role").value = "operator";
+  if ($("u_roleHint")) $("u_roleHint").hidden = !isNew || withLogin;
 }
 
 function blankUserForm() {
@@ -10728,7 +10908,10 @@ function blankUserForm() {
   $("u_email").value = "";
   syncUserRoleChoice(true);
   $("u_color").value = "#6366f1";
+  if ($("u_password")) $("u_password").value = "";
   renderUsersList();
+  staffSignInStatus("");
+  renderStaffSignIn();
 }
 
 // The Team modal is opened from the dashboard, where #message (inside the project view) is
@@ -10750,8 +10933,9 @@ async function saveUser(event) {
     color: $("u_color").value,
   };
   if (!payload.name || !payload.email) { userFormStatus("Name and email are required.", "warning"); return; }
+  const userId = $("userId").value;
+  if (!userId && newMemberGetsLogin()) { await createMemberWithLogin(payload); return; }
   try {
-    const userId = $("userId").value;
     if (userId) {
       await api(`/api/users/${userId}`, { method: "PUT", body: JSON.stringify(payload) });
     } else {
@@ -10769,8 +10953,153 @@ async function saveUser(event) {
   }
 }
 
+// ----- Staff sign-ins (#431) -----
+// The Team modal's "Sign-in" section: an admin sets or resets a teammate's password and switches
+// a login off or on; "Change my password" lets anyone signed in change their own (current password
+// required). With sign-in off on the server there is nothing to manage, and both sections say so
+// rather than offering buttons that would write passwords nobody uses. A password typed here goes
+// to the server once and is cleared from the box; it is never shown back or kept in state.
+const STAFF_MIN_PASSWORD = 10;
+
+async function loadStaffSignIn() {
+  const auth = await authForDecision();
+  if (!auth || !auth.enabled) { state.staffSignIn = { mode: "off", me: null, logins: [] }; return; }
+  try {
+    const data = await api("/api/staff/logins");
+    state.staffSignIn = { mode: data.authEnabled ? "admin" : "off", me: auth.user, logins: Array.isArray(data.logins) ? data.logins : [] };
+  } catch {
+    state.staffSignIn = { mode: "member", me: auth.user, logins: [] };
+  }
+}
+
+function newMemberGetsLogin() {
+  return state.staffSignIn?.mode === "admin" && Boolean($("u_password")?.value);
+}
+
+function staffSignInStatus(text, kind) {
+  const el = $("staffSignInStatus");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = kind === "error" ? "message error" : "muted";
+}
+
+function myPasswordStatus(text, kind) {
+  const el = $("myPasswordStatus");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = kind === "error" ? "message error" : "muted";
+}
+
+function renderStaffSignIn() {
+  const info = state.staffSignIn || { mode: "off", me: null, logins: [] };
+  const off = info.mode === "off";
+  const offText = "Sign-in is off on this server, so there are no logins or passwords to manage here. An admin turns it on with AUTH_ENABLED=true (see docs/SERVER_SETUP.md).";
+  const isNew = !$("userId")?.value;
+  if ($("u_passwordWrap")) $("u_passwordWrap").hidden = !(isNew && info.mode === "admin");
+  if ($("u_passwordHint")) $("u_passwordHint").hidden = !(isNew && info.mode === "admin");
+  syncUserRoleChoice(isNew);
+
+  // Change my password: anyone signed in.
+  $("myPasswordState").textContent = off ? offText : `Signed in as ${(info.me && (info.me.name || info.me.email)) || "you"}.`;
+  $("myPasswordControls").hidden = off || !info.me;
+
+  // The selected member's sign-in.
+  const stateEl = $("staffSignInState");
+  const controls = $("staffSignInControls");
+  const toggle = $("sl_toggleActiveBtn");
+  controls.hidden = true;
+  toggle.hidden = true;
+  if (off) { stateEl.textContent = offText; return; }
+  if (info.mode !== "admin") { stateEl.textContent = "Only an admin can set or reset team sign-ins."; return; }
+  const userId = $("userId").value;
+  if (!userId) { stateEl.textContent = "Add a sign-in password above to give a new member a login when you save them."; return; }
+  const login = info.logins.find((l) => l.id === userId);
+  if (!login) { stateEl.textContent = "This member is not in your organization's sign-in list."; return; }
+  if (info.me && login.id === info.me.id) { stateEl.textContent = "This is you. Use Change my password below."; return; }
+  if (login.role === "superadmin" && info.me?.role !== "superadmin") { stateEl.textContent = "Only a superadmin can manage this login."; return; }
+  stateEl.textContent = !login.hasLogin
+    ? `${login.name} has no sign-in yet. Set a password to give them one.`
+    : login.active ? `${login.name} can sign in.` : `${login.name}'s sign-in is switched off.`;
+  controls.hidden = false;
+  $("sl_setPasswordBtn").querySelector("span").textContent = login.hasLogin ? "Reset password" : "Set password";
+  if (login.hasLogin || !login.active) {
+    toggle.hidden = false;
+    toggle.querySelector("span").textContent = login.active ? "Deactivate login" : "Reactivate login";
+  }
+}
+
+async function refreshStaffSignIn() {
+  await loadStaffSignIn();
+  renderStaffSignIn();
+}
+
+async function createMemberWithLogin(payload) {
+  const password = $("u_password").value;
+  if (password.length < STAFF_MIN_PASSWORD) { userFormStatus(`The sign-in password must be at least ${STAFF_MIN_PASSWORD} characters.`, "warning"); return; }
+  try {
+    const created = await api("/api/staff/logins", { method: "POST", body: JSON.stringify({ name: payload.name, email: payload.email, role: payload.role, password }) });
+    $("u_password").value = "";
+    await loadUsers();
+    await refreshStaffSignIn();
+    if (created?.login?.id) editUser(created.login.id);
+    userFormStatus(`Added with a sign-in as ${created?.login?.role === "admin" ? "an Admin" : "an Operator"}. Tell them the password privately.`, "info");
+  } catch (err) {
+    userFormStatus(err.message || "Could not create the sign-in.", "error");
+  }
+}
+
+async function setStaffPassword() {
+  const userId = $("userId").value;
+  const password = $("sl_password").value;
+  if (!userId) return;
+  if (password.length < STAFF_MIN_PASSWORD) { staffSignInStatus(`The password must be at least ${STAFF_MIN_PASSWORD} characters.`, "error"); return; }
+  try {
+    await api(`/api/staff/logins/${encodeURIComponent(userId)}/password`, { method: "POST", body: JSON.stringify({ password }) });
+    $("sl_password").value = "";
+    await refreshStaffSignIn();
+    staffSignInStatus("Password set. Tell it to them privately; they can change it under Change my password.");
+  } catch (err) {
+    staffSignInStatus(err.message || "Could not set the password.", "error");
+  }
+}
+
+async function toggleStaffActive() {
+  const userId = $("userId").value;
+  const login = (state.staffSignIn?.logins || []).find((l) => l.id === userId);
+  if (!login) return;
+  const turnOff = login.active;
+  if (turnOff && !confirm(`Switch off ${login.name}'s sign-in? They are signed out at once and can't sign in until an admin switches it back on.`)) return;
+  try {
+    await api(`/api/staff/logins/${encodeURIComponent(userId)}/active`, { method: "POST", body: JSON.stringify({ active: !turnOff }) });
+    await loadUsers();
+    await refreshStaffSignIn();
+    staffSignInStatus(turnOff ? "Sign-in switched off." : "Sign-in switched back on.");
+  } catch (err) {
+    staffSignInStatus(err.message || "Could not change the sign-in.", "error");
+  }
+}
+
+async function changeMyPassword() {
+  const currentPassword = $("mp_current").value;
+  const newPassword = $("mp_new").value;
+  if (!currentPassword) { myPasswordStatus("Enter your current password.", "error"); return; }
+  if (newPassword.length < STAFF_MIN_PASSWORD) { myPasswordStatus(`The new password must be at least ${STAFF_MIN_PASSWORD} characters.`, "error"); return; }
+  if (newPassword !== $("mp_repeat").value) { myPasswordStatus("The two new passwords don't match.", "error"); return; }
+  try {
+    await api("/api/auth/password", { method: "POST", body: JSON.stringify({ currentPassword, newPassword }) });
+    myPasswordStatus("Your password is changed. Use the new one next time you sign in.");
+  } catch (err) {
+    myPasswordStatus(err.message || "Could not change your password.", "error");
+  } finally {
+    $("mp_current").value = "";
+    $("mp_new").value = "";
+    $("mp_repeat").value = "";
+  }
+}
+
 async function openUsersModal() {
   $("usersModal").hidden = false;
+  await loadStaffSignIn();
   await loadUsers();
   if ((state.users || []).length > 0) editUser(state.users[0].id);
   else blankUserForm();
@@ -10783,6 +11112,10 @@ $("openUsersBtn").addEventListener("click", openUsersModal);
 $("closeUsersBtn").addEventListener("click", closeUsersModal);
 $("newUserBtn").addEventListener("click", blankUserForm);
 $("userForm").addEventListener("submit", saveUser);
+$("u_password").addEventListener("input", () => syncUserRoleChoice(!$("userId").value));
+$("sl_setPasswordBtn").addEventListener("click", setStaffPassword);
+$("sl_toggleActiveBtn").addEventListener("click", toggleStaffActive);
+$("mp_saveBtn").addEventListener("click", changeMyPassword);
 $("usersModal").addEventListener("click", (e) => { if (e.target.id === "usersModal") closeUsersModal(); });
 
 // ----- KPI Dashboard -----
@@ -10974,6 +11307,7 @@ $("kpiModal").addEventListener("click", (e) => { if (e.target.id === "kpiModal")
   if (bootPage !== "project") showPage(VALID_PAGES.includes(bootPage) ? bootPage : "dashboard", { skipLoad: true });
 }
 await checkHealth();
+await loadServerPosture();
 // Independent loads, in parallel: the board no longer waits on clients and users in series.
 await Promise.all([loadProjects(), loadClients(), loadUsers()]);
 // Users arrive in parallel with the board, so repaint once for the assignee dots.

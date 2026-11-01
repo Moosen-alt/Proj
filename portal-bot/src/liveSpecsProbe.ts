@@ -34,6 +34,7 @@
 import { chromium, type Page } from "playwright";
 import fs from "node:fs";
 import path from "node:path";
+import { runDataDir } from "../../backend/src/statePaths";
 
 // Credentials should NOT be passed on the command line (they leak into shell
 // history/process lists). If PC_CREDS_FILE points at a KEY=VALUE file, load it
@@ -50,7 +51,7 @@ const URL0 = requireEnv("PC_URL");
 const EMAIL = requireEnv("PC_EMAIL");
 const PASS = requireEnv("PC_PASS");
 const TAG = process.env.PC_TAG || "portal";
-const OUT = process.env.OUT_DIR || path.join("data", "live-probe", TAG);
+const OUT = process.env.OUT_DIR || path.join(runDataDir(), "live-probe", TAG);
 // Headed by default — see the WAF note above. HEADLESS=1 is an explicit override.
 const HEADLESS = process.env.HEADLESS === "1";
 

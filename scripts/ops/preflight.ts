@@ -14,6 +14,7 @@
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
+import { backupDir as stateBackupDir, dbPath as stateDbPath, opsDir } from "../../backend/src/statePaths";
 import { AUTOMATIC_SNAPSHOT_RE } from "../../backend/src/offboxBackup";
 import { DEFAULT_LISTEN_HOST, isLoopbackListenHost, resolveListenHost } from "../../backend/src/listenHost";
 
@@ -29,7 +30,7 @@ const authOn = String(env.AUTH_ENABLED ?? "").toLowerCase() === "true"; // exact
 add("access", "AUTH_ENABLED", authOn ? "PASS" : "FAIL",
   authOn ? "login required" : "no login: anyone who can reach the port can read customer data and use the credential/approve endpoints");
 
-const dbPath = path.resolve(process.cwd(), env.AUTOPILOT_DB_PATH || "backend/data/autopilot.sqlite");
+const dbPath = stateDbPath();
 let admins: { email: string; role: string; hasPassword: boolean }[] | null = null;
 try {
   const { default: Database } = await import("better-sqlite3");
@@ -122,7 +123,7 @@ add("secrets", "SESSION_ENCRYPTION_KEY", !sessionKey || sessionKey === PLACEHOLD
     : `set (${sessionKey.length} characters). It is in NO backup: escrow it in a password manager and prove it with the restore drill (--no-dotenv)`);
 
 // --- BACKUPS ------------------------------------------------------------------------------------------
-const backupDir = path.resolve(process.cwd(), env.BACKUP_DIR || "backend/data/backups");
+const backupDir = stateBackupDir();
 const newestIn = (dir: string): { name: string; ageH: number } | null => {
   try {
     const hits = fs.readdirSync(dir).filter((f) => AUTOMATIC_SNAPSHOT_RE.test(f))
@@ -163,7 +164,7 @@ add("alerts", "watchdog channel", (smtp && to) || hook ? "PASS" : "FAIL",
     hook ? "webhook set" : "no webhook"].join("; "));
 add("alerts", "WATCHDOG_HEARTBEAT_URL", env.WATCHDOG_HEARTBEAT_URL ? "PASS" : "WARN",
   env.WATCHDOG_HEARTBEAT_URL ? "set: an outside service notices when this machine goes silent" : "unset: when the whole machine is off, nothing can tell anyone");
-const stateFile = path.resolve(process.cwd(), env.WATCHDOG_STATE_FILE || "data/ops/watchdog-state.json");
+const stateFile = env.WATCHDOG_STATE_FILE ? path.resolve(process.cwd(), env.WATCHDOG_STATE_FILE) : path.join(opsDir(), "watchdog-state.json");
 let lastRun: number | null = null;
 try { lastRun = Date.parse(JSON.parse(fs.readFileSync(stateFile, "utf8")).lastRunAt); } catch { lastRun = null; }
 add("alerts", "watchdog running", lastRun && Date.now() - lastRun < 20 * 60_000 ? "PASS" : "FAIL",

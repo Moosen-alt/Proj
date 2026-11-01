@@ -373,6 +373,9 @@ export type PermitFeeSource =
   | "learned_history"
   | "published_schedule"
   | "valuation_estimate"
+  /** The fee table printed on the AHJ's own stored form (#454) — the LAST rung, below the
+   *  valuation estimate: it answers only when nothing else prices the job, graded "estimated". */
+  | "printed_form"
   | "unknown";
 
 /** One filed record's fees, as the permit monitor last read them off the portal
@@ -453,6 +456,40 @@ export interface FeeComparison {
   note: string;
 }
 
+/** One line of what a printed fee table composes for a job (#454): the permit line, or a
+ *  percentage surcharge evaluated on it (per line, never stored pre-multiplied). */
+export interface PrintedFormFeeLine {
+  label: string;
+  amountUsd: number;
+  kind: "permit" | "surcharge";
+  /** On a surcharge: the printed percentage it was evaluated from. */
+  percent?: number;
+  discipline: "electrical" | "structural";
+}
+
+/** THE QUOTE BESIDE THE FEE TABLE PRINTED ON THE AHJ'S OWN FORM (#454) — a dated, lower-trust
+ *  cross-check. A note, never a replacement: nothing in it changes the amount. */
+export interface PrintedFormFeeCheck {
+  /** "agrees" within $1; "disagrees" by differenceUsd; "no_printed_table" — no held form for this
+   *  authority prints fee amounts; "not_comparable" — a table is held but does not price this job,
+   *  the quote has no amount, or the quote IS the printed table. */
+  verdict: "agrees" | "disagrees" | "no_printed_table" | "not_comparable";
+  /** What the printed lines compose for this job; null when none priced it. */
+  printedUsd: number | null;
+  quotedUsd: number | null;
+  quotedSource: PermitFeeSource;
+  /** Sum of the compared quoted-minus-printed gaps; null when nothing was compared. */
+  differenceUsd: number | null;
+  /** What was compared: each discipline against the schedule's own line, or the whole quote. */
+  compared: Array<{ what: "electrical" | "structural" | "total"; printedUsd: number; quotedUsd: number; differenceUsd: number }>;
+  /** The printed forms that priced this job, each with its own printed date. */
+  forms: Array<{ formName: string; printedDate: string; sourceUrl: string; discipline: "electrical" | "structural"; totalUsd: number }>;
+  lines: PrintedFormFeeLine[];
+  /** Printed tables held that do not price this job, and why. */
+  skipped: string[];
+  note: string;
+}
+
 export interface SubmissionPaymentQuote {
   track: string;
   /** True when the project's client bills per submission (staging is gated). */
@@ -489,6 +526,9 @@ export interface SubmissionPaymentQuote {
   /** The portal's figure beside the researched one, whenever a portal figure exists (read off
    *  the record, or typed by the operator) — both numbers and the difference. */
   permitFeeComparison: FeeComparison | null;
+  /** The permit amount beside the fee table printed on the AHJ's own form (#454) — a note, never
+   *  a replacement. null on the NEM track (no printed permit form prices an interconnection). */
+  printedFormCheck: PrintedFormFeeCheck | null;
   /** What the permit monitor has read off this track's filed records, complete or not. */
   portalFeeRecords: PortalFeeRecordSummary | null;
   paymentMethod: FeePaymentMethod;
@@ -664,6 +704,8 @@ export interface ProjectFeeSheetLine {
   verifiedAt: string;
   /** See SubmissionPaymentQuote.permitFeeComparison / portalFeeRecords. */
   comparison: FeeComparison | null;
+  /** See SubmissionPaymentQuote.printedFormCheck. Absent on the local-review line. */
+  printedFormCheck?: PrintedFormFeeCheck | null;
   portalRecords: PortalFeeRecordSummary | null;
   paymentMethod: FeePaymentMethod;
   serviceFeeUsd: number;
@@ -1127,6 +1169,22 @@ export type SubmittalTrackStatus =
   | "ready_for_issue"
   | "issued";
 
+/** #445: one input a recipe will fill that THIS job has no value for (backend recipeStageGaps) — the
+ *  stage gate's 409 and the track card read the same list. Never carries a value (rule 2). */
+export interface RecipeStageGap {
+  kind: "question" | "field" | "document";
+  /** The field key the replay reads, or the docType for a document. One entry per key. */
+  key: string;
+  /** The portal's own words for the box, or a fixed label for a secret field. */
+  label: string;
+  /** The project/client field (or document) to fill, in plain words. */
+  fieldName: string;
+  /** Where a person fills it. */
+  where: "project" | "client" | "documents" | "portal_questions";
+  /** A secret field (account, meter…): named by its fixed label only. */
+  secret: boolean;
+}
+
 export interface SubmittalTrack {
   type: SubmittalTrackType;
   label: string;
@@ -1168,6 +1226,10 @@ export interface SubmittalTrack {
   /** No recipe of its own: the recipe this project's LAST run of this track borrowed (another entity's,
    *  same portal — portalRecipes.findBorrowableRecipe), read from that run's result. null = none used. */
   borrowedRecipe?: { recipeId: string; recipeVersion: number | null; learnedFor: string; recordType: string; portalHost: string; lastUsedAt: string } | null;
+  /** #445: what this track's recipe will fill that the job has no value for — the same reading the
+   *  stage gate refuses on (backend recipeStageGaps), one entry per key. Labels and keys only, never a
+   *  value (rule 2). Absent when the track has no complete recipe of its own or nothing is missing. */
+  stageGaps?: RecipeStageGap[];
   /** NEM only (#308, #310): where the track stands between the signature request and the filing
    *  (backend signatureTrack.nemSignatureState) — "awaiting_signature_request" (stopped in front of
    *  Request Signatures: a person clicks it, or approves a run that does), "signature_request_unconfirmed"

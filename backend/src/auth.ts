@@ -3,6 +3,7 @@ import type { NextFunction, Request, Response } from "express";
 import type { AppDb, SqlParam } from "./db";
 import { DEFAULT_ORG_ID } from "./db";
 import { apiKeyAuthPrefixes, orgEntitlements, productsAllowPath } from "./entitlements";
+import { serverIsShared } from "./serverPosture";
 
 type Row = Record<string, SqlParam>;
 
@@ -45,14 +46,23 @@ function verifyPassword(password: string, stored: string): boolean {
 }
 
 /**
- * The ONE writer of users.password_hash outside the raw INSERT in seedAdminUser and
- * POST /api/orgs/:id/users. Exported so scripts (scripts/onboard-company.ts) do not
- * re-implement the hasher: the stored format is scrypt(password, 16-byte salt, 64) as
+ * The ONE writer of users.password_hash outside the raw INSERT in seedAdminUser. Used by
+ * POST /api/orgs/:id/users and the dashboard's staff-login routes (staffLogins.ts, #431), and
+ * exported so scripts (scripts/onboard-company.ts) do not re-implement the hasher: the stored format is scrypt(password, 16-byte salt, 64) as
  * "salthex:hashhex", and verifyPassword above is the only reader. A second, drifting
  * copy of that format is a login that cannot log in and nothing that says why.
  */
 export function setUserPassword(db: AppDb, userId: string, password: string): void {
   db.run("UPDATE users SET password_hash = ? WHERE id = ?", [hashPassword(password), userId]);
+}
+
+/**
+ * Whether `password` is this user's current password (self-service password change, #431). The
+ * only other reader of the stored format is login(); neither ever returns the hash.
+ */
+export function passwordMatchesForUser(db: AppDb, userId: string, password: string): boolean {
+  const row = db.get<Row>("SELECT password_hash FROM users WHERE id = ? AND active = 1", [userId]);
+  return Boolean(row?.password_hash) && verifyPassword(password, String(row?.password_hash));
 }
 
 // Create the first admin from env if no user has a password yet.
@@ -254,8 +264,11 @@ export function logout(_req: Request, res: Response): void {
   res.json({ ok: true });
 }
 
+// serverIsShared rides along (#439): the dashboard already reads this at boot, and it decides
+// whether the controls that read the SERVER'S disk are shown as if the server were the user's PC.
+// A boolean about the deployment, nothing about the caller, so it is safe before sign-in too.
 export function me(db: AppDb, req: Request, res: Response): void {
-  res.json({ enabled: AUTH_ENABLED, user: AUTH_ENABLED ? currentUser(db, req) : null });
+  res.json({ enabled: AUTH_ENABLED, user: AUTH_ENABLED ? currentUser(db, req) : null, serverIsShared: serverIsShared(process.env) });
 }
 
 /** Brand images and vendored fonts a logged-out page needs. A single file name, no leading dot. */
