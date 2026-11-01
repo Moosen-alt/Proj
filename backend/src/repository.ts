@@ -412,6 +412,9 @@ function mapProject(row: ProjectRow): ProjectRecord {
     assignedUserId: row.assigned_user_id ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    // The edit version an editor saves against (#440, migration v51). Read via the cast, like
+    // stage_detail, so row literals elsewhere keep compiling.
+    editVersion: Number((row as Record<string, unknown>).edit_version ?? 0) || 0,
   };
 }
 
@@ -843,8 +846,11 @@ export function updateProject(
   projectId: string,
   payload: ParserPayload,
   /** humanInverterEdit: ONLY a human-only caller (corrections-apply, a person's approval) may set it —
-   *  never PUT /api/projects/:id, which the parser and API keys use (#270). See recordMicroSupersession. */
-  options: { humanInverterEdit?: boolean } = {},
+   *  never PUT /api/projects/:id, which the parser and API keys use (#270). See recordMicroSupersession.
+   *  expectedVersion: the project's editVersion the editor LOADED (#440). Given, a project that has
+   *  moved on since — a teammate's save, or a background write of its data — is refused with a 409 and nothing
+   *  is written. Omitted (the parser, API keys, internal callers), the save is unconditional, as before. */
+  options: { humanInverterEdit?: boolean; expectedVersion?: number } = {},
 ): ProjectDetail {
   const existing = getProjectDetail(db, projectId).project;
   // Drop the non-persistent plan-set text overlay (re-derived from project_documents
@@ -905,6 +911,11 @@ export function updateProject(
   // Preserve the client link unless the payload explicitly changes it.
   const clientId = (payload.clientId ?? payload.client_id ?? existing.clientId) as string | null;
   db.transaction(() => {
+    // THE STALE-SAVE CHECK, INSIDE THE WRITE'S OWN TRANSACTION (#440). Read and refused here, not
+    // before the merge above, so nothing can move the row between the check and the UPDATE (a second
+    // connection's write in between makes this transaction's write fail rather than land). The throw
+    // rolls back; QC and learning below never run for a refused save.
+    if (options.expectedVersion !== undefined) assertProjectEditVersion(db, projectId, options.expectedVersion);
     db.run(
       `UPDATE projects SET
         client_id = ?, homeowner_name = ?, project_address = ?, city = ?, state = ?, zip = ?, ahj = ?, utility = ?,
@@ -944,6 +955,23 @@ export function updateProject(
   runQcForProject(db, projectId);
   learnFromProject(db, getProjectDetail(db, projectId).project, "project.updated");
   return getProjectDetail(db, projectId);
+}
+
+/** The message a stale save gets (#440). The dashboard reloads the project and says so itself. */
+export const PROJECT_EDIT_CONFLICT_MESSAGE =
+  "Not saved — this project was changed by someone else since you opened it. Reload it, check your changes against theirs, and save again.";
+
+/**
+ * Refuse a save made against an old edit version (#440): 409, `details.editConflict`, nothing
+ * written. Background writers never call this — a data write bumps the version (the v51 trigger) and goes on.
+ */
+export function assertProjectEditVersion(db: AppDb, projectId: string, expectedVersion: number): void {
+  const row = db.get<{ edit_version: number }>("SELECT edit_version FROM projects WHERE id = ?", [projectId]);
+  if (!row) throw new HttpError(404, "Project not found.");
+  const currentVersion = Number(row.edit_version) || 0;
+  if (currentVersion !== expectedVersion) {
+    throw new HttpError(409, PROJECT_EDIT_CONFLICT_MESSAGE, { editConflict: true, expectedVersion, currentVersion });
+  }
 }
 
 // ---------------------------------------------------------------------------

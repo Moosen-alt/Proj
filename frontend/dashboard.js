@@ -4,6 +4,9 @@ const state = {
   boardAll: null,
   selectedProjectId: null,
   detail: null,
+  // THIS EDITOR'S UNSAVED EDIT of the open project (#440): { projectId, baseVersion, dirty:Set<id> }.
+  // baseVersion is the project's editVersion when the edit began; null when nothing is unsaved.
+  projectEdit: null,
   // The server's full next-step answer for the open project (GET /api/projects/:id/next-step,
   // refreshed by every autopilot state), and which project it belongs to.
   nextStep: null,
@@ -2323,6 +2326,9 @@ async function selectProject(projectId) {
   // nulling state.autopilot alone left project A's enabled Stage / reasons on screen for B
   // until (and, if B's fetch failed, after) B's own answer arrived.
   if (state.selectedProjectId !== projectId || (state.autopilot && state.autopilot.projectId !== projectId)) resetAutopilotRail();
+  // An unsaved edit belongs to the project it was made on (#440): opening another one drops it, so
+  // coming back never shows the other project's typing as this one's.
+  if (state.selectedProjectId !== projectId) state.projectEdit = null;
   state.selectedProjectId = projectId;
   state.detail = await api(`/api/projects/${projectId}`);
   state.workflow = null;
@@ -4023,9 +4029,12 @@ function renderRecordPortal() {
 
   // Manual-entry inputs — prefill from the snapshot, but never clobber what the
   // operator is actively typing (a background re-render must not wipe the field).
+  // An UNSAVED edit is never clobbered either (#440): a field the operator changed and left keeps
+  // its value through every refresh (another teammate's save, a background write's SSE refetch, a
+  // conflict reload) until it is saved or the project is closed.
   const setIfIdle = (id, value) => {
     const el = $(id);
-    if (el && document.activeElement !== el) el.value = value ?? "";
+    if (el && document.activeElement !== el && !projectEditIsDirty(id)) el.value = value ?? "";
   };
   setIfIdle("manualJobValue", snap.jobValue != null ? String(snap.jobValue) : "");
   setIfIdle("manualProjectType", snap.projectType != null ? String(snap.projectType) : "");
@@ -4045,6 +4054,57 @@ function renderRecordPortal() {
   setIfIdle("manualHomeownerEmail", snap.homeownerEmail != null ? String(snap.homeownerEmail) : "");
   setIfIdle("manualHomeownerPhone", snap.homeownerPhone != null ? String(snap.homeownerPhone) : "");
   setIfIdle("manualDescription", desc);
+}
+
+// ---------------------------------------------------------------------------
+// TWO TEAMMATES, ONE PROJECT (#440). A save carries the project's editVersion as it was when this
+// editor STARTED changing the form — not the latest one a background refresh fetched, which would
+// quietly bless whatever a teammate saved in between. The server refuses a stale one with a 409
+// (details.editConflict) and writes nothing; the page reloads the project, keeps the fields the
+// operator changed (setIfIdle skips them), and asks them to check and save again.
+// ---------------------------------------------------------------------------
+const PROJECT_EDIT_CONFLICT_TEXT =
+  "Not saved — someone else changed this project since you started editing. It has been reloaded with their changes; your unsaved entries are still in the form. Check them and save again.";
+
+/** Start (or extend) this editor's edit of the open project: remember the version it loaded and
+ *  which fields were changed. Called from the manual-entry form's input/change events. */
+function noteProjectEdit(fieldId) {
+  const projectId = state.selectedProjectId;
+  if (!projectId) return;
+  if (!state.projectEdit || state.projectEdit.projectId !== projectId) {
+    state.projectEdit = { projectId, baseVersion: state.detail?.project?.editVersion, dirty: new Set() };
+  }
+  if (fieldId) state.projectEdit.dirty.add(fieldId);
+}
+
+function projectEditIsDirty(fieldId) {
+  const edit = state.projectEdit;
+  return !!(edit && edit.projectId === state.selectedProjectId && edit.dirty.has(fieldId));
+}
+
+/** The version a save from this editor is made against: where its edit began, else what is shown. */
+function projectEditBaseVersion() {
+  const edit = state.projectEdit;
+  const v = edit && edit.projectId === state.selectedProjectId ? edit.baseVersion : state.detail?.project?.editVersion;
+  return Number.isInteger(v) ? v : undefined;
+}
+
+function isProjectEditConflict(err) {
+  return !!(err && err.details && err.details.editConflict);
+}
+
+/** After a 409: reload the project (the unsaved fields stay, see setIfIdle). For the manual-entry
+ *  form's own conflict (rebaseManualEdit), rebase its edit on what was just loaded, so the operator's
+ *  next Save — made with the teammate's changes and the conflict message in view — goes through.
+ *  Another save's conflict leaves the form's edit stale: that form has not said anything yet. */
+async function reloadAfterEditConflict({ rebaseManualEdit }) {
+  const projectId = state.selectedProjectId;
+  if (!projectId) return;
+  await selectProject(projectId);
+  if (state.selectedProjectId !== projectId || !rebaseManualEdit) return;
+  if (state.projectEdit && state.projectEdit.projectId === projectId) {
+    state.projectEdit.baseVersion = state.detail?.project?.editVersion;
+  }
 }
 
 async function saveManualEntry() {
@@ -4096,14 +4156,20 @@ async function saveManualEntry() {
   }
   if (btn) btn.disabled = true;
   if (status) { status.textContent = "Saving…"; status.className = "muted"; }
+  const expectedVersion = projectEditBaseVersion();
   try {
-    const detail = await api(`/api/projects/${state.selectedProjectId}`, { method: "PUT", body: JSON.stringify(payload) });
+    const detail = await api(`/api/projects/${state.selectedProjectId}`, { method: "PUT", body: JSON.stringify({ ...payload, expectedVersion }) });
     if (detail && detail.project) state.detail = detail;
+    state.projectEdit = null; // saved: nothing unsaved left to protect
     if (status) { status.textContent = "Saved."; status.className = "muted"; }
     renderDetail();
     showMessage("Project data saved.", "info");
   } catch (err) {
-    if (status) { status.textContent = "Save failed: " + (err.message || err); status.className = "muted"; }
+    if (isProjectEditConflict(err)) {
+      try { await reloadAfterEditConflict({ rebaseManualEdit: true }); } catch { /* the message still stands; the next Save re-checks */ }
+      if (status) { status.textContent = PROJECT_EDIT_CONFLICT_TEXT; status.className = "muted"; }
+      showMessage(PROJECT_EDIT_CONFLICT_TEXT, "warning");
+    } else if (status) { status.textContent = "Save failed: " + (err.message || err); status.className = "muted"; }
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -5096,12 +5162,26 @@ async function saveTrackIssuer(type, value, btn) {
   if (!key || !state.selectedProjectId) return;
   if (btn) btn.disabled = true;
   try {
-    const detail = await api(`/api/projects/${state.selectedProjectId}`, { method: "PUT", body: JSON.stringify({ [key]: value }) });
+    // Saved against the version ON SCREEN (the card is drawn from it), not the manual-entry form's
+    // edit base. An unsaved manual edit that began at that same version is rebased onto this save,
+    // so the operator's own issuer save never makes their own form stale; one that began earlier
+    // stays stale (a teammate's save came in between) and still gets the conflict.
+    const sentVersion = state.detail?.project?.editVersion;
+    const detail = await api(`/api/projects/${state.selectedProjectId}`, { method: "PUT", body: JSON.stringify({ [key]: value, expectedVersion: Number.isInteger(sentVersion) ? sentVersion : undefined }) });
     if (detail && detail.project) state.detail = detail;
+    const edit = state.projectEdit;
+    if (edit && edit.projectId === state.selectedProjectId && edit.baseVersion === sentVersion) edit.baseVersion = detail?.project?.editVersion;
     await loadSubmittalTracks();
     renderDetail();
     showMessage(value ? `Saved — ${value} issues this ${humanize(type)} permit.` : `Cleared — the project's AHJ issues this ${humanize(type)} permit.`, "info");
   } catch (err) {
+    if (isProjectEditConflict(err)) {
+      // The card re-renders on reload, so the typed agency is said back in the message.
+      try { await reloadAfterEditConflict({ rebaseManualEdit: false }); } catch { /* ditto */ }
+      showMessage(`Not saved — someone else changed this project since you opened it. It has been reloaded with their changes. Your entry for this ${humanize(type)} permit was "${value || "(cleared)"}": check it and save again.`, "warning");
+      if (btn) btn.disabled = false;
+      return;
+    }
     showMessage(err.message || "Could not save the issuing agency.", "error");
     if (btn) btn.disabled = false;
   }
@@ -10144,6 +10224,10 @@ if ($("buildSplitBtn")) $("buildSplitBtn").addEventListener("click", buildDocume
 if ($("autofillSpecsBtn")) $("autofillSpecsBtn").addEventListener("click", autofillSpecs);
 if ($("genIntakeLinkBtn")) $("genIntakeLinkBtn").addEventListener("click", generateIntakeLink);
 if ($("saveManualEntryBtn")) $("saveManualEntryBtn").addEventListener("click", saveManualEntry);
+// Typing in the manual-entry form starts an edit against the version on screen (#440).
+for (const evt of ["input", "change"]) {
+  if ($("manualEntryForm")) $("manualEntryForm").addEventListener(evt, (e) => { if (e.target && e.target.id) noteProjectEdit(e.target.id); });
+}
 // Record manual stage open/close so a pinned-open stage (e.g. Submit) survives
 // re-renders. A summary click is user-only (programmatic el.open never fires it),
 // and the open state flips AFTER this handler, so the upcoming value is !el.open.

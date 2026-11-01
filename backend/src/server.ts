@@ -519,11 +519,23 @@ app.post("/api/projects", (req, res) => {
 });
 
 app.put("/api/projects/:id", (req, res) => {
-  const payload = req.body?.parserPayload ?? req.body?.payload ?? req.body;
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+  const rawPayload = req.body?.parserPayload ?? req.body?.payload ?? req.body;
+  if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
     throw new HttpError(400, "Project payload must be an object.");
   }
-  const updated = updateProject(db, String(req.params.id), payload);
+  // THE VERSION THE EDITOR LOADED (#440). Top-level on the body, never a project field: when the
+  // body IS the payload it is lifted out so it never lands in the parser snapshot. The dashboard
+  // always sends it; the parser and API keys don't, and their saves stay unconditional.
+  const { expectedVersion: rawExpected, ...payload } = rawPayload as Record<string, unknown>;
+  const expectedSource = rawPayload === req.body ? rawExpected : req.body?.expectedVersion;
+  let expectedVersion: number | undefined;
+  if (expectedSource !== undefined && expectedSource !== null) {
+    expectedVersion = Number(expectedSource);
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+      throw new HttpError(400, "expectedVersion must be the project's editVersion (a whole number).", { field: "expectedVersion" });
+    }
+  }
+  const updated = updateProject(db, String(req.params.id), payload, { expectedVersion });
   // A re-save from the parser is the repair door for a qc_failed project — the operator fixed
   // the intake, so the chain gets a fresh start. Guarded inside: only statuses the chain owns
   // (parsed/qc_passed/ready_to_stage) do anything; a submitted project no-ops.

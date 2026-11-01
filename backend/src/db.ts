@@ -2607,6 +2607,44 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       addColumnIfMissing(db, "project_metrics", "package_complete_at", "TEXT");
     },
   },
+  // v51 sits here, beside the other project-row migration (v44), not at the end of the list, so
+  // parallel PRs appending there don't collide on the same lines (see v43 / v46 / v50).
+  {
+    version: 51,
+    name: "project_edit_version",
+    up: (db) => {
+      // TWO TEAMMATES, ONE PROJECT (#440, shared server #429). Project saves were last-write-wins:
+      // the second person's Save silently threw the first person's edit away. edit_version is the
+      // version a dashboard editor loaded; PUT /api/projects/:id with expectedVersion refuses a stale
+      // one with a 409 and writes nothing (updateProject).
+      //
+      // BUMPED BY TRIGGER, NOT BY CALL SITE. Every writer of the project's DATA moves it — a
+      // teammate's save, the parser, the bill / datasheet reads and intake (all through
+      // updateProject, with no expected version, so they bump and never 409), the review queue's
+      // verified field (applyVerifiedField writes parser_json directly) — and a new writer cannot
+      // forget to. The column list is exactly what updateProject writes, i.e. what an editor's save
+      // could overwrite. Lifecycle writes (status, current_stage, stage_detail, archive, share token,
+      // assignment, the v17 per-job answer columns) do NOT bump it: a save never writes those, so no
+      // edit can be lost to them, and the stage chain that runs after every save writes them for
+      // seconds afterwards — bumping on them would refuse the editor's next save for nothing.
+      // The trigger fires only when the statement did not move edit_version itself; its own UPDATE
+      // sets only edit_version (not in the OF list), so it never re-fires. A trigger's writes are not
+      // counted in changes(), so no caller's row count moves.
+      // projects is CREATEd in the base schema, so this addColumnIfMissing comes after it.
+      addColumnIfMissing(db, "projects", "edit_version", "INTEGER NOT NULL DEFAULT 0");
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS projects_bump_edit_version
+        AFTER UPDATE OF client_id, homeowner_name, project_address, city, state, zip, ahj, utility,
+          account_number, meter_number, system_size_dc_kw, system_size_ac_kw, total_export_kw,
+          interconnection_method, parser_confidence_summary, parser_json
+        ON projects
+        FOR EACH ROW WHEN NEW.edit_version = OLD.edit_version
+        BEGIN
+          UPDATE projects SET edit_version = OLD.edit_version + 1 WHERE id = NEW.id;
+        END;
+      `);
+    },
+  },
   {
     version: 45,
     name: "jurisdiction_design_observations_precedents",
