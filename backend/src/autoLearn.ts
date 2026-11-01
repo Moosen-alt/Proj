@@ -1170,8 +1170,10 @@ async function autoLearnPortalInner(
     /** Round 5: why a reservation held the request (the run message names an expired verification). */
     reserveRefused: [] as string[],
   };
-  type InfoPageAttemptInput = { passes: ReturnType<typeof liveInfoPagePasses>; priorProgress: boolean };
-  const noInfoPagePass: InfoPageAttemptInput = { passes: [], priorProgress: true };
+  type InfoPageAttemptInput = { passes: ReturnType<typeof liveInfoPagePasses>; priorProgress: boolean; unavailable: boolean };
+  // The fail-closed stand-in (no project row, a read that threw, a retry after an admission): no pass
+  // AND no card (#366: "unavailable" is not a reading of this project's history).
+  const noInfoPagePass: InfoPageAttemptInput = { passes: [], priorProgress: true, unavailable: true };
   const armInfoPageAttempt = (attempt: number): InfoPageAttemptInput => {
     infoPageCall.attempt = [];
     infoPageCall.attemptStartId = "";
@@ -1180,9 +1182,9 @@ async function autoLearnPortalInner(
     try {
       input = infoPageCall.admitted.length
         ? noInfoPagePass
-        : { passes: liveInfoPagePasses(db), priorProgress: infoPagePriorProgress(db, projectId, portalUrl, scopeType) };
+        : { passes: liveInfoPagePasses(db), priorProgress: infoPagePriorProgress(db, projectId, portalUrl, scopeType), unavailable: false };
     } catch { input = noInfoPagePass; }
-    try { infoPageCall.attemptStartId = recordInfoPageLearnStart(db, projectId, scopeType, attempt); }
+    try { infoPageCall.attemptStartId = recordInfoPageLearnStart(db, projectId, scopeType, attempt, portalUrl); }
     catch { return noInfoPagePass; }
     return input;
   };
@@ -1490,6 +1492,7 @@ async function autoLearnPortalInner(
       // every admission reported at once.
       infoPagePasses: infoPageInput.passes,
       infoPagePriorProgress: infoPageInput.priorProgress,
+      infoPagePassUnavailable: infoPageInput.unavailable,
       // Round 5: the backstop reserves each use at the admission itself (limits checked there).
       reserveInfoPagePass,
       onInfoPagePassed,

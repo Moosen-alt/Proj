@@ -38,6 +38,12 @@
 // filed — check the portal for this project" — read on the project's card and, named within the
 // viewer's own org, on the pass's knowledge-base entry.
 import { DEFAULT_ORG_ID, type AppDb } from "./db";
+import { trackKind } from "./permitMonitor";
+import { isInformationalPageUrl, isPermitPortalUrl, isUtilityPlatformUrl, namedInterconnectionPlatforms, namedPermitPlatforms, portalHostOf, portalUrlsInText, salesforceTenantKind } from "./portalChannel";
+import { utilityFilingKey } from "./utilityFilingLookup";
+import { KNOWN_POWERCLERK_PORTALS, knownPowerClerkUtility, sameUtilityEntity } from "./utilityIdentity";
+import { isVerifiedKnowledge } from "./knowledgeBase";
+import { sameEntity } from "./portalRecipes";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
 import { id as newId } from "./ids";
@@ -213,14 +219,17 @@ const maskDigits = (x: unknown): string => s(x).replace(/\d/g, "#");
 
 /** BEFORE EACH LEARN ATTEMPT TOUCHES THE PORTAL (autoLearn): on record first, so a learn that dies,
  *  throws or is interrupted is progress unless it ends clean. Returns the start's id. */
-export function recordInfoPageLearnStart(db: AppDb, projectId: string, scope: Side, attempt: number): string {
+export function recordInfoPageLearnStart(db: AppDb, projectId: string, scope: Side, attempt: number, portalUrl: string): string {
   const startId = newId();
-  addAuditLog(db, projectId, "system", "auto-learn", ACT_LEARN_STARTED, { startId, scope, attempt });
+  // The learn's own portal URL: the project card reads it back (listInfoPageProjectState), so the
+  // card judges the same portal the learner's own check did.
+  addAuditLog(db, projectId, "system", "auto-learn", ACT_LEARN_STARTED, { startId, scope, attempt, portalUrl: s(portalUrl).slice(0, 300) });
   return startId;
 }
 
 /** IS THIS LEARN'S RESULT A CLEAN HOLD? It stopped at the backstop's hold of an information page
- *  whose run state was clean at the click (the candidate watch opens only then, and its request
+ *  whose run state was clean at the click (the candidate watch opens only then — #366: the
+ *  project's history may also have refused, which is not this run's own state — and its request
  *  was observed — held), passed no verified page, reported no after-click incident, reached no
  *  review, paused for nothing and continued no draft — and (round 3, V9) its recorded steps are an
  *  array with NO write in them (fill / select / check / uncheck / upload / press), and it says it
@@ -255,6 +264,221 @@ export function recordInfoPageHeldVerified(db: AppDb, projectId: string, scope: 
   }
 }
 
+/** Whose filing a tracked row is (#365): "utility" or "ahj" only when its columns say so and agree —
+ *  trackKind, the one answer, plus a consistency check. A row on the columns' defaults (no
+ *  permit_type: legacy rows, raw writes) or with contradictory columns ('nem' + a permit discipline)
+ *  cannot say: null, and it counts on both sides. */
+function trackedRowSide(t: Row): Side | null {
+  const pt = s(t.permit_type).trim().toLowerCase();
+  if (trackKind(s(t.target_type), pt) === "nem") return pt === "" || pt === "nem" ? "utility" : null;
+  // Helm's review (S5): only the permit tracks ensureCheckTarget writes are positively the permit
+  // side — free text a body field stored ("interconnection") cannot say, so it counts on both.
+  return KNOWN_PERMIT_TRACKS.has(pt) ? "ahj" : null;
+}
+const KNOWN_PERMIT_TRACKS = new Set(["building", "electrical", "combo", "permit", "mpu", "structural"]);
+
+/** A POSITIVE interconnection platform (Helm's review, blocker 1; round 3: THE HOST ONLY): a host on
+ *  the utility platform list (PowerClerk, ConnectTheGrid, customerapplication.com, a utility's own
+ *  domain) — and NEVER a Salesforce Experience site. isUtilityPlatformUrl fails closed for LAUNCHING
+ *  on the permit track, so it reads an unknown tenant (a city's own my.site.com portal) as a
+ *  utility's; and salesforceTenantKind's "utility" rests on words that say nothing about who owns
+ *  the host — a utility word, suffix or brand anywhere in the label ("coopercity", "edisonnj",
+ *  "cityofelectriccity") or an interconnection word in the PATH (a carve-out NEM learn on the city's
+ *  own site at /s/interconnection-application). As evidence that a filing was made ELSEWHERE, either
+ *  would fail open: a Salesforce site is never one here. */
+function isPositiveInterconnectionPlatform(u: string): boolean {
+  return isUtilityPlatformUrl(u) && salesforceTenantKind(u) === null;
+}
+
+/** EVERY PORTAL URL A UTILITY KB ROW'S portal_url HOLDS (Helm's review, S4; round 4, the S4 residue):
+ *  the value split on whitespace, commas, semicolons and pipes; a piece with a scheme read as is; a
+ *  scheme-less host[/path] — on ANY top-level domain ("permits.x.online/apply", "epermits.x.co/apply",
+ *  which the KB route stores verbatim) — read as https; a piece that is no host at all ("N/A") names
+ *  no portal. Plus the links portalUrlsInText finds in it and in the free-text portal_name. */
+function kbRowPortalUrls(portalUrl: string, portalName: string): string[] {
+  const urls: string[] = [];
+  for (const raw of portalUrl.split(/[\s,;|]+/)) {
+    const p = raw.trim().replace(/^[<("'[]+/, "").replace(/[>)"'\].]+$/, "");
+    if (!p) continue;
+    const u = /^https?:\/\//i.test(p) ? p : /^(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]+(?::\d+)?(?:[/?#]|$)/i.test(p) ? `https://${p}` : "";
+    if (portalHostOf(u)) urls.push(u);
+  }
+  return [...urls, ...portalUrlsInText(portalUrl), ...portalUrlsInText(portalName)];
+}
+
+/** POSITIVE EVIDENCE THAT THIS UTILITY'S NEM IS FILED ON ITS OWN PLATFORM (#365): its own records —
+ *  utility-keyed KB rows of ANY confidence and its utility recipes — name at least one portal, and
+ *  every portal they name is a utility interconnection platform (information pages ignored). A
+ *  utility that names a city's portal anywhere (a carve-out utility, verified or only seeded: the
+ *  operator may have filed it there by hand), any other portal, or nothing at all: false.
+ *  WHOSE records: only a STRONG match (a known identity, or the same name) is evidence FOR the
+ *  platform; a row that matches only by the fuzzy entity score (portalRecipes.sameEntity) can add
+ *  caution — a non-platform portal there counts the number — but never vouches for a platform.
+ *  THE UTILITY FILING LOOKUP (round 3, items 2 and 4) can make the number count — a filing that
+ *  names no platform, a URL its source page names off the platform, a source page on a host in
+ *  question or on a permit vendor's — but is never the only record that vouches: a web-researched,
+ *  shared lookup alone, with no KB row or utility recipe of this utility naming a platform, counts.
+ *  WORDS (round 4): a record's words that name a permit vendor or a city's permit portal
+ *  (portalChannel.namedPermitPlatforms — a lookup's filing name or quote, found or not; a KB row's
+ *  portal name, platform or submission method, any confidence, strong or fuzzy) count the number,
+ *  whatever else is on file. Words that merely name NO platform count it only from the lookup's
+ *  filing and from a person's VERIFIED row (a portal named with no URL, or a platform) — never from a
+ *  seeded or learned row's free text (research writes labels this code cannot read: "Unknown (…)",
+ *  "Custom") — and never when they are this utility's own platform portal's name (a strong KB row on a
+ *  platform names it so: Pacific Power's seed calls its PowerClerk tenant "Pacific Power Customer
+ *  Generation Portal"), or the utility is one whose tenant this codebase knows by heart
+ *  (utilityIdentity: PacifiCorp, Portland General — each files on exactly one tenant). */
+function utilityFilesOnlyOnInterconnectionPlatform(db: AppDb, state: string, utility: string, hostsInQuestion: ReadonlySet<string>): boolean {
+  if (!utility.trim()) return false;
+  const st = state.trim().toUpperCase();
+  const norm = (x: string): string => x.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const positive = (u: string): boolean => isPositiveInterconnectionPlatform(u);
+  // A STRONG match is in this state for certain: a row with no state can add caution, never vouch.
+  const sameState = (r: Row) => s(r.state).trim().toUpperCase() === st && st !== "";
+  const strong = (r: Row) => sameState(r) && (sameUtilityEntity(state, s(r.utility), utility) || norm(s(r.utility)) === norm(utility));
+  const weak = (r: Row) => !strong(r) && sameEntity(state, utility, s(r.state).trim() || state, s(r.utility));
+  type Rec = { r: Row; urls: string[]; words: string[]; verified: boolean; kb: boolean };
+  const rows: Rec[] = [
+    // portal_url read for every URL in it (kbRowPortalUrls); portal_name is free text, read for the
+    // links in it — and, with the platform and the submission method, for its words.
+    ...db.query<Row>("SELECT state, utility, portal_url, portal_name, portal_platform, submission_method, verified_at FROM permit_utility_knowledge WHERE (ahj IS NULL OR ahj = '') AND utility != ''")
+      .map((r) => ({ r, urls: kbRowPortalUrls(s(r.portal_url), s(r.portal_name)), words: [s(r.portal_name), s(r.portal_platform), s(r.submission_method)], verified: isVerifiedKnowledge(r), kb: true })),
+    ...db.query<Row>("SELECT state, utility, portal_url FROM portal_recipes WHERE scope_type = 'utility' AND portal_url IS NOT NULL AND portal_url != ''")
+      .map((r) => ({ r, urls: [s(r.portal_url)], words: [], verified: false, kb: false })),
+  ];
+  const mine = rows.filter((x) => strong(x.r));
+  const kin = rows.filter((x) => weak(x.r));
+  // (1) A RECORD OF THIS UTILITY (strong or fuzzy, any confidence) WHOSE WORDS NAME A PERMIT VENDOR OR
+  //     A CITY'S PERMIT PORTAL: a verified "City of Cedarvale Accela Citizen Access" / platform
+  //     "Accela" / method "City permit portal" merged onto a row that still holds a stale seeded
+  //     PowerClerk URL (a verify keeps a field it leaves blank) — it counts.
+  if ([...mine, ...kin].some((x) => namedPermitPlatforms(x.words).length)) return false;
+  // THIS UTILITY'S OWN PLATFORM PORTAL, BY NAME: what a strong KB row whose every URL is a platform
+  // calls it, and the known tenant's name.
+  const identity = knownPowerClerkUtility({ state, utility });
+  const platformNames = new Set([
+    ...mine.filter((x) => x.kb && x.urls.length > 0 && x.urls.every(positive)).map((x) => norm(s(x.r.portal_name))),
+    identity ? norm(KNOWN_POWERCLERK_PORTALS[identity].portalName) : "",
+  ].filter(Boolean));
+  /** Words that name a portal but no interconnection platform, and are not this utility's own
+   *  platform portal's name — for a utility whose tenant is not known by heart. */
+  const namesNoPlatform = (w: string): boolean => !identity && norm(w) !== "" && !namedInterconnectionPlatforms(w).length && !platformNames.has(norm(w));
+  // (2) A PERSON'S VERIFIED ROW OF THIS UTILITY that names a portal with no URL, or a platform, that is
+  //     no interconnection platform (a verify that names the city's portal and leaves the URL blank):
+  //     it counts.
+  if (mine.some((x) => x.verified && ((!x.urls.length && namesNoPlatform(s(x.r.portal_name))) || namesNoPlatform(s(x.r.portal_platform))))) return false;
+  // WHERE THE PRODUCT SAYS THIS UTILITY TAKES ITS APPLICATION (Helm's review, blocker 2): the utility
+  // filing lookup (migration v37) — the NEM track card shows its URL ahead of a seeded KB row, so it is
+  // the utility's own record, keyed by its exact name. A lookup that cannot be read: no evidence for a
+  // platform (counts).
+  let lookupUrls: string[] = [];
+  let lookupNamed: string[] = [];
+  try {
+    const row = db.get<Row>("SELECT payload_json FROM utility_filing_lookups WHERE profile_key = ?", [utilityFilingKey(state, utility)]);
+    // A row that cannot be parsed throws: unknown, so no evidence for a platform (counts).
+    const filing = row ? ((JSON.parse(s(row.payload_json) || "{}") as Row).filing as Row | undefined) : undefined;
+    const fact = filing && typeof filing === "object" ? filing : undefined;
+    const raw = fact ? fact.value : undefined;
+    // A filing value, or a dropped-URL list, of a shape this code does not know: unknown, so it counts.
+    if (raw !== undefined && raw !== null && typeof raw !== "object") return false;
+    if (fact && fact.droppedUrls !== undefined && !Array.isArray(fact.droppedUrls)) return false;
+    const value = raw && typeof raw === "object" ? (raw as Row) : null;
+    const name = s(value?.name);
+    const quote = s(fact?.quote);
+    // THE URLS THE DOOR DROPPED (round 4): the filing URL the answer named that acceptFilingUrl did
+    // not keep — a permit vendor's portal, a host the search never returned, a page off the platform
+    // the answer names. Evidence of where the lookup says the utility files, read by host.
+    const dropped = (Array.isArray(fact?.droppedUrls) ? (fact!.droppedUrls as unknown[]) : []).map((u) => s(u).trim()).filter((u) => portalHostOf(u) !== "");
+    // (3a) ITS WORDS NAME A PERMIT VENDOR OR A CITY'S PERMIT PORTAL — the filing's name or the quote,
+    //      found or not ("inside city limits submit through the City of Cedarvale Accela Citizen
+    //      Access portal; all other customers use PowerClerk"): it counts.
+    if (fact && namedPermitPlatforms([name, quote]).length) return false;
+    // (3b) A FILING THAT NAMES NO PLATFORM IS EVIDENCE AGAINST ONE (round 3, B2; round 4: the name AND
+    //      the quote, as the lookup's own parse and utilityKbChannel judge it). The door drops every
+    //      permit-vendor URL and keeps only the name ("City of Cedarvale Accela Citizen Access", url
+    //      null). Not evidence against it: a filing URL — kept or dropped — on a platform, a platform
+    //      named in the name or the quote, this utility's own platform portal's name, or a utility
+    //      whose tenant is known by heart (round 4: the Portland pass — Pacific Power's lookup may name
+    //      its "Customer Generation Portal" with no tenant URL kept).
+    if (value && !positive(s(value.url)) && !dropped.some(positive) && !namedInterconnectionPlatforms([name, quote]).length
+      && !platformNames.has(norm(name)) && !identity) return false;
+    // (3c) Its URL, every URL its source page's own words name (the quote), and a dropped URL off the
+    //      platform are portals the utility's lookup names: strong evidence.
+    lookupUrls = [s(value?.url), ...portalUrlsInText(quote), ...dropped.filter((u) => !positive(u))].filter(Boolean);
+    // The source page is where the answer was READ, not where it is filed (usually the utility's own
+    //     interconnection page): it reaches the own-host guard below, so a lookup read off the city's
+    //     own site counts the number there — and, on a permit vendor's host or a self-hosted permit
+    //     install (the city's Accela tenant), the strong set too. Every dropped URL reaches the guard.
+    const source = s(fact?.sourceUrl).trim();
+    if (isPermitPortalUrl(source)) lookupUrls.push(source);
+    lookupNamed = [source, ...dropped];
+  } catch {
+    return false;
+  }
+  const keep = (u: string) => portalHostOf(u) !== "" && !isInformationalPageUrl(u);
+  const records = mine.flatMap((x) => x.urls).filter(keep);
+  const own = [...records, ...lookupUrls.filter(keep)];
+  const fuzzy = kin.flatMap((x) => x.urls).filter(keep);
+  // THE OWN-HOST GUARD: a page this utility names (strong or fuzzy, platform or not, an information
+  // page too — round 4: "a utility's page on a portal in question: it may have filed here" holds for a
+  // KB row's net-metering guide as it does for the lookup's source page), or the page its lookup was
+  // read off or named, ON a portal in question: never skipped.
+  const named = [...mine.flatMap((x) => x.urls), ...kin.flatMap((x) => x.urls), ...lookupUrls, ...lookupNamed];
+  if (named.some((u) => { const h = portalHostOf(u); return h !== "" && hostsInQuestion.has(h); })) return false;
+  // THE LOOKUP NEVER VOUCHES ALONE (round 3, item 4): one of this utility's own KB rows or recipes
+  // must name a portal — and, with everything else it names, a platform.
+  if (!records.length || !own.every(positive)) return false;
+  return fuzzy.every(positive);
+}
+
+/** A TRACKED NUMBER OF THIS PROJECT AS A HARD REASON (#365), or "" — the one answer for the hand-out
+ *  (infoPagePriorProgressReasons) and the admission (reserveInfoPagePassUse). A number of the OTHER
+ *  side is skipped only when its row positively is that side's, it was not recorded on any portal in
+ *  question, and there is positive evidence it was filed elsewhere (see the HARD bullet above). No
+ *  readable portal: every number counts. A read error is a reason. */
+function trackedNumberHardReason(db: AppDb, projectId: string, side: Side, portalUrls: ReadonlyArray<string>): string {
+  try {
+    const nem = side === "utility";
+    const urls = (Array.isArray(portalUrls) ? portalUrls : []).map((u) => s(u).trim()).filter((u) => portalHostOf(u) !== "");
+    const hosts = new Set(urls.map((u) => portalHostOf(u)));
+    let elsewhere: boolean | null = null;
+    const filedElsewhere = (): boolean => {
+      if (elsewhere !== null) return elsewhere;
+      elsewhere = false;
+      if (!urls.length) return false;
+      if (nem) {
+        // A permit number on the utility side: permits are never filed on an interconnection platform.
+        elsewhere = urls.every((u) => isPositiveInterconnectionPlatform(u));
+      } else {
+        // A NEM number on the permit side: this utility files only on its own platform.
+        const p = db.get<Row>("SELECT state, utility FROM projects WHERE id = ?", [projectId]);
+        elsewhere = !!p && utilityFilesOnlyOnInterconnectionPlatform(db, s(p.state), s(p.utility), hosts);
+      }
+      return elsewhere;
+    };
+    for (const t of db.query<Row>("SELECT application_number, permit_number, target_type, permit_type, portal_url, tracking_url FROM permit_check_targets WHERE project_id = ?", [projectId])) {
+      const n = s(t.application_number).trim() || s(t.permit_number).trim();
+      if (!n) continue;
+      const rowSide = trackedRowSide(t);
+      if (rowSide !== null && rowSide !== side) {
+        const rowUrls = [s(t.portal_url), s(t.tracking_url)].filter((u) => u.trim() !== "");
+        const recordedHere = rowUrls.some((u) => { const h = portalHostOf(u); return h !== "" && hosts.has(h); });
+        // THE PROJECT'S OWN NEM ROW (Helm's review, S3): a URL it kept that is not positively a
+        // platform (a city status page, a sibling host, the city's Accela tenant) is its own evidence
+        // that the filing was NOT on the utility's platform — it counts.
+        const ownUrlNotPlatform = rowSide === "utility" && rowUrls.some((u) => !isPositiveInterconnectionPlatform(u));
+        if (!recordedHere && !ownUrlNotPlatform && filedElsewhere()) continue;
+      }
+      return `a filing of this project is tracked by number (${maskDigits(n).slice(0, 24)})`;
+    }
+    return "";
+  } catch {
+    return INFO_PAGE_TRACKED_UNREADABLE;
+  }
+}
+const INFO_PAGE_TRACKED_UNREADABLE = "this project's tracked filings could not be read";
+const INFO_PAGE_PROGRESS_UNREADABLE = "this project's progress on this portal could not be read";
+
 interface PriorProgressReasons {
   /** Never lifted by an allowance: a filing, a number, a draft, a stage that reached review, paused
    *  or was interrupted. */
@@ -271,8 +495,17 @@ interface PriorProgressReasons {
  * later server position where its Next files.
  *
  * HARD (a person can never lift these here — the page is then done by hand for this project):
- *   - any tracked application or permit number of this project, WHATEVER its portal URL (blank, this
- *     host or another: the table carries no side);
+ *   - a tracked application or permit number of this project (trackedNumberHardReason, #365). A
+ *     number of the OTHER side is skipped only on POSITIVE, HOST-LEVEL evidence that it was filed
+ *     elsewhere: a NEM number when this utility's own records (KB rows of any confidence, its
+ *     recipes) name a portal and every one is a utility interconnection platform host (PowerClerk
+ *     and kin, a utility's own domain — never a city's permit portal, never a Salesforce site,
+ *     whatever its label or path), and its filing lookup names no other (the lookup never vouches
+ *     alone); a permit number when every portal in question is such a platform host (permits are
+ *     never filed there). A row on the columns' defaults or with contradictory columns, a number
+ *     recorded on this very host, a NEM row that kept a URL off the platform, a utility that names
+ *     any other portal or none, or no portal given: it counts, as main counts it. Asked again at the
+ *     admission on the page the request actually leaves from (reserveInfoPagePassUse);
  *   - a submission on this side in any status but "failed" (staged, awaiting a person, paused,
  *     submitted, approved, issued — and any status not known here);
  *   - a portal run on this side with a confirmation number, or in any status but queued / running
@@ -289,16 +522,14 @@ interface PriorProgressReasons {
  *     person's fix captured mid-learn.
  * A read error is a hard reason: an unknown never reassures.
  */
-export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scopeType: Side): PriorProgressReasons {
+export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scopeType: Side, portalUrls: ReadonlyArray<string>): PriorProgressReasons {
   const hard: string[] = [];
   const learn: string[] = [];
   const side: Side = scopeType === "utility" ? "utility" : "ahj";
   const nem = side === "utility";
   try {
-    for (const t of db.query<Row>("SELECT application_number, permit_number FROM permit_check_targets WHERE project_id = ?", [projectId])) {
-      const n = s(t.application_number).trim() || s(t.permit_number).trim();
-      if (n) { hard.push(`a filing of this project is tracked by number (${maskDigits(n).slice(0, 24)})`); break; }
-    }
+    const tracked = trackedNumberHardReason(db, projectId, side, portalUrls);
+    if (tracked) hard.push(tracked);
     for (const x of db.query<Row>("SELECT permit_type, status, application_number, permit_number, confirmation_number FROM submissions WHERE project_id = ?", [projectId])) {
       if ((s(x.permit_type) === "nem") !== nem) continue;
       const numbered = !!(s(x.application_number).trim() || s(x.permit_number).trim() || s(x.confirmation_number).trim());
@@ -334,7 +565,7 @@ export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scope
       else learn.push(`an earlier learn of this project: ${r.action.replace(/^portal\./, "").replace(/_/g, " ")} (${r.at})`);
     }
   } catch {
-    hard.push("this project's progress on this portal could not be read");
+    hard.push(INFO_PAGE_PROGRESS_UNREADABLE);
   }
   return { hard: Array.from(new Set(hard)), learn: Array.from(new Set(learn)) };
 }
@@ -342,11 +573,17 @@ export function infoPagePriorProgressReasons(db: AppDb, projectId: string, scope
 /**
  * HAS THIS PROJECT ALREADY MADE PROGRESS ON THIS PORTAL? true refuses the pass (the learner's
  * INFO_PAGE_PRIOR_PROGRESS_REFUSAL). Every reason of infoPagePriorProgressReasons counts; an
- * unparseable portal URL or a read error is true: an unknown never reassures.
+ * unparseable portal URL is true; a read error THROWS (the caller hands its stand-in): an unknown
+ * never reassures, and never reads as this project's history.
  */
 export function infoPagePriorProgress(db: AppDb, projectId: string, portalUrl: string, scopeType: Side): boolean {
   try { const o = new URL(portalUrl).origin; if (!o || o === "null") return true; } catch { return true; }
-  const r = infoPagePriorProgressReasons(db, projectId, scopeType);
+  const r = infoPagePriorProgressReasons(db, projectId, scopeType, [portalUrl]);
+  // A READ ERROR IS NOT A READING (Helm's review, optional): it throws, so the caller hands its
+  // fail-closed stand-in (passUnavailable: no pass AND no card), never a history reading that would
+  // record a history-stamped card. The card itself still shows the reason (listInfoPageProjectState).
+  const unreadable = r.hard.find((h) => h === INFO_PAGE_TRACKED_UNREADABLE || h === INFO_PAGE_PROGRESS_UNREADABLE);
+  if (unreadable) throw new Error(unreadable);
   return r.hard.length > 0 || r.learn.length > 0;
 }
 
@@ -364,7 +601,16 @@ export function listInfoPageProjectState(db: AppDb, projectId: string): InfoPage
     const last = allowed.length ? allowed[allowed.length - 1] : null;
     const since = parsed.filter((r) => r.rid > (last?.rid ?? 0) && r.action !== ACT_ALLOWED_AGAIN && rowOnSide(r.d, side));
     if (!since.length) continue;
-    const reasons = infoPagePriorProgressReasons(db, projectId, side);
+    // THE PORTAL(S) IN QUESTION: every verified page this side passed or was held at, and every
+    // learn's own portal URL on this side — a number counts unless it is ruled off ALL of them, so
+    // the card is never more permissive than the learner's own check (which reads its portal URL).
+    // None known: every number counts.
+    const portals = [
+      ...since.map((r) => s(r.d.where)),
+      ...db.query<{ details: string }>("SELECT details FROM audit_logs WHERE project_id = ? AND action = ?", [projectId, ACT_LEARN_STARTED])
+        .map((r) => parse<Row>(r.details, {})).filter((d) => rowOnSide(d, side)).map((d) => s(d.portalUrl)),
+    ];
+    const reasons = infoPagePriorProgressReasons(db, projectId, side, portals);
     out.push({
       scope: side,
       passed: since.filter((r) => r.action === ACT_PASSED).map((r) => ({ passId: s(r.d.passId), where: s(r.d.where), at: r.at })).slice(-5),
@@ -426,7 +672,7 @@ export function recordInfoPageCandidate(db: AppDb, projectId: string, learnRunId
   const at = nowIso();
   return db.transaction(() => {
     const existing = db.get<Row>(
-      "SELECT id, status, decided_by, decided_at FROM portal_info_page_candidates WHERE project_id = ? AND identity_sha256 = ? AND status <> 'verified'",
+      "SELECT id, status, decided_by, decided_at, evidence_json FROM portal_info_page_candidates WHERE project_id = ? AND identity_sha256 = ? AND status <> 'verified'",
       [projectId, c.identitySha256]);
     if (existing) {
       const open = s(existing.status) === "open";
@@ -435,6 +681,10 @@ export function recordInfoPageCandidate(db: AppDb, projectId: string, learnRunId
           [at, learnRunId, shot, JSON.stringify(c.observed ?? null), JSON.stringify(c.observed ?? null), s(existing.id)]);
       } else {
         db.run("UPDATE portal_info_page_candidates SET last_seen_at = ?, seen_count = seen_count + 1, learn_run_id = ? WHERE id = ?", [at, learnRunId, s(existing.id)]);
+      }
+      if (open && c.capturedWithHistory === true) {
+        const ev = parse<Record<string, unknown>>(existing.evidence_json, {});
+        if (ev.capturedWithHistory !== true) db.run("UPDATE portal_info_page_candidates SET evidence_json = ? WHERE id = ?", [JSON.stringify({ ...ev, capturedWithHistory: true }), s(existing.id)]);
       }
       return { id: s(existing.id), status: open ? "open" as const : "dismissed" as const, inserted: false, decidedBy: s(existing.decided_by), decidedAt: s(existing.decided_at) };
     }
@@ -445,11 +695,14 @@ export function recordInfoPageCandidate(db: AppDb, projectId: string, learnRunId
          digest_json, prefix_json, evidence_json, observed_json, screenshot_png, status)
        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')`,
       [cid, projectId, learnRunId, at, at, s(c.origin), s(c.path), c.identityVersion, c.identitySha256,
-        JSON.stringify(c.digest), JSON.stringify(c.prefix), JSON.stringify(c.evidence ?? {}), JSON.stringify(c.observed ?? null), shot && shot.length ? shot : null],
+        JSON.stringify(c.digest), JSON.stringify(c.prefix), JSON.stringify(c.capturedWithHistory === true ? { ...((c.evidence ?? {}) as Record<string, unknown>), capturedWithHistory: true } : (c.evidence ?? {})), JSON.stringify(c.observed ?? null), shot && shot.length ? shot : null],
     );
     return { id: cid, status: "open" as const, inserted: true, decidedBy: "", decidedAt: "" };
   });
 }
+
+/** #366: the warning a card captured on a project with history carries. */
+export const INFO_PAGE_HISTORY_CAPTURE_WARNING = "Captured on a project that already made progress on this portal: make sure this is the page EVERY project sees at this step — not this project's own resumed or in-progress application.";
 
 /** The project's own values, read from its row (street, homeowner, parcel, system size). */
 function projectValues(db: AppDb, projectId: string): string[] {
@@ -533,7 +786,10 @@ const candidateRowToRecord = (db: AppDb, r: Row, usesOf: UsesOf = usesOnce(db)):
       return !!p && passExpiry(db, p, Date.now(), usesOf).length === 0;
     })(),
     refusals: s(r.status) === "open" ? candidateRefusals(db, r, usesOf) : [],
-    warnings: infoPageVerifyWarnings(digest ? digest.shape : null, evidence.text),
+    warnings: [
+      ...infoPageVerifyWarnings(digest ? digest.shape : null, evidence.text),
+      ...((evidence as { capturedWithHistory?: unknown }).capturedWithHistory === true ? [INFO_PAGE_HISTORY_CAPTURE_WARNING] : []),
+    ],
     // ROUND 4: this exact page's verification EXPIRED (30 days / 10 projects): the run was held as on
     // main, and a person re-verifies on this card.
     expiredPass: s(r.status) === "open" ? expiredInfoPagePassFor(db, s(r.identity_sha256), Date.now(), usesOf) : null,
@@ -911,6 +1167,11 @@ export function reserveInfoPagePassUse(
       // run's own learn start is on record, and it is not progress here.)
       const earlier = earlierInfoPageUseOnSide(db, projectId, scope === "utility" ? "utility" : "ahj");
       if (earlier) return [earlier];
+      // #365, ASKED AGAIN ON THE REAL PAGE: the hand-out judged the learn's own portal URL; the walk
+      // may have reached a page on another host. The use is judged on the page the verified request
+      // leaves from. Only the tracked-number reason: this run's own learn start is on record.
+      const tracked = trackedNumberHardReason(db, projectId, scope === "utility" ? "utility" : "ahj", [where]);
+      if (tracked) return [`the use could not be reserved (${tracked})`];
     }
     addAuditLog(db, projectId, "portal_bot", "network backstop", ACT_PASSED, { runId, scope, passId, where });
     return [];

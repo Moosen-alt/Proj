@@ -346,7 +346,7 @@ function isRealEntityName(name: string): boolean {
 function entityNameCore(name: string): string {
   return name.trim().replace(/,\s*[A-Za-z]{2}\.?$/, "").replace(/\s+[A-Z]{2}$/, "").trim();
 }
-function sameEntity(stateA: string, nameA: string, stateB: string, nameB: string): boolean {
+export function sameEntity(stateA: string, nameA: string, stateB: string, nameB: string): boolean {
   const sa = stateA.trim().toLowerCase();
   const sb = stateB.trim().toLowerCase();
   const score = knowledgeNameMatchScore(entityNameCore(nameA), entityNameCore(nameB));

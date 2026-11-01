@@ -4088,6 +4088,9 @@ export interface InfoPageCandidateCapture {
   evidence: unknown;
   /** The masked full-page screenshot, base64 PNG; absent when it could not be taken safely. */
   screenshotBase64?: string;
+  /** #366: captured on a project that already made progress on this portal — its session may have
+   *  sat at a later position of the interview, so the card warns the person verifying it. */
+  capturedWithHistory?: boolean;
 }
 
 /** A candidate row as the dashboard reads it (project-scoped evidence; never screenshot bytes). */
