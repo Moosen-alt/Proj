@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<!-- A SYNTHETIC Accela Citizen Access module search page (CapHome.aspx), shaped like ACA's general
+     search: ASP.NET WebForms, one aspnetForm, the Search control a __doPostBack link. Every value is
+     fictional. Used by backend/test/accelaRecordSearch.test.ts (#443). -->
+<html><head><title>Accela Citizen Access</title></head><body>
+<div id="ctl00_HeaderNavigation_divNavigation" class="ACA_Header_Nav">
+  <a id="ctl00_HeaderNavigation_com_headIsLoginStatus" href="../Login.aspx">Login</a>
+  <a href="../Account/RegisterDisclaimer.aspx">Register for an Account</a>
+</div>
+<form name="aspnetForm" method="post" action="./CapHome.aspx?module={{MODULE}}&amp;TabName={{MODULE}}" id="aspnetForm">
+<div>
+<input type="hidden" name="__EVENTTARGET" id="__EVENTTARGET" value="" />
+<input type="hidden" name="__EVENTARGUMENT" id="__EVENTARGUMENT" value="" />
+<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="{{VIEWSTATE}}" />
+<input type="hidden" name="__VIEWSTATEGENERATOR" id="__VIEWSTATEGENERATOR" value="A1B2C3D4" />
+<input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="EV-{{VIEWSTATE}}" />
+</div>
+<script type="text/javascript">
+//<![CDATA[
+var theForm = document.forms['aspnetForm'];
+if (!theForm) { theForm = document.aspnetForm; }
+function __doPostBack(eventTarget, eventArgument) {
+    if (!theForm.onsubmit || (theForm.onsubmit() != false)) {
+        theForm.__EVENTTARGET.value = eventTarget;
+        theForm.__EVENTARGUMENT.value = eventArgument;
+        theForm.submit();
+    }
+}
+//]]>
+</script>
+<div class="ACA_TabRow">
+  <a href="CapHome.aspx?module=Building&amp;TabName=Building">Building</a>
+  <a href="CapHome.aspx?module=Electrical&amp;TabName=Electrical">Electrical</a>
+</div>
+<div id="ctl00_PlaceHolderMain_divGeneralSearch">
+  <h1>Search for Records</h1>
+  <label for="ctl00_PlaceHolderMain_generalSearchForm_txtGSPermitNumber">Record Number:</label>
+  <input name="ctl00$PlaceHolderMain$generalSearchForm$txtGSPermitNumber" type="text" maxlength="50" id="ctl00_PlaceHolderMain_generalSearchForm_txtGSPermitNumber" />
+  <select name="ctl00$PlaceHolderMain$generalSearchForm$ddlGSPermitType" id="ctl00_PlaceHolderMain_generalSearchForm_ddlGSPermitType">
+    <option value="" selected="selected">--Select--</option>
+    <option value="Permitting/Residential/NA/NA">Residential</option>
+  </select>
+  <input name="ctl00$PlaceHolderMain$generalSearchForm$txtGSStartDate" type="text" value="01/01/2024" id="ctl00_PlaceHolderMain_generalSearchForm_txtGSStartDate" />
+  <input name="ctl00$PlaceHolderMain$generalSearchForm$txtGSEndDate" type="text" value="10/31/2026" id="ctl00_PlaceHolderMain_generalSearchForm_txtGSEndDate" />
+  <input type="checkbox" name="ctl00$PlaceHolderMain$generalSearchForm$chkGSShowExpired" id="ctl00_PlaceHolderMain_generalSearchForm_chkGSShowExpired" />
+  <a id="ctl00_PlaceHolderMain_btnNewSearch" class="ACA_LgButton ACA_LgButton_FontSize" href="javascript:__doPostBack('ctl00$PlaceHolderMain$btnNewSearch','')"><span>Search</span></a>
+  <a id="ctl00_PlaceHolderMain_btnResetSearch" class="ACA_SmButton" href="javascript:__doPostBack('ctl00$PlaceHolderMain$btnResetSearch','')"><span>Clear</span></a>
+</div>
+<div id="ctl00_PlaceHolderMain_divCreate">
+  <a id="ctl00_PlaceHolderMain_btnCreateApplication" href="javascript:__doPostBack('ctl00$PlaceHolderMain$btnCreateApplication','')"><span>Apply for a Permit</span></a>
+  <input type="submit" name="ctl00$PlaceHolderMain$btnPayFees" value="Pay Fees" id="ctl00_PlaceHolderMain_btnPayFees" />
+</div>
+</form>
+</body></html>
