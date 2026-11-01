@@ -18,7 +18,8 @@
 //      a filing awaiting_human_submit, a lookup in flight   -> skip, try again next cycle
 //      (a waiting portal run / filing counts only while its window can be open: written since the
 //      running server started and not on an archived project; issue #99)
-//   6. the supervised server (run-prod-supervised.ps1) owns this install -> skip
+//   6. the supervised server (run-prod-supervised.ps1) owns this install -> skip; the server
+//      processes could not be read at all -> skip and say exactly that (#188)
 //   7. snapshot the DB (online backup + .sha256 sidecar, verified) -> no snapshot, no pull
 //   8. stop this install's server (the process LISTENING on PORT whose command line is server.ts)
 //   9. `git merge --ff-only origin/main`; failure -> restart the old code, install unchanged
@@ -241,7 +242,12 @@ export async function runCycle(deps, opts = {}) {
 
   const busy = await deps.busy();
   if (busy.length) { log(`busy, skipping ${short(from)} -> ${short(to)}: ${busy.join("; ")}`); return { outcome: "busy", from, to, reasons: busy }; }
-  if (deps.supervisorRunning()) {
+  const supervisor = deps.supervisorRunning();
+  if (supervisor === null) {
+    log(`skipped ${short(from)} -> ${short(to)}: could not inspect the server processes (PowerShell failed or timed out); nothing done`);
+    return { outcome: "inspect-failed", from, to };
+  }
+  if (supervisor) {
     log("skipped: run-prod-supervised.ps1 is running and owns restarts of this install; nothing done");
     return { outcome: "supervised", from, to };
   }
@@ -343,11 +349,17 @@ foreach ($c in @(Get-NetTCPConnection -LocalPort $port -State Listen)) {
   }
   $roots += [int]$p.ProcessId
 }
-$sup = [bool]($all.Values | Where-Object { $_.CommandLine -like '*run-prod-supervised.ps1*' })
+$sup = [bool]($all.Values | Where-Object { [int]$_.ProcessId -ne $PID -and $_.Name -match '^(powershell|pwsh)\\.exe$' -and $_.CommandLine -match '-File\\s+"?[^"]*run-prod-supervised\\.ps1' })
 @{ roots = @($roots | Select-Object -Unique); supervisor = $sup } | ConvertTo-Json -Compress
 `;
 
-function inspectServer(cfg) {
+// THE SUPERVISOR IS A POWERSHELL RUNNING THE SCRIPT AS ITS -File (#188). The check used to match any
+// command line containing "run-prod-supervised.ps1", and the inspecting PowerShell carries this very
+// script text in its own -Command, so it always found itself: every cycle skipped as "supervised"
+// (39 in a row on 2026-10-04, with no supervisor running) and the install was only ever updated by
+// hand. Now: never $PID, and only powershell/pwsh whose -File is that script.
+// Returns null when the processes could not be read (PowerShell failed, timed out, or printed no JSON).
+export function inspectServer(cfg) {
   if (!WIN) return { roots: [], supervisor: false };
   const r = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", PS_SERVER], {
     encoding: "utf8", env: { ...process.env, AU_PORT: String(cfg.port) }, timeout: 60_000, windowsHide: true,
@@ -413,7 +425,9 @@ function realDeps(cfg, log) {
       }
       return busyReasons(counts, health);
     },
-    supervisorRunning: () => inspectServer(cfg)?.supervisor ?? true, // unreadable = assume it is
+    // true / false, or null when the processes could not be read: the cycle then skips and says so,
+    // never "the supervisor is running" (#188: an unreadable inspection used to be reported as one).
+    supervisorRunning: () => { const found = inspectServer(cfg); return found ? found.supervisor : null; },
     // Online backup from a read-only connection, then the sha256sum-format sidecar backup.ts
     // writes, then re-read both and run quick_check on the copy. Named `autopilot-pre-update-…`
     // so it lists with the other snapshots; backup.ts rotation never prunes it (isAutomaticSnapshot),
