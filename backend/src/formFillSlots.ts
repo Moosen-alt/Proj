@@ -145,10 +145,36 @@ export interface Slot {
   section?: string;
 }
 
+/** THE PAGE HANDED TO THE APPLICANT FROM A LINE DOWN (issue #446). City of Albuquerque's E-Plan
+ *  application prints "APPLICANT TO PROVIDE ALL INFORMATION BELOW:" under its letterhead; the
+ *  "PERMIT #" and "ADDITIONAL PERMIT #S" lines above it are the city's own, marked by that banner
+ *  alone (no office-use header, no office word in their labels). A banner is one printed line that
+ *  names the applicant, what they do (provide / complete / fill in the information) and "below". */
+const BANNER_ACTION = new Set(["provide", "provided", "complete", "completed", "fill", "filled", "information", "info"]);
+export function isApplicantBanner(str: string): boolean {
+  const words = slotTokens(str);
+  return words.length <= 12 && words.includes("below") && (words.includes("applicant") || words.includes("applicants"))
+    && words.some((w) => BANNER_ACTION.has(w));
+}
+
+/** The banners of a form, read once per text layer (partyOfSlot runs once per box). */
+const bannerCache = new WeakMap<TextItem[], TextItem[]>();
+function applicantBanners(items: TextItem[]): TextItem[] {
+  let got = bannerCache.get(items);
+  if (!got) {
+    got = items.filter((i) => !i.angle && !i.blank && isApplicantBanner(i.str));
+    bannerCache.set(items, got);
+  }
+  return got;
+}
+
 /** Rule 3: the party of a box — its own label's, else a party named to its LEFT on its own line
  *  (a baseline inside the box's band: a widget's rectangle, a label's own text height),
- *  else the nearest section header above it in its column. */
+ *  else the nearest section header above it in its column. Above an applicant banner, the office's. */
 export function partyOfSlot(items: TextItem[], headers: Array<{ item: TextItem; party: Party }>, s: Omit<Slot, "party" | "id">): Party | null {
+  // Above an "applicant to provide all information below" banner, on its page, is the agency's
+  // (issue #446): the banner hands the applicant only what follows it, whatever a box's label says.
+  if (applicantBanners(items).some((b) => b.page === s.page && b !== s.item && s.y > b.y + Math.max(b.height, 4) * 0.75)) return "office";
   const own = partyOfWords(slotTokens(s.label));
   if (own) return own;
   const line = items
@@ -232,7 +258,8 @@ export function combinedCityStateZip(data: Record<string, string>): string {
 export interface SlotPick { key: string; value: string; slot: Slot; synonym: string }
 
 /**
- * Pick one box per data key. Candidates rank by synonym order (the most specific label the form
+ * Pick one box per data key (the company's values once more in each further company block, #447 below).
+ * Candidates rank by synonym order (the most specific label the form
  * prints wins: "Construction address:" over a bare "Address:"), then — for the company's values —
  * the block its first value went in, then party fit (the contractor's "Phone:" over an unlabelled
  * one), then fewest extra words, then reading order (page, top to bottom, left to right). `accept`
@@ -249,14 +276,13 @@ export function pickSlots(
   let combinedFilled = false;
   // The block the first company value landed in; the rest of the company's values prefer it.
   let companySection: string | null = null;
-  for (const [key, raw] of Object.entries(data)) {
-    const value = String(raw ?? "").trim();
-    if (!value) continue;
-    if ((key === "state" || key === "zip") && combinedFilled) continue;
+  /** The boxes a key's value may go in, best first; `inSection` keeps them to one printed block. */
+  const candidates = (key: string, inSection?: string): Array<{ slot: Slot; synonym: string }> => {
     const cands = synonyms[key] ?? [key];
     const ranked: Array<{ slot: Slot; synonym: string; rank: number[] }> = [];
     for (const slot of slots) {
       if (used.has(slot.id) || isAuthorityLabel(slot.label)) continue;
+      if (inSection != null && (slot.section ?? "") !== inSection) continue;
       const combined = isCombinedCityStateZip(slot.label);
       if (combined && key !== "city") continue;
       let best: { i: number; extra: number } | null = null;
@@ -279,6 +305,10 @@ export function pickSlots(
       for (let i = 0; i < a.rank.length; i++) if (a.rank[i] !== b.rank[i]) return a.rank[i] - b.rank[i];
       return 0;
     });
+    return ranked;
+  };
+  /** Fill the first candidate `accept` takes; null when none. */
+  const take = (key: string, value: string, ranked: Array<{ slot: Slot; synonym: string }>): SlotPick | null => {
     for (const r of ranked) {
       const combined = isCombinedCityStateZip(r.slot.label);
       const pick: SlotPick = { key, value: combined ? combinedCityStateZip(data) : value, slot: r.slot, synonym: r.synonym };
@@ -286,8 +316,36 @@ export function pickSlots(
       used.add(r.slot.id);
       picks.push(pick);
       if (combined) combinedFilled = true;
-      if (COMPANY_KEYS.has(key) && companySection == null) companySection = r.slot.section ?? "";
-      break;
+      return pick;
+    }
+    return null;
+  };
+  for (const [key, raw] of Object.entries(data)) {
+    const value = String(raw ?? "").trim();
+    if (!value) continue;
+    if ((key === "state" || key === "zip") && combinedFilled) continue;
+    const pick = take(key, value, candidates(key));
+    if (pick && COMPANY_KEYS.has(key) && companySection == null) companySection = pick.slot.section ?? "";
+  }
+  // MORE THAN ONE COMPANY BLOCK (issue #447). City of Tigard prints an APPLICANT block and a
+  // CONTRACTOR block, each asking for a "Business name:", an address and a phone; the company is
+  // both, so both get its values. Another printed block is the company's only when its own name
+  // box reads as the contractor's — a business/company/contractor name by its label, or a "Name:"
+  // under a CONTRACTOR header. A bare "Name:" under APPLICANT (Yamhill County) may be the
+  // homeowner's, so that block stays as the operator left it. Owner, office and fee blocks never
+  // take a company value (keyAllowsParty), and each value stays inside the block its name went in.
+  if (companySection && String(data.installer ?? "").trim()) {
+    const order = [...slots].sort((a, b) => a.page - b.page || b.y - a.y || a.x - b.x);
+    const blocks = [...new Set(order.map((s) => s.section ?? ""))].filter((b) => b && b !== companySection);
+    for (const block of blocks) {
+      // The block's own header ("CONTRACTOR:") is printed in the block above it, not a box there.
+      const company = candidates("installer", block).filter((r) => r.slot.party === "contractor" && !headerParty(r.slot.label));
+      if (!company.length || !take("installer", String(data.installer).trim(), company)) continue;
+      for (const [key, raw] of Object.entries(data)) {
+        const value = String(raw ?? "").trim();
+        if (key === "installer" || !COMPANY_KEYS.has(key) || !value) continue;
+        take(key, value, candidates(key, block));
+      }
     }
   }
   return picks;

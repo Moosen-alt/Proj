@@ -19,7 +19,7 @@ import path from "node:path";
 import { PDFDocument } from "pdf-lib";
 import { autoFillByFieldName } from "../src/formFiller";
 import { autoPlaceFromData, extractLabels, splitBlankRuns, type AutoPlacement, type LabelItem } from "../src/formTextLayer";
-import { matchSynonym, isCombinedCityStateZip, headerParty, keyAllowsParty } from "../src/formFillSlots";
+import { matchSynonym, isCombinedCityStateZip, headerParty, keyAllowsParty, isApplicantBanner } from "../src/formFillSlots";
 
 let failures = 0;
 let passed = 0;
@@ -81,6 +81,14 @@ await check("the company's values never go in an owner, office or fee box; the h
   assert.equal(keyAllowsParty("name", "applicant", "applicant name"), true, "a synonym that names the party means it");
   assert.equal(keyAllowsParty("permitNumber", "office", "permit #"), false);
   assert.equal(keyAllowsParty("date", "owner", "date"), false, "the owner dates their own signature");
+});
+
+await check("an 'applicant to provide all information below' line is a banner; a sentence about items below is not (#446)", () => {
+  assert.equal(isApplicantBanner("APPLICANT TO PROVIDE ALL INFORMATION BELOW:"), true);
+  assert.equal(isApplicantBanner("Applicant to complete all information below"), true);
+  assert.equal(isApplicantBanner("If “No” is selected for any item below, or if the supporting structure is a manufactured dwelling, the project"), false);
+  assert.equal(isApplicantBanner("below."), false);
+  assert.equal(isApplicantBanner("APPLICANT"), false);
 });
 
 // ── AcroForm blanks (the tool's "fillable form" door) ────────────────────────────────────────
@@ -185,6 +193,52 @@ await check("Albuquerque E-Plan: the owner's name on its NAME line (not over 'OW
   const phoneLbl = f.items.find((i) => i.str === "PHONE" && Math.abs(i.y - (phone?.y ?? -99)) <= 1);
   assert.ok(phoneLbl && phone.x > phoneLbl.x + phoneLbl.width && phone.y < f.byKey.installer.y, `phone at ${JSON.stringify(phone)}`);
   assert.deepEqual(overprints(f.items, f.placements), []);
+});
+
+// ── More than one company block (issue #447) ────────────────────────────────────────────────
+await check("Tigard building + electrical: the company's name, address and phone go in BOTH the APPLICANT and the CONTRACTOR block (#447)", async () => {
+  for (const file of ["tigard-building.pdf", "tigard-electrical.pdf"]) {
+    const f = await flat(file);
+    const head = (str: string) => f.items.find((i) => i.str.trim() === str);
+    const applicant = head("APPLICANT");
+    const contractor = head("CONTRACTOR");
+    assert.ok(applicant && contractor && applicant.page === contractor.page && applicant.y > contractor.y, `${file}: both headers`);
+    const owner = f.items.find((i) => i.page === applicant.page && /^(PROPERTY )?OWNER$/.test(i.str.trim()));
+    for (const key of ["installer", "mailingAddress", "phone"]) {
+      const at = f.placements.filter((p) => p.key === key);
+      const inApplicant = at.filter((p) => p.page === applicant.page && p.y < applicant.y && p.y > contractor.y);
+      const inContractor = at.filter((p) => p.page === contractor.page && p.y < contractor.y);
+      assert.equal(inApplicant.length, 1, `${file}: ${key} once in APPLICANT (${JSON.stringify(at)})`);
+      assert.equal(inContractor.length, 1, `${file}: ${key} once in CONTRACTOR (${JSON.stringify(at)})`);
+      assert.equal(at.length, 2, `${file}: ${key} nowhere else`);
+      assert.ok(!owner || at.every((p) => p.page !== owner.page || p.y < applicant.y), `${file}: ${key} not in the owner block`);
+    }
+    assert.equal(f.placements.filter((p) => p.key === "installer").every((p) => p.label === "Business name:"), true, `${file}: on each block's Business name line`);
+    assert.equal(f.placements.filter((p) => p.key === "name").length, 1, `${file}: the homeowner once, in the owner block`);
+    assert.deepEqual(overprints(f.items, f.placements), [], file);
+  }
+});
+await check("single company block forms fill each value once: Yamhill's bare APPLICANT 'Name:' is not taken for the company (#447)", async () => {
+  for (const file of ["yamhill-building-application.pdf", "abq-eplan-application.pdf", "valencia-multi-purpose-permit-application.pdf"]) {
+    const f = await flat(file);
+    const keys = f.placements.map((p) => p.key);
+    assert.deepEqual(keys, [...new Set(keys)], `${file}: one box per key`);
+  }
+  for (const file of ["marion-e-01.pdf", "marion-b-01s.pdf", "coos-electrical.pdf", "bcd-5952-2024.pdf"]) {
+    const r = await autoFillByFieldName(blank(file), ROW);
+    const keys = r.matched.map((m) => m.key);
+    assert.deepEqual(keys, [...new Set(keys)], `${file}: one box per key`);
+  }
+});
+
+// ── An agency's box above the applicant's banner (issue #446) ──────────────────────────────
+await check("Albuquerque E-Plan: the permit number stays out of the city's top-right PERMIT # above 'APPLICANT TO PROVIDE ALL INFORMATION BELOW' (#446)", async () => {
+  const f = await flat("abq-eplan-application.pdf");
+  const banner = f.items.find((i) => /APPLICANT TO PROVIDE ALL INFORMATION BELOW/.test(i.str));
+  assert.ok(banner, "the banner is printed");
+  assert.equal(f.byKey.permitNumber, undefined, `permit number placed at ${JSON.stringify(f.byKey.permitNumber)}`);
+  assert.ok(f.placements.every((p) => p.page !== banner.page || p.y < banner.y), "nothing written above the banner");
+  for (const key of ["name", "street", "zip", "date", "installer", "mailingAddress", "phone"]) assert.ok(f.byKey[key], `${key} still placed below it`);
 });
 
 console.log(`\nformFillerRightBox: ${passed} passed, ${failures} failed`);
