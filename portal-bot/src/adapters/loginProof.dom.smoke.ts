@@ -19,7 +19,9 @@
 // This pins the fixed rule, against local fixtures only (no live portal):
 //   NEGATIVE (kill tests — these FLIP back to "logged in" if `formGone || urlMoved` returns):
 //     /gov/login       a real form that RE-RENDERS as an identifier-first step 1 after submit
-//     /idp-redirect    a login that hands off to a SECOND login at /auth/signin
+//     /idp-redirect    a login that hands off to a SECOND login at /auth/signin (not a refusal)
+//   NEGATIVE (#512 — a refusal must read as one, or the login is never marked stale):
+//     /acct/login?ReturnUrl=…  a refused password re-rendered on the SAME page, its query gone
 //   NEGATIVE (guard):
 //     /login-identifier-loop  an identifier-first page whose Next re-renders step 1 forever
 //   POSITIVE (guard both ways — the fix must not break a real login):
@@ -47,7 +49,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { chromium } from "playwright";
 import type { Page } from "playwright";
-import { performLogin, loginPageShape, looksLikeLoginUrl, isRegistrationUrl, accountAffordancePresent } from "./loginFlow";
+import { performLogin, loginPageShape, looksLikeLoginUrl, isRegistrationUrl, accountAffordancePresent, loginWasRefused } from "./loginFlow";
 
 let failures = 0;
 const check = async (label: string, fn: () => Promise<void>): Promise<void> => {
@@ -111,6 +113,18 @@ const IDP_HANDOFF = `<!doctype html><html><head><title>County Permits</title></h
   <button id="go">Sign In</button>
   <script>
     document.getElementById("go").onclick = function () { location.href = "/auth/signin"; };
+  </script>
+</body></html>`;
+
+// (C2) THE RECORD-LINK SIGN-IN (#512) — the same login page, reached with its return address
+// (/acct/login?ReturnUrl=…), whose form re-renders a REFUSED password at the bare page. The query
+// changed; the page did not. That is a refusal, not a hand-off to another login.
+const REFUSED_SAME_PAGE = `<!doctype html><html><head><title>Portal - Log In</title></head><body>
+  <h1>Log In</h1><p>Invalid username or password.</p>
+  <input type="text" id="u" name="username"><input type="password" id="p" name="password">
+  <button id="go">Log In</button>
+  <script>
+    document.getElementById("go").onclick = function () { location.href = "/acct/login"; };
   </script>
 </body></html>`;
 
@@ -281,6 +295,7 @@ const routes: Record<string, string> = {
   "/gov/login": RERENDER_LOGIN,
   "/idp-redirect": IDP_HANDOFF,
   "/auth/signin": SECOND_LOGIN,
+  "/acct/login": REFUSED_SAME_PAGE,
   "/login-two-step": TWO_STEP_REAL,
   "/app-redirect": APP_REDIRECT,
   "/dashboard": DASHBOARD,
@@ -377,6 +392,16 @@ await check("KILL TEST — login hands off to a SECOND login at /auth/signin →
   assert.notEqual(res.status, "logged_in", `a URL that moved to another sign-in page is not a session (got: ${res.message})`);
   assert.equal(res.ok, false, "a second login page must be an ACCESS failure, not a green run");
   assert.match(page.url(), /\/auth\/signin/, "fixture sanity: the hand-off should have happened");
+  assert.equal(loginWasRefused(res.message), false, `a hand-off to ANOTHER login page is not a refusal of this password (got: ${res.message})`);
+});
+
+// --- NEGATIVE (#512): a refusal re-rendered on the SAME page, its query string gone -----------
+await check("a refused password re-rendered at the same login page without its ?ReturnUrl → still_on_login, read as REFUSED (not a hand-off)", async () => {
+  await page.goto(`http://127.0.0.1:${port}/acct/login?ReturnUrl=%2Frecord%3Fid%3D7`);
+  const res = await performLogin(page, cred);
+  assert.equal(res.ok, false);
+  assert.equal(res.status, "still_on_login", `got ${res.status}: ${res.message}`);
+  assert.equal(loginWasRefused(res.message), true, `a refused password must read as refused, or the login is never marked stale and every check knocks again (got: ${res.message})`);
 });
 
 // --- POSITIVE (guard both ways): a real two-step login still succeeds ----------------------

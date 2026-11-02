@@ -39,6 +39,31 @@ export interface LoginResult {
   message: string;
 }
 
+/** DID THE PORTAL REFUSE THE STORED LOGIN? Read off performLogin's own wording — the one question
+ *  every caller that records login health asks (the learn's outcome in autoLearn, the monitor's
+ *  signed-in record read), so a refusal marks a credential stale everywhere or nowhere. A hand-off to
+ *  a second login, an unfinished two-step or an MFA screen is not a refusal of this password. */
+export function loginWasRefused(message: string): boolean {
+  return /still on the login form|username\/password was likely rejected|login failed/i.test(String(message ?? ""));
+}
+
+/** THE SAME LOGIN PAGE UNDER ANOTHER QUERY STRING IS NOT A HAND-OFF (#512). A sign-in page reached
+ *  through a record link carries its return address (…/Login?ReturnUrl=…) while its form often posts
+ *  to the bare page, so a refused password re-renders the same form on the same page with the query
+ *  gone. Read as "handed off to ANOTHER login", the refusal was never recorded (loginWasRefused) and
+ *  every later attempt knocked again — how an account gets locked. A hand-off moves to another
+ *  origin or another page (Baltimore's www → cityworkspro; /idp-redirect → /auth/signin). */
+function samePageIgnoringQuery(a: string, b: string): boolean {
+  try {
+    const x = new URL(a);
+    const y = new URL(b);
+    const page = (p: string) => p.replace(/\/+$/, "").toLowerCase();
+    return x.origin === y.origin && page(x.pathname) === page(y.pathname);
+  } catch {
+    return a === b;
+  }
+}
+
 // How long to wait for a login to resolve (AJAX login + JS redirect) before concluding
 // the credentials were rejected. PowerClerk's redirect can take several seconds.
 const LOGIN_RESULT_TIMEOUT_MS = 15000;
@@ -1573,7 +1598,7 @@ export async function performLogin(
     const endShape = await loginPageShape(page);
     const formStillThere = await loginFormPresent(page);
     const endUrl: string = typeof page.url === "function" ? page.url() : "";
-    if (endUrl !== loginUrl && endShape) {
+    if (!samePageIgnoringQuery(endUrl, loginUrl) && endShape) {
       // A SECOND LOGIN IS NOT A LOGGED-IN PAGE. Baltimore County's run followed
       // www.baltimorecountymd.gov -> cityworkspro.baltimorecountymd.gov — the right hop, same
       // registrable domain, same permit track — and landed on ANOTHER login, where it clicked
