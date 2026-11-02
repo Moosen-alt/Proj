@@ -11,9 +11,10 @@
 // actually resolves (a borrowed recipe included), which the card does not.
 import type { PortalRecipe, ProjectRecord, RecipeStageGap, SubmittalTrackType } from "../../shared/src/types";
 import type { AppDb } from "./db";
-import { clientStagingOverlay } from "./clients";
+import { clientStagingOverlay, stagingIdentityPortal } from "./clients";
 import { issuingAgencyFor, projectForTrack } from "./permitProcess";
-import { resolveRecipeFieldValues } from "./portalRecipes";
+import { findCompleteRecipeForProject, resolveRecipeFieldValues } from "./portalRecipes";
+import { recipeDisciplineForTrack } from "./portalChannel";
 import { bindRecipeForReplay } from "./recipeReplayBinding";
 import { recipeStageGaps } from "./recipeStageGaps";
 import { submissionDocumentsByType } from "./submissionDocuments";
@@ -34,16 +35,36 @@ function stagingPortalType(db: AppDb, project: ProjectRecord, track: SubmittalTr
  *  resolveRecipeFieldValues. One helper so the track card (stage gaps) and the approval sheet
  *  (#486) read the values the replay binds, never a second copy. Read-only. Throws on a read
  *  failure; each caller decides how to fail. */
-export function stagingFieldValues(db: AppDb, project: ProjectRecord, track: SubmittalTrackType): {
+export function stagingFieldValues(db: AppDb, project: ProjectRecord, track: SubmittalTrackType, recipeUrl?: string): {
   portalProject: ProjectRecord; portalType: string; overlay: Record<string, string>; values: Record<string, string>;
 } {
   const portalProject = projectForTrack(project, track);
   const portalType = stagingPortalType(db, project, track);
-  const overlay = clientStagingOverlay(db, project.clientId ?? null, portalType, { state: String(project.state ?? ""), track });
+  // THE CLIENT'S PORTAL IDENTITY FOR THE PORTAL THE REPLAY OPENS (#518), as prepareSubmission keys it:
+  // the recipe's URL (the caller's, else this track's own complete recipe), else a stored profile.
+  // Never the mock portal's row: these views describe a real filing, and a track with no recipe may
+  // still stage on a real portal through the learner.
+  const runIdentity = stagingIdentityPortal({
+    urls: [recipeUrl ?? trackRecipeUrl(db, portalProject, track)],
+    profilePortalType: portalType,
+    isRealPortal: portalType !== "mock",
+  });
+  const identityPortal = runIdentity === "mock" ? "" : runIdentity;
+  const overlay = clientStagingOverlay(db, project.clientId ?? null, identityPortal, { state: String(project.state ?? ""), track });
   const stagedProject = Object.keys(overlay).length > 0
     ? { ...portalProject, parserSnapshot: { ...portalProject.parserSnapshot, ...overlay } }
     : portalProject;
-  return { portalProject, portalType, overlay, values: resolveRecipeFieldValues(db, stagedProject, portalType, track) };
+  return { portalProject, portalType, overlay, values: resolveRecipeFieldValues(db, stagedProject, identityPortal, track) };
+}
+
+/** The portal URL of this track's own complete recipe (what the next stage replays), "" when none. */
+function trackRecipeUrl(db: AppDb, portalProject: ProjectRecord, track: SubmittalTrackType): string {
+  const scopeType = track === "nem" ? "utility" : "ahj";
+  const recipe = findCompleteRecipeForProject(db, {
+    scopeType, state: portalProject.state, ahj: portalProject.ahj, utility: portalProject.utility,
+    ...(scopeType === "ahj" ? { discipline: recipeDisciplineForTrack(track) } : {}),
+  });
+  return String(recipe?.portalUrl ?? "");
 }
 
 /** The gaps for one track's own complete recipe. [] when nothing is missing, or on any read
@@ -53,7 +74,7 @@ export function stageGapsForTrack(
 ): RecipeStageGap[] {
   if (!recipe || !Array.isArray(recipe.steps) || !recipe.steps.length) return [];
   try {
-    const { portalProject, overlay, values } = stagingFieldValues(db, project, track);
+    const { portalProject, overlay, values } = stagingFieldValues(db, project, track, String(recipe.portalUrl ?? ""));
     const binding = bindRecipeForReplay({
       steps: recipe.steps, portalUrl: recipe.portalUrl, project: portalProject, fieldValues: values, track,
       borrowed: null, agency: issuingAgencyFor(portalProject, track),

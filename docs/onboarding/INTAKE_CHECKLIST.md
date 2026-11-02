@@ -172,13 +172,17 @@ this company has identity rows and your file says `"portalIdentities": []`, the 
 them. Delete the key, don't blank it. (On a brand-new client there are no rows to lose, so
 `[]` and absent are the same thing there.)
 
-Two cautions before you fill one in. It is matched against the `portalType` the
-staging run resolves, and that is `portalProfile?.portal_type ?? "mock"`
-(`repository.ts:5319`) with **nothing in the repo writing `portal_profiles`** — so a row
-keyed to a real platform label matches nothing today, and a row keyed `"mock"` matches
-*every* run and becomes a global company-name override rather than the per-portal one
-intended. With the array empty, `installerCompanyName` falls back to
-`legalBusinessName || companyName`, which is the right answer almost always.
+Two cautions before you fill one in. A row applies only on the portal it names (#518):
+`powerclerk_pge` on PGE's PowerClerk (`pgenm.powerclerk.com`), `accela_oregon` on Oregon
+ePermitting (`aca-oregon.accela.com`). Staging keys the lookup on the portal URL the run opens
+(`stagingIdentityPortal` in `backend/src/clients.ts`), so another PowerClerk tenant (Pacific
+Power) or a city's own Accela tenant uses **no** row, and a row keyed `"mock"` applies only to the
+mock portal, never a real one. With no row for the portal, `installerCompanyName` falls back to
+`legalBusinessName || companyName`, which is the right answer almost always. Second: the PGE
+adapter now STOPS when that name (or the row's label) is not on the account's Installer Company
+list, or the row's contact code is not on the existing-contact list. It never picks another
+option, so a label must be the company's name exactly as the portal lists it (case, spacing and
+punctuation aside).
 
 Ask this one per portal and write it into `mfaRequired` / `mfaCodeDestination` above, not
 into prose: does login send a one-time code, and **which** inbox does it reach? A portal

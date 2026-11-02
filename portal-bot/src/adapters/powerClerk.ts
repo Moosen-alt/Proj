@@ -53,6 +53,96 @@ export function preparerEmailFor(s: Record<string, unknown>, installerEmail: str
   return firstEmail(str(s["filingContactEmail"])) || installerEmail;
 }
 
+// ---------------------------------------------------------------------------
+// WHO IS FILING (#518). The Installer Company list and the existing-contact list decide which
+// company and contact an application is filed under. Neither is ever answered with a default or a
+// guess: the option must be THIS client's, exactly one option may match, and the choice is read
+// back. Anything else throws, and the run stops before the page is saved.
+// ---------------------------------------------------------------------------
+
+/** Case, spacing and punctuation folded: "Acme Solar, LLC" and "ACME SOLAR LLC" are one name.
+ *  Words are never dropped or reordered, so "Acme Solar" never matches "Acme Solar Pros". */
+export function normalizeCompanyLabel(v: string): string {
+  return String(v ?? "").toLowerCase().replace(/&/g, " and ").replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+type SelectOptionView = { value: string; label: string };
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function singleSelect(page: any, label: string): Promise<any | null> {
+  const loc = page.getByLabel(label);
+  const n = await loc.count().catch(() => 0);
+  if (n === 0) return null;
+  if (n > 1) throw new Error(`more than one "${label}" list on the page`);
+  return loc;
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function optionsOf(sel: any): Promise<SelectOptionView[]> {
+  return sel.locator("option").evaluateAll((els: Array<{ value: string; textContent: string | null }>) =>
+    els.map((o) => ({ value: String(o.value ?? ""), label: String(o.textContent ?? "").replace(/\s+/g, " ").trim() })));
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function selectedOf(sel: any): Promise<SelectOptionView> {
+  return sel.evaluate((el: { selectedIndex: number; options: Array<{ value: string; textContent: string | null }> }) => {
+    const o = el.options[el.selectedIndex];
+    return { value: String(o?.value ?? ""), label: String(o?.textContent ?? "").replace(/\s+/g, " ").trim() };
+  });
+}
+
+/**
+ * Select the client's own company on PowerClerk's "Installer Company" list, or throw. An exact label
+ * wins; otherwise the one option whose label is the same name with case, spacing and punctuation
+ * folded. No match, two matches, no list, or a read-back that is not the client's company: throws,
+ * naming the company.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function selectInstallerCompany(page: any, companyName: string): Promise<void> {
+  const company = String(companyName ?? "").trim();
+  const stop = (why: string): Error => new Error(
+    `Installer Company: ${why} — stopped so the application is not filed under another company. `
+    + `Add "${company}" to the portal account, or set this client's PowerClerk (PGE) portal identity to the company's exact label on that list.`,
+  );
+  if (!company) throw stop("no submitting company on the project");
+  const sel = await singleSelect(page, "Installer Company").catch((e: Error) => { throw stop(e.message); });
+  if (!sel) throw stop(`no Installer Company list on the page to choose "${company}" from`);
+  const options = (await optionsOf(sel)).filter((o) => o.value !== "" && o.label !== "");
+  const exact = options.filter((o) => o.label === company);
+  const want = normalizeCompanyLabel(company);
+  const folded = options.filter((o) => normalizeCompanyLabel(o.label) === want);
+  const hits = exact.length ? exact : folded;
+  if (hits.length === 0) throw stop(`"${company}" is not on this account's Installer Company list`);
+  if (hits.length > 1) throw stop(`${hits.length} options on the Installer Company list read as "${company}"`);
+  await sel.selectOption(hits[0].value, { timeout: 5000 });
+  const now = await selectedOf(sel);
+  if (now.value !== hits[0].value || normalizeCompanyLabel(now.label) !== want) {
+    throw stop(`the list did not keep "${company}" selected`);
+  }
+}
+
+/**
+ * Select the client's existing-contact code on PowerClerk's "Existing contact to use for…" list, or
+ * throw. The code must be exactly one option's value or label; the choice is read back.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function selectExistingContact(page: any, contactCode: string, companyName: string): Promise<void> {
+  const code = String(contactCode ?? "").trim();
+  const company = String(companyName ?? "").trim() || "the submitting company";
+  const stop = (why: string): Error => new Error(
+    `Existing contact: ${why} — stopped so the application does not name another company's contact. `
+    + `Check ${company}'s PowerClerk (PGE) portal identity contact code against this account's list.`,
+  );
+  const sel = await singleSelect(page, "Existing contact to use for").catch((e: Error) => { throw stop(e.message); });
+  if (!sel) throw stop(`no existing-contact list on the page for ${company}'s contact code "${code}"`);
+  const hits = (await optionsOf(sel)).filter((o) => o.value !== "" && (o.value === code || o.label === code));
+  if (hits.length === 0) throw stop(`${company}'s contact code "${code}" is not on this account's list`);
+  if (hits.length > 1) throw stop(`${hits.length} options on the list match ${company}'s contact code "${code}"`);
+  await sel.selectOption(hits[0].value, { timeout: 5000 });
+  const now = await selectedOf(sel);
+  if (now.value !== hits[0].value) throw stop(`the list did not keep ${company}'s contact selected`);
+}
+
 // PowerClerk (PGE Net Metering) adapter
 // Built from an operator codegen recording captured up to the final submit page.
 // SECURITY: This adapter NEVER clicks final submit, pays fees, solves CAPTCHA, or
@@ -741,17 +831,20 @@ export class PowerClerkAdapter extends BasePortalAdapter {
       await settleAndNext("applicant");
 
       // --- Installer company selection (same authoritative client value) -----
-      const installerCompany = installerCompanyName;
-      await page.getByLabel("Installer Company").selectOption({ label: installerCompany }).catch(async () => {
-        // Fall back to first option if exact label is unavailable
-        await page.getByLabel("Installer Company").selectOption({ index: 1 }).catch(() => null);
-      });
+      // THIS CLIENT'S COMPANY OR THE RUN STOPS (#518). This used to fall back to the list's first
+      // option when the client's name was not on it, with no error. On a shared filing account the
+      // list holds every client, so that was an application filed under another company's name.
+      // A miss throws here, before Next, so nothing is saved on the portal under the wrong company.
+      await selectInstallerCompany(page, installerCompanyName);
       await settleAndNext("installer company");
 
       // --- System / point of interconnection / Description of Service -------
+      // The client's existing-contact code for THIS account (clientStagingOverlay keys it on the
+      // portal, #518). A code that is not on the list stops the run, the same way: the contact it
+      // would leave in place is whoever the portal defaults to.
       const existingContact = str(s["powerclerkExistingContact"] ?? s["existing_contact"]);
       if (existingContact) {
-        await page.getByLabel("Existing contact to use for").selectOption(existingContact).catch(() => null);
+        await selectExistingContact(page, existingContact, installerCompanyName);
       }
       // Description of Service is a REQUIRED radio. The old getByText().click().catch(()=>null)
       // silently no-op'd when the loading scrim intercepted the click, staging the application

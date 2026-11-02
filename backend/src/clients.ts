@@ -1023,9 +1023,67 @@ export async function offboardClient(db: AppDb, clientId: string, opts: Offboard
   return { dryRun: false, inventory, sessionDirsRemoved, sessionDirsFailed };
 }
 
+// WHICH PORTAL A CLIENT'S PORTAL IDENTITY ROW BELONGS TO (#518). An identity row carries what this
+// client is called on ONE portal account (the PowerClerk "Installer Company" label) and that
+// account's existing-contact code. A contact code means "this contact on THIS account"; on another
+// account the same code can be another company's contact — and on a shared filing account the
+// Installer Company list holds every client. So a row applies only on the portal it names.
+//
+// The staging run used to key the lookup on `portalProfile?.portal_type ?? "mock"`, and nothing writes
+// portal_profiles, so a real run asked for "mock": a row keyed to a real portal never matched, and a
+// row keyed "mock" matched every portal there is. Now:
+//   - a URL names its portal by host (PORTAL_IDENTITY_HOSTS); a host with no identity type gets none;
+//   - a bare portal type counts only when it is one a row can name (the client form's list, plus
+//     "mock" for the mock portal);
+//   - "utility", "AHJ", "" and anything else name no portal, so no row applies;
+//   - "mock" is the mock portal ONLY: stagingIdentityPortal says "mock" just for a run with no real
+//     portal profile and no portal URL at all, so a "mock" row never reaches a real portal.
+export const PORTAL_IDENTITY_TYPES = ["powerclerk_pge", "accela_oregon", "mock"] as const;
+const PORTAL_IDENTITY_HOSTS: Record<string, (typeof PORTAL_IDENTITY_TYPES)[number]> = {
+  "pgenm.powerclerk.com": "powerclerk_pge",
+  "aca-oregon.accela.com": "accela_oregon",
+};
+
+/** The identity type `portal` names — a portal URL or a portal type — or "" when it names none. */
+export function portalIdentityKey(portal: string | null | undefined): string {
+  const v = String(portal ?? "").trim();
+  if (!v) return "";
+  if (/^https?:\/\//i.test(v)) {
+    let host = "";
+    try { host = new URL(v).hostname.toLowerCase(); } catch { return ""; }
+    return PORTAL_IDENTITY_HOSTS[host] ?? "";
+  }
+  return (PORTAL_IDENTITY_TYPES as readonly string[]).includes(v) ? v : "";
+}
+
+/**
+ * The identity type for a staging run, from every portal URL the run could open (the recipe's, the
+ * learner's entry, the login's) and, when it has none, the stored portal profile a hand-coded adapter
+ * drives; "mock" only when there is neither. All of the URLs must name the SAME identity type, or none
+ * applies: a run that might land on either of two portals cannot know which account's contact code is
+ * right.
+ */
+export function stagingIdentityPortal(input: { urls: Array<string | null | undefined>; profilePortalType: string; isRealPortal: boolean }): string {
+  const urls = input.urls.map((u) => String(u ?? "").trim()).filter(Boolean);
+  if (urls.length) {
+    const keys = new Set(urls.map((u) => portalIdentityKey(u)));
+    return keys.size === 1 ? [...keys][0] : "";
+  }
+  if (input.isRealPortal) {
+    const key = portalIdentityKey(input.profilePortalType);
+    return key === "mock" ? "" : key;
+  }
+  // No real profile and nothing to open: the mock portal (or a manual hand-off, which files nothing).
+  return "mock";
+}
+
 // Returns the installer/licensing overlay for a project's linked client, keyed
 // to the snapshot field names the portal adapters already read. Empty object
 // when the project has no client.
+//
+// `portalType` picks the client's portal identity row: a portal URL or identity type
+// (portalIdentityKey). Anything that names no portal ("utility", "AHJ", "") uses none, and the
+// company name is the client's legal name.
 //
 // THE JOB IS REQUIRED: a licence is a state's and a permit's (licenceOverlay). On an Oregon job the
 // licence keys are the named columns exactly as before; elsewhere ccbLicenseNumber is that state's
@@ -1036,7 +1094,8 @@ export function clientStagingOverlay(db: AppDb, clientId: string | null, portalT
   const row = db.get<Row>("SELECT * FROM clients WHERE id = ?", [clientId]);
   if (!row) return {};
   const client = mapClient(row, identitiesFor(db, clientId));
-  const identity = client.portalIdentities.find((entry) => entry.portalType === portalType);
+  const identityKey = portalIdentityKey(portalType);
+  const identity = identityKey ? client.portalIdentities.find((entry) => entry.portalType === identityKey) : undefined;
   const licences = licenceOverlay(client, job);
 
   const overlay: Record<string, string> = {
