@@ -3207,6 +3207,60 @@ export interface PublicStatusTrack {
   needsRecheck: boolean;
 }
 
+/**
+ * THE CLOSEOUT MILESTONES (#497) — the steps after the agencies say yes that no portal reading
+ * produces today: the install, the final inspection, the PTO request and the PTO itself. A person
+ * records them on the project (backend/src/clientTimeline.ts recordProjectMilestone); the finals
+ * and PTO automation (#495, #496) records them through the same door when it lands.
+ */
+export type ProjectMilestoneKey = "installed" | "final_passed" | "pto_requested" | "pto_granted";
+
+/** One closeout milestone as staff see it on the project. */
+export interface ProjectMilestoneRecord {
+  key: ProjectMilestoneKey;
+  label: string;
+  /** When it happened, or null when it has not been recorded. */
+  at: string | null;
+  recordedBy: string;
+  /** Recording it sends the client an update (note + email). */
+  clientFacing: boolean;
+}
+
+/** Every step on a client's filing timeline, in the order a job moves through them. */
+export type ClientTimelineStepKey =
+  | "permit_filed" | "nem_filed" | "permit_issued" | "nem_approved" | ProjectMilestoneKey;
+
+/**
+ * One step of the client's timeline: filed → issued / approved → installed → final → PTO.
+ *
+ * Carries no record numbers, no portal text and no internal note: labels and `detail` are fixed
+ * templates, the dates are ours, the day counts are arithmetic on those dates. The application
+ * and permit numbers stay on the Applications card, where they already pass the client checks.
+ */
+export interface ClientTimelineStep {
+  key: ClientTimelineStepKey;
+  label: string;
+  /** done = it happened; current = the step the job is on now (a permit and an interconnection
+   *  run side by side, so two steps can be current at once); upcoming = not reached yet. */
+  state: "done" | "current" | "upcoming";
+  /** When a done step happened. null for an upcoming step, and for a done one whose date we do
+   *  not hold (a filing tracked without a recorded submission date). */
+  at: string | null;
+  /** A fixed client-safe line ("1 of 2 permits issued"), or "". */
+  detail: string;
+  /** Done agency steps: whole days the step took from its start (filed → issued, requested → granted). */
+  tookDays: number | null;
+  /** Current steps: whole days since the step started, when its start date is known. */
+  daysSoFar: number | null;
+  /** Current steps: the MEASURED usual days for this agency (median of at least 3 real filings),
+   *  else null — never a seeded or one-off figure, because a client plans a crew around it. */
+  typicalDays: number | null;
+}
+
+export interface ClientTimeline {
+  steps: ClientTimelineStep[];
+}
+
 export interface PublicProjectStatusPayload {
   project: {
     address: string;
@@ -3215,6 +3269,8 @@ export interface PublicProjectStatusPayload {
     status: string;
     updatedAt: string;
   };
+  /** Filed → issued/approved → installed → final → PTO, one row per step (#497). */
+  timeline: ClientTimeline;
   tracks: PublicStatusTrack[];
   history: PublicStatusHistoryEntry[];
   submissions: Array<{ type: string; status: string; submittedAt: string | null }>;
