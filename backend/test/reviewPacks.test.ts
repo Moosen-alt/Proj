@@ -54,6 +54,7 @@ await run("codeSummaryForPrompt renders adopted codes + amendments + criteria", 
 await run("AI findings are HARD-CAPPED: ai_review category, never blocker, never installer", () => {
   const findings = aiResultToFindings({
     provider: "claude",
+    completeness: "complete",
     findings: [
       { title: "Missing footing detail", message: "No footing detail shown.", severity: "blocker" as never, codeFamily: "IRC", codeSection: "R507.3" },
       { title: "Guard height unclear", message: "Guard height not dimensioned.", severity: "callout" },
@@ -76,7 +77,7 @@ await run("AI findings are HARD-CAPPED: ai_review category, never blocker, never
 await run("AI-served work type (deck): advisory-only report, zero blockers", async () => {
   const { report, ai } = await runReviewPack({
     workType: "deck", project, ctx,
-    llm: mockLlm({ provider: "claude", findings: [{ title: "Ledger attachment missing", message: "Show ledger fastening.", severity: "warning", codeFamily: "IRC", codeSection: "R507" }], summary: "Mostly complete.", confidence: "medium", notes: "" }),
+    llm: mockLlm({ provider: "claude", completeness: "complete", findings: [{ title: "Ledger attachment missing", message: "Show ledger fastening.", severity: "warning", codeFamily: "IRC", codeSection: "R507" }], summary: "Mostly complete.", confidence: "medium", notes: "" }),
     extractedText: "deck plan",
   });
   assert.equal(ai?.summary, "Mostly complete.");
@@ -88,7 +89,7 @@ await run("AI-served work type (deck): advisory-only report, zero blockers", asy
 await run("stub LLM: honest 'AI review unavailable' finding, never silent", async () => {
   const { report } = await runReviewPack({
     workType: "general", project, ctx,
-    llm: mockLlm({ provider: "stub", findings: [], summary: "", confidence: "low", notes: "AI plan review unavailable — no ANTHROPIC_API_KEY configured." }),
+    llm: mockLlm({ provider: "stub", completeness: "incomplete", findings: [], summary: "", confidence: "low", notes: "AI plan review unavailable — no ANTHROPIC_API_KEY configured." }),
   });
   assert.equal(report.findings.length, 1);
   assert.equal(report.findings[0].id, "ai.review.unavailable");
@@ -98,7 +99,7 @@ await run("solar pack keeps the deterministic engine (blockers intact), AI opini
   const solarProject = { ...project, parserSnapshot: { state: "ID", ahj: "Elmore County" } } as unknown as ProjectRecord;
   const { report } = await runReviewPack({
     workType: "solar_pv_residential", project: solarProject, ctx,
-    llm: mockLlm({ provider: "claude", findings: [{ title: "Note", message: "AI note.", severity: "warning" }], summary: "s", confidence: "low", notes: "" }),
+    llm: mockLlm({ provider: "claude", completeness: "complete", findings: [{ title: "Note", message: "AI note.", severity: "warning" }], summary: "s", confidence: "low", notes: "" }),
     extractedText: "plan text",
     includeAiSecondOpinion: true,
   });

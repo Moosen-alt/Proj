@@ -2383,6 +2383,13 @@ export interface AiReviewFinding {
 
 export interface AiPlanReviewResult {
   provider: "claude" | "stub";
+  /** Whether the model's review came back WHOLE. "complete": the answer ended on its own and
+   *  parsed, so an empty `findings` list means the model found nothing. "incomplete": the answer
+   *  was cut off at the output ceiling (stop_reason max_tokens), could not be read as the requested
+   *  JSON, or the call failed. Its findings are partial, and an empty list means nothing was read,
+   *  never "nothing found" (`notes` says why). REQUIRED so no producer can leave it out, and every
+   *  reader treats anything but "complete" as incomplete (issue #531). */
+  completeness: "complete" | "incomplete";
   findings: AiReviewFinding[];
   summary: string;
   confidence: "low" | "medium" | "high";
