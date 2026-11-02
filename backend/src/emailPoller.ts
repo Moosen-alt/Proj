@@ -8,6 +8,7 @@ import { logger } from "./logger";
 import { runEmailTracker } from "./repository";
 import { encryptStorageState, decryptStorageState } from "../../portal-bot/src/cryptoStorage";
 import { writeMboxMessage } from "./mbox";
+import { intakeEnabled, isIntakeMessage, processIntakeMessages } from "./emailIntake";
 
 // IMAP email polling — supports two source modes:
 //
@@ -224,13 +225,19 @@ export function upsertImapSource(
 
 async function fetchImapToMbox(
   cfg: ImapSourceConfig,
-): Promise<{ filePath: string; count: number }> {
+): Promise<{ filePath: string; count: number; intake: Buffer[] }> {
   const { ImapFlow } = await import("imapflow");
 
   const tmpDir = await mkdtemp(path.join(os.tmpdir(), "solar-imap-"));
   const mboxPath = path.join(tmpDir, "inbox.mbox");
   const out = createWriteStream(mboxPath, { encoding: "utf8" });
   let count = 0;
+  // EMAIL-IN INTAKE (#489): mail to the intake address is a new job, never a status email — it is
+  // handed to emailIntake.ts and never written to the tracker's MBOX. A per-client source with a
+  // recipient tag leaves it alone: on a shared inbox every such source sees it, and the first one
+  // would file it under its own org. The central inbox and untagged sources take it.
+  const intakeOn = intakeEnabled();
+  const intake: Buffer[] = [];
 
   const client = new ImapFlow({
     host: cfg.host,
@@ -250,7 +257,7 @@ async function fetchImapToMbox(
         mailbox && typeof mailbox === "object" && "exists" in mailbox
           ? (mailbox.exists as number)
           : 0;
-      if (total === 0) return { filePath: mboxPath, count: 0 };
+      if (total === 0) return { filePath: mboxPath, count: 0, intake };
       const startSeq = Math.max(1, total - cfg.maxMessages + 1);
 
       const { simpleParser } = await import("mailparser");
@@ -264,6 +271,11 @@ async function fetchImapToMbox(
           parsed = await simpleParser(msg.source);
         } catch {
           // Fall back to raw source if mailparser can't handle this message.
+        }
+
+        if (intakeOn && parsed && isIntakeMessage(parsed)) {
+          if (!cfg.recipientTag) intake.push(msg.source);
+          continue;
         }
 
         // Recipient tag filtering using parsed addresses (handles encoded display names).
@@ -298,22 +310,31 @@ async function fetchImapToMbox(
     );
   }
 
-  return { filePath: mboxPath, count };
+  return { filePath: mboxPath, count, intake };
 }
 
 async function runSourcePoll(
   db: AppDb,
   cfg: ImapSourceConfig,
-): Promise<{ fetched: number; matches: number; errors: string[] }> {
+): Promise<{ fetched: number; matches: number; errors: string[]; intakeCreated: number; intakeAttached: number; intakeUnsorted: number }> {
   const errors: string[] = [];
   let matches = 0;
   let count = 0;
   let filePath: string | null = null;
+  const intake = { created: 0, attached: 0, unsorted: 0 };
 
   try {
     const result = await fetchImapToMbox(cfg);
     filePath = result.filePath;
     count = result.count;
+
+    if (result.intake.length) {
+      // A DB source files only into its own org; the env (central) inbox is operator-level.
+      const run = await processIntakeMessages(db, result.intake, cfg.sourceId ? { sourceOrgId: cfg.orgId, restrictToOrg: true } : {});
+      intake.created = run.created;
+      intake.attached = run.attached;
+      intake.unsorted = run.unsorted;
+    }
 
     if (count > 0) {
       const tracked = await runEmailTracker(db, { filePath, orgId: cfg.orgId, clientId: cfg.clientId });
@@ -351,7 +372,7 @@ async function runSourcePoll(
     }
   }
 
-  return { fetched: count, matches, errors };
+  return { fetched: count, matches, errors, intakeCreated: intake.created, intakeAttached: intake.attached, intakeUnsorted: intake.unsorted };
 }
 
 // ---------------------------------------------------------------------------
@@ -361,7 +382,7 @@ async function runSourcePoll(
 /** Poll all configured IMAP sources (env + active DB rows) in sequence. */
 export async function pollImap(
   db: AppDb,
-): Promise<{ fetched: number; matches: number; errors: string[]; sources: number }> {
+): Promise<{ fetched: number; matches: number; errors: string[]; sources: number; intakeCreated: number; intakeAttached: number; intakeUnsorted: number }> {
   const sources: ImapSourceConfig[] = [];
 
   const envCfg = envImapConfig();
@@ -376,13 +397,17 @@ export async function pollImap(
   let totalFetched = 0;
   let totalMatches = 0;
   const allErrors: string[] = [];
+  const intake = { intakeCreated: 0, intakeAttached: 0, intakeUnsorted: 0 };
 
   for (const src of sources) {
     const r = await runSourcePoll(db, src);
     totalFetched += r.fetched;
     totalMatches += r.matches;
     allErrors.push(...r.errors);
+    intake.intakeCreated += r.intakeCreated;
+    intake.intakeAttached += r.intakeAttached;
+    intake.intakeUnsorted += r.intakeUnsorted;
   }
 
-  return { fetched: totalFetched, matches: totalMatches, errors: allErrors, sources: sources.length };
+  return { fetched: totalFetched, matches: totalMatches, errors: allErrors, sources: sources.length, ...intake };
 }

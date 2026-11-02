@@ -1434,6 +1434,26 @@ app.delete("/api/knowledge-base/:profileKey", (req, res) => {
   res.json({ deleted: true, profileKey, removed });
 });
 
+// EMAIL-IN INTAKE (#489): jobs emailed to intake+<client tag>@… that are waiting on a person, and
+// the latest ones placed. Each row carries the org of its client (else of the polling source), so
+// the list reads through reqOrgFilter and a row outside the caller's org is a 404.
+app.get("/api/email-intake", asyncHandler(async (req, res) => {
+  const { listEmailIntake } = await import("./emailIntake");
+  res.json(listEmailIntake(db, reqOrgFilter(db, req)));
+}));
+app.get("/api/email-intake/:id/files/:index", asyncHandler(async (req, res) => {
+  const { emailIntakeFile } = await import("./emailIntake");
+  const file = emailIntakeFile(db, String(req.params.id), Number(req.params.index), reqOrgFilter(db, req));
+  // Whatever an unknown sender attached is served as a download, never rendered in the page.
+  res.setHeader("Content-Type", "application/octet-stream");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.download(file.path, file.filename);
+}));
+app.post("/api/email-intake/:id/dismiss", asyncHandler(async (req, res) => {
+  const { dismissEmailIntake } = await import("./emailIntake");
+  res.json(dismissEmailIntake(db, String(req.params.id), reqOrgFilter(db, req), currentUser(db, req)?.email || "operator"));
+}));
+
 app.get("/api/email-tracker", (req, res) => {
   res.json(getEmailTrackerStatus(db, reqOrgFilter(db, req)));
 });
@@ -2993,41 +3013,13 @@ app.post("/api/parser/llm-extract", asyncHandler(async (req, res) => {
   const { createLLMProvider } = await import("./llm");
   const llm = createLLMProvider();
   try {
-    const result = await llm.extractProjectFields({ planText, utilityBillText, meterText, structuralLetterText, defaultState });
-    const { supplementStructuralIntake } = await import("./structuralIntake");
-    let extraction = supplementStructuralIntake(result, planText);
-    // The packet's own permit application / contract page (contract value, homeowner phone) and
-    // the racking callouts, read deterministically with their source page cited (#201).
-    const { supplementPacketApplication } = await import("./packetApplication");
-    extraction = supplementPacketApplication(extraction, planText);
-    // The AC disconnect's make / model (and amps / fusing) from its own SLD / schedule callout (#384).
-    const { supplementAcDisconnect } = await import("./acDisconnectIntake");
-    extraction = supplementAcDisconnect(extraction, planText);
-    // HYBRID PLAN SET: the parser page first posted the PDF to /api/parser/plan-scan-extract, which
-    // read the set's image-only pages (datasheets pasted in as pictures) by vision; that read rides
-    // back here and is merged UNDER this text read — the text wins every field it answered
-    // (scannedPlanSet.mergeImagePageRead validates the posted shape).
-    if (req.body?.planImageRead && typeof req.body.planImageRead === "object") {
-      const { mergeImagePageRead } = await import("./scannedPlanSet");
-      extraction = mergeImagePageRead(extraction, req.body.planImageRead);
-    }
-    // WHICH COMPANY IS THIS? The prompt has always read the title-block installer and
-    // always dropped it. Resolve it here, on the response the parser page already
-    // waits for, so the (still required) client picker can fill itself instead of
-    // asking the coordinator to pick blind. Tenancy-scoped with the same org filter
-    // every other read uses — suggesting another tenant's company would be exactly
-    // the cross-company error this feature exists to prevent. A resolution failure
-    // must never take down a parse that otherwise worked.
-    let clientResolution: ClientResolution | undefined;
-    try {
-      const { resolveClientForExtraction } = await import("./clientMatch");
-      clientResolution = resolveClientForExtraction(db, extraction.fields, reqOrgFilter(db, req), planText);
-    } catch (err) {
-      logger.warn("parser", "client resolution failed — parse returned without a client suggestion", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-    res.json({ ...extraction, clientResolution } satisfies ParserExtractionResponse);
+    // The supplements, the hybrid merge and the client suggestion live in parserExtraction.ts,
+    // shared with email-in intake (#489) so the two doors read a plan set the same way.
+    const { extractParserFields } = await import("./parserExtraction");
+    const extraction = await extractParserFields(db, llm, {
+      planText, utilityBillText, meterText, structuralLetterText, defaultState, planImageRead: req.body?.planImageRead,
+    }, reqOrgFilter(db, req));
+    res.json(extraction satisfies ParserExtractionResponse);
   } catch (err) {
     throw normalizeLlmError(err);
   }

@@ -240,6 +240,13 @@ export interface ClientRecord {
    *  its own when a job is held on something only the client can supply (#488): "" = yes (the
    *  default), "off" = staff send them by hand. clientRequestLinks.ts is the one reader. */
   requestLinksAutoSend: string;
+  /** EMAIL-IN INTAKE (#489): the tag after the + in the intake address (intake+<tag>@…) that
+   *  files a job emailed there under this client. Lower-case letters, digits, dot, dash and
+   *  underscore; "" = this client cannot email jobs in. */
+  intakeTag: string;
+  /** Extra senders (addresses, or "@domain" entries) allowed to email jobs to this client's tag,
+   *  beyond its own contact / business / updates / billing emails. Comma or newline separated. */
+  intakeSenders: string;
   /** The issuing state for the contractor licence numbers above. A bare number is ambiguous
    *  the moment a company is licensed in two states. */
   licenseState: string;
@@ -2589,6 +2596,51 @@ export interface EmailTrackerRunResult {
   unmatchedMessages: number;
   sourceErrors: string[];
   matches: EmailProjectMatch[];
+}
+
+// EMAIL-IN INTAKE (#489): a job emailed to intake+<client tag>@… (emailIntake.ts).
+/** created = a new project; attached = files added to the client's recent project at the same
+ *  address; unsorted = waiting on a person (reason says why); ignored = no attachments at all;
+ *  dismissed = a person cleared it from the unsorted list. */
+export type EmailIntakeStatus = "created" | "attached" | "unsorted" | "ignored" | "dismissed";
+
+export type EmailIntakeReason =
+  | "no_tag" | "unknown_tag" | "ambiguous_tag" | "unknown_sender" | "sender_not_authenticated"
+  | "no_usable_attachments" | "address_unreadable" | "plan_set_names_another_client" | "failed";
+
+export interface EmailIntakeFile {
+  name: string;
+  size: number;
+  /** The project document slot it went to (plan_set, utility_bill, meter_photo…). */
+  docType?: string;
+  /** Why it was not used — a refused file never drops the others. */
+  refused?: string;
+}
+
+export interface EmailIntakeView {
+  id: string;
+  status: EmailIntakeStatus;
+  reason: EmailIntakeReason | "";
+  /** One sentence for a person. */
+  reasonText: string;
+  sender: string;
+  intakeTag: string;
+  subject: string;
+  clientId: string | null;
+  projectId: string | null;
+  files: EmailIntakeFile[];
+  replyStatus: string;
+  receivedAt: string;
+  createdAt: string;
+}
+
+export interface EmailIntakeRunResult {
+  scanned: number;
+  created: number;
+  attached: number;
+  unsorted: number;
+  skippedDuplicates: number;
+  items: EmailIntakeView[];
 }
 
 export type OperationStepStatus = "not_started" | "in_progress" | "waiting" | "blocked" | "done";

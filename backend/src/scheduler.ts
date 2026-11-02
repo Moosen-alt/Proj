@@ -79,6 +79,10 @@ export function startMonitorScheduler(db: AppDb): void {
             logger.info("monitor", `IMAP: fetched ${imap.fetched} message(s), ${imap.matches} match(es).`);
             sseBroadcast({ type: "imap_poll_done", message: `IMAP: ${imap.fetched} fetched, ${imap.matches} matched.`, data: { fetched: imap.fetched, matches: imap.matches } });
           }
+          // Emailed jobs (#489): new projects, files added to a recent one, and what waits on a person.
+          if (imap.intakeCreated || imap.intakeAttached || imap.intakeUnsorted) {
+            logger.info("monitor", `Email intake: ${imap.intakeCreated} project(s) created, ${imap.intakeAttached} attached, ${imap.intakeUnsorted} unsorted.`);
+          }
         } catch (err) {
           logger.warn("monitor", `IMAP poll failed: ${err instanceof Error ? err.message : String(err)}`);
         }
