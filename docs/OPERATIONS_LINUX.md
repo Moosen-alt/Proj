@@ -104,7 +104,15 @@ WATCHDOG_WEBHOOK_URL=https://ntfy.sh/<long-random-topic>
 WATCHDOG_WEBHOOK_FORMAT=text
 WATCHDOG_HEARTBEAT_URL=https://hc-ping.com/<uuid>
 WATCHDOG_NAME=Keelix server
-# plus the desk's SMTP_*, and the Gmail/IMAP settings with the OAuth redirect moved to the new address
+# Client email and the tracking inbox (§5.1): the desk's lines where it has them
+SMTP_HOST=<mail server>
+SMTP_FROM=<the address clients see>
+SMTP_PORT=587
+SMTP_USER=<mail account>
+SMTP_PASS=<app password>
+EMAIL_IMAP_HOST=<shared inbox's IMAP server>   # or the GMAIL_* lines, with GMAIL_REDIRECT_URI moved (§5.1)
+EMAIL_IMAP_USER=<shared inbox>
+EMAIL_IMAP_PASS=<app password>
 ```
 
 Leave out `PORT` (the image listens on 4173, which the override publishes) and the per-path settings
@@ -279,6 +287,58 @@ $K watchdog --once --dry-run      # evaluates everything, sends nothing
 `WATCHDOG_HEARTBEAT_URL` (healthchecks.io, 5 min period, 15 min grace) is what tells you when the whole
 VM is off.
 
+### 5.1 Notifications: client email, the tracking inbox and customer links
+
+Nothing stops the server from running with these unset, which is why they go missing: without SMTP every
+client update is saved as a draft and never sent; without a tracking inbox no correction, approval or
+utility email is ever read; with a wrong `PUBLIC_BASE_URL` every link a client gets is dead. Preflight
+has a NOTIFICATIONS block for them (WARN, with the line to add) and counts the client emails waiting.
+
+1. **Client email.** The `SMTP_*` lines in §2: the mail account client updates should come from
+   (the watchdog's email uses it too). Restart the app (`docker compose up -d app`) after any `.env` change.
+2. **Tracking inbox.** Either the shared inbox clients forward agency mail to, over IMAP
+   (`EMAIL_IMAP_HOST`, `EMAIL_IMAP_USER`, `EMAIL_IMAP_PASS`; port 993 with TLS unless
+   `EMAIL_IMAP_PORT` / `EMAIL_IMAP_TLS=false` say otherwise), or Gmail. For Gmail, copy
+   `GMAIL_CLIENT_ID` and `GMAIL_CLIENT_SECRET`, and either copy the desk's `GMAIL_REFRESH_TOKEN` or
+   authorize again from the server: add `https://keelix.<your domain>/api/gmail/oauth/callback` as a
+   redirect URI on the Google OAuth client, set
+   `GMAIL_REDIRECT_URI=https://keelix.<your domain>/api/gmail/oauth/callback`, restart, open
+   `https://keelix.<your domain>/api/gmail/auth-url` signed in, follow the `url` it returns, and put
+   the `GMAIL_REFRESH_TOKEN=` line the callback page shows into `.env`. Restart. The inbox is read on
+   every monitor tick, so leave `MONITOR_INTERVAL_MINUTES` at 15 (preflight warns on 0, which only a
+   test copy should have).
+3. **Customer links.** `PUBLIC_BASE_URL=https://keelix.<your domain>` (§2); preflight FAILs on a
+   localhost or missing value.
+4. **Staff alerts.** Today that is the watchdog's `WATCHDOG_ALERT_TO` and ntfy lines (§5). The staff
+   alerts for stopped runs (#487) add their own recipients line here when they land.
+5. **Test send, to yourself:**
+
+   ```bash
+   K=/opt/keelix/scripts/ops/linux/keelix-ops.sh
+   $K preflight                                  # NOTIFICATIONS: every line PASS
+   $K test-email --to you@yourcompany.com        # prints the mail server's answer; exit 0 = accepted
+   ```
+
+   `test-email` sends one fixed message to the one address named, never to a client, and prints what
+   the mail server answered (`250 ...` when it took the message, or its refusal, such as
+   `535 5.7.8` for a wrong password). Then check the inbox, and the spam folder: mail landing in spam
+   means the sending domain needs SPF/DKIM for that mail server. The message shows the address client
+   links start with; open it from a phone off the office network. **(untested against a real mail
+   server: the sandbox has none.)**
+6. **Waiting client emails.** If preflight's `unsent client emails` line counts any (drafts saved
+   while SMTP was off, or sends that failed), list them and, once steps 1 and 3 pass, re-send them:
+
+   ```bash
+   cd /opt/keelix
+   docker compose stop app     # when /health shows jobs.running = 0, as for the recipe restore (§6)
+   U="docker compose run --rm --no-deps -T -v /opt/keelix/scripts:/app/scripts:ro -e AUTOPILOT_DB_PATH=/app/backend/data/autopilot.sqlite app npx tsx scripts/undelivered.ts"
+   $U            # lists them; sends nothing
+   $U --send     # re-sends each one to the client's current address
+   docker compose start app
+   ```
+
+   Read the list first: a message about a job that has since moved on may be better left unsent.
+
 ## 6. Deploying a new version
 
 ```bash
@@ -345,7 +405,7 @@ with `docker image rm solar-submission-autopilot:<sha>`, keeping the last three.
 | When | What | Look for |
 | --- | --- | --- |
 | After every deploy | the deploy's own preflight output | no FAIL |
-| Weekly | `keelix-ops.sh preflight --probe-edge` | no FAIL; the three EDGE lines PASS |
+| Weekly | `keelix-ops.sh preflight --probe-edge` | no FAIL; the three EDGE lines PASS; NOTIFICATIONS all PASS |
 | Weekly | `systemctl list-timers 'keelix-*'` and `journalctl -u keelix-restic --since -7d` | every timer ran; restic ended without errors |
 | Monthly | restore drill with the escrowed key (§4) | `RESTORE DRILL: PASS`, all logins decrypt |
 | Quarterly | restic copy restored onto a fresh VM, drill there | PASS |
@@ -356,7 +416,7 @@ with `docker image rm solar-submission-autopilot:<sha>`, keeping the last three.
 | --- | --- |
 | `scripts/ops/linux/docker-compose.override.yml` | loopback-only port, the two mounts, the `:current` image tag |
 | `scripts/ops/linux/deploy.sh`, `rollback.sh`, `lib.sh` | §6 and §7 |
-| `scripts/ops/linux/keelix-ops.sh` | runs `preflight`, `watchdog`, `offbox-sync` or `restore-drill` in a one-off container |
+| `scripts/ops/linux/keelix-ops.sh` | runs `preflight`, `watchdog`, `offbox-sync`, `restore-drill` or `test-email` in a one-off container |
 | `scripts/ops/linux/keelix-watchdog.{service,timer}` | §5, every 5 min |
 | `scripts/ops/linux/keelix-offbox-sync.{service,timer}` | §4, every 2 h at :20 |
 | `scripts/ops/linux/keelix-restic.{service,timer}`, `restic-backup.sh` | §4, nightly 03:30 |

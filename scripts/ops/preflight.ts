@@ -8,7 +8,9 @@
 // configuration, not behaviour: the restore drill, --test-alert and the restart drill prove the rest.
 //
 // READ-ONLY. Reads .env (via the environment), the users table (read-only connection, operator
-// accounts only: email, role, whether a password is set) and the backup folders. Writes nothing.
+// accounts only: email, role, whether a password is set), two counts for NOTIFICATIONS (active IMAP
+// tracking sources; unsent client emails) and the backup folders. Writes nothing. The one command
+// that SENDS (a test email to yourself) is scripts/ops/test-email.ts, kept apart so this stays read-only.
 // --probe-edge adds two GETs to PUBLIC_BASE_URL (/health and /status) to see whether Cloudflare
 // Access is in front and the customer bypass works (backend/src/opsEdgePosture.ts); off by default,
 // so a plain run never touches the network.
@@ -41,12 +43,28 @@ add("access", "AUTH_ENABLED", authOn ? "PASS" : "FAIL",
 
 const dbPath = stateDbPath();
 let admins: { email: string; role: string; hasPassword: boolean }[] | null = null;
+// NOTIFICATIONS (#493) read two counts from the same read-only connection. Each is null when its
+// table cannot be read (an older database), which preflight reports as "could not read", never as 0.
+let imapSourceRows: number | null = null;
+let unsent: { draft: number; failed: number } | null = null;
 try {
   const { default: Database } = await import("better-sqlite3");
   const db = new Database(dbPath, { readonly: true, fileMustExist: true });
   try {
-    admins = (db.prepare("SELECT email, role, COALESCE(password_hash, '') <> '' AS has_pw FROM users WHERE COALESCE(active, 1) = 1").all() as { email: string; role: string; has_pw: number }[])
-      .map((u) => ({ email: String(u.email), role: String(u.role), hasPassword: Number(u.has_pw) === 1 }));
+    try {
+      admins = (db.prepare("SELECT email, role, COALESCE(password_hash, '') <> '' AS has_pw FROM users WHERE COALESCE(active, 1) = 1").all() as { email: string; role: string; has_pw: number }[])
+        .map((u) => ({ email: String(u.email), role: String(u.role), hasPassword: Number(u.has_pw) === 1 }));
+    } catch { admins = null; }
+    try {
+      // The same filter the scheduler polls with (emailPoller.ts dbImapSources).
+      imapSourceRows = Number((db.prepare("SELECT COUNT(*) AS n FROM email_tracking_sources WHERE source_type = 'imap' AND active = 1 AND imap_host != ''").get() as { n: number }).n);
+    } catch { imapSourceRows = null; }
+    try {
+      // The same filter as crm.ts undeliveredCommunications (what scripts/undelivered.ts lists and
+      // re-sends), across every org: this is the box's backlog, not one tenant's.
+      const r = db.prepare("SELECT SUM(delivery_status = 'draft') AS draft, SUM(delivery_status = 'failed') AS failed FROM communications WHERE direction = 'outbound' AND channel = 'email' AND delivery_status IN ('draft','failed')").get() as { draft: number | null; failed: number | null };
+      unsent = { draft: Number(r.draft ?? 0), failed: Number(r.failed ?? 0) };
+    } catch { unsent = null; }
   } finally {
     db.close();
   }
@@ -125,6 +143,62 @@ const baseDead = !base || ["localhost", "127.0.0.1", "::1", "[::1]", "0.0.0.0", 
 add("links", "PUBLIC_BASE_URL", baseDead ? "FAIL" : base.startsWith("https://") ? "PASS" : "WARN",
   baseDead ? `${base || "unset"}: every status/portal/credential link a customer receives points at this machine and will not open`
     : base.startsWith("https://") ? base : `${base}: not https - customers will type portal passwords into the credential page over plain http`);
+
+// --- NOTIFICATIONS (#493) ---------------------------------------------------------------------------
+// Every client update and every agency/utility email the tracker matches depends on settings that
+// are easy to miss on a new box: without SMTP an update is only saved as a draft, without a tracking
+// inbox no correction or approval email is ever read. Each is a WARN (the server runs without them)
+// that names the .env line to add. PUBLIC_BASE_URL is the LINKS line above. Values are never printed.
+const smtpOn = Boolean(env.SMTP_HOST && env.SMTP_FROM); // exactly clientNotifier.ts smtpConfigured()
+add("notifications", "client email (SMTP)", smtpOn ? "PASS" : "WARN",
+  smtpOn
+    ? `set (${env.SMTP_USER ? "with sign-in" : "no sign-in"}): prove it with scripts/ops/test-email.ts --to <you>`
+    : `${env.SMTP_HOST ? "SMTP_FROM" : env.SMTP_FROM ? "SMTP_HOST" : "SMTP_HOST and SMTP_FROM"} unset: client updates are only saved as drafts, never sent. ` +
+      "Add SMTP_HOST=<server> and SMTP_FROM=<address clients see> (plus SMTP_PORT, SMTP_USER, SMTP_PASS) to .env");
+if (smtpOn && env.SMTP_USER && !env.SMTP_PASS) {
+  add("notifications", "SMTP_PASS", "WARN", "SMTP_USER is set but SMTP_PASS is empty: the mail server will refuse the sign-in. Add SMTP_PASS=<app password>");
+}
+// The three ways the scheduler reads the tracking inbox (scheduler.ts): the env IMAP inbox
+// (emailPoller.ts envImapConfig needs host, user AND password), IMAP sources saved in the database
+// (POST /api/imap/sources), and Gmail once it holds a refresh token (gmail.ts gmailStatus().authorized).
+const envImap = Boolean(env.EMAIL_IMAP_HOST && env.EMAIL_IMAP_USER && env.EMAIL_IMAP_PASS);
+const envImapPartial = !envImap && Boolean(env.EMAIL_IMAP_HOST || env.EMAIL_IMAP_USER || env.EMAIL_IMAP_PASS);
+const gmailApp = Boolean(env.GMAIL_CLIENT_ID && env.GMAIL_CLIENT_SECRET);
+const gmailOn = Boolean(env.GMAIL_REFRESH_TOKEN);
+const sources = [
+  envImap ? "IMAP inbox (EMAIL_IMAP_*)" : "",
+  imapSourceRows ? `${imapSourceRows} saved IMAP source(s) (email_tracking_sources)` : "",
+  gmailOn ? "Gmail" : "",
+].filter(Boolean);
+const trackingFixes: string[] = [];
+if (envImapPartial) {
+  trackingFixes.push(`EMAIL_IMAP_* is incomplete (${["EMAIL_IMAP_HOST", "EMAIL_IMAP_USER", "EMAIL_IMAP_PASS"].filter((k) => !env[k]).join(", ")} unset), so it is ignored`);
+}
+if (gmailApp && !gmailOn) {
+  // The OAuth redirect defaults to localhost; on the server the consent page must come back to the
+  // server's own address, which is the step the Linux runbook moves (OPERATIONS_LINUX.md s2).
+  const redirect = String(env.GMAIL_REDIRECT_URI ?? "").trim();
+  let redirectHost = "";
+  try { redirectHost = redirect ? new URL(redirect).hostname.toLowerCase() : "localhost"; } catch { redirectHost = "(unparseable)"; }
+  trackingFixes.push("Gmail is set up but not authorized (no GMAIL_REFRESH_TOKEN): open /api/gmail/auth-url signed in as an admin, then add the GMAIL_REFRESH_TOKEN line it shows" +
+    (!baseDead && redirectHost !== baseHost ? `; set GMAIL_REDIRECT_URI=${base.replace(/\/+$/, "")}/api/gmail/oauth/callback first (now ${redirect ? "another host" : "localhost"})` : ""));
+}
+add("notifications", "tracking inbox", sources.length ? (trackingFixes.length ? "WARN" : "PASS") : "WARN",
+  sources.length
+    ? [`${sources.join(" + ")}: agency and utility emails are read every monitor tick`, ...trackingFixes].join("; ")
+    : [imapSourceRows === null ? "could not read the Email tracking sources" : "none configured: correction, approval and utility emails are never read",
+      ...trackingFixes,
+      "add EMAIL_IMAP_HOST=, EMAIL_IMAP_USER=, EMAIL_IMAP_PASS= (the shared inbox clients forward to), or connect Gmail (GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, then GMAIL_REFRESH_TOKEN)"].join("; "));
+// Read exactly as scheduler.ts reads it: <= 0 (an empty value included) turns the monitor off.
+if (Number(env.MONITOR_INTERVAL_MINUTES ?? 15) <= 0) {
+  add("notifications", "MONITOR_INTERVAL_MINUTES", "WARN",
+    `${String(env.MONITOR_INTERVAL_MINUTES).trim() || "empty"}: the monitor never runs, so no tracking inbox is read and no portal status is checked (right on a test copy only). Remove the line or set MONITOR_INTERVAL_MINUTES=15`);
+}
+add("notifications", "unsent client emails", unsent === null ? "WARN" : unsent.draft + unsent.failed ? "WARN" : "PASS",
+  unsent === null ? `could not read communications from ${dbPath}`
+    : unsent.draft + unsent.failed
+      ? `${unsent.draft} draft (never tried) + ${unsent.failed} failed: list them with scripts/undelivered.ts, re-send with --send once SMTP and PUBLIC_BASE_URL are set`
+      : "none: every automated client email on record was sent");
 
 // --- SECRETS ---------------------------------------------------------------------------------------
 add("secrets", "SESSION_ENCRYPTION_KEY", !sessionKey || sessionKey === PLACEHOLDER_KEY ? "FAIL" : sessionKey.length < 32 ? "WARN" : "PASS",

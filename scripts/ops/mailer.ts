@@ -37,11 +37,12 @@ export function configuredChannels(env: NodeJS.ProcessEnv = process.env): ("emai
   return out;
 }
 
-export async function sendAlertEmail(subject: string, text: string, env: NodeJS.ProcessEnv = process.env): Promise<void> {
-  // Same transport construction as clientNotifier.ts sendEmail().
+/** Same transport construction as clientNotifier.ts sendEmail(), with timeouts so a dead server
+ *  answers in seconds instead of hanging the watchdog or the test send. */
+async function smtpTransport(env: NodeJS.ProcessEnv) {
   const { default: nodemailer } = await import("nodemailer");
   const port = Number(env.SMTP_PORT || 587);
-  const transporter = nodemailer.createTransport({
+  return nodemailer.createTransport({
     host: env.SMTP_HOST,
     port,
     secure: env.SMTP_SECURE === "true" || port === 465,
@@ -50,7 +51,45 @@ export async function sendAlertEmail(subject: string, text: string, env: NodeJS.
     greetingTimeout: 20_000,
     socketTimeout: 30_000,
   });
+}
+
+export async function sendAlertEmail(subject: string, text: string, env: NodeJS.ProcessEnv = process.env): Promise<void> {
+  const transporter = await smtpTransport(env);
   await transporter.sendMail({ from: env.SMTP_FROM, to: alertRecipients(env).join(", "), subject, text });
+}
+
+export interface TestSendResult {
+  ok: boolean;
+  /** The SMTP server's own answer line ("250 2.0.0 OK ..."), or its refusal ("535 5.7.8 ..."). */
+  response: string;
+  /** Error code when the send failed (ECONNREFUSED, EAUTH, EENVELOPE, ...). */
+  code: string;
+  accepted: string[];
+  rejected: string[];
+}
+
+/**
+ * ONE message to ONE named address, through the same SMTP settings client updates use, reporting
+ * what the server said (scripts/ops/test-email.ts, #493). The answer is the operator's evidence that
+ * mail leaves this box: a 250 means the server took it, which is all a sender can know.
+ */
+export async function sendTestEmail(to: string, subject: string, text: string, env: NodeJS.ProcessEnv = process.env): Promise<TestSendResult> {
+  try {
+    const transporter = await smtpTransport(env);
+    const info = await transporter.sendMail({ from: env.SMTP_FROM, to, subject, text });
+    const list = (v: unknown): string[] => (Array.isArray(v) ? v.map((a) => (typeof a === "string" ? a : String((a as { address?: string })?.address ?? ""))) : []);
+    const rejected = list(info.rejected);
+    return { ok: rejected.length === 0, response: String(info.response ?? ""), code: "", accepted: list(info.accepted), rejected };
+  } catch (err) {
+    const e = err as { code?: string; responseCode?: number; response?: string; message?: string };
+    return {
+      ok: false,
+      response: String(e?.response || e?.message || ""),
+      code: String(e?.code || (e?.responseCode ? `SMTP_${e.responseCode}` : "ERROR")),
+      accepted: [],
+      rejected: [to],
+    };
+  }
 }
 
 export async function postWebhook(subject: string, text: string, env: NodeJS.ProcessEnv = process.env): Promise<number> {
