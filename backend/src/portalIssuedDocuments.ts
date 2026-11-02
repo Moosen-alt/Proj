@@ -30,6 +30,9 @@
 //   - IDEMPOTENT: the file's sha256 is recorded (portal_record_documents, UNIQUE per project), so
 //     a re-read attaches nothing new; a file a person already attached under the same type is not
 //     attached twice; a downloaded file a person later deleted is not pushed back.
+//   - A PERSON'S FILE COUNTS: a file attached by hand under the track's slot (after the card said
+//     "download it by hand") is the closeout document on the card and in the handoff packet, and
+//     the monitor stops looking for one.
 //   - SAYS WHY when nothing was attached (permit_check_targets.issued_docs_gap, on the card beside
 //     #173's read gap): no record link, a sign-in wall, no document link on the page, a link that
 //     answered a web page…
@@ -290,6 +293,12 @@ export async function fetchIssuedRecordDocuments(
     if (text(target.issued_docs_gap)) setGap(db, targetId, "");
     return { status: "already_attached", attached: 0 };
   }
+  // A PERSON ATTACHED IT (the card's "download it by hand" followed): the file under this track's
+  // slot that the monitor did not download is the closeout document. Nothing to fetch, no gap.
+  if (handAttached(db, project.id, docType).length > 0) {
+    if (text(target.issued_docs_gap)) setGap(db, targetId, "");
+    return { status: "already_attached", attached: 0 };
+  }
   const lastTry = Date.parse(text(target.issued_docs_checked_at));
   if (!opts.force && Number.isFinite(lastTry) && Date.now() - lastTry < RECHECK_AFTER_MS) {
     return { status: "skipped", attached: 0, reason: "looked recently" };
@@ -390,7 +399,22 @@ function provenanceOf(recordNumber: string, fetchedAt: string): string {
   return `downloaded from record ${recordNumber || "(no number)"} on ${fetchedAt.slice(0, 10)}`;
 }
 
-/** Every closeout document the monitor attached to this project and still on file, by target. */
+/** The files under a closeout slot that the MONITOR did not download — a person attached them
+ *  (the upload picker's "Issued permit" / "Utility approval / PTO letter", or any other door).
+ *  The record they belong to is not known, so each counts for every finished filing of its track
+ *  that has no downloaded file of its own. */
+function handAttached(db: AppDb, projectId: string, docType: string): Row[] {
+  return db.query<Row>(
+    `SELECT d.* FROM project_documents d
+      WHERE d.project_id = ? AND d.doc_type = ?
+        AND NOT EXISTS (SELECT 1 FROM portal_record_documents r WHERE r.document_id = d.id)
+      ORDER BY d.uploaded_at, d.rowid`,
+    [projectId, docType],
+  );
+}
+
+/** Every closeout document on file for this project, by target: what the monitor downloaded off
+ *  that filing's record, else — on a finished filing — what a person attached under its slot. */
 export function issuedDocumentsByTarget(db: AppDb, projectId: string): Map<string, IssuedRecordDocument[]> {
   const rows = db.query<Row>(
     `SELECT r.*, d.original_filename AS filename FROM portal_record_documents r
@@ -411,6 +435,25 @@ export function issuedDocumentsByTarget(db: AppDb, projectId: string): Map<strin
       provenance: provenanceOf(text(r.record_number), text(r.fetched_at)),
     });
     out.set(text(r.target_id), list);
+  }
+  const byHand: Partial<Record<TrackKind, IssuedRecordDocument[]>> = {};
+  for (const track of ["permit", "nem"] as const) {
+    byHand[track] = handAttached(db, projectId, ISSUED_DOC_TYPE[track]).map((d) => ({
+      documentId: text(d.id),
+      docType: ISSUED_DOC_TYPE[track],
+      filename: text(d.original_filename),
+      recordNumber: "",
+      sourceUrl: "",
+      fetchedAt: text(d.uploaded_at),
+      provenance: `attached by ${text(d.uploaded_by) || "a person"} on ${text(d.uploaded_at).slice(0, 10)}`,
+    }));
+  }
+  if (byHand.permit?.length || byHand.nem?.length) {
+    for (const t of db.query<Row>("SELECT * FROM permit_check_targets WHERE project_id = ? AND active = 1", [projectId])) {
+      const track = trackKind(text(t.target_type), text(t.permit_type));
+      if (!isFinishedOutcome(track, text(t.latest_outcome)) || out.get(text(t.id))?.length) continue;
+      if (byHand[track]?.length) out.set(text(t.id), byHand[track]!);
+    }
   }
   return out;
 }

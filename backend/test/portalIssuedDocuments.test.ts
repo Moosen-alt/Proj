@@ -23,6 +23,9 @@
 //      on the target (issuedDocsGap); a record not issued is never visited.
 //   7. THE HANDOFF PACKET: the closeout section lists the file with its provenance and
 //      closeoutDocumentsComplete is true; a project missing its letter says why and is false.
+//      Then the person attaches the letter by hand (the card's "download it by hand"): the card,
+//      the packet and the monitor all count it ("attached by … on <date>"), and the upload
+//      picker offers the slot.
 //   8. THE CARD (frontend issuedDocumentsHtml, lifted from dashboard.js): the link and provenance,
 //      or the gap line, everything escaped.
 //   9. THE REAL DOOR (documentFetch allowUrl): a redirect hop the caller's door refuses is never
@@ -31,6 +34,7 @@
 // Kill: the sweep's fetchIssuedRecordDocuments call removed -> section 3 FAILS.
 // Kill: the SUBMIT_INTENT_WORDS check removed (portalIssuedDocuments.pickRecordDocumentLinks) ->
 //   sections 1 and 2 FAIL.
+// Kill: handAttached removed from issuedDocumentsByTarget / fetchIssuedRecordDocuments -> 7d-7f FAIL.
 // Kill: httpAttempt's allowUrl check removed (documentFetch) -> section 9 FAILS.
 import "./_isolate";
 import fs from "node:fs";
@@ -291,6 +295,30 @@ await gapCase("a record page whose only permit links leave its portal (said so, 
   const ms = missing.sections.find((s) => s.title === "Issued Permit & Approval Letter");
   check("7c. a finished filing with no letter on file: warning, says why, not complete",
     !!ms && ms.severity === "warning" && ms.lines.some((l) => /not on file — .*sign-in/i.test(l)) && missing.closeoutDocumentsComplete === false, JSON.stringify(ms));
+}
+
+// ═══ 7b. THE SIGN-IN WALL, THEN THE PERSON ATTACHES IT BY HAND ═══════════════════════════════
+{
+  const { saveProjectDocument } = await import("../src/projectDocuments");
+  saveProjectDocument(db, walled.p.id, { docType: "utility_approval", filename: "approval-letter.pdf", contentType: "application/pdf", buffer: Buffer.from(pdf("by hand")), source: "upload", uploadedBy: "Synthetic PM" });
+  const view = targetView(walled.p.id, walled.tid);
+  check("7d. a letter a person attached under the slot is the card's closeout document: 'attached by … on <date>', no gap",
+    view.issuedDocuments?.length === 1 && view.issuedDocuments[0].provenance === `attached by Synthetic PM on ${today}` && !view.issuedDocsGap,
+    JSON.stringify({ docs: view.issuedDocuments, gap: view.issuedDocsGap }));
+  const packet = R.getProjectHandoffPacket(db, walled.p.id);
+  const sec = packet.sections.find((s) => s.title === "Issued Permit & Approval Letter");
+  check("7e. …the handoff packet counts it: pass, complete",
+    !!sec && sec.severity === "pass" && sec.lines.some((l) => l.includes(`attached by Synthetic PM on ${today}`)) && packet.closeoutDocumentsComplete === true, JSON.stringify(sec));
+  asked.length = 0;
+  const r = await D.fetchIssuedRecordDocuments(db, walled.p, walled.tid, { force: true });
+  const stored = db.get<{ issued_docs_gap: string }>("SELECT issued_docs_gap FROM permit_check_targets WHERE id = ?", [walled.tid]);
+  check("7f. …and a re-read neither visits the record nor writes the gap back", r.status === "already_attached" && asked.length === 0 && stored?.issued_docs_gap === "",
+    JSON.stringify({ r, asked, stored }));
+  check("7g. a file the MONITOR downloaded is never re-labelled as attached by a person",
+    targetView(cy.id, cyTid).issuedDocuments?.length === 1 && targetView(cy.id, cyTid).issuedDocuments![0].provenance.startsWith("downloaded from record"));
+  const html = fs.readFileSync(path.join(REPO, "frontend", "dashboard.html"), "utf8");
+  check("7h. the upload picker offers both slots, so the by-hand path has somewhere to land",
+    /<option value="issued_permit">/.test(html) && /<option value="utility_approval">/.test(html));
 }
 
 // ═══ 8. THE CARD ═════════════════════════════════════════════════════════════════════════════
