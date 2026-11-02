@@ -53,7 +53,7 @@ db.backupTo(withAdmin); // the configured shape: an admin, no IMAP source, no co
 // NOTIFICATIONS (#493): one active IMAP source row, an inactive one (not polled), and the
 // client-email record in each delivery state (addCommunication, the production writer). The IMAP rows
 // are raw SQL because their writer, emailPoller.ts upsertImapSource, cannot run under ESM today
-// (`require` is not defined; filed while working #493); the columns are the ones it writes.
+// (`require` is not defined, #498); the columns are the ones it writes.
 const imapRow = (id: string, host: string, filePath: string, active: number): void => db.run(
   `INSERT INTO email_tracking_sources (id, source_type, label, file_path, imap_host, imap_user, imap_pass_encrypted, active, created_at, updated_at)
    VALUES (?, 'imap', ?, ?, ?, 'permits@ops.invalid', 'enc', ?, datetime('now'), datetime('now'))`, [id, id, filePath, host, active]);
@@ -209,7 +209,7 @@ check("MUST-EXCLUDE: an incomplete EMAIL_IMAP_* (the poller ignores it) is not a
 });
 out = notify(withAdmin, { GMAIL_CLIENT_ID: "client-id.ops.invalid", GMAIL_CLIENT_SECRET: SECRETS.gmailSecret, PUBLIC_BASE_URL: "https://keelix.ops.invalid" });
 check("MUST-EXCLUDE: Gmail set up but never authorized is not a PASS; on the server it names the redirect to set first", () => {
-  assert.match(line(out, "tracking inbox"), /WARN .*Gmail is set up but not authorized.*GMAIL_REDIRECT_URI=https:\/\/keelix\.ops\.invalid\/api\/gmail\/oauth\/callback first \(now localhost\)/);
+  assert.match(line(out, "tracking inbox"), /WARN .*Gmail is set up but not authorized.*GMAIL_REDIRECT_URI=https:\/\/keelix\.ops\.invalid\/api\/gmail\/oauth\/callback \(now localhost\) and restart, then open \/api\/gmail\/auth-url/);
 });
 out = notify(withAdmin, { GMAIL_CLIENT_ID: "client-id.ops.invalid", GMAIL_CLIENT_SECRET: SECRETS.gmailSecret, GMAIL_REFRESH_TOKEN: SECRETS.gmailToken,
   PUBLIC_BASE_URL: "https://keelix.ops.invalid" });

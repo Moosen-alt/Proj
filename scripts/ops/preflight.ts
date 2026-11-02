@@ -180,8 +180,9 @@ if (gmailApp && !gmailOn) {
   const redirect = String(env.GMAIL_REDIRECT_URI ?? "").trim();
   let redirectHost = "";
   try { redirectHost = redirect ? new URL(redirect).hostname.toLowerCase() : "localhost"; } catch { redirectHost = "(unparseable)"; }
-  trackingFixes.push("Gmail is set up but not authorized (no GMAIL_REFRESH_TOKEN): open /api/gmail/auth-url signed in as an admin, then add the GMAIL_REFRESH_TOKEN line it shows" +
-    (!baseDead && redirectHost !== baseHost ? `; set GMAIL_REDIRECT_URI=${base.replace(/\/+$/, "")}/api/gmail/oauth/callback first (now ${redirect ? "another host" : "localhost"})` : ""));
+  trackingFixes.push("Gmail is set up but not authorized (no GMAIL_REFRESH_TOKEN): " +
+    (!baseDead && redirectHost !== baseHost ? `set GMAIL_REDIRECT_URI=${base.replace(/\/+$/, "")}/api/gmail/oauth/callback (now ${redirect ? "another host" : "localhost"}) and restart, then ` : "") +
+    "open /api/gmail/auth-url signed in, follow its url, and add the GMAIL_REFRESH_TOKEN line the callback page shows");
 }
 add("notifications", "tracking inbox", sources.length ? (trackingFixes.length ? "WARN" : "PASS") : "WARN",
   sources.length
