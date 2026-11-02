@@ -355,9 +355,14 @@ await run("intake tag: normalised, validated, one client per tag in an org; send
 await run("the reply's subject and body pass the project's own account and meter through the redactor", () => {
   const mail = intakeReplyEmail({
     project: { projectAddress: `${ACCOUNT} Synthetic Way`, city: "", state: "", accountNumber: ACCOUNT, meterNumber: METER } as never,
-    attached: false, link: "https://keelix.example.test/status?token=t", missing: [], unsure: [], refused: [],
+    attached: false, link: "https://keelix.example.test/status?token=t", missing: [], unsure: [], refused: [], secrets: [],
   });
   assert.ok(!mail.subject.includes(ACCOUNT) && !mail.body.includes(ACCOUNT));
+  const other = intakeReplyEmail({
+    project: { projectAddress: "1 Synthetic Way", city: "", state: "" } as never,
+    attached: false, link: "https://keelix.example.test/status?token=t", missing: [], unsure: [], refused: [{ name: `acct-${ACCOUNT}.pdf`, size: 1, refused: "x" }], secrets: [ACCOUNT],
+  });
+  assert.ok(!other.body.includes(ACCOUNT), "a secret from the read (not on the project) was echoed in a file name");
 });
 
 console.log(failures ? `\n${failures} failure(s)` : "\nemailIntake: all checks passed");

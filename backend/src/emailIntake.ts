@@ -44,7 +44,8 @@
 // The email's own body is never sent to a model.
 //
 // THE REPLY. Only to a known sender, only once a project was created or attached, to the From
-// address (never Reply-To). SMTP_HOST + SMTP_FROM set and PUBLIC_BASE_URL set → sent; otherwise a
+// address (never Reply-To). Scrubbed with the project's own secret values (projectSecretValuesById)
+// and the read's; when those cannot be read the reply is withheld, never sent unscrubbed. SMTP_HOST + SMTP_FROM set and PUBLIC_BASE_URL set → sent; otherwise a
 // DRAFT communication on the project, like every other client email. EMAIL_INTAKE_AUTO_REPLY=off
 // or CLIENT_NOTIFICATIONS=off keeps it a draft.
 // ---------------------------------------------------------------------------
@@ -73,6 +74,7 @@ import { text } from "./json";
 import { logger } from "./logger";
 import { normalizeProject, normalizeTokens } from "./normalize";
 import { saveProjectDocument } from "./projectDocuments";
+import { isPlannerSecretKey, projectSecretValuesById } from "./projectSecrets";
 import { createProject, getProjectDetail } from "./repository";
 import { backendDataDir } from "./statePaths";
 import { nowIso } from "./time";
@@ -428,6 +430,8 @@ const FIELD_LABELS: Record<string, string> = {
 
 export function intakeReplyEmail(input: {
   project: ProjectRecord; attached: boolean; link: string; missing: string[]; unsure: string[]; refused: EmailIntakeFile[];
+  /** Every secret value to scrub (projectSecretValuesById plus the read's own secret fields). */
+  secrets: string[];
 }): { subject: string; body: string } {
   const address = formatProjectAddress(input.project) || "your job";
   const lines = [
@@ -443,7 +447,7 @@ export function intakeReplyEmail(input: {
   if (input.unsure.length) lines.push("", "We will double-check these against your documents before anything is filed:", ...input.unsure.map((u) => `  • ${u}`));
   if (input.refused.length) lines.push("", "Files we could not use:", ...input.refused.map((f) => `  • ${f.name}: ${f.refused}`));
   lines.push("", "Thank you,", BRAND);
-  const secrets = [String(input.project.accountNumber ?? ""), String(input.project.meterNumber ?? "")];
+  const secrets = [...input.secrets, String(input.project.accountNumber ?? ""), String(input.project.meterNumber ?? "")];
   return {
     subject: redactSecretValues(`Received: ${address}`, secrets),
     body: redactSecretValues(lines.join("\n"), secrets),
@@ -581,11 +585,23 @@ async function processOne(db: AppDb, raw: Buffer, opts: IntakeOptions, result: E
     ...MISSING_DOCS.filter(([t]) => !docTypes.has(t)).map(([, label]) => label),
   ];
   const refused = files.filter((f) => f.refused).map(({ name, size, refused: why }) => ({ name, size, refused: why }));
-  const email = intakeReplyEmail({
-    project, attached: Boolean(existingId), link: statusShareUrl(ensureStatusShareToken(db, projectId)),
-    missing, unsure: unsure.map((k) => FIELD_LABELS[k] ?? k), refused,
-  });
-  const replyStatus = await reply(db, { project, orgId, to: sender, ...email }, opts);
+  // THE SCRUB FAILS CLOSED (rule 2): the reply is written only when the project's own secret values
+  // could be read (projectSecretValuesById); the read's secret fields are added, so even a value
+  // too unsure to be written to the project is never echoed.
+  const projectSecrets = projectSecretValuesById(db, projectId);
+  let replyStatus = "withheld";
+  if (projectSecrets === null) {
+    logger.warn("email-intake", `reply withheld for project ${projectId}: its secret values could not be read to scrub it`);
+  } else {
+    const readSecrets = Object.entries(extraction?.fields ?? {})
+      .filter(([k, f]) => isPlannerSecretKey(k) && (typeof f?.value === "string" || typeof f?.value === "number"))
+      .map(([, f]) => String(f.value));
+    const email = intakeReplyEmail({
+      project, attached: Boolean(existingId), link: statusShareUrl(ensureStatusShareToken(db, projectId)),
+      missing, unsure: unsure.map((k) => FIELD_LABELS[k] ?? k), refused, secrets: [...projectSecrets, ...readSecrets],
+    });
+    replyStatus = await reply(db, { project, orgId, to: sender, ...email }, opts);
+  }
 
   const status: EmailIntakeStatus = existingId ? "attached" : "created";
   const item = insertRow(db, {

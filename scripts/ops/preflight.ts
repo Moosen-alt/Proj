@@ -190,6 +190,16 @@ add("notifications", "tracking inbox", sources.length ? (trackingFixes.length ? 
     : [imapSourceRows === null ? "could not read the Email tracking sources" : "none configured: correction, approval and utility emails are never read",
       ...trackingFixes,
       "add EMAIL_IMAP_HOST=, EMAIL_IMAP_USER=, EMAIL_IMAP_PASS= (the shared inbox clients forward to), or connect Gmail (GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, then GMAIL_REFRESH_TOKEN)"].join("; "));
+// Email-in intake (#489) is optional: a row only when EMAIL_INTAKE_ADDRESS is set. It is read off
+// the same inbox, so it needs one; the address shape is the one emailIntake.intakeAddressSetting takes.
+const intakeAddress = String(env.EMAIL_INTAKE_ADDRESS ?? "").trim();
+if (intakeAddress) {
+  const intakeOk = /^[^@\s+]+@[^@\s]+$/.test(intakeAddress);
+  add("notifications", "email intake", intakeOk && sources.length ? "PASS" : "WARN",
+    !intakeOk ? `EMAIL_INTAKE_ADDRESS=${intakeAddress} is not a plain address (no +tag): set it to the bare intake address, e.g. intake@<your domain>`
+      : sources.length ? `jobs emailed to ${intakeAddress.replace("@", "+<client tag>@")} become projects; give each client a tag under Clients`
+      : "EMAIL_INTAKE_ADDRESS is set but no tracking inbox is configured, so no emailed job is ever read (see tracking inbox)");
+}
 // Read exactly as scheduler.ts reads it: <= 0 (an empty value included) turns the monitor off.
 if (Number(env.MONITOR_INTERVAL_MINUTES ?? 15) <= 0) {
   add("notifications", "MONITOR_INTERVAL_MINUTES", "WARN",
