@@ -2,12 +2,16 @@
 //
 //   npx tsx scripts/ops/preflight.ts            # run in the install folder (reads the live .env)
 //   npx tsx scripts/ops/preflight.ts --json
+//   npx tsx scripts/ops/preflight.ts --probe-edge   # also GET PUBLIC_BASE_URL from outside (Linux server, #437)
 //
 // Every step of docs/OPERATIONS.md ends with "re-run preflight; this line must say PASS". It checks
 // configuration, not behaviour: the restore drill, --test-alert and the restart drill prove the rest.
 //
 // READ-ONLY. Reads .env (via the environment), the users table (read-only connection, operator
 // accounts only: email, role, whether a password is set) and the backup folders. Writes nothing.
+// --probe-edge adds two GETs to PUBLIC_BASE_URL (/health and /status) to see whether Cloudflare
+// Access is in front and the customer bypass works (backend/src/opsEdgePosture.ts); off by default,
+// so a plain run never touches the network.
 // NEVER PRINTS A SECRET: keys, passwords and tokens are reported as set/missing/length only.
 //
 // EXIT: 0 no FAIL (WARNs allowed), 1 at least one FAIL.
@@ -17,9 +21,14 @@ import path from "node:path";
 import { backupDir as stateBackupDir, dbPath as stateDbPath, opsDir } from "../../backend/src/statePaths";
 import { AUTOMATIC_SNAPSHOT_RE } from "../../backend/src/offboxBackup";
 import { DEFAULT_LISTEN_HOST, isLoopbackListenHost, resolveListenHost } from "../../backend/src/listenHost";
+import { exposedHostAdvice, isWindows, probeEdge, trustProxyRow, watchdogInstallHint, type HostShape } from "../../backend/src/opsEdgePosture";
 
 const env = process.env;
 const asJson = process.argv.includes("--json");
+const probeEdgeFlag = process.argv.includes("--probe-edge");
+// The desk is Windows; the hosted server is Linux, usually inside the Docker image. Wording that
+// only makes sense on one of them is chosen here (opsEdgePosture.ts).
+const shape: HostShape = { platform: process.platform, inContainer: fs.existsSync("/.dockerenv") };
 type Verdict = "PASS" | "WARN" | "FAIL";
 const rows: { area: string; check: string; verdict: Verdict; detail: string }[] = [];
 const add = (area: string, check: string, verdict: Verdict, detail: string): void => { rows.push({ area, check, verdict, detail }); };
@@ -93,7 +102,7 @@ if (isLoopbackListenHost(host)) {
   add("access", "SERVER_HOST", "PASS",
     `${env.SERVER_HOST?.trim() ? host : `unset (${host})`}: reachable only from this machine (customer links then need a tunnel - see OPERATIONS.md)`);
 } else if (authOn) {
-  add("access", "SERVER_HOST", "WARN", `${host}: listening beyond this machine - keep the Node firewall rule off the Public profile`);
+  add("access", "SERVER_HOST", "WARN", `${host}: listening beyond this machine - ${exposedHostAdvice(shape)}`);
 } else if (!listen.ok) {
   add("access", "SERVER_HOST", "FAIL", `${host} with AUTH_ENABLED off: the server will refuse to start - turn auth on, or remove SERVER_HOST`);
 } else {
@@ -147,12 +156,20 @@ if (!second) {
 } else {
   const secondDir = path.resolve(process.cwd(), second);
   const off = newestIn(secondDir);
-  const sameDrive = (a: string, b: string): boolean => path.parse(a).root.toLowerCase() === path.parse(b).root.toLowerCase();
+  // Windows judges by drive letter. On Linux every path's root is "/", so the drive-letter test
+  // called every folder "the same drive"; compare the filesystems' device ids instead (a mounted
+  // Storage Box or second disk has its own). A path that cannot be stat'ed counts as different.
+  const devOf = (p: string): number | null => { try { return fs.statSync(fs.existsSync(p) ? p : path.dirname(p)).dev; } catch { return null; } };
+  const sameDrive = (a: string, b: string): boolean => isWindows(shape)
+    ? path.parse(a).root.toLowerCase() === path.parse(b).root.toLowerCase()
+    : devOf(a) !== null && devOf(a) === devOf(b);
   add("backups", "BACKUP_SECOND_DIR", !fs.existsSync(secondDir) ? "FAIL" : !off ? "WARN" : "PASS",
     !fs.existsSync(secondDir) ? `${secondDir} does not exist (a disconnected share?)`
       : !off ? `${secondDir}: no snapshot copied yet - run scripts/ops/offbox-sync.ts`
         : `${secondDir}: newest off-box snapshot ${off.ageH.toFixed(1)} h old` +
-          (sameDrive(secondDir, dbPath) || sameDrive(secondDir, backupDir) ? " (same drive as the database or BACKUP_DIR: fine ONLY if it is a cloud-synced folder)" : ""));
+          (sameDrive(secondDir, dbPath) || sameDrive(secondDir, backupDir)
+            ? isWindows(shape) ? " (same drive as the database or BACKUP_DIR: fine ONLY if it is a cloud-synced folder)" : " (same filesystem as the database or BACKUP_DIR: not off the box - mount the Storage Box there)"
+            : ""));
 }
 
 // --- ALERTS ---------------------------------------------------------------------------------------------
@@ -168,7 +185,15 @@ const stateFile = env.WATCHDOG_STATE_FILE ? path.resolve(process.cwd(), env.WATC
 let lastRun: number | null = null;
 try { lastRun = Date.parse(JSON.parse(fs.readFileSync(stateFile, "utf8")).lastRunAt); } catch { lastRun = null; }
 add("alerts", "watchdog running", lastRun && Date.now() - lastRun < 20 * 60_000 ? "PASS" : "FAIL",
-  lastRun ? `last poll ${Math.round((Date.now() - lastRun) / 60_000)} min ago` : "has never run here (install-watchdog.ps1)");
+  lastRun ? `last poll ${Math.round((Date.now() - lastRun) / 60_000)} min ago` : `has never run here (${watchdogInstallHint(shape)})`);
+
+// --- EDGE (the hosted server behind cloudflared; #437) -------------------------------------------
+// TRUST_PROXY is read on every platform: it is what the login lockout keys on behind any proxy.
+{ const r = trustProxyRow(env, shape); add(r.area, r.check, r.verdict, r.detail); }
+if (probeEdgeFlag) {
+  if (baseDead) add("edge", "probe", "FAIL", "--probe-edge needs a real PUBLIC_BASE_URL");
+  else for (const r of await probeEdge(base, fetch)) add(r.area, r.check, r.verdict, r.detail);
+}
 
 // --- REPORT -------------------------------------------------------------------------------------------
 const fails = rows.filter((r) => r.verdict === "FAIL").length;

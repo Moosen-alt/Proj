@@ -1,0 +1,26 @@
+# The Linux server's compose override (docs/OPERATIONS_LINUX.md §1). Copy it to the checkout root:
+#   cp scripts/ops/linux/docker-compose.override.yml /opt/keelix/docker-compose.override.yml
+# Needs Compose 2.24+ (the !override tags).
+services:
+  app:
+    # deploy.sh / rollback.sh build solar-submission-autopilot:<sha> and point :current at it.
+    # `docker compose up --build` would overwrite :current with an unstamped build: use deploy.sh.
+    image: solar-submission-autopilot:current
+    ports: !override
+      # Only this machine (cloudflared) reaches the app. Nothing is published to the internet.
+      - "127.0.0.1:4173:4173"
+    environment:
+      # One state root, flat (#430): database, documents, backups, portal profiles, the draft
+      # ledger, run bundles, screenshots and logs all live in it.
+      AUTOPILOT_STATE_DIR: /app/backend/data
+      # BACKUP_SECOND_DIR=/app/offbox is the Storage Box (offbox mount below). Set here, not in .env,
+      # so it cannot drift from the mount.
+      BACKUP_SECOND_DIR: /app/offbox
+    volumes: !override
+      - /srv/keelix/backend-data:/app/backend/data
+      - /mnt/keelix-offbox:/app/offbox
+    # Give a running job a moment to finish its write on stop; deploy.sh waits for quiet first.
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: { max-size: "20m", max-file: "5" }

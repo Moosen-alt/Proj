@@ -20,7 +20,9 @@ const check = (label: string, fn: () => void): void => {
 const doc = fs.readFileSync(path.join(REPO, "docs", "OPERATIONS.md"), "utf8");
 const read = (rel: string): string => fs.readFileSync(path.join(REPO, rel), "utf8");
 const codeCorpus = [
-  ...fs.readdirSync(path.join(REPO, "scripts", "ops")).map((f) => read(path.join("scripts", "ops", f))),
+  // Files only: scripts/ops/linux/ (the Linux server's units and scripts, #437) is a folder.
+  ...fs.readdirSync(path.join(REPO, "scripts", "ops"), { withFileTypes: true }).filter((e) => e.isFile())
+    .map((e) => read(path.join("scripts", "ops", e.name))),
   read("backend/src/backup.ts"), read("backend/src/offboxBackup.ts"), read("backend/src/auth.ts"),
   read("backend/src/server.ts"), read("backend/src/clientNotifier.ts"),
 ].join("\n");

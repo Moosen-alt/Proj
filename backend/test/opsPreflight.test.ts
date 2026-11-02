@@ -123,8 +123,11 @@ const hostCase = (extra: Record<string, string>): string =>
 check("explicit loopback with auth off: PASS", () => {
   assert.match(hostCase({ AUTH_ENABLED: "false", SERVER_HOST: "::1" }), /PASS .*::1: reachable only from this machine/);
 });
-check("auth on + non-loopback: WARN with the firewall note", () => {
-  assert.match(hostCase({ AUTH_ENABLED: "true", SERVER_HOST: "0.0.0.0" }), /WARN .*0\.0\.0\.0: .*firewall rule off the Public profile/);
+check("auth on + non-loopback: WARN with the firewall note for this platform (#437: no Windows advice on Linux)", () => {
+  assert.match(hostCase({ AUTH_ENABLED: "true", SERVER_HOST: "0.0.0.0" }),
+    process.platform === "win32" ? /WARN .*0\.0\.0\.0: .*firewall rule off the Public profile/
+      : fs.existsSync("/.dockerenv") ? /WARN .*0\.0\.0\.0: .*publish the port on 127\.0\.0\.1 only/
+        : /WARN .*0\.0\.0\.0: .*port closed in the host and provider firewalls/);
 });
 check("auth off + non-loopback, no opt-in: FAIL - the server will refuse to start", () => {
   assert.match(hostCase({ AUTH_ENABLED: "false", SERVER_HOST: "0.0.0.0" }), /FAIL .*server will refuse to start/);

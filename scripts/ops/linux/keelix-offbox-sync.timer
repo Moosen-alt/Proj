@@ -1,0 +1,11 @@
+# Every 2 hours at :20, after the server's own 2-hourly snapshot has settled.
+[Unit]
+Description=Keelix off-box backup sync every 2 hours
+
+[Timer]
+OnCalendar=*-*-* 00/2:20:00
+Persistent=true
+RandomizedDelaySec=2min
+
+[Install]
+WantedBy=timers.target
