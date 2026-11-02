@@ -54,6 +54,7 @@ import { createUser, getUserWorkload, listUsers, updateUser, assignProjectToUser
 import { listBackups, runBackup, startBackupScheduler } from "./backup";
 import { startArtifactRetention } from "./artifactRetention";
 import { startMonitorScheduler } from "./scheduler";
+import { startStaffDigestScheduler } from "./staffAlerts";
 import { startAhjFormRefreshScheduler, startKbLinkCheckScheduler } from "./ahjFormRefresh";
 import { startCecSyncScheduler, primeCecCache, syncCecEquipment } from "./cecEquipment";
 import { extractZipToWorkdir } from "./batchZip";
@@ -3926,6 +3927,7 @@ const server = app.listen(port, listen.host, () => {
   startBackupScheduler(db);
   startArtifactRetention();
   startMonitorScheduler(db);
+  startStaffDigestScheduler(db);
   startAhjFormRefreshScheduler(db);
   startKbLinkCheckScheduler(db);
   startCecSyncScheduler(db);

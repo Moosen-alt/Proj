@@ -2862,6 +2862,42 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       addColumnIfMissing(db, "clients", "request_links_auto_send", "TEXT NOT NULL DEFAULT ''");
     },
   },
+  {
+    version: 55,
+    name: "staff_notifications",
+    up: (db) => {
+      // STAFF ALERTS + MORNING DIGEST (#487). One row per alert or digest the team was (or was
+      // not) sent, so "what did we fail to send" is a query — the lesson of the client backlog that
+      // sat in communications for twelve days. NOT the communications table: that one is the
+      // CLIENT's timeline, and scripts/undelivered.ts re-resolves every stranded row's recipient to
+      // the project's CLIENT — a staff alert left there would be re-sent to the customer.
+      //
+      // org_id is the row's OWN column, stamped at write from the project row (alerts) or the org
+      // being digested — the historical_failure_examples precedent (CLAUDE.md, tenancy): a digest
+      // has no project to reach an org through. (kind, ref, state) is the dedupe key: the newest
+      // row for (org, kind, ref) carrying the same state means this transition was already handled.
+      // recipient lists email addresses and the word "webhook" — never the webhook URL itself.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS staff_notifications (
+          id TEXT PRIMARY KEY,
+          org_id TEXT NOT NULL,
+          project_id TEXT,
+          kind TEXT NOT NULL,
+          ref TEXT NOT NULL,
+          state TEXT NOT NULL DEFAULT '',
+          subject TEXT NOT NULL DEFAULT '',
+          body TEXT NOT NULL DEFAULT '',
+          recipient TEXT NOT NULL DEFAULT '',
+          delivery_status TEXT NOT NULL DEFAULT 'pending',
+          delivery_detail TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          sent_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_staff_notifications_ref ON staff_notifications(org_id, kind, ref, created_at);
+        CREATE INDEX IF NOT EXISTS idx_staff_notifications_delivery ON staff_notifications(delivery_status, created_at);
+      `);
+    },
+  },
 ];
 
 /** v47 was edited in place while #218 was open (Helm's review at 0116f98a): a DB that ran an earlier

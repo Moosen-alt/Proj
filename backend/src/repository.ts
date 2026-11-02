@@ -75,6 +75,7 @@ import { findCompleteRecipeForProject, findAnyRecipeForProject, resolveRecipeFie
 import { notServedInResult } from "../../shared/src/portalNotServed";
 import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier";
 import { notifyClientOfFiling } from "./clientFilingUpdate";
+import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStatusChange } from "./staffAlerts";
 // detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget; the
 // card's Edit (updatePermitCheckTarget) re-detects with the same function when the URL changes.
 import { accelaModulesForNumber, detectPlatform, publicPermitStatusCheck, searchAccelaRecordByNumber } from "./publicPermitStatus";
@@ -6870,6 +6871,22 @@ export async function recordPermitStatusCheck(
   // demoted row: a reading this function refused to write is refused here for the same reason,
   // by the same verdict, so the two doors cannot disagree. (Passing the persisted outcome instead
   // would make this gate dead code — it would only ever see needs_human_review.)
+  // STAFF ALERT (#487) — also after the commit, and on what was WRITTEN (`classification`): a
+  // refused reading reaches staff as the needs_human_review it was persisted as, which is exactly
+  // the item somebody has to go and confirm. A new correction is its own alert (the correction is
+  // the news); otherwise a change of the target's outcome is, gated on the same change pair the
+  // client update uses — and on recordCheck, so a re-read of a known state alerts nobody.
+  // (The cast: TypeScript does not see the assignment inside the transaction closure.)
+  const newCorrectionId = correctionId as string | null;
+  if (newCorrectionId) {
+    void alertStaffOnCorrection(db, { projectId, correctionId: newCorrectionId, track: track ?? "permit" });
+  } else if (recordCheck) {
+    void alertStaffOnStatusChange(db, {
+      projectId, targetId: text(target?.id), track: track ?? "permit",
+      outcome: classification.outcome, previousOutcome,
+    });
+  }
+
   if (shouldNotifyClient(read.outcome, previousOutcome, provenance)) {
     void notifyClientOfStatusChange(db, detail.project, {
       outcome: read.outcome,
@@ -8044,6 +8061,7 @@ export function recoverInterruptedPortalRuns(
     addAuditLog(db, text(r.project_id), "system", "portal run recovery", "portal.run_interrupted", {
       runId: text(r.id), track: text(r.permit_type), trackingUrl: url || null, runner: text(r.runner),
     });
+    void alertStaffOnRunOutcome(db, { projectId: text(r.project_id), runId: text(r.id), track: text(r.permit_type), runStatus: "interrupted", reason: "" });
     recovered.push({ runId: text(r.id), projectId: text(r.project_id), permitType: text(r.permit_type), trackingUrl: url });
   }
   return recovered;
@@ -10368,6 +10386,15 @@ export async function prepareSubmission(
     if (acceptedFiling) {
       void notifyClientOfFiling(db, detail.project, { track: permitTypeTag, permitNumber: capturedPermitNumber, via: "auto_submit" });
     }
+
+    // STAFF ALERT (#487) — after the run's row committed, fire-and-forget, never into this path.
+    // Only the endings that need a person alert (paused, failed, submitted-unconfirmed); the
+    // reason is the run's own one line — the same text the row's error_message just took — and
+    // staffAlerts scrubs it before it leaves.
+    void alertStaffOnRunOutcome(db, {
+      projectId, runId, track: permitTypeTag, runStatus,
+      reason: failureMessage || (pauseReason ? pausedRunSentence(pauseReason, result) : ""),
+    });
 
     // #333: a filing the person made from the review window while this run was finishing — recorded
     // now, on top of the outcome (an awaiting_human_submit row, or the run's own failed row), never
