@@ -5653,6 +5653,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // a 6-page budget; a refusal already knows what went wrong, so it says so immediately.
     let pendingHint = "";
     const MAX_RECOVERY = 3;
+    // THE PLAN ACTS ON THE PAGE IT WAS MADE FOR (#410). Re-reads of a page that changed between
+    // its scrape and its plan being applied — bounded per run, so a page that keeps repainting
+    // itself cannot spend the budget re-planning; past the cap the walk behaves as before.
+    let pageMovedReplans = 0;
+    const PAGE_MOVED_REPLAN_MAX = 4;
+    // A REQUIRED BLANK STOPS THE ADVANCE (#410): pages (by identity) already given their one
+    // re-plan for required fields still blank, and a per-run cap on those planner calls.
+    const requiredReplanned = new Set<string>();
+    const REQUIRED_REPLAN_MAX = 8;
     // Validation blockers: collected when an advance click fails to move the page forward
     // (portal blocked the step due to required-field errors). Injected into the recovery hint
     // and surfaced in the final message so the operator can see WHICH fields the portal rejected.
@@ -5879,6 +5888,36 @@ export class AutoLearnAdapter extends BasePortalAdapter {
 
       // Debug: capture the page as-seen BEFORE any fills.
       await saveDebugShot(`p${pageCount.toString().padStart(3, "0")}-before-${(pageTitle || "page").replace(/\s+/g, "_").slice(0, 40)}`);
+
+      // THE PAGE THIS ITERATION'S PLAN IS FOR (#410), read with the scrape. Everything between
+      // here and the first fill (the entry pass, the type chooser, the planner call itself) can
+      // leave a different page on screen; `pageMovedUnderPlan` asks before the plan is applied.
+      const scrapedIdentity = await pageIdentityOf(this.page);
+      const stepsAtScrape = steps.length;
+      const pageMovedUnderPlan = async (phase: "before the planner was asked" | "while the planner worked"): Promise<boolean> => {
+        if (!scrapedIdentity || pageMovedReplans >= PAGE_MOVED_REPLAN_MAX) return false;
+        const now = await pageIdentityOf(this.page);
+        if (!now || (now.where === scrapedIdentity.where && now.controls === scrapedIdentity.controls)) return false;
+        pageMovedReplans++;
+        const headingOf = (w: string): string => w.slice(w.indexOf("|") + 1) || "(no heading)";
+        const before = new Set(scrapedIdentity.controls.split(",").filter(Boolean));
+        const shared = now.controls.split(",").filter((c) => c && before.has(c)).length;
+        // ANOTHER PAGE, not the same page painting more controls after it was read: its path or
+        // heading moved, or not one control it was read with is still there.
+        const anotherPage = now.where !== scrapedIdentity.where || (before.size > 0 && shared === 0);
+        const recorded = steps.length > stepsAtScrape;
+        this.debug?.event({
+          type: "page_changed_under_plan", page: pageCount, phase, anotherPage, recorded,
+          from: headingOf(scrapedIdentity.where).slice(0, 60), to: headingOf(now.where).slice(0, 60),
+        });
+        // ANY PAGE CHANGE THE WALK CAUSED IS A STEP, OR IT IS SAID. A change with no recorded step
+        // since the scrape cannot be replayed: the person at review hears where it happened.
+        if (anotherPage && !recorded) {
+          const note = `The portal moved from "${headingOf(scrapedIdentity.where).slice(0, 60)}" to "${headingOf(now.where).slice(0, 60)}" ${phase} on page ${pageCount}, without a recorded step. The walk re-read and re-planned the new page, but a replay of this recipe has no step for that change; if a replay stops there, re-record the portal.`;
+          if (!this.pageReviewNotes.includes(note)) this.pageReviewNotes.push(note);
+        }
+        return true;
+      };
 
       // PAGE CLASSIFICATION. A page with NO fillable inputs is EITHER a dashboard/home
       // (just navigation links — the portal entry screen after login) OR a read-only
@@ -6340,7 +6379,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // and the pass finds the identical button again — the second click TOGGLES the
         // drawer shut and the step lands in the recipe twice. The finder refuses it outright
         // now, so no click happens and nothing is recorded.
-        const entered = await enterApplicationFlow(this.page, { skipLabels: this.entryLabelsClicked }).catch(() => null);
+        // ONCE AN ENTRY CLICK HAS LANDED, ONE LOOK ONLY (#410): the walk is inside an application
+        // now, and the deep search's menu clicks and reload of the page it started on are page
+        // changes no step records (PGE: the reload resumed the wizard at Preparer, under a plan made
+        // for Welcome). A second entry on the page it opened is still found by the one look.
+        const entered = await enterApplicationFlow(this.page, { skipLabels: this.entryLabelsClicked, shallow: this.entryLabelsClicked.size > 0 }).catch(() => null);
         if (entered?.alreadyClicked) {
           this.debug?.event({ type: "application_entry_repeat_ignored", label: (entered.label || "").slice(0, 60) });
         } else if (entered?.ok && entered.label) {
@@ -6602,6 +6645,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //    THE PLANNER NEVER SEES A SIGNATURE BOX (one signer rule). The signature controls are
       //    taken out of the request; the planner's indices are into that shorter list and are
       //    mapped back here, so every consumer below still indexes `fields`.
+      // THE PAGE MUST STILL BE THE ONE READ (#410). A pass above (the entry pass, the type
+      // chooser) can leave another page on screen without asking the loop to re-read; planning
+      // `fields` then plans a page that is gone. Re-read instead — before paying for the call.
+      // Not after the typed signature: the bot's own signing changes the page it signs.
+      if (!signatureDone && await pageMovedUnderPlan("before the planner was asked")) continue;
       let plan: LearnPlanResponse;
       const planShot = await this.capturePlanScreenshot();
       const visibleIdx = fields.map((_f, i) => i).filter((i) => !signatureFieldIdx.has(i));
@@ -6641,6 +6689,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           this.debug?.event({ type: "signature_step_not_review", page: pageCount });
         }
       }
+      // ...AND STILL THE ONE READ WHEN THE PLAN COMES BACK (#410). Nothing has been applied yet:
+      // a plan whose page moved while it was being made is dropped and the new page is re-read.
+      if (!signatureDone && await pageMovedUnderPlan("while the planner worked")) continue;
 
       // c2) STRUCTURAL REVIEW GUARD — the Accela "Continue Application" trap.
       // On a review page its primary button (e.g. "Continue Application") SUBMITS, so we
@@ -7846,7 +7897,26 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //      "trusted" recipe. Only on real form pages (skip dashboards/review). Sensitive +
       //      acknowledgment fields are excluded inside the sweep.
       if (!plan.atReview && !isDashboard && hasFillable) {
-        const unfilled = await this.collectUnfilledRequired();
+        let unfilled = await this.collectUnfilledRequired();
+        // A REQUIRED BLANK STOPS THE ADVANCE (#410). Live PGE: this sweep named the Preparer's
+        // Name and Address blank on the very page it was about to leave, and the walk pressed Next
+        // anyway. Now the page gets ONE re-plan for exactly those blanks first, and the walk
+        // advances only after it; anything still blank is reported below, as before. Once per page
+        // (by identity) and capped per run, so a blank no data can answer costs one planner call,
+        // never a loop. Not on a page the bot signed (the signature boxes are the signature pass's).
+        if (unfilled.length && !signatureDone && requiredReplanned.size < REQUIRED_REPLAN_MAX) {
+          const replanKey = scrapedIdentity ? `${scrapedIdentity.where}#${scrapedIdentity.controls}` : deadPageKey(url, fields.length);
+          if (!requiredReplanned.has(replanKey)) {
+            requiredReplanned.add(replanKey);
+            const filled = await this.replanRequiredBlanks({ blanks: unfilled, url, pageTitle, steps, alreadyFilledLabels, appliedThisPage });
+            this.debug?.event({ type: "required_blank_replan", page: pageCount, blanks: unfilled.slice(0, 8), filled });
+            if (filled > 0) {
+              await this.waitForAutosaveIndicator(3000);
+              await sleep(400);
+              unfilled = await this.collectUnfilledRequired();
+            }
+          }
+        }
         for (const m of unfilled) {
           if (!fillVerifyMisses.includes(m)) fillVerifyMisses.push(m);
           if (!missesNeverFilled.includes(m) && !missesDidNotHold.includes(m)) missesNeverFilled.push(m);
@@ -9941,6 +10011,90 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   // flagging them would block every PowerClerk recipe from ever being trusted. The standard
   // "I understand my form will not be submitted…" acknowledgment is excluded too — it's the
   // review-gate checkbox, ticked at the review screen, not a data field. Returns visible labels.
+  /** A REQUIRED BLANK STOPS THE ADVANCE (#410): the page's ONE re-plan, for the required fields
+   *  the sweep just found blank on the page the walk is about to leave. The page is re-read (its
+   *  indices are the live page's), the planner is asked again with the blanks named, and only a
+   *  fill aimed at one of those blanks, on a control still empty, is applied: what the page
+   *  already holds is never re-typed, and nothing else on the page is re-run (the deterministic
+   *  passes have had their turn). The values are the planner's binding of this job's data, as on
+   *  any page (a Preparer / Submitter section is whoever submits, by the planner's own rules);
+   *  sensitive boxes stay excluded (the sweep never names one, and the label check refuses one).
+   *  Returns the number of fills applied; the caller sweeps again and reports what is still blank. */
+  private async replanRequiredBlanks(ctx: {
+    blanks: string[];
+    url: string;
+    pageTitle: string;
+    steps: RecipeStep[];
+    alreadyFilledLabels: string[];
+    appliedThisPage: AppliedFill[];
+  }): Promise<number> {
+    if (!this.page) return 0;
+    const norm = (s: string): string => String(s ?? "").replace(/[*:]/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+    const blanks = ctx.blanks.map(norm).filter(Boolean);
+    const aimsAtBlank = (label: string): boolean => {
+      const l = norm(label);
+      return !!l && blanks.some((b) => b === l || (l.length >= 4 && (b.startsWith(`${l} `) || l.startsWith(`${b} `))));
+    };
+    let fields: ExtractedField[] = [];
+    let bodyText = "";
+    try {
+      await this.waitForDynamicFieldsSettle().catch(() => null);
+      fields = (await this.extractAllFrames(EXTRACT_SEL)).map(toExtractedField);
+      const rawBody = await this.page.locator("body").innerText().catch(() => "");
+      bodyText = (redactStatusText(this.scrubSecrets(String(rawBody))) ?? "").slice(0, 2000);
+    } catch { return 0; }
+    if (!fields.length) return 0;
+    const named = ctx.blanks.slice(0, 8).map((b) => `"${b.slice(0, 60)}"`).join(", ");
+    let plan: LearnPlanResponse;
+    try {
+      plan = await this.askPlanner({
+        url: ctx.url,
+        pageTitle: ctx.pageTitle,
+        fields,
+        bodyText,
+        alreadyFilledLabels: ctx.alreadyFilledLabels,
+        isDashboard: false,
+        recoveryHint: `REQUIRED fields on THIS page are still blank and the walk is about to leave it: ${named}. ` +
+          `Fill each of them with this job's data, bound the way you bind every field (a Preparer / Submitter / Agent section is whoever submits the application, as your rules say). ` +
+          `Leave a field blank rather than invent a value. Do not change any field that already holds a value. Return only fills; the page's advance is already chosen.`,
+        screenshotBase64: await this.capturePlanScreenshot(),
+      });
+    } catch (err) {
+      this.debug?.event({ type: "required_blank_replan_error", message: (err instanceof Error ? err.message : String(err)).slice(0, 200) });
+      return 0;
+    }
+    let applied = 0;
+    for (const fillReq of plan.fills ?? []) {
+      const field = fields[fillReq.selectorIndex];
+      if (!field || field.fieldType === "button" || field.fieldType === "file") continue;
+      if (isSensitiveLabel(field.label)) continue;
+      if (!aimsAtBlank(field.label)) continue;
+      // A label can repeat on a page (PowerClerk's "Name" under two sections): only a control that
+      // is still empty is the blank. A box that already holds a value is never re-typed here.
+      if (field.fieldType === "text" || field.fieldType === "other") {
+        const loc = await this.locator(field.selector).catch(() => null);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const held = loc && typeof (loc as any).inputValue === "function" ? String(await (loc as any).inputValue({ timeout: 2000 }).catch(() => "")) : "";
+        if (held.trim()) continue;
+      }
+      const step = await this.applyFill(field, fillReq, false);
+      if (!step) continue;
+      ctx.steps.push(step);
+      applied++;
+      if (field.label) ctx.alreadyFilledLabels.push(field.label);
+      ctx.appliedThisPage.push({
+        selector: field.selector,
+        label: field.label || "",
+        fieldType: field.fieldType,
+        expected: fillReq.value ?? "",
+        sensitive: false,
+        required: !!field.required,
+        group: field.group,
+      });
+    }
+    return applied;
+  }
+
   private async collectUnfilledRequired(): Promise<string[]> {
     if (!this.page || typeof this.page.evaluate !== "function") return [];
     const labels = await this.page.evaluate(() => {
@@ -11386,6 +11540,38 @@ export async function advanceSignatureOf(page: any): Promise<string> {
     });
   } catch {
     return "";
+  }
+}
+
+/** WHICH PAGE THIS IS, for "is the live page still the one the plan was made for?" (#410).
+ *  Structure only: the address's path, the page's own heading (or the wizard's active step) and
+ *  the names of the visible controls one can type into or choose. Typed values, prose length,
+ *  button counts and list rows are left out on purpose: they move while a page is being read or
+ *  answered (a dropdown read open and shut, a "Saving…" label) without the page being another.
+ *  `where` (path + heading) tells a DIFFERENT page from the same page that painted more controls
+ *  after it was read. Null when the page cannot be asked (a fake page, mid-navigation). */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function pageIdentityOf(page: any): Promise<{ where: string; controls: string } | null> {
+  if (!page || typeof page.evaluate !== "function") return null;
+  try {
+    const got = await page.evaluate(() => {
+      const vis = (el: Element): boolean => {
+        const r = (el as HTMLElement).getBoundingClientRect();
+        return r.width > 2 && r.height > 2;
+      };
+      const heading = (document.querySelector("h1, h2, legend, .wizard-step.active, [aria-current='step']")?.textContent || "")
+        .replace(/\s+/g, " ").trim().slice(0, 80);
+      const controls = (Array.from(document.querySelectorAll("input, select, textarea")) as HTMLInputElement[])
+        .filter((el) => vis(el) && !/^(hidden|submit|button|reset|image)$/i.test(el.type || ""))
+        .map((el) => (el.getAttribute("name") || el.getAttribute("id") || el.type || el.tagName).toLowerCase())
+        .sort()
+        .join(",")
+        .slice(0, 600);
+      return { where: `${location.pathname}|${heading}`, controls };
+    });
+    return got && typeof got.where === "string" ? got : null;
+  } catch {
+    return null;
   }
 }
 
