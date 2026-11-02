@@ -74,6 +74,7 @@ import { portalAutomationDisabled, resolveHeadless } from "../../portal-bot/src/
 import { findCompleteRecipeForProject, findAnyRecipeForProject, resolveRecipeFieldValues, markPortalRecipeForRerecord, demoteOnReplayFailure, collectHealedSteps, persistHealedSteps, getPortalRecipe, portalEntityEvidence, recipeHostFit, findBorrowableRecipe, replayFailureBlamesRecipe, recipeStepsSignature, isNotServedRecipe, recordPortalNotServed, type BorrowedRecipeChoice } from "./portalRecipes";
 import { notServedInResult } from "../../shared/src/portalNotServed";
 import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier";
+import { notifyClientOfFiling } from "./clientFilingUpdate";
 import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStatusChange } from "./staffAlerts";
 // detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget; the
 // card's Edit (updatePermitCheckTarget) re-detects with the same function when the URL changes.
@@ -10345,6 +10346,14 @@ export async function prepareSubmission(
         });
     });
 
+    // THE CLIENT HEARS WE FILED (#490) — only on a filing the portal CONFIRMED (acceptedFiling). A
+    // click the portal did not confirm (submitted_unconfirmed) may not have filed, so it says nothing
+    // until a person confirms it through captureConfirmation, which then announces it. Once per
+    // track, fire-and-forget: it never throws and never touches the run's record.
+    if (acceptedFiling) {
+      void notifyClientOfFiling(db, detail.project, { track: permitTypeTag, permitNumber: capturedPermitNumber, via: "auto_submit" });
+    }
+
     // STAFF ALERT (#487) — after the run's row committed, fire-and-forget, never into this path.
     // Only the endings that need a person alert (paused, failed, submitted-unconfirmed); the
     // reason is the run's own one line — the same text the row's error_message just took — and
@@ -10634,6 +10643,8 @@ export function captureConfirmation(
   let recordLinkRefused = false;
   // Hoisted so the post-transaction correction close can read it — see below.
   let remainingTracks = 0;
+  // Hoisted so the client's "we filed it" update (#490) names the track this confirmation filed.
+  let filedTrack = "";
 
   db.transaction(() => {
     db.run("UPDATE portal_runs SET status = ?, finished_at = ? WHERE id = ?", ["submitted", ts, portalRunId]);
@@ -10712,6 +10723,7 @@ export function captureConfirmation(
     const trackKey = runPermitType
       || text(stamped?.permit_type)
       || (text(stamped?.submission_type) === "interconnection" ? "nem" : "");
+    filedTrack = trackKey;
     // THE RECORD'S LINK (#400). Rule 5 at the one creator: a utility-portal link never lands on a
     // permit target (ensureCheckTarget would refuse it). Here it is dropped instead of refused —
     // the number is the precious fact, and a link must never cost the filing its record.
@@ -10820,6 +10832,15 @@ export function captureConfirmation(
   }
 
   const detail = getProjectDetail(db, projectId);
+  // A PERSON CONFIRMED THIS FILING (the dashboard's capture form, or the hand-over's confident read
+  // of the completion page) — the client hears we filed (#490). Once per track: a re-capture of the
+  // same run, or a later "mark submitted" of the same track, sends nothing more.
+  void notifyClientOfFiling(db, detail.project, {
+    track: filedTrack || "permit",
+    applicationNumber: input.applicationNumber,
+    permitNumber: input.permitNumber,
+    via: "capture",
+  });
   learnFromSubmissionConfirmation(db, detail.project, input);
   return getProjectDetail(db, projectId);
 }

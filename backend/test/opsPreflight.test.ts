@@ -23,10 +23,14 @@ const SECRETS = {
   auth: "auth-secret-9876543210-zyxwvutsrq-PONMLKJIHG-fedcba",
   adminPw: "admin-pw-Larkspur-4471",
   smtpPw: "smtp-pw-Quintero-9931",
+  imapPw: "imap-pw-Halvorsen-2207",
+  gmailSecret: "gmail-secret-Mbeki-6018",
+  gmailToken: "gmail-refresh-Tanaka-7734",
 };
 const noPw = path.join(ISOLATED_CWD, "no-admin-pw.sqlite");
 const withAdmin = path.join(ISOLATED_CWD, "with-admin.sqlite");
-process.env.AUTOPILOT_DB_PATH = withAdmin;
+const withNotify = path.join(ISOLATED_CWD, "with-notify.sqlite");
+process.env.AUTOPILOT_DB_PATH = path.join(ISOLATED_CWD, "live.sqlite");
 process.env.SEED_TEST_INSTALLER = "false";
 process.env.AUTOPILOT_AUTO_START = "0";
 process.env.SESSION_ENCRYPTION_KEY = SECRETS.session;
@@ -37,6 +41,7 @@ process.env.ADMIN_PASSWORD = SECRETS.adminPw;
 const { openDatabase } = await import("../src/db");
 const { seedAdminUser } = await import("../src/auth");
 const { createUser } = await import("../src/users");
+const { addCommunication } = await import("../src/crm");
 const db = await openDatabase();
 createUser(db, { name: "Owner", email: "owner@ops.invalid" });
 db.backupTo(noPw); // today's shape: one OPERATOR user, no password
@@ -44,6 +49,22 @@ seedAdminUser(db); // the production path: sets the password on the matching exi
 const pwNotAdmin = path.join(ISOLATED_CWD, "pw-not-admin.sqlite");
 db.backupTo(pwNotAdmin); // what following ADMIN_EMAIL=<existing operator> actually produces
 db.run("UPDATE users SET role = 'admin' WHERE email = ?", ["owner@ops.invalid"]); // the documented promotion (no role writer exists)
+db.backupTo(withAdmin); // the configured shape: an admin, no IMAP source, no communications
+// NOTIFICATIONS (#493): one active IMAP source row, an inactive one (not polled), and the
+// client-email record in each delivery state (addCommunication, the production writer). The IMAP rows
+// are raw SQL because their writer, emailPoller.ts upsertImapSource, cannot run under ESM today
+// (`require` is not defined, #498); the columns are the ones it writes.
+const imapRow = (id: string, host: string, filePath: string, active: number): void => db.run(
+  `INSERT INTO email_tracking_sources (id, source_type, label, file_path, imap_host, imap_user, imap_pass_encrypted, active, created_at, updated_at)
+   VALUES (?, 'imap', ?, ?, ?, 'permits@ops.invalid', 'enc', ?, datetime('now'), datetime('now'))`, [id, id, filePath, host, active]);
+imapRow("shared-inbox", "imap.ops.invalid", "", 1);
+imapRow("switched-off", "imap2.ops.invalid", "imap:switched-off", 0);
+for (const deliveryStatus of ["draft", "draft", "failed", "sent"]) {
+  addCommunication(db, { direction: "outbound", channel: "email", subject: `update (${deliveryStatus})`, deliveryStatus });
+}
+addCommunication(db, { direction: "outbound", channel: "note", subject: "a note, not an email", deliveryStatus: "draft" });
+addCommunication(db, { direction: "inbound", channel: "email", subject: "an agency email", deliveryStatus: "" });
+db.backupTo(withNotify);
 db.close();
 
 let failures = 0;
@@ -102,6 +123,8 @@ const good = preflight({
   BACKUP_DIR: backupDir, BACKUP_INTERVAL_HOURS: "2", BACKUP_KEEP: "84", BACKUP_SECOND_DIR: secondDir,
   SMTP_HOST: "smtp.invalid", SMTP_FROM: "x@ops.invalid", SMTP_PASS: SECRETS.smtpPw, WATCHDOG_ALERT_TO: "ops@ops.invalid",
   WATCHDOG_HEARTBEAT_URL: "https://hc-ping.invalid/abc", WATCHDOG_STATE_FILE: stateFile,
+  EMAIL_IMAP_HOST: "imap.ops.invalid", EMAIL_IMAP_USER: "permits@ops.invalid", EMAIL_IMAP_PASS: SECRETS.imapPw,
+  STAFF_ALERT_TO: "owner@ops.invalid, pm@ops.invalid", STAFF_DIGEST_HOUR: "7",
 });
 check("no FAIL, exit 0", () => {
   assert.equal(good.code, 0, good.out);
@@ -109,6 +132,13 @@ check("no FAIL, exit 0", () => {
 });
 check("the seeded admin is seen (by email, never by password)", () => assert.match(line(good.out, "admin login"), /PASS .*owner@ops\.invalid/));
 check("final submit unset reads PASS", () => assert.match(line(good.out, "PORTAL_ALLOW_FINAL_SUBMIT"), /PASS/));
+check("NOTIFICATIONS all PASS on the configured shape (#493)", () => {
+  assert.match(line(good.out, "client email (SMTP)"), /PASS .*test-email\.ts --to/);
+  assert.match(line(good.out, "tracking inbox"), /PASS .*IMAP inbox \(EMAIL_IMAP_\*\)/);
+  assert.match(line(good.out, "unsent client emails"), /PASS .*none/);
+  assert.match(line(good.out, "staff alerts"), /PASS .*email to 2 address\(es\); morning digest at hour 7/);
+  assert.doesNotMatch(good.out, /MONITOR_INTERVAL_MINUTES/);
+});
 const armed = preflight({
   AUTOPILOT_DB_PATH: withAdmin, SESSION_ENCRYPTION_KEY: SECRETS.session, AUTH_ENABLED: "true", AUTH_SECRET: SECRETS.session,
   PORTAL_ALLOW_FINAL_SUBMIT: "1", BACKUP_DIR: backupDir,
@@ -152,6 +182,88 @@ const operatorOnly = preflight({ AUTOPILOT_DB_PATH: pwNotAdmin, AUTH_ENABLED: "t
 check("MUST-EXCLUDE: a password on an operator account is not reported as 'no password' nor as an admin PASS", () => {
   assert.match(line(operatorOnly.out, "admin login"), /WARN .*owner@ops\.invalid \(operator\) can sign in, but no ADMIN account has a password/);
 });
+
+console.log("preflight: NOTIFICATIONS (#493) - each a WARN naming the line to add, never a FAIL");
+const notify = (dbFile: string, extra: Record<string, string>): string =>
+  preflight({ AUTOPILOT_DB_PATH: dbFile, AUTH_ENABLED: "true", BACKUP_DIR: backupDir, ...extra }).out;
+let out = notify(withAdmin, {});
+check("no SMTP: WARN, client updates are only drafts, names SMTP_HOST= and SMTP_FROM=", () => {
+  assert.match(line(out, "client email (SMTP)"), /WARN .*SMTP_HOST and SMTP_FROM unset: client updates are only saved as drafts.*Add SMTP_HOST=<server> and SMTP_FROM=/);
+});
+check("no tracking source: WARN, emails are never read, names the EMAIL_IMAP_* and GMAIL_* lines", () => {
+  assert.match(line(out, "tracking inbox"), /WARN .*none configured: correction, approval and utility emails are never read.*EMAIL_IMAP_HOST=, EMAIL_IMAP_USER=, EMAIL_IMAP_PASS=.*GMAIL_REFRESH_TOKEN/);
+});
+check("no new line is a FAIL (the configured shape exits 0 without NOTIFICATIONS PASSing is covered above)", () => {
+  assert.doesNotMatch(out.split(/\r?\n/).filter((l) => /client email|tracking inbox|staff alerts|unsent client|SMTP_PASS|MONITOR_INTERVAL/.test(l)).join("\n"), /FAIL/);
+});
+check("no staff alert recipients: WARN naming STAFF_ALERT_TO= and STAFF_ALERT_WEBHOOK_URL= (#487's names)", () => {
+  assert.match(line(out, "staff alerts"), /WARN .*no recipients: nobody on the team is told.*Add STAFF_ALERT_TO=.*STAFF_ALERT_WEBHOOK_URL=/);
+});
+out = notify(withAdmin, { STAFF_ALERT_TO: "owner@ops.invalid" });
+check("MUST-EXCLUDE: STAFF_ALERT_TO with no SMTP cannot email anyone, so it is not a PASS", () => {
+  assert.match(line(out, "staff alerts"), /WARN .*STAFF_ALERT_TO is set but SMTP is not/);
+});
+out = notify(withAdmin, { STAFF_ALERT_WEBHOOK_URL: "https://ntfy.invalid/staff-topic" });
+check("a staff webhook alone is a PASS (no SMTP needed); no STAFF_DIGEST_HOUR means no digest, and it says so", () => {
+  assert.match(line(out, "staff alerts"), /PASS .*webhook set; no morning digest \(STAFF_DIGEST_HOUR unset\)/);
+  assert.ok(!out.includes("staff-topic"), "the webhook URL (a secret topic) is printed");
+});
+out = notify(withAdmin, { STAFF_ALERT_WEBHOOK_URL: "org-acme=https://ntfy.invalid/acme-topic", STAFF_DIGEST_HOUR: "7" });
+check("the verdict is the server's (staffAlertConfig.ts): another org's webhook is not the default org's channel", () => {
+  assert.match(line(out, "staff alerts"), /WARN .*no recipients/);
+  assert.ok(!out.includes("acme-topic"), "the webhook URL (a secret topic) is printed");
+});
+out = notify(withAdmin, { STAFF_ALERT_WEBHOOK_URL: "https://ntfy.invalid/staff-topic", STAFF_DIGEST_HOUR: "7am" });
+check("an unreadable STAFF_DIGEST_HOUR is no digest, said plainly (the server sends none)", () => {
+  assert.match(line(out, "staff alerts"), /PASS .*webhook set; no morning digest \(STAFF_DIGEST_HOUR=7am is not an hour 0-23\)/);
+});
+out = notify(withAdmin, { SMTP_HOST: "smtp.invalid" });
+check("SMTP_HOST without SMTP_FROM names only SMTP_FROM (clientNotifier needs both)", () => {
+  assert.match(line(out, "client email (SMTP)"), /WARN .*  SMTP_FROM unset/);
+});
+out = notify(withAdmin, { SMTP_HOST: "smtp.invalid", SMTP_FROM: "x@ops.invalid", SMTP_USER: "x@ops.invalid" });
+check("SMTP_USER with no SMTP_PASS: the sign-in will be refused", () => {
+  assert.match(line(out, "client email (SMTP)"), /PASS .*with sign-in/);
+  assert.match(line(out, "SMTP_PASS"), /WARN .*SMTP_USER is set but SMTP_PASS is empty/);
+});
+out = notify(withAdmin, { EMAIL_IMAP_HOST: "imap.ops.invalid", EMAIL_IMAP_USER: "permits@ops.invalid" });
+check("MUST-EXCLUDE: an incomplete EMAIL_IMAP_* (the poller ignores it) is not a PASS, and names the missing key", () => {
+  assert.match(line(out, "tracking inbox"), /WARN .*EMAIL_IMAP_\* is incomplete \(EMAIL_IMAP_PASS unset\), so it is ignored/);
+});
+out = notify(withAdmin, { GMAIL_CLIENT_ID: "client-id.ops.invalid", GMAIL_CLIENT_SECRET: SECRETS.gmailSecret, PUBLIC_BASE_URL: "https://keelix.ops.invalid" });
+check("MUST-EXCLUDE: Gmail set up but never authorized is not a PASS; on the server it names the redirect to set first", () => {
+  assert.match(line(out, "tracking inbox"), /WARN .*Gmail is set up but not authorized.*GMAIL_REDIRECT_URI=https:\/\/keelix\.ops\.invalid\/api\/gmail\/oauth\/callback \(now localhost\) and restart, then open \/api\/gmail\/auth-url/);
+});
+out = notify(withAdmin, { GMAIL_CLIENT_ID: "client-id.ops.invalid", GMAIL_CLIENT_SECRET: SECRETS.gmailSecret, GMAIL_REFRESH_TOKEN: SECRETS.gmailToken,
+  PUBLIC_BASE_URL: "https://keelix.ops.invalid" });
+check("Gmail with a refresh token (what the scheduler polls on) is a PASS", () => {
+  assert.match(line(out, "tracking inbox"), /PASS .*  Gmail: agency and utility emails are read/);
+});
+out = notify(withNotify, { SMTP_HOST: "smtp.invalid", SMTP_FROM: "x@ops.invalid" });
+check("an IMAP source saved in the database counts (active ones only: 1 of 2)", () => {
+  assert.match(line(out, "tracking inbox"), /PASS .*  1 saved IMAP source\(s\)/);
+});
+check("unsent client emails: counts outbound EMAIL drafts and failures only (2 + 1), with the command that re-sends them", () => {
+  assert.match(line(out, "unsent client emails"), /WARN .*  2 draft \(never tried\) \+ 1 failed: list them with scripts\/undelivered\.ts, re-send with --send/);
+});
+const bare = path.join(ISOLATED_CWD, "bare.sqlite");
+{
+  const { default: Database } = await import("better-sqlite3");
+  const b = new Database(bare);
+  b.exec("CREATE TABLE users (email TEXT, role TEXT, password_hash TEXT, active INTEGER)");
+  b.close();
+}
+out = notify(bare, {});
+check("MUST-EXCLUDE: a database without those tables reads as 'could not read', never as a clean 0", () => {
+  assert.match(line(out, "unsent client emails"), /WARN .*  could not read communications/);
+  assert.match(line(out, "tracking inbox"), /WARN .*  could not read the Email tracking sources/);
+});
+for (const v of ["0", ""]) {
+  out = notify(withAdmin, { MONITOR_INTERVAL_MINUTES: v });
+  check(`MONITOR_INTERVAL_MINUTES=${JSON.stringify(v)} turns the monitor off (scheduler.ts reads <= 0): WARN`, () => {
+    assert.match(line(out, "MONITOR_INTERVAL_MINUTES"), /WARN .*the monitor never runs, so no tracking inbox is read/);
+  });
+}
 
 const shortHistory = preflight({ AUTOPILOT_DB_PATH: withAdmin, BACKUP_DIR: backupDir, BACKUP_INTERVAL_HOURS: "2", BACKUP_KEEP: "14" });
 check("a 2 h interval that keeps only 14 snapshots (28 h of history) warns with the number to set", () => {

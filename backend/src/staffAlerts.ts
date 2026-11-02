@@ -22,7 +22,7 @@
 //
 // HOW (staffAlertConfig.ts): the product's own SMTP settings + STAFF_ALERT_TO, and an optional
 // STAFF_ALERT_WEBHOOK_URL in the watchdog's webhook shape (ntfy-style phone push). Unset = off.
-// Every alert and digest is RECORDED (staff_notifications, migration v54) whether it went out,
+// Every alert and digest is RECORDED (staff_notifications, migration v55) whether it went out,
 // failed, or was off — "what did we fail to send" is a query, not a log search.
 //
 // SAFETY

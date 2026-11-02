@@ -5,6 +5,7 @@
 #   /opt/keelix/scripts/ops/linux/keelix-ops.sh watchdog --once
 #   /opt/keelix/scripts/ops/linux/keelix-ops.sh offbox-sync
 #   /opt/keelix/scripts/ops/linux/keelix-ops.sh restore-drill [--no-dotenv] [--from /app/offbox]
+#   /opt/keelix/scripts/ops/linux/keelix-ops.sh test-email --to you@yourcompany.com
 #
 # The scripts (scripts/ops/*.ts) are not in the image, so this starts a ONE-OFF container from the
 # running image with the checkout's scripts/ mounted read-only: the same .env, the same state
@@ -19,8 +20,8 @@ set -euo pipefail
 
 name="${1:-}"; shift || true
 case "$name" in
-  preflight|watchdog|offbox-sync|restore-drill) ;;
-  *) die "usage: keelix-ops.sh preflight|watchdog|offbox-sync|restore-drill [args]" ;;
+  preflight|watchdog|offbox-sync|restore-drill|test-email) ;;
+  *) die "usage: keelix-ops.sh preflight|watchdog|offbox-sync|restore-drill|test-email [args]" ;;
 esac
 extra=()
 [ -n "${SESSION_ENCRYPTION_KEY:-}" ] && extra+=(-e SESSION_ENCRYPTION_KEY)
