@@ -113,6 +113,7 @@ SMTP_PASS=<app password>
 EMAIL_IMAP_HOST=<shared inbox's IMAP server>   # or the GMAIL_* lines, with GMAIL_REDIRECT_URI moved (§5.1)
 EMAIL_IMAP_USER=<shared inbox>
 EMAIL_IMAP_PASS=<app password>
+STAFF_ALERT_TO=<you>, <your PM>   # staff alerts (#487); and/or STAFF_ALERT_WEBHOOK_URL
 ```
 
 Leave out `PORT` (the image listens on 4173, which the override publishes) and the per-path settings
@@ -309,8 +310,11 @@ has a NOTIFICATIONS block for them (WARN, with the line to add) and counts the c
    test copy should have).
 3. **Customer links.** `PUBLIC_BASE_URL=https://keelix.<your domain>` (§2); preflight FAILs on a
    localhost or missing value.
-4. **Staff alerts.** Today that is the watchdog's `WATCHDOG_ALERT_TO` and ntfy lines (§5). The staff
-   alerts for stopped runs (#487) add their own recipients line here when they land.
+4. **Staff alerts.** The watchdog's `WATCHDOG_ALERT_TO` and ntfy lines (§5) cover the server being
+   down. Alerts to the team when a run stops or a job changes state, and the morning digest, come with
+   #487: `STAFF_ALERT_TO=<you>, <your PM>` (uses SMTP) and/or `STAFF_ALERT_WEBHOOK_URL=<ntfy topic>`,
+   and `STAFF_DIGEST_HOUR`. Preflight's `staff alerts` line reads those names; they do nothing until
+   #487 is deployed.
 5. **Test send, to yourself:**
 
    ```bash

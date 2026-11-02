@@ -124,6 +124,7 @@ const good = preflight({
   SMTP_HOST: "smtp.invalid", SMTP_FROM: "x@ops.invalid", SMTP_PASS: SECRETS.smtpPw, WATCHDOG_ALERT_TO: "ops@ops.invalid",
   WATCHDOG_HEARTBEAT_URL: "https://hc-ping.invalid/abc", WATCHDOG_STATE_FILE: stateFile,
   EMAIL_IMAP_HOST: "imap.ops.invalid", EMAIL_IMAP_USER: "permits@ops.invalid", EMAIL_IMAP_PASS: SECRETS.imapPw,
+  STAFF_ALERT_TO: "owner@ops.invalid, pm@ops.invalid", STAFF_DIGEST_HOUR: "7",
 });
 check("no FAIL, exit 0", () => {
   assert.equal(good.code, 0, good.out);
@@ -135,6 +136,7 @@ check("NOTIFICATIONS all PASS on the configured shape (#493)", () => {
   assert.match(line(good.out, "client email (SMTP)"), /PASS .*test-email\.ts --to/);
   assert.match(line(good.out, "tracking inbox"), /PASS .*IMAP inbox \(EMAIL_IMAP_\*\)/);
   assert.match(line(good.out, "unsent client emails"), /PASS .*none/);
+  assert.match(line(good.out, "staff alerts"), /PASS .*email to 2 address\(es\); morning digest at hour 7/);
   assert.doesNotMatch(good.out, /MONITOR_INTERVAL_MINUTES/);
 });
 const armed = preflight({
@@ -192,7 +194,19 @@ check("no tracking source: WARN, emails are never read, names the EMAIL_IMAP_* a
   assert.match(line(out, "tracking inbox"), /WARN .*none configured: correction, approval and utility emails are never read.*EMAIL_IMAP_HOST=, EMAIL_IMAP_USER=, EMAIL_IMAP_PASS=.*GMAIL_REFRESH_TOKEN/);
 });
 check("no new line is a FAIL (the configured shape exits 0 without NOTIFICATIONS PASSing is covered above)", () => {
-  assert.doesNotMatch(out.split(/\r?\n/).filter((l) => /client email|tracking inbox|unsent client|SMTP_PASS|MONITOR_INTERVAL/.test(l)).join("\n"), /FAIL/);
+  assert.doesNotMatch(out.split(/\r?\n/).filter((l) => /client email|tracking inbox|staff alerts|unsent client|SMTP_PASS|MONITOR_INTERVAL/.test(l)).join("\n"), /FAIL/);
+});
+check("no staff alert recipients: WARN naming STAFF_ALERT_TO= and STAFF_ALERT_WEBHOOK_URL= (#487's names)", () => {
+  assert.match(line(out, "staff alerts"), /WARN .*no recipients: nobody on the team is told.*Add STAFF_ALERT_TO=.*STAFF_ALERT_WEBHOOK_URL=/);
+});
+out = notify(withAdmin, { STAFF_ALERT_TO: "owner@ops.invalid" });
+check("MUST-EXCLUDE: STAFF_ALERT_TO with no SMTP cannot email anyone, so it is not a PASS", () => {
+  assert.match(line(out, "staff alerts"), /WARN .*STAFF_ALERT_TO is set but SMTP is not/);
+});
+out = notify(withAdmin, { STAFF_ALERT_WEBHOOK_URL: "https://ntfy.invalid/staff-topic" });
+check("a staff webhook alone is a PASS (no SMTP needed)", () => {
+  assert.match(line(out, "staff alerts"), /PASS .*webhook set/);
+  assert.ok(!out.includes("staff-topic"), "the webhook URL (a secret topic) is printed");
 });
 out = notify(withAdmin, { SMTP_HOST: "smtp.invalid" });
 check("SMTP_HOST without SMTP_FROM names only SMTP_FROM (clientNotifier needs both)", () => {

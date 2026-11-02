@@ -195,6 +195,22 @@ if (Number(env.MONITOR_INTERVAL_MINUTES ?? 15) <= 0) {
   add("notifications", "MONITOR_INTERVAL_MINUTES", "WARN",
     `${String(env.MONITOR_INTERVAL_MINUTES).trim() || "empty"}: the monitor never runs, so no tracking inbox is read and no portal status is checked (right on a test copy only). Remove the line or set MONITOR_INTERVAL_MINUTES=15`);
 }
+// Staff alerts (stopped runs, status changes, the morning digest) are #487, built in parallel: this
+// row reads the setting NAMES that task adds (STAFF_ALERT_TO, STAFF_ALERT_WEBHOOK_URL,
+// STAFF_DIGEST_HOUR) from the environment only and imports nothing from it. Until #487 is deployed
+// these settings do nothing, so the WARN says what to add for when it is.
+{
+  const staffTo = String(env.STAFF_ALERT_TO ?? "").split(/[,;]/).map((x) => x.trim()).filter(Boolean);
+  const staffHook = Boolean(String(env.STAFF_ALERT_WEBHOOK_URL ?? "").trim());
+  const staffMail = staffTo.length > 0 && smtpOn;
+  const digest = String(env.STAFF_DIGEST_HOUR ?? "").trim();
+  add("notifications", "staff alerts", staffMail || staffHook ? "PASS" : "WARN",
+    staffMail || staffHook
+      ? [staffMail ? `email to ${staffTo.length} address(es)` : "", staffHook ? "webhook set" : "", digest ? `morning digest at hour ${digest}` : ""].filter(Boolean).join("; ")
+      : staffTo.length
+        ? "STAFF_ALERT_TO is set but SMTP is not, so no staff alert can be emailed: set SMTP (above) or STAFF_ALERT_WEBHOOK_URL=<ntfy topic>"
+        : "no recipients: nobody on the team is told when a run stops or a job changes state. Add STAFF_ALERT_TO=<you>, <your PM> (uses SMTP) and/or STAFF_ALERT_WEBHOOK_URL=<ntfy topic> (staff alerts, #487)");
+}
 add("notifications", "unsent client emails", unsent === null ? "WARN" : unsent.draft + unsent.failed ? "WARN" : "PASS",
   unsent === null ? `could not read communications from ${dbPath}`
     : unsent.draft + unsent.failed

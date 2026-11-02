@@ -536,6 +536,7 @@ The October NEM fixes (#378 the review-page hand-over, #354, #400, #401, #385, #
 | `EMAIL_IMAP_HOST` / `EMAIL_IMAP_USER` / `EMAIL_IMAP_PASS` | – | the tracking inbox agency and utility mail is forwarded to; all three, or it is ignored (`EMAIL_IMAP_PORT` 993, `EMAIL_IMAP_TLS`, `EMAIL_IMAP_MAILBOX` INBOX). Preflight `tracking inbox` |
 | `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` / `GMAIL_REFRESH_TOKEN` | – | the Gmail alternative to IMAP; read only once the refresh token is set (OPERATIONS_LINUX.md §5.1) |
 | `GMAIL_REDIRECT_URI` | `http://localhost:<PORT>/api/gmail/oauth/callback` | where Google returns after consent; on a server, `<PUBLIC_BASE_URL>/api/gmail/oauth/callback` |
+| `STAFF_ALERT_TO` / `STAFF_ALERT_WEBHOOK_URL` / `STAFF_DIGEST_HOUR` | – | the team's alerts when a run stops or a job changes state, and the morning digest (#487; no effect before it is deployed). Preflight `staff alerts` |
 | `MONITOR_INTERVAL_MINUTES` | 15 | portal status checks and the tracking inbox; `0` turns both off (a test copy only) |
 | `BACKUP_DIR` | `backend/data/backups` | where snapshots are written first (production: `E:/SOLAR-Proj-Backups`) |
 | `BACKUP_INTERVAL_HOURS` / `BACKUP_KEEP` | 24 / 14 | snapshot cadence and how many to keep |
