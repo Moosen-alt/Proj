@@ -63,6 +63,7 @@ import { DECLARED_VALUATION_FIELD, rebindsToValuation } from "./valuation";
 import { feeBracketFieldForLabel } from "./feeBracketFields";
 import { SERVICE_FEEDER_200A_FIELD, SERVICE_FEEDER_400A_FIELD } from "./batteryServiceFeeder";
 import { DESIGN_NOTE_SOURCES, EXPORT_LIMITING_NO_EVIDENCE_KEY } from "../../shared/src/exportLimiting";
+import { FILING_CONTACT_EMAIL_KEY, contactTrackOf, isOwnerEmailSlot, planFilingContactEmails } from "../../shared/src/filingContactEmail";
 
 /** The submittal track an AHJ learn files, from the recipe discipline it will be keyed under
  *  (authoritative — the value the recipe lookup asks for), else the requested permit type.
@@ -243,7 +244,9 @@ const PLANNER_ALIAS_OF_CANONICAL: Readonly<Record<string, string>> = {
 export function plannerFieldView(projectFields: Record<string, string>): Record<string, string> {
   // The exportLimiting evidence flag (#356) is the replay's to read, never the model's: the planner
   // gets exportLimiting itself, as before, and no new text.
-  const omit = new Set<string>([...DESIGN_NOTE_SOURCES, ...PLANNER_REVIEW_PROSE_KEYS, EXPORT_LIMITING_NO_EVIDENCE_KEY]);
+  // The filing contact's email (#520) is placed by the one slot predicate after the plan
+  // (applyFilingContactEmail), never by the model: it is not the model's to choose where it goes.
+  const omit = new Set<string>([...DESIGN_NOTE_SOURCES, ...PLANNER_REVIEW_PROSE_KEYS, EXPORT_LIMITING_NO_EVIDENCE_KEY, FILING_CONTACT_EMAIL_KEY]);
   const same = (a: string | undefined, b: string | undefined) =>
     String(a ?? "").trim().toLowerCase() === String(b ?? "").trim().toLowerCase();
   const out: Record<string, string> = {};
@@ -254,6 +257,51 @@ export function plannerFieldView(projectFields: Record<string, string>): Record<
     out[k] = v;
   }
   return out;
+}
+
+/**
+ * THE FILING SERVICE'S EMAIL GOES WHERE THE ONE SLOT PREDICATE SAYS, AND NOWHERE ELSE (#520).
+ *
+ * Run on every plan the learn planner returns (the model's and the offline heuristic's alike), over
+ * the page's own email boxes: a box shared/filingContactEmail names (a separate applicant / agent /
+ * additional-contact slot) is filled from FILING_CONTACT_EMAIL and recorded BOUND to
+ * filingContactEmail, so a replay types its own server's address, never a literal. Every other box
+ * keeps the plan's own fill — the contractor's email box keeps the client's, a form with one company
+ * email slot keeps it there. A box the predicate does NOT name that came back holding the filing
+ * contact's address or key is put back to its owner: the homeowner's email on an owner / customer box
+ * (PowerClerk's NEM Applicant — the utility's e-signature goes there; owner ruling 2026-11-02), the
+ * contractor's on any other. No setting (`value` ""): nothing changes. Mutates `fills`. Exported for
+ * the unit test.
+ */
+export function applyFilingContactEmail(
+  fields: Array<{ label?: string; fieldType?: string; section?: string; selector?: { frame?: string } } | undefined>,
+  fills: Array<{ selectorIndex: number; value: string; field?: string }>,
+  opts: { track: string | null | undefined; value: string; projectFields: Record<string, string> },
+): void {
+  const value = String(opts.value ?? "").trim();
+  if (!value) return;
+  const track = contactTrackOf(opts.track);
+  const at: number[] = [];
+  const boxes: Array<{ label: string; section?: string; inContactBlock: boolean }> = [];
+  fields.forEach((f, i) => {
+    if (!f || (f.fieldType !== "text" && f.fieldType !== "other")) return;
+    at.push(i);
+    boxes.push({ label: String(f.label ?? ""), section: f.section, inContactBlock: Boolean(f.selector?.frame) });
+  });
+  const plan = planFilingContactEmails(boxes, { track, enabled: true });
+  const sameAddress = (a: unknown) => String(a ?? "").trim().toLowerCase() === value.toLowerCase();
+  boxes.forEach((box, j) => {
+    const i = at[j];
+    const k = fills.findIndex((f) => f.selectorIndex === i);
+    if (plan[j]) {
+      const fill = { selectorIndex: i, value, field: FILING_CONTACT_EMAIL_KEY };
+      if (k >= 0) fills[k] = fill; else fills.push(fill);
+      return;
+    }
+    if (k < 0 || (fills[k].field !== FILING_CONTACT_EMAIL_KEY && !sameAddress(fills[k].value))) return;
+    const key = isOwnerEmailSlot(box, { track }) ? "homeownerEmail" : "installerEmail";
+    fills[k] = { selectorIndex: i, value: String(opts.projectFields[key] ?? ""), field: key };
+  });
 }
 
 function clip(value: string | undefined, max: number): string {
@@ -699,6 +747,9 @@ export function buildPortalPlanner(
       if (at >= 0) fills[at] = { selectorIndex: i, value, field: key };
       else fills.push({ selectorIndex: i, value, field: key });
     }
+    // THE FILING SERVICE'S OWN EMAIL (#520): only into a separate applicant / agent / additional-contact
+    // slot the one predicate names; the homeowner's and the contractor's own boxes are never it.
+    applyFilingContactEmail(req.fields, fills, { track, value: projectFields[FILING_CONTACT_EMAIL_KEY] ?? "", projectFields });
     return {
       fills,
       advanceSelectorIndex: plan.advanceIndex,

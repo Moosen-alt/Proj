@@ -28,6 +28,8 @@ import { filingValuationText } from "./valuation";
 import { planSetDisconnectPart, standardDisconnectConflicts } from "./baselineRules";
 import { clientCompanyFactFields } from "./clients";
 import { COMPANY_IDENTIFIER_KEY, companyFactStamp, isCompanyAttestationStep, isCompanyIdentityLabel, looksLikePlaceholderIdentifier } from "../../shared/src/companyFacts";
+import { filingContactEmailSetting } from "./filingContact";
+import { FILING_CONTACT_EMAIL_KEY } from "../../shared/src/filingContactEmail";
 import { usStateCode } from "./permitPath";
 import { provablyDifferentUtility, sameUtilityEntity } from "./utilityIdentity";
 import { sameAgencyName } from "./permitProcessLookup";
@@ -1596,6 +1598,10 @@ export const RECIPE_FIELD_DESCRIPTIONS: Record<string, string> = {
   batteryCapacityKwh: "Battery/energy-storage capacity in kWh (alias of essKwh)",
   installerCompanyName: "Installer/contractor company name",
   installerEmail: "Installer company or contact email address",
+  // THE FILING SERVICE'S OWN EMAIL (#520, FILING_CONTACT_EMAIL). Only for a SEPARATE applicant / agent /
+  // additional-contact email slot (shared filingContactEmail — the one slot predicate); never the
+  // contractor's own email box, never a homeowner's / customer's (PowerClerk's NEM Applicant).
+  filingContactEmail: "The filing service's own contact email — ONLY a separate applicant / agent / correspondence / additional-contact email slot, never the contractor's own email box and never the homeowner's or customer's",
   installerPhone: "Installer company phone number",
   installerAddress: "Full installer company address (street, city, state, zip combined)",
   installerStreet: "Installer company street address only",
@@ -2356,6 +2362,10 @@ export function resolveRecipeFieldValues(
     const digits = String(v).replace(/\D/g, "").replace(/^1(?=\d{10}$)/, "");
     if (digits.length === 10) merged[k] = `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}`;
   }
+  // THE FILING SERVICE'S OWN CONTACT EMAIL (#520): present only when FILING_CONTACT_EMAIL is set, so
+  // with it unset the dictionary — and every learn and replay — is exactly what it was before.
+  const filingContact = filingContactEmailSetting();
+  if (filingContact) merged[FILING_CONTACT_EMAIL_KEY] = filingContact;
   // AN OWNER EMAIL BOX TAKES AN EMAIL ADDRESS OR NOTHING (looksLikeEmail, #71). The canonical keys
   // are resolved above; this catches the same value under an alias (ownerEmail, an overlay) so no
   // owner-email key forwards a name stored in the email slot. Blank, never the name: the human
@@ -2547,6 +2557,9 @@ export function deadFieldBindings(steps: RecipeStep[], projectFields: Record<str
     // refused promotion by the trust gate for a binding that, when unresolved,
     // replays exactly what it replays today.
     if (field.startsWith(FEE_BRACKET_FIELD_PREFIX)) continue;
+    // NOR IS THE FILING CONTACT'S EMAIL (#520): the resolver emits it only while FILING_CONTACT_EMAIL is
+    // set, and with it unset the replay binder (R12) puts the step back as it was before the key existed.
+    if (field === FILING_CONTACT_EMAIL_KEY) continue;
     // A field the resolver DOES define but which is empty for THIS project is fine — the
     // next project may have it. Only a key that cannot exist at all is dead.
     if (field && !known.has(field)) out.push(`${field} (${String(step.note ?? step.action).slice(0, 40)})`);

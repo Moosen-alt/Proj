@@ -64,6 +64,15 @@
 //      matching key (an Applicant dialog's homeownerName → installerContactName; an Owner dialog's
 //      installerEmail → homeownerEmail), a contact literal binds to this identity's key, and a part
 //      the identity lacks (an Owner's business name) replays blank. Unknown section: untouched.
+//   R12 THE FILING SERVICE'S EMAIL (#520) — where the one slot predicate (shared/src/filingContactEmail)
+//      names a SEPARATE applicant / agent / additional-contact email box, a step bound to the
+//      contractor's installerEmail, or holding a recorded literal address, binds to filingContactEmail
+//      (FILING_CONTACT_EMAIL) — never the literal. A step bound to filingContactEmail in a box the
+//      predicate does NOT name goes back to its owner: the homeowner's email on an owner / customer box
+//      (PowerClerk's NEM Applicant: the utility's e-signature and NEM mail go there — owner ruling
+//      2026-11-02, "we still need the ho to get the nem email"), the contractor's on any other. With no
+//      setting, a filingContactEmail step replays as it did before the key existed: an applicant /
+//      agent box the contractor's email, an extra-contact box blank.
 import type { CitedFact, ProjectRecord, RecipeStep } from "../../shared/src/types";
 import { stateRulesFor } from "./permitProcess";
 import { feeBracketFieldKey, parseFeeBracketFieldKey, sameFeeTier, tierBoundsFromLabel } from "../../portal-bot/src/feeBracketQuantity";
@@ -76,6 +85,8 @@ import { isPerJobAnswerKey, perJobAnswerKeyFor, perJobQuestionText, perJobStepEv
 import {
   contactFieldKind, contactKeyFor, contactKeyForRole, contactRoleOfStep, isContactOpener, type ContactRole, type ContactTrack,
 } from "../../shared/src/contactRoles";
+import { FILING_CONTACT_EMAIL_KEY, emailSlotKind, planFilingContactEmails } from "../../shared/src/filingContactEmail";
+import { looksLikeEmail } from "../../shared/src/emailAddress";
 export { sameFeeTier };
 
 
@@ -190,6 +201,25 @@ export function bindRecipeForReplay(input: {
   // The agency as the address-version row reads it — the one parse (portal-bot addressVersion)
   // the replay's live ranking asks too, so "will the replay rank by it" has one answer.
   const agencyRow = issuingAgencyRow(agencyName, { city: input.project.city });
+  // R12's plan, over every fill of the recipe (one application = one form): which boxes are the filing
+  // contact's separate slot. Each box is read from its label and its recorded section (the learner's
+  // fingerprint, a "section email: …" note, or a "[applicant]" / "[owner]" role mark).
+  const emailBoxOf = (s: RecipeStep) => {
+    const note = String(s.note ?? "");
+    const mark = /\[(applicant|owner|inspection contact)\]/i.exec(note)?.[1];
+    const fromNote = /^section email:\s*(.+)$/i.exec(note)?.[1];
+    return { label: labelOf(s), section: String(s.fingerprint?.section || fromNote || mark || ""), inContactBlock: Boolean(s.selector?.frame) };
+  };
+  const fillAt: number[] = [];
+  const fillBoxes: Array<{ label: string; section: string; inContactBlock: boolean }> = [];
+  input.steps.forEach((s, i) => {
+    if (s.action !== "fill" || s.sensitive) return;
+    fillAt.push(i);
+    fillBoxes.push(emailBoxOf(s));
+  });
+  const filingSlot = new Set<number>(planFilingContactEmails(fillBoxes, { track: contactTrack, enabled: true })
+    .map((yes, j) => (yes ? fillAt[j] : -1)).filter((i) => i >= 0));
+  const filingContact = String(input.fieldValues[FILING_CONTACT_EMAIL_KEY] ?? "").trim();
 
   input.steps.forEach((original, index) => {
     let step: RecipeStep = { ...original, selector: original.selector ? { ...original.selector, fallbacks: original.selector.fallbacks ? [...original.selector.fallbacks] : undefined } : original.selector };
@@ -416,6 +446,36 @@ export function bindRecipeForReplay(input: {
             }
           }
         }
+      }
+    }
+
+    // R12 — THE FILING SERVICE'S EMAIL only in the separate slot the one predicate names.
+    if (step.action === "fill" && step.field !== REPLAY_BLANK_FIELD && !step.sensitive) {
+      const box = emailBoxOf(original);
+      const kind = emailSlotKind(box, { track: contactTrack });
+      if (step.field === FILING_CONTACT_EMAIL_KEY) {
+        if (!filingSlot.has(index)) {
+          const owner = kind === "owner";
+          const want = owner ? "homeownerEmail" : "installerEmail";
+          step = { ...step, field: want };
+          delete step.value;
+          record("rebound", `"${label.slice(0, 40)}" is ${owner ? "the homeowner's email box (the utility's e-signature and notices go there)" : "the contractor's own email box"} — bound to ${want}, never the filing contact's`);
+        } else if (!filingContact) {
+          if (kind === "agentRole") {
+            step = { ...step, field: "installerEmail" };
+            delete step.value;
+            record("rebound", `"${label.slice(0, 40)}" bound to installerEmail — no FILING_CONTACT_EMAIL is set`);
+          } else {
+            step = { ...step, value: "", field: REPLAY_BLANK_FIELD };
+            record("blanked", `"${label.slice(0, 40)}" is an extra contact's email and no FILING_CONTACT_EMAIL is set — replayed blank`);
+          }
+        }
+      } else if (filingSlot.has(index) && filingContact
+        && (step.field === "installerEmail" || (!step.field && looksLikeEmail(step.value)))) {
+        const was = step.field ? `bound to ${step.field}` : "a recorded address";
+        step = { ...step, field: FILING_CONTACT_EMAIL_KEY };
+        delete step.value;
+        record("rebound", `"${label.slice(0, 40)}" is a separate applicant / contact email slot — bound to ${FILING_CONTACT_EMAIL_KEY}, not ${was}`);
       }
     }
 
