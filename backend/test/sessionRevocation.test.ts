@@ -12,7 +12,7 @@
 //   admin reset              POST /api/staff/logins/:id/password ends the teammate's cookies
 //   deactivation             POST /api/staff/logins/:id/active false ends them, and switching the
 //                            login back on does NOT revive them; the Team panel's Active box
-//                            (PUT /api/users/:id) does the same
+//                            (PUT /api/users/:id) does the same, for an admin only (#474)
 //   pre-#432 cookie          a two-field cookie (no version) keeps working, then dies on the
 //                            first bump like any other
 //   forged shapes            a signed cookie with a non-numeric or extra field is refused
@@ -272,6 +272,13 @@ try {
     assert.equal(res.status, 200, await res.text());
     assert.equal(await isSignedIn(session), false, "ticking Active again revived the old cookie");
     assert.equal(await isSignedIn(await signIn(mates.ed.email, mates.ed.password)), true);
+  });
+  // #474: the same door is admin-only for `active`; an operator's request is refused whole.
+  await run("an operator's PUT /api/users/:id {active:false} on an admin is 403 and signs nobody out", async () => {
+    const op = await signIn(mates.ana.email, mates.ana.password);
+    const res = await call(op, "/api/users/user-owner", put({ active: false }));
+    assert.equal(res.status, 403, await res.text());
+    assert.equal(await isSignedIn(owner), true, "the admin was signed out by an operator");
   });
   await run("an edit that leaves Active alone signs nobody out", async () => {
     const session = await signIn(mates.ed.email, mates.ed.password);
