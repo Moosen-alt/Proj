@@ -52,8 +52,8 @@ db.run("UPDATE users SET role = 'admin' WHERE email = ?", ["owner@ops.invalid"])
 db.backupTo(withAdmin); // the configured shape: an admin, no IMAP source, no communications
 // NOTIFICATIONS (#493): one active IMAP source row, an inactive one (not polled), and the
 // client-email record in each delivery state (addCommunication, the production writer). The IMAP rows
-// are raw SQL because their writer, emailPoller.ts upsertImapSource, cannot run under ESM today
-// (`require` is not defined, #498); the columns are the ones it writes.
+// are raw SQL (written before #498 fixed their writer, emailPoller.ts upsertImapSource); the
+// columns are the ones it writes, and "shared-inbox" keeps the legacy '' file_path shape.
 const imapRow = (id: string, host: string, filePath: string, active: number): void => db.run(
   `INSERT INTO email_tracking_sources (id, source_type, label, file_path, imap_host, imap_user, imap_pass_encrypted, active, created_at, updated_at)
    VALUES (?, 'imap', ?, ?, ?, 'permits@ops.invalid', 'enc', ?, datetime('now'), datetime('now'))`, [id, id, filePath, host, active]);

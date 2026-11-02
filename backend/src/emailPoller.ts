@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { unlink, mkdtemp } from "node:fs/promises";
 import os from "node:os";
@@ -134,6 +135,14 @@ function dbImapSources(db: AppDb): ImapSourceConfig[] {
 // Credential management for DB sources
 // ---------------------------------------------------------------------------
 
+/** The `file_path` an IMAP row stores. The column is `NOT NULL UNIQUE` (it is the mbox
+ *  watch path for mbox rows), so every IMAP row writing `''` meant the second inbox failed
+ *  with a UNIQUE constraint error (#498). `imap:<id>` is unique per row and can never equal
+ *  an mbox path, which `configureEmailTrackingSource` always stores resolved to absolute. */
+export function imapSourceFilePath(id: string): string {
+  return `imap:${id}`;
+}
+
 /** Upsert an IMAP source row. Pass password only when setting or rotating credentials. */
 export function upsertImapSource(
   db: AppDb,
@@ -155,7 +164,8 @@ export function upsertImapSource(
     active?: boolean;
   },
 ): string {
-  const { randomUUID } = require("node:crypto") as typeof import("node:crypto");
+  // randomUUID is a top-level import: the package is ESM, where `require` is not defined,
+  // so the old inline require() threw before anything was written (#498).
   const now = new Date().toISOString();
   const id = opts.id ?? randomUUID();
   const existing = db.get<{ imap_pass_encrypted?: string }>(
@@ -196,10 +206,11 @@ export function upsertImapSource(
          (id, source_type, label, file_path, imap_host, imap_port, imap_secure, imap_user,
           imap_pass_encrypted, imap_mailbox, imap_max_messages, recipient_tag, client_id,
           org_id, active, created_at, updated_at)
-       VALUES (?, 'imap', ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, 'imap', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         id,
         opts.label,
+        imapSourceFilePath(id),
         opts.host,
         opts.port ?? 993,
         opts.secure !== false ? 1 : 0,
