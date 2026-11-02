@@ -39,6 +39,7 @@ import { hasMpuScope } from "./serviceScope";
 import { essPermitStep, type EssPermitStep } from "./essRequirements";
 import { randomUUID } from "node:crypto";
 import { nemSignatureState, type NemSignatureView } from "./signatureTrack";
+import { notifyClientOfFiling } from "./clientFilingUpdate";
 
 /** Words that claim the statewide portal ("Oregon ePermitting", "OR E-permitting") with no URL —
  *  on a learned row, often the generic fallback's own words laundered in (portal-truth D2/D4). */
@@ -1035,6 +1036,9 @@ export function markTrackSubmitted(
       nextCheckAt: ts, // check on the next poll tick
     });
   });
+  // The operator recorded a filing they made — the client hears we filed (#490). Once per track:
+  // a track already announced by its capture or auto-submit sends nothing more.
+  void notifyClientOfFiling(db, project, { track: type, applicationNumber, permitNumber, via: "mark_submitted" });
 }
 
 // ---------------------------------------------------------------------------
