@@ -32,6 +32,9 @@
 //     S3  nobody touches the display for 5 s after the hand-over, then a page script posts the
 //         filing: aborted, 0 POSTs, and personActedSinceHandOver is false (Xvfb makes no input).
 //     S4  the input watch never armed: handOverToHuman refuses, and a trusted click is aborted.
+//     S5  (#381) after the hand-over the portal's Submit asks confirm(): the dialog waits for a person
+//         (personDialogs: automation never answers one), nobody on the virtual display answers it, so
+//         it is still open 3 s later and nothing reached the portal.
 import http from "node:http";
 import fs from "node:fs";
 import os from "node:os";
@@ -39,6 +42,7 @@ import path from "node:path";
 import { chromium, type Page } from "playwright";
 import { closePortal, openPortal, resolveHeadless } from "./browser";
 import { installFilingBackstop, isStoppingAbort, type FilingBackstop } from "./filingBackstop";
+import { dialogOpenOn, dialogsLeftToPerson } from "./personDialogs";
 
 let failures = 0;
 let total = 0;
@@ -182,6 +186,22 @@ const brief = (b: Bed, k: string, from: number): string => JSON.stringify({
   await sleep(900);
   check("S4 the input watch never armed: handOverToHuman refuses, and a trusted click is aborted",
     handed === false && postsFor("S4", from).length === 0, `handed=${handed} ${brief(b, "S4", from)}`);
+  await b.close();
+}
+
+{
+  const from = posts.length;
+  const b = await bed("S5");
+  // The portal's own confirm-then-submit, as a page script runs it (a timer, so evaluate returns
+  // before the dialog blocks the page).
+  await b.page.evaluate(() => {
+    setTimeout(() => { if (window.confirm("Submit this application?")) (document.forms[0] as HTMLFormElement).submit(); }, 0);
+  });
+  await sleep(3_000);
+  const open = dialogOpenOn(b.page);
+  check("S5 a confirm() after the hand-over waits for a person: still open 3 s later on the virtual display, 0 POSTs",
+    b.armed && dialogsLeftToPerson(b.page) && open && postsFor("S5", from).length === 0,
+    `leftToPerson=${dialogsLeftToPerson(b.page)} open=${open} ${brief(b, "S5", from)}`);
   await b.close();
 }
 
