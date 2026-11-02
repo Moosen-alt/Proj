@@ -9,8 +9,11 @@
 // ground or carport array needs UL 61730 / 1703 modules and UL 2703 racking just the same.
 //
 // These fixtures are SYNTHETIC text (no names, addresses or plan-set prose).
-// Every MUST-PASS fails with its fix removed; every MUST-EXCLUDE is a way the weighing could
-// over-correct into calling a real ground or carport array a roof.
+// Every MUST-PASS fails with its fix removed (on main), except the "GROUND RACKING" check, which
+// main passes: it pins a regression the first version of this fix brought in, and fails on that
+// version. Every MUST-EXCLUDE is a way the weighing could over-correct into calling a real ground or
+// carport array a roof; the TIE-BAND ones failed on that first version, which counted a ground set's
+// roof-notes boilerplate as a full vote per word.
 //
 // Run: npx tsx backend/test/mountEvidenceWeighing.test.ts
 import "./_isolate";
@@ -61,7 +64,10 @@ const GROUND_SITE = "reviewer.plan.ground-array-site";
 const LISTINGS = "city.plan.ul-listings-missing";
 const SPACING_OVER = "city.struct.anchor-spacing-exceeds-ahj";
 const FIRE_IDS = ["city.fire.pathways-missing", "reviewer.plan.fire-path"];
-const ROOF_ONLY_IDS = [...FIRE_IDS, "city.struct.framing-missing", "city.struct.attachment-detail-missing", "city.struct.span-table-incomplete", SPACING_OVER];
+// Every rule a roof reading switches on that a ground array reads clear of — the four BLOCKERS the
+// first version of this fix newly raised on a tie-band ground set among them (fire pathways, framing,
+// rapid shutdown, the roof site plan).
+const ROOF_ONLY_IDS = [...FIRE_IDS, "city.struct.framing-missing", "city.struct.attachment-detail-missing", "city.struct.span-table-incomplete", SPACING_OVER, "city.elec.rapid-shutdown-missing", "city.plan.site-roof-missing"];
 
 // A rooftop set: the mount named on the cover, the notes and the attachment detail; rafters and
 // flashing; ONE carport, drawn on the site plan as an existing structure. Inverter listings only.
@@ -86,6 +92,18 @@ const GROUND_PLAN = [
   "(N) GROUND-MOUNTED AC DISCONNECT AT THE ARRAY",
   "UNDERGROUND FEEDER IN TRENCH, 24\" MIN. COVER",
   "ROOF MOUNTED CONDUIT: NONE",
+  "INVERTERS LISTED TO UL 1741.",
+].join("\n");
+
+// A ground set in the TIE BAND: three ground-mount phrases against a general-notes template line that
+// names a roof mount, roof penetrations and flashing — three roof words. Counted whole that was a tie,
+// and the tie put a ground array on the roof rules. The notes line is boilerplate; the array is a
+// ground mount.
+const GROUND_PLAN_WITH_ROOF_NOTES = [
+  "SOLAR PV SYSTEM - GROUND MOUNT",
+  "GROUND MOUNT RACKING ON DRIVEN STEEL PIERS",
+  "GROUND MOUNTED ARRAY SET BACK 10' FROM THE PROPERTY LINE",
+  "GENERAL NOTES: ROOF MOUNTED SYSTEMS - ALL ROOF PENETRATIONS SHALL BE SEALED WITH FLASHING",
   "INVERTERS LISTED TO UL 1741.",
 ].join("\n");
 
@@ -135,6 +153,27 @@ check("MUST PASS: ground-mounted EQUIPMENT, an underground feeder and a negated 
   assert.equal(mountKindForProject(textOnly("UNDERGROUND ARRAY FEEDER TO THE MAIN PANEL")), "unknown");
   assert.equal(mountKindForProject(textOnly("THIS IS NOT A GROUND MOUNT")), "unknown");
 });
+check("MUST PASS: a roof plan with ONE stray ground-mount phrase keeps the roof rules", () => {
+  const p = textOnly(`${ROOF_WITH_STRAY_CARPORT}\nSHEET PV-9: GROUND MOUNT DETAIL (N/A)`);
+  assert.equal(mountKindForProject(p), "unknown", "one ground-mount phrase outvoted the roof evidence");
+  assert.ok(!get(report(p), GROUND_SITE));
+});
+check("MUST PASS: a grounding instruction ('GROUND RACKING') is not a ground array", () => {
+  // Bonding notes, not mount nouns: each of these read "ground" in the first version of this fix,
+  // and a ground reading switches off every roof rule.
+  for (const text of [
+    "GROUND RACKING PER UL 2703",
+    "EQUIPMENT GROUNDING: GROUND RACK RAILS W/ WEEB\nPV ON (E) COMP ROOF",
+    "BOND AND GROUND RACKING\nGROUND RACKING RAILS\nROOF PLAN",
+  ]) {
+    const p = textOnly(text);
+    assert.equal(mountKindForProject(p), "unknown", JSON.stringify(text));
+    assert.equal(isRoofMounted(p, designText(p)), true, JSON.stringify(text));
+    assert.equal(rapidShutdownApplies(p, designText(p)), true, JSON.stringify(text));
+  }
+  const fs = report(textOnly("EQUIPMENT GROUNDING: GROUND RACK RAILS W/ WEEB\nPV ON (E) COMP ROOF"));
+  assert.ok(!get(fs, GROUND_SITE), "a grounding note made the roof job a ground array");
+});
 check("MUST PASS: the parser's own empty-field flag 'confirm roof mount vs ground mount' is a tie, and keeps the roof rules", () => {
   // A deliberate change (#533): this used to read "ground" and exempt the job from every roof rule.
   const p = project({ reviewFlags: "Confirm roof mount vs ground mount." });
@@ -183,6 +222,21 @@ check("MUST EXCLUDE: a ground array that states both listings gets no listing fi
 check("MUST EXCLUDE: one ground-mount phrase with nothing on the roof side still reads ground", () => {
   assert.equal(mountKindForProject(textOnly("GROUND MOUNT ARRAY ON DRIVEN PIER FOUNDATION")), "ground");
 });
+check("MUST EXCLUDE (tie band): a roof-notes template line does not tie a ground set onto the roof rules", () => {
+  const p = textOnly(GROUND_PLAN_WITH_ROOF_NOTES);
+  assert.equal(mountKindForProject(p), "ground", "general-notes boilerplate outvoted three ground-mount phrases");
+  const fs = report(p);
+  assert.ok(get(fs, GROUND_SITE), "the ground-array callout did not fire");
+  const leaked = ROOF_ONLY_IDS.filter((id) => get(fs, id));
+  assert.deepEqual(leaked, [], `roof rules fired on a ground array: ${leaked.join(", ")}`);
+  assert.match(get(fs, LISTINGS)?.message || "", /ground-mount racking listing \(UL 2703\)/, "the listing check still runs, in ground words");
+});
+check("MUST EXCLUDE (tie band): one ground-mount phrase beside a lone roof-plan sheet name reads ground", () => {
+  assert.equal(mountKindForProject(textOnly("GROUND MOUNT ARRAY\nPV-2 ROOF PLAN")), "ground");
+});
+check("MUST PASS (tie band): one ground-mount phrase against one roof-mount phrase is a tie, and a tie keeps the roof rules", () => {
+  assert.equal(mountKindForProject(textOnly("GROUND MOUNT ARRAY\nROOF MOUNT RACKING")), "unknown");
+});
 
 console.log("\n3. A REAL CARPORT PLAN — CARPORT, RAPID SHUTDOWN KEPT, LISTINGS CHECKED");
 const carportJob = textOnly(CARPORT_PLAN);
@@ -199,6 +253,14 @@ check("MUST PASS: the carport's listing finding names the carport racking", () =
 });
 check("MUST EXCLUDE: a ground-mounted carport stays a carport (the stricter reading for rapid shutdown)", () => {
   assert.equal(mountKindForProject(textOnly("(N) GROUND-MOUNTED CARPORT ARRAY")), "carport");
+  assert.equal(mountKindForProject(textOnly("(N) POLE-MOUNTED SOLAR CANOPY")), "carport");
+});
+check("MUST PASS: a ground array with one '(E) CARPORT' on its site plan is a ground array", () => {
+  // One carport word is a structure on the site plan, beside a ground array as beside a roof one.
+  const p = textOnly("GROUND MOUNT ARRAY ON DRIVEN PIERS\nSITE PLAN: (E) CARPORT");
+  assert.equal(mountKindForProject(p), "ground");
+  assert.equal(mountAdjective(mountKindForProject(p)), "Ground-mounted");
+  assert.equal(rapidShutdownApplies(p, designText(p)), false);
 });
 check("MUST EXCLUDE: the mounting FIELD still answers alone (Carport / Canopy / Roof mount)", () => {
   assert.equal(mountKindForProject(project({ mounting: "Carport" })), "carport");
