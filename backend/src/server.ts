@@ -13,6 +13,7 @@ import { llmUsageForProject, runWithLlmContext } from "./llmAccounting";
 import { parseJson } from "./json";
 import { collectDiagnostics, logErrorBlock, logger, requestLogger, startupBanner } from "./logger";
 import { buildInfo, publicBuildInfo, versionString } from "./buildInfo";
+import { COPYRIGHT_NOTICE, PROVENANCE_ID } from "../../shared/src/provenance";
 import { checkConcurrencyConfig, readConcurrencyConfig } from "./concurrencyConfig";
 import { deleteKnowledgeProfile, findLearnedProfileForProject, retractCorrectionLearning, saveVerifiedAhjProfile, saveVerifiedUtilityProfile } from "./knowledgeBase";
 import {
@@ -256,6 +257,8 @@ logger.info("build", `Running ${BUILD.label}`, {
   version: BUILD.version, sha: BUILD.sha, commitDate: BUILD.commitDate, dirty: BUILD.dirty,
   pinned: BUILD.pinned, source: BUILD.source, codeRoot: BUILD.codeRoot,
 });
+// Ownership notice (#545): proprietary Keelix code; the provenance id is fixed, see shared/src/provenance.ts.
+logger.info("build", COPYRIGHT_NOTICE, { provenance: PROVENANCE_ID });
 const dbPath = stateDbPath();
 applyStateDirEnvDefaults(); // replay output under AUTOPILOT_STATE_DIR too (statePaths.ts)
 
