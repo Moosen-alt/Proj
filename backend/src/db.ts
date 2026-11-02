@@ -2797,6 +2797,17 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       addColumnIfMissing(db, "users", "session_version", "INTEGER NOT NULL DEFAULT 0");
     },
   },
+  {
+    version: 54,
+    name: "clients_handoff_auto_send",
+    up: (db) => {
+      // THE INSTALLER HANDOFF PACKET, EMAILED BY THE SERVER (#491). Per-client opt-out: '' = the
+      // server emails the packet when the job reaches handoff_ready (the default the owner asked
+      // for); 'off' = staff send it by hand from the project page. No table: the packet's record
+      // is its communications row (installerHandoff.ts). clients is CREATEd in the base schema.
+      addColumnIfMissing(db, "clients", "handoff_auto_send", "TEXT NOT NULL DEFAULT ''");
+    },
+  },
 ];
 
 /** v47 was edited in place while #218 was open (Helm's review at 0116f98a): a DB that ran an earlier

@@ -233,6 +233,9 @@ export interface ClientRecord {
    *  this REQUIRED and asks for a shared inbox rather than one person's. Falls back to
    *  businessEmail in clientNotifier when blank. */
   updatesInbox: string;
+  /** The installer handoff packet (#491): '' = the server emails it to updatesInbox when a job
+   *  reaches handoff_ready; 'off' = staff send it by hand from the project page. */
+  handoffAutoSend: string;
   /** Who receives OUR invoices — a third address again: the AHJ's correspondent, the
    *  operations inbox and accounts payable are rarely one person. */
   billingContactEmail: string;

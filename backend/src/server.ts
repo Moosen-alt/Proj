@@ -66,6 +66,7 @@ import { folderScanPayload } from "./batchZip";
 import type { RequestScope } from "./scope";
 import { DEFAULT_ORG_ID } from "./db";
 import { ensureStatusShareToken, statusShareUrl } from "./clientNotifier";
+import { sendInstallerHandoff } from "./installerHandoff";
 import { listCodeProfiles, listRowlessDesignLookups, getCodeProfile, saveResearchedCodeProfile, saveVerifiedCodeProfile, codeProfileKey, applyEditionProposal, dismissEditionProposal } from "./codeProfiles";
 import { applyCorrectionApproval } from "./correctionAgent";
 import { runStandaloneReview, getReviewSubmission, listReviewSubmissions, reviewSubjectToProject } from "./reviewSubject";
@@ -1581,6 +1582,17 @@ app.get("/api/projects/:id/runbook", (req, res) => {
 app.get("/api/projects/:id/handoff-packet", (req, res) => {
   res.json(getProjectHandoffPacket(db, req.params.id));
 });
+
+// SEND THE INSTALLER HANDOFF PACKET (#491) — the operator's door: the first send when the client
+// sends by hand or the automatic one did not go, and every re-send. Under /api/projects/:id, so the
+// tenant scope guard covers it; the recipient is always the project's own client.
+app.post("/api/projects/:id/handoff-packet/send", asyncHandler(async (req, res) => {
+  const projectId = String(req.params.id);
+  const { project } = getProjectDetail(db, projectId); // 404 if missing
+  const result = await sendInstallerHandoff(db, project, { trigger: "manual", actor: currentUser(db, req)?.email || "operator" });
+  if (result.deliveryStatus === "skipped") throw new HttpError(result.refusedStatus ?? 409, result.detail);
+  res.json(result);
+}));
 
 app.get("/api/projects/:id/communication-drafts", (req, res) => {
   res.json(getProjectCommunicationDrafts(db, req.params.id));

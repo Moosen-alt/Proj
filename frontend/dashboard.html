@@ -454,6 +454,12 @@
                  stageDisabledReason / approveDisabledReason, written via textContent). -->
             <ul id="autopilotOffReasons" class="autopilot-off" hidden></ul>
           </div>
+          <!-- #491: the installer handoff packet. The server emails it when the job reaches handoff_ready;
+               this sends it (again) by hand. Shown only on a handed-off project (renderHandoffPacket). -->
+          <div id="handoffActions" class="actions" hidden>
+            <span class="actions-label">Closeout:</span>
+            <button id="sendHandoffPacketBtn" type="button" class="secondary"><i data-lucide="send"></i><span>Send handoff packet</span></button>
+          </div>
           <div id="submitBlockerNote" class="submit-blocker-note" hidden></div>
           <div id="reviewMismatchBanner" style="display:none;margin:6px 0 2px;padding:8px 12px;background:#fff3cd;border:1px solid #ffc107;border-radius:6px;font-size:12px;color:#664d03">
             <strong><i data-lucide="alert-triangle" style="width:13px;height:13px;vertical-align:-2px"></i> Portal review mismatch</strong> — the staged portal form may not match the project record. Review before approving.<br>
@@ -1355,6 +1361,13 @@
           <div class="form-row">
             <label>Business phone<input id="c_businessPhone" /></label>
             <label>Business email<input id="c_businessEmail" type="email" /></label>
+          </div>
+          <div class="form-row">
+            <!-- #491: the installer handoff packet, emailed when a job is permit-issued + NEM-approved. -->
+            <label>Installer handoff packet<select id="c_handoffAutoSend">
+              <option value="">Email it automatically when the job is approved</option>
+              <option value="off">Staff send it by hand</option>
+            </select></label>
           </div>
 
           <h3>Authorized signer</h3>
