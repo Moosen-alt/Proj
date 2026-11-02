@@ -124,8 +124,13 @@ export function buildClientTimeline(db: AppDb, project: ProjectRecord, now: Date
   const state = text(project.state);
   const utility = text(project.utility);
 
+  // LABELS NAME THE STEP, NEVER ITS OUTCOME ("Interconnection review", not "Interconnection
+  // approved"): every step is listed from the first day, and a page that prints "Interconnection
+  // approved" beside a hollow dot has still printed the claim (readingProvenance.test pins that the
+  // status page never words an unconfirmed approval). The outcome word is `doneDetail`, shown only
+  // once the step is done.
   type Draft = { key: ClientTimelineStepKey; label: string; done: boolean; at: string | null; start: string | null;
-    ready: boolean; detail: string; typical: number | null };
+    ready: boolean; detail: string; doneDetail: string; typical: number | null };
   const steps: Draft[] = [];
 
   // --- the permit chain -------------------------------------------------------------------
@@ -137,7 +142,8 @@ export function buildClientTimeline(db: AppDb, project: ProjectRecord, now: Date
   const filedCount = permits.filter((t) => FILED.has(t.status)).length;
   steps.push({
     key: "permit_filed",
-    label: permits.length > 1 ? "Permit applications filed" : "Permit application filed",
+    label: permits.length > 1 ? "Permit applications" : "Permit application",
+    doneDetail: "Filed",
     done: permitFiled,
     // The step completed when its LAST filing went in; the review clock below starts at the first.
     at: permitFiled ? latest(permits.map((t) => t.filedAt)) : null,
@@ -156,7 +162,8 @@ export function buildClientTimeline(db: AppDb, project: ProjectRecord, now: Date
   }
   steps.push({
     key: "permit_issued",
-    label: permits.length > 1 ? "Permits issued" : "Permit issued",
+    label: "Permit review",
+    doneDetail: permits.length > 1 ? "All permits issued" : "Issued",
     done: permitIssued,
     at: permitIssued ? latest(permitsDone.map((t) => t.doneAt)) : null,
     start: permitFirstFiledAt,
@@ -171,7 +178,8 @@ export function buildClientTimeline(db: AppDb, project: ProjectRecord, now: Date
     const nemApproved = nem.status === "issued";
     steps.push({
       key: "nem_filed",
-      label: "Interconnection application filed",
+      label: "Interconnection application",
+      doneDetail: "Filed",
       done: nemFiled,
       at: nemFiled ? nem.filedAt : null,
       start: null,
@@ -181,7 +189,8 @@ export function buildClientTimeline(db: AppDb, project: ProjectRecord, now: Date
     });
     steps.push({
       key: "nem_approved",
-      label: "Interconnection approved",
+      label: "Interconnection review",
+      doneDetail: "Approved",
       done: nemApproved,
       at: nemApproved ? nem.doneAt : null,
       start: nem.filedAt,
@@ -196,25 +205,25 @@ export function buildClientTimeline(db: AppDb, project: ProjectRecord, now: Date
   const milestone = (key: ProjectMilestoneKey) => recorded.get(key)?.at || null;
   const installedAt = milestone("installed");
   steps.push({
-    key: "installed", label: "Installed", done: Boolean(installedAt), at: installedAt,
+    key: "installed", label: "Installation", doneDetail: "Installed", done: Boolean(installedAt), at: installedAt,
     // The install is scheduled once the permit side is cleared.
     start: null, ready: permitIssued, detail: "", typical: null,
   });
   const finalAt = milestone("final_passed");
   steps.push({
-    key: "final_passed", label: "Final inspection passed", done: Boolean(finalAt), at: finalAt,
+    key: "final_passed", label: "Final inspection", doneDetail: "Passed", done: Boolean(finalAt), at: finalAt,
     start: installedAt, ready: Boolean(installedAt), detail: "", typical: null,
   });
   if (nem) {
     const requestedAt = milestone("pto_requested");
     const grantedAt = milestone("pto_granted");
     steps.push({
-      key: "pto_requested", label: "Permission to operate requested", done: Boolean(requestedAt), at: requestedAt,
+      key: "pto_requested", label: "Permission to operate request", doneDetail: "Requested", done: Boolean(requestedAt), at: requestedAt,
       // The utility's completion paperwork carries the final's sign-off, so the request follows it.
       start: finalAt, ready: Boolean(finalAt), detail: "", typical: null,
     });
     steps.push({
-      key: "pto_granted", label: "Permission to operate granted", done: Boolean(grantedAt), at: grantedAt,
+      key: "pto_granted", label: "Permission to operate", doneDetail: "Granted", done: Boolean(grantedAt), at: grantedAt,
       start: requestedAt, ready: Boolean(requestedAt), detail: "", typical: null,
     });
   }
@@ -241,7 +250,7 @@ export function buildClientTimeline(db: AppDb, project: ProjectRecord, now: Date
         state: s.done ? "done" : current ? "current" : "upcoming",
         at: s.done ? s.at : null,
         // A not-yet-current step's detail is still useful when it says how far its filings got.
-        detail: s.done ? "" : s.detail,
+        detail: s.done ? s.doneDetail : s.detail,
         tookDays: s.done ? wholeDays(s.start, s.at) : null,
         daysSoFar: current ? wholeDays(s.start, nowIsoString) : null,
         typicalDays: current && s.typical != null ? Math.max(1, Math.round(s.typical)) : null,

@@ -3246,7 +3246,8 @@ export interface ClientTimelineStep {
   /** When a done step happened. null for an upcoming step, and for a done one whose date we do
    *  not hold (a filing tracked without a recorded submission date). */
   at: string | null;
-  /** A fixed client-safe line ("1 of 2 permits issued"), or "". */
+  /** A fixed client-safe line: the outcome once done ("Issued"), how far an open step got
+   *  ("1 of 2 permits issued", "Correction requested — we are on it"), or "". */
   detail: string;
   /** Done agency steps: whole days the step took from its start (filed → issued, requested → granted). */
   tookDays: number | null;

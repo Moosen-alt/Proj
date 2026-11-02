@@ -115,6 +115,8 @@ await check("(a) before filing: the permit and interconnection filings are curre
     ["permit_filed", "permit_issued", "nem_filed", "nem_approved", "installed", "final_passed", "pto_requested", "pto_granted"]);
   assert.deepEqual(steps.filter((s) => s.state === "current").map((s) => s.key), ["permit_filed", "nem_filed"]);
   assert.equal(steps[0].detail, "Being prepared");
+  // Every step is listed from day one, so a label never states an outcome (readingProvenance.test).
+  assert.ok(steps.every((s) => !/approved|issued|granted|passed|filed|requested|installed/i.test(s.label)), JSON.stringify(steps.map((s) => s.label)));
   assert.ok(steps.slice(4).every((s) => s.state === "upcoming"), JSON.stringify(steps));
 });
 
@@ -125,7 +127,7 @@ await check("(a2) a job with no utility has no interconnection or PTO steps", ()
 
 // An Oregon job files a building AND an electrical permit (the state rule requiredTracks reads).
 await check("premise: the fixture job files two permits and an interconnection", () => {
-  assert.equal(step(job.id, "permit_filed").label, "Permit applications filed");
+  assert.equal(step(job.id, "permit_filed").label, "Permit applications");
 });
 // A staged (not yet sent) permit: still not filed. Then the real filings.
 submit(job.id, "building", day(20), "awaiting_human_submit");
@@ -199,10 +201,12 @@ await check("(e) issued and approved: dated at the reading that closed them, wit
   assert.equal(issued.at, day(2));
   assert.equal(issued.tookDays, 10);
   assert.equal(issued.typicalDays, null);
+  assert.equal(issued.detail, "All permits issued", "the outcome word appears once the step is done");
   const nem = step(job.id, "nem_approved");
   assert.equal(nem.state, "done");
   assert.equal(nem.at, day(1));
   assert.equal(nem.tookDays, 9);
+  assert.equal(nem.detail, "Approved");
   assert.equal(step(job.id, "installed").state, "current", "the install is next once the permit is issued");
 });
 
