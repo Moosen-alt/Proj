@@ -127,7 +127,14 @@ export interface RecordDocumentLink {
  * question production does. Only <a href> to http(s) on the record's own portal and track; a
  * link carrying any submit-intent word is refused before it is scored. At most three, best first.
  */
-export function pickRecordDocumentLinks(html: string, pageUrl: string, track: TrackKind): RecordDocumentLink[] {
+export function pickRecordDocumentLinks(
+  html: string,
+  pageUrl: string,
+  track: TrackKind,
+  /** Collects the hrefs of links that WOULD be the document but leave the record's portal or its
+   *  track — skipped, never requested, and named in the card's reason. */
+  skipped: string[] = [],
+): RecordDocumentLink[] {
   const $ = load(html);
   const out = new Map<string, RecordDocumentLink>();
   $("a[href]").each((_i, el) => {
@@ -136,7 +143,6 @@ export function pickRecordDocumentLinks(html: string, pageUrl: string, track: Tr
     let href: string;
     try { href = new URL(raw, pageUrl).toString(); } catch { return; }
     if (!/^https?:\/\//i.test(href)) return;
-    if (!trackSafeUrl(track, href) || !onRecordPortal(href, pageUrl)) return;
     // The words a person would read: the anchor's text, its title / aria-label, and the cell the
     // link sits in (an Accela attachments row names the file beside a bare "Download").
     const label = [$(el).text(), $(el).attr("title"), $(el).attr("aria-label"), $(el).attr("download")]
@@ -174,6 +180,12 @@ export function pickRecordDocumentLinks(html: string, pageUrl: string, track: Tr
       if (!approval && !pto && !authorization && !executed) return;
       score = 1;
       if (words.has("letter") || pto || authorization) score += 2;
+    }
+    // RULE 5, and the record's own portal: a link that would be the document but leaves either is
+    // skipped and named, never requested.
+    if (!trackSafeUrl(track, href) || !onRecordPortal(href, pageUrl)) {
+      if (!skipped.includes(href)) skipped.push(href);
+      return;
     }
     if (/\.pdf$/i.test(new URL(href).pathname)) score += 1;
     const prior = out.get(href);
@@ -314,9 +326,16 @@ export async function fetchIssuedRecordDocuments(
   if (!pageNamesRecord(pageText, recordNumber)) {
     return nothing(`The page at the record link does not name record ${recordNumber} — nothing was downloaded from someone else's record.`);
   }
-  const links = pickRecordDocumentLinks(page.text, page.finalUrl || recordUrl, track);
+  const offPortal: string[] = [];
+  const links = pickRecordDocumentLinks(page.text, page.finalUrl || recordUrl, track, offPortal);
+  const skippedNote = offPortal.length
+    ? ` Skipped ${offPortal.length} link(s) that leave the record's portal or its track: ${offPortal.map((u) => portalHostOf(u) || u).join(", ")}.`
+    : "";
+  if (offPortal.length) {
+    addAuditLog(db, project.id, "system", "permit monitor", "permit_target.issued_document_link_skipped", { targetId, track, recordNumber, skipped: offPortal.slice(0, 5) });
+  }
   if (!links.length) {
-    return nothing(`Record ${recordNumber} lists no downloadable ${track === "nem" ? "approval or PTO letter" : "issued permit"} the monitor can open without a sign-in. Download ${what} from the portal by hand.`);
+    return nothing(`Record ${recordNumber} lists no downloadable ${track === "nem" ? "approval or PTO letter" : "issued permit"} the monitor can open without a sign-in.${skippedNote} Download ${what} from the portal by hand.`);
   }
 
   const held = heldHashes(db, project.id, docType);

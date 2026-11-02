@@ -118,6 +118,10 @@ const pdf = (tag: string) => new TextEncoder().encode(`%PDF-1.4\n% synthetic ${t
   check("1c. never a javascript postback, a form or a button", !/javascript|Submit\.aspx/i.test(hrefs), hrefs);
   check("1d. never the plan review comments or the permit application", !/docId=11[23]/.test(hrefs), hrefs);
   check("1e. never a utility host (rule 5), another city's host, or another agency's path on the shared Accela host", !/powerclerk|othercity|otheragency/.test(hrefs), hrefs);
+  const skipped: string[] = [];
+  D.pickRecordDocumentLinks(accelaPage(STR), recordUrl("000A1"), "permit", skipped);
+  check("1f. …and those three are reported as skipped, not silently dropped",
+    skipped.length === 3 && skipped.every((u) => /powerclerk|othercity|otheragency/.test(u)), JSON.stringify(skipped));
 }
 
 // ═══ 2. THE PICKER, PowerClerk-style ═══════════════════════════════════════════════════════════
@@ -262,9 +266,9 @@ await gapCase("a download that redirected off the record's portal", (url, rec) =
   served.set(url, { kind: "html", html: accelaPage(rec).replace("docId=111", "docId=778") });
   served.set(href, { kind: "pdf", bytes: pdf("off-portal"), finalUrl: "https://files.elsewhere.example.com/permit.pdf" });
 }, /Refused: ended at https:\/\/files\.elsewhere/);
-await gapCase("a record page with no document link", (url, rec) => {
+await gapCase("a record page whose only permit links leave its portal (said so, hosts named)", (url, rec) => {
   served.set(url, { kind: "html", html: accelaPage(rec).replace(/<table class="attachments">[\s\S]*?<\/table>/, "") });
-}, /lists no downloadable issued permit/);
+}, /lists no downloadable issued permit.*Skipped 3 link\(s\) that leave the record's portal or its track: pgenm\.powerclerk\.com, permits\.othercity\.example\.gov, aca-oregon\.accela\.com/);
 {
   // A NEM filing whose only URL is an AHJ permit portal is not a record on its track (rule 5).
   const p = mkProject("City of Testbay");
