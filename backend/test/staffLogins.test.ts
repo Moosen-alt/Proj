@@ -364,6 +364,7 @@ try {
       ["/api/staff/logins/whoever/password", { password: "off-mode-pass-1" }],
       ["/api/staff/logins/whoever/active", { active: false }],
       ["/api/auth/password", { currentPassword: "a", newPassword: "off-mode-pass-1" }],
+      ["/api/auth/logout-everywhere", {}],
     ] as Array<[string, unknown]>) {
       const res = await anyone(p, post(body));
       const json = await res.json() as { error: string; details: { code?: string } };

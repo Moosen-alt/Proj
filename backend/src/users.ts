@@ -1,6 +1,6 @@
 import type { AppDb, SqlParam } from "./db";
 import { DEFAULT_ORG_ID } from "./db";
-import { ADMIN_ROLES, ALL_ROLES, ROLE_OPERATOR, ROLE_SUPERADMIN } from "./auth";
+import { ADMIN_ROLES, ALL_ROLES, ROLE_OPERATOR, ROLE_SUPERADMIN, bumpSessionVersion } from "./auth";
 import { HttpError } from "./httpError";
 import { correctionOverdueSql } from "./kpi";
 import { nowIso } from "./time";
@@ -92,6 +92,7 @@ export function updateUser(
     role = input.role;
   }
 
+  const active = input.active !== undefined ? Boolean(input.active) : user.active;
   db.run(
     "UPDATE users SET name = ?, email = ?, role = ?, color = ?, active = ? WHERE id = ?",
     [
@@ -99,10 +100,14 @@ export function updateUser(
       input.email ?? user.email,
       role,
       input.color ?? user.color,
-      input.active !== undefined ? (input.active ? 1 : 0) : (user.active ? 1 : 0),
+      active ? 1 : 0,
       userId,
     ],
   );
+  // The Team panel's Active box is the second door that switches a login off (the first is
+  // staffLogins.setStaffLoginActive). Either way it ends the user's sessions (#432), so turning
+  // the box back on later never revives a cookie issued before it was turned off.
+  if (active !== user.active) bumpSessionVersion(db, userId);
   return getUser(db, userId)!;
 }
 

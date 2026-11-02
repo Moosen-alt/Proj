@@ -18,7 +18,7 @@
 import { HttpError } from "./httpError";
 import type { AppDb, SqlParam } from "./db";
 import { addAuditLog } from "./audit";
-import { ROLE_ADMIN, ROLE_OPERATOR, ROLE_SUPERADMIN, passwordMatchesForUser, setUserPassword, type SessionUser } from "./auth";
+import { ROLE_ADMIN, ROLE_OPERATOR, ROLE_SUPERADMIN, bumpSessionVersion, passwordMatchesForUser, setUserPassword, type SessionUser } from "./auth";
 import { createUser } from "./users";
 
 type Row = Record<string, SqlParam>;
@@ -140,8 +140,9 @@ export function resetStaffPassword(db: AppDb, actor: SessionUser, userId: string
 }
 
 /**
- * Switch a login off (or back on). Off takes effect on the very next request: the session cookie
- * is stateless, but currentUser re-reads `active = 1` every time, so an open session dies too.
+ * Switch a login off (or back on). Off takes effect on the very next request: currentUser re-reads
+ * `active = 1` every time, so an open session dies too. Either switch also bumps the session
+ * version (#432), so switching a login back on never revives a cookie issued before it was off.
  */
 export function setStaffLoginActive(db: AppDb, actor: SessionUser, userId: string, active: boolean): StaffLogin {
   const target = loginInOrg(db, actor, userId);
@@ -149,6 +150,7 @@ export function setStaffLoginActive(db: AppDb, actor: SessionUser, userId: strin
   assertMayManage(actor, target);
   if (target.active !== active) {
     db.run("UPDATE users SET active = ? WHERE id = ?", [active ? 1 : 0, target.id]);
+    bumpSessionVersion(db, target.id);
     addAuditLog(db, null, "human", actor.email, active ? "staff.login_reactivated" : "staff.login_deactivated", {
       userId: target.id, email: target.email,
     });

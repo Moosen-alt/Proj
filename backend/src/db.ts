@@ -841,6 +841,12 @@ function migrate(db: AppDb): void {
   addColumnIfMissing(db, "projects", "customer_id", "TEXT");
   // password auth (used only when AUTH_ENABLED=true)
   addColumnIfMissing(db, "users", "password_hash", "TEXT NOT NULL DEFAULT ''");
+  // Revocable sign-in sessions (#432): every session cookie carries the version it was issued
+  // under, and currentUser accepts it only while it still equals this column. A password change
+  // or reset, a deactivation and "Sign out everywhere" bump it (auth.ts bumpSessionVersion), so
+  // every older cookie stops working at once. 0 is also what a cookie from before this column
+  // reads as, so the deploy signs nobody out.
+  addColumnIfMissing(db, "users", "session_version", "INTEGER NOT NULL DEFAULT 0");
   // AHJ portal platform (Accela/ProjectDox/EnerGov…) + submission method — drives
   // portal-automation reuse (one Playwright driver per platform across AHJs).
   addColumnIfMissing(db, "permit_utility_knowledge", "portal_platform", "TEXT NOT NULL DEFAULT ''");
