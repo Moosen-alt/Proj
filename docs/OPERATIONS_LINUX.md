@@ -342,6 +342,15 @@ has a NOTIFICATIONS block for them (WARN, with the line to add) and counts the c
    ```
 
    Read the list first: a message about a job that has since moved on may be better left unsent.
+7. **Emailed jobs (#489, optional).** To let installers email a new job instead of uploading it,
+   set `EMAIL_INTAKE_ADDRESS=intake@<your domain>` to an address the tracking inbox (step 2)
+   receives, with plus-addressing on. Give each client a tag under Clients ("Email-in intake tag",
+   say `acme`) and tell them to send the plan set and bill to `intake+acme@<your domain>` from one of
+   the addresses on their client record (add others under "Other senders"; `@theirdomain.com`
+   allows a whole domain). The server creates and parses the project, queues the usual local chain
+   and replies with the status link (a draft until steps 1 and 3 pass). Anything it cannot place
+   waits under Knowledge & Learning > Emailed jobs. `EMAIL_INTAKE_AUTO_REPLY=off` keeps the replies as drafts;
+   `EMAIL_INTAKE_DEDUPE_DAYS` (default 30) is how long the same address files onto the same project.
 
 ## 6. Deploying a new version
 

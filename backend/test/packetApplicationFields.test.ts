@@ -204,7 +204,10 @@ check("WIRING: /api/parser/llm-extract runs the packet-application read on the t
   const server = fs.readFileSync(path.join(REPO, "backend", "src", "server.ts"), "utf8");
   const route = server.slice(server.indexOf('app.post("/api/parser/llm-extract"'));
   const body = route.slice(0, route.indexOf("\n}));"));
-  assert.match(body, /supplementPacketApplication\(extraction, planText\)/);
+  // The route's server half lives in parserExtraction.ts (shared with email-in intake, #489).
+  assert.match(body, /extractParserFields\(db, llm, \{/);
+  const shared = fs.readFileSync(path.join(REPO, "backend", "src", "parserExtraction.ts"), "utf8");
+  assert.match(shared, /supplementPacketApplication\(extraction, planText\)/);
 });
 
 // parser.html: the regex fallback refuses a title-block capture, and the callout value fills the

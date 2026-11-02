@@ -1039,6 +1039,53 @@ async function loadEmailTracker() {
   } catch (err) {
     $("emailTrackerStatus").textContent = err.message || "Email tracker status unavailable.";
   }
+  loadEmailIntake().catch(() => null);
+}
+
+// EMAILED JOBS (#489). Built with DOM calls, never innerHTML: every string here came from an email.
+async function loadEmailIntake() {
+  const panel = $("emailIntakePanel");
+  const list = $("emailIntakeList");
+  if (!panel || !list) return;
+  const data = await api("/api/email-intake");
+  panel.hidden = !data.enabled && !(data.unsorted || []).length && !(data.recent || []).length;
+  $("emailIntakeAddress").textContent = data.enabled
+    ? `Installers email new jobs (plan set + bill) to ${data.address}. Set each client's tag under Clients.`
+    : "Email-in intake is off (EMAIL_INTAKE_ADDRESS is not set).";
+  const el = (tag, props = {}, children = []) => {
+    const node = document.createElement(tag);
+    Object.assign(node, props);
+    node.append(...children);
+    return node;
+  };
+  const rows = [];
+  for (const item of data.unsorted || []) {
+    const files = (item.files || []).map((f, i) => el("li", {}, [
+      el("a", { href: `/api/email-intake/${encodeURIComponent(item.id)}/files/${i}`, textContent: f.name }),
+      f.refused ? ` (${f.refused})` : "",
+    ]));
+    const dismiss = el("button", { className: "secondary", type: "button", textContent: "Dismiss" });
+    dismiss.addEventListener("click", async () => {
+      dismiss.disabled = true;
+      try { await api(`/api/email-intake/${encodeURIComponent(item.id)}/dismiss`, { method: "POST" }); await loadEmailIntake(); }
+      catch (err) { dismiss.disabled = false; showMessage(err.message || "Could not dismiss.", "error"); }
+    });
+    rows.push(el("div", { className: "panel" }, [
+      el("strong", { textContent: `Needs a person: ${item.subject || "(no subject)"}` }),
+      el("div", { className: "muted", textContent: `From ${item.sender || "unknown sender"}${item.intakeTag ? ` to tag "${item.intakeTag}"` : ""}, ${new Date(item.receivedAt || item.createdAt).toLocaleString()}` }),
+      el("div", { textContent: item.reasonText }),
+      el("ul", {}, files),
+      dismiss,
+    ]));
+  }
+  for (const item of data.recent || []) {
+    const open = el("a", { href: "#", textContent: item.status === "attached" ? "Files added to project" : "Project created" });
+    open.addEventListener("click", (e) => { e.preventDefault(); if (item.projectId) selectProject(item.projectId); });
+    rows.push(el("div", { className: "muted" }, [
+      open, ` from ${item.sender}: ${item.subject || "(no subject)"} (${new Date(item.createdAt).toLocaleString()}; reply ${item.replyStatus || "none"})`,
+    ]));
+  }
+  list.replaceChildren(...rows);
 }
 
 // The ops plan + brief, runbook, handoff packet, communication drafts and installer actions panels
@@ -10052,7 +10099,7 @@ async function handleBatchDrop(file) {
 // ----- Clients & contractor licensing -----
 const CLIENT_TEXT_FIELDS = [
   "companyName", "legalBusinessName", "dba", "contactName", "contactEmail", "phone", "billingStatus", "billingMode", "serviceFeeUsd",
-  "requestLinksAutoSend", "handoffAutoSend",
+  "requestLinksAutoSend", "handoffAutoSend", "intakeTag", "intakeSenders",
   "ccbLicenseNumber", "ccbExpiration", "electricalLicenseNumber", "metroCityLicenseNumber",
   "electricalSupervisorName", "electricianLicenseNumber",
   "ein", "bondCarrier", "insuranceCarrier", "businessAddress", "businessCity", "businessState",

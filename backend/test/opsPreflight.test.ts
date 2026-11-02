@@ -230,6 +230,15 @@ out = notify(withAdmin, { EMAIL_IMAP_HOST: "imap.ops.invalid", EMAIL_IMAP_USER: 
 check("MUST-EXCLUDE: an incomplete EMAIL_IMAP_* (the poller ignores it) is not a PASS, and names the missing key", () => {
   assert.match(line(out, "tracking inbox"), /WARN .*EMAIL_IMAP_\* is incomplete \(EMAIL_IMAP_PASS unset\), so it is ignored/);
 });
+check("email intake (#489) is optional: no row while EMAIL_INTAKE_ADDRESS is unset", () => assert.doesNotMatch(out, /email intake/));
+out = notify(withAdmin, { EMAIL_IMAP_HOST: "imap.ops.invalid", EMAIL_IMAP_USER: "permits@ops.invalid", EMAIL_IMAP_PASS: SECRETS.imapPw, EMAIL_INTAKE_ADDRESS: "intake@ops.invalid" });
+check("email intake on an inbox that is read: PASS, naming the tagged address", () => {
+  assert.match(line(out, "email intake"), /PASS .*intake\+<client tag>@ops\.invalid/);
+});
+out = notify(withAdmin, { EMAIL_INTAKE_ADDRESS: "intake+acme@ops.invalid" });
+check("MUST-EXCLUDE: a tagged intake address with no inbox is not a PASS", () => {
+  assert.match(line(out, "email intake"), /WARN .*not a plain address/);
+});
 out = notify(withAdmin, { GMAIL_CLIENT_ID: "client-id.ops.invalid", GMAIL_CLIENT_SECRET: SECRETS.gmailSecret, PUBLIC_BASE_URL: "https://keelix.ops.invalid" });
 check("MUST-EXCLUDE: Gmail set up but never authorized is not a PASS; on the server it names the redirect to set first", () => {
   assert.match(line(out, "tracking inbox"), /WARN .*Gmail is set up but not authorized.*GMAIL_REDIRECT_URI=https:\/\/keelix\.ops\.invalid\/api\/gmail\/oauth\/callback \(now localhost\) and restart, then open \/api\/gmail\/auth-url/);

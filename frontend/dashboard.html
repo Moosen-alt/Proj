@@ -1048,6 +1048,12 @@
         </div>
         <div id="emailWatchSharedNote" class="shared-server-note">Watch and Scan Email read an MBOX file on the server, not on your computer. To import mail from your computer, drop the .mbox file above.</div>
         <div id="emailTrackerStatus" class="email-tracker-status muted">No email watch source configured.</div>
+        <!-- #489: jobs emailed to intake+<client tag>@… — the ones waiting on a person, and the latest placed. -->
+        <div id="emailIntakePanel" hidden>
+          <div class="section-head subhead" style="margin-top:8px"><h2>Emailed jobs</h2></div>
+          <div id="emailIntakeAddress" class="muted" style="font-size:12px"></div>
+          <div id="emailIntakeList" class="stack"></div>
+        </div>
 
         <!-- Batch PDF import -->
         <div class="section-head subhead" style="margin-top:8px">
@@ -1341,6 +1347,10 @@
               <option value="off">Off: staff send it by hand</option>
             </select>
           </label>
+          <div class="form-row">
+            <label>Email-in intake tag<input id="c_intakeTag" placeholder="e.g. acme, for intake+acme@…" autocomplete="off" /></label>
+            <label>Other senders allowed to email jobs<input id="c_intakeSenders" placeholder="pm@acme.com, @acme.com" autocomplete="off" /></label>
+          </div>
 
           <h3>Licensing</h3>
           <div class="form-row">

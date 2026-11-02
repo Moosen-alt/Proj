@@ -2971,6 +2971,44 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       `);
     },
   },
+  {
+    version: 59,
+    name: "email_intake",
+    up: (db) => {
+      // EMAIL-IN INTAKE (#489). An installer emails a new job (plan set, bill, meter photo) to the
+      // intake address with their tag (intake+acme@…); emailIntake.ts creates and parses the
+      // project. One row per message: message_key (Message-ID, else a hash of the raw message) is
+      // what keeps a poll that re-reads the same inbox from making the job twice. A message the
+      // server could not place is status 'unsorted' with its reason, and its attachments are kept
+      // under backend/data/email-intake/<id>/ for a person. org_id is the matched client's org, else
+      // the polling source's — never anything the message says (rule 6).
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS email_intake_messages (
+          id TEXT PRIMARY KEY,
+          message_key TEXT NOT NULL UNIQUE,
+          org_id TEXT NOT NULL,
+          client_id TEXT,
+          project_id TEXT,
+          status TEXT NOT NULL,
+          reason TEXT NOT NULL DEFAULT '',
+          sender TEXT NOT NULL DEFAULT '',
+          intake_tag TEXT NOT NULL DEFAULT '',
+          subject TEXT NOT NULL DEFAULT '',
+          files_json TEXT NOT NULL DEFAULT '[]',
+          reply_status TEXT NOT NULL DEFAULT '',
+          received_at TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          resolved_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_email_intake_org_status ON email_intake_messages(org_id, status, created_at);
+      `);
+      // Per client: the tag after the + in the intake address, and the extra sender addresses
+      // (or @domain entries) allowed to send it jobs beyond the client's own contact emails.
+      // clients is CREATEd in the base schema.
+      addColumnIfMissing(db, "clients", "intake_tag", "TEXT NOT NULL DEFAULT ''");
+      addColumnIfMissing(db, "clients", "intake_senders", "TEXT NOT NULL DEFAULT ''");
+    },
+  },
 ];
 
 /** v47 was edited in place while #218 was open (Helm's review at 0116f98a): a DB that ran an earlier

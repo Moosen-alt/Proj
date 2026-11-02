@@ -144,6 +144,9 @@ const UNSCOPED_BY_DESIGN: Record<string, string> = {
   "/api/imap": "operator-level mail integration",
   "/api/email-tracker/sources": "creates a source stamped with the caller's org",
   "/api/email-tracker/run": "takes the org from the session, never the body",
+  // Email-in intake (#489): each row is stamped with its client's org (else the polling source's)
+  // and the handlers 404 a row outside reqOrgFilter (emailIntake.rowInScope; emailIntake.test).
+  "/api/email-intake": "rows carry their client's org; handlers read through reqOrgFilter and 404 outside it",
   "/api/permit-monitor/run": "global background sweep; runs as system",
   "/api/nem-monitor/run": "global background sweep; runs as system",
   "/api/portal-pauses": "global automation kill-switches",
@@ -161,6 +164,7 @@ const SCOPED_LIST_ROUTES: Record<string, string> = {
   "/api/users": "reqOrgFilter",
   "/api/users/workload": "reqOrgFilter",
   "/api/email-tracker": "reqOrgFilter",
+  "/api/email-intake": "reqOrgFilter",
   "/api/customers": "reqOrgFilter",
   "/api/kpi": "reqOrgFilter",
   "/api/corrections/overdue": "reqOrgFilter",

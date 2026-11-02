@@ -64,6 +64,8 @@ function mapClient(row: Row, identities: ClientPortalIdentity[]): ClientRecord {
     handoffAutoSend: s(row.handoff_auto_send),
     billingContactEmail: s(row.billing_contact_email),
     requestLinksAutoSend: s(row.request_links_auto_send),
+    intakeTag: s(row.intake_tag),
+    intakeSenders: s(row.intake_senders),
     licenseState: s(row.license_state),
     insuranceExpiry: s(row.insurance_expiry),
     bondExpiry: s(row.bond_expiry),
@@ -489,6 +491,8 @@ const FIELD_COLUMNS: [keyof ClientRecord, string][] = [
   ["handoffAutoSend", "handoff_auto_send"],
   ["billingContactEmail", "billing_contact_email"],
   ["requestLinksAutoSend", "request_links_auto_send"],
+  ["intakeTag", "intake_tag"],
+  ["intakeSenders", "intake_senders"],
   ["licenseState", "license_state"],
   ["insuranceExpiry", "insurance_expiry"],
   ["bondExpiry", "bond_expiry"],
@@ -501,9 +505,31 @@ const FIELD_COLUMNS: [keyof ClientRecord, string][] = [
   ["serviceFeeUsd", "service_fee_usd"],
 ];
 
-// serviceFeeUsd is REAL; everything else is coerced to string.
+// serviceFeeUsd is REAL; the intake tag is normalised (#489); everything else is coerced to string.
 function fieldValue(key: keyof ClientRecord, raw: unknown): string | number | null {
+  if (key === "intakeTag") return normalizeIntakeTag(raw);
   return key === "serviceFeeUsd" ? moneyOrNull(raw) : s(raw);
+}
+
+/** The intake tag as stored: lower-case, and only what can sit after the + of an email address
+ *  without quoting. Anything else is refused rather than silently changed, so the address the
+ *  installer is told is the address that works. */
+export function normalizeIntakeTag(raw: unknown): string {
+  const tag = s(raw).trim().toLowerCase();
+  if (tag && !/^[a-z0-9][a-z0-9._-]{0,39}$/.test(tag)) {
+    throw new HttpError(400, `Intake tag "${s(raw).trim()}" can only use letters, digits, dot, dash and underscore (up to 40), starting with a letter or digit.`, { field: "intakeTag" });
+  }
+  return tag;
+}
+
+/** One client per tag inside an org: two would make every job emailed to it ambiguous. */
+function assertIntakeTagFree(db: AppDb, orgId: string, tag: string, exceptClientId: string): void {
+  if (!tag) return;
+  const other = db.get<Row>(
+    "SELECT company_name FROM clients WHERE org_id = ? AND intake_tag = ? AND id != ?",
+    [orgId, tag, exceptClientId],
+  );
+  if (other) throw new HttpError(400, `Intake tag "${tag}" is already used by ${s(other.company_name) || "another client"}.`, { field: "intakeTag" });
 }
 
 function identitiesFor(db: AppDb, clientId: string): ClientPortalIdentity[] {
@@ -599,6 +625,7 @@ export function createClient(db: AppDb, payload: Record<string, unknown>, orgId:
   const columns = ["id", "created_at", "org_id", ...FIELD_COLUMNS.map(([, col]) => col)];
   const values: (string | number | null)[] = [clientId, nowIso(), orgId, ...FIELD_COLUMNS.map(([key]) => fieldValue(key, payload[key]))];
   const placeholders = columns.map(() => "?").join(", ");
+  assertIntakeTagFree(db, orgId, normalizeIntakeTag(payload.intakeTag), clientId);
 
   return db.transaction(() => {
     db.run(`INSERT INTO clients (${columns.join(", ")}) VALUES (${placeholders})`, values);
@@ -609,8 +636,9 @@ export function createClient(db: AppDb, payload: Record<string, unknown>, orgId:
 }
 
 export function updateClient(db: AppDb, clientId: string, payload: Record<string, unknown>): ClientRecord {
-  const existing = db.get<Row>("SELECT id FROM clients WHERE id = ?", [clientId]);
+  const existing = db.get<Row>("SELECT id, org_id FROM clients WHERE id = ?", [clientId]);
   if (!existing) throw new HttpError(404, "Client not found.");
+  if ("intakeTag" in payload) assertIntakeTagFree(db, s(existing.org_id) || DEFAULT_ORG_ID, normalizeIntakeTag(payload.intakeTag), clientId);
 
   // Only update fields present in the payload (partial update supported).
   const updates = FIELD_COLUMNS.filter(([key]) => key in payload);
