@@ -3483,6 +3483,7 @@ const NEXT_STEP_BUTTON_LABELS = {
   startAutopilotBtn: "Stage portals · Autopilot",
   addPermitTargetBtn: "Add tracking target",
   copyHandoffPacketBtn: "Copy handoff packet",
+  sendHandoffPacketBtn: "Send handoff packet",
 };
 
 // Take the operator TO a control or panel: open every <details> it sits in (stage accordion,
@@ -6174,6 +6175,9 @@ function renderRunbook() {
 
 function renderHandoffPacket() {
   const packet = state.handoffPacket;
+  // #491: the Send button lives in the rail, and only a handed-off project offers it.
+  const handoffActions = $("handoffActions");
+  if (handoffActions) handoffActions.hidden = !(state.detail && state.detail.project && state.detail.project.status === "handoff_ready");
   if (!packet) {
     $("handoffPacketStatus").textContent = "not synced";
     $("handoffPacket").innerHTML = `<p class="muted">Open a project to generate the project handoff packet.</p>`;
@@ -9803,6 +9807,25 @@ $("addOpsNoteBtn").addEventListener("click", addOpsNote);
 $("copyHandoffBtn").addEventListener("click", copyHandoff);
 $("copyRunbookBtn").addEventListener("click", copyRunbook);
 $("copyHandoffPacketBtn").addEventListener("click", copyHandoffPacket);
+// #491: email the installer handoff packet to the project's client now (first send or again).
+$("sendHandoffPacketBtn")?.addEventListener("click", async () => {
+  const p = state.detail?.project;
+  if (!p) { showMessage("Open a project first.", "warning"); return; }
+  const btnEl = $("sendHandoffPacketBtn");
+  btnEl.disabled = true;
+  try {
+    const res = await api(`/api/projects/${p.id}/handoff-packet/send`, { method: "POST", body: "{}" });
+    const docs = (res.attachments || []).length ? ` with ${res.attachments.join(", ")}` : "";
+    if (res.deliveryStatus === "sent") showMessage(`Handoff packet sent to ${res.recipient}${docs}.`);
+    else if (res.deliveryStatus === "draft") showMessage(`Handoff packet drafted for ${res.recipient}, not sent: mail is not set up on this server.`, "warning");
+    else showMessage(`Sending the handoff packet to ${res.recipient} failed: ${res.detail || "the mail server refused it"}.`, "error");
+    await selectProject(p.id);
+  } catch (err) {
+    showMessage(err.message || "Could not send the handoff packet.", "error");
+  } finally {
+    btnEl.disabled = false;
+  }
+});
 $("copyCommunicationDraftsBtn").addEventListener("click", copyCommunicationDrafts);
 // Tokenized read-only status page for the client — created on demand, then copied.
 // The same link is auto-included in automated client update emails.
@@ -9961,7 +9984,7 @@ async function handleBatchDrop(file) {
 // ----- Clients & contractor licensing -----
 const CLIENT_TEXT_FIELDS = [
   "companyName", "legalBusinessName", "dba", "contactName", "contactEmail", "phone", "billingStatus", "billingMode", "serviceFeeUsd",
-  "requestLinksAutoSend",
+  "requestLinksAutoSend", "handoffAutoSend",
   "ccbLicenseNumber", "ccbExpiration", "electricalLicenseNumber", "metroCityLicenseNumber",
   "electricalSupervisorName", "electricianLicenseNumber",
   "ein", "bondCarrier", "insuranceCarrier", "businessAddress", "businessCity", "businessState",

@@ -264,7 +264,17 @@ await check("untracked filing, portal readings, handoff, done, archived, unknown
   assert.equal(decide(facts({ status: "submitted", portalReadings: 3, tracks: filed })).key, "portal_readings");
   const handoff = decide(facts({ status: "handoff_ready", tracks: [track("nem", { done: true }), track("combo", { done: true })] }));
   assert.equal(handoff.key, "handoff_ready");
-  assert.equal(handoff.button?.id, "copyHandoffPacketBtn");
+  // #491: the server emails the packet on the transition; with none sent yet, a person sends it.
+  assert.equal(handoff.button?.id, "sendHandoffPacketBtn");
+  assert.equal(handoff.who, "me");
+  const sent = decide(facts({
+    status: "handoff_ready", tracks: [track("nem", { done: true }), track("combo", { done: true })],
+    installerHandoff: { deliveryStatus: "sent", at: "2026-11-02T08:00:00.000Z", recipient: "permits@installer.test", detail: "" },
+  }));
+  assert.equal(sent.key, "handoff_ready");
+  assert.equal(sent.who, "nobody");
+  assert.equal(sent.urgency, "done");
+  assert.match(sent.headline, /^Handed off 2026-11-02 — the installer handoff packet went to permits@installer\.test/);
   assert.equal(decide(facts({ status: "issued", tracks: [track("nem", { done: true }), track("combo", { done: true })] })).key, "done");
   assert.equal(decide(facts({ archived: true })).key, "archived");
   const unknown = decide(facts({ status: "submitted", tracks: [] }));

@@ -76,6 +76,7 @@ import { notServedInResult } from "../../shared/src/portalNotServed";
 import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier";
 import { notifyClientOfFiling } from "./clientFilingUpdate";
 import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStatusChange } from "./staffAlerts";
+import { installerHandoffNoteBody, sendInstallerHandoff } from "./installerHandoff";
 // detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget; the
 // card's Edit (updatePermitCheckTarget) re-detects with the same function when the URL changes.
 import { accelaModulesForNumber, detectPlatform, publicPermitStatusCheck, searchAccelaRecordByNumber } from "./publicPermitStatus";
@@ -6695,6 +6696,9 @@ export async function recordPermitStatusCheck(
   const doneBeforeReading = (classification.outcome === "issued" || classification.outcome === "nem_approved") && previousOutcome !== classification.outcome
     ? trackDoneSnapshot(db, detail.project)
     : null;
+  // Set on the transition to handoff_ready only (triggerHandoffIfReady) — the installer handoff
+  // packet goes out after the transaction commits, below.
+  let handedOff = false;
 
   db.transaction(() => {
     // `recordCheck &&` on all three: see the note above. An unchanged poll falls straight through
@@ -6816,7 +6820,7 @@ export async function recordPermitStatusCheck(
         recordNumber: input.permitNumber || text(target.permit_number) || input.applicationNumber || text(target.application_number),
       });
     }
-    if (mayWriteStatus) triggerHandoffIfReady(db, projectId, ts);
+    if (mayWriteStatus) handedOff = triggerHandoffIfReady(db, projectId, ts);
     // ONE ROW PER CHECK, ALWAYS — this is the per-check evidence trail, and it is the thing the
     // status-check gate above is allowed to suppress *because* this is not. `checkId` is null when
     // no row was written: an audit entry pointing at a permit_status_checks id that does not exist
@@ -6908,6 +6912,11 @@ export async function recordPermitStatusCheck(
       applicationNumber: text(target?.application_number),
     });
   }
+
+  // THE INSTALLER HANDOFF PACKET (#491) — on the transition only, after the commit, fire-and-
+  // forget (it never throws). Its record (the communication, the client note) is written before
+  // its first await, so the detail returned below already shows it.
+  if (handedOff) void sendInstallerHandoff(db, getProjectDetail(db, projectId).project, { trigger: "automatic" });
 
   return getProjectDetail(db, projectId);
 }
@@ -7288,22 +7297,6 @@ const MONITOR_WAITING_MAY_ADVANCE = new Set(["awaiting_human_submit", "submitted
   }
 }
 
-function buildInstallerHandoffChecklist(project: ProjectRecord): string[] {
-  const size = project.systemSizeDcKw ? `${project.systemSizeDcKw} kW DC` : "system";
-  return [
-    `PERMIT ISSUED — ${project.ahj || "AHJ"}: Download permit card and post at job site before work begins.`,
-    `NEM APPROVED — ${project.utility || "Utility"}: Save the approval confirmation email/letter.`,
-    `INSTALLATION: Install per the approved plans. Do not deviate from stamped set without re-permit.`,
-    `RAPID SHUTDOWN: Label all rapid shutdown devices per approved plans before inspection.`,
-    `FINAL INSPECTION: Schedule with ${project.ahj || "AHJ"}. Inspector will verify install matches approved plans.`,
-    `AFTER INSPECTION PASSES: Send a copy of the signed final inspection card to ${project.utility || "the utility"} to trigger Permission to Operate (PTO).`,
-    `PTO: Utility will issue PTO once inspection record is received. Timeline varies (typically 1–5 business days).`,
-    `SYSTEM SIZE: ${size} — verify AC output at inverter matches NEM application.`,
-    project.interconnectionMethod ? `INTERCONNECTION: ${project.interconnectionMethod}` : "",
-    `HOMEOWNER: Notify ${project.homeownerName || "homeowner"} that the system can be energized only after PTO is received.`,
-  ].filter(Boolean);
-}
-
 /**
  * IS THE SUBMISSION SCOPE COMPLETE? — the handoff predicate, per track, from the filings'
  * own tracking targets. Returns what still stands in the way (empty = hand off).
@@ -7337,25 +7330,21 @@ export function handoffBlockers(db: AppDb, project: ProjectRecord): string[] {
   return blockers;
 }
 
-function triggerHandoffIfReady(db: AppDb, projectId: string, ts: string): void {
+/** Moves the project to handoff_ready when the scope is complete. Returns true ON THE TRANSITION
+ *  only — the caller sends the installer handoff packet (installerHandoff.ts) after its
+ *  transaction commits, so a repeat reading on a handed-off project sends nothing. */
+function triggerHandoffIfReady(db: AppDb, projectId: string, ts: string): boolean {
   const project = db.get<ProjectRow>("SELECT * FROM projects WHERE id = ?", [projectId]);
-  if (!project) return;
+  if (!project) return false;
   // Already handed off: nothing to write, and the note/audit are written only on the transition.
   // (A correction arriving after handoff has already moved the status to correction_received
   // before this runs, so it is not caught here — and the predicate below refuses it.)
-  if (project.status === "handoff_ready") return;
-  if (handoffBlockers(db, mapProject(project)).length > 0) return;
+  if (project.status === "handoff_ready") return false;
+  if (handoffBlockers(db, mapProject(project)).length > 0) return false;
 
-  const mappedProject = mapProject(project);
-  const checklist = buildInstallerHandoffChecklist(mappedProject);
-  const noteBody = [
-    "✓ PERMIT ISSUED + NEM APPROVED — your submission scope is complete.",
-    "",
-    "Installer handoff checklist:",
-    ...checklist.map((line, i) => `${i + 1}. ${line}`),
-    "",
-    "No further action required from this platform unless a correction is received after final inspection.",
-  ].join("\n");
+  // The checklist is installerHandoff.ts's ONE copy: this note and the client's handoff email
+  // render the same lines.
+  const noteBody = installerHandoffNoteBody(mapProject(project));
 
   db.run("UPDATE projects SET status = 'handoff_ready', current_stage = ?, stage_detail = ?, updated_at = ? WHERE id = ?", [
     "Permit issued + NEM approved. Ready for installer handoff.",
@@ -7375,6 +7364,7 @@ function triggerHandoffIfReady(db: AppDb, projectId: string, ts: string): void {
     nemApproved: true,
     fromStatus: project.status,
   });
+  return true;
 }
 
 /**
