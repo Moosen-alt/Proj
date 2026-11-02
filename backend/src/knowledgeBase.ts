@@ -1649,7 +1649,9 @@ function classifyMboxBucket(value: string): { bucket: MboxEmailBucket; workflow:
   const lower = value.toLowerCase();
   const nem = /\b(nem|net meter|net-meter|interconnection|powerclerk|pto|permission to operate|customer generation|utility application|export|meter photo|inverter settings)\b/i.test(value);
   const permit = /\b(permit|building|electrical|inspection|inspector|plans examiner|ahj|jurisdiction|devhub|projectdox|epermitting|accela|energov)\b/i.test(value);
-  const correction = /\b(correction|required correction|deficien|rejected|revise|resubmit|review comments|not approved|failed review|plan check comments)\b/i.test(value);
+  // "Checksheet" is Portland's word for its correction letter ("A checksheet has been issued for your
+  // permit") — without it the letter's "issued" bucketed it as a permit approval (#522).
+  const correction = /\b(correction|required correction|deficien|rejected|revise|resubmit|review comments|not approved|failed review|plan check comments|check ?sheets?)\b/i.test(value);
   const approval = /\b(approved|approval|accepted|issued|ready to issue|ready for issue|permit issued|interconnection approved|application approved|pto granted|permission to operate)\b/i.test(value);
   const missingInfo = /\b(missing|incomplete|provide|please upload|please submit|required documents?|additional information|more information|cannot process|hold)\b/i.test(value);
   const fee = /\b(fee|fees|invoice|payment due|balance due|pay online|payment required|permit fee)\b/i.test(value);
@@ -1670,6 +1672,31 @@ function classifyMboxBucket(value: string): { bucket: MboxEmailBucket; workflow:
   if (status) return { bucket: "status_update", workflow, confidence: 0.74 };
   if (lower.trim()) return { bucket: "spam_irrelevant", workflow, confidence: 0.75 };
   return { bucket: "spam_irrelevant", workflow: "unknown", confidence: 0.99 };
+}
+
+/**
+ * DOES THIS EMAIL ASK THE APPLICANT FOR SOMETHING? (#522)
+ *
+ * The bucket classifier calls an email `missing_info_request` on loose words ("missing", "provide",
+ * "hold"), which a plain receipt can also carry ("if anything is missing we will contact you"). So
+ * the bucket alone is not enough to open a correction on a job — an email has to ASK, directly:
+ * "please upload / submit / resubmit / revise / correct", "information needed / required /
+ * requested", "we cannot process", "on hold pending". An ask led by a condition ("if", "should",
+ * "may") or a negation ("no documents are missing") never counts. Pure; regex only.
+ */
+const INFORMATION_ASK = /\b(?:please\s+(?:re-?upload|upload|submit|resubmit|revise|correct)|(?:additional\s+)?(?:information|documents?|documentation|items?)\s+(?:is\s+|are\s+)?(?:needed|required|requested|missing|outstanding)|(?:cannot|can\s?not|unable\s+to)\s+(?:process|proceed|continue)|on\s+hold\s+(?:pending|until)|placed\s+on\s+hold|(?:application|submittal|submission|package)\s+(?:is|was)\s+incomplete)\b/i;
+const CONDITIONAL_OR_NEGATED = /\b(?:if|should|may|might|in\s+case|whether|no|none|nothing)\b/i;
+
+export function emailAsksForInformation(text: string): boolean {
+  return String(text || "")
+    .split(/(?<=[.!?])\s+|\n+/)
+    .some((sentence) => {
+      const ask = INFORMATION_ASK.exec(sentence);
+      // Only what LEADS UP TO the ask can make it conditional or negated: "if more information is
+      // needed" / "no documents are missing" do not ask; "please upload it no later than Friday"
+      // and "please upload it; if you have questions, call" do.
+      return Boolean(ask) && !CONDITIONAL_OR_NEGATED.test(sentence.slice(0, ask!.index));
+    });
 }
 
 function correctionTaxonomy(value: string, bucket: MboxEmailBucket): { category: string | null; subcategory: string | null; requiredAction: string | null; docs: string[] } {

@@ -75,7 +75,7 @@ import { findCompleteRecipeForProject, findAnyRecipeForProject, resolveRecipeFie
 import { notServedInResult } from "../../shared/src/portalNotServed";
 import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier";
 import { notifyClientOfFiling } from "./clientFilingUpdate";
-import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStatusChange } from "./staffAlerts";
+import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStatusChange, alertStaffOnUnmatchedCorrectionEmail } from "./staffAlerts";
 import { installerHandoffNoteBody, sendInstallerHandoff } from "./installerHandoff";
 // detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget; the
 // card's Edit (updatePermitCheckTarget) re-detects with the same function when the URL changes.
@@ -147,6 +147,8 @@ import {
   importMboxKnowledge,
   importMboxKnowledgeFromFile,
   classifyMboxMessages,
+  emailAsksForInformation,
+  redactEmailText,
   isVerifiedKnowledge,
   type ClassifiedMboxMessage,
 } from "./knowledgeBase";
@@ -4694,13 +4696,43 @@ function matchProjectForEmail(
   };
 }
 
+/**
+ * IS THIS EMAIL A CORRECTION NOTICE (#522)? A correction or deficiency bucket always is; an
+ * information-request bucket is when the email directly ASKS for something (emailAsksForInformation
+ * — the bucket's own words are loose enough to catch a receipt). The one answer for both the
+ * reading's text (emailStatusText) and the unmatched-email alert.
+ */
+function emailIsCorrectionNotice(message: ClassifiedMboxMessage): boolean {
+  const bucket = message.record.type;
+  if (bucket === "permit_correction" || bucket === "nem_correction") return true;
+  return bucket === "missing_info_request" && emailAsksForInformation(message.rawSearchText);
+}
+
+/** The subject line alone, through the same redaction as the body (numbers, addresses, emails). */
+function redactEmailSubject(message: ClassifiedMboxMessage): string {
+  return redactEmailText(message.subject).slice(0, 240);
+}
+
 function emailStatusText(message: ClassifiedMboxMessage): string {
+  const infoRequest = message.record.type === "missing_info_request";
+  const asksForInformation = infoRequest && emailIsCorrectionNotice(message);
+  const unaskedInformationRequest = infoRequest && !asksForInformation;
   return [
     `Email bucket: ${message.record.type}`,
     message.record.workflow ? `Workflow: ${message.record.workflow}` : "",
     message.record.statusLabel ? `Status: ${message.record.statusLabel}` : "",
+    // An information request that never says "correction" ("please upload the signed owner form")
+    // read as needs_human_review: no correction, no due date, no client update (#522). Said here in
+    // words classifyPermitStatusText's correctionPattern already reads, so the reading takes the
+    // ONE correction path every other correction takes.
+    asksForInformation ? "Agency request: additional information requested." : "",
     message.record.requiredAction ? `Required action: ${message.record.requiredAction}` : "",
-    message.redactedText,
+    // AND THE OTHER WAY ROUND: an information-request email that does NOT ask ("if additional
+    // information is needed, we will contact you") used to open a correction anyway, because
+    // correctionPattern reads "additional information" / "incomplete" anywhere in the body. Its
+    // reading is the subject alone, so it lands as needs_human_review — a person looks — and the
+    // client is never told of a correction nobody asked for. The match row keeps the subject.
+    unaskedInformationRequest ? `Subject: ${redactEmailSubject(message)}` : message.redactedText,
   ].filter(Boolean).join("\n").slice(0, 5000);
 }
 
@@ -4784,6 +4816,18 @@ export async function runEmailTracker(
         const match = matchProjectForEmail(db, message, { orgId: sourceOrgId, clientId: sourceClientId });
         if (!match) {
           result.unmatchedMessages += 1;
+          // A CORRECTION NOBODY CAN PLACE STILL REACHES THE TEAM (#522). It used to be a count and
+          // nothing else. One alert per message (deduped by its signature — the inbox is re-read
+          // every poll), to this source's org only, carrying no email text (rule 2).
+          if (emailIsCorrectionNotice(message)) {
+            void alertStaffOnUnmatchedCorrectionEmail(db, {
+              orgId: sourceOrgId,
+              signature: message.sourceSignature,
+              from: message.from,
+              receivedAt: message.record.occurredAt,
+              bucket: message.record.type,
+            });
+          }
           continue;
         }
 

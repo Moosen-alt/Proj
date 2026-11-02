@@ -13,6 +13,8 @@
 //                       submitted_unconfirmed (ref = run id; a run ends once)
 //              correction  a correction notice was matched (ref = correction id)
 //              status   a permit/NEM tracking target's outcome changed (ref = target id)
+//              unmatched_email  a correction email matched no job (ref = the message's signature;
+//                       no project, so the org is the inbox source's) (#522)
 //            The dedupe is the newest staff_notifications row for (org, kind, ref): the same
 //            state there means this transition was already handled, so a re-entered writer or a
 //            re-poll sends nothing — the same idea as shouldNotifyClient, kept in the table so it
@@ -47,7 +49,7 @@ import { projectSecretValuesById } from "./projectSecrets";
 import { redactSecretValues } from "../../shared/src/portalSafety";
 import { configuredStaffOrgs, staffAlertChannels, staffDigestHour, type StaffAlertChannels } from "./staffAlertConfig";
 
-export type StaffAlertKind = "run" | "correction" | "status" | "digest";
+export type StaffAlertKind = "run" | "correction" | "status" | "digest" | "unmatched_email";
 
 /** Stage-run endings that need a person. awaiting_human_submit (staged cleanly, waiting for
  *  review) is deliberately absent: it is the expected end of a run and the digest carries it. */
@@ -291,6 +293,50 @@ export function alertStaffOnCorrection(db: AppDb, input: { projectId: string; co
     return recordAndSend(db, { orgId: facts.orgId, projectId: input.projectId, kind: "correction", ref: input.correctionId, state: "matched", subject, body });
   } catch (err) {
     logger.warn("staff-alert", `correction alert skipped: ${err instanceof Error ? err.message : String(err)}`);
+    return Promise.resolve();
+  }
+}
+
+const UNMATCHED_KIND: Record<string, string> = {
+  permit_correction: "permit correction",
+  nem_correction: "interconnection (NEM) correction",
+  missing_info_request: "request for more information",
+};
+
+/** The sender's DOMAIN only ("portlandoregon.gov") — never the mailbox or display name. */
+export function senderDomain(from: string): string {
+  const all = String(from || "").match(/@([a-z0-9.-]+\.[a-z]{2,})/gi);
+  return all?.length ? all[all.length - 1].slice(1).toLowerCase().replace(/\.+$/, "") : "unknown sender";
+}
+
+/**
+ * A correction email from the tracking inbox matched no job (#522) — it used to be counted and
+ * dropped. RULE 2 / no-homeowner-data: the alert carries the sender's domain, the date and the kind,
+ * in our own words — never the subject, the body, an address or a record number. The team finds the
+ * message in the inbox by sender and date. RULE 6: the org is the inbox SOURCE's (the tracker's
+ * scope), never a guess. Deduped per message signature, so the next poll's re-read sends nothing.
+ */
+export function alertStaffOnUnmatchedCorrectionEmail(
+  db: AppDb,
+  input: { orgId: string; signature: string; from: string; receivedAt: string | null; bucket: string },
+): Promise<void> {
+  try {
+    const domain = senderDomain(input.from);
+    const day = String(input.receivedAt || "").slice(0, 10) || "unknown date";
+    const kind = UNMATCHED_KIND[input.bucket] ?? "correction";
+    const base = (process.env.PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 4173}`).replace(/\/+$/, "");
+    const subject = `${BRAND} — needs you: a ${kind} email matched no job (${domain})`;
+    const body = [
+      `A ${kind} email came into the tracking inbox and could not be matched to any job.`,
+      `From: ${domain}`,
+      `Received: ${day}`,
+      "Why: it named no address, record number, account or meter that a job holds.",
+      "Next: find it in the tracking inbox by sender and date, open the job, and add the record or application number to its tracking so the next email matches on its own.",
+      `Open ${BRAND}: ${base}/`,
+    ].join("\n");
+    return recordAndSend(db, { orgId: input.orgId || DEFAULT_ORG_ID, projectId: null, kind: "unmatched_email", ref: input.signature, state: "unmatched", subject, body });
+  } catch (err) {
+    logger.warn("staff-alert", `unmatched email alert skipped: ${err instanceof Error ? err.message : String(err)}`);
     return Promise.resolve();
   }
 }
