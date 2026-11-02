@@ -54,6 +54,7 @@ import { createUser, getUserWorkload, listUsers, updateUser, assignProjectToUser
 import { listBackups, runBackup, startBackupScheduler } from "./backup";
 import { startArtifactRetention } from "./artifactRetention";
 import { startMonitorScheduler } from "./scheduler";
+import { startStaffDigestScheduler } from "./staffAlerts";
 import { startAhjFormRefreshScheduler, startKbLinkCheckScheduler } from "./ahjFormRefresh";
 import { startCecSyncScheduler, primeCecCache, syncCecEquipment } from "./cecEquipment";
 import { extractZipToWorkdir } from "./batchZip";
@@ -165,6 +166,7 @@ import {
 import { createSignatureRequestApproval } from "./signatureRequestApproval";
 import { confirmSignatureRequestSent } from "./signatureTrack";
 import { getSubmittalTracks, markTrackSubmitted } from "./submittalTracks";
+import { buildApprovalSheet } from "./approvalSheet";
 import { projectForTrack } from "./permitProcess";
 import { ahjProcessKnowledgeStatus, AHJ_PROCESS_REFERENCE_ENV } from "./processProfiles";
 import { enqueueStageSteps } from "./autoStageSteps";
@@ -3757,6 +3759,18 @@ app.get("/api/projects/:id/submittal-tracks", (req, res) => {
 
 const SUBMITTAL_TRACK_TYPES: SubmittalTrackType[] = ["nem", "building", "electrical", "combo", "permit", "mpu"];
 
+// THE APPROVAL SHEET (#486): what Approve & auto-submit is about to file for this track — the
+// replay's own values, account / meter masked to the last 4, every disagreement with the bill or the
+// plan set named first. A READ: it writes nothing and decides nothing; the approve request
+// (POST prepare-submission) and the gate are unchanged. Under /api/projects/:id, so the org scope
+// guard answers another org's project with a 404 before this handler runs (rule 6).
+app.get("/api/projects/:id/approval-sheet", (req, res) => {
+  const track = String(req.query.track ?? "").trim() as SubmittalTrackType;
+  if (!SUBMITTAL_TRACK_TYPES.includes(track)) throw new HttpError(400, `track must be one of ${SUBMITTAL_TRACK_TYPES.join(", ")}.`);
+  const detail = getProjectDetail(db, String(req.params.id));
+  res.json({ sheet: buildApprovalSheet(db, detail.project, track) });
+});
+
 // "I SENT THE SIGNATURE REQUEST" (#310): a named person clicked the utility portal's Request
 // Signatures themselves. Recorded with who and when; the NEM track then waits on the homeowner's
 // signature (signatureTrack). The name is the signed-in user's when auth is on, never the body's.
@@ -3922,6 +3936,7 @@ const server = app.listen(port, listen.host, () => {
   startBackupScheduler(db);
   startArtifactRetention();
   startMonitorScheduler(db);
+  startStaffDigestScheduler(db);
   startAhjFormRefreshScheduler(db);
   startKbLinkCheckScheduler(db);
   startCecSyncScheduler(db);

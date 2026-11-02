@@ -186,7 +186,9 @@ const PDF_REQUIRED_DOC_TYPES = new Set([
 
 // Slots that hold a photo or a scan. A PDF is fine here too — people scan the meter
 // tag and the utility bill to PDF constantly.
-const IMAGE_OR_PDF_DOC_TYPES = new Set(["meter_photo", "site_photo", "roof_photo", "utility_bill", "photo"]);
+// The issued permit and the utility's approval / PTO letter (#492): downloaded off the filed record
+// by the permit monitor, or attached by a person — a permit card is often a phone photo.
+const IMAGE_OR_PDF_DOC_TYPES = new Set(["meter_photo", "site_photo", "roof_photo", "utility_bill", "photo", "issued_permit", "utility_approval"]);
 
 // Where a native CAD file is allowed to live: as reference material an operator can
 // download, never as something the pipeline will try to read.

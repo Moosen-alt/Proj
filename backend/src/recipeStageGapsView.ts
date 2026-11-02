@@ -29,6 +29,23 @@ function stagingPortalType(db: AppDb, project: ProjectRecord, track: SubmittalTr
   return row?.portal_type ?? "mock";
 }
 
+/** THE REPLAY'S VALUE DICTIONARY FOR ONE TRACK, assembled the way prepareSubmission assembles it:
+ *  the track's issuer view, the client's staging overlay over its snapshot, then
+ *  resolveRecipeFieldValues. One helper so the track card (stage gaps) and the approval sheet
+ *  (#486) read the values the replay binds, never a second copy. Read-only. Throws on a read
+ *  failure; each caller decides how to fail. */
+export function stagingFieldValues(db: AppDb, project: ProjectRecord, track: SubmittalTrackType): {
+  portalProject: ProjectRecord; portalType: string; overlay: Record<string, string>; values: Record<string, string>;
+} {
+  const portalProject = projectForTrack(project, track);
+  const portalType = stagingPortalType(db, project, track);
+  const overlay = clientStagingOverlay(db, project.clientId ?? null, portalType, { state: String(project.state ?? ""), track });
+  const stagedProject = Object.keys(overlay).length > 0
+    ? { ...portalProject, parserSnapshot: { ...portalProject.parserSnapshot, ...overlay } }
+    : portalProject;
+  return { portalProject, portalType, overlay, values: resolveRecipeFieldValues(db, stagedProject, portalType, track) };
+}
+
 /** The gaps for one track's own complete recipe. [] when nothing is missing, or on any read
  *  failure (the card never blocks; the stage gate decides). */
 export function stageGapsForTrack(
@@ -36,13 +53,7 @@ export function stageGapsForTrack(
 ): RecipeStageGap[] {
   if (!recipe || !Array.isArray(recipe.steps) || !recipe.steps.length) return [];
   try {
-    const portalProject = projectForTrack(project, track);
-    const portalType = stagingPortalType(db, project, track);
-    const overlay = clientStagingOverlay(db, project.clientId ?? null, portalType, { state: String(project.state ?? ""), track });
-    const stagedProject = Object.keys(overlay).length > 0
-      ? { ...portalProject, parserSnapshot: { ...portalProject.parserSnapshot, ...overlay } }
-      : portalProject;
-    const values = resolveRecipeFieldValues(db, stagedProject, portalType, track);
+    const { portalProject, overlay, values } = stagingFieldValues(db, project, track);
     const binding = bindRecipeForReplay({
       steps: recipe.steps, portalUrl: recipe.portalUrl, project: portalProject, fieldValues: values, track,
       borrowed: null, agency: issuingAgencyFor(portalProject, track),
