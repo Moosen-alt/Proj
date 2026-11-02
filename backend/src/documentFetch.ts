@@ -123,6 +123,13 @@ export interface FetchPublicDocumentOptions {
   /** Injected for tests. Production uses the headed-Chromium launcher below. */
   launcher?: DocumentBrowserLauncher;
   userAgent?: string;
+  /** THE CALLER'S OWN DOOR, asked of the URL and of EVERY redirect hop before it is requested:
+   *  a refusal (do not go there) or null. The permit monitor's issued-document fetch passes rule
+   *  5's track predicate and "the record's own portal" here (portalIssuedDocuments.ts), so a hop
+   *  onto the other track's portal is refused before anything is sent to it, exactly as a private
+   *  address is. Setting it also forbids the browser rung: a window follows its own redirects,
+   *  and only publicUrlGuard is wired into it. */
+  allowUrl?: (url: string) => string | null;
 }
 
 // A current desktop Chrome. The point of the first rung is to look like what a person uses;
@@ -262,9 +269,14 @@ interface HttpAttempt {
   /** The URL the guard refused (the first one, or a redirect hop). Nothing was sent to it. */
   refusedUrl?: string;
   refusal?: string;
+  /** The refusal was the caller's allowUrl, not a private address. */
+  callerRefused?: boolean;
 }
 
-async function httpAttempt(url: string, opts: { timeoutMs: number; userAgent: string; maxBytes: number }): Promise<HttpAttempt> {
+async function httpAttempt(
+  url: string,
+  opts: { timeoutMs: number; userAgent: string; maxBytes: number; allowUrl?: (url: string) => string | null },
+): Promise<HttpAttempt> {
   const blank: HttpAttempt = { status: 0, contentType: "", server: "", bytes: new Uint8Array(0), finalUrl: url };
   // ONE deadline for the whole chain, as fetch's own redirect:"follow" had.
   const signal = AbortSignal.timeout(opts.timeoutMs);
@@ -275,6 +287,9 @@ async function httpAttempt(url: string, opts: { timeoutMs: number; userAgent: st
       // host answering 302 Location: http://169.254.169.254/ took the server there (#391).
       const refusal = await publicUrlRefusal(current);
       if (refusal) return { ...blank, finalUrl: current, refusedUrl: current, refusal };
+      // The caller's own door, asked of the same URL at the same moment (allowUrl).
+      const callerRefusal = opts.allowUrl ? opts.allowUrl(current) : null;
+      if (callerRefusal) return { ...blank, finalUrl: current, refusedUrl: current, refusal: callerRefusal, callerRefused: true };
       // ...AND AGAIN AT CONNECT TIME (#407): the check above and the connection are two lookups,
       // so the connection goes through a dispatcher that judges the addresses it dials.
       const res = await fetch(current, {
@@ -353,7 +368,21 @@ export async function fetchPublicDocument(url: string, opts: FetchPublicDocument
   const maxBytes = opts.maxBytes ?? DEFAULT_MAX_BYTES;
   const userAgent = opts.userAgent || BROWSER_UA;
 
-  const attempt = await httpAttempt(checked.url.toString(), { timeoutMs, userAgent, maxBytes });
+  const attempt = await httpAttempt(checked.url.toString(), { timeoutMs, userAgent, maxBytes, allowUrl: opts.allowUrl });
+
+  if (attempt.refusedUrl && attempt.callerRefused) {
+    // Not a private address: a place the caller's own door does not open onto. Nothing was sent.
+    return {
+      ok: false,
+      status: 0,
+      contentType: "",
+      via: "http",
+      reason: attempt.refusedUrl === checked.url.toString()
+        ? `Refused: ${attempt.refusal}`
+        : `Refused: ${checked.url.host} redirected to ${attempt.refusedUrl}. ${attempt.refusal}`,
+      finalUrl: attempt.refusedUrl,
+    };
+  }
 
   if (attempt.refusedUrl) {
     // Not a network failure and not a wall: the server will not go there. No browser either —
@@ -440,7 +469,7 @@ export async function fetchPublicDocument(url: string, opts: FetchPublicDocument
   }
 
   const blocked = `${describeStatus(attempt.status, attempt.server)} from ${checked.url.host} — the site refused an ordinary HTTP client`;
-  const browserAllowed = opts.allowBrowser !== false && process.env.DOCUMENT_FETCH_BROWSER !== "0";
+  const browserAllowed = opts.allowBrowser !== false && !opts.allowUrl && process.env.DOCUMENT_FETCH_BROWSER !== "0";
   if (!browserAllowed) {
     return {
       ok: false,

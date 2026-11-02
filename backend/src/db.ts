@@ -1077,6 +1077,33 @@ function migrate(db: AppDb): void {
       ON portal_fee_readings(project_id, target_id, source_kind);
   `);
 
+  // THE ISSUED PERMIT AND THE UTILITY'S APPROVAL LETTER, DOWNLOADED OFF THE FILED RECORD by the
+  // permit monitor once the record reads issued / approved (portalIssuedDocuments.ts, #492). One
+  // row per document attached: which record it came from, the URL, when, and the file's sha256 —
+  // the hash is what makes a re-read attach nothing new. The file itself is a project_documents
+  // row (document_id). Per-target "why nothing was attached" lives on permit_check_targets
+  // (issued_docs_gap), beside read_gap. The legacy idempotent idiom on purpose (see above).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS portal_record_documents (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      target_id TEXT NOT NULL DEFAULT '',
+      track TEXT NOT NULL DEFAULT 'permit',
+      doc_type TEXT NOT NULL DEFAULT '',
+      document_id TEXT NOT NULL DEFAULT '',
+      record_number TEXT NOT NULL DEFAULT '',
+      source_url TEXT NOT NULL DEFAULT '',
+      link_text TEXT NOT NULL DEFAULT '',
+      sha256 TEXT NOT NULL DEFAULT '',
+      fetched_at TEXT NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_portal_record_documents_hash
+      ON portal_record_documents(project_id, sha256);
+  `);
+  addColumnIfMissing(db, "permit_check_targets", "issued_docs_gap", "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, "permit_check_targets", "issued_docs_checked_at", "TEXT");
+
   runVersionedMigrations(db);
   healStructuralLetterColumns(db);
 
