@@ -328,6 +328,12 @@ export function clientUpdateFor(
     // THE CLOSEOUT (#497). Recorded by a person (or the finals / PTO automation) through
     // clientTimeline.recordProjectMilestone, never read off a portal. None of the three promises a
     // date: there is no measured history for these steps yet, and a client books around it.
+    //
+    // WHO REQUESTS PTO: the installer, for now (owner, 2026-11-02: "to start they request pto").
+    // The handoff packet's checklist already tells them to send the signed final inspection card to
+    // the utility, so these two say the same thing: after the final passes the next move is THEIRS,
+    // and the "requested" update never claims we sent it. Revisit when the PTO package (#496) files
+    // it for them.
     case "final_passed":
       return {
         subject: "Final inspection passed",
@@ -336,13 +342,15 @@ export function clientUpdateFor(
         meaning: text(project.utility)
           ? `That closes out the permit. The last step is ${utility}'s permission to operate.`
           : "That closes out the permit.",
-        action: "Nothing needed from you. We will tell you if anything is needed for the next step.",
+        action: text(project.utility)
+          ? `Next for you: send the signed final inspection card to ${utility} to request permission to operate, and let us know when it has gone in.`
+          : "Nothing needed from you.",
       };
 
     case "pto_requested":
       return {
         subject: "Permission to operate requested",
-        headline: `We have asked ${utility} for permission to operate.`,
+        headline: `Permission to operate has been requested from ${utility}.`,
         // The sentence that saves a phone call AND a problem: an installed system is not a
         // system the homeowner may switch on.
         meaning: "The system stays off until they grant it.",
@@ -397,7 +405,7 @@ export function clientUpdateEmailBody(
     "",
     `Live status page (no login needed): ${opts.link}`,
     "",
-    "— Solar Submission Autopilot (automated update; reply to reach the team)",
+    `— ${BRAND} (automated update; reply to reach the team)`,
   ].join("\n");
 }
 

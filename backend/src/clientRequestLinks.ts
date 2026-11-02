@@ -248,7 +248,7 @@ export function intakeEmail(
     ...(link ? [`Answer here (secure link, no login needed): ${link}`, ""] : []),
     ...(needs.bill.length
       ? [
-          "Please send the bill to your Keelix coordinator the way you send plan sets. We read the account and meter numbers from the bill itself, so please do not type them into an email.",
+          `Please send the bill to your ${BRAND} coordinator the way you send plan sets. We read the account and meter numbers from the bill itself, so please do not type them into an email.`,
           "",
         ]
       : []),

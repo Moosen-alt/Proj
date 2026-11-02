@@ -62,7 +62,7 @@ export function installerHandoffChecklist(project: ProjectRecord): string[] {
     `RAPID SHUTDOWN: Label all rapid shutdown devices per approved plans before inspection.`,
     `FINAL INSPECTION: Schedule with ${project.ahj || "AHJ"}. Inspector will verify install matches approved plans.`,
     `AFTER INSPECTION PASSES: Send a copy of the signed final inspection card to ${project.utility || "the utility"} to trigger Permission to Operate (PTO).`,
-    `PTO: Utility will issue PTO once inspection record is received. Timeline varies (typically 1–5 business days).`,
+    `PTO: Utility will issue PTO once inspection record is received. Timeline varies by utility.`,
     `SYSTEM SIZE: ${size} — verify AC output at inverter matches NEM application.`,
     project.interconnectionMethod ? `INTERCONNECTION: ${project.interconnectionMethod}` : "",
     `HOMEOWNER: Notify ${project.homeownerName || "homeowner"} that the system can be energized only after PTO is received.`,
@@ -246,7 +246,9 @@ export async function sendInstallerHandoff(
       `Closeout for your solar project at ${address || "the project site"}:`,
       "",
       update.headline,
-      update.meaning,
+      // The portal note's meaning line says the packet "goes to your updates inbox by email";
+      // inside that very email it points at what follows instead.
+      "Our filing work on it is complete. Below are the approvals with their reference numbers, the issued documents we have on file and the steps to permission to operate.",
       "",
       "Approved:",
       ...(approved.length ? approved.map((l) => `- ${l}`) : ["- The permit and the interconnection (see the status page for each filing)."]),
@@ -266,7 +268,7 @@ export async function sendInstallerHandoff(
       "",
       `Live status page (no login needed): ${link}`,
       "",
-      "— Solar Submission Autopilot (automated update; reply to reach the team)",
+      `— ${BRAND} (automated update; reply to reach the team)`,
     ].join("\n");
     const subject = redactSecretValues(rawSubject, secrets);
     const body = redactSecretValues(rawBody, secrets);

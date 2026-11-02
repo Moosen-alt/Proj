@@ -230,7 +230,7 @@ await check("(g) each client-facing milestone sends ONE client update; 'installe
   await settle();
   const notes = clientNotes(job.id);
   assert.equal(notes.filter((b) => /passed the final inspection/.test(b)).length, 1, notes.join("\n"));
-  assert.equal(notes.filter((b) => /asked Pacific Power for permission to operate/.test(b)).length, 1, notes.join("\n"));
+  assert.equal(notes.filter((b) => /Permission to operate has been requested from Pacific Power/.test(b)).length, 1, notes.join("\n"));
   assert.equal(notes.filter((b) => /Pacific Power has granted permission to operate/.test(b)).length, 1, notes.join("\n"));
   assert.ok(!notes.some((b) => /install/i.test(b) && !/permission|final/i.test(b)), `an 'installed' update was sent: ${notes.join("\n")}`);
   const emails = db.query<{ subject: string; delivery_status: string }>(
@@ -238,6 +238,14 @@ await check("(g) each client-facing milestone sends ONE client update; 'installe
   );
   assert.equal(emails.length, 1, "the email channel carries the same one update");
   assert.equal(emails[0].delivery_status, "draft", "SMTP unset → a draft, like every other client update");
+  // The installer requests PTO for now (owner, 2026-11-02): the final-passed update hands them that
+  // step, matching the handoff checklist, and every client email signs off with the brand.
+  assert.ok(notes.some((b) => /send the signed final inspection card to Pacific Power to request permission to operate/.test(b)), notes.join("\n"));
+  assert.ok(!notes.some((b) => /We have asked .* for permission to operate/.test(b)), "the PTO update must not claim we requested it");
+  const finalBody = String(db.get<{ body: string }>(
+    "SELECT body FROM communications WHERE project_id = ? AND subject LIKE '%Final inspection passed%'", [job.id])?.body ?? "");
+  assert.match(finalBody, /\n— Keelix \(automated update; reply to reach the team\)$/, finalBody);
+  assert.doesNotMatch(finalBody, /Solar Submission Autopilot/);
 
   recordProjectMilestone(db, job.id, { milestone: "final_passed", at: "2026-10-30", recordedBy: "pm@keelix.test", now: NOW });
   clearProjectMilestone(db, job.id, "pto_granted", "pm@keelix.test");
@@ -292,11 +300,14 @@ await check("(j) RULE 2: no record number, account/meter value, portal text or i
   assert.ok(!clientNotes(job.id).some((b) => b.includes(PM_NOTE)), "an internal note became a client update");
 });
 
-await check("(k) the wording: three closeout updates, each answering 'anything needed from me'; none for 'installed'; none in the monitor's gate", () => {
+await check("(k) the wording: three closeout updates, each answering 'anything needed from me' (final passed: the PTO request is theirs); none for 'installed'; none in the monitor's gate", () => {
   const project = getProjectDetail(db, job.id).project;
   for (const m of ["final_passed", "pto_requested", "pto_granted"]) {
     const u = clientUpdateFor(db, project, m, { targetType: m === "final_passed" ? "permit" : "nem" });
-    assert.ok(u && u.headline && u.meaning && /^Nothing needed from you/.test(u.action), `${m}: ${JSON.stringify(u)}`);
+    // final_passed hands the installer the PTO request (they file it for now, owner 2026-11-02);
+    // the other two need nothing from the client.
+    const expected = m === "final_passed" ? /^Next for you: send the signed final inspection card/ : /^Nothing needed from you/;
+    assert.ok(u && u.headline && u.meaning && expected.test(u.action), `${m}: ${JSON.stringify(u)}`);
     assert.ok(!(CLIENT_FACING_OUTCOMES as readonly string[]).includes(m), `${m} is in the monitor's reading gate`);
   }
   assert.equal(clientUpdateFor(db, project, "installed", { targetType: "permit" }), null);
