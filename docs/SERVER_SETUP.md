@@ -152,9 +152,12 @@ Env: `BACKUP_DIR`, `BACKUP_KEEP` (snapshots, default 14), `BACKUP_INTERVAL_HOURS
   `POST /api/auth/password {"currentPassword","newPassword"}`.
   The older `POST /api/orgs/:id/users {"email","name","password"}` still works.
   Passwords hashed; API keys sha256 + shown once.
-- A password reset does not end a session already open elsewhere (sessions are
-  signed cookies, up to AUTH_SESSION_HOURS). To cut someone off at once,
-  deactivate the login.
+- Sessions are signed cookies that last up to AUTH_SESSION_HOURS, and each one
+  ends early, on every device, when that person's password is changed or reset
+  or their login is switched off. A self-change keeps the device it was made on
+  signed in. Anyone can also press **Sign out everywhere** (Team → Change my
+  password section, `POST /api/auth/logout-everywhere`) to end every session
+  they have, this one included: the lost-laptop button.
 - Assign projects per user (`projects.assigned_user_id`, dashboard selector).
 - `/api/auth/login` / `/api/auth/logout`; everything else 401s without a
   session or `x-api-key`.
@@ -176,6 +179,27 @@ The human "record this portal" capture runs on an operator's LOCAL machine
 (needs a visible browser) and talks to the server API — set the server URL in
 the record command the dashboard generates. Learning/staging runs headless on
 the server itself.
+
+With sign-in on (`AUTH_ENABLED=true`) the recorder needs the person's own
+**recorder token** (#433):
+
+1. In the dashboard: **Team → Recorder tokens → Make a recorder token**. It is
+   shown once (the server keeps only a hash), lasts 30 days by default (at most
+   90), and can be revoked there. Switching a person's login off stops their
+   tokens too.
+2. On the recording computer, put it in `RECORDER_TOKEN` before running the
+   command (`set RECORDER_TOKEN=…` on Windows, `export RECORDER_TOKEN=…`
+   elsewhere). The downloaded `record-portal.bat` asks for it. `--token` works
+   too, but the shell history keeps it.
+3. Behind Cloudflare Access, also set `CF_ACCESS_CLIENT_ID` and
+   `CF_ACCESS_CLIENT_SECRET` to an Access **service token** (or
+   `--cf-access-client-id` / `--cf-access-client-secret`).
+
+A recorder token reaches only the recorder's four endpoints (start a recording,
+read the recording project's field values, suggest bindings, save the steps),
+as its person: audit rows name them. It can never stage, approve or submit a
+filing, administer anything, or mint another token. With sign-in off nothing
+changes and no token is needed.
 
 ## Stripe — collecting client payments (per-submission billing)
 

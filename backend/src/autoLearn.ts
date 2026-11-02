@@ -1138,8 +1138,9 @@ async function autoLearnPortalInner(
   // it will not talk to. So a run blocked that way is retried ONCE with a real window.
   //
   // Only for a bot block: a genuine 403 from an auth failure, a dead host, or any other
-  // error retries nothing. And only where a display exists — set PORTAL_HEADED_RETRY=0 on a
-  // server, where a headed launch cannot work and the retry would just cost time.
+  // error retries nothing. And only where a display exists: the Docker image brings its own
+  // virtual one (Xvfb, scripts/docker-entrypoint.sh, #434); on a bare server with no display set
+  // PORTAL_HEADED_RETRY=0, where a headed launch cannot work and the retry would just cost time.
   let headlessForAttempt = input.headless;
   let headedRetryUsed = false;
   // #344 — THE INFORMATION-PAGE PASS IS PER autoLearnPortal CALL, NOT PER ATTEMPT (round 2). Before

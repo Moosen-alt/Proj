@@ -76,6 +76,14 @@ const UNSCOPED_BY_DESIGN: Record<string, string> = {
   // so the handler itself refuses a request with no session (asserted below) and only ever
   // touches the signed-in user's own row.
   "/api/auth/password": "self-service: the handler requires a session and changes only that user's own password",
+  // "Sign out everywhere" (#432). Same shape as /api/auth/password: the handler refuses a request
+  // with no session (asserted below) and bumps only the signed-in user's own session version.
+  "/api/auth/logout-everywhere": "self-service: the handler requires a session and ends only that user's own sessions",
+  // Recorder tokens (#433). Under /api/auth/ like the password change, so each handler is the gate
+  // (requireRecorderTokenOwner: a session, never a recorder token) and reads/writes only the
+  // caller's OWN tokens; another person's token id is a 404 inside recorderTokens.ts.
+  "/api/auth/recorder-tokens": "self-service: requireRecorderTokenOwner requires a session; lists/mints only the caller's own tokens",
+  "/api/auth/recorder-tokens/:id": "self-service: requireRecorderTokenOwner requires a session; revokeRecorderToken 404s on another person's token",
 
   // Staff logins (#431): admin-gated (requireStaffAdmin = sign-in on + requireAdmin) and scoped
   // INSIDE staffLogins.ts to the acting admin's own org, where another org's id is a 404.
@@ -268,12 +276,50 @@ run(
     /function requireStaffAdmin\(req: Request\)[\s\S]{0,300}!AUTH_ENABLED[\s\S]{0,200}requireAdmin\(req\)/.test(source),
     "requireStaffAdmin must check AUTH_ENABLED and call requireAdmin",
   );
-  const start = source.indexOf('app.post("/api/auth/password"');
-  const body = start < 0 ? "" : source.slice(start, source.indexOf("\napp.", start + 10));
+  for (const selfRoute of ["/api/auth/password", "/api/auth/logout-everywhere"]) {
+    const start = source.indexOf(`app.post("${selfRoute}"`);
+    const body = start < 0 ? "" : source.slice(start, source.indexOf("\napp.", start + 10));
+    run(
+      `POST ${selfRoute} refuses without a session`,
+      /const user = currentUser\(db, req\);\s*if \(!user\) throw new HttpError\(401/.test(body),
+      body.slice(0, 300),
+    );
+  }
+}
+
+// RECORDER TOKENS (#433). Exempted above by name: every /api/auth/recorder-tokens route goes
+// through requireRecorderTokenOwner, which refuses with sign-in off and without a session, and
+// refuses a request a recorder token authenticated.
+{
+  const tokenRoutes = apiRoutes.filter((r) => r.path.startsWith("/api/auth/recorder-tokens"));
+  run("the recorder-token routes are registered", tokenRoutes.length >= 3, JSON.stringify(tokenRoutes));
+  for (const route of tokenRoutes) {
+    const start = source.indexOf(`app.${route.verb}("${route.path}"`);
+    const body = start < 0 ? "" : source.slice(start, source.indexOf("\napp.", start + 10));
+    run(`${route.verb.toUpperCase()} ${route.path} requires the token's owner session`, /requireRecorderTokenOwner\(req\)/.test(body), body.slice(0, 300));
+  }
+  // The routes a recorder token reaches (recorderTokens.RECORDER_ROUTES) are exactly four, each an
+  // existing registration in server.ts under the same verb. A renamed route must take its entry
+  // along; a fifth entry is a widening of what a token reaches and shows up here in review.
+  const tokenSource = fs.readFileSync(path.resolve(process.cwd(), "backend/src/recorderTokens.ts"), "utf8");
+  const reach = [...tokenSource.matchAll(/\{ method: "([A-Z]+)", route: "([^"]+)", pattern:/g)].map((m) => ({ verb: m[1].toLowerCase(), path: m[2] }));
   run(
-    "POST /api/auth/password refuses without a session",
-    /const user = currentUser\(db, req\);\s*if \(!user\) throw new HttpError\(401/.test(body),
-    body.slice(0, 300),
+    "a recorder token reaches exactly the four recorder routes",
+    JSON.stringify(reach.map((r) => `${r.verb} ${r.path}`).sort()) === JSON.stringify([
+      "get /api/projects/:id/staging-field-values",
+      "post /api/portal-recipes/:id/suggest-bindings",
+      "post /api/portal-recipes/record",
+      "put /api/portal-recipes/:id/steps",
+    ]),
+    JSON.stringify(reach),
+  );
+  for (const r of reach) {
+    run(`recorder route ${r.verb.toUpperCase()} ${r.path} is registered in server.ts`, apiRoutes.some((a) => a.verb === r.verb && a.path === r.path), "");
+  }
+  run(
+    "requireRecorderTokenOwner refuses with sign-in off, without a session, and for a recorder-token principal",
+    /function requireRecorderTokenOwner\(req: Request\)[\s\S]{0,200}!AUTH_ENABLED[\s\S]{0,250}currentUser\(db, req\);\s*if \(!user \|\| recorderPrincipal\(req\)\) throw new HttpError\(401/.test(source),
+    "requireRecorderTokenOwner must check AUTH_ENABLED, require currentUser, and refuse a recorderPrincipal",
   );
 }
 

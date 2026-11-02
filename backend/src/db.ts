@@ -2645,6 +2645,36 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       `);
     },
   },
+  // v52 sits here, beside v51 (the other shared-server #429 migration), not at the end of the list,
+  // so parallel PRs appending there don't collide on the same lines.
+  {
+    version: 52,
+    name: "recorder_tokens",
+    up: (db) => {
+      // PER-USER RECORDER TOKENS (#433, shared server #429). The portal recorder CLI runs on a
+      // person's own computer and posts to the server; with sign-in on, it has no cookie. A signed-in
+      // person mints a token here (recorderTokens.ts): shown ONCE, stored as sha256 only, expiring
+      // (default 30 days), revocable. It authenticates ONLY the recorder's four endpoints
+      // (RECORDER_ROUTES), as that person, so the audit trail names who recorded. It reaches an org
+      // through its user (users.org_id), so no org_id column here (CLAUDE.md tenancy model).
+      // revoked_at / last_used_at are '' when unset; rows are never deleted, so the history stays.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS recorder_tokens (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          name TEXT NOT NULL DEFAULT '',
+          token_hash TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          revoked_at TEXT NOT NULL DEFAULT '',
+          revoked_by TEXT NOT NULL DEFAULT '',
+          last_used_at TEXT NOT NULL DEFAULT '',
+          FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recorder_tokens_user ON recorder_tokens(user_id);
+      `);
+    },
+  },
   {
     version: 45,
     name: "jurisdiction_design_observations_precedents",
@@ -2750,6 +2780,21 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
           armed_at TEXT NOT NULL DEFAULT ''
         );
       `);
+    },
+  },
+  {
+    version: 53,
+    name: "users_session_version",
+    up: (db) => {
+      // REVOCABLE SIGN-IN SESSIONS (#432, shared server #429). Every session cookie carries the
+      // session_version it was issued under, and currentUser accepts it only while the user's row
+      // still holds that number. A password change or reset (setUserPassword, in the same UPDATE
+      // as the hash), a deactivation or reactivation, and "Sign out everywhere" bump it
+      // (auth.ts bumpSessionVersion), so every older cookie stops working on its next request.
+      // Default 0 is also what a cookie minted before this migration reads as (it has no version
+      // field), so the deploy signs nobody out; the user's first bump ends it like any other.
+      // users is CREATEd in the base schema, so this addColumnIfMissing comes after it.
+      addColumnIfMissing(db, "users", "session_version", "INTEGER NOT NULL DEFAULT 0");
     },
   },
 ];

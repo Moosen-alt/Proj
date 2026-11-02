@@ -16,6 +16,13 @@
  *     --project <projectId> --profile ./.portal-profiles/accela \
  *     [--api http://localhost:4173] [--platform Accela]
  *
+ * Recording to a SHARED SERVER with sign-in on (#433): make a recorder token in the dashboard
+ * (Team, Recorder tokens) and put it in the RECORDER_TOKEN environment variable (or --token, which
+ * your shell history keeps — the variable is better). When the server sits behind Cloudflare
+ * Access, also set CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET (a service token your admin
+ * gives you; or --cf-access-client-id / --cf-access-client-secret). With sign-in off none of these
+ * are needed and nothing changes.
+ *
  * Delete / re-record from the dashboard (Portal Recipes admin) if one wasn't completed.
  */
 import path from "node:path";
@@ -175,9 +182,74 @@ export function finalizeRecordedSteps(steps: ReadonlyArray<RecipeStep>): RecipeS
   return terminal ? [...body, review, terminal] : [...body, review];
 }
 
+function argFrom(argv: readonly string[], name: string, fallback = ""): string {
+  const i = argv.indexOf(`--${name}`);
+  return i >= 0 && argv[i + 1] ? String(argv[i + 1]) : fallback;
+}
+
 function arg(name: string, fallback = ""): string {
-  const i = process.argv.indexOf(`--${name}`);
-  return i >= 0 && process.argv[i + 1] ? String(process.argv[i + 1]) : fallback;
+  return argFrom(process.argv, name, fallback);
+}
+
+/** How the recorder authenticates to the server (#433). Every field may be empty (sign-in off). */
+export interface RecorderServerAuth {
+  /** The person's recorder token, minted in the dashboard. Sent as x-recorder-token. */
+  token: string;
+  /** A Cloudflare Access service token, when the server sits behind Access. */
+  cfAccessClientId: string;
+  cfAccessClientSecret: string;
+}
+
+/** Flags win over the environment; the environment is the recommended place (no shell history). */
+export function readRecorderServerAuth(argv: readonly string[], env: Record<string, string | undefined>): RecorderServerAuth {
+  return {
+    token: argFrom(argv, "token", env.RECORDER_TOKEN || "").trim(),
+    cfAccessClientId: argFrom(argv, "cf-access-client-id", env.CF_ACCESS_CLIENT_ID || "").trim(),
+    cfAccessClientSecret: argFrom(argv, "cf-access-client-secret", env.CF_ACCESS_CLIENT_SECRET || "").trim(),
+  };
+}
+
+/**
+ * The headers every call to the server carries. Nothing is added for an empty field, so with
+ * sign-in off (no token) the requests are exactly what they were before #433. The Access pair is
+ * sent only as a pair: half of one is refused by Cloudflare anyway, and sending it would only
+ * leak the half that was set.
+ */
+export function recorderRequestHeaders(auth: RecorderServerAuth, opts: { json?: boolean } = {}): Record<string, string> {
+  const headers: Record<string, string> = {};
+  if (opts.json) headers["content-type"] = "application/json";
+  if (auth.token) headers["x-recorder-token"] = auth.token;
+  if (auth.cfAccessClientId && auth.cfAccessClientSecret) {
+    headers["CF-Access-Client-Id"] = auth.cfAccessClientId;
+    headers["CF-Access-Client-Secret"] = auth.cfAccessClientSecret;
+  }
+  return headers;
+}
+
+/** True when a token would cross the network in plain text (http:// to a host that is not this machine). */
+export function tokenWouldTravelInPlainText(api: string, auth: RecorderServerAuth): boolean {
+  if (!auth.token && !auth.cfAccessClientSecret) return false;
+  try {
+    const u = new URL(api);
+    if (u.protocol !== "http:") return false;
+    const host = u.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    return !(host === "localhost" || host === "::1" || /^127\./.test(host));
+  } catch {
+    return false;
+  }
+}
+
+/** What to tell the person when the server refuses the recorder (401/403), naming the fix. */
+export function explainServerRefusal(status: number, auth: RecorderServerAuth): string {
+  if (status === 401) {
+    return auth.token
+      ? "The server refused your recorder token (unknown, revoked or expired, or your login is switched off). Make a new one in the dashboard (Team, Recorder tokens) and set RECORDER_TOKEN to it."
+      : "The server has sign-in on. Make a recorder token in the dashboard (Team, Recorder tokens) and set the RECORDER_TOKEN environment variable to it, then run this again.";
+  }
+  if (status === 403 && !(auth.cfAccessClientId && auth.cfAccessClientSecret)) {
+    return "The server refused the request. If it sits behind Cloudflare Access, set CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET (ask your admin for the service token).";
+  }
+  return "";
 }
 
 async function main(): Promise<void> {
@@ -192,20 +264,29 @@ async function main(): Promise<void> {
   const api = arg("api", process.env.API_BASE || "http://localhost:4173");
   if (scope === "ahj" && !ahj) throw new Error("--ahj is required for an AHJ recipe.");
   if (scope === "utility" && !utility) throw new Error("--utility is required for a utility recipe.");
+  // Recorder token + optional Cloudflare Access service token (#433). All empty with sign-in off.
+  const auth = readRecorderServerAuth(process.argv, process.env);
+  if (tokenWouldTravelInPlainText(api, auth)) {
+    console.warn(`WARNING: ${api} is plain http://, so your token crosses the network unencrypted. Use the server's https:// address.`);
+  }
+  const refused = async (what: string, res: Response): Promise<Error> => {
+    const hint = explainServerRefusal(res.status, auth);
+    return new Error(`${what}: ${res.status} ${await res.text()}${hint ? `\n${hint}` : ""}`);
+  };
 
   // 1) Start (or reset) the recording row + fetch the recording project's field values
   //    so we can auto-bind typed values to their field key.
   const startRes = await fetch(`${api}/api/portal-recipes/record`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: recorderRequestHeaders(auth, { json: true }),
     body: JSON.stringify({ scopeType: scope, ahj, utility, state, portalPlatform: platform, portalUrl: url }),
   });
-  if (!startRes.ok) throw new Error(`Failed to start recording: ${startRes.status} ${await startRes.text()}`);
+  if (!startRes.ok) throw await refused("Failed to start recording", startRes);
   const recipe = await startRes.json();
 
   let fieldValues: Record<string, string> = {};
   if (projectId) {
-    const fvRes = await fetch(`${api}/api/projects/${projectId}/staging-field-values`);
+    const fvRes = await fetch(`${api}/api/projects/${projectId}/staging-field-values`, { headers: recorderRequestHeaders(auth) });
     if (fvRes.ok) fieldValues = (await fvRes.json()).fieldValues ?? {};
   }
   // Reverse map: normalized value -> field key (longest values first to avoid collisions).
@@ -265,7 +346,7 @@ async function main(): Promise<void> {
       try {
         const suggestRes = await fetch(`${api}/api/portal-recipes/${recipe.id}/suggest-bindings`, {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: recorderRequestHeaders(auth, { json: true }),
           body: JSON.stringify({ steps: closed, projectId }),
         });
         if (suggestRes.ok) {
@@ -283,10 +364,10 @@ async function main(): Promise<void> {
 
   const saveRes = await fetch(`${api}/api/portal-recipes/${recipe.id}/steps`, {
     method: "PUT",
-    headers: { "content-type": "application/json" },
+    headers: recorderRequestHeaders(auth, { json: true }),
     body: JSON.stringify({ steps: finalSteps, status: "complete" }),
   });
-  if (!saveRes.ok) throw new Error(`Failed to save recipe: ${saveRes.status} ${await saveRes.text()}`);
+  if (!saveRes.ok) throw await refused("Failed to save recipe", saveRes);
   const boundCount = finalSteps.filter((s: RecipeStep) => s.field).length;
   console.log(`\nSaved ${finalSteps.length} step(s) to recipe ${recipe.id} (${boundCount} data-bound). Set any UPLOAD docTypes in the dashboard, then the bot will replay it.`);
   process.exit(0);

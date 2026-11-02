@@ -275,6 +275,19 @@ await check("(d) an approved run the gate declined carries the gate's reasons fo
 });
 
 // ── (c) the route, on a real server with sign-in off ─────────────────────────────────────────
+// EVERY FIXTURE IS WRITTEN BEFORE THE SERVER EXISTS (#471). The spawned server and this process
+// share one SQLite file, and the server keeps writing after each 202 (processNextJob runs the job
+// off the request path). A write from here that starts as a read (createProject, the operator
+// hold) then fails at once with "database is locked": SQLite does not wait on busy_timeout when a
+// read transaction must become a write after another connection committed. So this process only
+// READS once the server is up, and each read retries a transient SQLITE_BUSY.
+// A project an early gate refuses before any browser (an operator hold), so no run opens anything.
+const held = () => {
+  const pid = fx.newProject();
+  repo.setProjectStatusByOperator(db, pid, "blocked", "waiting on the homeowner", "operator");
+  return pid;
+};
+const heldFor = { c1: held(), c2: held(), c3: held() };
 const dbPath = String(process.env.AUTOPILOT_DB_PATH);
 const PORT = 5380 + Math.floor(Math.random() * 15); // never 4173 / 4270
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -299,49 +312,54 @@ try {
     await new Promise((r) => setTimeout(r, 1000));
   }
   const post = (p: string, body: Record<string, unknown>) => fetch(`${BASE}${p}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-  // A project an early gate refuses before any browser (an operator hold), so no run opens anything.
-  const held = () => {
-    const pid = fx.newProject();
-    repo.setProjectStatusByOperator(db, pid, "blocked", "waiting on the homeowner", "operator");
-    return pid;
+  /** A read from this process while the server may be writing: retried on a transient SQLITE_BUSY
+   *  (a WAL read can meet one mid-checkpoint), never on anything else. */
+  const read = async <T>(fn: () => T): Promise<T> => {
+    for (let attempt = 1; ; attempt++) {
+      try { return fn(); } catch (err) {
+        const code = String((err as { code?: unknown }).code ?? "");
+        if (attempt >= 40 || !code.startsWith("SQLITE_BUSY")) throw err;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
   };
-  const approvalsFor = (pid: string) => db.query<{ id: string; approver: string }>("SELECT id, approver FROM portal_run_approvals WHERE project_id = ?", [pid]);
-  const payloadOf = (jobId: string) => JSON.parse(db.get<{ payload: string }>("SELECT payload FROM job_queue WHERE id = ?", [jobId])!.payload) as { autoSubmit?: boolean; approvalId?: string | null };
+  const approvalsFor = (pid: string) => read(() => db.query<{ id: string; approver: string }>("SELECT id, approver FROM portal_run_approvals WHERE project_id = ?", [pid]));
+  const payloadOf = (jobId: string) => read(() => JSON.parse(db.get<{ payload: string }>("SELECT payload FROM job_queue WHERE id = ?", [jobId])!.payload) as { autoSubmit?: boolean; approvalId?: string | null });
 
   await check("(c1) sign-in off: a nameless autoSubmit mints no approval, audits it, and the 202 says no approval was recorded", async () => {
-    const pid = held();
+    const pid = heldFor.c1;
     const res = await post(`/api/projects/${pid}/prepare-submission`, { track: "building", autoSubmit: true });
     const text = await res.text();
     assert.equal(res.status, 202, text);
     const body = JSON.parse(text) as { jobId: string; finalSubmitApproval?: { recorded: boolean; approver: string | null } };
     assert.deepEqual(body.finalSubmitApproval, { recorded: false, approver: null }, "the response does not say the approval was not recorded");
-    assert.equal(approvalsFor(pid).length, 0, "MUST-EXCLUDE: a nameless request minted an approval");
-    const payload = payloadOf(body.jobId);
+    assert.equal((await approvalsFor(pid)).length, 0, "MUST-EXCLUDE: a nameless request minted an approval");
+    const payload = await payloadOf(body.jobId);
     assert.equal(payload.autoSubmit, false, "MUST-EXCLUDE: a nameless request's job asks for the final submit");
     assert.equal(payload.approvalId ?? null, null);
-    assert.equal(db.query("SELECT id FROM audit_logs WHERE project_id = ? AND action = 'portal.final_submit_not_approved'", [pid]).length, 1);
+    assert.equal((await read(() => db.query("SELECT id FROM audit_logs WHERE project_id = ? AND action = 'portal.final_submit_not_approved'", [pid]))).length, 1);
   });
 
   await check("(c2) sign-in off: a named autoSubmit mints exactly one approval under that name and the 202 names it", async () => {
-    const pid = held();
+    const pid = heldFor.c2;
     const res = await post(`/api/projects/${pid}/prepare-submission`, { track: "building", autoSubmit: true, approverName: "  Pat Approver " });
     const text = await res.text();
     assert.equal(res.status, 202, text);
     const body = JSON.parse(text) as { jobId: string; finalSubmitApproval?: { recorded: boolean; approver: string | null } };
     assert.deepEqual(body.finalSubmitApproval, { recorded: true, approver: "Pat Approver" });
-    const rows = approvalsFor(pid);
+    const rows = await approvalsFor(pid);
     assert.equal(rows.length, 1);
     assert.equal(rows[0].approver, "Pat Approver");
-    assert.equal(payloadOf(body.jobId).approvalId, rows[0].id, "the job does not carry the approval this request minted");
+    assert.equal((await payloadOf(body.jobId)).approvalId, rows[0].id, "the job does not carry the approval this request minted");
   });
 
   await check("(c3) a plain stage carries no approval answer and mints nothing", async () => {
-    const pid = held();
+    const pid = heldFor.c3;
     const res = await post(`/api/projects/${pid}/prepare-submission`, { track: "building" });
     const body = JSON.parse(await res.text()) as Record<string, unknown>;
     assert.equal(res.status, 202);
     assert.equal("finalSubmitApproval" in body, false);
-    assert.equal(approvalsFor(pid).length, 0);
+    assert.equal((await approvalsFor(pid)).length, 0);
   });
 } finally {
   server.kill("SIGTERM");

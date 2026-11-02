@@ -8,7 +8,7 @@
 # Runs as a sidecar: `litestream replicate -config litestream.yml`
 # Or wrap the app: `litestream replicate -exec "npm start" -config litestream.yml`
 #
-# Required env vars (add as fly secrets):
+# Required env vars (set them in the server's .env, never in this file):
 #   LITESTREAM_ACCESS_KEY_ID     — AWS/Backblaze/Cloudflare R2 access key
 #   LITESTREAM_SECRET_ACCESS_KEY — secret key
 #   LITESTREAM_BUCKET            — bucket name (e.g. "solar-autopilot-db")

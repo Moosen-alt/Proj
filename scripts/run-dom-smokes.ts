@@ -124,6 +124,7 @@ const NOT_DOM_SMOKES = new Map<string, string>([
   ["portal-bot/src/adapters/autoLearnLive.smoke.ts", "live portal + real credentials — npm run portal:test:live"],
   ["portal-bot/src/adapters/oregonEPermitting.stress.smoke.ts", "live stress run — npm run portal:test:stress"],
   ["backend/test/rehearsal.live.smoke.ts", "live rehearsal against real services — npm run rehearse:live"],
+  ["portal-bot/src/headedDisplay.image.smoke.ts", "needs a display: runs inside the built server image (CI job \"Server image\", #434)"],
 ]);
 
 type Bucket = "run" | "skip" | "unclassified";
