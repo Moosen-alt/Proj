@@ -35,7 +35,7 @@ Key variables (see `.env.example` for the full list):
 | `SESSION_ENCRYPTION_KEY` | **Required.** Encrypts portal storage-state blobs |
 | `ANTHROPIC_API_KEY` | Enables Claude AI (vision parsing, extraction, drafting) |
 | `AUTH_ENABLED` / `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Turn on dashboard login |
-| `SERVER_HOST` | Listen address. Default `127.0.0.1` (this machine only); the Docker image and `fly.toml` set `0.0.0.0`. With `AUTH_ENABLED` off, a non-loopback host refuses to start unless `ALLOW_UNAUTHENTICATED_NETWORK=1` |
+| `SERVER_HOST` | Listen address. Default `127.0.0.1` (this machine only); the Docker image sets `0.0.0.0`. With `AUTH_ENABLED` off, a non-loopback host refuses to start unless `ALLOW_UNAUTHENTICATED_NETWORK=1` |
 | `AUTH_COOKIE_SECURE` / `AUTH_SESSION_HOURS` | Secure-cookie flag (HTTPS) + login lifetime |
 | `MONITOR_INTERVAL_MINUTES` | How often permit/NEM checks + email tracker run (0 = off) |
 | `SEED_TEST_INSTALLER` | Seed the TML test installer. **Set `false` in production.** |
@@ -45,6 +45,13 @@ Key variables (see `.env.example` for the full list):
 ---
 
 ## 3. Run
+
+The hosting target is **one server (a VM) running this image with docker compose**: this
+section, plus [`docs/SERVER_SETUP.md`](docs/SERVER_SETUP.md) for the VM itself (HTTPS front door,
+logins, backups). There is no Fly.io configuration any more: `fly.toml` and the Fly deploy
+workflow were removed (#434). The file sized the machine at 1 GB and one shared CPU, far below
+what a team needs (`docs/SCALE_DEPLOYMENT.md`), and declared the port twice; nobody deployed
+there, and the target became one VM (#429). Deploys are by hand (§10).
 
 ### Option A — Docker (recommended)
 
@@ -61,6 +68,17 @@ docker compose up -d --build
   database, documents and backups was written into the container and lost on every redeploy.
   If you mount the volume somewhere else, set `AUTOPILOT_STATE_DIR` to that same path.
 - Container health is wired to `/health`; `docker ps` shows healthy/unhealthy.
+- **A virtual display (#434).** Some portals refuse a headless browser and accept a real window
+  (coosbayor.gov: 403 headless, 200 headed), so staging and auto-learn retry once with a headed
+  browser on a bot block. The image's entrypoint (`scripts/docker-entrypoint.sh`) starts Xvfb, a
+  display with no screen, and exports `DISPLAY`, so that retry can open its window. Runs still
+  start headless (`PORTAL_HEADLESS` keeps its default); only the retry goes headed, and
+  `PORTAL_HEADED_RETRY=0` still turns it off. Nobody can see or click a window on that display: it
+  is automation's, and the review-page hand-over never treats it as a person's (CI's "Server image"
+  job pins that inside the built image). `PORTAL_VIRTUAL_DISPLAY=0` skips the display; a `DISPLAY`
+  you set yourself wins. Keep `DOCUMENT_FETCH_BROWSER=0` on a server
+  ([`docs/SERVER_SETUP.md`](docs/SERVER_SETUP.md)): with a display the document-fetch window could
+  now open there too.
 
 Plain Docker (no compose):
 
