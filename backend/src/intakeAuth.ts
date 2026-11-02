@@ -56,7 +56,11 @@ export function parseAuthenticationResults(value: string): { authservId: string;
     cur += ch;
   }
   segments.push(cur);
-  const authservId = (segments.shift() ?? "").trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+  // Microsoft 365 writes no authserv-id: its header opens straight with "spf=pass …". A first
+  // segment that is already a method=result is a result, not the id.
+  const first = (segments[0] ?? "").trim().split(/\s+/)[0] ?? "";
+  let authservId = "";
+  if (!first.includes("=")) { segments.shift(); authservId = first.toLowerCase(); }
   const results: AuthResult[] = [];
   for (const seg of segments) {
     const tokens = seg.replace(/\s*=\s*/g, "=").trim().split(/\s+/).filter(Boolean);

@@ -36,6 +36,15 @@ run("the reader takes authserv-id, methods, results and ptype.property values; c
   assert.deepEqual(parseAuthenticationResults("mx.example.test; none").results, []);
 });
 
+run("a Microsoft 365 header (no authserv-id, opens with spf=pass) keeps all its results, so aligned SPF + DKIM can fire", () => {
+  const m365 = "spf=pass (sender IP is 192.0.2.10) smtp.mailfrom=acme.example.test; dkim=pass (signature was verified) header.d=acme.example.test;dmarc=pass action=none header.from=acme.example.test;compauth=pass reason=100";
+  const r = parseAuthenticationResults(m365);
+  assert.equal(r.authservId, "");
+  assert.deepEqual(r.results.map((x) => `${x.method}=${x.result}`), ["spf=pass", "dkim=pass", "dmarc=pass", "compauth=pass"]);
+  assert.equal(r.results[0].props["smtp.mailfrom"], "acme.example.test");
+  assert.ok(senderAuthenticated([m365.replace(/;dmarc=pass[^;]*/, "")], FROM), "the SPF + DKIM fallback on an M365 header without its DMARC line");
+});
+
 run("alignment: same domain or a subdomain either way; never a sibling, another domain or a bare suffix", () => {
   assert.ok(domainsAlign("acme.example.test", "acme.example.test"));
   assert.ok(domainsAlign("bounce@mail.acme.example.test", "acme.example.test"));
