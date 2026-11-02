@@ -2836,7 +2836,7 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
     },
   },
   {
-    version: 60,
+    version: 59,
     name: "email_intake",
     up: (db) => {
       // EMAIL-IN INTAKE (#489). An installer emails a new job (plan set, bill, meter photo) to the
