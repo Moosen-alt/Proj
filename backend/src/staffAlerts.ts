@@ -17,7 +17,7 @@
 //            state there means this transition was already handled, so a re-entered writer or a
 //            re-poll sends nothing — the same idea as shouldNotifyClient, kept in the table so it
 //            also survives a restart.
-//   digest   once a day at STAFF_DIGEST_HOUR (server local time): every open job whose next step
+//   digest   once a day at STAFF_DIGEST_HOUR (server local time; unset = no digest): every open job whose next step
 //            is the team's (decideNextStep's who === "me"), most urgent first, each with a link.
 //
 // HOW (staffAlertConfig.ts): the product's own SMTP settings + STAFF_ALERT_TO, and an optional
@@ -74,13 +74,16 @@ export function shouldAlertStaffOnStatus(outcome: string, previousOutcome: strin
 
 /**
  * Make a free-text reason safe for an alert (rule 2). First line only, then: the project's own
- * secrets redacted (separators ignored, the planner's predicate), URLs and email addresses
- * dropped, any bare run of 7+ digits masked (an account or meter number this project does not
+ * secrets redacted (separators ignored, the planner's predicate), the value after a password /
+ * secret / token / key word dropped, URLs and email addresses dropped, any bare run of 7+ digits masked (an account or meter number this project does not
  * know about yet), capped at 200 characters.
  */
 export function scrubStaffText(raw: string, secrets: Iterable<string>): string {
   let s = String(raw ?? "").split(/\r?\n/)[0].replace(/\s+/g, " ").trim();
   s = redactSecretValues(s, secrets);
+  // A credential this project does not hold as a field (a portal login echoed in an error): the
+  // value after a password/secret/token/key word goes, whatever it looks like.
+  s = s.replace(/\b(pass(?:word|wd|code)|pwd|secret|token|api[\s_-]?key)\b(\s*(?:is|was|[:=]))?\s*("[^"]*"|'[^']*'|\S+)/gi, "$1 [redacted]");
   s = s.replace(/\bhttps?:\/\/\S+/gi, "[link]");
   s = s.replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[email]");
   s = s.replace(/\d{7,}/g, "[number]");

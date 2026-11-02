@@ -21,7 +21,6 @@ import path from "node:path";
 import { backupDir as stateBackupDir, dbPath as stateDbPath, opsDir } from "../../backend/src/statePaths";
 import { AUTOMATIC_SNAPSHOT_RE } from "../../backend/src/offboxBackup";
 import { DEFAULT_LISTEN_HOST, isLoopbackListenHost, resolveListenHost } from "../../backend/src/listenHost";
-import { describeStaffAlerts } from "../../backend/src/staffAlertConfig";
 import { exposedHostAdvice, isWindows, probeEdge, trustProxyRow, watchdogInstallHint, type HostShape } from "../../backend/src/opsEdgePosture";
 
 const env = process.env;
@@ -187,15 +186,6 @@ let lastRun: number | null = null;
 try { lastRun = Date.parse(JSON.parse(fs.readFileSync(stateFile, "utf8")).lastRunAt); } catch { lastRun = null; }
 add("alerts", "watchdog running", lastRun && Date.now() - lastRun < 20 * 60_000 ? "PASS" : "FAIL",
   lastRun ? `last poll ${Math.round((Date.now() - lastRun) / 60_000)} min ago` : `has never run here (${watchdogInstallHint(shape)})`);
-
-// STAFF ALERTS (#487): the team hears when a job stops on them. WARN, not FAIL, when off — the
-// server runs without it — but a shared queue nobody is told about is how jobs sit. The answer is
-// staffAlertConfig.ts's, the module the server sends by, so this cannot report a state it ignores.
-{
-  const staff = describeStaffAlerts(env);
-  add("alerts", "staff alerts", staff.on ? "PASS" : "WARN", staff.detail);
-  add("alerts", "staff morning digest", staff.on && !/^off/.test(staff.digest) ? "PASS" : "WARN", staff.digest);
-}
 
 // --- EDGE (the hosted server behind cloudflared; #437) -------------------------------------------
 // TRUST_PROXY is read on every platform: it is what the login lockout keys on behind any proxy.

@@ -13,8 +13,11 @@
 //   STAFF_ALERT_WEBHOOK_FORMAT  json (default) posts {subject, text}; text posts the plain text with
 //                               the subject as a "Title" header — what ntfy.sh expects.
 //   STAFF_DIGEST_HOUR           0-23, server local time, for the morning "needs you today" email.
-//                               Default 7; "off" turns the digest off and leaves the alerts on.
+//                               Unset (or "off") means no digest; the alerts stay on either way.
 // Unset recipients and unset webhook means OFF: nothing is sent, and preflight says so.
+//
+// PREFLIGHT: the rows for these settings are #493's (worker-493, in parallel); describeStaffAlerts()
+// below is the one-line answer it can print, so preflight and the server cannot disagree.
 //
 // ORG SCOPING (CLAUDE.md rule 6 — tenant data never crosses orgs). A bare entry belongs to the
 // default org (org-default: Keelix's own team). An entry written `<org-id>=<address-or-url>`
@@ -79,11 +82,11 @@ export function configuredStaffOrgs(env: NodeJS.ProcessEnv = process.env): strin
   return [...orgs].filter((o) => staffAlertsOn(o, env));
 }
 
-/** The digest hour (0-23), or null when the digest is off. Unset means 7. Anything unreadable is
+/** The digest hour (0-23), or null when the digest is off. Unset means off. Anything unreadable is
  *  null (off) rather than a guess: an email at a surprise hour is worse than a preflight WARN. */
 export function staffDigestHour(env: NodeJS.ProcessEnv = process.env): number | null {
   const raw = String(env.STAFF_DIGEST_HOUR ?? "").trim();
-  if (!raw) return 7;
+  if (!raw) return null;
   if (/^(off|false|no|none|-1)$/i.test(raw)) return null;
   if (!/^\d{1,2}$/.test(raw)) return null;
   const h = Number(raw);
@@ -104,7 +107,7 @@ export function describeStaffAlerts(env: NodeJS.ProcessEnv = process.env): { on:
   const on = c.emails.length > 0 || c.webhooks.length > 0;
   const hour = staffDigestHour(env);
   const digest = !on ? "off (no staff alert channel)"
-    : hour === null ? `off (STAFF_DIGEST_HOUR=${String(env.STAFF_DIGEST_HOUR ?? "")})`
+    : hour === null ? (String(env.STAFF_DIGEST_HOUR ?? "").trim() ? `off (STAFF_DIGEST_HOUR=${String(env.STAFF_DIGEST_HOUR)} is not an hour 0-23)` : "off (STAFF_DIGEST_HOUR unset)")
     : `every day at ${String(hour).padStart(2, "0")}:00 server time`;
   return { on, detail: on ? parts.join("; ") : `off: nobody is told when a run stops, a correction lands or a status changes (${parts.join("; ")})`, digest };
 }

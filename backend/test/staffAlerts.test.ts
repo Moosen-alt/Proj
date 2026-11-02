@@ -40,6 +40,8 @@ const mailer = await import("../../scripts/ops/mailer");
 
 const ACCOUNT = "1234567890";   // the fixture's account number
 const METER = "987654321";      // the fixture's meter number
+const PASSWORD = "Tr0ub4dor&3-Kx"; // a password-shaped credential echoed in an error
+const PORTAL_TEXT = "Record Status: Plan Review Hold - Inspector Quillfeather notes parcel lien";   // raw scraped page text
 
 // ── fake servers (loopback; they never touch the DB) ─────────────────────────────────────────
 const mails: Array<{ rcpt: string[]; data: string }> = [];
@@ -112,8 +114,8 @@ await check("config: bare entries are the default org's, `<org>=` entries that o
   const described = JSON.stringify(cfg.describeStaffAlerts());
   assert.doesNotMatch(described, /@|ntfy|acme\.invalid/, `preflight's line never prints an address or URL: ${described}`);
 });
-await check("config: STAFF_DIGEST_HOUR — unset 7, 0-23 honoured, off/garbage = off", () => {
-  for (const [raw, want] of [["", 7], ["0", 0], ["23", 23], ["9", 9], ["off", null], ["24", null], ["7am", null], ["-1", null]] as const) {
+await check("config: STAFF_DIGEST_HOUR — unset = no digest, 0-23 honoured, off/garbage = off", () => {
+  for (const [raw, want] of [["", null], ["0", 0], ["23", 23], ["9", 9], ["off", null], ["24", null], ["7am", null], ["-1", null]] as const) {
     setEnv(raw ? { STAFF_DIGEST_HOUR: raw } : {});
     assert.equal(cfg.staffDigestHour(), want, `STAFF_DIGEST_HOUR=${raw}`);
   }
@@ -131,6 +133,9 @@ await check("scrubStaffText: first line; known secrets (any separators), URLs, e
   for (const bad of [/1234.?567.?890/, /987.?654.?321/, /portal\.invalid/, /ops@x/, /55512345678/, /second line/]) assert.doesNotMatch(out, bad, out);
   assert.match(out, /Field "Account" got/);
   assert.ok(sa.scrubStaffText("x".repeat(500), []).length <= 200);
+  const cred = sa.scrubStaffText(`login failed: password=${PASSWORD} token "abc def" api key: K-77`, []);
+  for (const bad of [PASSWORD, "abc def", "K-77"]) assert.ok(!cred.includes(bad), cred);
+  assert.equal(sa.scrubStaffText("the plan did not pass review", []), "the plan did not pass review", "a bare 'pass' is prose");
 });
 await check("the webhook is the watchdog's exact shape (scripts/ops/mailer.ts postWebhook), json and text", async () => {
   for (const format of ["json", "text"] as const) {
@@ -150,7 +155,7 @@ let failedProject = "";
 await check("a stage run that FAILS alerts once: address, track, the run's reason — scrubbed", async () => {
   hooks.length = 0;
   failedProject = newProject();
-  fx.stubRunner(async () => fx.failingStep(`Required field "Meter number" is blank (bill shows ${METER}, account ${ACCOUNT}); see https://permits.portland.example/rec/${ACCOUNT}`));
+  fx.stubRunner(async () => fx.failingStep(`Required field "Meter number" is blank (bill shows ${METER}, account ${ACCOUNT}); login password: ${PASSWORD}; see https://permits.portland.example/rec/${ACCOUNT}\n${PORTAL_TEXT}`));
   await repo.prepareSubmission(db, failedProject, "building").catch((e) => e);
   await settle();
   const run = fx.latestRun(failedProject)!;
@@ -205,7 +210,7 @@ await check("a status CHANGE alerts once in our own words; a re-poll of it sends
   const now = new Date().toISOString();
   db.run(`INSERT INTO permit_check_targets (id, project_id, target_type, permit_type, active, latest_outcome, permit_number, created_at, updated_at)
           VALUES ('t-staff', ?, 'permit', 'electrical', 1, 'waiting', 'ELEC-2026-0042', ?, ?)`, [statusProject, now, now]);
-  await repo.recordPermitStatusCheck(db, statusProject, { targetId: "t-staff", source: "manual", rawStatusText: "Permit issued" });
+  await repo.recordPermitStatusCheck(db, statusProject, { targetId: "t-staff", source: "manual", rawStatusText: `Permit issued. ${PORTAL_TEXT}` });
   await settle();
   let mine = rows("project_id = ? AND kind = 'status'", [statusProject]);
   assert.equal(mine.length, 1, JSON.stringify(mine));
@@ -333,7 +338,7 @@ await check("MUST-EXCLUDE: no account/meter number, homeowner name or portal URL
     ...hooks.map((h) => `${h.title}\n${h.body}`),
   ].join("\n");
   assert.ok(rows().length >= 10, "the suite sent things to inspect");
-  for (const bad of [ACCOUNT, METER, "permits.portland.example", ...ownerNames]) {
+  for (const bad of [ACCOUNT, METER, PASSWORD, "Quillfeather", "parcel lien", "permits.portland.example", ...ownerNames]) {
     assert.ok(!everything.includes(bad), `"${bad}" leaked into a staff alert`);
   }
   assert.doesNotMatch(everything, /1234.?567.?890|987.?654.?321/);

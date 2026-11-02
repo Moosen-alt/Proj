@@ -94,10 +94,6 @@ check("SERVER_HOST unset is loopback since #82 (server.ts binds 127.0.0.1), so a
   assert.match(line(today.out, "SERVER_HOST"), /PASS .*unset \(127\.0\.0\.1\): reachable only from this machine/);
 });
 check("BACKUP_DIR with a fresh snapshot is a PASS even today", () => assert.match(line(today.out, "BACKUP_DIR"), /PASS/));
-check("staff alerts (#487) unset: WARN off, and the digest says off too", () => {
-  assert.match(line(today.out, "staff alerts"), /WARN .*off: nobody is told when a run stops/);
-  assert.match(line(today.out, "staff morning digest"), /WARN .*off/);
-});
 
 console.log("preflight: the configured shape");
 const good = preflight({
@@ -106,18 +102,12 @@ const good = preflight({
   BACKUP_DIR: backupDir, BACKUP_INTERVAL_HOURS: "2", BACKUP_KEEP: "84", BACKUP_SECOND_DIR: secondDir,
   SMTP_HOST: "smtp.invalid", SMTP_FROM: "x@ops.invalid", SMTP_PASS: SECRETS.smtpPw, WATCHDOG_ALERT_TO: "ops@ops.invalid",
   WATCHDOG_HEARTBEAT_URL: "https://hc-ping.invalid/abc", WATCHDOG_STATE_FILE: stateFile,
-  STAFF_ALERT_TO: "staff@ops.invalid", STAFF_ALERT_WEBHOOK_URL: "https://ntfy.invalid/staff-topic-secret", STAFF_DIGEST_HOUR: "6",
 });
 check("no FAIL, exit 0", () => {
   assert.equal(good.code, 0, good.out);
   assert.doesNotMatch(good.out, /^\s+FAIL/m);
 });
 check("the seeded admin is seen (by email, never by password)", () => assert.match(line(good.out, "admin login"), /PASS .*owner@ops\.invalid/));
-check("staff alerts (#487) configured: PASS with the channels named, never the address or the webhook URL", () => {
-  assert.match(line(good.out, "staff alerts"), /PASS .*email to 1 address\(es\); webhook set/);
-  assert.match(line(good.out, "staff morning digest"), /PASS .*every day at 06:00 server time/);
-  assert.doesNotMatch(good.out, /staff@ops\.invalid|staff-topic-secret/);
-});
 check("final submit unset reads PASS", () => assert.match(line(good.out, "PORTAL_ALLOW_FINAL_SUBMIT"), /PASS/));
 const armed = preflight({
   AUTOPILOT_DB_PATH: withAdmin, SESSION_ENCRYPTION_KEY: SECRETS.session, AUTH_ENABLED: "true", AUTH_SECRET: SECRETS.session,
