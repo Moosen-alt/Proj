@@ -315,7 +315,11 @@ has a NOTIFICATIONS block for them (WARN, with the line to add) and counts the c
    #487: `STAFF_ALERT_TO=<you>, <your PM>` (uses SMTP) and/or `STAFF_ALERT_WEBHOOK_URL=<ntfy topic>`,
    and `STAFF_DIGEST_HOUR`. Preflight's `staff alerts` line reads those names; they do nothing until
    #487 is deployed.
-5. **Test send, to yourself:**
+5. **Filing contact email.** `FILING_CONTACT_EMAIL=<the tracking inbox>` (#520) puts that address in a
+   form's separate applicant / agent / additional-contact email box, so agency and utility mail about a
+   filing reaches it too. The contractor's own email box keeps the client's address and the homeowner's
+   box (PowerClerk's NEM Applicant) is never touched. Unset = no change.
+6. **Test send, to yourself:**
 
    ```bash
    K=/opt/keelix/scripts/ops/linux/keelix-ops.sh
@@ -329,7 +333,7 @@ has a NOTIFICATIONS block for them (WARN, with the line to add) and counts the c
    means the sending domain needs SPF/DKIM for that mail server. The message shows the address client
    links start with; open it from a phone off the office network. **(untested against a real mail
    server: the sandbox has none.)**
-6. **Waiting client emails.** If preflight's `unsent client emails` line counts any (drafts saved
+7. **Waiting client emails.** If preflight's `unsent client emails` line counts any (drafts saved
    while SMTP was off, or sends that failed), list them and, once steps 1 and 3 pass, re-send them:
 
    ```bash
@@ -342,7 +346,7 @@ has a NOTIFICATIONS block for them (WARN, with the line to add) and counts the c
    ```
 
    Read the list first: a message about a job that has since moved on may be better left unsent.
-7. **Emailed jobs (#489, optional).** To let installers email a new job instead of uploading it,
+8. **Emailed jobs (#489, optional).** To let installers email a new job instead of uploading it,
    set `EMAIL_INTAKE_ADDRESS=intake@<your domain>` to an address the tracking inbox (step 2)
    receives, with plus-addressing on. Give each client a tag under Clients ("Email-in intake tag",
    say `acme`) and tell them to send the plan set and bill to `intake+acme@<your domain>` from one of

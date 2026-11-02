@@ -41,6 +41,18 @@ export async function fillApplicantEmail(
   }
 }
 
+/**
+ * THE PREPARER'S EMAIL (#520). The preparer is whoever submits the application, and owner direction
+ * 2026-11-02 21:25 UTC lets that be the filing service on NEM ("owner in preparer info can be keelixs
+ * for nem if needed to get their updates via email"): the filing contact's address (FILING_CONTACT_EMAIL,
+ * on the staging overlay as filingContactEmail) when one is configured, else the installer's, as before.
+ * The Applicant's email is NOT this — fillApplicantEmail keeps the homeowner's, where the utility sends
+ * the e-signature and the NEM mail.
+ */
+export function preparerEmailFor(s: Record<string, unknown>, installerEmail: string): string {
+  return firstEmail(str(s["filingContactEmail"])) || installerEmail;
+}
+
 // ---------------------------------------------------------------------------
 // WHO IS FILING (#518). The Installer Company list and the existing-contact list decide which
 // company and contact an application is filed under. Neither is ever answered with a default or a
@@ -772,7 +784,7 @@ export class PowerClerkAdapter extends BasePortalAdapter {
         });
       }
       await fillText("preparerZip", "Zip Code", "Zip Code", instZip);
-      await fillText("preparerEmail", "Email", "Email", installerEmail);
+      await fillText("preparerEmail", "Email", "Email", preparerEmailFor(s, installerEmail));
       await fillText("preparerPhone", "(###) ###-####", "Phone", installerPhone);
       await settleAndNext("preparer contact", /PGE Customer Information|Applicant/i);
 

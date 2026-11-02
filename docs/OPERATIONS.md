@@ -537,6 +537,7 @@ The October NEM fixes (#378 the review-page hand-over, #354, #400, #401, #385, #
 | `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` / `GMAIL_REFRESH_TOKEN` | – | the Gmail alternative to IMAP; read only once the refresh token is set (OPERATIONS_LINUX.md §5.1) |
 | `GMAIL_REDIRECT_URI` | `http://localhost:<PORT>/api/gmail/oauth/callback` | where Google returns after consent; on a server, `<PUBLIC_BASE_URL>/api/gmail/oauth/callback` |
 | `STAFF_ALERT_TO` / `STAFF_ALERT_WEBHOOK_URL` / `STAFF_DIGEST_HOUR` | – | the team's alerts when a run stops or a job changes state, and the morning digest (#487; no effect before it is deployed). Preflight `staff alerts` |
+| `FILING_CONTACT_EMAIL` | – | your tracking address, filled ONLY into a form's separate applicant / agent / additional-contact email box (#520). The contractor's own email box keeps the client's address; the homeowner's box (PowerClerk's NEM Applicant) is never touched |
 | `MONITOR_INTERVAL_MINUTES` | 15 | portal status checks and the tracking inbox; `0` turns both off (a test copy only) |
 | `BACKUP_DIR` | `backend/data/backups` | where snapshots are written first (production: `E:/SOLAR-Proj-Backups`) |
 | `BACKUP_INTERVAL_HOURS` / `BACKUP_KEEP` | 24 / 14 | snapshot cadence and how many to keep |

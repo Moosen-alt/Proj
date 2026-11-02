@@ -14,6 +14,7 @@ import { nowIso } from "./time";
 import { text as s } from "./json";
 import { addAuditLog } from "./audit";
 import { deleteCustomer } from "./crm";
+import { filingContactEmailSetting } from "./filingContact";
 
 type Row = Record<string, unknown>;
 
@@ -1100,6 +1101,10 @@ export function clientStagingOverlay(db: AppDb, clientId: string | null, portalT
   const overlay: Record<string, string> = {
     installerCompanyName: identity?.installerCompanyLabel || client.legalBusinessName || client.companyName,
     installerEmail: client.businessEmail || client.contactEmail,
+    // THE FILING SERVICE'S OWN EMAIL (#520, FILING_CONTACT_EMAIL) beside the contractor's — never in
+    // place of it. Only when configured, so with it unset the overlay is exactly what it was. The hand-
+    // coded PowerClerk adapter's Preparer email reads it (powerClerk.preparerEmailFor).
+    ...(filingContactEmailSetting() ? { filingContactEmail: filingContactEmailSetting() } : {}),
     installerPhone: client.businessPhone || client.phone,
     installerAddress: [client.businessAddress, client.businessCity, client.businessState, client.businessZip]
       .filter(Boolean)
