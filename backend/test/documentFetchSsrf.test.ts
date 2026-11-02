@@ -14,7 +14,13 @@
 //   3. the form-fill tool's fetch options never launch the browser on a 403 (fake launcher,
 //      counted), where the default options do;
 //   4. the same over real HTTP: the spawned server answers 400 for each refused target with the
-//      private stub never hit, and a 403 origin comes back 422 with the browser fallback off.
+//      private stub never hit, and a 403 origin comes back 422 with the browser fallback off;
+//   5. connect time (#407): a resolver that answers PUBLIC to the check and PRIVATE to the
+//      connection (DNS rebinding) is refused at the connect, on both fetch doors, with the private
+//      stub never hit; an allowed hostname origin still connects;
+//   6. the browser rung (#407): a fake window whose page 302s into the LAN is refused before it
+//      follows, the outcome names the hop (privateTarget), and the private stub is never hit.
+//      (The real-Chromium wiring of the same judge: documentFetchBrowserGuard.dom.smoke.ts.)
 //
 // No real browser runs: the in-process checks use a fake launcher, and the spawned server gets
 // an empty PLAYWRIGHT_BROWSERS_PATH, so even a regression could not open a window.
@@ -29,6 +35,10 @@ import path from "node:path";
 
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "document-fetch-ssrf-"));
 process.env.AUTOPILOT_DB_PATH = path.join(tmpDir, "inproc.sqlite");
+// fetchFormTemplate's cache lands here, not in backend/data.
+process.env.AUTOPILOT_STATE_DIR = path.join(tmpDir, "state");
+// The resolver seam (setHostResolverForTests) refuses to install without it.
+process.env.AUTOPILOT_TEST_SEAMS = "1";
 process.env.LOG_LEVEL = "error";
 delete process.env.DOCUMENT_FETCH;
 delete process.env.DOCUMENT_FETCH_BROWSER;
@@ -65,6 +75,25 @@ const publicStub = http.createServer((req, res) => {
     res.end();
     return;
   }
+  if (req.url === "/doc.pdf") {
+    res.writeHead(200, { "content-type": "application/pdf" });
+    res.end("%PDF-1.4 public bytes");
+    return;
+  }
+  // A wall to the plain rung; to the (fake) window, a redirect into the LAN or the document.
+  if (req.url === "/walled-redirect.pdf" || req.url === "/walled-ok.pdf") {
+    if (!req.headers["x-fake-window"]) {
+      res.writeHead(403, { "content-type": "text/html", server: "AkamaiGHost" });
+      res.end("");
+    } else if (req.url === "/walled-redirect.pdf") {
+      res.writeHead(302, { location: `${PRIVATE}/secret.pdf` });
+      res.end();
+    } else {
+      res.writeHead(200, { "content-type": "application/pdf" });
+      res.end("%PDF-1.4 public bytes, through the window");
+    }
+    return;
+  }
   if (req.url === "/walled.pdf") {
     // The Akamai shape: 403, empty body. The ladder's cue to open a real window.
     res.writeHead(403, { "content-type": "text/html", server: "AkamaiGHost" });
@@ -75,7 +104,9 @@ const publicStub = http.createServer((req, res) => {
   res.end();
 });
 await new Promise<void>((r) => publicStub.listen(0, "127.0.0.1", () => r()));
-const PUBLIC = `http://127.0.0.1:${(publicStub.address() as AddressInfo).port}`;
+const PUBLIC_PORT = (publicStub.address() as AddressInfo).port;
+const PUBLIC = `http://127.0.0.1:${PUBLIC_PORT}`;
+const PRIVATE_PORT = (privateStub.address() as AddressInfo).port;
 // The stub stands in for a public host. Only its exact origin is let through; the private stub,
 // on the same address but another port, is not.
 process.env.DOCUMENT_FETCH_ALLOW_ORIGINS = PUBLIC;
@@ -143,6 +174,101 @@ if (guard) {
   check("3. a 403 under the tool's options never launches Chromium", launches === 0 && !tool.bytes, `launches=${launches}`);
 }
 
+// --- 5. connect time: the address dialled is the address judged (#407) --------------------------
+{
+  const seam = (guard as { setHostResolverForTests?: (fn: ((host: string) => Promise<Array<{ address: string; family: number }>>) | null) => void } | null)?.setHostResolverForTests;
+  check("5. publicUrlGuard has a resolver seam the suite can play a rebinding resolver through", typeof seam === "function");
+  if (seam) {
+    // "localhost" because the system resolver really does answer 127.0.0.1 for it: on a tree that
+    // judges only before the request, fetch's own lookup takes the connection to the private stub.
+    const REBIND = `http://localhost:${PRIVATE_PORT}/secret.pdf`;
+    let asked = 0;
+    const rebinding = async () => {
+      asked++;
+      return asked === 1 ? [{ address: "93.184.216.34", family: 4 }] : [{ address: "127.0.0.1", family: 4 }];
+    };
+
+    seam(rebinding);
+    privateHits = 0;
+    const got = await fetchPublicDocument(REBIND, { allowBrowser: false, timeoutMs: 3_000 });
+    check("5. fetchPublicDocument: public to the check, private to the connect → refused",
+      !got.ok && got.status === 0 && got.privateTarget === REBIND && /private/i.test(got.reason), `${got.reason} privateTarget=${got.privateTarget}`);
+    check("5. fetchPublicDocument: the connection asked the resolver itself", asked >= 2, `asked=${asked}`);
+    check("5. fetchPublicDocument: the private stub was NEVER hit", privateHits === 0, `hits=${privateHits}`);
+
+    asked = 0;
+    privateHits = 0;
+    const ahjForms = await import("../src/ahjForms");
+    const thrown = await ahjForms.fetchFormTemplate({ id: "ssrf-rebind-407", sourceUrl: REBIND, formName: "Rebind test form" } as never)
+      .then(() => null, (e: Error) => e);
+    check("5. safeFetchTemplate (fetchFormTemplate): rebinding refused, not fetched", !!thrown && /private/i.test(thrown.message), String(thrown?.message));
+    check("5. safeFetchTemplate: the private stub was NEVER hit", privateHits === 0, `hits=${privateHits}`);
+
+    // Every answer private: the check refuses first; the connect is never reached.
+    seam(async () => [{ address: "169.254.169.254", family: 4 }]);
+    const meta = await fetchPublicDocument("http://metadata.rebind.test/latest/", { allowBrowser: false, timeoutMs: 3_000 });
+    check("5. a name answering only private is refused before any request", !meta.ok && meta.privateTarget === "http://metadata.rebind.test/latest/", meta.reason);
+
+    // DOCUMENT_FETCH_ALLOW_ORIGINS still works for a HOSTNAME origin: it connects as it always has.
+    seam(null);
+    const before = process.env.DOCUMENT_FETCH_ALLOW_ORIGINS;
+    process.env.DOCUMENT_FETCH_ALLOW_ORIGINS = `${PUBLIC},http://localhost:${PUBLIC_PORT}`;
+    const allowed = await fetchPublicDocument(`http://localhost:${PUBLIC_PORT}/doc.pdf`, { allowBrowser: false, timeoutMs: 3_000 });
+    check("5. an allowed hostname origin still connects", allowed.ok && allowed.via === "http", allowed.reason);
+    process.env.DOCUMENT_FETCH_ALLOW_ORIGINS = before;
+  }
+}
+
+// --- 6. the browser rung judges every hop (#407) --------------------------------------------------
+{
+  // A stand-in for Chromium: it follows redirects ITSELF, as the real window does, and asks the
+  // launcher's judge before each request and each redirect, as the real launcher's DevTools hook
+  // does. A launcher that is handed no judge (a tree without the fix) follows wherever it is sent.
+  let launches = 0;
+  type Judge = (url: string, kind: "redirect" | "navigation" | "subresource") => Promise<string | null>;
+  const fakeWindow = async (opts: { judgeHop?: Judge }) => {
+    launches++;
+    const judge = opts?.judgeHop;
+    const load = async (start: string, kind: "navigation" | "subresource") => {
+      let current = start;
+      if (judge && (await judge(current, kind))) throw new Error("net::ERR_BLOCKED_BY_CLIENT");
+      for (let hop = 0; hop < 5; hop++) {
+        const res = await fetch(current, { redirect: "manual", headers: { "x-fake-window": "1" } });
+        const loc = res.status >= 300 && res.status < 400 ? res.headers.get("location") : null;
+        if (loc) {
+          const next = new URL(loc, current).toString();
+          if (judge && (await judge(next, "redirect"))) throw new Error("net::ERR_BLOCKED_BY_CLIENT");
+          current = next;
+          continue;
+        }
+        return { status: res.status, contentType: res.headers.get("content-type") || "", bytes: new Uint8Array(await res.arrayBuffer()), url: current };
+      }
+      throw new Error("too many redirects");
+    };
+    return {
+      async visit(u: string) { const r = await load(u, "navigation"); return { status: r.status, html: new TextDecoder().decode(r.bytes), url: r.url }; },
+      async fetchInPage(u: string) { return load(u, "subresource"); },
+      async close() { /* nothing to close */ },
+    };
+  };
+
+  privateHits = 0;
+  const got = await fetchPublicDocument(`${PUBLIC}/walled-redirect.pdf`, { launcher: fakeWindow as never });
+  check("6. browser rung reached (the plain rung met a wall)", launches === 1, `launches=${launches}`);
+  check("6. a window redirected into the LAN: refused, privateTarget named",
+    !got.ok && got.via === "browser" && got.privateTarget === `${PRIVATE}/secret.pdf`, `${got.reason} privateTarget=${got.privateTarget}`);
+  check("6. the refusal says the window was redirected there", /redirected to/i.test(got.reason) && got.reason.includes(`${PRIVATE}/secret.pdf`), got.reason);
+  check("6. the private stub was NEVER hit by the window", privateHits === 0, `hits=${privateHits}`);
+
+  privateHits = 0;
+  const rendered = await fetchPublicDocument(`${PUBLIC}/walled-redirect.pdf`, { launcher: fakeWindow as never, render: true });
+  check("6. render mode: the same redirect refused and named", !rendered.ok && rendered.privateTarget === `${PRIVATE}/secret.pdf`, rendered.reason);
+  check("6. render mode: the private stub was NEVER hit", privateHits === 0, `hits=${privateHits}`);
+
+  const fine = await fetchPublicDocument(`${PUBLIC}/walled-ok.pdf`, { launcher: fakeWindow as never });
+  check("6. control: a window on a public document still retrieves it", fine.ok && fine.via === "browser" && !fine.privateTarget, fine.reason);
+}
+
 // --- 4. over real HTTP, through /api/tools/form-fill/* -------------------------------------------
 function freePortInBand(start: number, count: number): number {
   for (let i = 0; i < count; i++) {
@@ -177,7 +303,7 @@ const env: Record<string, string | undefined> = {
   NO_PROXY: "*",
   no_proxy: "*",
 };
-for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "DOCUMENT_FETCH", "DOCUMENT_FETCH_BROWSER", "AUTH_ENABLED"]) delete env[k];
+for (const k of ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "DOCUMENT_FETCH", "DOCUMENT_FETCH_BROWSER", "AUTH_ENABLED", "AUTOPILOT_STATE_DIR", "AUTOPILOT_TEST_SEAMS"]) delete env[k];
 
 const server = spawn(process.execPath, [path.join(REPO, "node_modules/tsx/dist/cli.mjs"), path.join(REPO, "backend/src/server.ts")], { env, stdio: ["ignore", "pipe", "pipe"] });
 let serverLog = "";
