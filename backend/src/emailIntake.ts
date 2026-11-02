@@ -264,26 +264,49 @@ async function sortAttachments(attachments: Attachment[]): Promise<WorkingFile[]
 // The parse → project payload.
 // ---------------------------------------------------------------------------
 
-/** The plan set's contractor block is a client SUGGESTION on the Parser page, never project data;
- *  structureDescription is a person's answer there (parser.html applyExtraction). */
-const NOT_PROJECT_FIELDS = new Set([
-  "contractorCompany", "contractorCcb", "contractorElectricalLicense", "contractorMetroCityLicense", "contractorAddress",
-  "contractorPhone", "contractorEmail", "contractorSupervisor", "contractorElectricianLicense", "structureDescription",
+/** THE FIELDS THE PARSER PAGE SAVES from a model read: its LLM_SNAPSHOT_KEYS and the keys of its
+ *  LLM_FIELD_TARGETS (frontend/parser.html; emailIntake.test fails when the two drift). An
+ *  ALLOWLIST, as the page's is: a key the model invents — "client_id", say, from a plan set that
+ *  tries to steer it — never reaches createProject (rule 6), and the contractor block (a client
+ *  suggestion on the page) and structureDescription (a person's answer there) are not in it. */
+export const PARSER_PROJECT_FIELDS: ReadonlySet<string> = new Set([
+  "owner", "street", "city", "state", "zip", "ahj", "utility", "account", "meter", "dcKw", "acKw", "interco",
+  "moduleMake", "moduleModel", "moduleWattage", "moduleQty", "invMake", "invModel", "invQty", "batteryMake",
+  "batteryModel", "batteryQty", "roofMaterial", "mounting", "rackingSystem", "roofRafterSpan", "invOutputW",
+  "pvMicroMake", "pvMicroModel", "pvMicroQty", "pvMicroOutputW", "inverterSettings", "moduleVoc",
+  "moduleIsc", "moduleVocTempCoeff", "pvMicroMaxDcInputV", "modulesPerString", "siteLowTempC",
+  "dwellingUnits", "constructionCategory", "invMaxDcInputV", "siteHighTempC", "acConductor",
+  "acConductorCount", "acRunLengthFt", "roofMaterialSubtype", "tileAttachmentMethod", "attachmentHardware",
+  "busRating", "mainBreaker", "pvBreaker", "acDiscReq", "acDiscMakeModel", "acDiscQty", "acDiscAmps",
+  "acDiscFused", "acDiscVoltage", "snow", "deadLoad", "roofRafterSpacing", "wind", "permitPath", "windSpeed",
+  "riskCategory", "lightFrame", "framingType", "roofLayers", "moduleHeightAboveRoof", "gravityWindDesign",
+  "manufacturerInstallation", "rafterExceptionCompliant", "moduleFiguresCompliant", "attachmentToFraming",
+  "attachmentSpacingIn", "attachmentEdgeSpacingIn", "attachmentsOutsideEdgeZone",
+  "standingSeamMethod2Compliant", "moduleListingAgency", "existingSystem", "existingDcKw", "existingAcKw",
+  "existingModuleMake", "existingModuleModel", "existingModuleQty", "existingInvMake", "existingInvModel",
+  "existingInvQty", "combinedDcKw", "combinedAcKw", "utilitySchedule", "serviceVoltage", "servicePhase",
+  "numberOfCircuits", "parcelNumber", "jobValue", "homeownerEmail", "homeownerPhone", "statedValuation",
+  "azimuth", "tilt", "roofSlope", "mainServiceRating", "pvArrays", "stampRecommendation",
+  "electricalCalcText", "structuralCalcText", "sitePlanNotesText", "roofPlanNotesText", "labelsText",
+  "projectDescriptionText", "locateCalloutText",
 ]);
 
-/** Every confident extracted value, keyed by the parser's own field ids (normalizeProject reads
- *  them). Low-confidence fields are left out and returned as `unsure`. */
+/** Every confident extracted value the Parser page would save, keyed by its own field ids
+ *  (normalizeProject reads them). Low-confidence fields are left out and returned as `unsure`. */
 export function payloadFromExtraction(extraction: Pick<ParserExtractionResponse, "fields" | "lowConfidenceFields">): { payload: ParserPayload; unsure: string[] } {
   const payload: ParserPayload = {};
   const unsure: string[] = [];
   const low = new Set(extraction.lowConfidenceFields ?? []);
   for (const [key, field] of Object.entries(extraction.fields ?? {})) {
-    if (NOT_PROJECT_FIELDS.has(key)) continue;
+    if (!PARSER_PROJECT_FIELDS.has(key)) continue;
     const value = field?.value;
     if (value == null || value === "" || (Array.isArray(value) && !value.length)) continue;
     if (low.has(key)) { unsure.push(key); continue; }
     payload[key] = value as ParserPayload[string];
   }
+  // The page fills its Racking box from the racking callouts' product (LLM_FIELD_TARGETS), and its
+  // save sends that box as `racking`.
+  if (payload.rackingSystem != null && payload.racking == null) payload.racking = payload.rackingSystem;
   return { payload, unsure };
 }
 

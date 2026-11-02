@@ -526,11 +526,14 @@ const parser = fs.readFileSync(path.resolve(process.cwd(), "frontend/parser.html
 check("the resolver is called from the real parse route, org-scoped", () => {
   const route = server.slice(server.indexOf('app.post("/api/parser/llm-extract"'));
   const body = route.slice(0, route.indexOf("app.post(", 10));
-  assert.match(body, /resolveClientForExtraction\(/,
-    "the parse route does not call the resolver — it has no production caller");
-  assert.match(body, /reqOrgFilter\(db, req\)/,
-    "the resolver is called without the request's org filter — another tenant's client could be suggested");
-  assert.match(body, /clientResolution/);
+  // The route's server half lives in parserExtraction.ts (shared with email-in intake, #489): the
+  // route hands it the REQUEST's org filter, and it hands that filter to the resolver.
+  const shared = fs.readFileSync(path.resolve(process.cwd(), "backend/src/parserExtraction.ts"), "utf8");
+  assert.match(body, /extractParserFields\(db, llm, \{[\s\S]*?\}, reqOrgFilter\(db, req\)\)/,
+    "the parse route does not pass the request's org filter to the shared extraction — another tenant's client could be suggested");
+  assert.match(shared, /resolveClientForExtraction\(db, extraction\.fields, orgFilter, planText\)/,
+    "the shared extraction does not call the resolver with the caller's org filter — it has no production caller, or reads unscoped");
+  assert.match(shared, /clientResolution/);
 });
 
 check("no NEW top-level /api path was added for this (Round 6 deny-by-default)", () => {

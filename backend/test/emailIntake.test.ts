@@ -36,8 +36,9 @@ const { openDatabase, DEFAULT_ORG_ID } = await import("../src/db");
 const { createClient, updateClient } = await import("../src/clients");
 const {
   processIntakeMessages, listEmailIntake, emailIntakeFile, dismissEmailIntake, mboxMessages, payloadFromExtraction,
-  intakeTagFrom, senderIsKnown, intakeReplyEmail,
+  intakeTagFrom, senderIsKnown, intakeReplyEmail, PARSER_PROJECT_FIELDS,
 } = await import("../src/emailIntake");
+const { REPO } = await import("./_isolate");
 const { writeMboxMessage } = await import("../src/mbox");
 const { PDFDocument, StandardFonts } = await import("pdf-lib");
 const { default: MailComposer } = await import("nodemailer/lib/mail-composer/index.js");
@@ -167,9 +168,31 @@ await run("a low-confidence field is not written; the contractor block is never 
   const p = projectsFor(acme.id)[0];
   assert.equal(p.account_number, "", "the low-confidence account number was written");
   assert.ok(!String(p.parser_json).includes("contractorCompany"));
-  const { payload, unsure } = payloadFromExtraction({ fields: { a: { value: "x", confidence: 0.2 }, b: { value: "y", confidence: 0.9 }, contractorCcb: { value: "1", confidence: 1 } } as never, lowConfidenceFields: ["a"] });
-  assert.deepEqual(payload, { b: "y" });
-  assert.deepEqual(unsure, ["a"]);
+  const { payload, unsure } = payloadFromExtraction({
+    fields: {
+      utility: { value: "x", confidence: 0.2 }, ahj: { value: "y", confidence: 0.9 }, contractorCcb: { value: "1", confidence: 1 },
+      client_id: { value: rival.id, confidence: 1 }, clientId: { value: rival.id, confidence: 1 }, structureDescription: { value: "garage", confidence: 1 },
+    } as never,
+    lowConfidenceFields: ["utility"],
+  });
+  assert.deepEqual(payload, { ahj: "y" }, "a key outside the Parser page's own list reached the project");
+  assert.deepEqual(unsure, ["utility"]);
+});
+
+await run("the saved-field allowlist is the Parser page's own (LLM_SNAPSHOT_KEYS + LLM_FIELD_TARGETS)", () => {
+  const html = fs.readFileSync(path.join(REPO, "frontend", "parser.html"), "utf8");
+  const block = (start: string, end: string) => {
+    const a = html.indexOf(start);
+    assert.ok(a >= 0, `${start} not found in parser.html`);
+    return html.slice(a, html.indexOf(end, a)).replace(/\/\/.*$/gm, "");
+  };
+  const snapshot = [...block("const LLM_SNAPSHOT_KEYS = new Set([", "]);").matchAll(/'([A-Za-z0-9_]+)'/g)].map((m) => m[1]);
+  const targets = [...block("const LLM_FIELD_TARGETS = {", "};").matchAll(/([A-Za-z0-9_]+):\s*\[/g)].map((m) => m[1]);
+  const page = new Set([...snapshot, ...targets]);
+  assert.ok(page.size > 50, `read only ${page.size} keys from parser.html`);
+  const missing = [...page].filter((k) => !PARSER_PROJECT_FIELDS.has(k));
+  const extra = [...PARSER_PROJECT_FIELDS].filter((k) => !page.has(k));
+  assert.deepEqual({ missing, extra }, { missing: [], extra: [] });
 });
 
 await run("the reply goes to the From address with the status link and what is missing, never the account or meter", () => {

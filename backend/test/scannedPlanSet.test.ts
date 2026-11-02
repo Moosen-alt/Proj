@@ -346,7 +346,9 @@ await check("(u2) a TEXT plan set is posted to the same route (the server finds 
   assert.match(html, /planChars >= 40 \* Math\.max\(1, state\.planDoc\?\.pageCount \|\| 1\)\)\{[\s\S]{0,400}fetch\(`\/api\/parser\/plan-scan-extract\$\{planScanQuery\}`/);
   assert.match(html, /v\.planReadMode === 'hybrid'/);
   assert.match(html, /postJson\('\/api\/parser\/llm-extract', \{[^\n]*planImageRead/);
-  assert.match(server, /mergeImagePageRead\(extraction, req\.body\.planImageRead\)/);
+  // The merge lives in parserExtraction.ts (shared with email-in intake, #489); the route hands it the posted read.
+  assert.match(server, /planImageRead: req\.body\?\.planImageRead/);
+  assert.match(fs.readFileSync(path.join(REPO, "backend", "src", "parserExtraction.ts"), "utf8"), /mergeImagePageRead\(extraction, input\.planImageRead\)/);
   assert.match(server, /if \(read\.mode === "hybrid"\) \{ res\.json\(read\.extraction/);
 });
 await check("(u3) MUST-PASS: the parser page shows the smart read's roof planes (never 'No roof planes parsed' over a roof plan that was read)", () => {
