@@ -96,6 +96,7 @@ const { sendInstallerHandoff } = await import("../src/installerHandoff");
 const { INSTALLER_HANDOFF_SENDER } = await import("../src/handoffDocuments");
 const { resendCommunication } = await import("../src/clientNotifier");
 const { undeliveredCommunications } = await import("../src/crm");
+const { redactSecretValues } = await import("../../shared/src/portalSafety");
 
 const db = await openDatabase();
 type Row = Record<string, unknown>;
@@ -112,6 +113,8 @@ const ISSUED = "Permit issued. Download permit card from the portal.";
 const NEM_APPROVED = "Interconnection application approved. Permission to operate granted.";
 const ACCOUNT = "8812345670";
 const METER = "M99887766";
+// A portal password the parser picked up off a form — a credential, under a secret key.
+const PASSWORD = "Hunter2-Solar9";
 const PDF = Buffer.from("%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF\n");
 
 const handoffRows = (pid: string): Row[] => db.query<Row>(
@@ -134,7 +137,10 @@ const makeJob = (opts: { autoSend?: string; nemNumber?: string } = {}): { pid: s
     clientId: client.id, owner: `Handoff Owner ${n}`, street: `${100 + n} Closeout Way`, city: "Portland",
     state: "OR", zip: "97201", ahj: "Portland", utility: "PGE", dcKw: "8.6", acKw: "6.5", permitPath: "prescriptive",
   } as never).project.id;
-  db.run("UPDATE projects SET account_number = ?, meter_number = ? WHERE id = ?", [ACCOUNT, METER, pid]);
+  db.run("UPDATE projects SET account_number = ?, meter_number = ?, parser_json = ? WHERE id = ?",
+    [ACCOUNT, METER, JSON.stringify({ ...JSON.parse(String(db.get<Row>("SELECT parser_json FROM projects WHERE id = ?", [pid])?.parser_json || "{}")), portalPassword: PASSWORD }), pid]);
+  // …and typed where it flows into the packet (the checklist's INTERCONNECTION line).
+  db.run("UPDATE projects SET interconnection_method = ? WHERE id = ?", [`Supply-side tap; portal login pw ${PASSWORD}, meter ${METER}`, pid]);
   R.createPermitCheckTarget(db, pid, { jurisdiction: "Portland", applicationNumber: `COMBO-${n}`, permitType: "combo" } as never);
   const detail = R.createPermitCheckTarget(db, pid, { jurisdiction: "PGE", applicationNumber: opts.nemNumber ?? `NEM-${n}`, permitType: "nem", targetType: "nem" } as never);
   const byNumber = Object.fromEntries(detail.permitCheckTargets.map((t) => [t.applicationNumber, t.id]));
@@ -202,12 +208,15 @@ try {
     const note = String(db.get<Row>("SELECT body FROM project_notes WHERE project_id = ? AND note_type = 'handoff'", [a.pid])?.body ?? "");
     const lines = note.split("\n").filter((l) => /^\d+\. /.test(l));
     assert.ok(lines.length >= 8, note);
-    for (const l of lines) assert.ok(body.includes(l), `missing from the email: ${l}`);
+    // Compared after the scrub: the note is internal and keeps what was typed; the email may not.
+    for (const l of lines) assert.ok(body.includes(redactSecretValues(l, [ACCOUNT, METER, PASSWORD])), `missing from the email: ${l}`);
   });
-  await check("1f. RULE 2: the account and meter numbers reach neither subject nor body — even typed into a reference field", () => {
+  await check("1f. RULE 2: the account number, meter number and a credential reach neither subject nor body — even typed into fields that flow there", () => {
+    assert.match(body, /INTERCONNECTION: Supply-side tap/, "the fixture's leak path is live: the field reaches the body");
     for (const text of [subject, body]) {
       assert.doesNotMatch(text.replace(/\D/g, " "), /8812\s*345\s*670/, text);
       assert.ok(!text.includes(METER), text);
+      assert.ok(!text.includes(PASSWORD), text);
       assert.ok(!text.includes("8812-345-670"), text);
     }
     assert.match(body, /\[redacted\]/, "the typed-in account number is redacted, not dropped silently");
@@ -254,6 +263,7 @@ try {
     assert.equal(packets()[0].to, a.inbox);
     assert.match(packets()[0].data, /filename="?issued-permit-1\.pdf/);
     assert.ok(!packets()[0].data.includes(ACCOUNT), "an original file name carrying the account number was forwarded");
+    assert.ok(!packets()[0].data.includes(PASSWORD) && !packets()[0].data.includes(METER), "a secret reached the sent message");
     assert.doesNotMatch(packets()[0].data, /utility-bill|outside\.pdf|utility-approval/);
   });
 

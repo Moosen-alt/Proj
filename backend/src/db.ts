@@ -2798,7 +2798,7 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
     },
   },
   {
-    version: 54,
+    version: 57,
     name: "clients_handoff_auto_send",
     up: (db) => {
       // THE INSTALLER HANDOFF PACKET, EMAILED BY THE SERVER (#491). Per-client opt-out: '' = the
