@@ -4469,28 +4469,43 @@ function serverIsSharedNow() {
   return !!(state.authMe && state.authMe.serverIsShared === true);
 }
 
+// Sign-in on: the recorder CLI needs the person's own recorder token (#433), wherever the server is.
+function recorderNeedsTokenNow() {
+  return !!(state.authMe && state.authMe.enabled);
+}
+
+const RECORDER_TOKEN_WHERE = "Sign-in is on here, so the recorder needs your personal recorder token: make one under Team, Recorder tokens, and set it as RECORDER_TOKEN on your computer before you run the command (record.bat asks for it). If this server sits behind Cloudflare Access, also set CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET (ask your admin).";
+
 function recordSharedNoteText() {
   const origin = window.location.origin;
-  let text = `This dashboard runs on a shared server, so the recorder runs on your own computer, not here: download record.bat or copy the command, and run it in your SOLAR-Proj folder. It saves the recipe to this server: ${origin}.`;
-  if (state.authMe && state.authMe.enabled) {
-    text += " Sign-in is on here, so the recorder needs your personal recorder token. Recorder tokens are not built yet (issue #433); until then this server refuses a recording sent from your computer.";
-  }
+  let text = serverIsSharedNow()
+    ? `This dashboard runs on a shared server, so the recorder runs on your own computer, not here: download record.bat or copy the command, and run it in your SOLAR-Proj folder. It saves the recipe to this server: ${origin} (the --api flag).`
+    : "";
+  if (recorderNeedsTokenNow()) text += `${text ? " " : ""}${RECORDER_TOKEN_WHERE}`;
   return text;
 }
 
 function sharedServerBatLines() {
-  if (!serverIsSharedNow()) return "";
+  let lines = "";
   // REM lines are inert; the origin comes from the browser's own location bar, never the server.
   const origin = window.location.origin.replace(/[\r\n%^&|<>]/g, "");
-  let lines = `REM Saves to the shared server ${origin} (the --api flag below).\r\n`;
-  if (state.authMe && state.authMe.enabled) lines += "REM Sign-in is on there: the recorder needs your personal recorder token (issue #433).\r\n";
+  if (serverIsSharedNow()) lines += `REM Saves to the shared server ${origin} (the --api flag below).\r\n`;
+  if (recorderNeedsTokenNow()) {
+    // The token is ASKED FOR when the file runs, never written into it: a .bat sitting in a
+    // Downloads folder must not carry a credential. Already set in this window? Then it is used as is.
+    lines += "REM Sign-in is on there: the recorder needs your personal recorder token (dashboard: Team, Recorder tokens).\r\n";
+    lines += "REM Behind Cloudflare Access? Set CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET first (ask your admin).\r\n";
+    lines += "if not defined RECORDER_TOKEN set /p RECORDER_TOKEN=Paste your recorder token and press Enter: \r\n";
+  }
   return lines;
 }
 
 function applyServerPosture() {
   const shared = serverIsSharedNow();
   document.body.classList.toggle("server-shared", shared);
-  const note = shared ? recordSharedNoteText() : "";
+  // The record notes also show on an unshared server with sign-in on: they say where the token goes.
+  document.body.classList.toggle("recorder-needs-token", recorderNeedsTokenNow());
+  const note = shared || recorderNeedsTokenNow() ? recordSharedNoteText() : "";
   for (const id of ["recordSharedNote", "recordCmdSharedNote"]) {
     const el = $(id);
     if (el) el.textContent = note;
@@ -11199,8 +11214,85 @@ async function changeMyPassword() {
   }
 }
 
+// ----- Recorder tokens (#433) -----
+// A signed-in person's own tokens for the portal recorder CLI (npm run portal:record) when it saves
+// to a server with sign-in on. Shown ONCE at mint (the server keeps only a hash); listed by name and
+// dates, never the token; revocable. With sign-in off the recorder needs none, and this says so.
+function recorderTokensStatus(text, kind) {
+  const el = $("recorderTokensStatus");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = kind === "error" ? "message error" : "muted";
+}
+
+function renderRecorderTokens(data) {
+  const off = !data || data.authEnabled === false;
+  $("recorderTokensState").textContent = off
+    ? "Sign-in is off on this server, so the recorder needs no token here."
+    : "The portal recorder on your own computer uses one of these to save recordings to this server as you. It reaches only the recorder's endpoints: it cannot stage, approve or submit anything.";
+  $("recorderTokensControls").hidden = off;
+  const list = $("rt_list");
+  if (!list) return;
+  const tokens = off ? [] : (Array.isArray(data.tokens) ? data.tokens : []);
+  list.innerHTML = tokens.length
+    ? tokens.map((t) => {
+      const status = t.revokedAt ? `revoked ${esc(fmtDate(t.revokedAt))}` : t.live ? `expires ${esc(fmtDate(t.expiresAt, true))}` : `expired ${esc(fmtDate(t.expiresAt, true))}`;
+      const used = t.lastUsedAt ? `last used ${esc(fmtDate(t.lastUsedAt))}` : "never used";
+      const revoke = t.live ? ` <button type="button" class="secondary ghost" data-revoke-recorder-token="${esc(t.id)}"><span>Revoke</span></button>` : "";
+      return `<li><strong>${esc(t.name || "recorder")}</strong> <span class="muted">made ${esc(fmtDate(t.createdAt, true))}, ${status}, ${used}</span>${revoke}</li>`;
+    }).join("")
+    : (off ? "" : `<li class="muted">You have no recorder tokens yet.</li>`);
+}
+
+async function loadRecorderTokens() {
+  const auth = await authForDecision();
+  if (!auth || !auth.enabled || !auth.user) { renderRecorderTokens({ authEnabled: false, tokens: [] }); return; }
+  try {
+    renderRecorderTokens(await api("/api/auth/recorder-tokens"));
+  } catch (err) {
+    renderRecorderTokens({ authEnabled: true, tokens: [] });
+    recorderTokensStatus(err.message || "Could not load your recorder tokens.", "error");
+  }
+}
+
+async function mintRecorderToken() {
+  const name = $("rt_name").value.trim();
+  const days = Number($("rt_days").value || 30);
+  try {
+    const res = await api("/api/auth/recorder-tokens", { method: "POST", body: JSON.stringify({ name, days }) });
+    $("rt_newToken").value = res.token || "";
+    $("rt_newTokenWrap").hidden = !res.token;
+    $("rt_name").value = "";
+    $("rt_newToken").focus();
+    $("rt_newToken").select();
+    recorderTokensStatus("Token made. Copy it now: it is not shown again.");
+    await loadRecorderTokens();
+  } catch (err) {
+    recorderTokensStatus(err.message || "Could not make a recorder token.", "error");
+  }
+}
+
+async function revokeRecorderToken(id) {
+  if (!id || !confirm("Revoke this recorder token? A recorder using it is refused from its next request.")) return;
+  try {
+    await api(`/api/auth/recorder-tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
+    recorderTokensStatus("Token revoked.");
+    await loadRecorderTokens();
+  } catch (err) {
+    recorderTokensStatus(err.message || "Could not revoke the token.", "error");
+  }
+}
+
+function clearNewRecorderToken() {
+  if ($("rt_newToken")) $("rt_newToken").value = "";
+  if ($("rt_newTokenWrap")) $("rt_newTokenWrap").hidden = true;
+  recorderTokensStatus("");
+}
+
 async function openUsersModal() {
   $("usersModal").hidden = false;
+  clearNewRecorderToken();
+  void loadRecorderTokens();
   await loadStaffSignIn();
   await loadUsers();
   if ((state.users || []).length > 0) editUser(state.users[0].id);
@@ -11208,7 +11300,8 @@ async function openUsersModal() {
   if (window.lucide) window.lucide.createIcons();
 }
 
-function closeUsersModal() { $("usersModal").hidden = true; }
+// Closing the Team window forgets a just-made token: it was shown once.
+function closeUsersModal() { $("usersModal").hidden = true; clearNewRecorderToken(); }
 
 $("openUsersBtn").addEventListener("click", openUsersModal);
 $("closeUsersBtn").addEventListener("click", closeUsersModal);
@@ -11218,6 +11311,11 @@ $("u_password").addEventListener("input", () => syncUserRoleChoice(!$("userId").
 $("sl_setPasswordBtn").addEventListener("click", setStaffPassword);
 $("sl_toggleActiveBtn").addEventListener("click", toggleStaffActive);
 $("mp_saveBtn").addEventListener("click", changeMyPassword);
+$("rt_mintBtn").addEventListener("click", mintRecorderToken);
+$("rt_list").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-revoke-recorder-token]");
+  if (btn) revokeRecorderToken(btn.getAttribute("data-revoke-recorder-token"));
+});
 $("usersModal").addEventListener("click", (e) => { if (e.target.id === "usersModal") closeUsersModal(); });
 
 // ----- KPI Dashboard -----
