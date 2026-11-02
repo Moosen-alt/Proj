@@ -52,7 +52,10 @@ const NAMES = [
   "TRACK_ISSUER_KEY", "TRACK_ISSUER_SOURCE", "trackIssuerHtml", "trackIssuerEditHtml", "saveTrackIssuer",
   // What the recipe will fill that the job has no value for (#445) — trackCardHtml calls it.
   "STAGE_GAP_LINK", "trackStageGapsHtml",
-  "trackCardHtml", "utilityGroupTitle", "renderSubmittalTracks",
+  "trackCardHtml", "utilityGroupTitle",
+  // The closeout milestones group (#497) — renderSubmittalTracks draws and binds it.
+  "closeoutGroupHtml", "bindCloseoutMilestones", "saveProjectMilestone",
+  "renderSubmittalTracks",
 ];
 const preamble = "const screenshotMisses = new Set(); const screenshotKey = (a, b, c) => `${a}:${b}:${c}`;";
 const code = `${preamble}\n${NAMES.map(lift).join("\n\n")}`;

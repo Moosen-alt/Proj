@@ -20,7 +20,8 @@
 // reading it now, nothing for you to do yet" is the same fact and a completely different
 // Tuesday. Every update below ends with it, including when the answer is "nothing".
 //
-// WHY THESE ARE TEMPLATES AND NOT LLM-WRITTEN. The event set is four outcomes and a filing, so a template
+// WHY THESE ARE TEMPLATES AND NOT LLM-WRITTEN. The event set is four outcomes, a filing and three
+// closeout milestones, so a template
 // can be genuinely well written once and then be right every time. An LLM would cost per event,
 // and — the real objection — it would occasionally claim something we do not know, in text sent
 // to a paying customer under our name. The variation a model would add is not worth a single
@@ -163,6 +164,21 @@ export function isClientFacingOutcome(outcome: string): boolean {
  * portal did not confirm (submitted_unconfirmed) is never announced as filed.
  */
 export const CLIENT_FILED_EVENT = "filed";
+
+/**
+ * THE CLOSEOUT MILESTONES A CLIENT HEARS ABOUT (#497): final inspection passed, PTO requested,
+ * PTO granted. "installed" is not here on purpose — the client is the installer, and the one
+ * thing they do not need is us telling them their own crew finished.
+ *
+ * Kept out of CLIENT_FACING_OUTCOMES for the same reason as CLIENT_FILED_EVENT: that list is the
+ * MONITOR's gate on a change of a polled reading, and none of these is a reading. They are sent
+ * only by clientTimeline.recordProjectMilestone, once per milestone, when it is recorded.
+ */
+export const CLIENT_MILESTONE_EVENTS = ["final_passed", "pto_requested", "pto_granted"] as const;
+
+export function isClientMilestoneEvent(milestone: string): boolean {
+  return (CLIENT_MILESTONE_EVENTS as readonly string[]).includes(milestone);
+}
 
 /**
  * WHAT THE PERMIT STRUCTURE LETS US SAY TO A CLIENT (leak sweep unknown-as-fact-client-email-combo-
@@ -308,6 +324,38 @@ export function clientUpdateFor(
         action: "Nothing needed from you. We are watching it and will tell you the day it moves.",
       };
     }
+
+    // THE CLOSEOUT (#497). Recorded by a person (or the finals / PTO automation) through
+    // clientTimeline.recordProjectMilestone, never read off a portal. None of the three promises a
+    // date: there is no measured history for these steps yet, and a client books around it.
+    case "final_passed":
+      return {
+        subject: "Final inspection passed",
+        headline: `${ahj} has passed the final inspection.`,
+        // The utility's permission to operate is the next gate only on a job that has one.
+        meaning: text(project.utility)
+          ? `That closes out the permit. The last step is ${utility}'s permission to operate.`
+          : "That closes out the permit.",
+        action: "Nothing needed from you. We will tell you if anything is needed for the next step.",
+      };
+
+    case "pto_requested":
+      return {
+        subject: "Permission to operate requested",
+        headline: `We have asked ${utility} for permission to operate.`,
+        // The sentence that saves a phone call AND a problem: an installed system is not a
+        // system the homeowner may switch on.
+        meaning: "The system stays off until they grant it.",
+        action: "Nothing needed from you. We are watching it and will tell you the day it is granted.",
+      };
+
+    case "pto_granted":
+      return {
+        subject: "Permission to operate granted",
+        headline: `${utility} has granted permission to operate.`,
+        meaning: "The system can be turned on.",
+        action: "Nothing needed from you.",
+      };
 
     case "correction_flagged":
       return {

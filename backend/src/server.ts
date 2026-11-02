@@ -54,6 +54,7 @@ import { createUser, getUserWorkload, listUsers, updateUser, assignProjectToUser
 import { listBackups, runBackup, startBackupScheduler } from "./backup";
 import { startArtifactRetention } from "./artifactRetention";
 import { startMonitorScheduler } from "./scheduler";
+import { startStaffDigestScheduler } from "./staffAlerts";
 import { startAhjFormRefreshScheduler, startKbLinkCheckScheduler } from "./ahjFormRefresh";
 import { startCecSyncScheduler, primeCecCache, syncCecEquipment } from "./cecEquipment";
 import { extractZipToWorkdir } from "./batchZip";
@@ -66,6 +67,7 @@ import { folderScanPayload } from "./batchZip";
 import type { RequestScope } from "./scope";
 import { DEFAULT_ORG_ID } from "./db";
 import { ensureStatusShareToken, statusShareUrl } from "./clientNotifier";
+import { sendInstallerHandoff } from "./installerHandoff";
 import { listCodeProfiles, listRowlessDesignLookups, getCodeProfile, saveResearchedCodeProfile, saveVerifiedCodeProfile, codeProfileKey, applyEditionProposal, dismissEditionProposal } from "./codeProfiles";
 import { applyCorrectionApproval } from "./correctionAgent";
 import { runStandaloneReview, getReviewSubmission, listReviewSubmissions, reviewSubjectToProject } from "./reviewSubject";
@@ -85,6 +87,7 @@ import {
   updateCustomer,
 } from "./crm";
 import { clientPortalPayload, clientPortalUrl, ensureClientPortalToken, publicProjectStatusPayload, trackLabel } from "./clientPortal";
+import { buildClientTimeline, clearProjectMilestone, projectMilestones, recordProjectMilestone } from "./clientTimeline";
 import { scanStaleStatusClassifications } from "./permitMonitor";
 import { getKpiReport, requestNoticedAt } from "./kpi";
 import {
@@ -165,6 +168,7 @@ import {
 import { createSignatureRequestApproval } from "./signatureRequestApproval";
 import { confirmSignatureRequestSent } from "./signatureTrack";
 import { getSubmittalTracks, markTrackSubmitted } from "./submittalTracks";
+import { buildApprovalSheet } from "./approvalSheet";
 import { projectForTrack } from "./permitProcess";
 import { ahjProcessKnowledgeStatus, AHJ_PROCESS_REFERENCE_ENV } from "./processProfiles";
 import { enqueueStageSteps } from "./autoStageSteps";
@@ -1602,6 +1606,17 @@ app.get("/api/projects/:id/handoff-packet", (req, res) => {
   res.json(getProjectHandoffPacket(db, req.params.id));
 });
 
+// SEND THE INSTALLER HANDOFF PACKET (#491) — the operator's door: the first send when the client
+// sends by hand or the automatic one did not go, and every re-send. Under /api/projects/:id, so the
+// tenant scope guard covers it; the recipient is always the project's own client.
+app.post("/api/projects/:id/handoff-packet/send", asyncHandler(async (req, res) => {
+  const projectId = String(req.params.id);
+  const { project } = getProjectDetail(db, projectId); // 404 if missing
+  const result = await sendInstallerHandoff(db, project, { trigger: "manual", actor: currentUser(db, req)?.email || "operator" });
+  if (result.deliveryStatus === "skipped") throw new HttpError(result.refusedStatus ?? 409, result.detail);
+  res.json(result);
+}));
+
 app.get("/api/projects/:id/communication-drafts", (req, res) => {
   res.json(getProjectCommunicationDrafts(db, req.params.id));
 });
@@ -1642,6 +1657,29 @@ app.post("/api/projects/:id/ops-steps/:stepId", (req, res) => {
 
 app.post("/api/projects/:id/notes", (req, res) => {
   res.status(201).json(addProjectNote(db, req.params.id, req.body || {}));
+});
+
+// THE CLOSEOUT MILESTONES (#497): installed, final passed, PTO requested, PTO granted — recorded by
+// a person on the project page, read back with the client's timeline as the client sees it. Under
+// /api/projects/:id, so each inherits the project scope guard (rule 6: out-of-scope 404) and the
+// entitlement gate; no new top-level path. Recording a client-facing one sends the client update
+// once (clientTimeline.recordProjectMilestone); the route does not wait on the email.
+app.get("/api/projects/:id/milestones", (req, res) => {
+  const detail = getProjectDetail(db, String(req.params.id));
+  res.json({ milestones: projectMilestones(db, detail.project.id), timeline: buildClientTimeline(db, detail.project) });
+});
+
+app.post("/api/projects/:id/milestones", (req, res) => {
+  const { milestones } = recordProjectMilestone(db, String(req.params.id), {
+    milestone: String(req.body?.milestone ?? ""),
+    at: req.body?.at,
+    recordedBy: currentUser(db, req)?.email || "operator",
+  });
+  res.status(201).json({ milestones });
+});
+
+app.delete("/api/projects/:id/milestones/:milestone", (req, res) => {
+  res.json({ milestones: clearProjectMilestone(db, String(req.params.id), String(req.params.milestone), currentUser(db, req)?.email || "operator") });
 });
 
 app.post("/api/projects/:id/workflow", (req, res) => {
@@ -3136,6 +3174,15 @@ app.post("/api/projects/:id/payment/record-fee", asyncHandler(async (req, res) =
   res.json({ quote });
 }));
 
+// FEE ACCURACY (#494) — what we quoted at filing beside what was paid, per AHJ/utility and track,
+// flagging any jurisdiction whose quotes miss by more than ?thresholdPct (default 10, or
+// FEE_ACCURACY_THRESHOLD_PCT). A new top-level path, so it is tenant-scoped here (reqOrgFilter)
+// and declared in routeScope.test. Read-only: never writes "verified", never touches a schedule.
+app.get("/api/fee-accuracy", asyncHandler(async (req, res) => {
+  const { buildFeeAccuracyReport } = await import("./feeAccuracy");
+  res.json(buildFeeAccuracyReport(db, reqOrgFilter(db, req), { thresholdPct: req.query.thresholdPct }));
+}));
+
 // THE FEE SHEET — "what does this job cost, and where did that number come from?"
 //
 // Both tracks in one answer: the amount, the schedule line it fell in, the published page it
@@ -3740,6 +3787,18 @@ app.get("/api/projects/:id/submittal-tracks", (req, res) => {
 
 const SUBMITTAL_TRACK_TYPES: SubmittalTrackType[] = ["nem", "building", "electrical", "combo", "permit", "mpu"];
 
+// THE APPROVAL SHEET (#486): what Approve & auto-submit is about to file for this track — the
+// replay's own values, account / meter masked to the last 4, every disagreement with the bill or the
+// plan set named first. A READ: it writes nothing and decides nothing; the approve request
+// (POST prepare-submission) and the gate are unchanged. Under /api/projects/:id, so the org scope
+// guard answers another org's project with a 404 before this handler runs (rule 6).
+app.get("/api/projects/:id/approval-sheet", (req, res) => {
+  const track = String(req.query.track ?? "").trim() as SubmittalTrackType;
+  if (!SUBMITTAL_TRACK_TYPES.includes(track)) throw new HttpError(400, `track must be one of ${SUBMITTAL_TRACK_TYPES.join(", ")}.`);
+  const detail = getProjectDetail(db, String(req.params.id));
+  res.json({ sheet: buildApprovalSheet(db, detail.project, track) });
+});
+
 // "I SENT THE SIGNATURE REQUEST" (#310): a named person clicked the utility portal's Request
 // Signatures themselves. Recorded with who and when; the NEM track then waits on the homeowner's
 // signature (signatureTrack). The name is the signed-in user's when auth is on, never the body's.
@@ -3905,6 +3964,7 @@ const server = app.listen(port, listen.host, () => {
   startBackupScheduler(db);
   startArtifactRetention();
   startMonitorScheduler(db);
+  startStaffDigestScheduler(db);
   startAhjFormRefreshScheduler(db);
   startKbLinkCheckScheduler(db);
   startCecSyncScheduler(db);

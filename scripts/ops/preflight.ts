@@ -23,6 +23,7 @@ import path from "node:path";
 import { backupDir as stateBackupDir, dbPath as stateDbPath, opsDir } from "../../backend/src/statePaths";
 import { AUTOMATIC_SNAPSHOT_RE } from "../../backend/src/offboxBackup";
 import { DEFAULT_LISTEN_HOST, isLoopbackListenHost, resolveListenHost } from "../../backend/src/listenHost";
+import { DEFAULT_STAFF_ORG_ID, configuredStaffOrgs, parseOrgScopedList, staffAlertChannels, staffAlertsOn, staffDigestHour } from "../../backend/src/staffAlertConfig";
 import { exposedHostAdvice, isWindows, probeEdge, trustProxyRow, watchdogInstallHint, type HostShape } from "../../backend/src/opsEdgePosture";
 
 const env = process.env;
@@ -205,19 +206,25 @@ if (Number(env.MONITOR_INTERVAL_MINUTES ?? 15) <= 0) {
   add("notifications", "MONITOR_INTERVAL_MINUTES", "WARN",
     `${String(env.MONITOR_INTERVAL_MINUTES).trim() || "empty"}: the monitor never runs, so no tracking inbox is read and no portal status is checked (right on a test copy only). Remove the line or set MONITOR_INTERVAL_MINUTES=15`);
 }
-// Staff alerts (stopped runs, status changes, the morning digest) are #487, built in parallel: this
-// row reads the setting NAMES that task adds (STAFF_ALERT_TO, STAFF_ALERT_WEBHOOK_URL,
-// STAFF_DIGEST_HOUR) from the environment only and imports nothing from it. Until #487 is deployed
-// these settings do nothing, so the WARN says what to add for when it is.
+// Staff alerts (stopped runs, corrections, status changes, the morning digest; #487). The verdict
+// is staffAlertConfig.ts's — the leaf module the server sends by — so this row cannot call a
+// setting on that the server ignores (an address with no SMTP, a webhook that is not http(s), an
+// unreadable STAFF_DIGEST_HOUR). It never prints an address or the webhook URL (an ntfy topic is
+// the password to the push channel).
 {
-  const staffTo = String(env.STAFF_ALERT_TO ?? "").split(/[,;]/).map((x) => x.trim()).filter(Boolean);
-  const staffHook = Boolean(String(env.STAFF_ALERT_WEBHOOK_URL ?? "").trim());
-  const staffMail = staffTo.length > 0 && smtpOn;
-  const digest = String(env.STAFF_DIGEST_HOUR ?? "").trim();
-  add("notifications", "staff alerts", staffMail || staffHook ? "PASS" : "WARN",
-    staffMail || staffHook
-      ? [staffMail ? `email to ${staffTo.length} address(es)` : "", staffHook ? "webhook set" : "", digest ? `morning digest at hour ${digest}` : ""].filter(Boolean).join("; ")
-      : staffTo.length
+  const staffChannels = staffAlertChannels(DEFAULT_STAFF_ORG_ID, env);
+  const staffListed = parseOrgScopedList(env.STAFF_ALERT_TO, /[,;]/).filter((e) => e.orgId === DEFAULT_STAFF_ORG_ID).length;
+  const staffOn = staffAlertsOn(DEFAULT_STAFF_ORG_ID, env);
+  const digestHour = staffDigestHour(env);
+  const digestRaw = String(env.STAFF_DIGEST_HOUR ?? "").trim();
+  const otherOrgs = configuredStaffOrgs(env).filter((o) => o !== DEFAULT_STAFF_ORG_ID).length;
+  add("notifications", "staff alerts", staffOn ? "PASS" : "WARN",
+    staffOn
+      ? [staffChannels.emails.length ? `email to ${staffChannels.emails.length} address(es)` : "",
+        staffChannels.webhooks.length ? "webhook set" : "",
+        digestHour !== null ? `morning digest at hour ${digestHour}` : digestRaw ? `no morning digest (STAFF_DIGEST_HOUR=${digestRaw} is not an hour 0-23)` : "no morning digest (STAFF_DIGEST_HOUR unset)",
+        otherOrgs ? `${otherOrgs} other org(s) configured` : ""].filter(Boolean).join("; ")
+      : staffListed
         ? "STAFF_ALERT_TO is set but SMTP is not, so no staff alert can be emailed: set SMTP (above) or STAFF_ALERT_WEBHOOK_URL=<ntfy topic>"
         : "no recipients: nobody on the team is told when a run stops or a job changes state. Add STAFF_ALERT_TO=<you>, <your PM> (uses SMTP) and/or STAFF_ALERT_WEBHOOK_URL=<ntfy topic> (staff alerts, #487)");
 }

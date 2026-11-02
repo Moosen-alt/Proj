@@ -75,6 +75,8 @@ import { findCompleteRecipeForProject, findAnyRecipeForProject, resolveRecipeFie
 import { notServedInResult } from "../../shared/src/portalNotServed";
 import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier";
 import { notifyClientOfFiling } from "./clientFilingUpdate";
+import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStatusChange } from "./staffAlerts";
+import { installerHandoffNoteBody, sendInstallerHandoff } from "./installerHandoff";
 // detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget; the
 // card's Edit (updatePermitCheckTarget) re-detects with the same function when the URL changes.
 import { accelaModulesForNumber, detectPlatform, publicPermitStatusCheck, searchAccelaRecordByNumber } from "./publicPermitStatus";
@@ -98,7 +100,9 @@ import { addAuditLog } from "./audit";
 import { clientLicenceRow, clientStagingOverlay, contractorLicenceForState, getClient } from "./clients";
 import { planSetLicenceWarning } from "./clientMatch";
 import { assertSubmissionPaid } from "./submissionFees";
+import { snapshotFilingQuote } from "./feeAccuracy";
 import { readAndRecordPortalFees } from "./portalFeeReadings";
+import { closeoutDocumentLines, fetchIssuedRecordDocuments, isFinishedOutcome, issuedDocumentsByTarget } from "./portalIssuedDocuments";
 import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential } from "./portalCredentials";
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
 import { logger } from "./logger";
@@ -524,9 +528,25 @@ function mapPermitTarget(row: Row): PermitCheckTarget {
     portalPlatform: text(row.portal_platform),
     trackingUrl: row.tracking_url ? text(row.tracking_url) : undefined,
     readGap: text(row.read_gap) || undefined,
+    // Only while the filing is finished: a gap from an earlier issued reading that a later
+    // correction undid is not this filing's news any more.
+    issuedDocsGap: isFinishedOutcome(trackKind(text(row.target_type), text(row.permit_type)), text(row.latest_outcome))
+      ? text(row.issued_docs_gap) || undefined
+      : undefined,
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
   };
+}
+
+/** Each target's downloaded issued permit / approval letter (#492), with provenance — one query
+ *  for the project, not one per target. */
+function withIssuedDocuments(db: AppDb, projectId: string, targets: PermitCheckTarget[]): PermitCheckTarget[] {
+  const byTarget = issuedDocumentsByTarget(db, projectId);
+  if (!byTarget.size) return targets;
+  return targets.map((t) => {
+    const docs = byTarget.get(t.id);
+    return docs?.length ? { ...t, issuedDocuments: docs, issuedDocsGap: undefined } : t;
+  });
 }
 
 function mapPermitStatusCheck(row: Row): PermitStatusCheck {
@@ -1363,9 +1383,9 @@ export function getProjectDetail(db: AppDb, projectId: string): ProjectDetail {
       .query<Row>("SELECT * FROM human_review_items WHERE project_id = ? ORDER BY status DESC, created_at DESC", [projectId])
       .map(mapReview),
     corrections,
-    permitCheckTargets: db
+    permitCheckTargets: withIssuedDocuments(db, projectId, db
       .query<Row>("SELECT * FROM permit_check_targets WHERE project_id = ? ORDER BY active DESC, created_at DESC", [projectId])
-      .map(mapPermitTarget),
+      .map(mapPermitTarget)),
     permitStatusChecks: db
       .query<Row>("SELECT c.*, t.target_type, t.permit_type FROM permit_status_checks c LEFT JOIN permit_check_targets t ON t.id = c.target_id WHERE c.project_id = ? ORDER BY c.created_at DESC LIMIT 50", [projectId])
       .map(mapPermitStatusCheck),
@@ -1434,6 +1454,8 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     db.run("DELETE FROM audit_logs WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM historical_failure_examples WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM permit_timeline_samples WHERE project_id = ?", [projectId]);
+    // Closeout milestones (migration v58, #497).
+    db.run("DELETE FROM project_milestones WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM historical_project_fingerprints WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM knowledge_events WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM project_notes WHERE project_id = ?", [projectId]);
@@ -1447,6 +1469,9 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     db.run("DELETE FROM project_intake_requests WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM submission_payments WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM portal_fee_readings WHERE project_id = ?", [projectId]);
+    db.run("DELETE FROM portal_record_documents WHERE project_id = ?", [projectId]);
+    // The filing-time quote (migration v56, #494) carries the same FK.
+    db.run("DELETE FROM fee_quote_snapshots WHERE project_id = ?", [projectId]);
     // Keep permit_fee_history (learned real fees) but unlink the deleted project.
     db.run("UPDATE permit_fee_history SET project_id = NULL WHERE project_id = ?", [projectId]);
     // Communications may belong to a customer too — unlink rather than destroy correspondence.
@@ -2216,6 +2241,8 @@ export function getProjectHandoffPacket(db: AppDb, projectId: string): ProjectHa
   const noteLines = runbook.recentNotes
     .slice(0, 8)
     .map((note) => `${note.noteType.replaceAll("_", " ")} | ${note.createdBy || "Operations"}: ${note.body}`);
+  // The issued permit(s) and the approval letter the installer needs (#492).
+  const closeout = closeoutDocumentLines(db, projectId);
 
   const sections: ProjectHandoffPacketSection[] = [
     handoffSection({
@@ -2262,6 +2289,12 @@ export function getProjectHandoffPacket(db: AppDb, projectId: string): ProjectHa
       lines: timelineLines.length ? timelineLines : ["No timeline activity recorded yet."],
     }),
     handoffSection({
+      title: "Issued Permit & Approval Letter",
+      severity: closeout.complete ? "pass" : closeout.finished ? "warning" : "info",
+      source: "portal_record_documents",
+      lines: closeout.lines.length ? closeout.lines : ["No filing reads issued or approved yet."],
+    }),
+    handoffSection({
       title: "PM Notes",
       severity: runbook.recentNotes.some((note) => note.noteType === "blocker") ? "blocker" : runbook.recentNotes.length ? "info" : "pass",
       source: "project_notes",
@@ -2283,6 +2316,7 @@ export function getProjectHandoffPacket(db: AppDb, projectId: string): ProjectHa
     timelineEventCount: timeline.totalEvents,
     ownerRoles: [...owners].sort((a, b) => a.localeCompare(b)),
     sections,
+    closeoutDocumentsComplete: closeout.complete,
   };
   return {
     ...basePacket,
@@ -6664,6 +6698,9 @@ export async function recordPermitStatusCheck(
   const doneBeforeReading = (classification.outcome === "issued" || classification.outcome === "nem_approved") && previousOutcome !== classification.outcome
     ? trackDoneSnapshot(db, detail.project)
     : null;
+  // Set on the transition to handoff_ready only (triggerHandoffIfReady) — the installer handoff
+  // packet goes out after the transaction commits, below.
+  let handedOff = false;
 
   db.transaction(() => {
     // `recordCheck &&` on all three: see the note above. An unchanged poll falls straight through
@@ -6785,7 +6822,7 @@ export async function recordPermitStatusCheck(
         recordNumber: input.permitNumber || text(target.permit_number) || input.applicationNumber || text(target.application_number),
       });
     }
-    if (mayWriteStatus) triggerHandoffIfReady(db, projectId, ts);
+    if (mayWriteStatus) handedOff = triggerHandoffIfReady(db, projectId, ts);
     // ONE ROW PER CHECK, ALWAYS — this is the per-check evidence trail, and it is the thing the
     // status-check gate above is allowed to suppress *because* this is not. `checkId` is null when
     // no row was written: an audit entry pointing at a permit_status_checks id that does not exist
@@ -6843,6 +6880,22 @@ export async function recordPermitStatusCheck(
   // demoted row: a reading this function refused to write is refused here for the same reason,
   // by the same verdict, so the two doors cannot disagree. (Passing the persisted outcome instead
   // would make this gate dead code — it would only ever see needs_human_review.)
+  // STAFF ALERT (#487) — also after the commit, and on what was WRITTEN (`classification`): a
+  // refused reading reaches staff as the needs_human_review it was persisted as, which is exactly
+  // the item somebody has to go and confirm. A new correction is its own alert (the correction is
+  // the news); otherwise a change of the target's outcome is, gated on the same change pair the
+  // client update uses — and on recordCheck, so a re-read of a known state alerts nobody.
+  // (The cast: TypeScript does not see the assignment inside the transaction closure.)
+  const newCorrectionId = correctionId as string | null;
+  if (newCorrectionId) {
+    void alertStaffOnCorrection(db, { projectId, correctionId: newCorrectionId, track: track ?? "permit" });
+  } else if (recordCheck) {
+    void alertStaffOnStatusChange(db, {
+      projectId, targetId: text(target?.id), track: track ?? "permit",
+      outcome: classification.outcome, previousOutcome,
+    });
+  }
+
   if (shouldNotifyClient(read.outcome, previousOutcome, provenance)) {
     void notifyClientOfStatusChange(db, detail.project, {
       outcome: read.outcome,
@@ -6861,6 +6914,11 @@ export async function recordPermitStatusCheck(
       applicationNumber: text(target?.application_number),
     });
   }
+
+  // THE INSTALLER HANDOFF PACKET (#491) — on the transition only, after the commit, fire-and-
+  // forget (it never throws). Its record (the communication, the client note) is written before
+  // its first await, so the detail returned below already shows it.
+  if (handedOff) void sendInstallerHandoff(db, getProjectDetail(db, projectId).project, { trigger: "automatic" });
 
   return getProjectDetail(db, projectId);
 }
@@ -7241,22 +7299,6 @@ const MONITOR_WAITING_MAY_ADVANCE = new Set(["awaiting_human_submit", "submitted
   }
 }
 
-function buildInstallerHandoffChecklist(project: ProjectRecord): string[] {
-  const size = project.systemSizeDcKw ? `${project.systemSizeDcKw} kW DC` : "system";
-  return [
-    `PERMIT ISSUED — ${project.ahj || "AHJ"}: Download permit card and post at job site before work begins.`,
-    `NEM APPROVED — ${project.utility || "Utility"}: Save the approval confirmation email/letter.`,
-    `INSTALLATION: Install per the approved plans. Do not deviate from stamped set without re-permit.`,
-    `RAPID SHUTDOWN: Label all rapid shutdown devices per approved plans before inspection.`,
-    `FINAL INSPECTION: Schedule with ${project.ahj || "AHJ"}. Inspector will verify install matches approved plans.`,
-    `AFTER INSPECTION PASSES: Send a copy of the signed final inspection card to ${project.utility || "the utility"} to trigger Permission to Operate (PTO).`,
-    `PTO: Utility will issue PTO once inspection record is received. Timeline varies (typically 1–5 business days).`,
-    `SYSTEM SIZE: ${size} — verify AC output at inverter matches NEM application.`,
-    project.interconnectionMethod ? `INTERCONNECTION: ${project.interconnectionMethod}` : "",
-    `HOMEOWNER: Notify ${project.homeownerName || "homeowner"} that the system can be energized only after PTO is received.`,
-  ].filter(Boolean);
-}
-
 /**
  * IS THE SUBMISSION SCOPE COMPLETE? — the handoff predicate, per track, from the filings'
  * own tracking targets. Returns what still stands in the way (empty = hand off).
@@ -7290,25 +7332,21 @@ export function handoffBlockers(db: AppDb, project: ProjectRecord): string[] {
   return blockers;
 }
 
-function triggerHandoffIfReady(db: AppDb, projectId: string, ts: string): void {
+/** Moves the project to handoff_ready when the scope is complete. Returns true ON THE TRANSITION
+ *  only — the caller sends the installer handoff packet (installerHandoff.ts) after its
+ *  transaction commits, so a repeat reading on a handed-off project sends nothing. */
+function triggerHandoffIfReady(db: AppDb, projectId: string, ts: string): boolean {
   const project = db.get<ProjectRow>("SELECT * FROM projects WHERE id = ?", [projectId]);
-  if (!project) return;
+  if (!project) return false;
   // Already handed off: nothing to write, and the note/audit are written only on the transition.
   // (A correction arriving after handoff has already moved the status to correction_received
   // before this runs, so it is not caught here — and the predicate below refuses it.)
-  if (project.status === "handoff_ready") return;
-  if (handoffBlockers(db, mapProject(project)).length > 0) return;
+  if (project.status === "handoff_ready") return false;
+  if (handoffBlockers(db, mapProject(project)).length > 0) return false;
 
-  const mappedProject = mapProject(project);
-  const checklist = buildInstallerHandoffChecklist(mappedProject);
-  const noteBody = [
-    "✓ PERMIT ISSUED + NEM APPROVED — your submission scope is complete.",
-    "",
-    "Installer handoff checklist:",
-    ...checklist.map((line, i) => `${i + 1}. ${line}`),
-    "",
-    "No further action required from this platform unless a correction is received after final inspection.",
-  ].join("\n");
+  // The checklist is installerHandoff.ts's ONE copy: this note and the client's handoff email
+  // render the same lines.
+  const noteBody = installerHandoffNoteBody(mapProject(project));
 
   db.run("UPDATE projects SET status = 'handoff_ready', current_stage = ?, stage_detail = ?, updated_at = ? WHERE id = ?", [
     "Permit issued + NEM approved. Ready for installer handoff.",
@@ -7328,6 +7366,7 @@ function triggerHandoffIfReady(db: AppDb, projectId: string, ts: string): void {
     nemApproved: true,
     fromStatus: project.status,
   });
+  return true;
 }
 
 /**
@@ -7664,6 +7703,12 @@ export async function runDuePermitChecks(
     if (source !== "mock") {
       await readAndRecordPortalFees(db, detail.project, text(target.id)).catch((err) => {
         logger.warn("monitor", "portal fee read failed — status unaffected", { projectId, targetId: text(target.id), err: err instanceof Error ? err.message : String(err) });
+      });
+      // THE ISSUED PERMIT / APPROVAL LETTER, off the same record once it reads issued / approved
+      // (portalIssuedDocuments.ts, #492) — read-only GETs on the record's own portal and track,
+      // after the status is recorded and unable to change it.
+      await fetchIssuedRecordDocuments(db, detail.project, text(target.id)).catch((err) => {
+        logger.warn("monitor", "issued-document fetch failed — status unaffected", { projectId, targetId: text(target.id), err: err instanceof Error ? err.message : String(err) });
       });
     }
     touchProjectMetrics(db, projectId);
@@ -8011,6 +8056,7 @@ export function recoverInterruptedPortalRuns(
     addAuditLog(db, text(r.project_id), "system", "portal run recovery", "portal.run_interrupted", {
       runId: text(r.id), track: text(r.permit_type), trackingUrl: url || null, runner: text(r.runner),
     });
+    void alertStaffOnRunOutcome(db, { projectId: text(r.project_id), runId: text(r.id), track: text(r.permit_type), runStatus: "interrupted", reason: "" });
     recovered.push({ runId: text(r.id), projectId: text(r.project_id), permitType: text(r.permit_type), trackingUrl: url });
   }
   return recovered;
@@ -10334,7 +10380,18 @@ export async function prepareSubmission(
     // track, fire-and-forget: it never throws and never touches the run's record.
     if (acceptedFiling) {
       void notifyClientOfFiling(db, detail.project, { track: permitTypeTag, permitNumber: capturedPermitNumber, via: "auto_submit" });
+      // The quote in force as it was filed (#494), once per billing track; never throws.
+      snapshotFilingQuote(db, detail.project, permitTypeTag, submissionId);
     }
+
+    // STAFF ALERT (#487) — after the run's row committed, fire-and-forget, never into this path.
+    // Only the endings that need a person alert (paused, failed, submitted-unconfirmed); the
+    // reason is the run's own one line — the same text the row's error_message just took — and
+    // staffAlerts scrubs it before it leaves.
+    void alertStaffOnRunOutcome(db, {
+      projectId, runId, track: permitTypeTag, runStatus,
+      reason: failureMessage || (pauseReason ? pausedRunSentence(pauseReason, result) : ""),
+    });
 
     // #333: a filing the person made from the review window while this run was finishing — recorded
     // now, on top of the outcome (an awaiting_human_submit row, or the run's own failed row), never
@@ -10616,8 +10673,10 @@ export function captureConfirmation(
   let recordLinkRefused = false;
   // Hoisted so the post-transaction correction close can read it — see below.
   let remainingTracks = 0;
-  // Hoisted so the client's "we filed it" update (#490) names the track this confirmation filed.
+  // Hoisted so the client's "we filed it" update (#490) names the track this confirmation filed,
+  // and so the filing-time quote snapshot (#494) knows the track and the submission row.
   let filedTrack = "";
+  let filedSubmissionId = "";
 
   db.transaction(() => {
     db.run("UPDATE portal_runs SET status = ?, finished_at = ? WHERE id = ?", ["submitted", ts, portalRunId]);
@@ -10697,6 +10756,7 @@ export function captureConfirmation(
       || text(stamped?.permit_type)
       || (text(stamped?.submission_type) === "interconnection" ? "nem" : "");
     filedTrack = trackKey;
+    filedSubmissionId = text(stamped?.id);
     // THE RECORD'S LINK (#400). Rule 5 at the one creator: a utility-portal link never lands on a
     // permit target (ensureCheckTarget would refuse it). Here it is dropped instead of refused —
     // the number is the precious fact, and a link must never cost the filing its record.
@@ -10803,6 +10863,11 @@ export function captureConfirmation(
       });
     }
   }
+
+  // THE QUOTE IN FORCE AS IT WAS FILED (#494), kept once per billing track for the fee accuracy
+  // report. Outside the transaction and never throwing, for the same reason as the close above.
+  // A legacy run with no track and no stamped row bills as the permit track (billingTrack).
+  snapshotFilingQuote(db, projectForTarget, filedTrack, filedSubmissionId);
 
   const detail = getProjectDetail(db, projectId);
   // A PERSON CONFIRMED THIS FILING (the dashboard's capture form, or the hand-over's confident read

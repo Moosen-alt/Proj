@@ -172,6 +172,7 @@ const SCOPED_LIST_ROUTES: Record<string, string> = {
   "/api/signatures": "reqOrgFilter",
   "/api/ops-actions": "reqOrgFilter",
   "/api/ops-report": "reqOrgFilter",
+  "/api/fee-accuracy": "reqOrgFilter",
 };
 
 const topLevel = (p: string): string => {

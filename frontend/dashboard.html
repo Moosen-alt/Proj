@@ -454,6 +454,12 @@
                  stageDisabledReason / approveDisabledReason, written via textContent). -->
             <ul id="autopilotOffReasons" class="autopilot-off" hidden></ul>
           </div>
+          <!-- #491: the installer handoff packet. The server emails it when the job reaches handoff_ready;
+               this sends it (again) by hand. Shown only on a handed-off project (renderHandoffPacket). -->
+          <div id="handoffActions" class="actions" hidden>
+            <span class="actions-label">Closeout:</span>
+            <button id="sendHandoffPacketBtn" type="button" class="secondary"><i data-lucide="send"></i><span>Send handoff packet</span></button>
+          </div>
           <div id="submitBlockerNote" class="submit-blocker-note" hidden></div>
           <div id="reviewMismatchBanner" style="display:none;margin:6px 0 2px;padding:8px 12px;background:#fff3cd;border:1px solid #ffc107;border-radius:6px;font-size:12px;color:#664d03">
             <strong><i data-lucide="alert-triangle" style="width:13px;height:13px;vertical-align:-2px"></i> Portal review mismatch</strong> — the staged portal form may not match the project record. Review before approving.<br>
@@ -534,6 +540,8 @@
                     <option value="ground_footing">Ground-mount footing / racking detail</option>
                     <option value="trench_detail">Trench / burial-depth detail</option>
                     <option value="zoning_approval">Zoning / land-use approval</option>
+                    <option value="issued_permit">Issued permit / permit card</option>
+                    <option value="utility_approval">Utility approval / PTO letter</option>
                     <option value="module_spec">Module spec</option>
                     <option value="inverter_spec">Inverter spec</option>
                     <option value="battery_spec">Battery / ESS spec</option>
@@ -1332,6 +1340,13 @@
               <option value="off">Off: staff send them by hand</option>
             </select>
           </label>
+          <!-- #491: the installer handoff packet, emailed when a job is permit-issued + NEM-approved. -->
+          <label>Installer handoff packet
+            <select id="c_handoffAutoSend">
+              <option value="">Email it to the client automatically when the job is approved</option>
+              <option value="off">Off: staff send it by hand</option>
+            </select>
+          </label>
           <div class="form-row">
             <label>Email-in intake tag<input id="c_intakeTag" placeholder="e.g. acme, for intake+acme@…" autocomplete="off" /></label>
             <label>Other senders allowed to email jobs<input id="c_intakeSenders" placeholder="pm@acme.com, @acme.com" autocomplete="off" /></label>
@@ -1592,6 +1607,8 @@
 
   <!-- Classic script before the module: the KPI panel's filing rows (window.KpiFilings, #74). -->
   <script src="/kpi-filings.js"></script>
+  <!-- The KPI panel's fee accuracy section, quoted vs paid per jurisdiction (window.FeeAccuracy, #494). -->
+  <script src="/fee-accuracy.js"></script>
   <script src="/corrections-filing.js"></script>
   <script src="/correction-notice.js"></script>
   <!-- The pending edition proposals on a code-profile KB card (window.EditionProposals, #172). -->

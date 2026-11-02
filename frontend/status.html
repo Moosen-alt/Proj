@@ -154,6 +154,25 @@
     .hist .filing { font-size: 12px; color: var(--muted); font-weight: 500; }
     .hist .when { white-space: nowrap; font-size: 12px; font-weight: 500; }
 
+    /* THE JOB'S TIMELINE (#497): filed → issued / approved → installed → final → PTO. A dot per
+       step on a rail: filled for done, ringed for the step the job is on now (a permit and an
+       interconnection run side by side, so two can be ringed), hollow for what is still ahead. */
+    .steps { list-style: none; margin: 0; padding: 8px 0 6px; }
+    .step { position: relative; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 16px; padding: 9px 0 9px 26px; font-size: 14px; }
+    .step::before { content: ""; position: absolute; left: 3px; top: 14px; width: 10px; height: 10px; border-radius: 999px; border: 2px solid var(--line); background: var(--surface); }
+    .step::after { content: ""; position: absolute; left: 8px; top: 28px; bottom: -14px; width: 2px; background: var(--line); }
+    .step:last-child::after { display: none; }
+    .step.done::before { background: var(--primary); border-color: var(--primary); }
+    .step.done::after { background: color-mix(in oklab, var(--primary) 45%, var(--line)); }
+    .step.current::before { border-color: var(--primary); box-shadow: 0 0 0 4px color-mix(in oklab, var(--primary) 18%, transparent); }
+    .step .what { flex: 1 1 220px; min-width: 0; }
+    .step .name { font-weight: 600; letter-spacing: -.005em; }
+    .step.current .name { color: var(--primary); }
+    .step.upcoming .name { color: var(--muted); font-weight: 500; }
+    .step .note { font-size: 12px; color: var(--muted); font-weight: 500; }
+    .step .when { white-space: nowrap; font-size: 12px; font-weight: 500; color: var(--muted); }
+    .step.current .when { color: var(--primary); font-weight: 700; }
+
     .empty { padding: 16px 0; color: var(--muted); font-size: 13px; }
     .err { max-width: 680px; margin: 0 auto; text-align: center; padding: 72px 24px; color: var(--muted); font-size: 15px; }
     footer { border-top: 1px solid var(--line); padding-top: 20px; font-size: 12px; color: var(--muted); }
@@ -209,6 +228,30 @@
     const BEFORE_FILING = new Set(["pending", "parsed", "qc_failed", "qc_passed", "ready_to_stage", "awaiting_human_submit", "blocked"]);
     const lastChecked = (iso) => iso ? "last checked " + when(iso) : "not checked yet";
     const badge = (outcome, label) => `<span class="badge ${GOOD.has(outcome) ? "good" : WARN.has(outcome) ? "warn" : ""}">${esc(label || outcome || "Not checked yet")}</span>`;
+
+    // THE TIMELINE (#497). Every value is escaped, the numbers included: the payload is built from
+    // fixed templates server-side (backend/src/clientTimeline.ts), and this page still trusts none
+    // of it. The state is matched against the three known values, never interpolated.
+    const STEP_STATE = { done: "done", current: "current", upcoming: "upcoming" };
+    const days = (n) => `${esc(n)} day${Number(n) === 1 ? "" : "s"}`;
+    const stepNote = (s) => [
+      s.detail ? esc(s.detail) : "",
+      s.state === "done" && s.tookDays != null ? `took ${days(s.tookDays)}` : "",
+      s.state === "current" && s.daysSoFar != null ? `${days(s.daysSoFar)} so far` : "",
+      s.state === "current" && s.typicalDays != null ? `usually about ${days(s.typicalDays)}` : "",
+    ].filter(Boolean).join(" · ");
+    const stepWhen = (s) => s.state === "done" ? (s.at ? esc(when(s.at)) : "Done") : s.state === "current" ? "Now" : "";
+    const timelineHtml = (timeline) => {
+      const steps = (timeline && timeline.steps) || [];
+      if (!steps.length) return "";
+      return `<ol class="steps">${steps.map((s) => {
+        const note = stepNote(s);
+        return `<li class="step ${STEP_STATE[s.state] || "upcoming"}">
+            <div class="what"><div class="name">${esc(s.label)}</div>${note ? `<div class="note">${note}</div>` : ""}</div>
+            <span class="when">${stepWhen(s)}</span>
+          </li>`;
+      }).join("")}</ol>`;
+    };
 
     async function load() {
       const app = document.getElementById("app");
@@ -284,6 +327,7 @@
             ${readingNote(h, h.statusLabel || h.outcome)}
           </div>`;
         }).join("") || `<div class="empty">No status changes yet.</div>`;
+        const timeline = timelineHtml(d.timeline);
         app.innerHTML = `
           <div class="band band-ink">
             <div class="inner">
@@ -295,6 +339,11 @@
           </div>
           <div class="band band-paper">
             <div class="inner">
+              ${timeline ? `<section>
+                <p class="eyebrow">Timeline</p>
+                <h2>From filing to permission to operate.</h2>
+                <div class="card"><div class="card-body">${timeline}</div></div>
+              </section>` : ""}
               <section>
                 <p class="eyebrow">Applications</p>
                 <h2>Where each filing stands.</h2>

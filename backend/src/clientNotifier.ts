@@ -35,6 +35,7 @@ import { addAuditLog } from "./audit";
 import { text } from "./json";
 import { logger } from "./logger";
 import { outcomeTrack, type ReadingProvenance } from "./permitMonitor";
+import { INSTALLER_HANDOFF_SENDER, installerHandoffAttachments, type HandoffAttachment } from "./handoffDocuments";
 
 /**
  * `provenance` is REQUIRED, not an optional trailing argument (CLAUDE.md: an omitted one fails
@@ -93,7 +94,9 @@ export function smtpConfigured(): boolean {
   return Boolean(process.env.SMTP_HOST && process.env.SMTP_FROM);
 }
 
-export async function sendEmail(to: string, subject: string, textBody: string): Promise<void> {
+/** `attachments`: the installer handoff's issued documents (handoffDocuments.ts) — the one caller
+ *  that attaches anything. */
+export async function sendEmail(to: string, subject: string, textBody: string, attachments: HandoffAttachment[] = []): Promise<void> {
   const { default: nodemailer } = await import("nodemailer");
   const port = Number(process.env.SMTP_PORT || 587);
   const transporter = nodemailer.createTransport({
@@ -102,7 +105,10 @@ export async function sendEmail(to: string, subject: string, textBody: string): 
     secure: process.env.SMTP_SECURE === "true" || port === 465,
     auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS || "" } : undefined,
   });
-  await transporter.sendMail({ from: process.env.SMTP_FROM, to, subject, text: textBody });
+  await transporter.sendMail({
+    from: process.env.SMTP_FROM, to, subject, text: textBody,
+    ...(attachments.length ? { attachments: attachments.map((a) => ({ filename: a.filename, path: a.path, ...(a.contentType ? { contentType: a.contentType } : {}) })) } : {}),
+  });
 }
 
 /**
@@ -139,7 +145,7 @@ function refreshStatusLink(db: AppDb, projectId: string | null, body: string): s
 
 export async function resendCommunication(
   db: AppDb,
-  comm: { id: string; projectId: string | null; recipient: string; subject: string; body: string },
+  comm: { id: string; projectId: string | null; recipient: string; subject: string; body: string; loggedBy?: string },
 ): Promise<{ delivered: boolean; to: string; detail: string }> {
   let to = "";
   try {
@@ -161,8 +167,14 @@ export async function resendCommunication(
     return { delivered: false, to: "(none)", detail };
   }
   const body = refreshStatusLink(db, comm.projectId, comm.body);
+  // AN INSTALLER HANDOFF DRAFTED WHILE SMTP WAS UNSET (#491) lists its documents as attached, so
+  // the backlog sends it WITH them — resolved now through the same allowlist the first attempt
+  // used, never a list stored on the row.
+  const attachments = comm.loggedBy === INSTALLER_HANDOFF_SENDER && comm.projectId
+    ? installerHandoffAttachments(db, comm.projectId)
+    : [];
   try {
-    await sendEmail(to, comm.subject, body);
+    await sendEmail(to, comm.subject, body, attachments);
     db.run(
       "UPDATE communications SET delivery_status = 'sent', delivery_detail = '', recipient = ?, body = ? WHERE id = ?",
       [to, body, comm.id],
