@@ -59,6 +59,7 @@ import { startCecSyncScheduler, primeCecCache, syncCecEquipment } from "./cecEqu
 import { extractZipToWorkdir } from "./batchZip";
 import { AUTH_ENABLED, currentUser, login, logout, me, requireAuth, seedAdminUser, setUserPassword, entitlementGate, requestOrg, createApiKey, ADMIN_ROLES, ROLE_SUPERADMIN, type SessionUser } from "./auth";
 import { changeOwnPassword, createStaffLogin, listStaffLogins, resetStaffPassword, setStaffLoginActive } from "./staffLogins";
+import { listRecorderTokens, mintRecorderToken, recorderPrincipal, revokeRecorderToken } from "./recorderTokens";
 import { PRODUCTS, PRODUCT_KEYS, grantProduct, revokeProduct, orgEntitlements, productsForEdition } from "./entitlements";
 import { requestScope, orgFilter, orgClause, reqOrgFilter, assertInScope, auditCrossOrgAccess } from "./scope";
 import { folderScanPayload } from "./batchZip";
@@ -1271,6 +1272,35 @@ app.post("/api/auth/password", (req, res) => {
   res.json({ ok: true });
 });
 
+// Recorder tokens (#433): a signed-in person mints, lists and revokes their OWN tokens for the
+// portal recorder CLI (recorderTokens.ts). Under /api/auth/, which the sign-in gate lets through,
+// so THESE HANDLERS are the gate: a session cookie or nothing. A recorder token never authenticates
+// these (requireAuth attaches a token's person only on the recorder's four routes), so a token can
+// never mint another token or outlive its own revocation by re-minting.
+function requireRecorderTokenOwner(req: Request): SessionUser {
+  if (!AUTH_ENABLED) throw new HttpError(409, `${SIGN_IN_OFF} The recorder needs no token here.`, { code: "auth_disabled" });
+  const user = currentUser(db, req);
+  if (!user || recorderPrincipal(req)) throw new HttpError(401, "Not authenticated.");
+  return user;
+}
+
+app.get("/api/auth/recorder-tokens", (req, res) => {
+  if (!AUTH_ENABLED) { res.json({ authEnabled: false, tokens: [] }); return; }
+  const user = requireRecorderTokenOwner(req);
+  res.json({ authEnabled: true, tokens: listRecorderTokens(db, user) });
+});
+
+app.post("/api/auth/recorder-tokens", (req, res) => {
+  const user = requireRecorderTokenOwner(req);
+  const minted = mintRecorderToken(db, user, { name: req.body?.name, days: req.body?.days });
+  res.status(201).json({ token: minted.token, recorderToken: minted.info, note: "Copy this token now. It is shown only once." });
+});
+
+app.delete("/api/auth/recorder-tokens/:id", (req, res) => {
+  const user = requireRecorderTokenOwner(req);
+  res.json({ recorderToken: revokeRecorderToken(db, user, String(req.params.id)) });
+});
+
 // Shareable read-only report link (e.g. the AHJ forwards a pre-review to an applicant).
 app.post("/api/review/submissions/:id/share", (req, res) => {
   const sub = getReviewSubmission(db, reviewOrgId(req), String(req.params.id));
@@ -1920,24 +1950,36 @@ app.post("/api/portal-recipes/record", (req, res) => {
       url: String(b.portalUrl),
     });
   }
-  res.status(201).json(
-    startPortalRecording(db, {
-      scopeType,
-      state: b.state ? String(b.state) : undefined,
-      ahj: b.ahj ? String(b.ahj) : undefined,
-      utility: b.utility ? String(b.utility) : undefined,
-      portalPlatform: b.portalPlatform ? String(b.portalPlatform) : undefined,
-      portalUrl: b.portalUrl ? String(b.portalUrl) : undefined,
-      createdBy: b.createdBy ? String(b.createdBy) : undefined,
-    }),
-  );
+  // WHO RECORDED (#433): the signed-in person (a session, or the recorder token they minted) is
+  // the author; a body-supplied createdBy is only a fallback when nobody is signed in (sign-in off).
+  const user = currentUser(db, req);
+  const recipe = startPortalRecording(db, {
+    scopeType,
+    state: b.state ? String(b.state) : undefined,
+    ahj: b.ahj ? String(b.ahj) : undefined,
+    utility: b.utility ? String(b.utility) : undefined,
+    portalPlatform: b.portalPlatform ? String(b.portalPlatform) : undefined,
+    portalUrl: b.portalUrl ? String(b.portalUrl) : undefined,
+    createdBy: user ? (user.name || user.email) : b.createdBy ? String(b.createdBy) : undefined,
+  });
+  addAuditLog(db, null, "human", user?.email || "operator", "portal_recipe.recording_started", {
+    recipeId: recipe.id, profileKey: recipe.profileKey, via: recorderPrincipal(req) ? "recorder_token" : user ? "session" : "none", orgId: user?.orgId ?? null,
+  });
+  res.status(201).json(recipe);
 });
 app.put("/api/portal-recipes/:id/steps", (req, res) => {
   const steps = Array.isArray(req.body?.steps) ? req.body.steps : [];
-  res.json(savePortalRecipeSteps(db, String(req.params.id), steps, {
+  const saved = savePortalRecipeSteps(db, String(req.params.id), steps, {
     status: req.body?.status,
     notes: req.body?.notes ? String(req.body.notes) : undefined,
-  }));
+  });
+  // Audited with who saved them (#433): through the recorder CLI that is the token's person.
+  const user = currentUser(db, req);
+  addAuditLog(db, null, "human", user?.email || "operator", "portal_recipe.steps_saved", {
+    recipeId: saved.id, profileKey: saved.profileKey, steps: steps.length, status: saved.status,
+    via: recorderPrincipal(req) ? "recorder_token" : user ? "session" : "none", orgId: user?.orgId ?? null,
+  });
+  res.json(saved);
 });
 // Close the review browsers for one client + track. Fire-and-forget (a wedged Chromium
 // shutdown must never hang the operator's HTTP response), sanitized clientId (a raw
@@ -2161,6 +2203,9 @@ app.post("/api/projects/:id/auto-learn", (req, res) => {
 app.post("/api/portal-recipes/:id/suggest-bindings", asyncHandler(async (req, res) => {
   const steps = Array.isArray(req.body?.steps) ? req.body.steps : [];
   const projectId = String(req.body?.projectId || "").trim();
+  // The project id arrives in the BODY, where no mounted scope guard reaches it. This route is one
+  // of the four a recorder token reaches (#433), so check it here: another org's project is a 404.
+  assertRefInScope(requestScope(db, req), "projects", projectId, "Project");
   let fieldValues: Record<string, string> = {};
   if (projectId) {
     try {

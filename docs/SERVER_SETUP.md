@@ -173,6 +173,27 @@ The human "record this portal" capture runs on an operator's LOCAL machine
 the record command the dashboard generates. Learning/staging runs headless on
 the server itself.
 
+With sign-in on (`AUTH_ENABLED=true`) the recorder needs the person's own
+**recorder token** (#433):
+
+1. In the dashboard: **Team → Recorder tokens → Make a recorder token**. It is
+   shown once (the server keeps only a hash), lasts 30 days by default (at most
+   90), and can be revoked there. Switching a person's login off stops their
+   tokens too.
+2. On the recording computer, put it in `RECORDER_TOKEN` before running the
+   command (`set RECORDER_TOKEN=…` on Windows, `export RECORDER_TOKEN=…`
+   elsewhere). The downloaded `record-portal.bat` asks for it. `--token` works
+   too, but the shell history keeps it.
+3. Behind Cloudflare Access, also set `CF_ACCESS_CLIENT_ID` and
+   `CF_ACCESS_CLIENT_SECRET` to an Access **service token** (or
+   `--cf-access-client-id` / `--cf-access-client-secret`).
+
+A recorder token reaches only the recorder's four endpoints (start a recording,
+read the recording project's field values, suggest bindings, save the steps),
+as its person: audit rows name them. It can never stage, approve or submit a
+filing, administer anything, or mint another token. With sign-in off nothing
+changes and no token is needed.
+
 ## Stripe — collecting client payments (per-submission billing)
 
 Today (no code needed):
