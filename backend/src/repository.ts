@@ -75,7 +75,7 @@ import { findCompleteRecipeForProject, findAnyRecipeForProject, resolveRecipeFie
 import { notServedInResult } from "../../shared/src/portalNotServed";
 import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier";
 import { notifyClientOfFiling } from "./clientFilingUpdate";
-import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStatusChange } from "./staffAlerts";
+import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStatusChange, alertStaffOnUnmatchedCorrectionEmail } from "./staffAlerts";
 import { installerHandoffNoteBody, sendInstallerHandoff } from "./installerHandoff";
 // detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget; the
 // card's Edit (updatePermitCheckTarget) re-detects with the same function when the URL changes.
@@ -147,6 +147,8 @@ import {
   importMboxKnowledge,
   importMboxKnowledgeFromFile,
   classifyMboxMessages,
+  emailAsksForInformation,
+  redactEmailText,
   isVerifiedKnowledge,
   type ClassifiedMboxMessage,
 } from "./knowledgeBase";
@@ -4694,13 +4696,43 @@ function matchProjectForEmail(
   };
 }
 
+/**
+ * IS THIS EMAIL A CORRECTION NOTICE (#522)? A correction or deficiency bucket always is; an
+ * information-request bucket is when the email directly ASKS for something (emailAsksForInformation
+ * — the bucket's own words are loose enough to catch a receipt). The one answer for both the
+ * reading's text (emailStatusText) and the unmatched-email alert.
+ */
+function emailIsCorrectionNotice(message: ClassifiedMboxMessage): boolean {
+  const bucket = message.record.type;
+  if (bucket === "permit_correction" || bucket === "nem_correction") return true;
+  return bucket === "missing_info_request" && emailAsksForInformation(message.rawSearchText);
+}
+
+/** The subject line alone, through the same redaction as the body (numbers, addresses, emails). */
+function redactEmailSubject(message: ClassifiedMboxMessage): string {
+  return redactEmailText(message.subject).slice(0, 240);
+}
+
 function emailStatusText(message: ClassifiedMboxMessage): string {
+  const infoRequest = message.record.type === "missing_info_request";
+  const asksForInformation = infoRequest && emailIsCorrectionNotice(message);
+  const unaskedInformationRequest = infoRequest && !asksForInformation;
   return [
     `Email bucket: ${message.record.type}`,
     message.record.workflow ? `Workflow: ${message.record.workflow}` : "",
     message.record.statusLabel ? `Status: ${message.record.statusLabel}` : "",
+    // An information request that never says "correction" ("please upload the signed owner form")
+    // read as needs_human_review: no correction, no due date, no client update (#522). Said here in
+    // words classifyPermitStatusText's correctionPattern already reads, so the reading takes the
+    // ONE correction path every other correction takes.
+    asksForInformation ? "Agency request: additional information requested." : "",
     message.record.requiredAction ? `Required action: ${message.record.requiredAction}` : "",
-    message.redactedText,
+    // AND THE OTHER WAY ROUND: an information-request email that does NOT ask ("if additional
+    // information is needed, we will contact you") used to open a correction anyway, because
+    // correctionPattern reads "additional information" / "incomplete" anywhere in the body. Its
+    // reading is the subject alone, so it lands as needs_human_review — a person looks — and the
+    // client is never told of a correction nobody asked for. The match row keeps the subject.
+    unaskedInformationRequest ? `Subject: ${redactEmailSubject(message)}` : message.redactedText,
   ].filter(Boolean).join("\n").slice(0, 5000);
 }
 
@@ -4801,6 +4833,18 @@ export async function runEmailTracker(
         const match = matchProjectForEmail(db, message, { orgId: sourceOrgId, clientId: sourceClientId });
         if (!match) {
           result.unmatchedMessages += 1;
+          // A CORRECTION NOBODY CAN PLACE STILL REACHES THE TEAM (#522). It used to be a count and
+          // nothing else. One alert per message (deduped by its signature — the inbox is re-read
+          // every poll), to this source's org only, carrying no email text (rule 2).
+          if (emailIsCorrectionNotice(message)) {
+            void alertStaffOnUnmatchedCorrectionEmail(db, {
+              orgId: sourceOrgId,
+              signature: message.sourceSignature,
+              from: message.from,
+              receivedAt: message.record.occurredAt,
+              bucket: message.record.type,
+            });
+          }
           continue;
         }
 
@@ -6719,6 +6763,14 @@ export async function recordPermitStatusCheck(
   // packet goes out after the transaction commits, below.
   let handedOff = false;
 
+  // THE SAME LETTER, SEEN TWICE (#523). The poll read the correction off the portal first; now the
+  // agency's email about it arrives. The email still records — its words are usually the fuller list
+  // of what was asked — but as an item of the notice already open, not a second notice, and the team
+  // is not alerted twice. Read before the transaction (the target row is about to be overwritten).
+  const sameNotice = recordCheck && classification.outcome === "correction_flagged" && source === "email" && target && previousOutcome === "correction_flagged"
+    ? sameNoticeAsPolledCorrection(db, text(target.id), noticedAt || ts)
+    : null;
+
   db.transaction(() => {
     // `recordCheck &&` on all three: see the note above. An unchanged poll falls straight through
     // to the target/project/audit work below, which is NOT gated.
@@ -6732,7 +6784,7 @@ export async function recordPermitStatusCheck(
         jurisdiction: text(target?.jurisdiction),
         recordNumber: input.permitNumber || text(target?.permit_number) || input.applicationNumber || text(target?.application_number),
         readingSource: source,
-      }, noticedAt);
+      }, noticedAt, sameNotice?.noticeId ?? null);
     } else if (recordCheck && refused) {
       // THE REFUSED READING'S OWN ROW — issue_type names it, parser_value carries what the text
       // said (outcome + label), notes carry why it was not trusted. This is the item an operator
@@ -6904,7 +6956,10 @@ export async function recordPermitStatusCheck(
   // client update uses — and on recordCheck, so a re-read of a known state alerts nobody.
   // (The cast: TypeScript does not see the assignment inside the transaction closure.)
   const newCorrectionId = correctionId as string | null;
-  if (newCorrectionId) {
+  // A second report of a notice already alerted (#523) is not news for the team.
+  if (newCorrectionId && sameNotice) {
+    addAuditLog(db, projectId, "system", "email tracker", "correction.grouped_with_polled_notice", { correctionId: newCorrectionId, noticeId: sameNotice.noticeId, polledCorrectionId: sameNotice.correctionId });
+  } else if (newCorrectionId) {
     void alertStaffOnCorrection(db, { projectId, correctionId: newCorrectionId, track: track ?? "permit" });
   } else if (recordCheck) {
     void alertStaffOnStatusChange(db, {
@@ -6938,6 +6993,33 @@ export async function recordPermitStatusCheck(
   if (handedOff) void sendInstallerHandoff(db, getProjectDetail(db, projectId).project, { trigger: "automatic" });
 
   return getProjectDetail(db, projectId);
+}
+
+/** How recent a polled correction must be for an emailed one on the same filing to count as the
+ *  same letter (#523). Agencies email the letter the day they post it; a week is generous, and past
+ *  it an emailed correction is treated as a new round rather than risk hiding one. */
+export const SAME_NOTICE_WINDOW_DAYS = 7;
+
+/**
+ * Is an emailed correction on this target the letter the portal poll already recorded (#523)? Yes
+ * when the target's newest OPEN correction was raised by a PORTAL reading of this same target within
+ * SAME_NOTICE_WINDOW_DAYS before the email. A closed one (the agency's previous round, answered)
+ * never groups, and neither does an earlier EMAILED correction: that is a letter of its own.
+ */
+function sameNoticeAsPolledCorrection(db: AppDb, targetId: string, emailAt: string): { correctionId: string; noticeId: string } | null {
+  const row = db.get<Row>(
+    `SELECT c.id, c.notice_id, c.source, c.created_at FROM corrections c
+       JOIN permit_status_checks k ON k.correction_id = c.id
+      WHERE k.target_id = ? AND c.closed_at IS NULL
+      ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1`,
+    [targetId],
+  );
+  if (!row || text(row.source) !== "portal") return null;
+  const raised = Date.parse(text(row.created_at));
+  const at = Date.parse(emailAt);
+  if (!Number.isFinite(raised) || !Number.isFinite(at)) return null;
+  if (Math.abs(at - raised) > SAME_NOTICE_WINDOW_DAYS * 86_400_000) return null;
+  return { correctionId: text(row.id), noticeId: text(row.notice_id) || text(row.id) };
 }
 
 /** WHAT A CHECK THAT READ NOTHING STILL DOES (shouldSkipEmptyRead), at both doors: it ALWAYS
@@ -7014,6 +7096,9 @@ function insertMonitorCorrection(
   source: CorrectionRecord["source"],
   origin: CorrectionReadingOrigin,
   noticedAt: string | null = null,
+  /** The notice this item belongs to, when it is a second report of a notice already recorded
+   *  (sameNoticeAsPolledCorrection); null = a notice of its own. */
+  noticeId: string | null = null,
 ): string {
   // A portal reading is the record PAGE; the correction is what that page asks for.
   const { correctionText, sourceText } = correctionFromReading(readText, source === "portal");
@@ -7021,7 +7106,7 @@ function insertMonitorCorrection(
   const correctionId = id();
   // The filing is the TARGET's (its target_type / permit_type), never the page's words.
   const filing: CorrectionFilingInput = origin.targetId ? { targetType: origin.targetType, permitType: origin.permitType, noticedAt } : { noticedAt };
-  const stamp = correctionFilingStamp(db, project, correctionId, ts, filing);
+  const stamp = correctionFilingStamp(db, project, correctionId, ts, { ...filing, noticeId });
   db.run(
     `INSERT INTO corrections (
       id, project_id, source, correction_text, source_text, correction_bucket, root_cause, required_action,
