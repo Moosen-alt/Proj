@@ -4,6 +4,7 @@ import type { AppDb, SqlParam } from "./db";
 import { DEFAULT_ORG_ID } from "./db";
 import { apiKeyAuthPrefixes, orgEntitlements, productsAllowPath } from "./entitlements";
 import { serverIsShared } from "./serverPosture";
+import { attachRecorderPrincipal, isRecorderRoute, presentedRecorderToken, recorderPrincipal, userFromRecorderToken } from "./recorderTokens";
 
 type Row = Record<string, SqlParam>;
 
@@ -185,6 +186,11 @@ export const ADMIN_ROLES = new Set([ROLE_ADMIN, ROLE_SUPERADMIN]);
 export const ALL_ROLES = [ROLE_SUPERADMIN, ROLE_ADMIN, ROLE_OPERATOR];
 
 export function currentUser(db: AppDb, req: Request): SessionUser | null {
+  // A recorder token (#433) authenticated THIS request as its person. Only requireAuth attaches
+  // it, and only on one of the recorder's four routes, so on every other route this is null and
+  // the answer comes from the session cookie alone.
+  const viaRecorder = recorderPrincipal(req);
+  if (viaRecorder) return viaRecorder;
   const token = readCookie(req, COOKIE);
   if (!token) return null;
   const parsed = readToken(token);
@@ -362,9 +368,28 @@ export function requireAuth(db: AppDb) {
     if (apiKeyAuthPrefixes().some((p) => req.path.startsWith(p)) && orgFromApiKey(db, req)) {
       return next();
     }
+    // Recorder token (#433): the portal recorder CLI on a person's own computer has no cookie. A
+    // token authenticates EXACTLY the recorder's four routes (method + whole path,
+    // recorderTokens.RECORDER_ROUTES), as the person who minted it. On any other route it is
+    // ignored — never a principal — so staging, approval, admin and minting all 401 below as if
+    // no token had been sent (rule 1: a recorder token never approves or stages a filing).
+    const recorderToken = presentedRecorderToken(req);
+    if (recorderToken && isRecorderRoute(req.method, req.path)) {
+      const user = userFromRecorderToken(db, recorderToken);
+      if (user) {
+        attachRecorderPrincipal(req, user);
+        return next();
+      }
+      res.status(401).json({ error: "This recorder token is not valid: it is unknown, revoked or expired, or its login is switched off. Make a new one in the dashboard (Team, Recorder tokens)." });
+      return;
+    }
     if (currentUser(db, req)) return next();
     if (req.path.startsWith("/api/")) {
-      res.status(401).json({ error: "Not authenticated." });
+      res.status(401).json({
+        error: recorderToken
+          ? "Not authenticated. A recorder token only reaches the portal recorder's own endpoints."
+          : "Not authenticated.",
+      });
       return;
     }
     res.redirect("/login");

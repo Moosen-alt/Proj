@@ -19,14 +19,26 @@
 // has asked this question once and then gone wherever the far end pointed. Both doors follow
 // redirects manually and ask again before each request.
 //
+// THE ADDRESS JUDGED IS THE ADDRESS DIALLED (issue #407). publicUrlRefusal resolves the name and
+// judges the answer, but a fetch that then resolves the name AGAIN for its own connection can be
+// handed a different answer: a resolver the far end controls says 93.184.216.34 to the check and
+// 127.0.0.1 to the connect (DNS rebinding). So both fetch doors also connect through
+// publicDispatcher, whose `lookup` IS the judgement: it resolves, refuses the whole name if any
+// answer is private, and hands the connection exactly the addresses it judged. A name that
+// resolves differently at connect time is refused there with PrivateAddressError, before a socket
+// opens, and the caller reports it as the same private-target refusal. (An IP-literal host never
+// reaches a lookup; the check above judges it, and a literal cannot rebind.)
+//
 // DOCUMENT_FETCH_ALLOW_ORIGINS is the one way past it: a comma-separated list of EXACT origins
 // (scheme://host:port) treated as reachable. It exists for the test suites, whose stub servers
 // necessarily listen on 127.0.0.1, and for an operator who deliberately serves documents from
 // one intranet host. It never matches a different port, scheme or host, so a listed origin that
 // redirects anywhere else is still refused at the next hop.
 // ---------------------------------------------------------------------------
+import type { LookupAddress, LookupOptions } from "node:dns";
 import dns from "node:dns/promises";
 import net from "node:net";
+import { Agent } from "undici";
 import { HttpError } from "./httpError";
 
 function ipv4IsPrivate(ip: string): boolean {
@@ -129,11 +141,92 @@ export async function publicUrlRefusal(raw: string): Promise<string | null> {
   let addrs: string[];
   if (net.isIP(host)) addrs = [host];
   else {
-    try { addrs = (await dns.lookup(host, { all: true })).map((a) => a.address); }
+    try { addrs = (await resolveHost(host)).map((a) => a.address); }
     catch { return null; }
   }
-  if (!addrs.length || addrs.some((a) => ipIsPrivate(a))) {
-    return `Refusing to fetch an internal/private address (${u.hostname}).`;
+  if (!addrs.length || addrs.some((a) => ipIsPrivate(a))) return privateRefusalText(u.hostname);
+  return null;
+}
+
+const privateRefusalText = (hostname: string): string => `Refusing to fetch an internal/private address (${hostname}).`;
+
+// ---------------------------------------------------------------------------
+// Connect-time judging (issue #407, header above).
+// ---------------------------------------------------------------------------
+
+type HostResolver = (host: string) => Promise<LookupAddress[]>;
+const systemResolver: HostResolver = (host) => dns.lookup(host, { all: true });
+let resolveHost: HostResolver = systemResolver;
+
+/** Test seam: answer name lookups (the check's AND the connect's) from `fn`, so a suite can play a
+ *  rebinding resolver that says public to the first query and private to the second. null restores
+ *  the system resolver. Refuses unless AUTOPILOT_TEST_SEAMS=1: a resolver that can say "public"
+ *  for any name is a way past this module, so no production process can install one. */
+export function setHostResolverForTests(fn: HostResolver | null): void {
+  if (process.env.AUTOPILOT_TEST_SEAMS !== "1") throw new Error("setHostResolverForTests needs AUTOPILOT_TEST_SEAMS=1 — it is a test seam only.");
+  resolveHost = fn ?? systemResolver;
+}
+
+/** A connection refused at connect time because the name resolved to a private address. */
+export class PrivateAddressError extends Error {
+  readonly code = "EPRIVATETARGET";
+  constructor(readonly hostname: string) {
+    super(privateRefusalText(hostname));
+    this.name = "PrivateAddressError";
+  }
+}
+
+type LookupCallback = (err: NodeJS.ErrnoException | null, address: string | LookupAddress[], family?: number) => void;
+
+/**
+ * The `lookup` a judged connection dials through: net.connect's own contract (dns.lookup's
+ * signature), with the judgement inside it. Resolves once, refuses the name if ANY answer is
+ * private (the rule publicUrlRefusal applies), and otherwise answers with exactly the addresses it
+ * judged — so the socket can only open to one of them. A failed resolution is passed through as
+ * the network failure it is.
+ */
+export function judgedLookup(hostname: string, options: LookupOptions, callback: LookupCallback): void {
+  resolveHost(hostname).then((answers) => {
+    if (!answers.length || answers.some((a) => ipIsPrivate(a.address))) {
+      callback(new PrivateAddressError(hostname), options?.all ? [] : "", 0);
+      return;
+    }
+    const family = Number(options?.family) || 0;
+    const usable = family === 4 || family === 6 ? answers.filter((a) => a.family === family) : answers;
+    if (!usable.length) {
+      const err: NodeJS.ErrnoException = new Error(`getaddrinfo ENOTFOUND ${hostname}`);
+      err.code = "ENOTFOUND";
+      callback(err, options?.all ? [] : "", 0);
+      return;
+    }
+    if (options?.all) callback(null, usable);
+    else callback(null, usable[0].address, usable[0].family);
+  }, (err: NodeJS.ErrnoException) => callback(err, options?.all ? [] : "", 0));
+}
+
+let pinnedAgent: Agent | null = null;
+/** The dispatcher both fetch doors connect through: every new connection's name is resolved and
+ *  judged by judgedLookup. Connections are pooled per origin, so a reused socket is one that was
+ *  judged when it opened. */
+export function publicDispatcher(): Agent {
+  if (!pinnedAgent) pinnedAgent = new Agent({ connect: { lookup: judgedLookup } });
+  return pinnedAgent;
+}
+
+/** The fetch options a judged request to `url` takes: the judged dispatcher, except for an
+ *  origin DOCUMENT_FETCH_ALLOW_ORIGINS lets through (the operator's deliberate intranet host, a
+ *  test's stub server), which connects as it always has. Spread into fetch's init. */
+export function judgedFetchInit(url: string): { dispatcher?: Agent } {
+  try { if (allowedOrigins().has(new URL(url).origin)) return {}; } catch { /* a bad URL fails in fetch */ }
+  return { dispatcher: publicDispatcher() };
+}
+
+/** The connect-time refusal behind a failed fetch (fetch wraps it: TypeError "fetch failed" with
+ *  the connect error as its cause), or null when the failure was anything else. */
+export function connectTimeRefusal(err: unknown): string | null {
+  for (let e = err, depth = 0; e && depth < 6; e = (e as { cause?: unknown }).cause, depth++) {
+    if (e instanceof PrivateAddressError) return e.message;
+    if ((e as { code?: unknown }).code === "EPRIVATETARGET") return String((e as Error).message || privateRefusalText("?"));
   }
   return null;
 }

@@ -41,7 +41,7 @@ import { BCD_5952_LIMITS, type ChecklistRecovery } from "./prescriptiveChecklist
 import { bcdChecklistAnswers, bcd5952AssumedFacts, bcd5952FailedRows, bcd5952MissingFacts, bcd5952SnapshotAdditions } from "./bcdChecklistFacts";
 import { iowaPvWorksheetValues } from "./iowaPvWorksheet";
 import { documentFetchDisabled } from "./documentFetch";
-import { assertPublicHttpUrl } from "./publicUrlGuard";
+import { assertPublicHttpUrl, connectTimeRefusal, judgedFetchInit } from "./publicUrlGuard";
 import {
   agencyRowAppliesToJob, agencyRowProvenance, anchorSitesOnce,
   agencyTrackFormTypes, applicationKindForPath, applicationSlotFor, stateIssuerKeepsGenericSlot, explicitSingleFamilyAnswer, formApplicationKind, formAuthorityFor, rowBelongsToAuthority, structureMeaningOf,
@@ -1419,7 +1419,16 @@ async function safeFetchTemplate(rawUrl: string): Promise<Response> {
   let url = rawUrl;
   for (let hop = 0; hop < 5; hop++) {
     await assertPublicHttpUrl(url);
-    const res = await fetch(url, { redirect: "manual" });
+    // The connection is judged too (#407): the check above and fetch's own lookup are two
+    // resolutions, and a rebinding resolver can answer them differently.
+    let res: Response;
+    try {
+      res = await fetch(url, { ...(judgedFetchInit(url) as RequestInit), redirect: "manual" });
+    } catch (err) {
+      const refusal = connectTimeRefusal(err);
+      if (refusal) throw new HttpError(400, refusal);
+      throw err;
+    }
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location");
       if (!loc) return res;

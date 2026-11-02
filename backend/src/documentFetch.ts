@@ -43,7 +43,9 @@
 //   holder typed, so the URL and EVERY redirect hop must resolve to a public address
 //   (publicUrlGuard.ts, the same predicate the AHJ form-template fetch asks). Redirects are
 //   followed by hand so the question is asked before each request, not once at the top; a
-//   refused hop ends the ladder with `privateTarget` set and nothing sent there.
+//   refused hop ends the ladder with `privateTarget` set and nothing sent there. The connection
+//   itself dials only the addresses that were judged (#407, publicDispatcher), and the headed
+//   window asks the same question of every request and redirect it makes (guardBrowserHops).
 //
 // * BOUNDED: every rung has a timeout, one browser runs at a time, and the session is closed
 //   in a finally whatever happens.
@@ -54,7 +56,7 @@
 // ---------------------------------------------------------------------------
 import pLimit from "p-limit";
 import { logger } from "./logger";
-import { publicUrlRefusal } from "./publicUrlGuard";
+import { connectTimeRefusal, judgedFetchInit, publicUrlRefusal } from "./publicUrlGuard";
 import { looksBotBlocked } from "./runAbort";
 
 export type FetchVia = "http" | "browser";
@@ -96,7 +98,16 @@ export interface DocumentBrowserSession {
   close(): Promise<void>;
 }
 
-export type DocumentBrowserLauncher = (opts: { timeoutMs: number }) => Promise<DocumentBrowserSession>;
+/** What kind of request a browser hop is: a 3xx Location the window is about to follow, a
+ *  document the window is about to load (a navigation the page itself started, a meta refresh),
+ *  or anything else the page asks for. */
+export type BrowserHopKind = "redirect" | "navigation" | "subresource";
+/** The question a launcher asks before its browser sends a request or follows a redirect: the
+ *  refusal (do NOT send / follow it) or null (go ahead). Asked by the launcher, answered here, so
+ *  the rule stays publicUrlGuard's and a launcher only has to wire it in (#407). */
+export type BrowserHopJudge = (url: string, kind: BrowserHopKind) => Promise<string | null>;
+
+export type DocumentBrowserLauncher = (opts: { timeoutMs: number; judgeHop: BrowserHopJudge }) => Promise<DocumentBrowserSession>;
 
 export interface FetchPublicDocumentOptions {
   /** Budget for the plain-HTTP rung. Default 20s. */
@@ -264,7 +275,10 @@ async function httpAttempt(url: string, opts: { timeoutMs: number; userAgent: st
       // host answering 302 Location: http://169.254.169.254/ took the server there (#391).
       const refusal = await publicUrlRefusal(current);
       if (refusal) return { ...blank, finalUrl: current, refusedUrl: current, refusal };
+      // ...AND AGAIN AT CONNECT TIME (#407): the check above and the connection are two lookups,
+      // so the connection goes through a dispatcher that judges the addresses it dials.
       const res = await fetch(current, {
+        ...(judgedFetchInit(current) as RequestInit),
         redirect: "manual",
         signal,
         // NO cookies, NO authorization, NO credentials of any kind. A plain public GET.
@@ -301,6 +315,10 @@ async function httpAttempt(url: string, opts: { timeoutMs: number; userAgent: st
       return { status: res.status, contentType, server, bytes, finalUrl: current };
     }
   } catch (err) {
+    // A name that answered public to the check and private to the connection: the same refusal
+    // as the check's, and nothing was sent (the socket never opened).
+    const refusal = connectTimeRefusal(err);
+    if (refusal) return { ...blank, finalUrl: current, refusedUrl: current, refusal };
     return { ...blank, finalUrl: current, networkError: err instanceof Error ? err.message : String(err) };
   }
 }
@@ -460,10 +478,43 @@ async function browserAttempt(
   const fail = (reason: string, status = cfg.httpStatus): FetchedDocument =>
     ({ ok: false, status, contentType: "", via: "browser", reason, finalUrl: url.toString() });
 
+  // THE WINDOW ASKS THE SAME QUESTION (#407). Chromium follows a page's redirects itself, so the
+  // URL the plain rung judged is only the first of the window's requests. Every request it sends
+  // and every redirect it is about to follow comes here first; a private one is failed before
+  // Chromium acts on it. A refused redirect or document load ends the attempt, named, with
+  // privateTarget set; a refused subresource (an <img> or a script's fetch into the LAN) is only
+  // blocked, since the page around it is still the public page we asked for.
+  const verdicts = new Map<string, Promise<string | null>>();
+  const refusedHops: Array<{ url: string; kind: BrowserHopKind; refusal: string }> = [];
+  const judgeHop: BrowserHopJudge = async (hopUrl, kind) => {
+    let origin: string;
+    try { origin = new URL(hopUrl).origin; } catch { origin = hopUrl; }
+    // One verdict per origin per window: a page of forty images on one host is one lookup.
+    let verdict = verdicts.get(origin);
+    if (!verdict) { verdict = publicUrlRefusal(hopUrl).catch((e: unknown) => `could not be judged: ${e instanceof Error ? e.message : String(e)}`); verdicts.set(origin, verdict); }
+    const refusal = await verdict;
+    if (refusal) {
+      refusedHops.push({ url: hopUrl, kind, refusal });
+      logger.info("document-fetch", "a real window was refused a private address", { host: url.host, kind, target: hopUrl });
+    }
+    return refusal;
+  };
+  /** The attempt's outcome when the window was sent somewhere private, or null. */
+  const privateOutcome = (): FetchedDocument | null => {
+    const hop = refusedHops.find((h) => h.kind !== "subresource");
+    if (!hop) return null;
+    return {
+      ok: false, status: 0, contentType: "", via: "browser",
+      reason: `${cfg.blocked}. Refused: a real window on ${url.host} was ${hop.kind === "redirect" ? "redirected" : "sent"} to ${hop.url}. ${hop.refusal}`,
+      finalUrl: hop.url,
+      privateTarget: hop.url,
+    };
+  };
+
   let session: DocumentBrowserSession | null = null;
   try {
     try {
-      session = await cfg.launcher({ timeoutMs: cfg.timeoutMs });
+      session = await cfg.launcher({ timeoutMs: cfg.timeoutMs, judgeHop });
     } catch (err) {
       // A headed launch on a machine with no display is a real and common outcome. Say so
       // plainly rather than reporting it as the site blocking us.
@@ -474,7 +525,14 @@ async function browserAttempt(
     // RENDERED MODE: the page itself is the answer (this is what link discovery wants), so
     // navigating IS the retrieval and the DOM after scripts have run is the honest body.
     if (cfg.render) {
-      const visited = await session.visit(url.toString(), remaining());
+      let visited: Awaited<ReturnType<DocumentBrowserSession["visit"]>>;
+      try {
+        visited = await session.visit(url.toString(), remaining());
+      } catch (err) {
+        return privateOutcome() ?? fail(`${cfg.blocked}. A real window could not load the page: ${err instanceof Error ? err.message : String(err)}`);
+      }
+      const refusedPage = privateOutcome();
+      if (refusedPage) return refusedPage;
       const status = visited.status ?? 200;
       const html = visited.html || "";
       const refusal = classifyRefusal(status, "text/html", html);
@@ -501,13 +559,18 @@ async function browserAttempt(
         host: url.host, error: err instanceof Error ? err.message : String(err),
       });
     }
+    // An origin that sends a window into the LAN is not one to ask for the document next.
+    const refusedWarmUp = privateOutcome();
+    if (refusedWarmUp) return refusedWarmUp;
 
     let got: { status: number; contentType: string; bytes: Uint8Array; url?: string };
     try {
       got = await session.fetchInPage(url.toString(), remaining());
     } catch (err) {
-      return fail(`${cfg.blocked}. The in-page retrieval failed: ${err instanceof Error ? err.message : String(err)}`);
+      return privateOutcome() ?? fail(`${cfg.blocked}. The in-page retrieval failed: ${err instanceof Error ? err.message : String(err)}`);
     }
+    const refusedDocument = privateOutcome();
+    if (refusedDocument) return refusedDocument;
 
     if (got.bytes.length > cfg.maxBytes) {
       return fail(`${cfg.blocked}. A real window got the document, but it is ${got.bytes.length} bytes, over the ${cfg.maxBytes}-byte cap.`, got.status);
@@ -612,31 +675,103 @@ const CHROMIUM_ARGS = [
   "--disable-save-password-bubble",
 ];
 
-export const headedChromiumLauncher: DocumentBrowserLauncher = async ({ timeoutMs }) => {
-  const { chromium } = await import("playwright");
-  // Chromium does not inherit HTTPS_PROXY from the environment — it must be wired
-  // explicitly, exactly as portal-bot/src/browser.ts does it.
-  const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
-  const proxy = httpsProxy
-    ? { server: httpsProxy, bypass: ["127.0.0.1", "localhost", "[::1]", process.env.PORTAL_PROXY_BYPASS || ""].filter(Boolean).join(",") }
-    : undefined;
+/** The Chromium launcher, headed (production: headless is refused by the WAFs this rung exists
+ *  for) or headless (the real-browser smoke, which has no display to open a window on). */
+export function chromiumDocumentLauncher(headless: boolean): DocumentBrowserLauncher {
+  return async ({ timeoutMs, judgeHop }) => {
+    const { chromium } = await import("playwright");
+    // Chromium does not inherit HTTPS_PROXY from the environment — it must be wired
+    // explicitly, exactly as portal-bot/src/browser.ts does it.
+    const httpsProxy = process.env.HTTPS_PROXY || process.env.https_proxy;
+    const proxy = httpsProxy
+      ? { server: httpsProxy, bypass: ["127.0.0.1", "localhost", "[::1]", process.env.PORTAL_PROXY_BYPASS || ""].filter(Boolean).join(",") }
+      : undefined;
 
-  const browser = await chromium.launch({ headless: false, args: CHROMIUM_ARGS, proxy });
-  try {
-    // No storage state, no stored cookies, no credentials: a fresh anonymous window every
-    // time, which is all a public document needs.
-    const context = await browser.newContext({ viewport: null, proxy });
-    await context.addInitScript({ content: NAME_SHIM });
-    const page = await context.newPage();
-    page.setDefaultTimeout(timeoutMs);
-    return buildSession(browser, context, page, timeoutMs);
-  } catch (err) {
-    // Setup failed after a successful launch: the caller never receives a session and so can
-    // never close it. Tear the browser down here or the process leaks a window.
-    await browser.close().catch(() => {});
-    throw err;
-  }
-};
+    const browser = await chromium.launch({ headless, args: CHROMIUM_ARGS, proxy });
+    try {
+      // The hop guard goes on BEFORE the context and page exist, so every loader the window ever
+      // has is created under it. Fail closed: a window whose redirects cannot be judged is not
+      // opened at all (the attempt reports the launch failure).
+      await guardBrowserHops(browser, judgeHop);
+      // No storage state, no stored cookies, no credentials: a fresh anonymous window every
+      // time, which is all a public document needs.
+      const context = await browser.newContext({ viewport: null, proxy });
+      await context.addInitScript({ content: NAME_SHIM });
+      const page = await context.newPage();
+      page.setDefaultTimeout(timeoutMs);
+      return buildSession(browser, context, page, timeoutMs);
+    } catch (err) {
+      // Setup failed after a successful launch: the caller never receives a session and so can
+      // never close it. Tear the browser down here or the process leaks a window.
+      await browser.close().catch(() => {});
+      throw err;
+    }
+  };
+}
+
+export const headedChromiumLauncher: DocumentBrowserLauncher = chromiumDocumentLauncher(false);
+
+/** One request as Fetch.requestPaused reports it: at the request stage (no response fields) or
+ *  at the response stage (responseStatusCode set). */
+interface PausedRequest {
+  requestId: string;
+  request?: { url?: string };
+  resourceType?: string;
+  responseStatusCode?: number;
+  responseHeaders?: Array<{ name: string; value: string }>;
+}
+
+/**
+ * JUDGE EVERY HOP AT THE BROWSER (#407): the same response-stage pattern the portal backstop uses
+ * (portal-bot/src/filingBackstop.ts, joinRedirectGuard), cut down to one question. One
+ * browser-level DevTools session pauses every request twice:
+ *   - at the REQUEST stage, before it is sent: the URL is judged (a document load the page itself
+ *     started, a meta refresh, a script's fetch, an <img>);
+ *   - at the RESPONSE stage, before Chromium acts on it: a 3xx's Location is judged before the
+ *     redirect is followed. Chromium never pauses a redirect's second leg at the request stage
+ *     (that is why the backstop works at this stage), so this is where a redirect is caught.
+ * A refused request or hop is failed (BlockedByClient) and never sent; anything else continues
+ * untouched, so cookies, TLS and the redirect itself stay Chromium's own. A judge that throws
+ * fails the request: unjudged is refused.
+ *
+ * What it cannot reach: Chromium's OWN resolver. The window resolves the name again when it
+ * connects, so a rebinding resolver can still split the judged name from the dialled address
+ * inside the window. The plain rung (which pins the address) is the door a URL from outside comes
+ * through; this rung runs only on an operator's own fetch after a wall (#406).
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function guardBrowserHops(browser: any, judge: BrowserHopJudge): Promise<void> {
+  const session = await browser.newBrowserCDPSession();
+  session.on("Fetch.requestPaused", (e: PausedRequest) => {
+    void (async () => {
+      const atResponse = e.responseStatusCode !== undefined && e.responseStatusCode !== null;
+      let target = "";
+      let kind: BrowserHopKind = "subresource";
+      const requestUrl = String(e.request?.url || "");
+      if (atResponse) {
+        const status = Number(e.responseStatusCode);
+        const location = (e.responseHeaders || []).find((h) => /^location$/i.test(String(h?.name || "")))?.value;
+        if (status >= 300 && status < 400 && location) {
+          try { target = new URL(location, requestUrl).toString(); } catch { target = ""; }
+          kind = "redirect";
+        }
+      } else {
+        target = requestUrl;
+        kind = e.resourceType === "Document" ? "navigation" : "subresource";
+      }
+      let refused = false;
+      if (/^https?:/i.test(target)) {
+        try { refused = (await judge(target, kind)) !== null; } catch { refused = true; }
+      }
+      if (refused) await session.send("Fetch.failRequest", { requestId: e.requestId, errorReason: "BlockedByClient" }).catch(() => null);
+      else if (atResponse) await session.send("Fetch.continueResponse", { requestId: e.requestId }).catch(() => null);
+      else await session.send("Fetch.continueRequest", { requestId: e.requestId }).catch(() => null);
+    })();
+  });
+  await session.send("Fetch.enable", {
+    patterns: [{ urlPattern: "*", requestStage: "Request" }, { urlPattern: "*", requestStage: "Response" }],
+  });
+}
 
 type PwBrowser = Awaited<ReturnType<Awaited<typeof import("playwright")>["chromium"]["launch"]>>;
 type PwContext = Awaited<ReturnType<PwBrowser["newContext"]>>;

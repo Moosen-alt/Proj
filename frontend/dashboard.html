@@ -1510,12 +1510,32 @@
             <div class="actions">
               <button type="button" id="mp_saveBtn" class="secondary"><i data-lucide="lock"></i><span>Change my password</span></button>
             </div>
-            <p class="muted field-hint">Lost a laptop, or signed in on a shared computer? Sign out everywhere ends every session you have open, on every device, this one included.</p>
+            <p class="muted field-hint">Lost a laptop, or signed in on a shared computer? Sign out everywhere ends every session you have open, on every device, this one included. Recorder tokens are separate: revoke those below.</p>
             <div class="actions">
               <button type="button" id="mp_signOutEverywhereBtn" class="secondary"><i data-lucide="log-out"></i><span>Sign out everywhere</span></button>
             </div>
           </div>
           <p id="myPasswordStatus" class="muted" role="status"></p>
+        </section>
+        <!-- #433: per-person token for the portal recorder CLI on a shared server with sign-in on. -->
+        <section id="recorderTokensPane" class="users-signin" aria-labelledby="recorderTokensTitle">
+          <h3 id="recorderTokensTitle">Recorder tokens</h3>
+          <p id="recorderTokensState" class="muted"></p>
+          <div id="recorderTokensControls" class="stack" hidden>
+            <div class="form-row">
+              <label>Name (which computer)<input id="rt_name" type="text" maxlength="60" placeholder="e.g. my laptop" autocomplete="off" /></label>
+              <label>Expires after (days)<input id="rt_days" type="number" min="1" max="90" value="30" /></label>
+            </div>
+            <div class="actions">
+              <button type="button" id="rt_mintBtn" class="secondary"><i data-lucide="key-round"></i><span>Make a recorder token</span></button>
+            </div>
+            <div id="rt_newTokenWrap" class="stack" hidden>
+              <label>Your new token (shown only once: copy it now)<input id="rt_newToken" type="text" readonly autocomplete="off" spellcheck="false" /></label>
+              <p class="muted field-hint">On your computer, set it as RECORDER_TOKEN before you run the record command (Windows: <code>set RECORDER_TOKEN=&lt;token&gt;</code>; Mac/Linux: <code>export RECORDER_TOKEN=&lt;token&gt;</code>). The downloaded record.bat asks for it. Keep it private: it records portals as you.</p>
+            </div>
+            <ul id="rt_list" class="stack compact"></ul>
+          </div>
+          <p id="recorderTokensStatus" class="muted" role="status"></p>
         </section>
         </div>
       </div>
