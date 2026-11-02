@@ -7839,6 +7839,21 @@ function permitTargetEditPatch(target, values) {
 // backend/test/permitTargetCard.test.ts. Every control carries THIS card's target id; the inputs are
 // found inside the card (data-edit-field / data-record-field), never by page-wide id, because the
 // cards repeat. `ui` says which form, if any, is open on this card (state, so a re-render keeps it).
+// THE ISSUED PERMIT / APPROVAL LETTER the monitor downloaded off this filing's record (#492), each
+// linked with its provenance ("downloaded from record X on date"), or the one line saying why none
+// is on file. Pinned by backend/test/portalIssuedDocuments.test.ts.
+function issuedDocumentsHtml(target) {
+  const docs = Array.isArray(target.issuedDocuments) ? target.issuedDocuments : [];
+  const what = target.targetType === "nem" ? "Approval letter" : "Issued permit";
+  if (docs.length) {
+    return `<p data-issued-docs><strong>${esc(what)}:</strong> ${docs.map((d) => `<a href="/api/projects/${encodeURIComponent(target.projectId)}/documents/${encodeURIComponent(d.documentId)}">${esc(d.filename)}</a> <span class="muted">· ${esc(d.provenance)}</span>`).join("; ")}</p>`;
+  }
+  if (target.issuedDocsGap) {
+    return `<p data-issued-docs-gap style="border-left:3px solid var(--warn, #b7791f);padding-left:6px"><strong>${esc(what)} not on file:</strong> ${esc(target.issuedDocsGap)}</p>`;
+  }
+  return "";
+}
+
 function permitTargetCardHtml(target, checks, ui) {
   const id = esc(target.id);
   const platformLabel = target.portalPlatform && target.portalPlatform !== "unknown" && target.portalPlatform !== "public_url"
@@ -7880,6 +7895,7 @@ function permitTargetCardHtml(target, checks, ui) {
       ${target.portalUrl ? `<p class="muted" style="word-break:break-all">${esc(target.portalUrl)}</p>` : ""}
       ${target.trackingUrl && target.trackingUrl !== target.portalUrl ? `<p class="muted" style="word-break:break-all">Status link: ${esc(target.trackingUrl)}</p>` : ""}
       ${target.readGap && !stopped ? `<p data-read-gap style="border-left:3px solid var(--warn, #b7791f);padding-left:6px"><strong>Can't read on its own:</strong> ${esc(target.readGap)}</p>` : ""}
+      ${issuedDocumentsHtml(target)}
       <p class="muted">${stopped ? "Tracking stopped — the monitor no longer reads this filing." : `Checks every ${esc(target.checkFrequencyDays)} day(s) · Next: ${target.nextCheckAt ? esc(new Date(target.nextCheckAt).toLocaleString()) : "not scheduled"}`} · Source strategy: ${esc(target.portalPlatform || "auto")}</p>
       ${ui?.editing || ui?.recording ? "" : `<div style="margin-top:6px">
         <button type="button" class="secondary" style="font-size:12px" data-target-action="edit" data-target-id="${id}">Edit</button>

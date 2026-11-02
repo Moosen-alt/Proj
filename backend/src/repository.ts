@@ -99,6 +99,7 @@ import { clientLicenceRow, clientStagingOverlay, contractorLicenceForState, getC
 import { planSetLicenceWarning } from "./clientMatch";
 import { assertSubmissionPaid } from "./submissionFees";
 import { readAndRecordPortalFees } from "./portalFeeReadings";
+import { closeoutDocumentLines, fetchIssuedRecordDocuments, isFinishedOutcome, issuedDocumentsByTarget } from "./portalIssuedDocuments";
 import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential } from "./portalCredentials";
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
 import { logger } from "./logger";
@@ -524,9 +525,25 @@ function mapPermitTarget(row: Row): PermitCheckTarget {
     portalPlatform: text(row.portal_platform),
     trackingUrl: row.tracking_url ? text(row.tracking_url) : undefined,
     readGap: text(row.read_gap) || undefined,
+    // Only while the filing is finished: a gap from an earlier issued reading that a later
+    // correction undid is not this filing's news any more.
+    issuedDocsGap: isFinishedOutcome(trackKind(text(row.target_type), text(row.permit_type)), text(row.latest_outcome))
+      ? text(row.issued_docs_gap) || undefined
+      : undefined,
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
   };
+}
+
+/** Each target's downloaded issued permit / approval letter (#492), with provenance — one query
+ *  for the project, not one per target. */
+function withIssuedDocuments(db: AppDb, projectId: string, targets: PermitCheckTarget[]): PermitCheckTarget[] {
+  const byTarget = issuedDocumentsByTarget(db, projectId);
+  if (!byTarget.size) return targets;
+  return targets.map((t) => {
+    const docs = byTarget.get(t.id);
+    return docs?.length ? { ...t, issuedDocuments: docs, issuedDocsGap: undefined } : t;
+  });
 }
 
 function mapPermitStatusCheck(row: Row): PermitStatusCheck {
@@ -1363,9 +1380,9 @@ export function getProjectDetail(db: AppDb, projectId: string): ProjectDetail {
       .query<Row>("SELECT * FROM human_review_items WHERE project_id = ? ORDER BY status DESC, created_at DESC", [projectId])
       .map(mapReview),
     corrections,
-    permitCheckTargets: db
+    permitCheckTargets: withIssuedDocuments(db, projectId, db
       .query<Row>("SELECT * FROM permit_check_targets WHERE project_id = ? ORDER BY active DESC, created_at DESC", [projectId])
-      .map(mapPermitTarget),
+      .map(mapPermitTarget)),
     permitStatusChecks: db
       .query<Row>("SELECT c.*, t.target_type, t.permit_type FROM permit_status_checks c LEFT JOIN permit_check_targets t ON t.id = c.target_id WHERE c.project_id = ? ORDER BY c.created_at DESC LIMIT 50", [projectId])
       .map(mapPermitStatusCheck),
@@ -1447,6 +1464,7 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     db.run("DELETE FROM project_intake_requests WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM submission_payments WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM portal_fee_readings WHERE project_id = ?", [projectId]);
+    db.run("DELETE FROM portal_record_documents WHERE project_id = ?", [projectId]);
     // Keep permit_fee_history (learned real fees) but unlink the deleted project.
     db.run("UPDATE permit_fee_history SET project_id = NULL WHERE project_id = ?", [projectId]);
     // Communications may belong to a customer too — unlink rather than destroy correspondence.
@@ -2216,6 +2234,8 @@ export function getProjectHandoffPacket(db: AppDb, projectId: string): ProjectHa
   const noteLines = runbook.recentNotes
     .slice(0, 8)
     .map((note) => `${note.noteType.replaceAll("_", " ")} | ${note.createdBy || "Operations"}: ${note.body}`);
+  // The issued permit(s) and the approval letter the installer needs (#492).
+  const closeout = closeoutDocumentLines(db, projectId);
 
   const sections: ProjectHandoffPacketSection[] = [
     handoffSection({
@@ -2262,6 +2282,12 @@ export function getProjectHandoffPacket(db: AppDb, projectId: string): ProjectHa
       lines: timelineLines.length ? timelineLines : ["No timeline activity recorded yet."],
     }),
     handoffSection({
+      title: "Issued Permit & Approval Letter",
+      severity: closeout.complete ? "pass" : closeout.finished ? "warning" : "info",
+      source: "portal_record_documents",
+      lines: closeout.lines.length ? closeout.lines : ["No filing reads issued or approved yet."],
+    }),
+    handoffSection({
       title: "PM Notes",
       severity: runbook.recentNotes.some((note) => note.noteType === "blocker") ? "blocker" : runbook.recentNotes.length ? "info" : "pass",
       source: "project_notes",
@@ -2283,6 +2309,7 @@ export function getProjectHandoffPacket(db: AppDb, projectId: string): ProjectHa
     timelineEventCount: timeline.totalEvents,
     ownerRoles: [...owners].sort((a, b) => a.localeCompare(b)),
     sections,
+    closeoutDocumentsComplete: closeout.complete,
   };
   return {
     ...basePacket,
@@ -7664,6 +7691,12 @@ export async function runDuePermitChecks(
     if (source !== "mock") {
       await readAndRecordPortalFees(db, detail.project, text(target.id)).catch((err) => {
         logger.warn("monitor", "portal fee read failed — status unaffected", { projectId, targetId: text(target.id), err: err instanceof Error ? err.message : String(err) });
+      });
+      // THE ISSUED PERMIT / APPROVAL LETTER, off the same record once it reads issued / approved
+      // (portalIssuedDocuments.ts, #492) — read-only GETs on the record's own portal and track,
+      // after the status is recorded and unable to change it.
+      await fetchIssuedRecordDocuments(db, detail.project, text(target.id)).catch((err) => {
+        logger.warn("monitor", "issued-document fetch failed — status unaffected", { projectId, targetId: text(target.id), err: err instanceof Error ? err.message : String(err) });
       });
     }
     touchProjectMetrics(db, projectId);

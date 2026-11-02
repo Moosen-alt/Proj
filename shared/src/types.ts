@@ -1178,8 +1178,27 @@ export interface PermitCheckTarget {
   /** WHY THE MONITOR COULD NOT READ THIS FILING on its last check (#413), one actionable line ("No
    *  portal recipe learned for … yet", "Login wall: …"); absent once a status is read. */
   readGap?: string;
+  /** THE ISSUED PERMIT / APPROVAL LETTER the monitor downloaded off this filing's record once it
+   *  read issued / approved (#492), each with its provenance; absent when none is on file. */
+  issuedDocuments?: IssuedRecordDocument[];
+  /** WHY no issued permit / approval letter was attached for this finished filing (#492), one
+   *  actionable line; absent once one is on file. */
+  issuedDocsGap?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** A closeout document the permit monitor downloaded off a filed record (#492). */
+export interface IssuedRecordDocument {
+  documentId: string;
+  /** "issued_permit" (permit track) | "utility_approval" (NEM track). */
+  docType: string;
+  filename: string;
+  recordNumber: string;
+  sourceUrl: string;
+  fetchedAt: string;
+  /** "downloaded from record <number> on <date>". */
+  provenance: string;
 }
 
 // A project's required submittal tracks (utility NEM + building/electrical permits),
@@ -2728,6 +2747,9 @@ export interface ProjectHandoffPacket {
   timelineEventCount: number;
   ownerRoles: string[];
   sections: ProjectHandoffPacketSection[];
+  /** Every finished filing (permit issued / NEM approved) has its issued permit or approval
+   *  letter on file, downloaded or attached (#492). False while any is missing or none finished. */
+  closeoutDocumentsComplete: boolean;
   reportText: string;
 }
 
