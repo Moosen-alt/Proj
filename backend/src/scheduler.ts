@@ -102,6 +102,16 @@ export function startMonitorScheduler(db: AppDb): void {
         }
       }
 
+      // THE ONE REMINDER for an intake / login link the server emailed a client (#488): due
+      // CLIENT_REQUEST_REMINDER_DAYS after a send that left, re-checked against the need first.
+      try {
+        const { remindClientRequests } = await import("./clientRequestLinks");
+        const r = await remindClientRequests(db);
+        if (r.reminded > 0) logger.info("monitor", `client request reminders: ${r.reminded} sent, ${r.closed} ask(s) closed.`);
+      } catch (err) {
+        logger.warn("monitor", `client request reminders failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+
       if (permit.checked > 0 || emailMatches > 0 || imapMatches > 0 || gmailMatches > 0) {
         logger.info("monitor", `auto-run: ${permit.checked} permit/NEM check(s), ${emailMatches + imapMatches + gmailMatches} email match(es) across ${sources.length} mbox source(s).`);
       }

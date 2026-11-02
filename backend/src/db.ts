@@ -2798,6 +2798,44 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
     },
   },
   {
+    version: 54,
+    name: "client_request_sends",
+    up: (db) => {
+      // THE INTAKE AND LOGIN LINKS, EMAILED BY THE SERVER (#488). When the automatic chain stops on
+      // something only the client can supply (the utility bill, a portal question, the utility
+      // portal login), clientRequestLinks.ts makes the request and emails the client's inbox the
+      // link. One row per ASK: it is what makes the send happen once per open request instead of
+      // once per chain run, carries the one reminder, and is what the Next step reads back as
+      // "Sent to <contact> on <date>". closed_at is stamped when the need goes away (answered,
+      // bill arrived, login stored, request spent or expired); a new need later is a new ask.
+      // Created here, never lazily: nextStep reads it, and reads write nothing (nextStep.test).
+      // The token is NOT stored here — the credential link's token lives only in its own
+      // credential_requests row, and the sent email's stored copy masks it.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS client_request_sends (
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          request_id TEXT NOT NULL DEFAULT '',
+          project_id TEXT NOT NULL,
+          client_id TEXT NOT NULL,
+          portal_url TEXT NOT NULL DEFAULT '',
+          recipient TEXT NOT NULL DEFAULT '',
+          needs_json TEXT NOT NULL DEFAULT '[]',
+          sent_at TEXT NOT NULL,
+          delivery_status TEXT NOT NULL DEFAULT '',
+          reminder_at TEXT NOT NULL DEFAULT '',
+          reminder_status TEXT NOT NULL DEFAULT '',
+          closed_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_client_request_sends_project ON client_request_sends(project_id, closed_at);
+        CREATE INDEX IF NOT EXISTS idx_client_request_sends_client ON client_request_sends(client_id, kind, closed_at);
+      `);
+      // Per-client opt-out: '' = the server emails the links (the default the owner asked for);
+      // 'off' = staff send them by hand, as before. clients is CREATEd in the base schema.
+      addColumnIfMissing(db, "clients", "request_links_auto_send", "TEXT NOT NULL DEFAULT ''");
+    },
+  },
+  {
     version: 57,
     name: "clients_handoff_auto_send",
     up: (db) => {

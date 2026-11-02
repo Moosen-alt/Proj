@@ -38,7 +38,7 @@ import type { ProjectRecord } from "../../shared/src/types";
 import { addAuditLog } from "./audit";
 import { addCommunication, undeliveredCommunications } from "./crm";
 import {
-  ensureStatusShareToken, formatProjectAddress, sendEmail, smtpConfigured, statusShareUrl,
+  clientUpdatesSilenced, ensureStatusShareToken, formatProjectAddress, sendEmail, smtpConfigured, statusShareUrl,
 } from "./clientNotifier";
 import { BRAND, clientFacingPermitType, clientPermitStructure, recordClientUpdateNote, type ClientUpdate } from "./clientUpdates";
 import { INSTALLER_HANDOFF_SENDER, installerHandoffAttachments } from "./handoffDocuments";
@@ -186,7 +186,8 @@ const skip = (detail: string, refusedStatus = 409): InstallerHandoffResult =>
  *   trigger "automatic": the transition. Honours the per-client opt-out and sends only when this
  *     project has no handoff email on record yet.
  *   trigger "manual": a person pressed Send on the project page. Sends again whatever is on record.
- * Both honour CLIENT_NOTIFICATIONS=off, an archived project, and a project not at handoff_ready.
+ * Both honour clientUpdatesSilenced (CLIENT_NOTIFICATIONS=off, no client, archived) and refuse a
+ *  project not at handoff_ready.
  */
 export async function sendInstallerHandoff(
   db: AppDb,
@@ -194,18 +195,20 @@ export async function sendInstallerHandoff(
   opts: { trigger: "automatic" | "manual"; actor?: string },
 ): Promise<InstallerHandoffResult> {
   try {
-    if (/^(0|false|off)$/i.test(String(process.env.CLIENT_NOTIFICATIONS ?? "").trim())) {
-      return skip("Client emails are switched off on this server (CLIENT_NOTIFICATIONS=off).");
-    }
     // Read fresh: callers hold a record captured before the transition.
     const row = db.get<Row>("SELECT status, archived_at, client_id, org_id FROM projects WHERE id = ?", [project.id]);
     if (!row) return skip("Project not found.", 404);
     if (text(row.status) !== "handoff_ready") {
       return skip("The handoff packet goes out once the permit is issued and the interconnection approved — this project is not there yet.");
     }
-    if (text(row.archived_at).trim()) return skip("This project is archived.");
     const clientId = text(row.client_id);
-    if (!clientId) return skip("This project has no submitting client to send the packet to.");
+    // THE ONE "may this project talk to its client" answer every client update asks (#490):
+    // CLIENT_NOTIFICATIONS=off, no submitting client, or an archived project.
+    if (clientUpdatesSilenced(db, { id: project.id, clientId: clientId || null })) {
+      return skip(/^(0|false|off)$/i.test(String(process.env.CLIENT_NOTIFICATIONS ?? "").trim())
+        ? "Client emails are switched off on this server (CLIENT_NOTIFICATIONS=off)."
+        : !clientId ? "This project has no submitting client to send the packet to." : "This project is archived.");
+    }
 
     const prior = installerHandoffRecords(db, [project.id]).get(project.id);
     if (opts.trigger === "automatic") {

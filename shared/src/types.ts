@@ -239,6 +239,10 @@ export interface ClientRecord {
   /** Who receives OUR invoices — a third address again: the AHJ's correspondent, the
    *  operations inbox and accounts payable are rarely one person. */
   billingContactEmail: string;
+  /** Whether the server emails this client the intake link and the one-time portal-login link on
+   *  its own when a job is held on something only the client can supply (#488): "" = yes (the
+   *  default), "off" = staff send them by hand. clientRequestLinks.ts is the one reader. */
+  requestLinksAutoSend: string;
   /** The issuing state for the contractor licence numbers above. A bare number is ambiguous
    *  the moment a company is licensed in two states. */
   licenseState: string;
@@ -997,6 +1001,23 @@ export interface NextStep {
    *  list. Never written as fact — each is one click for a person to confirm (the confirmation
    *  door, POST /api/portal-runs/:runId/capture-confirmation). Absent when there are none. */
   recordCandidates?: SubmitCaptureCandidate[];
+  /** The intake / portal-login links the server emailed the client for this job and that are still
+   *  open (#488) — the banner's "Sent to <contact> on <date>". Detail tier only; absent when none. */
+  clientAsks?: ClientAskSent[];
+}
+/** One automatic ask of the client that is still open (clientRequestLinks.ts, client_request_sends). */
+export interface ClientAskSent {
+  kind: "intake" | "credentials";
+  /** The address it went to (the client's updates inbox, else its business email). */
+  recipient: string;
+  sentAt: string;
+  /** "sent" | "draft" (SMTP or PUBLIC_BASE_URL not set: nothing left; send it by hand from the
+   *  project's communications) | "failed" (the mail server refused). */
+  deliveryStatus: string;
+  /** What was asked, as plain labels (never a value). */
+  needs: string[];
+  reminderAt?: string;
+  reminderStatus?: string;
 }
 /** One record number a person may confirm (NextStep.recordCandidates). */
 export interface SubmitCaptureCandidate {

@@ -48,6 +48,7 @@
 
 import type { AppDb } from "./db";
 import type {
+  ClientAskSent,
   CorrectionRecord,
   NextStep,
   NextStepCompact,
@@ -70,6 +71,7 @@ import { billingTrack } from "./submissionFees";
 import { findingHoldScope, gateCheckDefaultScope, scopeHoldsTrack, tracksHeld } from "./gateScope";
 import { issuingAuthorityForTrack } from "./applicationDocsAgency";
 import { parseJobProgressNote } from "./jobProgress";
+import { clientAsksForProject } from "./clientAsks";
 import { installerHandoffRecords, type InstallerHandoffRecord } from "./installerHandoff";
 import { SIGNATURE_REQUEST_CONFIRMED_ACTION, reduceNemSignatureState } from "./signatureTrack";
 import { visionRelaxedBlockers } from "./reviewerVision";
@@ -273,6 +275,9 @@ export interface NextStepFacts {
   gate?: { decision: SubmitGateReport["decision"]; blockers: Array<{ id: string; title: string; nextAction: string; holds?: SubmitGateHold[] }> };
   /** Detail tier only: reviewer blockers as the approve route judges them (each with its tracks). */
   reviewerBlockers?: ReviewerBlocker[];
+  /** Detail tier only: the intake / login links the server emailed the client that are still open
+   *  (clientAsks.ts, #488) — carried onto the answer whatever its key. */
+  clientAsks?: ClientAskSent[];
   /** handoff_ready only: the installer handoff email on record for the CURRENT handoff
    *  (installerHandoff.installerHandoffRecords, #491), or null when none was sent or drafted. */
   installerHandoff?: InstallerHandoffRecord | null;
@@ -666,6 +671,7 @@ export function decideNextStep(facts: NextStepFacts): NextStep {
     gateCanOverrule: passedGateRule && !gateChecked && unfinished.length > 0,
     hasStagedDraft,
     ...(recordCandidates.length ? { recordCandidates } : {}),
+    ...(!facts.archived && facts.clientAsks?.length ? { clientAsks: facts.clientAsks } : {}),
   });
 
   if (facts.archived) return make("archived", "nobody", "done", "Archived — nothing is asked of anyone.", [], null);
@@ -1008,6 +1014,7 @@ export function loadFullNextStepFacts(db: AppDb, projectId: string): NextStepFac
         blockers: gate.checks.filter((c) => c.status === "blocker").map((c) => ({ id: c.id, title: c.title, nextAction: c.nextAction, ...(c.holds ? { holds: c.holds } : {}) })),
       },
       reviewerBlockers: reviewerBlockerList(db, project),
+      clientAsks: clientAsksForProject(db, projectId),
     };
   });
 }

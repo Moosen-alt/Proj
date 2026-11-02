@@ -88,6 +88,8 @@ export function statusShareUrl(token: string): string {
   return `${base}/status?token=${encodeURIComponent(token)}`;
 }
 
+/** SMTP_HOST and SMTP_FROM are both set. Shared with clientRequestLinks.ts (#488), so the two
+ *  outbound client channels agree on what "configured" means. */
 export function smtpConfigured(): boolean {
   return Boolean(process.env.SMTP_HOST && process.env.SMTP_FROM);
 }
@@ -193,34 +195,48 @@ export async function resendCommunication(
   }
 }
 
+/**
+ * Whether this project may talk to its client at all — the ONE answer for every client update
+ * (status changes and filings alike). Synchronous, so the filing door can ask it before it
+ * claims its once-per-track marker.
+ */
+export function clientUpdatesSilenced(db: AppDb, project: Pick<ProjectRecord, "id" | "clientId">): boolean {
+  // "off" too: every other kill switch in this codebase accepts it, and the demo kit's .env said
+  // CLIENT_NOTIFICATIONS=off for weeks while this line quietly ignored it.
+  if (/^(0|false|off)$/i.test(String(process.env.CLIENT_NOTIFICATIONS ?? "").trim())) return true;
+  if (!project.clientId) return true;
+
+  // AN ARCHIVED PROJECT DOES NOT TALK. Hiding the card was only half the feature: the monitor
+  // keeps polling an archived project's permit_check_targets row, and on an outcome change this
+  // function emailed the client about a job their tracker says does not exist — and minted a
+  // working per-project status link while doing it. That is the duplicate-job confusion the
+  // archive exists to remove, arriving down the other channel.
+  //
+  // Read fresh from the row, not from the passed record: callers hold a ProjectRecord captured
+  // before the archive and it carries no archived_at.
+  const archived = db.get<{ archived_at?: string }>(
+    "SELECT archived_at FROM projects WHERE id = ?", [project.id],
+  );
+  if (String(archived?.archived_at || "").trim()) {
+    logger.info("notify", "skipped a client update for an archived project", { projectId: project.id });
+    return true;
+  }
+  return false;
+}
+
 /** Notify the submitting client of a status change. Never throws — a delivery
  *  problem must never break the monitor tick that detected the change. */
 export async function notifyClientOfStatusChange(
   db: AppDb,
   project: ProjectRecord,
-  evt: { outcome: string; statusLabel: string; targetType: string; permitType?: string; permitNumber?: string; applicationNumber?: string },
+  evt: {
+    outcome: string; statusLabel: string; targetType: string; permitType?: string; permitNumber?: string; applicationNumber?: string;
+    /** The filing event's resolved agency and measured review time (clientFilingUpdate.ts). */
+    agency?: string; reviewDays?: number | null;
+  },
 ): Promise<void> {
   try {
-    // "off" too: every other kill switch in this codebase accepts it, and the demo kit's .env said
-    // CLIENT_NOTIFICATIONS=off for weeks while this line quietly ignored it.
-    if (/^(0|false|off)$/i.test(String(process.env.CLIENT_NOTIFICATIONS ?? "").trim())) return;
-    if (!project.clientId) return;
-
-    // AN ARCHIVED PROJECT DOES NOT TALK. Hiding the card was only half the feature: the monitor
-    // keeps polling an archived project's permit_check_targets row, and on an outcome change this
-    // function emailed the client about a job their tracker says does not exist — and minted a
-    // working per-project status link while doing it. That is the duplicate-job confusion the
-    // archive exists to remove, arriving down the other channel.
-    //
-    // Read fresh from the row, not from the passed record: callers hold a ProjectRecord captured
-    // before the archive and it carries no archived_at.
-    const archived = db.get<{ archived_at?: string }>(
-      "SELECT archived_at FROM projects WHERE id = ?", [project.id],
-    );
-    if (String(archived?.archived_at || "").trim()) {
-      logger.info("notify", "skipped a client update for an archived project", { projectId: project.id });
-      return;
-    }
+    if (clientUpdatesSilenced(db, project)) return;
 
     // THE NOTE IS WRITTEN FIRST, BEFORE ANYTHING THAT CAN BAIL OUT.
     //
@@ -235,6 +251,8 @@ export async function notifyClientOfStatusChange(
       permitType: evt.permitType,
       permitNumber: evt.permitNumber,
       applicationNumber: evt.applicationNumber,
+      agency: evt.agency,
+      reviewDays: evt.reviewDays,
     });
     if (!update) return;   // not a client-facing outcome; that gate lives in clientUpdates.ts
     try {
