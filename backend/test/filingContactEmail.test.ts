@@ -51,9 +51,9 @@ const check = (name: string, ok: boolean, detail = ""): void => {
   else console.log(`ok   - ${name}`);
 };
 
-const FILING = "tracking@filing-service.example";
-const CLIENT = "office@kestrel-solar.example";
-const OWNER = "homeowner.mockdata@example.com";
+const FILING = "tracking@filing-service.test";
+const CLIENT = "office@kestrel-solar.test";
+const OWNER = "homeowner.mockdata@example.test";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. The one slot predicate.
