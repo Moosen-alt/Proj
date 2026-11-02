@@ -3144,6 +3144,15 @@ app.post("/api/projects/:id/payment/record-fee", asyncHandler(async (req, res) =
   res.json({ quote });
 }));
 
+// FEE ACCURACY (#494) — what we quoted at filing beside what was paid, per AHJ/utility and track,
+// flagging any jurisdiction whose quotes miss by more than ?thresholdPct (default 10, or
+// FEE_ACCURACY_THRESHOLD_PCT). A new top-level path, so it is tenant-scoped here (reqOrgFilter)
+// and declared in routeScope.test. Read-only: never writes "verified", never touches a schedule.
+app.get("/api/fee-accuracy", asyncHandler(async (req, res) => {
+  const { buildFeeAccuracyReport } = await import("./feeAccuracy");
+  res.json(buildFeeAccuracyReport(db, reqOrgFilter(db, req), { thresholdPct: req.query.thresholdPct }));
+}));
+
 // THE FEE SHEET — "what does this job cost, and where did that number come from?"
 //
 // Both tracks in one answer: the amount, the schedule line it fell in, the published page it

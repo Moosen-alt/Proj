@@ -98,6 +98,7 @@ import { addAuditLog } from "./audit";
 import { clientLicenceRow, clientStagingOverlay, contractorLicenceForState, getClient } from "./clients";
 import { planSetLicenceWarning } from "./clientMatch";
 import { assertSubmissionPaid } from "./submissionFees";
+import { snapshotFilingQuote } from "./feeAccuracy";
 import { readAndRecordPortalFees } from "./portalFeeReadings";
 import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential } from "./portalCredentials";
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
@@ -1447,6 +1448,8 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     db.run("DELETE FROM project_intake_requests WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM submission_payments WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM portal_fee_readings WHERE project_id = ?", [projectId]);
+    // The filing-time quote (migration v56, #494) carries the same FK.
+    db.run("DELETE FROM fee_quote_snapshots WHERE project_id = ?", [projectId]);
     // Keep permit_fee_history (learned real fees) but unlink the deleted project.
     db.run("UPDATE permit_fee_history SET project_id = NULL WHERE project_id = ?", [projectId]);
     // Communications may belong to a customer too — unlink rather than destroy correspondence.
@@ -10334,6 +10337,8 @@ export async function prepareSubmission(
     // track, fire-and-forget: it never throws and never touches the run's record.
     if (acceptedFiling) {
       void notifyClientOfFiling(db, detail.project, { track: permitTypeTag, permitNumber: capturedPermitNumber, via: "auto_submit" });
+      // The quote in force as it was filed (#494), once per billing track; never throws.
+      snapshotFilingQuote(db, detail.project, permitTypeTag, submissionId);
     }
 
     // #333: a filing the person made from the review window while this run was finishing — recorded
@@ -10616,8 +10621,10 @@ export function captureConfirmation(
   let recordLinkRefused = false;
   // Hoisted so the post-transaction correction close can read it — see below.
   let remainingTracks = 0;
-  // Hoisted so the client's "we filed it" update (#490) names the track this confirmation filed.
+  // Hoisted so the client's "we filed it" update (#490) names the track this confirmation filed,
+  // and so the filing-time quote snapshot (#494) knows the track and the submission row.
   let filedTrack = "";
+  let filedSubmissionId = "";
 
   db.transaction(() => {
     db.run("UPDATE portal_runs SET status = ?, finished_at = ? WHERE id = ?", ["submitted", ts, portalRunId]);
@@ -10697,6 +10704,7 @@ export function captureConfirmation(
       || text(stamped?.permit_type)
       || (text(stamped?.submission_type) === "interconnection" ? "nem" : "");
     filedTrack = trackKey;
+    filedSubmissionId = text(stamped?.id);
     // THE RECORD'S LINK (#400). Rule 5 at the one creator: a utility-portal link never lands on a
     // permit target (ensureCheckTarget would refuse it). Here it is dropped instead of refused —
     // the number is the precious fact, and a link must never cost the filing its record.
@@ -10803,6 +10811,11 @@ export function captureConfirmation(
       });
     }
   }
+
+  // THE QUOTE IN FORCE AS IT WAS FILED (#494), kept once per billing track for the fee accuracy
+  // report. Outside the transaction and never throwing, for the same reason as the close above.
+  // A legacy run with no track and no stamped row bills as the permit track (billingTrack).
+  snapshotFilingQuote(db, projectForTarget, filedTrack, filedSubmissionId);
 
   const detail = getProjectDetail(db, projectId);
   // A PERSON CONFIRMED THIS FILING (the dashboard's capture form, or the hand-over's confident read
