@@ -2836,7 +2836,7 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
     },
   },
   {
-    version: 59,
+    version: 58,
     name: "project_milestones",
     up: (db) => {
       // THE CLOSEOUT MILESTONES (#497): installed, final inspection passed, PTO requested, PTO

@@ -1434,7 +1434,7 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     db.run("DELETE FROM audit_logs WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM historical_failure_examples WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM permit_timeline_samples WHERE project_id = ?", [projectId]);
-    // Closeout milestones (migration v59, #497).
+    // Closeout milestones (migration v58, #497).
     db.run("DELETE FROM project_milestones WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM historical_project_fingerprints WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM knowledge_events WHERE project_id = ?", [projectId]);

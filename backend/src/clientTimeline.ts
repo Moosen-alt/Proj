@@ -8,7 +8,7 @@
 //
 //   · filed / issued / approved: submittalTracks.trackProgress — the tracks panel's own status
 //     and isTrackDone's verdict, never a second copy of "is it filed, is it done";
-//   · installed / final passed / PTO requested / PTO granted: project_milestones (migration v59),
+//   · installed / final passed / PTO requested / PTO granted: project_milestones (migration v58),
 //     written only by recordProjectMilestone below;
 //   · the usual days: clientFilingUpdate.usualReviewDays — the measured median of real filings
 //     (permit_timeline_samples, rolled up in the KB) when there are at least three, else nothing.
