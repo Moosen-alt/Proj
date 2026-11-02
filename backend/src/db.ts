@@ -2947,6 +2947,30 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       addColumnIfMissing(db, "clients", "handoff_auto_send", "TEXT NOT NULL DEFAULT ''");
     },
   },
+  {
+    version: 58,
+    name: "project_milestones",
+    up: (db) => {
+      // THE CLOSEOUT MILESTONES (#497): installed, final inspection passed, PTO requested, PTO
+      // granted. No portal reading produces them today, so the client's timeline had nothing to
+      // show after "permit issued / interconnection approved". One row per (project, milestone),
+      // written only by clientTimeline.recordProjectMilestone — a person on the project page now,
+      // the finals and PTO automation (#495, #496) through the same door when it lands. reached_at
+      // is when it happened (what the client sees); recorded_at / recorded_by are who wrote it.
+      // Created here, never lazily: the client pages read it, and reads write nothing.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS project_milestones (
+          project_id TEXT NOT NULL,
+          milestone TEXT NOT NULL,
+          reached_at TEXT NOT NULL,
+          recorded_by TEXT NOT NULL DEFAULT '',
+          source TEXT NOT NULL DEFAULT 'operator',
+          recorded_at TEXT NOT NULL,
+          PRIMARY KEY (project_id, milestone)
+        );
+      `);
+    },
+  },
 ];
 
 /** v47 was edited in place while #218 was open (Helm's review at 0116f98a): a DB that ran an earlier

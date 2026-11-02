@@ -2352,6 +2352,7 @@ async function selectProject(projectId) {
   state.permitTargetEditing = null;
   state.permitTargetRecording = null;
   state.submittalTracks = null;
+  state.projectMilestones = null;
   state.paymentQuotes = null;
   state.feeReceipts = [];
   state.feeSheet = null;
@@ -4963,6 +4964,7 @@ async function loadSubmittalTracks() {
   } catch {
     state.submittalTracks = null;
   }
+  await loadProjectMilestones();
   updatePortalLoginsSummary();
   syncRecordPermitType();
 }
@@ -5436,7 +5438,8 @@ function renderSubmittalTracks() {
   // "Utility net metering (NEM) / interconnection", "… interconnection + export credit (net
   // billing …)", "… interconnection only …", or "… (net-metering program not yet confirmed)");
   // the header repeats that phrase and falls back to the neutral "interconnection".
-  wrap.innerHTML = group(utilityGroupTitle(utility), utility) + group("AHJ — Permit(s)", permits);
+  wrap.innerHTML = group(utilityGroupTitle(utility), utility) + group("AHJ — Permit(s)", permits) + closeoutGroupHtml();
+  bindCloseoutMilestones(wrap);
 
   wrap.querySelectorAll("button[data-track-submit]").forEach((btn) => {
     btn.addEventListener("click", () => markSubmittalTrack(btn.dataset.trackSubmit));
@@ -5980,6 +5983,71 @@ async function approveAndSubmit() {
   } finally {
     // Re-enable only what the server allows now, never blindly.
     await refreshAutopilot();
+  }
+}
+
+// ----- Closeout milestones (#497): installed, final passed, PTO requested, PTO granted -----
+// No portal reading produces these yet (the finals / PTO automation is #495 / #496), so a person
+// records them here. They fill the client's timeline on the status page and tracker; the three
+// marked "emails the client" send the client update once, the first time they are recorded.
+async function loadProjectMilestones() {
+  if (!state.selectedProjectId) { state.projectMilestones = null; return; }
+  try {
+    const res = await api(`/api/projects/${state.selectedProjectId}/milestones`);
+    state.projectMilestones = res.milestones || [];
+  } catch {
+    state.projectMilestones = null;
+  }
+}
+
+function closeoutGroupHtml() {
+  const milestones = state.projectMilestones;
+  if (!milestones || !milestones.length) return "";
+  const today = new Date().toISOString().slice(0, 10);
+  const rows = milestones.map((m) => {
+    const key = esc(m.key);
+    const recorded = m.at
+      ? `<span>${statusBadge("done")} ${esc(new Date(m.at).toLocaleDateString())}${m.recordedBy ? ` <span class="muted">by ${esc(m.recordedBy)}</span>` : ""}</span>
+         <button class="ghost" type="button" data-milestone-clear="${key}">Clear</button>`
+      : `<input type="date" max="${esc(today)}" value="${esc(today)}" data-milestone-date="${key}" aria-label="${esc(m.label)} date" />
+         <button class="secondary" type="button" data-milestone-record="${key}">Record</button>`;
+    return `
+      <article class="item">
+        <div class="item-title"><span>${esc(m.label)}</span>${m.clientFacing ? `<span class="muted">emails the client</span>` : ""}</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:12px">${recorded}</div>
+      </article>`;
+  }).join("");
+  return `<div class="track-group"><div class="track-group-head">Closeout — install, final, PTO</div>${rows}</div>`;
+}
+
+function bindCloseoutMilestones(wrap) {
+  wrap.querySelectorAll("button[data-milestone-record]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.milestoneRecord;
+      const input = Array.from(wrap.querySelectorAll("input[data-milestone-date]")).find((el) => el.dataset.milestoneDate === key);
+      saveProjectMilestone(key, String(input?.value || "").trim(), btn, "POST");
+    });
+  });
+  wrap.querySelectorAll("button[data-milestone-clear]").forEach((btn) => {
+    btn.addEventListener("click", () => saveProjectMilestone(btn.dataset.milestoneClear, "", btn, "DELETE"));
+  });
+}
+
+async function saveProjectMilestone(key, at, btn, method) {
+  if (!state.selectedProjectId || !key) return;
+  if (btn) btn.disabled = true;
+  try {
+    const base = `/api/projects/${state.selectedProjectId}/milestones`;
+    const res = method === "DELETE"
+      ? await api(`${base}/${encodeURIComponent(key)}`, { method: "DELETE" })
+      : await api(base, { method: "POST", body: JSON.stringify({ milestone: key, at }) });
+    state.projectMilestones = res.milestones || state.projectMilestones;
+    renderSubmittalTracks();
+    const label = (state.projectMilestones || []).find((m) => m.key === key)?.label || humanize(key);
+    showMessage(method === "DELETE" ? `${label} cleared.` : `${label} recorded.`, "info");
+  } catch (err) {
+    if (btn) btn.disabled = false;
+    showMessage(err.message || "Could not save the milestone.", "error");
   }
 }
 

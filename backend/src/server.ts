@@ -87,6 +87,7 @@ import {
   updateCustomer,
 } from "./crm";
 import { clientPortalPayload, clientPortalUrl, ensureClientPortalToken, publicProjectStatusPayload, trackLabel } from "./clientPortal";
+import { buildClientTimeline, clearProjectMilestone, projectMilestones, recordProjectMilestone } from "./clientTimeline";
 import { scanStaleStatusClassifications } from "./permitMonitor";
 import { getKpiReport, requestNoticedAt } from "./kpi";
 import {
@@ -1636,6 +1637,29 @@ app.post("/api/projects/:id/ops-steps/:stepId", (req, res) => {
 
 app.post("/api/projects/:id/notes", (req, res) => {
   res.status(201).json(addProjectNote(db, req.params.id, req.body || {}));
+});
+
+// THE CLOSEOUT MILESTONES (#497): installed, final passed, PTO requested, PTO granted — recorded by
+// a person on the project page, read back with the client's timeline as the client sees it. Under
+// /api/projects/:id, so each inherits the project scope guard (rule 6: out-of-scope 404) and the
+// entitlement gate; no new top-level path. Recording a client-facing one sends the client update
+// once (clientTimeline.recordProjectMilestone); the route does not wait on the email.
+app.get("/api/projects/:id/milestones", (req, res) => {
+  const detail = getProjectDetail(db, String(req.params.id));
+  res.json({ milestones: projectMilestones(db, detail.project.id), timeline: buildClientTimeline(db, detail.project) });
+});
+
+app.post("/api/projects/:id/milestones", (req, res) => {
+  const { milestones } = recordProjectMilestone(db, String(req.params.id), {
+    milestone: String(req.body?.milestone ?? ""),
+    at: req.body?.at,
+    recordedBy: currentUser(db, req)?.email || "operator",
+  });
+  res.status(201).json({ milestones });
+});
+
+app.delete("/api/projects/:id/milestones/:milestone", (req, res) => {
+  res.json({ milestones: clearProjectMilestone(db, String(req.params.id), String(req.params.milestone), currentUser(db, req)?.email || "operator") });
 });
 
 app.post("/api/projects/:id/workflow", (req, res) => {
