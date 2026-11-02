@@ -75,6 +75,7 @@ import { findCompleteRecipeForProject, findAnyRecipeForProject, resolveRecipeFie
 import { notServedInResult } from "../../shared/src/portalNotServed";
 import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier";
 import { notifyClientOfFiling } from "./clientFilingUpdate";
+import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStatusChange } from "./staffAlerts";
 import { installerHandoffNoteBody, sendInstallerHandoff } from "./installerHandoff";
 // detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget; the
 // card's Edit (updatePermitCheckTarget) re-detects with the same function when the URL changes.
@@ -100,6 +101,7 @@ import { clientLicenceRow, clientStagingOverlay, contractorLicenceForState, getC
 import { planSetLicenceWarning } from "./clientMatch";
 import { assertSubmissionPaid } from "./submissionFees";
 import { readAndRecordPortalFees } from "./portalFeeReadings";
+import { closeoutDocumentLines, fetchIssuedRecordDocuments, isFinishedOutcome, issuedDocumentsByTarget } from "./portalIssuedDocuments";
 import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential } from "./portalCredentials";
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
 import { logger } from "./logger";
@@ -525,9 +527,25 @@ function mapPermitTarget(row: Row): PermitCheckTarget {
     portalPlatform: text(row.portal_platform),
     trackingUrl: row.tracking_url ? text(row.tracking_url) : undefined,
     readGap: text(row.read_gap) || undefined,
+    // Only while the filing is finished: a gap from an earlier issued reading that a later
+    // correction undid is not this filing's news any more.
+    issuedDocsGap: isFinishedOutcome(trackKind(text(row.target_type), text(row.permit_type)), text(row.latest_outcome))
+      ? text(row.issued_docs_gap) || undefined
+      : undefined,
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
   };
+}
+
+/** Each target's downloaded issued permit / approval letter (#492), with provenance — one query
+ *  for the project, not one per target. */
+function withIssuedDocuments(db: AppDb, projectId: string, targets: PermitCheckTarget[]): PermitCheckTarget[] {
+  const byTarget = issuedDocumentsByTarget(db, projectId);
+  if (!byTarget.size) return targets;
+  return targets.map((t) => {
+    const docs = byTarget.get(t.id);
+    return docs?.length ? { ...t, issuedDocuments: docs, issuedDocsGap: undefined } : t;
+  });
 }
 
 function mapPermitStatusCheck(row: Row): PermitStatusCheck {
@@ -1364,9 +1382,9 @@ export function getProjectDetail(db: AppDb, projectId: string): ProjectDetail {
       .query<Row>("SELECT * FROM human_review_items WHERE project_id = ? ORDER BY status DESC, created_at DESC", [projectId])
       .map(mapReview),
     corrections,
-    permitCheckTargets: db
+    permitCheckTargets: withIssuedDocuments(db, projectId, db
       .query<Row>("SELECT * FROM permit_check_targets WHERE project_id = ? ORDER BY active DESC, created_at DESC", [projectId])
-      .map(mapPermitTarget),
+      .map(mapPermitTarget)),
     permitStatusChecks: db
       .query<Row>("SELECT c.*, t.target_type, t.permit_type FROM permit_status_checks c LEFT JOIN permit_check_targets t ON t.id = c.target_id WHERE c.project_id = ? ORDER BY c.created_at DESC LIMIT 50", [projectId])
       .map(mapPermitStatusCheck),
@@ -1448,6 +1466,7 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     db.run("DELETE FROM project_intake_requests WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM submission_payments WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM portal_fee_readings WHERE project_id = ?", [projectId]);
+    db.run("DELETE FROM portal_record_documents WHERE project_id = ?", [projectId]);
     // Keep permit_fee_history (learned real fees) but unlink the deleted project.
     db.run("UPDATE permit_fee_history SET project_id = NULL WHERE project_id = ?", [projectId]);
     // Communications may belong to a customer too — unlink rather than destroy correspondence.
@@ -2217,6 +2236,8 @@ export function getProjectHandoffPacket(db: AppDb, projectId: string): ProjectHa
   const noteLines = runbook.recentNotes
     .slice(0, 8)
     .map((note) => `${note.noteType.replaceAll("_", " ")} | ${note.createdBy || "Operations"}: ${note.body}`);
+  // The issued permit(s) and the approval letter the installer needs (#492).
+  const closeout = closeoutDocumentLines(db, projectId);
 
   const sections: ProjectHandoffPacketSection[] = [
     handoffSection({
@@ -2263,6 +2284,12 @@ export function getProjectHandoffPacket(db: AppDb, projectId: string): ProjectHa
       lines: timelineLines.length ? timelineLines : ["No timeline activity recorded yet."],
     }),
     handoffSection({
+      title: "Issued Permit & Approval Letter",
+      severity: closeout.complete ? "pass" : closeout.finished ? "warning" : "info",
+      source: "portal_record_documents",
+      lines: closeout.lines.length ? closeout.lines : ["No filing reads issued or approved yet."],
+    }),
+    handoffSection({
       title: "PM Notes",
       severity: runbook.recentNotes.some((note) => note.noteType === "blocker") ? "blocker" : runbook.recentNotes.length ? "info" : "pass",
       source: "project_notes",
@@ -2284,6 +2311,7 @@ export function getProjectHandoffPacket(db: AppDb, projectId: string): ProjectHa
     timelineEventCount: timeline.totalEvents,
     ownerRoles: [...owners].sort((a, b) => a.localeCompare(b)),
     sections,
+    closeoutDocumentsComplete: closeout.complete,
   };
   return {
     ...basePacket,
@@ -6847,6 +6875,22 @@ export async function recordPermitStatusCheck(
   // demoted row: a reading this function refused to write is refused here for the same reason,
   // by the same verdict, so the two doors cannot disagree. (Passing the persisted outcome instead
   // would make this gate dead code — it would only ever see needs_human_review.)
+  // STAFF ALERT (#487) — also after the commit, and on what was WRITTEN (`classification`): a
+  // refused reading reaches staff as the needs_human_review it was persisted as, which is exactly
+  // the item somebody has to go and confirm. A new correction is its own alert (the correction is
+  // the news); otherwise a change of the target's outcome is, gated on the same change pair the
+  // client update uses — and on recordCheck, so a re-read of a known state alerts nobody.
+  // (The cast: TypeScript does not see the assignment inside the transaction closure.)
+  const newCorrectionId = correctionId as string | null;
+  if (newCorrectionId) {
+    void alertStaffOnCorrection(db, { projectId, correctionId: newCorrectionId, track: track ?? "permit" });
+  } else if (recordCheck) {
+    void alertStaffOnStatusChange(db, {
+      projectId, targetId: text(target?.id), track: track ?? "permit",
+      outcome: classification.outcome, previousOutcome,
+    });
+  }
+
   if (shouldNotifyClient(read.outcome, previousOutcome, provenance)) {
     void notifyClientOfStatusChange(db, detail.project, {
       outcome: read.outcome,
@@ -7655,6 +7699,12 @@ export async function runDuePermitChecks(
       await readAndRecordPortalFees(db, detail.project, text(target.id)).catch((err) => {
         logger.warn("monitor", "portal fee read failed — status unaffected", { projectId, targetId: text(target.id), err: err instanceof Error ? err.message : String(err) });
       });
+      // THE ISSUED PERMIT / APPROVAL LETTER, off the same record once it reads issued / approved
+      // (portalIssuedDocuments.ts, #492) — read-only GETs on the record's own portal and track,
+      // after the status is recorded and unable to change it.
+      await fetchIssuedRecordDocuments(db, detail.project, text(target.id)).catch((err) => {
+        logger.warn("monitor", "issued-document fetch failed — status unaffected", { projectId, targetId: text(target.id), err: err instanceof Error ? err.message : String(err) });
+      });
     }
     touchProjectMetrics(db, projectId);
     projects.push(detail);
@@ -8001,6 +8051,7 @@ export function recoverInterruptedPortalRuns(
     addAuditLog(db, text(r.project_id), "system", "portal run recovery", "portal.run_interrupted", {
       runId: text(r.id), track: text(r.permit_type), trackingUrl: url || null, runner: text(r.runner),
     });
+    void alertStaffOnRunOutcome(db, { projectId: text(r.project_id), runId: text(r.id), track: text(r.permit_type), runStatus: "interrupted", reason: "" });
     recovered.push({ runId: text(r.id), projectId: text(r.project_id), permitType: text(r.permit_type), trackingUrl: url });
   }
   return recovered;
@@ -10325,6 +10376,15 @@ export async function prepareSubmission(
     if (acceptedFiling) {
       void notifyClientOfFiling(db, detail.project, { track: permitTypeTag, permitNumber: capturedPermitNumber, via: "auto_submit" });
     }
+
+    // STAFF ALERT (#487) — after the run's row committed, fire-and-forget, never into this path.
+    // Only the endings that need a person alert (paused, failed, submitted-unconfirmed); the
+    // reason is the run's own one line — the same text the row's error_message just took — and
+    // staffAlerts scrubs it before it leaves.
+    void alertStaffOnRunOutcome(db, {
+      projectId, runId, track: permitTypeTag, runStatus,
+      reason: failureMessage || (pauseReason ? pausedRunSentence(pauseReason, result) : ""),
+    });
 
     // #333: a filing the person made from the review window while this run was finishing — recorded
     // now, on top of the outcome (an awaiting_human_submit row, or the run's own failed row), never

@@ -1181,8 +1181,27 @@ export interface PermitCheckTarget {
   /** WHY THE MONITOR COULD NOT READ THIS FILING on its last check (#413), one actionable line ("No
    *  portal recipe learned for … yet", "Login wall: …"); absent once a status is read. */
   readGap?: string;
+  /** THE ISSUED PERMIT / APPROVAL LETTER the monitor downloaded off this filing's record once it
+   *  read issued / approved (#492), each with its provenance; absent when none is on file. */
+  issuedDocuments?: IssuedRecordDocument[];
+  /** WHY no issued permit / approval letter was attached for this finished filing (#492), one
+   *  actionable line; absent once one is on file. */
+  issuedDocsGap?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** A closeout document the permit monitor downloaded off a filed record (#492). */
+export interface IssuedRecordDocument {
+  documentId: string;
+  /** "issued_permit" (permit track) | "utility_approval" (NEM track). */
+  docType: string;
+  filename: string;
+  recordNumber: string;
+  sourceUrl: string;
+  fetchedAt: string;
+  /** "downloaded from record <number> on <date>". */
+  provenance: string;
 }
 
 // A project's required submittal tracks (utility NEM + building/electrical permits),
@@ -1213,6 +1232,50 @@ export interface RecipeStageGap {
   where: "project" | "client" | "documents" | "portal_questions";
   /** A secret field (account, meter…): named by its fixed label only. */
   secret: boolean;
+}
+
+/** #486: where one value on the approval sheet came from. "bill" = the customer's utility bill
+ *  (its parsed reading, or the bill-image read); "plan_set" = the plan set as saved on the project;
+ *  "person" = a person verified or set it (review queue, operator-set issuer); "client" = the
+ *  submitting company's own record; "project" = the project record, with no finer provenance
+ *  stored; "derived" = computed by the replay from other values (e.g. energy source). */
+export type ApprovalSheetSource = "bill" | "plan_set" | "person" | "client" | "project" | "derived";
+
+/** #486: one line of the Approve & auto-submit sheet. `value` is the replay's own value for THIS
+ *  filing; an account or meter number is masked to its last 4 (rule 2) and never sent whole. */
+export interface ApprovalSheetRow {
+  key: string;
+  label: string;
+  /** "" = nothing on file. */
+  value: string;
+  source: ApprovalSheetSource;
+  /** The source in words, e.g. "Utility bill (account holder)". */
+  sourceLabel: string;
+  masked?: boolean;
+  /** The cross-check against another source, when one could be made. */
+  check?: "match" | "mismatch" | "missing";
+  /** What the cross-check found, in words (masked like the value). */
+  checkNote?: string;
+}
+
+/** #486: something the approver should see before approving. Mismatches and missing values are
+ *  shown first, in red; notes are worth a look but are not disagreements. */
+export interface ApprovalSheetIssue {
+  kind: "mismatch" | "missing" | "note";
+  rowKey: string;
+  text: string;
+}
+
+/** #486: GET /api/projects/:id/approval-sheet — what Approve & auto-submit is about to file. A read:
+ *  it writes nothing, decides nothing, and the gate (mayClickFinalSubmit / automaticSubmitRefusals)
+ *  stays the only authority on whether the run may click submit. */
+export interface ApprovalSheet {
+  projectId: string;
+  track: SubmittalTrackType;
+  category: "utility" | "permit";
+  rows: ApprovalSheetRow[];
+  /** Mismatches first, then missing values, then notes. */
+  issues: ApprovalSheetIssue[];
 }
 
 export interface SubmittalTrack {
@@ -2731,6 +2794,9 @@ export interface ProjectHandoffPacket {
   timelineEventCount: number;
   ownerRoles: string[];
   sections: ProjectHandoffPacketSection[];
+  /** Every finished filing (permit issued / NEM approved) has its issued permit or approval
+   *  letter on file, downloaded or attached (#492). False while any is missing or none finished. */
+  closeoutDocumentsComplete: boolean;
   reportText: string;
 }
 

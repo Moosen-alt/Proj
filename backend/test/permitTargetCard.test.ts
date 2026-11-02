@@ -62,7 +62,7 @@ const bundle = [
   cut("function", "esc"), cut("function", "humanize"), cut("function", "statusBadge"),
   cut("function", "permitTargetKindLabel"), cut("function", "portalSaysFor"), cut("function", "permitStatusTargetId"),
   cut("const", "PERMIT_STATUS_PICKS"), cut("function", "permitTargetStatusText"), cut("function", "permitTargetEditPatch"),
-  cut("function", "permitTargetCardHtml"), cut("function", "handlePermitTargetClick"),
+  cut("function", "issuedDocumentsHtml"), cut("function", "permitTargetCardHtml"), cut("function", "handlePermitTargetClick"),
   cut("async function", "savePermitTargetEdit"), cut("async function", "recordPermitStatus"),
 ].join("\n\n");
 type Target = Record<string, unknown>;
