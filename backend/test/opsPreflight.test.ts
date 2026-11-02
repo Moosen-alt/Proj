@@ -204,9 +204,18 @@ check("MUST-EXCLUDE: STAFF_ALERT_TO with no SMTP cannot email anyone, so it is n
   assert.match(line(out, "staff alerts"), /WARN .*STAFF_ALERT_TO is set but SMTP is not/);
 });
 out = notify(withAdmin, { STAFF_ALERT_WEBHOOK_URL: "https://ntfy.invalid/staff-topic" });
-check("a staff webhook alone is a PASS (no SMTP needed)", () => {
-  assert.match(line(out, "staff alerts"), /PASS .*webhook set/);
+check("a staff webhook alone is a PASS (no SMTP needed); no STAFF_DIGEST_HOUR means no digest, and it says so", () => {
+  assert.match(line(out, "staff alerts"), /PASS .*webhook set; no morning digest \(STAFF_DIGEST_HOUR unset\)/);
   assert.ok(!out.includes("staff-topic"), "the webhook URL (a secret topic) is printed");
+});
+out = notify(withAdmin, { STAFF_ALERT_WEBHOOK_URL: "org-acme=https://ntfy.invalid/acme-topic", STAFF_DIGEST_HOUR: "7" });
+check("the verdict is the server's (staffAlertConfig.ts): another org's webhook is not the default org's channel", () => {
+  assert.match(line(out, "staff alerts"), /WARN .*no recipients/);
+  assert.ok(!out.includes("acme-topic"), "the webhook URL (a secret topic) is printed");
+});
+out = notify(withAdmin, { STAFF_ALERT_WEBHOOK_URL: "https://ntfy.invalid/staff-topic", STAFF_DIGEST_HOUR: "7am" });
+check("an unreadable STAFF_DIGEST_HOUR is no digest, said plainly (the server sends none)", () => {
+  assert.match(line(out, "staff alerts"), /PASS .*webhook set; no morning digest \(STAFF_DIGEST_HOUR=7am is not an hour 0-23\)/);
 });
 out = notify(withAdmin, { SMTP_HOST: "smtp.invalid" });
 check("SMTP_HOST without SMTP_FROM names only SMTP_FROM (clientNotifier needs both)", () => {

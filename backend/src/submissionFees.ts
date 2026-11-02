@@ -657,6 +657,33 @@ export function feeLineConfirmable(source: PermitFeeSource, confidence: FeeConfi
 
 /** Build (and persist, unless already paid/waived) the payment quote for a track. */
 export function buildPaymentQuote(db: AppDb, project: ProjectRecord, trackInput?: string | null): SubmissionPaymentQuote {
+  return computePaymentQuote(db, project, trackInput, true).quote;
+}
+
+/** What the RESEARCHED ladder says for this track (learned history, the published schedule, the
+ *  estimate, the printed form), without the portal's own figure on top and without writing
+ *  anything. This is the number a client is quoted before the filing, which is what the fee
+ *  accuracy report (#494) snapshots at filing time and later holds up against what was paid. */
+export interface ResearchedPermitQuote {
+  track: "permit" | "nem";
+  usd: number | null;
+  source: PermitFeeSource;
+  confidence: FeeConfidence;
+  basis: string;
+  /** The agency the fee is owed to (permit: the issuer's AHJ; nem: the utility). */
+  jurisdiction: string;
+}
+
+export function researchedPermitQuote(db: AppDb, project: ProjectRecord, trackInput?: string | null): ResearchedPermitQuote {
+  return computePaymentQuote(db, project, trackInput, false).researched;
+}
+
+function computePaymentQuote(
+  db: AppDb,
+  project: ProjectRecord,
+  trackInput: string | null | undefined,
+  persist: boolean,
+): { quote: SubmissionPaymentQuote; researched: ResearchedPermitQuote } {
   const track = billingTrack(trackInput);
   const billing = clientBilling(db, project.clientId);
   const existing = getSubmissionPayment(db, project.id, track);
@@ -799,7 +826,14 @@ export function buildPaymentQuote(db: AppDb, project: ProjectRecord, trackInput?
   }
 
   // ── THE PORTAL'S OWN FIGURE, ON TOP OF THE LADDER ─────────────────────────────────────────
-  const researched = { usd: permitFeeUsd, source: permitFeeSource, confidence: permitFeeConfidence };
+  const researched: ResearchedPermitQuote = {
+    track,
+    usd: permitFeeUsd,
+    source: permitFeeSource,
+    confidence: permitFeeConfidence,
+    basis: permitFeeBasis,
+    jurisdiction: text(track === "nem" ? project.utility : feeProject.ahj),
+  };
   const portalFeeRecords = portalFeeSummary(db, project.id, track);
   let permitFeeComparison: FeeComparison | null = null;
   // A READ LEADS THE LINE ONLY WHEN IT IS THE WHOLE TRACK, AND NOT A PARTIAL LIFECYCLE THAT
@@ -880,8 +914,8 @@ export function buildPaymentQuote(db: AppDb, project: ProjectRecord, trackInput?
   const ts = nowIso();
 
   // Persist/refresh the quote row so the dashboard and the gate share one record.
-  // A paid/waived row is never rewritten by a re-quote.
-  if (!existing) {
+  // A paid/waived row is never rewritten by a re-quote. researchedPermitQuote reads only.
+  if (persist && !existing) {
     db.run(
       `INSERT INTO submission_payments
          (id, project_id, track, status, permit_fee_estimate_usd, permit_fee_actual_usd, service_fee_usd, total_usd, fee_basis, quoted_at, updated_at)
@@ -891,7 +925,7 @@ export function buildPaymentQuote(db: AppDb, project: ProjectRecord, trackInput?
       // never written from a machine read).
       [id(), project.id, track, permitFeeSource === "actual" ? null : permitFeeSource === "portal_record" ? researched.usd : permitFeeUsd, serviceFeeUsd, totalUsd ?? 0, permitFeeBasis, ts, ts],
     );
-  } else if (existing.status === "quoted") {
+  } else if (persist && existing?.status === "quoted") {
     db.run(
       `UPDATE submission_payments
          SET permit_fee_estimate_usd = ?, service_fee_usd = ?, total_usd = ?, fee_basis = ?, updated_at = ?
@@ -900,7 +934,7 @@ export function buildPaymentQuote(db: AppDb, project: ProjectRecord, trackInput?
     );
   }
 
-  return {
+  const quote: SubmissionPaymentQuote = {
     track,
     required: billing.billingMode === "per_submission",
     billingMode: billing.billingMode,
@@ -945,6 +979,7 @@ export function buildPaymentQuote(db: AppDb, project: ProjectRecord, trackInput?
     // no sign that the real bill has seven charges on it and which one is missing.
     permitFeeCharges: schedule?.charges ?? [],
   };
+  return { quote, researched };
 }
 
 /** Record the REAL portal-calculated fee (true-up) and feed the fee history so

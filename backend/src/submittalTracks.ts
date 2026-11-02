@@ -38,6 +38,7 @@ import { nowIso } from "./time";
 import { hasMpuScope } from "./serviceScope";
 import { essPermitStep, type EssPermitStep } from "./essRequirements";
 import { randomUUID } from "node:crypto";
+import { snapshotFilingQuote } from "./feeAccuracy";
 import { nemSignatureState, type NemSignatureView } from "./signatureTrack";
 import { notifyClientOfFiling } from "./clientFilingUpdate";
 
@@ -1005,6 +1006,7 @@ export function markTrackSubmitted(
   // rollback of a half-written submission.
   refuseUtilityUrlOnPermitTarget(targetTypeFor(type), trackingUrl);
 
+  let submissionId = "";
   db.transaction(() => {
     // If a staged run left an awaiting_human_submit submission for this track, the
     // operator's manual submit RESOLVES it — update that row in place rather than
@@ -1016,6 +1018,7 @@ export function markTrackSubmitted(
       [project.id, type],
     );
     if (awaiting) {
+      submissionId = s(awaiting.id);
       db.run(
         `UPDATE submissions
            SET status = 'submitted', application_number = ?, permit_number = ?,
@@ -1039,7 +1042,7 @@ export function markTrackSubmitted(
            screenshots_path, notes, created_at)
          VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, '', ?, ?)`,
         [
-          randomUUID(),
+          (submissionId = randomUUID()),
           project.id,
           null,
           type === "nem" ? "interconnection" : "permit",
@@ -1106,6 +1109,10 @@ export function markTrackSubmitted(
   // The operator recorded a filing they made — the client hears we filed (#490). Once per track:
   // a track already announced by its capture or auto-submit sends nothing more.
   void notifyClientOfFiling(db, project, { track: type, applicationNumber, permitNumber, via: "mark_submitted" });
+
+  // THE QUOTE IN FORCE AS IT WAS FILED (#494), kept once per billing track for the fee accuracy
+  // report. After the transaction and never throwing: the filing is the fact that matters.
+  snapshotFilingQuote(db, project, type, submissionId);
 }
 
 // ---------------------------------------------------------------------------

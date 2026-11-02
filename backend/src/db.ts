@@ -1077,6 +1077,33 @@ function migrate(db: AppDb): void {
       ON portal_fee_readings(project_id, target_id, source_kind);
   `);
 
+  // THE ISSUED PERMIT AND THE UTILITY'S APPROVAL LETTER, DOWNLOADED OFF THE FILED RECORD by the
+  // permit monitor once the record reads issued / approved (portalIssuedDocuments.ts, #492). One
+  // row per document attached: which record it came from, the URL, when, and the file's sha256 —
+  // the hash is what makes a re-read attach nothing new. The file itself is a project_documents
+  // row (document_id). Per-target "why nothing was attached" lives on permit_check_targets
+  // (issued_docs_gap), beside read_gap. The legacy idempotent idiom on purpose (see above).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS portal_record_documents (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      target_id TEXT NOT NULL DEFAULT '',
+      track TEXT NOT NULL DEFAULT 'permit',
+      doc_type TEXT NOT NULL DEFAULT '',
+      document_id TEXT NOT NULL DEFAULT '',
+      record_number TEXT NOT NULL DEFAULT '',
+      source_url TEXT NOT NULL DEFAULT '',
+      link_text TEXT NOT NULL DEFAULT '',
+      sha256 TEXT NOT NULL DEFAULT '',
+      fetched_at TEXT NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_portal_record_documents_hash
+      ON portal_record_documents(project_id, sha256);
+  `);
+  addColumnIfMissing(db, "permit_check_targets", "issued_docs_gap", "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, "permit_check_targets", "issued_docs_checked_at", "TEXT");
+
   runVersionedMigrations(db);
   healStructuralLetterColumns(db);
 
@@ -2833,6 +2860,91 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       // Per-client opt-out: '' = the server emails the links (the default the owner asked for);
       // 'off' = staff send them by hand, as before. clients is CREATEd in the base schema.
       addColumnIfMissing(db, "clients", "request_links_auto_send", "TEXT NOT NULL DEFAULT ''");
+    },
+  },
+  {
+    version: 55,
+    name: "staff_notifications",
+    up: (db) => {
+      // STAFF ALERTS + MORNING DIGEST (#487). One row per alert or digest the team was (or was
+      // not) sent, so "what did we fail to send" is a query — the lesson of the client backlog that
+      // sat in communications for twelve days. NOT the communications table: that one is the
+      // CLIENT's timeline, and scripts/undelivered.ts re-resolves every stranded row's recipient to
+      // the project's CLIENT — a staff alert left there would be re-sent to the customer.
+      //
+      // org_id is the row's OWN column, stamped at write from the project row (alerts) or the org
+      // being digested — the historical_failure_examples precedent (CLAUDE.md, tenancy): a digest
+      // has no project to reach an org through. (kind, ref, state) is the dedupe key: the newest
+      // row for (org, kind, ref) carrying the same state means this transition was already handled.
+      // recipient lists email addresses and the word "webhook" — never the webhook URL itself.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS staff_notifications (
+          id TEXT PRIMARY KEY,
+          org_id TEXT NOT NULL,
+          project_id TEXT,
+          kind TEXT NOT NULL,
+          ref TEXT NOT NULL,
+          state TEXT NOT NULL DEFAULT '',
+          subject TEXT NOT NULL DEFAULT '',
+          body TEXT NOT NULL DEFAULT '',
+          recipient TEXT NOT NULL DEFAULT '',
+          delivery_status TEXT NOT NULL DEFAULT 'pending',
+          delivery_detail TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          sent_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_staff_notifications_ref ON staff_notifications(org_id, kind, ref, created_at);
+        CREATE INDEX IF NOT EXISTS idx_staff_notifications_delivery ON staff_notifications(delivery_status, created_at);
+      `);
+    },
+  },
+  {
+    version: 56,
+    name: "fee_quote_snapshots",
+    up: (db) => {
+      // WHAT THE CLIENT WAS TOLD, KEPT (#494). The fee accuracy report holds the quote up against
+      // what the jurisdiction actually billed, and the quote it needs is the one in force WHEN
+      // THE TRACK WAS FILED. Recomputing it later is not that number: the learned tier feeds on
+      // every real fee recorded since, so a quote rebuilt after the fact already contains part of
+      // the answer it is being graded against (Portland's own receipts would pull its median up
+      // and the low quote would vanish from the report that exists to find it).
+      //
+      // One row per project and BILLING track (permit | nem), written ONCE by the filing doors
+      // (markTrackSubmitted, captureConfirmation) through feeAccuracy.snapshotFilingQuote and
+      // never updated: a second building filing or a re-capture keeps the first snapshot. The
+      // amount is the RESEARCHED ladder's (learned history, published schedule, estimate,
+      // printed form), never the portal's own figure, which is the thing it is compared with.
+      // A child of projects: it reaches an org through its project and carries no org_id.
+      // A report reads it; nothing here writes a schedule or a "verified" (rule 3).
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS fee_quote_snapshots (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          track TEXT NOT NULL,
+          submission_id TEXT NOT NULL DEFAULT '',
+          state TEXT NOT NULL DEFAULT '',
+          jurisdiction TEXT NOT NULL DEFAULT '',
+          quoted_usd REAL,
+          source TEXT NOT NULL DEFAULT 'unknown',
+          confidence TEXT NOT NULL DEFAULT 'unknown',
+          basis TEXT NOT NULL DEFAULT '',
+          snapshotted_at TEXT NOT NULL,
+          FOREIGN KEY (project_id) REFERENCES projects(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_quote_snapshots_project_track
+          ON fee_quote_snapshots(project_id, track);
+      `);
+    },
+  },
+  {
+    version: 57,
+    name: "clients_handoff_auto_send",
+    up: (db) => {
+      // THE INSTALLER HANDOFF PACKET, EMAILED BY THE SERVER (#491). Per-client opt-out: '' = the
+      // server emails the packet when the job reaches handoff_ready (the default the owner asked
+      // for); 'off' = staff send it by hand from the project page. No table: the packet's record
+      // is its communications row (installerHandoff.ts). clients is CREATEd in the base schema.
+      addColumnIfMissing(db, "clients", "handoff_auto_send", "TEXT NOT NULL DEFAULT ''");
     },
   },
   {

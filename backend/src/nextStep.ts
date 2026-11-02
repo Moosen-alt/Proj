@@ -72,6 +72,7 @@ import { findingHoldScope, gateCheckDefaultScope, scopeHoldsTrack, tracksHeld } 
 import { issuingAuthorityForTrack } from "./applicationDocsAgency";
 import { parseJobProgressNote } from "./jobProgress";
 import { clientAsksForProject } from "./clientAsks";
+import { installerHandoffRecords, type InstallerHandoffRecord } from "./installerHandoff";
 import { SIGNATURE_REQUEST_CONFIRMED_ACTION, reduceNemSignatureState } from "./signatureTrack";
 import { visionRelaxedBlockers } from "./reviewerVision";
 import { startedAtLabel } from "./formAcquisitionPlan";
@@ -277,6 +278,9 @@ export interface NextStepFacts {
   /** Detail tier only: the intake / login links the server emailed the client that are still open
    *  (clientAsks.ts, #488) — carried onto the answer whatever its key. */
   clientAsks?: ClientAskSent[];
+  /** handoff_ready only: the installer handoff email on record for the CURRENT handoff
+   *  (installerHandoff.installerHandoffRecords, #491), or null when none was sent or drafted. */
+  installerHandoff?: InstallerHandoffRecord | null;
 }
 
 const ON_PORTAL = new Set(["awaiting_human_submit", "submitted", "paused_for_human"]);
@@ -408,6 +412,9 @@ export function loadNextStepFacts(db: AppDb, projects: ProjectRecord[]): Map<str
     ),
     (r) => s(r.project_id),
   );
+  // The installer handoff email (#491), read only for handed-off projects.
+  const handedOffIds = projects.filter((p) => p.status === "handoff_ready").map((p) => p.id);
+  const handoffs = installerHandoffRecords(db, handedOffIds);
   const feeDueKinds = groupBy(
     db.query<Row>(`SELECT project_id, target_type, permit_type FROM permit_check_targets WHERE project_id IN (${ph}) AND active = 1 AND latest_outcome = 'ready_for_issue'`, ids),
     (r) => s(r.project_id),
@@ -478,6 +485,7 @@ export function loadNextStepFacts(db: AppDb, projects: ProjectRecord[]): Map<str
       qcReview: pending.filter(isCriticalReviewItem).map((r) => ({ issueType: r.issueType, fieldName: r.fieldName })),
       portalReadings: pending.filter((r) => r.fieldName === "permit_status").length,
       approvedRunIds: (approvals.get(pid) ?? []).map((r) => s(parseJson<Row>(s(r.details), {}).portalRunId)).filter(Boolean),
+      ...(status === "handoff_ready" ? { installerHandoff: handoffs.get(pid) ?? null } : {}),
     });
   }
 
@@ -539,6 +547,7 @@ export const NEXT_STEP_BUTTON_IDS = [
   "startAutopilotBtn",
   "addPermitTargetBtn",
   "copyHandoffPacketBtn",
+  "sendHandoffPacketBtn",
 ] as const;
 /** Every fixTarget id the rule table can emit — same test. */
 export const NEXT_STEP_FIX_TARGETS = [
@@ -945,9 +954,32 @@ export function decideNextStep(facts: NextStepFacts): NextStep {
 
   // 18. Closeout.
   if (facts.status === "handoff_ready") {
-    return make("handoff_ready", "me", "done",
+    // THE PACKET IS EMAILED BY THE SERVER ON THE TRANSITION (#491). Sent: nobody owes anything,
+    // and the step says when and to whom. Drafted, failed, or not sent (the client sends by hand,
+    // or no inbox): a person sends it — the button re-sends through the same door.
+    const sent = facts.installerHandoff;
+    if (sent && sent.deliveryStatus === "sent") {
+      return make("handoff_ready", "nobody", "done",
+        `Handed off ${sent.at.slice(0, 10)} — the installer handoff packet went to ${sent.recipient}.`,
+        [why("Permit issued and interconnection approved. Final inspection, then the utility's permission to operate, are the installer's.")],
+        btn("sendHandoffPacketBtn", "Send handoff packet again"), sent.at);
+    }
+    // A send in flight — unless it is old enough that the process doing it must have died.
+    const sending = sent?.deliveryStatus === "pending";
+    if (sending && Date.now() - Date.parse(sent.at) < AUTO_CHAIN_FRESH_MS) {
+      return make("handoff_ready", "nobody", "done",
+        `Sending the installer handoff packet to ${sent.recipient}.`, [], null, sent.at);
+    }
+    const whyNot = sending
+      ? why(`Sending the packet to ${sent!.recipient} never finished — send it again.`)
+      : sent?.deliveryStatus === "draft"
+      ? why(`The packet to ${sent.recipient} is drafted but was not sent: mail is not set up on this server.`)
+      : sent?.deliveryStatus === "failed"
+        ? why(`Sending the packet to ${sent.recipient} failed: ${sent.detail || "the mail server refused it"}.`)
+        : null;
+    return make("handoff_ready", "me", "today",
       "Permit issued and interconnection approved — send the installer the handoff packet.",
-      [], btn("copyHandoffPacketBtn", "Copy handoff packet"));
+      whyNot ? [whyNot] : [], btn("sendHandoffPacketBtn", "Send handoff packet"));
   }
   if (facts.tracks.length && facts.tracks.every((t) => t.done)) {
     return make("done", "nobody", "done", "Every required filing is issued / approved.", [], null);

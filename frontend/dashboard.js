@@ -3484,6 +3484,7 @@ const NEXT_STEP_BUTTON_LABELS = {
   startAutopilotBtn: "Stage portals · Autopilot",
   addPermitTargetBtn: "Add tracking target",
   copyHandoffPacketBtn: "Copy handoff packet",
+  sendHandoffPacketBtn: "Send handoff packet",
 };
 
 // Take the operator TO a control or panel: open every <details> it sits in (stage accordion,
@@ -5539,6 +5540,85 @@ const APPROVE_HELD_BY_STAGED_DRAFT = "This filing has a staged draft; finish it 
 // The name namedPersonConsent remembers: one person, one name per browser.
 const APPROVER_NAME_KEY = "feeConfirmName";
 
+// THE APPROVAL SHEET (#486). The approve prompt was a fixed paragraph that showed none of the values
+// about to be filed, so the legality check (NEM_OPERATOR_RUNBOOK §3) meant opening several panels and
+// a wrong-bill or wrong-size job could be approved unseen. The prompt is now one screen: the replay's
+// own values for THIS filing (GET /api/projects/:id/approval-sheet — the account and meter arrive
+// masked to the last 4, never whole), each with its source, and every disagreement with the bill or
+// the plan set listed first, in red. Approving is still the same single action: this resolves
+// true/false exactly where confirm() did, and the name prompt, the request and the server's gate
+// (mayClickFinalSubmit / automaticSubmitRefusals) are unchanged. If the sheet cannot be read (an older
+// server, a network error) the plain confirm is shown and says so: the sheet never blocks an approval.
+function approvalSheetHtml(sheet, recordedAs) {
+  const issues = Array.isArray(sheet.issues) ? sheet.issues : [];
+  const red = issues.filter((i) => i.kind === "mismatch" || i.kind === "missing");
+  const notes = issues.filter((i) => i.kind === "note");
+  const issueList = (list, color) => `<ul style="margin:4px 0 0 18px;padding:0;color:${color}">${list.map((i) => `<li>${esc(i.text)}</li>`).join("")}</ul>`;
+  const rows = (Array.isArray(sheet.rows) ? sheet.rows : []).map((r) => {
+    const bad = r.check === "mismatch" || r.check === "missing";
+    const value = r.value ? esc(r.value) : `<span style="color:var(--destructive)">Not on file</span>`;
+    const check = r.check === "match" ? `<div class="muted" style="font-size:12px;color:var(--ink-pass)">✓ ${esc(r.checkNote || "Matches")}</div>`
+      : r.check === "mismatch" ? `<div style="font-size:12px;color:var(--destructive)">✗ ${esc(r.checkNote || "Does not match")}</div>` : "";
+    return `<tr data-approval-row="${esc(r.key)}"${bad ? ` style="background:var(--tint-fail)"` : ""}>
+      <th scope="row" style="text-align:left;padding:6px 10px 6px 0;vertical-align:top;white-space:nowrap">${esc(r.label)}</th>
+      <td style="padding:6px 10px 6px 0;vertical-align:top">${r.value && r.masked ? `<span class="mono">${value}</span>` : value}${check}</td>
+      <td class="muted" style="padding:6px 0;vertical-align:top;font-size:12px">${esc(r.sourceLabel || "")}</td>
+    </tr>`;
+  }).join("");
+  return `${red.length
+      ? `<div data-approval-mismatches style="border:1px solid var(--edge-fail);background:var(--tint-fail);color:var(--ink-fail);border-radius:var(--radius-sm);padding:10px 12px"><strong>${red.length === 1 ? "1 thing disagrees or is missing" : `${red.length} things disagree or are missing`} — check before approving</strong>${issueList(red, "var(--ink-fail)")}</div>`
+      : `<div data-approval-clean style="border:1px solid var(--edge-pass);background:var(--tint-pass);color:var(--ink-pass);border-radius:var(--radius-sm);padding:10px 12px">No disagreement found between the project, the bill and the plan set.</div>`}
+    ${notes.length ? `<div data-approval-notes style="border:1px solid var(--edge-warn);background:var(--tint-warn);border-radius:var(--radius-sm);padding:10px 12px"><strong>Worth a look</strong>${issueList(notes, "inherit")}</div>` : ""}
+    <table style="width:100%;border-collapse:collapse"><thead><tr><th style="text-align:left" class="muted">Field</th><th style="text-align:left" class="muted">What will be filed</th><th style="text-align:left" class="muted">Source</th></tr></thead><tbody>${rows}</tbody></table>
+    <p class="muted" style="font-size:12px;white-space:pre-line">${esc(APPROVE_AUTO_SUBMIT_LEDE.replace(/^Approve & auto-submit this filing\?\n\n/, ""))}</p>
+    ${recordedAs ? `<p style="margin:0"><strong>Recorded as:</strong> ${esc(recordedAs)}</p>` : ""}`;
+}
+
+async function confirmApprovalSheet(type, recordedAs = "") {
+  let sheet = null;
+  try {
+    const res = await api(`/api/projects/${state.selectedProjectId}/approval-sheet?track=${encodeURIComponent(type)}`);
+    sheet = res && res.sheet && Array.isArray(res.sheet.rows) ? res.sheet : null;
+  } catch { sheet = null; }
+  if (!sheet) {
+    return confirm(`${APPROVE_AUTO_SUBMIT_LEDE}\n\n(The approval sheet could not be loaded: check the values on the project before approving.)${recordedAs ? `\n\nRecorded as: ${recordedAs}` : ""}`);
+  }
+  let modal = document.getElementById("approvalSheetModal");
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = "approvalSheetModal";
+    modal.className = "modal";
+    modal.hidden = true;
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-labelledby", "approvalSheetTitle");
+    document.body.appendChild(modal);
+  }
+  modal.innerHTML = `<div class="modal-card modal-card-wide">
+      <div class="modal-head"><h2 id="approvalSheetTitle" tabindex="-1">Approve &amp; auto-submit: ${esc(type === "nem" ? "the utility (NEM) application" : `the ${humanize(type).toLowerCase()} permit`)}</h2></div>
+      <div class="modal-body modal-body-stack">${approvalSheetHtml(sheet, recordedAs)}</div>
+      <div class="actions" style="display:flex;gap:8px;justify-content:flex-end;padding:12px 20px;border-top:1px solid var(--line)">
+        <button type="button" class="secondary" data-approval-cancel>Cancel</button>
+        <button type="button" class="primary" data-approval-approve>Approve &amp; auto-submit</button>
+      </div>
+    </div>`;
+  modal.hidden = false;
+  return new Promise((resolve) => {
+    const done = (answer) => {
+      modal.hidden = true;
+      document.removeEventListener("keydown", onKey, true);
+      resolve(answer);
+    };
+    const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); done(false); } };
+    document.addEventListener("keydown", onKey, true);
+    modal.querySelector("[data-approval-cancel]").addEventListener("click", () => done(false));
+    modal.querySelector("[data-approval-approve]").addEventListener("click", () => done(true));
+    modal.addEventListener("click", (e) => { if (e.target === modal) done(false); }, { once: true });
+    const title = modal.querySelector("#approvalSheetTitle");
+    if (title && title.focus) title.focus();
+  });
+}
+
 async function approveAndAutoSubmitTrack(type, btn) {
   if (!state.selectedProjectId || !type) return;
   // The card holds the button while a NEM draft is staged (#435); a click from a card drawn before
@@ -5547,10 +5627,10 @@ async function approveAndAutoSubmitTrack(type, btn) {
   if (track && track.type === "nem" && track.status === "staged") { showMessage(APPROVE_HELD_BY_STAGED_DRAFT, "warning"); return; }
   const auth = await authForDecision();
   if (auth && auth.enabled) {
-    if (!confirm(`${APPROVE_AUTO_SUBMIT_LEDE}\n\nRecorded as: ${(auth.user && (auth.user.name || auth.user.email)) || "you"}`)) return;
+    if (!(await confirmApprovalSheet(type, (auth.user && (auth.user.name || auth.user.email)) || "you"))) return;
     return stageSubmittalTrack(type, btn, true);
   }
-  if (!confirm(APPROVE_AUTO_SUBMIT_LEDE)) return;
+  if (!(await confirmApprovalSheet(type))) return;
   let last = "";
   try { last = localStorage.getItem(APPROVER_NAME_KEY) || ""; } catch { last = ""; }
   const typed = prompt("Your name, recorded as the approver of this run:", last);
@@ -6163,6 +6243,9 @@ function renderRunbook() {
 
 function renderHandoffPacket() {
   const packet = state.handoffPacket;
+  // #491: the Send button lives in the rail, and only a handed-off project offers it.
+  const handoffActions = $("handoffActions");
+  if (handoffActions) handoffActions.hidden = !(state.detail && state.detail.project && state.detail.project.status === "handoff_ready");
   if (!packet) {
     $("handoffPacketStatus").textContent = "not synced";
     $("handoffPacket").innerHTML = `<p class="muted">Open a project to generate the project handoff packet.</p>`;
@@ -7907,6 +7990,21 @@ function permitTargetEditPatch(target, values) {
 // backend/test/permitTargetCard.test.ts. Every control carries THIS card's target id; the inputs are
 // found inside the card (data-edit-field / data-record-field), never by page-wide id, because the
 // cards repeat. `ui` says which form, if any, is open on this card (state, so a re-render keeps it).
+// THE ISSUED PERMIT / APPROVAL LETTER the monitor downloaded off this filing's record (#492), each
+// linked with its provenance ("downloaded from record X on date"), or the one line saying why none
+// is on file. Pinned by backend/test/portalIssuedDocuments.test.ts.
+function issuedDocumentsHtml(target) {
+  const docs = Array.isArray(target.issuedDocuments) ? target.issuedDocuments : [];
+  const what = target.targetType === "nem" ? "Approval letter" : "Issued permit";
+  if (docs.length) {
+    return `<p data-issued-docs><strong>${esc(what)}:</strong> ${docs.map((d) => `<a href="/api/projects/${encodeURIComponent(target.projectId)}/documents/${encodeURIComponent(d.documentId)}">${esc(d.filename)}</a> <span class="muted">· ${esc(d.provenance)}</span>`).join("; ")}</p>`;
+  }
+  if (target.issuedDocsGap) {
+    return `<p data-issued-docs-gap style="border-left:3px solid var(--warn, #b7791f);padding-left:6px"><strong>${esc(what)} not on file:</strong> ${esc(target.issuedDocsGap)}</p>`;
+  }
+  return "";
+}
+
 function permitTargetCardHtml(target, checks, ui) {
   const id = esc(target.id);
   const platformLabel = target.portalPlatform && target.portalPlatform !== "unknown" && target.portalPlatform !== "public_url"
@@ -7948,6 +8046,7 @@ function permitTargetCardHtml(target, checks, ui) {
       ${target.portalUrl ? `<p class="muted" style="word-break:break-all">${esc(target.portalUrl)}</p>` : ""}
       ${target.trackingUrl && target.trackingUrl !== target.portalUrl ? `<p class="muted" style="word-break:break-all">Status link: ${esc(target.trackingUrl)}</p>` : ""}
       ${target.readGap && !stopped ? `<p data-read-gap style="border-left:3px solid var(--warn, #b7791f);padding-left:6px"><strong>Can't read on its own:</strong> ${esc(target.readGap)}</p>` : ""}
+      ${issuedDocumentsHtml(target)}
       <p class="muted">${stopped ? "Tracking stopped — the monitor no longer reads this filing." : `Checks every ${esc(target.checkFrequencyDays)} day(s) · Next: ${target.nextCheckAt ? esc(new Date(target.nextCheckAt).toLocaleString()) : "not scheduled"}`} · Source strategy: ${esc(target.portalPlatform || "auto")}</p>
       ${ui?.editing || ui?.recording ? "" : `<div style="margin-top:6px">
         <button type="button" class="secondary" style="font-size:12px" data-target-action="edit" data-target-id="${id}">Edit</button>
@@ -9776,6 +9875,25 @@ $("addOpsNoteBtn").addEventListener("click", addOpsNote);
 $("copyHandoffBtn").addEventListener("click", copyHandoff);
 $("copyRunbookBtn").addEventListener("click", copyRunbook);
 $("copyHandoffPacketBtn").addEventListener("click", copyHandoffPacket);
+// #491: email the installer handoff packet to the project's client now (first send or again).
+$("sendHandoffPacketBtn")?.addEventListener("click", async () => {
+  const p = state.detail?.project;
+  if (!p) { showMessage("Open a project first.", "warning"); return; }
+  const btnEl = $("sendHandoffPacketBtn");
+  btnEl.disabled = true;
+  try {
+    const res = await api(`/api/projects/${p.id}/handoff-packet/send`, { method: "POST", body: "{}" });
+    const docs = (res.attachments || []).length ? ` with ${res.attachments.join(", ")}` : "";
+    if (res.deliveryStatus === "sent") showMessage(`Handoff packet sent to ${res.recipient}${docs}.`);
+    else if (res.deliveryStatus === "draft") showMessage(`Handoff packet drafted for ${res.recipient}, not sent: mail is not set up on this server.`, "warning");
+    else showMessage(`Sending the handoff packet to ${res.recipient} failed: ${res.detail || "the mail server refused it"}.`, "error");
+    await selectProject(p.id);
+  } catch (err) {
+    showMessage(err.message || "Could not send the handoff packet.", "error");
+  } finally {
+    btnEl.disabled = false;
+  }
+});
 $("copyCommunicationDraftsBtn").addEventListener("click", copyCommunicationDrafts);
 // Tokenized read-only status page for the client — created on demand, then copied.
 // The same link is auto-included in automated client update emails.
@@ -9934,7 +10052,7 @@ async function handleBatchDrop(file) {
 // ----- Clients & contractor licensing -----
 const CLIENT_TEXT_FIELDS = [
   "companyName", "legalBusinessName", "dba", "contactName", "contactEmail", "phone", "billingStatus", "billingMode", "serviceFeeUsd",
-  "requestLinksAutoSend",
+  "requestLinksAutoSend", "handoffAutoSend",
   "ccbLicenseNumber", "ccbExpiration", "electricalLicenseNumber", "metroCityLicenseNumber",
   "electricalSupervisorName", "electricianLicenseNumber",
   "ein", "bondCarrier", "insuranceCarrier", "businessAddress", "businessCity", "businessState",
@@ -11435,6 +11553,21 @@ async function loadKpi() {
     renderKpi(kpi);
   } catch (err) {
     $("kpiBody").innerHTML = `<p class="muted">Failed to load KPIs: ${esc(err.message)}</p>`;
+    return;
+  }
+  loadFeeAccuracy();
+}
+
+// FEE ACCURACY (#494): quoted at filing vs paid, per jurisdiction. All filed jobs, not the date
+// range above (a jurisdiction's quotes are judged on every bill we have). Its own request, so a
+// failure here leaves the KPIs standing.
+async function loadFeeAccuracy() {
+  const slot = $("kpiFeeAccuracy");
+  if (!slot || !window.FeeAccuracy) return;
+  try {
+    slot.innerHTML = window.FeeAccuracy.renderFeeAccuracy(await api("/api/fee-accuracy"));
+  } catch (err) {
+    slot.innerHTML = `<p class="muted">Fee accuracy did not load: ${esc(err.message)}</p>`;
   }
 }
 
@@ -11559,6 +11692,8 @@ function renderKpi(kpi) {
     ${renderStagingQuality(kpi.stagingQuality)}
 
     ${window.KpiFilings ? window.KpiFilings.renderFilingKpis(kpi.filings) : ""}
+
+    <div id="kpiFeeAccuracy"></div>
 
     ${kpi.byUser.length > 0 ? `
     <h3 style="margin-top:24px">Per Operator</h3>
