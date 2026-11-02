@@ -556,7 +556,9 @@ export function trustedLearnWording(input: {
   bindingNote: string;
 }): { note: string; message: string; done: string } {
   const checked = `${input.fieldsChecked} field(s) checked on the final page (${input.fieldsMatched} matched) of ${input.recordedFills} recorded fill(s) across ${input.pageCount} page(s)`;
-  const swept = "each form page was checked as the walk left it — no required field left blank or unheld, no computed total left to recalculate, no field showing a validation error";
+  // What the checks FOUND, not a promise about the portal: secret boxes left blank for a person are
+  // excluded by design (they bind by name) and are listed in the run's own message.
+  const swept = "each form page was checked as the walk left it and none was found with a required field blank or unheld, a computed total left to recalculate, or a field showing a validation error";
   return {
     note: `Auto-learned and verified (${input.confidence} confidence) on ${input.pageCount} page(s).${input.bindingNote} ${swept.charAt(0).toUpperCase()}${swept.slice(1)}; the verifier compared values on the final page: ${checked}. ${FINAL_SUBMIT_GATE_SENTENCE}`,
     message: `Portal learned: ${swept}; the verifier compared values on the final page: ${checked} (verifier confidence: ${input.confidence}). The recipe is trusted and will replay on future ${input.scopeType === "utility" ? "utility" : "AHJ"} projects. ${FINAL_SUBMIT_GATE_SENTENCE}`,
