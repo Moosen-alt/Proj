@@ -54,6 +54,7 @@ export function designText(project: MountInputs, omit: readonly string[] = []): 
 // The mounting FIELD is authoritative when present; the text stays as the fallback for a parse
 // that did not capture it. Silence still means roof, which is the conservative direction: roof
 // rules are the stricter set, so an unknown mount is over-reviewed rather than under-reviewed.
+// THE TEXT FALLBACK WEIGHS, IT DOES NOT SPOT (#533): see mountKindFromText below.
 // CARPORT IS NOT GROUND, for one rule. A carport/canopy has no dwelling roof, so the fire
 // access pathway, roof framing and flashing rules do not apply to it — but NEC 690.12 rapid
 // shutdown governs PV "on buildings", and whether a carport counts is an AHJ call, not ours.
@@ -68,18 +69,60 @@ export function mountKind(project: MountInputs, allText: string): MountKind {
   // benchmark snapshots still carry (leak sweep 2026-09-28: the portal description read ONLY the
   // dead mountType key, so every job was "Roof-mounted"). Both answer here, mounting first.
   const mounting = str(project, "mounting") || str(project, "mountType");
-  const probe = mounting || `${project.interconnectionMethod}\n${allText}`;
-  if (/carport|canopy|awning|patio cover/i.test(probe)) return "carport";
+  if (!mounting) return mountKindFromText(`${project.interconnectionMethod}\n${allText}`);
+  if (/carport|canopy|awning|patio cover/i.test(mounting)) return "carport";
   // The mounting FIELD answers through groundMountFromField, the same reading the blocking consumers
   // use (#269): it used to take any bare "ground" / "pole" in the field as a ground array, so "Roof mount
   // w/ ground lugs", "Pole barn roof" or "Roof mount - not a ground mount" dropped the advisory roof
   // rules while the required set kept the roof rows. A roof + ground combination stays "ground" here,
   // as it always has — the field cannot say which array a roof rule would be about.
-  if (mounting) return groundMountFromField(project) ? "ground" : "roof";
-  // Only the free text needs the longer phrase, where a bare "ground" is a grounding note.
-  if (/ground[-\s]?mount|ground.?mounted|ground.?array|pole[-\s]?mount/i.test(probe)) return "ground";
-  // Silence means roof, which is the conservative direction: the roof rules are the stricter
-  // set, so an unknown mount is over-reviewed rather than under-reviewed.
+  return groundMountFromField(project) ? "ground" : "roof";
+}
+
+// THE TEXT FALLBACK WEIGHS THE EVIDENCE (#533). It used to ask "does the word appear ANYWHERE?",
+// so one "CARPORT" — a label on the site plan, naming an existing structure beside the driveway —
+// turned a plan set that says "roof mount" seven times and names its rafters into a carport array:
+// reviewer.plan.ground-array-site fired ("roof access rules do not apply") and every roof-gated rule
+// (structure, snow, attachment spacing, the UL listings) went silent. Those were exactly the items
+// the inspector then corrected. A site plan names the carport, the shed, the tree canopy and the
+// ground-mounted disconnect of a rooftop job as a matter of course; the array's own mount is named
+// over and over, on the cover, the notes and the attachment detail.
+//
+// So the free text counts. Roof-array evidence: "roof mount(ed)", rooftop, flush mount, rafters,
+// flashing, a roof attachment / penetration / framing / plan / layout / section sheet. Ground: a
+// mount noun ("ground mount", "ground array", "ground rack", "pole mount") — never a ground-mounted
+// INVERTER / disconnect / meter / battery / transformer (equipment, not the array), "underground
+// array feeder", or a negated "not a ground mount". Carport: carport, canopy (never a TREE canopy),
+// awning, patio cover.
+//   - ground wins only by OUTNUMBERING the roof evidence. One mention with nothing on the roof side
+//     still reads ground ("GROUND MOUNT ARRAY ON DRIVEN PIER FOUNDATION"); the parser's own empty-field
+//     flag "confirm roof mount vs ground mount" is a tie, and a tie keeps the roof rules.
+//   - a carport needs TWO mentions of its own AND to outnumber the roof evidence: the word is a
+//     structure noun on any site plan, so one of it is never the array.
+//   - a carport beside a winning ground count is a carport when it is mentioned at least as often
+//     ("ground-mounted carport"), as the old carport-first order had it: a carport keeps NEC 690.12
+//     rapid shutdown, a ground array is exempt, so the tie goes to the stricter reading.
+//   - a roof win is "unknown", never "roof": the text fallback has never written "Roof-mounted" on
+//     an application (mountAdjective), and isRoofMounted already reads unknown as a roof.
+const ROOF_ARRAY_TEXT = /\broof[-\s]?(?:mount\w*|tops?\b)|\bflush[-\s]?mount\w*|\brafters?\b|\bflashings?\b|\broof\s+(?:attachments?|penetrations?|framing|plans?|layouts?|sections?)\b/gi;
+const GROUND_ARRAY_TEXT = /\bground[-\s_/]?(?:mount\w*|arrays?\b|rack\w*)|\bpole[-\s_/]?mount\w*/gi;
+const CARPORT_TEXT = /\bcarports?\b|\bcanop(?:y|ies)\b|\bawnings?\b|\bpatio[-\s]+covers?\b/gi;
+const TREE_CANOPY = /\btrees?\s+canop(?:y|ies)\b|\bcanop(?:y|ies)\s+of\s+(?:the\s+)?(?:\(e\)\s*|existing\s+)?trees?\b/gi;
+const mentions = (text: string, re: RegExp): number => (text.match(re) || []).length;
+
+function mountKindFromText(probe: string): MountKind {
+  const text = probe
+    .replace(NEGATED_MOUNT, " ")
+    .replace(NEGATED_ROOF, " ")
+    .replace(MOUNTED_EQUIPMENT, " ")
+    .replace(TREE_CANOPY, " ");
+  const roof = mentions(text, ROOF_ARRAY_TEXT);
+  const ground = mentions(text, GROUND_ARRAY_TEXT);
+  const carport = mentions(text, CARPORT_TEXT);
+  if (ground > roof) return carport >= ground ? "carport" : "ground";
+  if (carport >= 2 && carport > roof) return "carport";
+  // Silence — or a roof that outweighs the rest — means roof, which is the conservative direction:
+  // the roof rules are the stricter set, so an unknown mount is over-reviewed rather than under-reviewed.
   return "unknown";
 }
 
