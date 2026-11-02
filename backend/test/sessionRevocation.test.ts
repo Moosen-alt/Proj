@@ -298,6 +298,23 @@ await run("Sign out everywhere is audit-logged with the user's email", async () 
   } finally { db.close(); }
 });
 
+// The migration (v52) is safe to replay: a database that runs it again keeps the column and every
+// user's version, so a replay never signs anyone back in or out.
+await run("replaying migration v52 keeps the column and the users' versions", async () => {
+  process.env.AUTOPILOT_DB_PATH = DB_PATH;
+  const { openDatabase } = await import("../src/db");
+  let db = await openDatabase();
+  const before = db.get<{ v: number }>("SELECT session_version AS v FROM users WHERE id = ?", [mates.ana.id])?.v;
+  db.run("DELETE FROM schema_meta WHERE version >= 52");
+  db.close();
+  db = await openDatabase();
+  try {
+    assert.equal(db.get<{ v: number }>("SELECT session_version AS v FROM users WHERE id = ?", [mates.ana.id])?.v, before);
+    assert.ok(Number(before) >= 2, `ana's version is ${before}`);
+    assert.ok(db.get("SELECT 1 FROM schema_meta WHERE version = 52"), "v52 was not recorded again");
+  } finally { db.close(); }
+});
+
 fs.rmSync(tmpDir, { recursive: true, force: true });
 console.log(failures === 0 ? "\nsessionRevocation: all checks passed" : `\nsessionRevocation: ${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

@@ -319,14 +319,18 @@ try {
     assert.equal((await tryLogin(BASE, OP.email, OP_NEW)).status, 200);
     assert.equal((await lastAudit("user.password_changed"))?.actor_name, OP.email);
   });
+  // The change above ended `self`'s cookie (#432: a new password signs out every older session;
+  // the route hands the changing device a fresh cookie, which this client does not keep), so the
+  // throttle is exercised from a new sign-in under the new password.
+  const selfAfter = await loginAs(OP.email, OP_NEW);
   await run("self-change: wrong current passwords are throttled (429 after 5)", async () => {
     const statuses: number[] = [];
     for (let i = 0; i < 6; i++) {
-      statuses.push((await self("/api/auth/password", post({ currentPassword: `wrong-guess-${i}`, newPassword: "never-applied-123" }))).status);
+      statuses.push((await selfAfter("/api/auth/password", post({ currentPassword: `wrong-guess-${i}`, newPassword: "never-applied-123" }))).status);
     }
     assert.deepEqual(statuses, [400, 400, 400, 400, 400, 429]);
     // Even the right password is held off while locked.
-    assert.equal((await self("/api/auth/password", post({ currentPassword: OP_NEW, newPassword: "never-applied-123" }))).status, 429);
+    assert.equal((await selfAfter("/api/auth/password", post({ currentPassword: OP_NEW, newPassword: "never-applied-123" }))).status, 429);
     assert.equal((await tryLogin(BASE, OP.email, OP_NEW)).status, 200);
   });
 
