@@ -6,7 +6,8 @@
 //                  address again within the window ATTACHES instead; a refused file is reported and
 //                  the others still land; the unsorted list is per org and a row outside it is a 404.
 //   MUST NOT     — a message re-read by the next poll makes a second project; an unknown sender, an
-//                  unknown or missing tag, a DMARC fail or a plan set licensed to another client is
+//                  unknown or missing tag, a DMARC fail (or, with EMAIL_INTAKE_REQUIRE_AUTH on, no
+//                  passing result in the topmost Authentication-Results) or a plan set licensed to another client is
 //                  filed on any client; mail to any other address is touched; the reply or the stored
 //                  communication carries the account or meter number; the email body reaches the
 //                  model; a low-confidence field is written to the project.
@@ -30,6 +31,7 @@ delete process.env.SMTP_HOST;
 delete process.env.SMTP_FROM;
 delete process.env.CLIENT_NOTIFICATIONS;
 delete process.env.EMAIL_INTAKE_AUTO_REPLY;
+delete process.env.EMAIL_INTAKE_REQUIRE_AUTH;
 delete process.env.ANTHROPIC_API_KEY;
 
 const { openDatabase, DEFAULT_ORG_ID } = await import("../src/db");
@@ -282,6 +284,42 @@ await run("no tag, an unknown tag, a DMARC fail and a plan set licensed to anoth
   } finally { extractionOverride = null; }
   assert.equal(projectsFor(rival.id).length, 0);
   assert.equal(projectsFor(acme.id).length, 2);
+});
+
+await run("EMAIL_INTAKE_REQUIRE_AUTH=1 (#510): no header or a forged pass under the provider's own header is unsorted; the provider's dmarc=pass files", async () => {
+  const A_R = "Authentication-Results";
+  const plan = (n: number) => pdf([`Address: ${n} Synthetic Way, Salem, OR 97301`]);
+  process.env.EMAIL_INTAKE_REQUIRE_AUTH = "1";
+  try {
+    const before = outbox.length;
+    const refused: Array<Promise<Buffer>> = [
+      // No header at all: the default accepts this on the sender match; the switch does not.
+      message({ attachments: [{ filename: "p.pdf", content: await plan(401) }] }),
+      // The provider ran nothing useful (none) and the sender wrote its own "pass" lower down. MailComposer
+      // keeps an array header's order, so the provider's line is on top, as a real delivery has it.
+      message({ headers: { [A_R]: ["mx.example.test; none", "mx.example.test; dmarc=pass header.from=acme.example.test"] } as never, attachments: [{ filename: "p.pdf", content: await plan(402) }] }),
+      // A pass, but for a domain that is not the From's.
+      message({ headers: { [A_R]: "mx.example.test; dmarc=pass header.from=elsewhere.example.test" }, attachments: [{ filename: "p.pdf", content: await plan(403) }] }),
+      // SPF alone is not enough; both must pass and align.
+      message({ headers: { [A_R]: "mx.example.test; spf=pass smtp.mailfrom=bounce@acme.example.test; dkim=fail header.d=acme.example.test" }, attachments: [{ filename: "p.pdf", content: await plan(404) }] }),
+    ];
+    for (const p of refused) {
+      const r = await processIntakeMessages(db, [await p], opts);
+      assert.equal(r.created + r.attached, 0, JSON.stringify(r));
+      assert.equal(r.items[0]?.reason, "sender_not_authenticated", JSON.stringify(r));
+    }
+    assert.equal(outbox.length, before, "an unauthenticated sender was replied to");
+    assert.equal(projectsFor(acme.id).length, 2);
+
+    const passed = await processIntakeMessages(db, [await message({ headers: { [A_R]: "mx.example.test; spf=pass smtp.mailfrom=office@acme.example.test; dkim=pass header.d=acme.example.test; dmarc=pass (p=reject) header.from=acme.example.test" }, attachments: [{ filename: "p.pdf", content: await plan(405) }] })], opts);
+    assert.equal(passed.created, 1, JSON.stringify(passed));
+    const aligned = await processIntakeMessages(db, [await message({ headers: { [A_R]: "mx.example.test; spf=pass smtp.mailfrom=bounce@mail.acme.example.test; dkim=pass header.d=acme.example.test" }, attachments: [{ filename: "p.pdf", content: await plan(406) }] })], opts);
+    assert.equal(aligned.created, 1, `aligned SPF + DKIM without a DMARC line: ${JSON.stringify(aligned)}`);
+  } finally { delete process.env.EMAIL_INTAKE_REQUIRE_AUTH; }
+  // Switch off again: no header files on the sender match alone, as before #510.
+  const off = await processIntakeMessages(db, [await message({ attachments: [{ filename: "p.pdf", content: await plan(407) }] })], opts);
+  assert.equal(off.created, 1, JSON.stringify(off));
+  assert.equal(projectsFor(acme.id).length, 5);
 });
 
 await run("an address the documents do not give is unsorted, not a blank project", async () => {
