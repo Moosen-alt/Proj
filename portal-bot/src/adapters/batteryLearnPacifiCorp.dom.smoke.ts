@@ -162,8 +162,12 @@ for (const variant of ["stale", "binding"] as const) {
     !steps.some((s) => s.selector?.css === "#pcInputBase41"), JSON.stringify(steps.map((s) => s.selector)));
   check(`${tag} ...and the stray is reported, naming the export box`,
     learner.equipmentStrays.some((l) => /Total System Export/i.test(l)), JSON.stringify(learner.equipmentStrays));
+  const events: Array<Record<string, unknown>> = [];
+  (learner as unknown as { debug: unknown }).debug = { event: (e: Record<string, unknown>) => { events.push(e); } };
   await learner.recordPageTrustEvidence(1, page.url());
   const ev = learner.trustEvidence[0];
+  check(`${tag} ...EVENT equipment_fill_reached_other_control {page, where, writes} names the export box`,
+    events.some((e) => e.type === "equipment_fill_reached_other_control" && Array.isArray(e.writes) && (e.writes as string[]).some((w) => /Total System Export/i.test(w))), JSON.stringify(events));
   check(`${tag} ...and it is the page's trust evidence`, !!ev && ev.strayWrites.some((l) => /Total System Export/i.test(l)), JSON.stringify(learner.trustEvidence));
   check(`${tag} ...the cloned system's own box still gets its model`, bim === BATTERY_MODEL, `clone box holds ${JSON.stringify(bim)}`);
   check(`${tag} ...and the export box shows no validation error at the end`, !!ev && !ev.validationErrors.length, JSON.stringify(ev?.validationErrors));
@@ -223,9 +227,22 @@ console.log("\n[D] the page ends with an invalid field and a required box unchec
     (document.getElementById("ex") as HTMLInputElement).value = v;
   }, BATTERY_MODEL);
   const learner = learnerOn(page, "Portland General Electric", true);
+  // The run's own debug channel, captured: the events are what the gate's reader (#534) keys on.
+  const events: Array<Record<string, unknown>> = [];
+  (learner as unknown as { debug: unknown }).debug = { event: (e: Record<string, unknown>) => { events.push(e); } };
   await learner.recordPageTrustEvidence(4, page.url());
   const ev = learner.trustEvidence[0];
   console.log(`   ${JSON.stringify(ev)}`);
+  console.log(`   events: ${JSON.stringify(events.map((e) => e.type))}`);
+  const vErr = events.find((e) => e.type === "validation_error_after_fill");
+  const unchk = events.find((e) => e.type === "required_checkbox_unchecked");
+  check("[D] EVENT validation_error_after_fill {page, where, errors} names the field and the portal's words",
+    !!vErr && vErr.page === 4 && typeof vErr.where === "string" && Array.isArray(vErr.errors)
+      && (vErr.errors as string[]).includes("Total System Export (kW): Please enter a valid decimal number"), JSON.stringify(vErr));
+  check("[D] EVENT required_checkbox_unchecked {page, where, boxes:[{label, acknowledgment}]} lists both attestations",
+    !!unchk && unchk.page === 4 && Array.isArray(unchk.boxes)
+      && [NO_BACKFEED, TRANSFER].every((l) => (unchk.boxes as Array<{ label: string; acknowledgment: boolean }>).some((b) => b.label === l && b.acknowledgment === false)), JSON.stringify(unchk));
+  check("[D] ...and no stray-write event on a page that had none", !events.some((e) => e.type === "equipment_fill_reached_other_control"), JSON.stringify(events));
   check("[D] the visible validation error is recorded, named by its field",
     !!ev && ev.page === 4 && ev.validationErrors.some((e) => /^Total System Export \(kW\): Please enter a valid decimal number$/.test(e)), JSON.stringify(ev?.validationErrors));
   check("[D] each required checkbox left unchecked is recorded",

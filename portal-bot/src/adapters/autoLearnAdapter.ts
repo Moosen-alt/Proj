@@ -10453,12 +10453,16 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     };
     if (!entry.validationErrors.length && !entry.requiredUnchecked.length && !entry.strayWrites.length) return;
     this.trustEvidence.push(entry);
-    this.debug?.event({
-      type: "trust_evidence", page, where: entry.where,
-      validationErrors: entry.validationErrors.slice(0, 8),
-      requiredUnchecked: entry.requiredUnchecked.slice(0, 8),
-      strayWrites: entry.strayWrites.slice(0, 8),
-    });
+    // One event per kind of evidence, named for what it is (the gate's reader, #534, keys on them).
+    if (entry.validationErrors.length) {
+      this.debug?.event({ type: "validation_error_after_fill", page, where: entry.where, errors: entry.validationErrors.slice(0, 12) });
+    }
+    if (entry.requiredUnchecked.length) {
+      this.debug?.event({ type: "required_checkbox_unchecked", page, where: entry.where, boxes: entry.requiredUnchecked.slice(0, 12) });
+    }
+    if (entry.strayWrites.length) {
+      this.debug?.event({ type: "equipment_fill_reached_other_control", page, where: entry.where, writes: entry.strayWrites.slice(0, 12) });
+    }
   }
 
   // Read each applied fill back; re-apply once if it didn't hold; return the labels of REQUIRED
