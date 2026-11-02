@@ -923,10 +923,13 @@ tracking) is `docs/NEM_OPERATOR_RUNBOOK.md`.
    review screenshot and a learn or portal run artifact exist. For a brand-new jurisdiction,
    see §6 — a mock stage looks exactly like this one.
 7. **A human submits.** A person opens the staged application on the portal, reads the filled
-   fields, and presses submit. Fees are paid there, by them. If they use our Approve & Submit
-   button, that action is auth-gated and audit-logged with their name, because a filing must
-   always be attributable to a person — and for most portals it still hands off to the human
-   for the final click rather than clicking it itself.
+   fields, and presses submit. Fees are paid there, by them. If they use our Approve & auto-submit
+   button (on the rail or the track card, the same action), it records their named approval of
+   that one run, because a filing must always be attributable to a person. It starts its own run
+   from the start of the application, and the bot clicks the portal's submit only with
+   `PORTAL_ALLOW_FINAL_SUBMIT=1` and a recipe recorded through submit; otherwise it stops at the
+   review screen for the human's final click. On a staged NEM draft it is held: the human
+   finishes that draft.
 8. **After.** The permit monitor watches for status changes and corrections. A correction
    reopens the filing through a named form; the automation refills and a human files again.
 

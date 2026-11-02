@@ -61,7 +61,7 @@ check(`the runbook cites ${cites.length} files, each exists and each line range 
 const frontend = ["frontend/dashboard.js", "frontend/dashboard.html", "frontend/parser.html", "backend/src/submittalTracks.ts"].map(read).join("\n");
 const LABELS = [
   "Parse uploaded files", "Save to project", "Submitting client", "Stage in portal", "Approve & auto-submit",
-  "Approve & Submit", "Stage portals · Autopilot", "I submitted it → capture #", "Save & track",
+  "Stage portals · Autopilot", "I submitted it → capture #", "Save & track",
   "Interconnection / case #", "Confirmation / PTO #", "Public status URL", "Before you submit on the portal",
   "Approve & request signatures", "I sent the signature request", "Check signature now",
   "Permit & NEM Checkup", "Record status", "Edit", "NEM checks", "Manage logins", "Audit Log",
@@ -98,10 +98,14 @@ check("the 'What the tool will not do' box names fees, CAPTCHA/MFA and filing wi
   assert.match(box, /named person's approval/);
 });
 
-// The runbook must not promise the next-step rail button files (#423), nor that Stage-then-Approve
-// files on NEM (#435).
-check("it says the rail's Approve & Submit never clicks, and not to Stage before Approve & auto-submit", () => {
-  assert.match(doc, /Approve & Submit\*\*[^]*never clicks/);
+// The runbook must say the rail's Approve is the card's one action (#423: it used to be a second
+// "Approve & Submit" that never filed), held on a staged NEM draft like the card's, and must not
+// promise that Stage-then-Approve files on NEM (#435).
+check("it says the rail's Approve & auto-submit is the track card's action, held on a staged NEM draft, and not to Stage before Approve & auto-submit", () => {
+  const flat = doc.replace(/\s+/g, " ");
+  assert.match(flat, /rail's \*\*Approve & auto-submit\*\*[^]*same action as the track card's/);
+  assert.match(flat, /held while a draft is staged, exactly like the card's/);
+  assert.doesNotMatch(flat, /Approve & Submit/, "the runbook still names the retired rail label");
   assert.match(doc, /Do not click Stage first and then Approve & auto-submit/);
 });
 

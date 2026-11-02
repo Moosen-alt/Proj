@@ -202,10 +202,25 @@ await check("staged drafts: approve (unless the reviewer gate refuses), then fil
   const base = { status: "awaiting_human_submit" as const, tracks: [track("nem", { stagedRun: staged, latestRun: staged, onPortal: true }), track("combo", { filed: true })] };
   const step = decide(facts(base));
   assert.equal(step.key, "staged_awaiting_submit");
-  assert.equal(step.button?.id, "approveSubmitBtn");
+  // #423/#435: the one Approve action (Approve & auto-submit, the card's door) is HELD while a NEM
+  // draft is staged — a run from the start would stop on the draft or open a second application —
+  // so it is not offered, and the why says so; the person finishes the draft on the portal.
+  assert.equal(step.button, null, "a held Approve & auto-submit offered on a staged NEM draft");
+  assert.ok(step.why.some((w) => /Approve & auto-submit is held/.test(w.text)), JSON.stringify(step.why));
   assert.match(step.headline, /PGE/);
+  assert.match(step.headline, /click its submit on the portal yourself/);
   // The staged draft renders in the PINNED card (#portalRunsPinned), not the folded run history.
   assert.equal(step.why[0].fixTarget, "portalRunsPinned", "the staged-draft 'why' points at the folded history, not the pinned draft card");
+  // A staged PERMIT draft keeps the one Approve action, under the card's label, and says what it does.
+  const permitStaged = run("awaiting_human_submit");
+  const permitBase = { status: "awaiting_human_submit" as const, tracks: [track("combo", { stagedRun: permitStaged, latestRun: permitStaged, onPortal: true }), track("nem", { filed: true })] };
+  const permitStep = decide(facts(permitBase));
+  assert.equal(permitStep.key, "staged_awaiting_submit");
+  assert.deepEqual(permitStep.button, { id: "approveSubmitBtn", label: "Approve & auto-submit" });
+  assert.ok(permitStep.why.some((w) => /Approve & auto-submit starts its own run .* under your named approval/.test(w.text)), JSON.stringify(permitStep.why));
+  assert.ok(!/Approve & Submit/.test(permitStep.headline + permitStep.why.map((w) => w.text).join(" ")), "the old label survives in the copy");
+  assert.equal(decide(facts({ ...permitBase, reviewerBlockers: [{ code: "x", detail: "y" }] })).button, null,
+    "Approve would 409 on reviewer blockers — do not offer it");
   assert.equal(decide(facts({ ...base, reviewerBlockers: [{ code: "x", detail: "y" }] })).button, null,
     "Approve would 409 on reviewer blockers — do not offer it");
   const approved = decide(facts({ ...base, approvedRunIds: [staged.id] }));

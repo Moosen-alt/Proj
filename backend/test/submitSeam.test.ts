@@ -465,6 +465,8 @@ check("1k. and the approve button stays available (a later track still needs it)
     "GATE_ANSWER_TTL_MS", "gateStampFor", "boardStepFor", "compactGateAnswer", "rememberGateAnswer", "BOARD_WHO_SHORT", "boardWhoHtml",
     "STATUS_LABELS", "statusLabel", "PRE_STAGE_STATUSES", "statusBoxView", "renderStatusBox",
     "NON_QC_REVIEW_FIELDS", "ADVISORY_REVIEW_ISSUE_TYPES", "reviewItemBuckets", "reopenResultMessage", "showSubmitBlockerNote",
+    // The rail's Approve & auto-submit holds where the track card holds it (#423); applyAutopilotState calls these.
+    "APPROVE_HELD_BY_STAGED_DRAFT", "RAIL_APPROVE_TITLE", "RAIL_APPROVE_NO_TRACK", "railApproveHold",
     "applyAutopilotState", "startAutopilot", "fmtDate", "boardReviewCountChip", "boardCardHtml",
     "resetAutopilotRail", "AUTOPILOT_LOAD_FAILED_TEXT", "refreshAutopilot", "selectProject",
     "permitTargetKindLabel", "portalSaysFor", "renderPermitMonitor", "TRACK_STATE_WORDS", "trackStateWords", "kbConfidenceBadge",
@@ -640,7 +642,7 @@ check("1k. and the approve button stays available (a later track still needs it)
   const offText = (apEls.autopilotOffReasons.kids as Array<{ textContent: string }>).map((k) => k.textContent).join(" | ");
   check("10h. canStage:false switches Stage portals OFF", apEls.startAutopilotBtn.disabled === true);
   check("10h2. ...and says why as visible text (not only a tooltip)", apEls.autopilotOffReasons.hidden === false && /already staged or filed/.test(offText), offText);
-  check("10h3. Approve & Submit's disabled reason is visible text too", /Approve & Submit is off: Nothing is staged/.test(offText), offText);
+  check("10h3. Approve & auto-submit's disabled reason is visible text too", /Approve & auto-submit is off: Nothing is staged/.test(offText), offText);
   apLib.applyAutopilotState({ projectId: "p1", phase: "idle", canApprove: false, canStage: true, stageDisabledReason: null, blockers: [] });
   check("10h4. MUST PASS: canStage:true switches it back ON", apEls.startAutopilotBtn.disabled === false);
   apLib.applyAutopilotState({ projectId: "p-other", phase: "idle", canApprove: true, canStage: false, blockers: [] });
