@@ -235,6 +235,13 @@ out = notify(withAdmin, { EMAIL_IMAP_HOST: "imap.ops.invalid", EMAIL_IMAP_USER: 
 check("email intake on an inbox that is read: PASS, naming the tagged address", () => {
   assert.match(line(out, "email intake"), /PASS .*intake\+<client tag>@ops\.invalid/);
 });
+check("email intake (#510): the row says the sender check is in its default mode and names the switch", () => {
+  assert.match(line(out, "email intake"), /sender check default: .*EMAIL_INTAKE_REQUIRE_AUTH=1 requires a pass/);
+});
+out = notify(withAdmin, { EMAIL_IMAP_HOST: "imap.ops.invalid", EMAIL_IMAP_USER: "permits@ops.invalid", EMAIL_IMAP_PASS: SECRETS.imapPw, EMAIL_INTAKE_ADDRESS: "intake@ops.invalid", EMAIL_INTAKE_REQUIRE_AUTH: "1" });
+check("email intake (#510): with EMAIL_INTAKE_REQUIRE_AUTH=1 the row says the sender check is required", () => {
+  assert.match(line(out, "email intake"), /PASS .*sender check REQUIRED/);
+});
 out = notify(withAdmin, { EMAIL_INTAKE_ADDRESS: "intake+acme@ops.invalid" });
 check("MUST-EXCLUDE: a tagged intake address with no inbox is not a PASS", () => {
   assert.match(line(out, "email intake"), /WARN .*not a plain address/);
