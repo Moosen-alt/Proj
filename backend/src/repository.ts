@@ -97,7 +97,7 @@ import { STAGE_COUNT, stageForStatus, isBlockedProject } from "./projectStage";
 import { compactNextStep, decideNextStep, loadNextStepFacts, withoutCodeResearch } from "./nextStep";
 import { correctionHoldScope, criticalFieldHoldScope, findingHoldScope, GATE_TRACKS, scopeHoldsTrack, tracksHeld, type GateHoldScope } from "./gateScope";
 import { addAuditLog } from "./audit";
-import { clientLicenceRow, clientStagingOverlay, contractorLicenceForState, getClient } from "./clients";
+import { clientLicenceRow, clientStagingOverlay, contractorLicenceForState, getClient, stagingIdentityPortal } from "./clients";
 import { planSetLicenceWarning } from "./clientMatch";
 import { assertSubmissionPaid } from "./submissionFees";
 import { snapshotFilingQuote } from "./feeAccuracy";
@@ -9334,7 +9334,31 @@ export async function prepareSubmission(
   // (CCB#, electrical license, installer company) instead of hardcoded names.
   // The licence keys are THIS track's in THIS state (clients.licenceOverlay) — never Oregon's CCB
   // on another state's filing.
-  const overlay = clientStagingOverlay(db, detail.project.clientId, portalType, { state: String(detail.project.state ?? ""), track: track ?? null });
+  //
+  // WHOSE PORTAL IDENTITY (#518): the client's identity row for the portal THIS run opens — keyed on
+  // every URL the run could launch (the recipe's, the learner's entry, the login's), never on
+  // `portalType`, which is "mock" for every real run (nothing writes portal_profiles) and would
+  // apply a "mock" row everywhere. `portalType` itself is untouched: it still keys the credential
+  // lookup and the browser profile directory. The value dictionary below is resolved with the same
+  // key, so the replay, the planner and the hand-coded adapters all read one identity.
+  const identityPortal = stagingIdentityPortal({
+    urls: [
+      recipe ? (recipe as { portalUrl?: string }).portalUrl : "",
+      learnEntryUrl({
+        track,
+        learnedProfileUrl: permitSafeUrl(learnedProfile && (learnedProfile as { portalUrl?: string }).portalUrl),
+        recipeUrl: recipe ? (recipe as { portalUrl?: string }).portalUrl : "",
+        draftUrl: draftRecipe ? draftRecipe.portalUrl : "",
+        utilityUrl: utilityPortalUrl,
+        ahjUrl: ahjPortalUrl,
+        statewideUrl: statewidePortalUrl,
+      }),
+      credentialUrl,
+    ],
+    profilePortalType: portalType,
+    isRealPortal,
+  });
+  const overlay = clientStagingOverlay(db, detail.project.clientId, identityPortal, { state: String(detail.project.state ?? ""), track: track ?? null });
   const stagedProject = Object.keys(overlay).length > 0
     ? { ...portalProject, parserSnapshot: { ...portalProject.parserSnapshot, ...overlay } }
     : portalProject;
@@ -9638,7 +9662,7 @@ export async function prepareSubmission(
       && !recipeTrackConflict && !recipeEntityMisfit && !recipeDisciplineConflict) {
     let gaps: RecipeStageGap[] = [];
     try {
-      const gateValues = resolveRecipeFieldValues(db, stagedProject, portalType, track ?? null);
+      const gateValues = resolveRecipeFieldValues(db, stagedProject, identityPortal, track ?? null);
       const gateBinding = bindRecipeForReplay({
         steps: recipe.steps ?? [], portalUrl: recipe.portalUrl, project: portalProject, fieldValues: gateValues, track,
         borrowed: borrowed ? { learnedFor: borrowed.learnedFor, discipline: borrowed.discipline } : null,
@@ -9780,7 +9804,7 @@ export async function prepareSubmission(
       // anything binds or runs them. A human step edit does not bump the version, so heals and the
       // demotion are measured against every field of these steps, selectors included.
       const replayStepsSig = recipeStepsSignature(recipe.steps ?? []);
-      const replayFieldValues = resolveRecipeFieldValues(db, stagedProject, portalType, track ?? null);
+      const replayFieldValues = resolveRecipeFieldValues(db, stagedProject, identityPortal, track ?? null);
       replayBinding = bindRecipeForReplay({
         steps: recipe.steps ?? [], portalUrl: recipe.portalUrl, project: portalProject, fieldValues: replayFieldValues, track,
         borrowed: borrowed ? { learnedFor: borrowed.learnedFor, discipline: borrowed.discipline } : null,
