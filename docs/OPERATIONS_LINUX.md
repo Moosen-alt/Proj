@@ -351,6 +351,12 @@ has a NOTIFICATIONS block for them (WARN, with the line to add) and counts the c
    and replies with the status link (a draft until steps 1 and 3 pass). Anything it cannot place
    waits under Knowledge & Learning > Emailed jobs. `EMAIL_INTAKE_AUTO_REPLY=off` keeps the replies as drafts;
    `EMAIL_INTAKE_DEDUPE_DAYS` (default 30) is how long the same address files onto the same project.
+   Set `EMAIL_INTAKE_REQUIRE_AUTH=1` when the inbox is Gmail, Microsoft 365 or another provider that
+   stamps an `Authentication-Results` header (most hosted IMAP does; open any received message's
+   original source to check): a job is then filed only when that header shows the sender's domain
+   passed DMARC (or SPF and DKIM for the From domain), so a forged From naming a client's address
+   waits unsorted as "sender not authenticated" instead of starting a project and getting the reply.
+   Unset, only a stated DMARC fail is refused. Preflight's `email intake` row says which mode is on.
 
 ## 6. Deploying a new version
 
