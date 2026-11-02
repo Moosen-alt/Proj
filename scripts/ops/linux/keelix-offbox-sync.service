@@ -1,0 +1,15 @@
+# Copy and verify the snapshots and the document mirror into BACKUP_SECOND_DIR (/app/offbox in the
+# container = the Storage Box mounted at /mnt/keelix-offbox on the host). docs/OPERATIONS_LINUX.md §4.
+[Unit]
+Description=Keelix off-box backup sync
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+# Refuse to run against an empty mount point: that would "copy off-box" onto the local disk.
+RequiresMountsFor=/mnt/keelix-offbox
+ConditionPathIsMountPoint=/mnt/keelix-offbox
+
+[Service]
+Type=oneshot
+ExecStart=/opt/keelix/scripts/ops/linux/keelix-ops.sh offbox-sync
+TimeoutStartSec=2h

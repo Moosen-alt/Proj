@@ -1,0 +1,14 @@
+# The watchdog poll (scripts/ops/watchdog.ts --once), every 5 minutes via keelix-watchdog.timer.
+# docs/OPERATIONS_LINUX.md §5. Install: copy both files to /etc/systemd/system/, then
+#   systemctl daemon-reload && systemctl enable --now keelix-watchdog.timer
+[Unit]
+Description=Keelix watchdog poll
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/keelix/scripts/ops/linux/keelix-ops.sh watchdog --once
+# Never let a hung poll pile up behind the next one.
+TimeoutStartSec=4min

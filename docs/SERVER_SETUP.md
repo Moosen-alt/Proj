@@ -34,6 +34,10 @@
 
 ## Deploy (one VM, ~$20–40/mo: Hetzner / DigitalOcean / Lightsail; 4GB+ RAM)
 
+> **The team's hosted server** (Docker behind Cloudflare Tunnel and Access, with backup timers and
+> image deploys) follows [OPERATIONS_LINUX.md](OPERATIONS_LINUX.md). The bare-VM steps below (Caddy,
+> a systemd unit running Node directly) remain an alternative.
+
 ```bash
 git clone <repo> && cd SOLAR-Proj && npm install
 npx playwright install --with-deps chromium

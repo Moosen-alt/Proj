@@ -1,0 +1,20 @@
+# Continuous replication of the live database to object storage (Litestream), so a lost disk costs
+# seconds of work rather than up to BACKUP_INTERVAL_HOURS. OPTIONAL: the 2-hourly snapshots, the
+# off-box sync and the nightly restic copy stand without it. docs/OPERATIONS_LINUX.md §4.
+# Runs as uid 1000, the container's node user, so the files it writes next to the database stay
+# readable by the app. Stop it before any database restore (rollback.sh refuses while it runs).
+[Unit]
+Description=Keelix Litestream replication of autopilot.sqlite
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=1000
+Group=1000
+EnvironmentFile=/etc/keelix/litestream.env
+ExecStart=/usr/bin/litestream replicate -config /opt/keelix/scripts/ops/linux/litestream.yml
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

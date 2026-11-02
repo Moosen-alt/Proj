@@ -319,5 +319,10 @@ git pull
 docker compose up -d --build      # or: npm ci && restart the service
 ```
 
+On the hosted Linux server, update with `scripts/ops/linux/deploy.sh` instead: it stamps the build,
+waits for running jobs, takes a named snapshot and confirms `/health`, and `rollback.sh` undoes it.
+That server's whole runbook (Cloudflare Tunnel and Access, backups, timers, deploy and rollback) is
+[docs/OPERATIONS_LINUX.md](docs/OPERATIONS_LINUX.md).
+
 The SQLite schema self-migrates on boot (new columns/indexes are added
 idempotently); your data in the volume is preserved.
