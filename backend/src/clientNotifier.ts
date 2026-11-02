@@ -87,11 +87,13 @@ export function statusShareUrl(token: string): string {
   return `${base}/status?token=${encodeURIComponent(token)}`;
 }
 
-function smtpConfigured(): boolean {
+/** SMTP_HOST and SMTP_FROM are both set. Shared with clientRequestLinks.ts (#488), so the two
+ *  outbound client channels agree on what "configured" means. */
+export function smtpConfigured(): boolean {
   return Boolean(process.env.SMTP_HOST && process.env.SMTP_FROM);
 }
 
-async function sendEmail(to: string, subject: string, textBody: string): Promise<void> {
+export async function sendEmail(to: string, subject: string, textBody: string): Promise<void> {
   const { default: nodemailer } = await import("nodemailer");
   const port = Number(process.env.SMTP_PORT || 587);
   const transporter = nodemailer.createTransport({

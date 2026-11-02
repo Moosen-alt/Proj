@@ -3394,6 +3394,17 @@ const NEXT_STEP_WHO = {
 // Answers that describe something wrong (amber), as opposed to routine next work (neutral).
 const NEXT_STEP_PROBLEM_KEYS = ["operator_blocked", "portal_paused", "staging_failed", "qc_failed", "gate_blocked", "gap_fill_missing", "unknown"];
 
+// One open automatic ask of the client, as a sentence. Pure; the caller esc()s it.
+function clientAskLine(a) {
+  const what = a.kind === "credentials" ? "Portal-login link" : "Intake link";
+  const day = String(a.sentAt || "").slice(0, 10);
+  const needs = Array.isArray(a.needs) && a.needs.length ? ` (${a.needs.slice(0, 3).join("; ")}${a.needs.length > 3 ? "; …" : ""})` : "";
+  const reminder = a.reminderAt ? ` Reminder ${a.reminderStatus === "sent" ? "sent" : `not sent (${a.reminderStatus || "unknown"})`} ${String(a.reminderAt).slice(0, 10)}.` : "";
+  if (a.deliveryStatus === "sent") return `${what} sent to ${a.recipient} on ${day}${needs}.${reminder}`;
+  if (a.deliveryStatus === "failed") return `${what} for ${a.recipient} could not be sent on ${day}${needs}: see the project's communications and send it by hand.`;
+  return `${what} drafted for ${a.recipient} on ${day}${needs}: email is not set up, so nothing left; send it by hand from the project's communications.`;
+}
+
 // The banner for ONE server answer. Pure: returns { className, html }. Every server string
 // (headline, why, labels) is esc()'d — they are prose, never markup. `exists(id)` says whether
 // a fix target / button is on this page; a missing one is simply not linked.
@@ -3409,6 +3420,7 @@ function nextStepBannerHtml(step, ctx) {
   const since = step.since ? String(step.since).slice(0, 10) : "";
   const whys = Array.isArray(step.why) ? step.why.slice(0, 3) : [];
   const cands = Array.isArray(step.recordCandidates) ? step.recordCandidates.filter((cand) => cand && cand.runId && cand.recordNumber) : [];
+  const asks = Array.isArray(step.clientAsks) ? step.clientAsks.filter((a) => a && a.recipient && a.sentAt) : [];
   const button = step.button && step.button.id && exists(step.button.id) ? step.button : null;
   const provisional = !step.gateChecked
     ? `<span class="next-step-provisional">${esc(c.full === false
@@ -3431,6 +3443,11 @@ function nextStepBannerHtml(step, ctx) {
         + `<ul class="next-step-whys">${cands.map((cand, i) => `<li>${esc(humanize(cand.track || ""))}: <strong>${esc(cand.recordNumber || "")}</strong>`
           + (cand.recordLink ? ` <a href="${esc(cand.recordLink)}" target="_blank" rel="noopener">open ↗</a>` : "")
           + ` <button type="button" class="secondary next-step-confirm" data-confirm-record="${i}">Confirm this number</button></li>`).join("")}</ul></span>`
+      : "")
+    // THE LINKS THE SERVER EMAILED THE CLIENT (#488): "Sent to <contact> on <date>", or why it did
+    // not leave. esc() on every value.
+    + (asks.length
+      ? `<ul class="next-step-whys next-step-client-asks">${asks.map((a) => `<li>${esc(clientAskLine(a))}</li>`).join("")}</ul>`
       : "")
     + provisional
     + `</span>`;
@@ -9849,6 +9866,7 @@ async function handleBatchDrop(file) {
 // ----- Clients & contractor licensing -----
 const CLIENT_TEXT_FIELDS = [
   "companyName", "legalBusinessName", "dba", "contactName", "contactEmail", "phone", "billingStatus", "billingMode", "serviceFeeUsd",
+  "requestLinksAutoSend",
   "ccbLicenseNumber", "ccbExpiration", "electricalLicenseNumber", "metroCityLicenseNumber",
   "electricalSupervisorName", "electricianLicenseNumber",
   "ein", "bondCarrier", "insuranceCarrier", "businessAddress", "businessCity", "businessState",
