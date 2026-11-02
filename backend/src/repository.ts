@@ -6113,8 +6113,30 @@ export async function reopenCorrectionOnPortal(
   //    on a utility platform, and a NEM filing never on an AHJ permit platform. Stop before any
   //    browser opens.
   const reopenTrack = targetType === "nem" ? "nem" : "permit";
-  let recipe = findCompleteRecipeForProject(db, { scopeType, state: detail.project.state, ahj: detail.project.ahj, utility: detail.project.utility })
-    ?? findAnyRecipeForProject(db, { scopeType, state: detail.project.state, ahj: detail.project.ahj, utility: detail.project.utility });
+  // THE FILING'S OWN DISCIPLINE (#455, the reopen half of #426): a per-discipline AHJ (City of
+  // Coos Bay: a structural and an electrical recipe, no '' row) has no recipe for a discipline-less
+  // lookup, so the reopen ran on the target's URL with no steps, or stopped with "no portal URL is
+  // known". Same helper the monitor uses — staging's own track → discipline mapping.
+  const reopenFiling = trackForTarget(text(target.target_type), text(target.permit_type));
+  const reopenDiscipline = recipeDisciplineForTarget(text(target.target_type), text(target.permit_type));
+  const recipeInput = { scopeType, state: detail.project.state, ahj: detail.project.ahj, utility: detail.project.utility, discipline: reopenDiscipline };
+  let recipe = findCompleteRecipeForProject(db, recipeInput) ?? findAnyRecipeForProject(db, recipeInput);
+  // LEGACY-ROW DISCIPLINE CHECK — staging's (prepareSubmission): a '' row recorded before recipes
+  // were keyed per discipline is still accepted as the fallback, and if its steps were learned for
+  // the OTHER discipline they pick the other jurisdiction row and record type. A reopen replays
+  // those steps against THIS filing, so the row is dropped (the reopen then runs on the target's
+  // own URL with no steps, like a host misfit below) rather than replayed down the wrong path.
+  if (recipe && reopenDiscipline && !recipe.discipline) {
+    try {
+      const learnedFor = recipeDisciplineFromSteps(getPortalRecipe(db, recipe.id).steps);
+      if (disciplineConflictsWithTrack(learnedFor, reopenFiling)) {
+        addAuditLog(db, projectId, "system", "correction reopen", "portal.discipline_recipe_skipped", {
+          correctionId, targetId: text(target.id), track: reopenFiling, recipeId: recipe.id, learnedFor,
+        });
+        recipe = null;
+      }
+    } catch { /* unreadable steps — leave the recipe to the host-fit judge below */ }
+  }
   if (recipe) {
     const entityInput = { scope: scopeType, state: detail.project.state, name: scopeType === "utility" ? detail.project.utility : detail.project.ahj, excludeRecipeIds: [recipe.id] };
     const fit = recipeHostFit(reopenTrack, portalEntityEvidence(db, entityInput), recipe);
@@ -6149,7 +6171,6 @@ export async function reopenCorrectionOnPortal(
   //    gate re-reads the project's current path + selected file at the attach itself.
   //    Scoped to THIS target's filing (docs-audit PLAN D3): a reopened building permit is
   //    handed the building track's documents, never the utility bill or the electrical form.
-  const reopenFiling = trackForTarget(text(target.target_type), text(target.permit_type));
   const docsByType = submissionDocumentsByType(db, detail.project, reopenFiling);
   const beforeUpload = uploadDocumentGuard(db, projectId, { track: reopenFiling });
 
