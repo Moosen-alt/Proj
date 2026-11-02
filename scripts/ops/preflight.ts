@@ -23,6 +23,7 @@ import path from "node:path";
 import { backupDir as stateBackupDir, dbPath as stateDbPath, opsDir } from "../../backend/src/statePaths";
 import { AUTOMATIC_SNAPSHOT_RE } from "../../backend/src/offboxBackup";
 import { DEFAULT_LISTEN_HOST, isLoopbackListenHost, resolveListenHost } from "../../backend/src/listenHost";
+import { intakeRequiresAuth } from "../../backend/src/intakeAuth";
 import { DEFAULT_STAFF_ORG_ID, configuredStaffOrgs, parseOrgScopedList, staffAlertChannels, staffAlertsOn, staffDigestHour } from "../../backend/src/staffAlertConfig";
 import { exposedHostAdvice, isWindows, probeEdge, trustProxyRow, watchdogInstallHint, type HostShape } from "../../backend/src/opsEdgePosture";
 
@@ -198,7 +199,10 @@ if (intakeAddress) {
   const intakeOk = /^[^@\s+]+@[^@\s]+$/.test(intakeAddress);
   add("notifications", "email intake", intakeOk && sources.length ? "PASS" : "WARN",
     !intakeOk ? `EMAIL_INTAKE_ADDRESS=${intakeAddress} is not a plain address (no +tag): set it to the bare intake address, e.g. intake@<your domain>`
-      : sources.length ? `jobs emailed to ${intakeAddress.replace("@", "+<client tag>@")} become projects; give each client a tag under Clients`
+      : sources.length ? `jobs emailed to ${intakeAddress.replace("@", "+<client tag>@")} become projects; give each client a tag under Clients; ` +
+        (intakeRequiresAuth(env)
+          ? "sender check REQUIRED (EMAIL_INTAKE_REQUIRE_AUTH): only mail the inbox's provider marked dmarc=pass (or aligned spf+dkim pass) is filed"
+          : "sender check default: a stated DMARC fail is refused, mail with no Authentication-Results is filed on the sender match alone (EMAIL_INTAKE_REQUIRE_AUTH=1 requires a pass; right for Gmail and most hosted inboxes)")
       : "EMAIL_INTAKE_ADDRESS is set but no tracking inbox is configured, so no emailed job is ever read (see tracking inbox)");
 }
 // Read exactly as scheduler.ts reads it: <= 0 (an empty value included) turns the monitor off.

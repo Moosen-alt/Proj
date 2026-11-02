@@ -16,7 +16,8 @@
 // client's org — never anything the message text or the plan set says. The sender must be one of
 // that client's own addresses (contact, business, updates, billing) or an entry an operator added
 // to clients.intake_senders; anything else is unsorted, never filed on a guessed client. A
-// message whose DMARC result is a fail is unsorted too. A plan set whose licence number binds to
+// message whose DMARC result is a fail is unsorted too, and with EMAIL_INTAKE_REQUIRE_AUTH on so is
+// one without a passing result from the receiving server (intakeAuth.ts, #510). A plan set whose licence number binds to
 // a DIFFERENT client (the parser's exact-CCB auto-assign) is unsorted rather than filed under
 // either. A per-client IMAP source (a DB row) only ever matches clients in its own org.
 //
@@ -69,6 +70,7 @@ import { ensureStatusShareToken, formatProjectAddress, sendEmail, smtpConfigured
 import { addCommunication } from "./crm";
 import { describeKind, isImageKind, looksLikeCad, sniffFileKind } from "./fileTypes";
 import { HttpError } from "./httpError";
+import { intakeAuthRefusal } from "./intakeAuth";
 import { id } from "./ids";
 import { text } from "./json";
 import { logger } from "./logger";
@@ -131,17 +133,23 @@ const ADDRESS_RE = /[^\s<>,;:"'()[\]]+@[^\s<>,;:"'()[\]]+/g;
 
 /** A header as plain text, whatever shape mailparser gave it (a string, an address object, a
  *  structured { value } header, or an array of those when the header repeats). */
+function flatHeader(v: unknown): string {
+  if (v == null) return "";
+  if (Array.isArray(v)) return v.map(flatHeader).join(" ");
+  if (typeof v === "object") {
+    const o = v as { text?: unknown; value?: unknown };
+    return o.text != null ? String(o.text) : flatHeader(o.value);
+  }
+  return String(v);
+}
 function headerText(parsed: ParsedMail, name: string): string {
-  const flat = (v: unknown): string => {
-    if (v == null) return "";
-    if (Array.isArray(v)) return v.map(flat).join(" ");
-    if (typeof v === "object") {
-      const o = v as { text?: unknown; value?: unknown };
-      return o.text != null ? String(o.text) : flat(o.value);
-    }
-    return String(v);
-  };
-  return flat(parsed.headers?.get(name) as unknown);
+  return flatHeader(parsed.headers?.get(name) as unknown);
+}
+
+/** Each occurrence of a repeated header, in message order (top first), as plain text. */
+function headerValues(parsed: ParsedMail, name: string): string[] {
+  const v = parsed.headers?.get(name) as unknown;
+  return (v == null ? [] : Array.isArray(v) ? v : [v]).map(flatHeader).filter((t) => t.trim());
 }
 
 /** Every address the message was delivered to: To, Cc, and the Delivered-To / X-Original-To a
@@ -189,11 +197,6 @@ export function senderIsKnown(client: Pick<ClientRow, "contact_email" | "busines
   return entries.some((e) => (e.startsWith("@") ? e === domain : e === from));
 }
 
-/** DMARC said the From domain did not send this. Only a stated fail counts: plenty of honest mail
- *  passes through servers that add no Authentication-Results at all. */
-function dmarcFailed(parsed: ParsedMail): boolean {
-  return /\bdmarc=fail\b/i.test(headerText(parsed, "authentication-results"));
-}
 
 // ---------------------------------------------------------------------------
 // Attachments.
@@ -347,7 +350,7 @@ const REASON_TEXT: Record<EmailIntakeReason, string> = {
   unknown_tag: "No client has this intake tag.",
   ambiguous_tag: "More than one client has this intake tag.",
   unknown_sender: "The sender is not one of this client's addresses. Add it to the client's intake senders if it should be.",
-  sender_not_authenticated: "The sender's domain failed its DMARC check, so the From address cannot be trusted.",
+  sender_not_authenticated: "The From address could not be verified: the sender's domain failed its DMARC check, or EMAIL_INTAKE_REQUIRE_AUTH is on and the mail server recorded no passing result for it.",
   no_usable_attachments: "None of the attachments is a PDF or a photo we can use.",
   address_unreadable: "The project address could not be read from the documents (a scanned plan set, or no plan set). Open the files in the Parser.",
   plan_set_names_another_client: "The plan set's licence number belongs to a different client than the tag.",
@@ -533,7 +536,13 @@ async function processOne(db: AppDb, raw: Buffer, opts: IntakeOptions, result: E
   const client = clients[0];
   const orgId = client.org_id || DEFAULT_ORG_ID;
   if (!senderIsKnown(client, sender)) return unsorted("unknown_sender", orgId, client.id, null);
-  if (dmarcFailed(parsed)) return unsorted("sender_not_authenticated", orgId, client.id, null);
+  // A stated DMARC fail always refuses; with EMAIL_INTAKE_REQUIRE_AUTH on, so does the absence of a
+  // pass in the topmost Authentication-Results header (intakeAuth.ts says why the topmost only).
+  const authRefusal = intakeAuthRefusal(headerValues(parsed, "authentication-results"), sender);
+  if (authRefusal) {
+    logger.info("email-intake", `sender authentication: ${authRefusal}`, { tag });
+    return unsorted("sender_not_authenticated", orgId, client.id, null);
+  }
 
   const files = await sortAttachments(attachments);
   const usable = files.filter((f) => !f.refused);
