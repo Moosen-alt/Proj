@@ -16,6 +16,8 @@
 //   (P) PROVENANCE: a review-queue verification reads "set by a person", the bill-image read reads
 //       "utility bill", and a later edit whose fields are not recorded drops back to "project record".
 //   (T) A PERMIT TRACK shows the issuing agency and no account / meter rows.
+//   (G) RULE 1: the gate (automaticSubmitRefusals) answers the same before and after the sheet is read,
+//       and the sheet module calls no gate function, no stage route, no recipe writer and no SQL write.
 //   (W) A READ: building the sheet writes nothing (total_changes()).
 //   (D) THE DASHBOARD: the sheet's HTML lists the red items before the table and escapes every value;
 //       with no sheet (an older server) the plain confirm is still shown, and says so.
@@ -158,6 +160,21 @@ await check("(T) a permit track shows the issuing agency and no account or meter
   assert.equal(sheet.category, "permit");
   assert.equal(rowOf(sheet, "ahj").value, "Portland");
   assert.ok(!sheet.rows.some((r) => r.key === "account" || r.key === "meter" || r.key === "applicant"), JSON.stringify(sheet.rows.map((r) => r.key)));
+});
+
+await check("(G) RULE 1: reading the sheet leaves the gate's answer as it was, and the sheet module never reaches the gate or a recipe", () => {
+  const recipe = fx.completeRecipe();
+  const ask = (approver: string | null) => repo.automaticSubmitRefusals(db, {
+    recipeId: recipe.id, runId: "run-sheet", runApproval: approver ? { approver, runId: "run-sheet" } : null, env: { PORTAL_ALLOW_FINAL_SUBMIT: "1" },
+  });
+  const before = [ask(null), ask("Pat Approver")];
+  for (const id of [clean, mixed]) sheetFor(id);
+  assert.deepEqual([ask(null), ask("Pat Approver")], before, "the gate answered differently after the sheet was read");
+  // Source-level: the sheet is a read beside the gate, never a door into it.
+  const src = fs.readFileSync(path.join(REPO, "backend", "src", "approvalSheet.ts"), "utf8").split("\n").filter((l) => !/^\s*(\/\/|\*)/.test(l)).join("\n");
+  for (const forbidden of [/automaticSubmitRefusals|mayClickFinalSubmit|finalSubmitRefusals/, /prepareSubmission|prepare-submission/, /portal_recipes|savePortalRecipe/, /\b(INSERT|UPDATE|DELETE)\b/, /addAuditLog/]) {
+    assert.doesNotMatch(src, forbidden, `approvalSheet.ts reaches ${forbidden}`);
+  }
 });
 
 await check("(W) building the sheet writes nothing", () => {
