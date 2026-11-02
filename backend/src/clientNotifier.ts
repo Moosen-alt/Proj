@@ -91,7 +91,9 @@ function smtpConfigured(): boolean {
   return Boolean(process.env.SMTP_HOST && process.env.SMTP_FROM);
 }
 
-async function sendEmail(to: string, subject: string, textBody: string): Promise<void> {
+/** The product's one SMTP send. Exported for staffAlerts.ts (#487), so staff alerts go out on the
+ *  same transport and the same six SMTP_* variables as client email — one set to rotate. */
+export async function sendEmail(to: string, subject: string, textBody: string): Promise<void> {
   const { default: nodemailer } = await import("nodemailer");
   const port = Number(process.env.SMTP_PORT || 587);
   const transporter = nodemailer.createTransport({
