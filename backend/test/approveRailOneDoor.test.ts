@@ -61,7 +61,7 @@ const lift = (name: string): string => {
   return dashboard.slice(m.index, i) + (isConst ? ";" : "");
 };
 const NAMES = [
-  "humanize", "authForDecision", "APPROVE_AUTO_SUBMIT_LEDE", "APPROVE_HELD_BY_STAGED_DRAFT", "APPROVER_NAME_KEY", "approveAndAutoSubmitTrack",
+  "humanize", "authForDecision", "APPROVE_AUTO_SUBMIT_LEDE", "APPROVE_HELD_BY_STAGED_DRAFT", "APPROVER_NAME_KEY", "confirmApprovalSheet", "approveAndAutoSubmitTrack",
   "stagedResultLine", "NO_APPROVAL_RECORDED_TEXT", "stageSubmittalTrack",
   "RAIL_APPROVE_TITLE", "RAIL_APPROVE_NO_TRACK", "railApproveHold", "approveAndSubmit", "NEXT_STEP_BUTTON_LABELS",
 ];
