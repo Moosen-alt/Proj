@@ -64,7 +64,7 @@ import {
   type ContactFieldKind, type ContactRole, type ContactTrack,
 } from "../../../shared/src/contactRoles";
 import { portalSaysNotServed } from "../../../shared/src/portalNotServed";
-import { prepareComputeSettle, waitForComputeSettled } from "../computeSettle";
+import { computeStaleAtExit, prepareComputeSettle, waitForComputeSettled } from "../computeSettle";
 
 // AutoLearnAdapter — AUTONOMOUSLY learns an unknown AHJ/utility portal form instead of
 // having a human record it. Each page is scraped into a structured snapshot
@@ -269,6 +269,21 @@ export interface LearnResult {
    *  PageTrustEvidence). Recorded for the trust gate to read (#534); this field alone changes no
    *  decision. Undefined when no page had any. */
   trustEvidence?: PageTrustEvidence[];
+  /** #534 — EQUIPMENT VALUES THE PORTAL DID NOT KEEP: a control the deterministic equipment pass
+   *  set from the project's own equipment, read back NOT holding it (equipment_fill_not_held), and
+   *  still blank when the walk left its page. Each label is ALSO in requiredFieldMisses (it is a
+   *  required field left blank: an application's equipment make/model is never optional, whatever
+   *  marker the widget carries); listed here too so the backend can tell them from a QUESTION the
+   *  planner left unanswered (the note-topic learner reads only the latter). */
+  equipmentNotHeld?: string[];
+  /** #534 — "page N: <marker>" for every page the walk LEFT while the portal still said a computed
+   *  total was stale ("Needs to be recalculated"). The draft keeps whatever the page held then. */
+  computePendingAtExit?: string[];
+  /** #534 — "page N: <field>: <message>" for every field-level validation error (a visible
+   *  aria-invalid control, a visible field-feedback line) still showing when the walk LEFT the
+   *  page. Distinct from validationBlocks, which only ever means "an advance was refused": a portal
+   *  that saves drafts (PowerClerk) lets the walk advance past "This field is required." */
+  exitValidationErrors?: string[];
   /** Page-level messages the PORTAL printed during the walk, on any page, whether or not
    *  it advanced ("Property Address not found."). Distinct from validationBlocks, which
    *  only ever means "an advance was refused". */
@@ -2166,6 +2181,24 @@ interface AppliedFill {
   secretBinding?: string;
 }
 
+/** What the required-field sweep (collectUnfilledRequired) never counts as a blank: secret boxes the
+ *  learn leaves blank by design (bound by name at replay) and the review-gate acknowledgment. One
+ *  definition, handed into the sweep's page function as sources and read by the page-exit validation
+ *  reader (#534), so the two can never disagree about what is excluded. */
+const REQUIRED_SWEEP_SENSITIVE = /\b(password|passcode|account\s*(number|no|#)?|acct|meter\s*(number|no|#)?|ssn|social security|tax\s*id|ein|routing|card\s*number|cvv|security code)\b/i;
+const REQUIRED_SWEEP_ACK = /will not be submitted until|i understand\b|i acknowledge|i certify|i attest|accept (the )?terms|terms (and|&) conditions/i;
+
+/** #534 — the run-wide record of what each page still showed wrong as the walk LEFT it. `misses` and
+ *  `didNotHold` are learn()'s own fillVerifyMisses / missesDidNotHold (an unheld equipment value is a
+ *  required field left blank, typed and not kept); the other three are their own result fields. */
+interface PageExitLedger {
+  misses: string[];
+  didNotHold: string[];
+  equipmentNotHeld: string[];
+  computePending: string[];
+  invalid: string[];
+}
+
 export interface UploadSlot {
   /** A unique per-page key; the matching element is tagged with data-al-upl="<key>". */
   key: string;
@@ -2536,6 +2569,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    *  validation error after the fills, a required checkbox left unchecked, a stray equipment write.
    *  Recorded only; the trust gate's reading of it is #534's. */
   private trustEvidence: PageTrustEvidence[] = [];
+  /** #534 — EQUIPMENT CONTROLS THE PORTAL DID NOT KEEP, keyed by the CONTROL (its `section label`
+   *  context), not by the value key: the bare-select side guess can legitimately miss under one key
+   *  and land under the other on the same control. Set when every candidate was applied and read
+   *  back NOT holding (equipment_fill_not_held with no success); cleared by a later fill on that
+   *  control that held, or by finding it already holding the project's value. Whatever is still
+   *  here when the walk leaves the page is decided by a read-back (settleUnheldEquipment). */
+  private readonly equipmentUnheld = new Map<string, { target: ExtractedField; key: string }>();
   /** The run's own credential (from login()); used mid-run only on the start URL's site. */
   private runCredential: { username: string; password: string } | undefined;
   /** The URL the run was opened at — the run's own credential belongs to its host + first path
@@ -3148,6 +3188,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // (the total, a bare "tilt") is rebound, so the rows the learn adds — and every replay —
         // read this array's own key.
         if (rowControl) this.rebindRowStep(steps, field, resolved.key);
+        this.equipmentUnheld.delete(context); // it holds the project's value now (#534)
         continue;
       }
       let sawNotHeld = false;
@@ -3196,12 +3237,19 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         this.equipmentLanded.set(failKey, candidate);
         filled++;
         success = true;
+        this.equipmentUnheld.delete(context); // a later fill that held clears an earlier miss (#534)
         this.debug?.event({ type: "equipment_fill", label: context.slice(0, 80), key: resolved.key, candidate: candidate.slice(0, 60) });
         break;
       }
       // Every candidate applied but none held: remember and stop retrying this
       // field for the rest of the run (each retry burns option-wait caps).
-      if (!success && sawNotHeld && !strayed) this.equipmentFillFailed.add(failKey);
+      if (!success && sawNotHeld && !strayed) {
+        this.equipmentFillFailed.add(failKey);
+        // ...AND THE BLANK IS OWED TO THE TRUST GATE (#534). Live PacifiCorp: the inverter Model never
+        // held, nothing filled it after, and the recipe was promoted with it blank — this event was
+        // the only record, and nothing read it. Decided when the walk leaves the page.
+        if (!this.equipmentUnheld.has(context)) this.equipmentUnheld.set(context, { target, key: resolved.key });
+      }
     }
     return filled;
   }
@@ -6100,6 +6148,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // The same misses, split by WHY — see the note at verifyFillsLanded's call site.
     const missesDidNotHold: string[] = [];
     const missesNeverFilled: string[] = [];
+    // #534 — what each page still showed wrong as the walk LEFT it (sweepPageExit). Run-wide: a page
+    // left incomplete stays incomplete in the draft, whatever the final page looks like.
+    const exitLedger: PageExitLedger = {
+      misses: fillVerifyMisses, didNotHold: missesDidNotHold,
+      equipmentNotHeld: [], computePending: [], invalid: [],
+    };
 
     // Pathnames already walked this run. Mid-wizard, a planner NAVIGATE back to one of
     // these RESTARTS the flow (live Salem/Accela: from CapHome it clicked a link back to
@@ -8378,6 +8432,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //      a required box left unchecked, an equipment write that strayed. Recorded for the trust
       //      gate (#534) to read; nothing here changes the walk.
       if (!isDashboard && hasFillable) await this.recordPageTrustEvidence(pageCount, url).catch(() => null);
+      // d4c) THE PAGE AS THE WALK LEAVES IT (#534) — equipment the portal did not keep, a total still
+      //      to be recalculated, a field still showing a validation error. After the retraction just
+      //      above (which splices by label), so nothing recorded here can be retracted by it. Same
+      //      pages as the required sweep; the review page is swept at (f).
+      if (!plan.atReview && !isDashboard && hasFillable) {
+        await this.sweepPageExit(pageCount, exitLedger).catch(() => null);
+      }
 
       // e) Record the final submit (if any). Clicked ONLY on the operator's explicit
       //    delegation; otherwise recorded and left for a human. Pay/fee buttons rejected.
@@ -8452,6 +8513,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // that keeps resetting. One more pass at the exit; verifyFillsLanded already
         // re-applies whatever is lost.
         await this.verifyFillsLanded(appliedThisPage, { budgetMs: 25_000, requiredOnly: true }).catch(() => [] as string[]);
+        // The review page is a page the walk leaves too (#534): a final wizard page can carry the
+        // equipment section, and a rating still "Needs to be recalculated" there was seen live.
+        // Reads only — before the drain and the lockdown below.
+        await this.sweepPageExit(pageCount, exitLedger).catch(() => null);
         reachedReview = true;
         // ...AND THE PORTAL HAS SAVED IT (B3): the re-apply above may have written again, and the lock
         // below aborts everything, own writes included — so the run's own pending save drains first.
@@ -8863,6 +8928,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       break;
     }
 
+    // #534 — an equipment miss no page exit decided (the walk ended mid-page, or left it by a path
+    // that skips the sweep) is decided now, by the same read-back. Fail closed: a control that
+    // cannot be found any more is still a value the portal did not keep.
+    await this.recordUnheldEquipment(exitLedger).catch(() => null);
+
     // 3) Scrape the review screen (best effort).
     let reviewScreen: LearnResult["reviewScreen"] = { fields: [], bodyTextSnippet: "" };
     try {
@@ -8904,6 +8974,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         + (missesNeverFilled.length ? ` NEVER FILLED (nothing was typed): ${missesNeverFilled.slice(0, 8).join(", ")}.` : "")
         + " Re-check these before submit."
       : "";
+    // #534 — what a page still showed wrong when the walk LEFT it. Said here as well as handed to the
+    // trust gate: the person at review reads this message, and the final page will not show it.
+    const exitWarning =
+      (exitLedger.computePending.length
+        ? ` 🧮 ${exitLedger.computePending.length} page(s) were left with a computed total still to be recalculated — open each and recalculate before submit: ${exitLedger.computePending.slice(0, 6).join("; ")}.`
+        : "")
+      + (exitLedger.invalid.length
+        ? ` ⛔ ${exitLedger.invalid.length} field(s) still showed a validation error when the walk left the page — fix before submit: ${exitLedger.invalid.slice(0, 8).join("; ")}.`
+        : "");
     // The portal's own words, quoted. On a run that never reached review this is usually the
     // ONLY line that names a cause — the trace shows the same page seven times and the
     // validation channel is empty, because every advance "worked".
@@ -8936,9 +9015,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       ? ` 🏢 Not chosen — ${this.filerIdentityRefused.slice(0, 3).join(" | ")}`
       : "";
     const message = reachedReview
-      ? `${HUMAN_REVIEW_MESSAGE} Auto-learn reached the review screen after ${pageCount} page(s). Verify every field/value below before a human submits.${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${filerWarning}${noticeWarning}${choiceWarning}`
+      ? `${HUMAN_REVIEW_MESSAGE} Auto-learn reached the review screen after ${pageCount} page(s). Verify every field/value below before a human submits.${validationWarning}${docsWarning}${verifyWarning}${exitWarning}${secretWarning}${filerWarning}${noticeWarning}${choiceWarning}`
       : filledSomething
-        ? `Auto-learn filled ${pageCount} page(s) and recorded the steps, but did not reach a review screen. Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${filerWarning}${noticeWarning}${choiceWarning}`
+        ? `Auto-learn filled ${pageCount} page(s) and recorded the steps, but did not reach a review screen. Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${exitWarning}${secretWarning}${filerWarning}${noticeWarning}${choiceWarning}`
         : tileStop
           ? `Auto-learn stopped at a page of ${tileStop.tiles.length} choice tile(s): ${tileStop.why}. The page offered: ${tileStop.tiles.map((t) => `"${t}"`).join(" | ")}. If one of these is the way in, a person clicks it; record that step manually. (${pageCount} page(s), no steps recorded.) Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`
           : `Auto-learn found nothing fillable on ${pageCount} page(s); no steps recorded.${nothingFillableHint} Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`;
@@ -8990,6 +9069,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       requiredFieldMisses: fillVerifyMisses,
       missingRequiredDocs,
       validationBlocks,
+      // #534 — always present (possibly empty), like validationBlocks: the backend's trust gate reads
+      // all three, and an absent field must never be confused with a run that checked.
+      equipmentNotHeld: exitLedger.equipmentNotHeld,
+      computePendingAtExit: exitLedger.computePending,
+      exitValidationErrors: exitLedger.invalid,
       portalNotices: portalNotices.length ? portalNotices.slice(0, 5) : undefined,
       secretsLeftBlank: this.secretsLeftBlank.length ? this.secretsLeftBlank.map((s) => s.label) : undefined,
       filerIdentityRefused: this.filerIdentityRefused.length ? [...this.filerIdentityRefused] : undefined,
@@ -10667,9 +10751,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
 
   private async collectUnfilledRequired(): Promise<string[]> {
     if (!this.page || typeof this.page.evaluate !== "function") return [];
-    const labels = await this.page.evaluate(() => {
-      const SENSITIVE = /\b(password|passcode|account\s*(number|no|#)?|acct|meter\s*(number|no|#)?|ssn|social security|tax\s*id|ein|routing|card\s*number|cvv|security code)\b/i;
-      const ACK = /will not be submitted until|i understand\b|i acknowledge|i certify|i attest|accept (the )?terms|terms (and|&) conditions/i;
+    const labels = await this.page.evaluate((src: { sensitive: string; ack: string }) => {
+      // The exclusions are module constants (REQUIRED_SWEEP_SENSITIVE / _ACK) handed in as sources,
+      // so the page-exit validation reader (#534) excludes exactly what this sweep excludes.
+      const SENSITIVE = new RegExp(src.sensitive, "i");
+      const ACK = new RegExp(src.ack, "i");
       const norm = (s: string | null | undefined) => (s || "").trim().replace(/\s+/g, " ");
       // Walk OPEN shadow roots too — a required field inside a web component must gate
       // trust exactly like a light-DOM one (the fill loop can see and fill it, so this
@@ -10738,7 +10824,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         }
       }
       return Array.from(out).slice(0, 20);
-    }).catch(() => [] as string[]);
+    }, { sensitive: REQUIRED_SWEEP_SENSITIVE.source, ack: REQUIRED_SWEEP_ACK.source }).catch(() => [] as string[]);
     const all = Array.isArray(labels) ? labels : [];
     // A BATTERY SPEC ON A NO-BATTERY JOB IS BLANK BY DESIGN, like a sensitive field: the fill
     // guard refuses to invent it, so counting it as a required miss would block the trust gate on
@@ -10864,6 +10950,112 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     if (entry.strayWrites.length) {
       this.debug?.event({ type: "equipment_fill_reached_other_control", page, where: entry.where, writes: entry.strayWrites.slice(0, 12) });
     }
+  }
+
+  /**
+   * THE PAGE AS THE WALK LEAVES IT (#534).
+   *
+   * A live PacifiCorp learn walked ten pages and was trusted, because its verifiers read only the
+   * final page. Page 9 had been left with the inverter Model blank and System Rating reading "Needs
+   * to be recalculated"; the run's own events said so (equipment_fill_not_held, compute_settled
+   * settled:false) and nothing carried either to the trust gate. The required sweep could not see
+   * the model: PowerClerk's filtered select carries no required marker, only the portal's own
+   * "This field is required." line under it. So, on every page the walk leaves, three readings:
+   *
+   *   A. an equipment value the portal did not keep, still blank now (settleUnheldEquipment) — a
+   *      required field left blank, typed and not kept: into the run's required misses;
+   *   B. the portal's own marker that a computed total is stale (computeStaleAtExit);
+   *   C. a field-level validation error still showing (collectFieldValidationErrors).
+   *
+   * Reads only — nothing here clicks or types. Each finding is page-numbered and never retracted by
+   * a later page: a page left incomplete stays incomplete in the draft.
+   */
+  private async sweepPageExit(page: number, into: PageExitLedger): Promise<void> {
+    const unheld = await this.recordUnheldEquipment(into);
+    const stale = this.page ? await computeStaleAtExit(this.page).catch(() => "") : "";
+    if (stale) {
+      const line = `page ${page}: ${stale}`;
+      if (!into.computePending.includes(line)) into.computePending.push(line);
+    }
+    const invalid = (await this.collectFieldValidationErrors()).map((e) => `page ${page}: ${e}`);
+    for (const line of invalid) if (!into.invalid.includes(line)) into.invalid.push(line);
+    if (unheld.length || stale || invalid.length) {
+      this.debug?.event({
+        type: "page_exit_incomplete", page,
+        equipmentNotHeld: unheld.slice(0, 8), computePending: stale || null, validationErrors: invalid.slice(0, 8).map((v) => v.slice(0, 160)),
+      });
+    }
+  }
+
+  /** A — decide every pending unheld equipment value by reading its control back, and record the
+   *  ones still blank as required misses. Returns the labels recorded. */
+  private async recordUnheldEquipment(into: PageExitLedger): Promise<string[]> {
+    const unheld = await this.settleUnheldEquipment();
+    for (const label of unheld) {
+      if (!into.misses.includes(label)) into.misses.push(label);
+      if (!into.didNotHold.includes(label)) into.didNotHold.push(label);
+      if (!into.equipmentNotHeld.includes(label)) into.equipmentNotHeld.push(label);
+    }
+    return unheld;
+  }
+
+  /** Read back each equipment control the portal did not keep (equipmentUnheld) and empty the list.
+   *  Returns the controls (by `section label`) still blank — or no longer found, or unreadable:
+   *  FAIL CLOSED, because the control WAS read when it was seen not holding, and "could not tell"
+   *  is not "it holds". A control the page no longer shows is not asked any more and is dropped. A
+   *  non-blank value that is not the project's is not a blank; whether it is the right value is a
+   *  binding question, not this one. */
+  private async settleUnheldEquipment(): Promise<string[]> {
+    const out: string[] = [];
+    const pending = [...this.equipmentUnheld.entries()];
+    this.equipmentUnheld.clear();
+    for (const [context, u] of pending) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const loc = (await this.locator(u.target.selector).catch(() => null)) as any;
+      const found = loc ? (await loc.count?.().catch(() => 1)) !== 0 : false;
+      if (found && typeof loc.isVisible === "function" && !(await loc.isVisible().catch(() => true))) {
+        this.debug?.event({ type: "equipment_unheld_dropped", label: context.slice(0, 80), why: "no longer shown" });
+        continue;
+      }
+      const raw = found ? await this.currentControlValue(u.target) : null;
+      const text = String(raw ?? "").replace(/\s+/g, " ").trim();
+      // A whole-string placeholder ("Please select...", "-- Select --", "Choose one"), never a value
+      // that merely starts with the word.
+      const blank = !text || /^[-\s]*((please\s+)?(select|choose)(\s+(one|an?\s+option))?)[\s.…-]*$/i.test(text);
+      if (!blank) {
+        this.debug?.event({ type: "equipment_unheld_cleared", label: context.slice(0, 80), key: u.key });
+        continue;
+      }
+      out.push(context);
+    }
+    return out;
+  }
+
+  /** C — the field-level validation errors still showing (fieldValidationErrorsInPage), as
+   *  "<field>: <message>". The required sweep's exclusions apply (secret boxes left blank by design,
+   *  the review acknowledgment, a battery spec on a no-battery job), and every line is scrubbed of
+   *  the run's secrets before it can leave the adapter — a portal repeats a typed account back in
+   *  its error, exactly as with validationBlocks. */
+  private async collectFieldValidationErrors(): Promise<string[]> {
+    if (!this.page || typeof this.page.evaluate !== "function") return [];
+    await this.page.evaluate("globalThis.__name = globalThis.__name || function (f) { return f; };").catch(() => null);
+    const raw = await this.page.evaluate(fieldValidationErrorsInPage).catch(() => null);
+    if (!Array.isArray(raw)) return [];
+    const norm = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
+    const out: string[] = [];
+    for (const r of raw as Array<{ label?: string; section?: string; message?: string }>) {
+      const label = norm(r.label).slice(0, 80);
+      const message = norm(r.message).slice(0, 160);
+      if (!message) continue;
+      if (REQUIRED_SWEEP_SENSITIVE.test(label) || REQUIRED_SWEEP_ACK.test(label)) continue;
+      if (!label && (REQUIRED_SWEEP_SENSITIVE.test(message) || REQUIRED_SWEEP_ACK.test(message))) continue;
+      if (this.hasBattery === false && label && batteryControlKind(label, { control: "text" }) === "spec") continue;
+      const section = norm(r.section).slice(0, 60);
+      const field = section && label && !label.toLowerCase().includes(section.toLowerCase()) ? `${section} ${label}` : (label || section);
+      const line = this.scrubSecrets(field ? `${field}: ${message}` : message);
+      if (!out.includes(line)) out.push(line);
+    }
+    return out.slice(0, 20);
   }
 
   // Read each applied fill back; re-apply once if it didn't hold; return the labels of REQUIRED
@@ -12363,6 +12555,98 @@ export async function collectValidationErrorsFrom(page: any): Promise<string[]> 
   } catch {
     return [];
   }
+}
+
+/**
+ * FIELD-LEVEL VALIDATION STILL SHOWING ON THE PAGE (#534) — read by the learner as it leaves each
+ * page (sweepPageExit). A portal that saves drafts lets the walk advance past "This field is
+ * required." (PowerClerk did, under a blank inverter Model, on a learn that was then trusted), so
+ * collectValidationErrorsFrom — which runs only after an advance that did NOT move — never sees it.
+ *
+ * Deliberately NOT that function. It is the post-advance guard learn and replay share, and it reads
+ * page-level banners (role=alert, .alert-danger, aria-live) that are often not about any field. This
+ * reads only what a portal attaches to a CONTROL:
+ *   - a visible field-feedback element with text (.invalid-feedback, *validation-feedback*,
+ *     *field-validation-error*, data-test-role="validation-error", data-valmsg-for), tied to its
+ *     control by aria-describedby, data-valmsg-for, an "<id>-validation-error" id, or else the
+ *     nearest ancestor holding a control (its aria-invalid one, else the control just before it);
+ *   - a visible control marked aria-invalid="true" that no message was tied to.
+ * Visible = a non-empty box and not display:none / visibility:hidden (a 1x1 visually-hidden combobox
+ * input counts; a collapsed section's 0x0 does not). Page-side and self-contained (evaluate serializes
+ * it); labels are the required sweep's reading (label[for], the wrapping label, the group's legend /
+ * label, aria-label), plus the nearest fieldset legend as `section`.
+ */
+export function fieldValidationErrorsInPage(): Array<{ label: string; section: string; message: string }> {
+  const norm = (s: string | null | undefined): string => String(s || "").replace(/\s+/g, " ").trim();
+  const deepQueryAll = (root: ParentNode, sel: string): Element[] => {
+    const found: Element[] = Array.from(root.querySelectorAll(sel));
+    for (const host of Array.from(root.querySelectorAll("*"))) {
+      if ((host as Element).shadowRoot) found.push(...deepQueryAll((host as Element).shadowRoot as ShadowRoot, sel));
+    }
+    return found;
+  };
+  const shown = (el: Element): boolean => {
+    const r = (el as HTMLElement).getBoundingClientRect?.();
+    if (!r || (r.width <= 0 && r.height <= 0)) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden";
+  };
+  const GROUP = "fieldset, .form-group, [class*='form-group'], [class*='field'], .row, [class*='row']";
+  const labelOf = (el: Element): string => {
+    const root = el.getRootNode() as Document | ShadowRoot;
+    const id = el.getAttribute("id");
+    if (id) { const l = root.querySelector(`label[for="${CSS.escape(id)}"]`); if (l?.textContent?.trim()) return norm(l.textContent); }
+    const w = el.closest("label"); if (w?.textContent?.trim()) return norm(w.textContent);
+    const grp = el.closest(GROUP);
+    const gl = grp?.querySelector("legend, label, .control-label, .field-label, strong, b");
+    if (gl?.textContent?.trim()) return norm(gl.textContent);
+    return norm(el.getAttribute("aria-label") || el.getAttribute("name") || "");
+  };
+  const sectionOf = (el: Element): string => {
+    const legend = el.closest("fieldset")?.querySelector(":scope > legend");
+    return legend ? norm(legend.textContent).slice(0, 60) : "";
+  };
+  const CONTROL = "input:not([type=hidden]), select, textarea, [role=combobox], [role=listbox], [role=radiogroup]";
+  const FEEDBACK = ".invalid-feedback, [class*='validation-feedback'], [class*='field-validation-error'], [data-test-role='validation-error'], [data-valmsg-for]";
+  const out: Array<{ label: string; section: string; message: string }> = [];
+  const seen = new Set<string>();
+  const tied = new Set<Element>();
+  const push = (control: Element | null, near: Element, message: string): void => {
+    const label = control ? labelOf(control) : "";
+    const section = sectionOf(control ?? near);
+    const key = `${section}|${label}|${message}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    if (control) tied.add(control);
+    out.push({ label, section, message });
+  };
+  for (const fb of deepQueryAll(document, FEEDBACK)) {
+    const message = norm((fb as HTMLElement).innerText || fb.textContent);
+    if (!message || message.length > 200 || !shown(fb)) continue;
+    const root = fb.getRootNode() as Document | ShadowRoot;
+    let control: Element | null = null;
+    const fbId = fb.getAttribute("id") || "";
+    if (fbId) control = root.querySelector(`[aria-describedby~="${CSS.escape(fbId)}"]`);
+    const forName = fb.getAttribute("data-valmsg-for");
+    if (!control && forName) control = root.querySelector(`[name="${CSS.escape(forName)}"]`);
+    if (!control && /-(validation-)?error$/.test(fbId)) {
+      const cid = fbId.replace(/-(validation-)?error$/, "");
+      if (cid) control = root.querySelector(`#${CSS.escape(cid)}`);
+    }
+    for (let a = fb.parentElement; a && !control; a = a.parentElement) {
+      const inside = Array.from(a.querySelectorAll(CONTROL)).filter((c) => !fb.contains(c));
+      if (!inside.length) continue;
+      control = inside.find((c) => c.getAttribute("aria-invalid") === "true")
+        ?? inside.filter((c) => !!(c.compareDocumentPosition(fb) & Node.DOCUMENT_POSITION_FOLLOWING)).pop()
+        ?? inside[0];
+    }
+    push(control, fb, message);
+  }
+  for (const c of deepQueryAll(document, "[aria-invalid='true']")) {
+    if (tied.has(c) || !c.matches(CONTROL) || !shown(c)) continue;
+    push(c, c, "marked invalid by the portal");
+  }
+  return out.slice(0, 20);
 }
 
 // A PAGE THAT MOVED CAN STILL HAVE MOVED BACKWARDS.
