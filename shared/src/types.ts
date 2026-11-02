@@ -460,6 +460,75 @@ export interface FeeComparison {
   note: string;
 }
 
+/** FEE ACCURACY (#494): what we quoted at filing beside what the jurisdiction was paid. */
+export type FeeAccuracyPaidSource = "actual" | "portal_record" | "receipts" | "billing_summary";
+
+export interface FeeAccuracyJob {
+  projectId: string;
+  /** The project's homeowner name as the dashboard shows it (org-scoped report), else its id. */
+  label: string;
+  filedAt: string;
+  quotedUsd: number;
+  /** The ladder tier the filing-time quote came from; "payment_row" for a job filed before
+   *  quotes were snapshotted (the estimate frozen on its paid quote). */
+  quoteSource: PermitFeeSource | "payment_row";
+  quoteConfidence: string;
+  quoteBasis: string;
+  quotedAt: string;
+  paidUsd: number;
+  paidSource: FeeAccuracyPaidSource;
+  paidBasis: string;
+  /** quoted − paid. Negative: quoted low. */
+  missUsd: number;
+  /** missUsd ÷ paid × 100, one decimal. */
+  missPct: number;
+}
+
+export interface FeeAccuracyGroup {
+  track: "permit" | "nem";
+  state: string;
+  /** The project's AHJ as entered (permit) or its utility (nem). */
+  jurisdiction: string;
+  n: number;
+  medianMissPct: number;
+  medianAbsMissPct: number;
+  /** The signed miss of the job furthest off. */
+  worstMissPct: number;
+  /** The median's direction, "on" when within the threshold. */
+  direction: "low" | "high" | "on";
+  /** medianAbsMissPct over the threshold. */
+  flagged: boolean;
+  /** Furthest off first. */
+  jobs: FeeAccuracyJob[];
+}
+
+export interface FeeAccuracyExclusion {
+  projectId: string;
+  label: string;
+  track: "permit" | "nem";
+  state: string;
+  jurisdiction: string;
+  reason:
+    | "no_quote"
+    | "quote_not_frozen"
+    | "no_researched_figure"
+    | "no_paid_figure"
+    | "partial_portal_read"
+    | "provisional_portal_read"
+    | "receipts_incomplete";
+  detail: string;
+}
+
+export interface FeeAccuracyReport {
+  thresholdPct: number;
+  generatedAt: string;
+  /** Flagged first, then by median absolute miss. */
+  groups: FeeAccuracyGroup[];
+  /** Filed jobs left out, each with why: a missing quote, or no whole, settled paid figure. */
+  excluded: FeeAccuracyExclusion[];
+  notes: string[];
+}
+
 /** One line of what a printed fee table composes for a job (#454): the permit line, or a
  *  percentage surcharge evaluated on it (per line, never stored pre-multiplied). */
 export interface PrintedFormFeeLine {
