@@ -32,6 +32,12 @@
 //                participating in the Wattsmart Battery Program?") — required of every applicant,
 //                battery or not; never refused, never forced (PacifiCorp rejected a filing by name
 //                when it was left blank).
+//   ATTESTATION  a statement about how THIS battery behaves that the applicant ticks ("The battery
+//                system will not backfeed into the grid.", "The battery system includes a transfer
+//                switch … (islanding)") — #536. A statement on the filing, so it is answered ONLY
+//                from an owner ruling for that portal (BATTERY_ATTESTATION_RULINGS below), never
+//                by the planner; on a no-battery job it is never ticked and replay skips it (it
+//                describes a battery that does not exist, exactly like a spec).
 //   MENTION      the words appear but the control is none of the above (an acknowledgment box
 //                citing "the Battery System Interim Technical Requirements", a notes box) — the
 //                planner's value stands.
@@ -42,7 +48,68 @@
  *  step's action mapped by batteryControlOfStep. Anything else reads as "other". */
 export type BatteryControl = "select" | "radio" | "checkbox" | "text" | "file" | "other";
 
-export type BatteryControlKind = "spec" | "declaration" | "program" | "mention";
+export type BatteryControlKind = "spec" | "declaration" | "program" | "attestation" | "mention";
+
+// ── BATTERY ATTESTATIONS (#536) ─────────────────────────────────────────────────────────────
+//
+// Live on a PacifiCorp battery learn (2026-11-02, synthetic job, one Enphase IQ Battery 5P):
+// ticking "This system includes battery storage" revealed two REQUIRED checkboxes, and the walk
+// left both unticked:
+//   "The battery system will not backfeed into the grid." *
+//   "The battery system includes a transfer switch (or equivalent) to ensure proper isolation
+//    before going off grid (islanding)." *
+// Each is a statement the applicant makes on the filing, so it is not the planner's to make. The
+// owner ruled on PacifiCorp (2026-11-02, issue #536): "these can all be checked as yes too" —
+// Pacific Power does not allow battery export. That ruling is DATA here, per portal and per
+// statement; a portal with no ruling has no answer and the box is left for a person.
+
+/** The attestation statements this code can recognise, by id. CLOSED on purpose: a statement is
+ *  only an "attestation" once someone has written its words here, so a new portal's new sentence
+ *  reads as before (a mention) until a person adds it — and a ruling to answer it. */
+const BATTERY_ATTESTATION_STATEMENTS: ReadonlyArray<{ id: string; re: RegExp }> = Object.freeze([
+  // "The battery system will not backfeed into the grid." / "…will not export to the grid".
+  { id: "no-backfeed", re: /\b(?:batter(?:y|ies)|energy\s*storage|storage\s+system|ess)\b[^.]{0,60}\b(?:will|shall|does|do)\s+not\s+(?:back-?\s*feed|export)\b/i },
+  // "The battery system includes a transfer switch (or equivalent) to ensure proper isolation
+  // before going off grid (islanding)."
+  { id: "transfer-switch-isolation", re: /\b(?:batter(?:y|ies)|energy\s*storage|storage\s+system|ess)\b[^.]{0,60}\btransfer\s+switch\b[^.]{0,160}\b(?:isolat\w*|island\w*|off[-\s]?grid)\b/i },
+].map((s) => Object.freeze(s)));
+
+/** WHO RULED, ON WHICH PORTAL, WHAT. `portal` is tested against the portal's name as the run
+ *  carries it (the NEM learn's portalName is the project's utility). Rocky Mountain Power is
+ *  PacifiCorp's other brand, but the ruling named PacifiCorp / Pacific Power, so it is not
+ *  covered until someone rules on it. */
+export type BatteryAttestationRuling = Readonly<{ portal: RegExp; statements: ReadonlyArray<string>; answer: "checked"; ruling: string }>;
+export const BATTERY_ATTESTATION_RULINGS: ReadonlyArray<BatteryAttestationRuling> = Object.freeze([
+  Object.freeze({
+    portal: /\bpacifi\s?corp\b|\bpacific\s+power\b/i,
+    statements: Object.freeze(["no-backfeed", "transfer-switch-isolation"]),
+    answer: "checked" as const,
+    ruling: "owner ruling 2026-11-02 (#536): on PacifiCorp battery jobs both attestations are checked; Pacific Power does not allow battery export",
+  }),
+]);
+
+/** The attestation statement a label makes, or null. */
+export function batteryAttestationOf(label: unknown): string | null {
+  const text = String(label ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  return BATTERY_ATTESTATION_STATEMENTS.find((s) => s.re.test(text))?.id ?? null;
+}
+
+/** THE ANSWER A BATTERY JOB GIVES THIS ATTESTATION ON THIS PORTAL — only from a ruling, else null
+ *  (leave it for a person). Never on a job without a battery, and never while the project is
+ *  silent about one: the statement describes a battery that has to exist. */
+export function batteryAttestationAnswer(
+  portalName: unknown,
+  label: unknown,
+  hasBattery: boolean | undefined,
+): { answer: "checked"; statement: string; ruling: string } | null {
+  if (hasBattery !== true) return null;
+  const statement = batteryAttestationOf(label);
+  if (!statement) return null;
+  const portal = String(portalName ?? "");
+  const r = BATTERY_ATTESTATION_RULINGS.find((x) => x.portal.test(portal) && x.statements.includes(statement));
+  return r ? { answer: r.answer, statement, ruling: r.ruling } : null;
+}
 
 /** The words that make a label ABOUT storage at all. Bare "storage" counts: "Storage capacity
  *  (kWh)" is a battery spec on every interconnection portal that asks it. */
@@ -145,6 +212,9 @@ export function batteryControlKind(
   const kind = controlOf(control.control);
   // A programme question names the battery but asks about enrolment.
   if (/\bprogram(?:me)?\b/i.test(text)) return "program";
+  // A statement about the battery's behaviour the applicant ticks (#536) — before the spec words,
+  // which "transfer switch … rating" style wording could otherwise reach.
+  if (batteryAttestationOf(text)) return "attestation";
   // A battery's document is a fact about the battery, never the yes/no question.
   if (kind === "file") return "spec";
   if (SPEC_WORDS.test(text)) return "spec";

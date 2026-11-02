@@ -5246,7 +5246,10 @@ export class RecipeAdapter extends BasePortalAdapter {
     // which it was, between the declaration commit and this one: isBatteryDeclaration said
     // "declaration" for every check step and skipForNoBattery then executed it.
     if (kind === "declaration") return step.action === "check";
-    return true; // a spec of a battery that does not exist
+    // A spec of a battery that does not exist — and an ATTESTATION about one (#536: "The battery
+    // system will not backfeed into the grid" is never ticked for a battery that is not there; on
+    // such a job the portal does not render it, so a recorded tick skips rather than fails).
+    return true;
   }
 
   // A SLOT THAT ONLY EXISTS AT REPLAY CAN ONLY BE FILLED AT REPLAY.

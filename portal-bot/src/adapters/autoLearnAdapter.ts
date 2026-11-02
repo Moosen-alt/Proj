@@ -50,7 +50,7 @@ export interface ContinueDraft {
   awaitingSignature?: boolean;
 }
 import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isInterstitialForwardLabel as sharedIsInterstitialForwardLabel, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
-import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
+import { BATTERY_DECLARATION_QUESTION, batteryAttestationAnswer, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
 import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopSentLine, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
 // Types only (erased): the information-page door is reached duck-typed on the installed backstop.
 import type { FilingBackstop, InfoPageCandidateTake, InfoPagePassOpen } from "../filingBackstop";
@@ -208,6 +208,24 @@ export interface LearnPlanResponse {
 
 export type LearnPlanner = (req: LearnPlanRequest) => Promise<LearnPlanResponse>;
 
+/** #536 — WHAT A PAGE ENDED WITH THAT A PERSON WOULD NOT CALL CLEAN, read just before the walk
+ *  leaves it (after every fill, the rescans, the policy / declaration / attestation passes and the
+ *  required sweep). Labels and the portal's own message text only, scrubbed of secrets.
+ *   - validationErrors: a field the portal shows as invalid after the fills — "Total System Export
+ *     (kW): Please enter a valid decimal number" (the PacifiCorp battery learn, 2026-11-02). The
+ *     advance was not refused (PowerClerk validates at submit), so validationBlocks never saw it.
+ *   - requiredUnchecked: a REQUIRED checkbox still unchecked. `acknowledgment` marks the boxes the
+ *     walk leaves for a person by design (the review gate's "will not be submitted until…", terms).
+ *   - strayWrites: an equipment write that reached another control (put back, not recorded) or
+ *     whose selector reached another field's control (not typed). */
+export type PageTrustEvidence = {
+  page: number;
+  where: string;
+  validationErrors: string[];
+  requiredUnchecked: Array<{ label: string; acknowledgment: boolean }>;
+  strayWrites: string[];
+};
+
 export interface LearnResult {
   ok: boolean;
   portalName: string;
@@ -246,6 +264,10 @@ export interface LearnResult {
   missingRequiredDocs?: string[];
   /** Inline validation errors the portal raised when an advance was blocked. */
   validationBlocks?: string[];
+  /** #536 — PER-PAGE TRUST EVIDENCE, one entry per page that ended with any (see
+   *  PageTrustEvidence). Recorded for the trust gate to read (#534); this field alone changes no
+   *  decision. Undefined when no page had any. */
+  trustEvidence?: PageTrustEvidence[];
   /** Page-level messages the PORTAL printed during the walk, on any page, whether or not
    *  it advanced ("Property Address not found."). Distinct from validationBlocks, which
    *  only ever means "an advance was refused". */
@@ -2480,6 +2502,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   // Equipment fields whose select verification failed for EVERY candidate this
   // run — retrying them each rescan pass just burns waitForOptionReady caps.
   private equipmentFillFailed = new Set<string>();
+  /** #536 — every equipment write that reached (or would have reached) a control it was not aimed
+   *  at, for the whole walk (labels only), and the ones on the page being walked now. */
+  private equipmentStrays: string[] = [];
+  private pageEquipmentStrays: string[] = [];
+  /** #536 — per-page TRUST EVIDENCE (labels and the portal's own words, scrubbed): a visible
+   *  validation error after the fills, a required checkbox left unchecked, a stray equipment write.
+   *  Recorded only; the trust gate's reading of it is #534's. */
+  private trustEvidence: PageTrustEvidence[] = [];
   /** The run's own credential (from login()); used mid-run only on the start URL's site. */
   private runCredential: { username: string; password: string } | undefined;
   /** The URL the run was opened at — the run's own credential belongs to its host + first path
@@ -3003,6 +3033,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       if (resolved.side && !bareSelect) { lastSide = resolved.side; lastSideAt = i; }
       const failKey = `${resolved.key}::${context}`;
       if (this.equipmentFillFailed.has(failKey)) continue;
+      // #536: a refusal for reaching ANOTHER control is about this one occurrence's selector — a
+      // repeated label's other occurrence (the cloned system's box) still gets its own try.
+      const strayKey = `${failKey}::#${occurrence}`;
+      if (this.equipmentFillFailed.has(strayKey)) continue;
       // DUPLICATE LABELS make a label selector ambiguous — getByLabel("Quantity")
       // resolves to the FIRST match, so the inverter quantity would overwrite the
       // module quantity. Prefer the element's unique #id fallback (kept as the
@@ -3032,6 +3066,21 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           ? { ...field, selector: { css: cssFb.css, ...frame, fallbacks: labelFb } }
           : { ...field, selector: { ...field.selector, nth: occurrence } };
       }
+      // #536 — THE CONTROL THIS SELECTOR RESOLVES TO MUST BE THE ONE THE FIELD NAMES. A field's
+      // selector is read when the page is scraped; PowerClerk re-renders a section when a box in
+      // it is ticked and renumbers its per-render ids, so by the time this pass runs a recorded
+      // #pcInputBaseNN can name the NEIGHBOURING control. Live (PacifiCorp battery learn,
+      // 2026-11-02): batteryModel, aimed at "Battery Inverter Model", was typed into Total System
+      // Export (kW) — "Please enter a valid decimal number". When the element the selector reaches
+      // calls itself by ANOTHER field's label on this page (and not by this one's), nothing is
+      // typed: the field is reported and left alone.
+      const wrongControl = await this.equipmentTargetIsAnotherField(target, field, fields);
+      if (wrongControl) {
+        this.equipmentFillFailed.add(strayKey);
+        this.noteEquipmentStray({ label: String(field.label ?? ""), key: resolved.key, other: wrongControl, reverted: false, refusedBeforeWrite: true });
+        this.debug?.event({ type: "equipment_fill_wrong_control", label: context.slice(0, 80), key: resolved.key, resolvedTo: wrongControl.slice(0, 80) });
+        continue;
+      }
       // Already holding one of our values (e.g. a rescan pass)? Leave it alone —
       // re-selecting a manufacturer re-fires the portal's cascade and WIPES the
       // dependent model select that was just filled.
@@ -3042,17 +3091,37 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       }
       let sawNotHeld = false;
       let success = false;
+      let strayed = false;
       for (const candidate of resolved.candidates) {
+        // #536 — what every OTHER text box on the page holds before this write, so a write that
+        // landed somewhere else is seen, put back and reported (equipmentStrayWrites).
+        const before = await this.snapshotOtherTextControls(target);
         const step = await this.applyFill(target, { value: candidate, field: resolved.key }, false);
+        const strays = before ? await this.equipmentStrayWrites(before, candidate) : [];
+        if (strays.length) {
+          // The write reached a control it was not aimed at. Put each one back to what it held,
+          // record NO step (a replay would repeat the stray write on every project), and stop
+          // trying this field for the run — a person checks both controls.
+          const reverted = await this.revertStrayWrites(strays);
+          for (const s of strays) {
+            this.noteEquipmentStray({ label: String(field.label ?? ""), key: resolved.key, other: s.label, reverted: reverted.has(s.mark), refusedBeforeWrite: false });
+          }
+          this.debug?.event({ type: "equipment_fill_stray_write", label: context.slice(0, 80), key: resolved.key, candidate: candidate.slice(0, 60), changed: strays.map((s) => s.label.slice(0, 60)), reverted: strays.filter((s) => reverted.has(s.mark)).length });
+          this.equipmentFillFailed.add(strayKey);
+          strayed = true;
+          break;
+        }
+        await this.clearEquipmentSnapshotMarks();
         if (!step) continue;
         // VERIFY the select actually took the value: the custom-combobox fallback
         // can report success without changing a native select (seen with alias
         // candidate ordering — "AP Systems" no-ops, then the loop never reached
         // "Altenergy Power System"). A fill that didn't land tries the next candidate.
-        if (target.fieldType === "select") {
+        // #536: a typed box is read back too — the value must be in the control it was aimed at.
+        if (target.fieldType === "select" || target.fieldType === "text") {
           const raw = await this.currentControlValue(target);
           // null = unreadable (trust applyFill); a READ value must actually match.
-          if (raw !== null && !AutoLearnAdapter.equipmentValueMatches(raw, candidate)) {
+          if (raw !== null && !AutoLearnAdapter.equipmentReadBackHolds(raw, candidate)) {
             sawNotHeld = true;
             this.debug?.event({ type: "equipment_fill_not_held", label: context.slice(0, 80), key: resolved.key, candidate: candidate.slice(0, 60) });
             continue;
@@ -3067,9 +3136,179 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       }
       // Every candidate applied but none held: remember and stop retrying this
       // field for the rest of the run (each retry burns option-wait caps).
-      if (!success && sawNotHeld) this.equipmentFillFailed.add(failKey);
+      if (!success && sawNotHeld && !strayed) this.equipmentFillFailed.add(failKey);
     }
     return filled;
+  }
+
+  /** A read-back of an equipment value: the select/text matcher, plus numbers compared as numbers
+   *  ("1" typed into a quantity box the portal shows as "1.00" held). */
+  private static equipmentReadBackHolds(raw: string, candidate: string): boolean {
+    if (AutoLearnAdapter.equipmentValueMatches(raw, candidate)) return true;
+    const num = (s: string): number => (/^\s*-?[\d,]*\.?\d+\s*$/.test(s) ? Number(s.replace(/,/g, "")) : NaN);
+    const c = num(candidate);
+    return Number.isFinite(c) && raw.split("\u0007").some((p) => num(p) === c);
+  }
+
+  /** #536 — Does the element this field's selector resolves to call itself by ANOTHER field's label
+   *  on this page, and not by this field's own? Returns that other label, or null (the same
+   *  control, or one that cannot tell — no own label, an unreadable page, a field without a label).
+   *  "Calls itself": label[for], a wrapping label, aria-label, aria-labelledby — the extractor's own
+   *  order. Only a POSITIVE identification as a different field refuses; an odd label source on a
+   *  custom widget never does. */
+  private async equipmentTargetIsAnotherField(target: ExtractedField, field: ExtractedField, fields: ExtractedField[]): Promise<string | null> {
+    // A generic prompt ("Please select…", "Select", "Qty") names no field: it never identifies one.
+    const GENERIC = /^(?:please )?(?:select|choose)\b.*$|^(?:qty|quantity|model|manufacturer|make)$/;
+    const norm = (s: unknown): string => String(s ?? "").toLowerCase().replace(/\*/g, " ").replace(/[^a-z0-9]+/g, " ").trim();
+    const mine = norm(field.label);
+    if (!mine) return null;
+    const others = new Map<string, string>();
+    for (const f of fields) {
+      const n = norm(f.label);
+      if (n && n !== mine && f !== field && !GENERIC.test(n)) others.set(n, String(f.label));
+    }
+    if (!others.size) return null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const loc = (await this.locator(target.selector).catch(() => null)) as any;
+    if (!loc || typeof loc.evaluate !== "function") return null;
+    const own = await loc.evaluate((el: Element) => {
+      const out: string[] = [];
+      const root = el.getRootNode() as Document | ShadowRoot;
+      const id = el.getAttribute("id");
+      if (id && typeof (root as Document).querySelector === "function") {
+        for (const l of Array.from((root as Document).querySelectorAll(`label[for="${CSS.escape(id)}"]`))) out.push(l.textContent || "");
+      }
+      const wrap = el.closest("label");
+      if (wrap) out.push(wrap.textContent || "");
+      const aria = el.getAttribute("aria-label");
+      if (aria) out.push(aria);
+      for (const ref of (el.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean)) {
+        out.push(el.ownerDocument?.getElementById(ref)?.textContent || "");
+      }
+      return out;
+    }).catch(() => null) as string[] | null;
+    if (!Array.isArray(own)) return null;
+    const ownNorm = own.map(norm).filter(Boolean);
+    if (!ownNorm.length) return null;
+    if (ownNorm.some((o) => o === mine || o.includes(mine) || mine.includes(o))) return null;
+    for (const o of ownNorm) {
+      const hit = others.get(o);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  /** #536 — every visible, editable TEXT box on the target's page other than the target (and its
+   *  own widget), stamped so it can be found again, with what it holds now. Text boxes only:
+   *  a select is LEGITIMATELY changed by an equipment pick (a manufacturer's cascade empties its
+   *  model), and a search box belongs to whichever combobox is open. null = cannot read (a fake page,
+   *  a framed control): the write goes ahead exactly as before. */
+  private async snapshotOtherTextControls(target: ExtractedField): Promise<Array<{ mark: string; label: string; value: string }> | null> {
+    if (!this.page || typeof this.page.evaluate !== "function" || target.selector?.frame) return null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const loc = (await this.locator(target.selector).catch(() => null)) as any;
+    if (!loc || typeof loc.evaluate !== "function") return null;
+    const snap = await loc.evaluate((el: Element) => {
+      const doc = el.ownerDocument;
+      if (!doc) return null;
+      doc.querySelectorAll("[data-al-eqs]").forEach((n) => n.removeAttribute("data-al-eqs"));
+      // The target's own widget: the nearest combobox-ish ancestor within three levels.
+      let widget: Element | null = null;
+      let a: Element | null = el;
+      for (let i = 0; i < 3 && a; i++, a = a.parentElement) {
+        if (/select|combo|dropdown|autocomplete|typeahead/i.test(`${a.getAttribute("class") || ""} ${a.getAttribute("role") || ""}`)) { widget = a; break; }
+      }
+      const TEXTISH = new Set(["", "text", "number", "tel", "email", "url", "decimal"]);
+      const norm = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim();
+      const labelOf = (c: Element): string => {
+        const id = c.getAttribute("id");
+        if (id) { const l = doc.querySelector(`label[for="${CSS.escape(id)}"]`); if (l?.textContent?.trim()) return norm(l.textContent); }
+        const w = c.closest("label"); if (w?.textContent?.trim()) return norm(w.textContent);
+        return norm(c.getAttribute("aria-label") || c.getAttribute("placeholder") || c.getAttribute("name") || id || "");
+      };
+      const out: Array<{ mark: string; label: string; value: string }> = [];
+      let n = 0;
+      for (const c of Array.from(doc.querySelectorAll("input, textarea"))) {
+        if (c === el || el.contains(c) || c.contains(el) || (widget && widget.contains(c))) continue;
+        const tag = c.tagName.toLowerCase();
+        const type = (c.getAttribute("type") || "").toLowerCase();
+        if (tag === "input" && !TEXTISH.has(type)) continue;
+        if (c.getAttribute("role") === "combobox" || c.hasAttribute("aria-autocomplete")) continue;
+        const ic = c as HTMLInputElement;
+        if (ic.readOnly || ic.disabled) continue;
+        const r = (c as HTMLElement).getBoundingClientRect();
+        const st = getComputedStyle(c as HTMLElement);
+        if (!(r.width > 0 && r.height > 0) || st.visibility === "hidden" || st.display === "none") continue;
+        const mark = `eqs${n++}`;
+        c.setAttribute("data-al-eqs", mark);
+        out.push({ mark, label: labelOf(c).slice(0, 120), value: ic.value || "" });
+        if (n >= 200) break;
+      }
+      return out;
+    }).catch(() => null) as Array<{ mark: string; label: string; value: string }> | null;
+    return Array.isArray(snap) ? snap : null;
+  }
+
+  /** #536 — the stamped boxes whose value CHANGED during the write to carry this job's value: the
+   *  value they hold now is not empty and contains the candidate (or is a 4+ character piece of
+   *  it). A box the portal filled from the pick (a rating populated from the certified list) holds
+   *  a different value and is left alone — that write was the portal's, not ours. */
+  private async equipmentStrayWrites(before: Array<{ mark: string; label: string; value: string }>, candidate: string): Promise<Array<{ mark: string; label: string; before: string }>> {
+    if (!before.length || !this.page) return [];
+    const nowByMark = await this.page.evaluate(() => {
+      const out: Record<string, string> = {};
+      for (const c of Array.from(document.querySelectorAll("[data-al-eqs]"))) out[c.getAttribute("data-al-eqs") || ""] = (c as HTMLInputElement).value || "";
+      return out;
+    }).catch(() => null) as Record<string, string> | null;
+    if (!nowByMark || typeof nowByMark !== "object") return [];
+    const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
+    const cand = norm(candidate);
+    if (!cand) return [];
+    const out: Array<{ mark: string; label: string; before: string }> = [];
+    for (const b of before) {
+      const now = nowByMark[b.mark];
+      if (typeof now !== "string" || now === b.value) continue;
+      const n = norm(now);
+      if (!n) continue;
+      const carries = n.includes(cand) || (n.length >= 4 && cand.includes(n) && !norm(b.value).includes(n));
+      if (carries) out.push({ mark: b.mark, label: b.label, before: b.value });
+    }
+    return out;
+  }
+
+  /** #536 — put each stray box back to what it held (typed + blurred, so a per-field autosave
+   *  stores the old value again), then read it back. Returns the marks that hold their old value. */
+  private async revertStrayWrites(strays: Array<{ mark: string; label: string; before: string }>): Promise<Set<string>> {
+    const ok = new Set<string>();
+    if (!this.page) return ok;
+    for (const s of strays) {
+      try {
+        const loc = this.page.locator(`[data-al-eqs="${s.mark}"]`).first();
+        await withOwnWriteWindow(this.page, `learner revert of a stray equipment write (${s.label.slice(0, 40)})`, async () => {
+          await loc.fill(s.before, { timeout: 5000 });
+          if (typeof loc.blur === "function") await loc.blur().catch(() => {});
+        });
+        const back = await loc.inputValue().catch(() => null);
+        if (back === s.before) ok.add(s.mark);
+      } catch { /* reported as not reverted */ }
+    }
+    await this.clearEquipmentSnapshotMarks();
+    return ok;
+  }
+
+  private async clearEquipmentSnapshotMarks(): Promise<void> {
+    if (!this.page || typeof this.page.evaluate !== "function") return;
+    await this.page.evaluate(() => { document.querySelectorAll("[data-al-eqs]").forEach((n) => n.removeAttribute("data-al-eqs")); }).catch(() => null);
+  }
+
+  /** #536 — an equipment write that reached (or would have reached) another control: kept for the
+   *  hand-off and the page's trust evidence. Labels only — never a value. */
+  private noteEquipmentStray(s: { label: string; key: string; other: string; reverted: boolean; refusedBeforeWrite: boolean }): void {
+    const line = s.refusedBeforeWrite
+      ? `${s.label || s.key}: its selector now reaches "${s.other}" — not filled`
+      : `${s.label || s.key}: the write also changed "${s.other}" — ${s.reverted ? "put back" : "COULD NOT be put back, check it"}; not recorded`;
+    if (!this.equipmentStrays.includes(line)) this.equipmentStrays.push(line);
+    if (!this.pageEquipmentStrays.includes(line)) this.pageEquipmentStrays.push(line);
   }
 
   // Resolve the document file to attach to a given file-input field. Matches the field's
@@ -3998,6 +4237,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       result = { ...result, message: this.scrubSecrets(result.message) };
       // #344: the unverified information page this walk held (for a person to verify), and every
       // verified one it passed (each use of the relaxation is on record).
+      // #536: per-page trust evidence (for the gate, #534) and, in the hand-off, any equipment write
+      // that reached another control — a person checks both boxes before submitting.
+      if (this.trustEvidence.length) result = { ...result, trustEvidence: this.trustEvidence.map((e) => ({ ...e, validationErrors: [...e.validationErrors], requiredUnchecked: e.requiredUnchecked.map((u) => ({ ...u })), strayWrites: [...e.strayWrites] })) };
+      if (this.equipmentStrays.length) {
+        result = { ...result, message: `${result.message} EQUIPMENT FILL REACHED ANOTHER CONTROL — check before submitting: ${this.equipmentStrays.slice(0, 6).map((l) => this.scrubSecrets(l)).join("; ")}.` };
+      }
       if (this.infoPageCandidate) result = { ...result, infoPageCandidate: this.infoPageCandidate };
       if (this.infoPagePassed.length) result = { ...result, infoPagePassed: [...this.infoPagePassed] };
       if (this.infoPageIncidents.length) result = { ...result, infoPageIncidents: this.infoPageIncidents.map((i) => ({ ...i, why: i.why.map((w) => this.scrubSecrets(w)) })) };
@@ -7772,6 +8017,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           pageFillCount++;
           appliedThisPage.push(bd.applied);
         }
+        // d3c') BATTERY-ATTESTATION PASS (#536) — the statements the declaration revealed, ticked
+        //       only where the owner ruled for this portal (see applyBatteryAttestations).
+        for (const ba of await this.applyBatteryAttestations(alreadyFilledLabels).catch(() => [])) {
+          steps.push(ba.step);
+          pageFillCount++;
+          appliedThisPage.push(ba.applied);
+        }
       }
 
       // d3d) EVERY PV ARRAY ITS OWN ROW (#382) — after every other pass on the page, so nothing
@@ -7869,6 +8121,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           }
         }
       }
+
+      // d4c) TRUST EVIDENCE (#536) — what the page ends with: a field the portal shows as invalid,
+      //      a required box left unchecked, an equipment write that strayed. Recorded for the trust
+      //      gate (#534) to read; nothing here changes the walk.
+      if (!isDashboard && hasFillable) await this.recordPageTrustEvidence(pageCount, url).catch(() => null);
 
       // e) Record the final submit (if any). Clicked ONLY on the operator's explicit
       //    delegation; otherwise recorded and left for a human. Pay/fee buttons rejected.
@@ -8690,6 +8947,49 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     if (!picked) return [];
     this.debug?.event({ type: "battery_declaration_answered", label: picked.applied.label.slice(0, 70), answer: picked.applied.expected, planner: "none" });
     return [picked];
+  }
+
+  /** THE ATTESTATIONS THE DECLARATION REVEALED, ANSWERED FROM THE OWNER'S RULING (#536).
+   *
+   *  Live PacifiCorp battery learn (2026-11-02): the declaring tick revealed "The battery system
+   *  will not backfeed into the grid." * and "The battery system includes a transfer switch (or
+   *  equivalent) to ensure proper isolation before going off grid (islanding)." *, the planner
+   *  left both unticked, and nothing else on the page would ever tick them. The owner ruled both
+   *  checked on PacifiCorp battery jobs. This pass reads the page as it stands after the
+   *  declaration and the rescans, and ticks each VISIBLE, UNCHECKED checkbox whose statement has a
+   *  ruling for this portal (shared batteryAttestationAnswer — the fill guard in applyFillInner
+   *  asks the same function, so the planner can neither skip nor invent one). Battery jobs only;
+   *  a portal with no ruling, or a statement nobody ruled on, is left alone (a person ticks it,
+   *  and the trust evidence names it as a required box left unchecked). Records a replayable
+   *  `check` whose note names the ruling. */
+  private async applyBatteryAttestations(alreadyFilledLabels: string[]): Promise<Array<{ step: RecipeStep; applied: AppliedFill }>> {
+    const out: Array<{ step: RecipeStep; applied: AppliedFill }> = [];
+    if (this.hasBattery !== true || !this.page) return out;
+    let fields: ExtractedField[] = [];
+    try { fields = (await this.extractAllFrames(EXTRACT_SEL)).map(toExtractedField); } catch { return out; }
+    for (const field of fields) {
+      if (field.fieldType !== "checkbox" || !field.label) continue;
+      const ruled = batteryAttestationAnswer(this.portalName, field.label, this.hasBattery);
+      if (!ruled) continue;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const loc = (await this.locator(field.selector).catch(() => null)) as any;
+      if (!loc) continue;
+      if (typeof loc.isVisible === "function" && !(await loc.isVisible().catch(() => false))) continue;
+      if (typeof loc.isChecked === "function" && await loc.isChecked().catch(() => false)) {
+        if (!alreadyFilledLabels.includes(field.label)) alreadyFilledLabels.push(field.label);
+        continue; // already answered as ruled
+      }
+      const step = await this.applyFill(field, { value: "true" }, false);
+      if (!step) continue;
+      step.note = `battery attestation: ${field.label.slice(0, 120)} → checked (${ruled.ruling.slice(0, 120)})`;
+      if (!alreadyFilledLabels.includes(field.label)) alreadyFilledLabels.push(field.label);
+      this.debug?.event({ type: "battery_attestation_answered", label: field.label.slice(0, 80), statement: ruled.statement, planner: "none" });
+      out.push({
+        step,
+        applied: { selector: field.selector, label: field.label, fieldType: "checkbox", expected: "true", sensitive: false, required: !!field.required },
+      });
+    }
+    return out;
   }
 
   // A DISAMBIGUATION GRID IS A CHOICE ABOUT WHOSE PROPERTY WE ARE FILING ON.
@@ -9653,6 +9953,29 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     //   PROGRAM     "Will you be participating in the Wattsmart Battery Program?" is required of
     //               every applicant, battery or not — never refused (PacifiCorp rejected a
     //               filing by name when it was left blank), never forced.
+    // DETERMINISTIC GUARD: A BATTERY ATTESTATION IS A STATEMENT ON THE FILING (#536).
+    //
+    // "The battery system will not backfeed into the grid." and "…includes a transfer switch (or
+    // equivalent) to ensure proper isolation before going off grid (islanding)." are things the
+    // applicant SAYS about this battery. Who may say them is an owner ruling per portal
+    // (shared BATTERY_ATTESTATION_RULINGS — PacifiCorp, 2026-11-02: both checked), never the
+    // planner's judgement: with a ruling the box is ticked (whatever the planner offered); without
+    // one, or on a job whose battery is absent or unknown, nothing is ticked or recorded and the
+    // box stays for a person. Only a checkbox is answered — the ruling says "checked".
+    if (batteryControlKind(field.label || "", { control: field.fieldType, options: field.options }) === "attestation") {
+      const label = String(field.label ?? "");
+      const ruled = field.fieldType === "checkbox" ? batteryAttestationAnswer(this.portalName, label, this.hasBattery) : null;
+      if (!ruled) {
+        this.debug?.event({ type: "battery_attestation_left_for_person", label: label.slice(0, 80), hasBattery: this.hasBattery ?? null, control: field.fieldType });
+        return null;
+      }
+      if (value.trim() !== "true") {
+        this.debug?.event({ type: "battery_attestation_answered", label: label.slice(0, 80), statement: ruled.statement, planner: value.trim() ? "corrected" : "none" });
+        value = "true";
+        fillReq.value = value;
+      }
+    }
+
     if (this.hasBattery !== undefined) {
       const label = field.label || "";
       const kind = batteryControlKind(label, { control: field.fieldType, options: field.options });
@@ -10027,6 +10350,115 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       this.debug?.event({ type: "battery_spec_blank_by_design", labels: all.filter((l) => !kept.includes(l)).slice(0, 8) });
     }
     return kept;
+  }
+
+  /** #536 — THE PAGE'S TRUST EVIDENCE, recorded as the walk is about to leave it (see
+   *  PageTrustEvidence). Two in-page readings plus the equipment pass's own stray writes:
+   *   - a control the portal marks INVALID (aria-invalid="true", Bootstrap's .is-invalid, or a
+   *     native constraint failure on a box that holds a value) with the message beside it, and any
+   *     visible field-level message element (.invalid-feedback, .field-validation-error,
+   *     [class*=validation-message], [class*=error-message]) — named by its field. Page banners
+   *     (role=alert summaries) are portalNotices' channel, not this one: a notice is not a field
+   *     the walk got wrong.
+   *   - a REQUIRED checkbox (required / aria-required / an asterisk on its own or its group's
+   *     label) still unchecked, flagged `acknowledgment` when it is a box the walk leaves for a
+   *     person by design (the same wording collectUnfilledRequired excludes).
+   *  Nothing here changes what the walk does next. */
+  private async recordPageTrustEvidence(page: number, url: string): Promise<void> {
+    const strayWrites = this.pageEquipmentStrays.splice(0);
+    type Read = { validationErrors: string[]; requiredUnchecked: Array<{ label: string; acknowledgment: boolean }> };
+    let read = null as Read | null;
+    if (this.page && typeof this.page.evaluate === "function") {
+      read = await this.page.evaluate(() => {
+        const norm = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim();
+        const ACK = /will not be submitted until|i understand\b|i acknowledge|accept (the )?terms|terms (and|&) conditions/i;
+        const GROUP = "fieldset, .form-group, [class*='form-group'], [class*='field'], .row, [class*='row']";
+        const visible = (el: Element) => {
+          const r = (el as HTMLElement).getBoundingClientRect?.();
+          if (!r || !(r.width > 0 && r.height > 0)) return false;
+          const st = getComputedStyle(el as HTMLElement);
+          return st.visibility !== "hidden" && st.display !== "none";
+        };
+        const labelOf = (el: Element): string => {
+          const id = el.getAttribute("id");
+          if (id) { const l = document.querySelector(`label[for="${CSS.escape(id)}"]`); if (l?.textContent?.trim()) return norm(l.textContent); }
+          const w = el.closest("label"); if (w?.textContent?.trim()) return norm(w.textContent);
+          const aria = el.getAttribute("aria-label"); if (aria) return norm(aria);
+          const grp = el.closest(GROUP);
+          const gl = grp?.querySelector("legend, label, .control-label, .field-label");
+          return norm(gl?.textContent || el.getAttribute("name") || "");
+        };
+        const clean = (l: string) => l.replace(/\s*\*\s*$/, "").replace(/\s*\*\s*/g, " ").trim();
+        const MSG = ".invalid-feedback, .field-validation-error, [class*='validation-message'], [class*='error-message']";
+        const errors = new Set<string>();
+        const controls = Array.from(document.querySelectorAll("input, select, textarea")) as Array<HTMLInputElement>;
+        for (const c of controls) {
+          const type = (c.getAttribute("type") || "").toLowerCase();
+          if (type === "hidden" || type === "button" || type === "submit") continue;
+          if (!visible(c)) continue;
+          const flagged = c.getAttribute("aria-invalid") === "true" || c.classList.contains("is-invalid")
+            // A native number box holding a non-number. Other native constraints (step, range,
+            // pattern) are not read: a novalidate form may never enforce them, and evidence the
+            // portal itself would not complain about is noise for the gate.
+            || (!!c.validity && c.validity.badInput === true);
+          if (!flagged) continue;
+          const grp = c.closest(GROUP) || c.parentElement;
+          const msgEl = grp ? Array.from(grp.querySelectorAll(MSG)).find((m) => visible(m) && norm(m.textContent)) : null;
+          const msg = norm(msgEl?.textContent) || norm(c.validationMessage) || "shown as invalid";
+          errors.add(`${clean(labelOf(c)) || "field"}: ${msg}`.slice(0, 200));
+        }
+        for (const m of Array.from(document.querySelectorAll(MSG))) {
+          if (!visible(m)) continue;
+          const t = norm(m.textContent);
+          if (t.length < 4) continue;
+          const grp = m.closest(GROUP) || m.parentElement;
+          const c = grp?.querySelector("input:not([type=hidden]), select, textarea");
+          const line = `${c ? clean(labelOf(c)) || "field" : "field"}: ${t}`.slice(0, 200);
+          if (![...errors].some((e) => e.endsWith(`: ${t}`) || e === line)) errors.add(line);
+        }
+        const unchecked: Array<{ label: string; acknowledgment: boolean }> = [];
+        const seen = new Set<string>();
+        for (const c of Array.from(document.querySelectorAll("input[type=checkbox]")) as HTMLInputElement[]) {
+          if (c.checked) continue;
+          // A styled checkbox's input is often visually hidden behind its label: visible if either is.
+          const id = c.getAttribute("id");
+          const forLbl = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+          if (!visible(c) && !(forLbl && visible(forLbl)) && !(c.closest("label") && visible(c.closest("label") as Element))) continue;
+          const own = norm(forLbl?.textContent || c.closest("label")?.textContent || c.getAttribute("aria-label") || "");
+          const grp = c.closest(GROUP);
+          const gl = grp?.querySelector("legend, label, .control-label, .field-label");
+          // PowerClerk puts the red asterisk in a sibling span after the label
+          // (data-test-role="required-indicator"), so a lone "*" element in the box that holds only
+          // this checkbox counts as well.
+          const box = grp || c.parentElement;
+          const lone = !!box && box.querySelectorAll("input[type=checkbox]").length === 1;
+          const indicator = lone && !!box && Array.from(box.querySelectorAll("span, abbr, sup, i, b, strong")).some((e) => /^\s*\*\s*$/.test(e.textContent || ""));
+          const required = c.required || c.getAttribute("aria-required") === "true" || /\*/.test(own) || (!own && /\*/.test(gl?.textContent || "")) || indicator;
+          if (!required) continue;
+          const label = clean(own || norm(gl?.textContent) || c.getAttribute("name") || "checkbox").slice(0, 200);
+          if (seen.has(label)) continue;
+          seen.add(label);
+          unchecked.push({ label, acknowledgment: ACK.test(label) });
+        }
+        return { validationErrors: Array.from(errors).slice(0, 20), requiredUnchecked: unchecked.slice(0, 20) };
+      }).catch(() => null) as Read | null;
+    }
+    const shape = read && Array.isArray(read.validationErrors) && Array.isArray(read.requiredUnchecked) ? read : { validationErrors: [], requiredUnchecked: [] };
+    const entry: PageTrustEvidence = {
+      page,
+      where: safeHostPath(url),
+      validationErrors: shape.validationErrors.map((e) => this.scrubSecrets(String(e))),
+      requiredUnchecked: shape.requiredUnchecked.map((u) => ({ label: this.scrubSecrets(String(u.label)), acknowledgment: u.acknowledgment === true })),
+      strayWrites: strayWrites.map((w) => this.scrubSecrets(w)),
+    };
+    if (!entry.validationErrors.length && !entry.requiredUnchecked.length && !entry.strayWrites.length) return;
+    this.trustEvidence.push(entry);
+    this.debug?.event({
+      type: "trust_evidence", page, where: entry.where,
+      validationErrors: entry.validationErrors.slice(0, 8),
+      requiredUnchecked: entry.requiredUnchecked.slice(0, 8),
+      strayWrites: entry.strayWrites.slice(0, 8),
+    });
   }
 
   // Read each applied fill back; re-apply once if it didn't hold; return the labels of REQUIRED
