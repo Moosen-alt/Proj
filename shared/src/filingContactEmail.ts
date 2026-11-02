@@ -14,7 +14,9 @@
 //     contractor stays on record;
 //   - a form with ONE company email slot keeps the client's email in it — no silent swap;
 //   - a box that names a SEPARATE contact (additional / alternate / secondary contact,
-//     notification, cc) takes the filing contact's email on either track;
+//     notification, cc) takes the filing contact's email — on NEM only inside a known installer block
+//     or an additional-contacts section (the one place the contractor's block gets the filing address:
+//     its notification box), never with no known section, where it may be the customer's;
 //   - an applicant / agent / correspondence email takes it on a PERMIT form only, and only when the
 //     same form also has the contractor's own email box (otherwise that slot IS the contractor's);
 //   - a second address of the COMPANY's own contact ("Secondary Email" in a contractor dialog) takes
@@ -83,7 +85,15 @@ export function emailSlotKind(box: EmailBoxOnForm, opts: { track: ContactTrack }
   if (OWNER_WORDS.test(label)) return "owner";
   // On a utility interconnection the applicant is the customer (contactRoles.contactSectionRole).
   if (nem && /\bapplicants?\b/.test(label) && !COMPANY_WORDS.test(label)) return "owner";
-  if (SEPARATE_CONTACT.test(label)) return sectionRole === "owner" ? "owner" : "separateContact";
+  if (SEPARATE_CONTACT.test(label)) {
+    if (sectionRole === "owner") return "owner";
+    // On a utility form a bare "Notification Email" / "CC Email" with NO known section is as likely the
+    // CUSTOMER's notice address, and filling it would displace the homeowner's NEM mail (owner ruling
+    // 2026-11-02 20:32). On NEM it is the filing contact's only inside a known installer block or a
+    // section that itself names an additional contact; anything else is left to the existing rules.
+    if (nem && sectionRole !== "company" && !SEPARATE_SECTION.test(section)) return null;
+    return "separateContact";
+  }
   if (SECOND_ADDRESS.test(label)) {
     // The block's own second address: the company's takes the filing contact; the owner's, or a
     // block nobody can name, is left exactly as the existing rules have it.

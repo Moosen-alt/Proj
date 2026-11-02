@@ -98,7 +98,7 @@ for (const boxes of [
     { label: "Applicant Email" },
     { label: "Email", section: "Installer Information" },
     { label: "Email", section: "Customer Information" },
-    { label: "Alternate Contact Email" },
+    { label: "Alternate Contact Email", section: "Additional Contacts" },
     { label: "Additional Contact Email", section: "Applicant Information" },
   ];
   const plan = planFilingContactEmails(boxes, nem);
@@ -108,6 +108,14 @@ for (const boxes of [
   check("NEM: the installer's own box keeps the client's email", plan[2] === false && emailSlotKind(boxes[2], nem) === "company");
   check("NEM: a separate Alternate Contact Email takes it; one inside the Applicant's (customer's) block does not",
     plan[4] === true && plan[5] === false, JSON.stringify(plan));
+  for (const label of ["Notification Email", "Email notifications to", "CC Email", "Alternate Contact Email"]) {
+    check(`NEM, NO known section: "${label}" is not a slot (it may be the customer's notice address)`,
+      planFilingContactEmails([{ label }], nem)[0] === false && emailSlotKind({ label }, nem) === null);
+  }
+  check("NEM: a Notification Email under Additional Contacts, or inside the known Installer block, is a slot",
+    planFilingContactEmails([{ label: "Notification Email", section: "Additional Contacts" }, { label: "Notification Email", section: "Installer Information" }], nem).every((v) => v));
+  check("PERMIT: a Notification Email with no section is still a slot (permit reading unchanged)",
+    planFilingContactEmails([{ label: "Notification Email" }], permit)[0] === true);
   check("NEM: an agent-role label is never the filing contact's on an interconnection",
     planFilingContactEmails([{ label: "Contractor Email" }, { label: "Correspondence Email" }], nem).every((v) => !v));
 }
@@ -147,7 +155,7 @@ const projectFields = { installerEmail: CLIENT, homeownerEmail: OWNER, [FILING_C
   const fields = [
     { label: "Email", fieldType: "text", section: "Applicant Information" },
     { label: "Email", fieldType: "text", section: "Installer Information" },
-    { label: "Alternate Contact Email", fieldType: "text" },
+    { label: "Alternate Contact Email", fieldType: "text", section: "Additional Contacts" },
     { label: "Receive email notifications", fieldType: "checkbox" },
   ];
   const fills = [
@@ -206,7 +214,7 @@ const bind = (steps: RecipeStep[], track: string, on: boolean) => bindRecipeForR
   const steps = [
     fill("Email", { field: "homeownerEmail", fingerprint: { section: "Applicant Information" } as never }),
     fill("Email", { field: "installerEmail", fingerprint: { section: "Installer Information" } as never }),
-    fill("Alternate Contact Email", { value: FILING }),
+    fill("Alternate Contact Email", { value: FILING, fingerprint: { section: "Additional Contacts" } as never }),
   ];
   const b = bind(steps, "nem", true);
   check("REPLAY NEM, setting on: the PowerClerk Applicant step is UNCHANGED (homeownerEmail)",
