@@ -72,7 +72,7 @@
 //      (PowerClerk's NEM Applicant: the utility's e-signature and NEM mail go there — owner ruling
 //      2026-11-02, "we still need the ho to get the nem email"), the contractor's on any other. With no
 //      setting, a filingContactEmail step replays as it did before the key existed: an applicant /
-//      agent box the contractor's email, an extra-contact box blank.
+//      agent / preparer box the contractor's email, an extra-contact box blank.
 import type { CitedFact, ProjectRecord, RecipeStep } from "../../shared/src/types";
 import { stateRulesFor } from "./permitProcess";
 import { feeBracketFieldKey, parseFeeBracketFieldKey, sameFeeTier, tierBoundsFromLabel } from "../../portal-bot/src/feeBracketQuantity";
@@ -461,7 +461,7 @@ export function bindRecipeForReplay(input: {
           delete step.value;
           record("rebound", `"${label.slice(0, 40)}" is ${owner ? "the homeowner's email box (the utility's e-signature and notices go there)" : "the contractor's own email box"} — bound to ${want}, never the filing contact's`);
         } else if (!filingContact) {
-          if (kind === "agentRole") {
+          if (kind === "agentRole" || kind === "preparer") {
             step = { ...step, field: "installerEmail" };
             delete step.value;
             record("rebound", `"${label.slice(0, 40)}" bound to installerEmail — no FILING_CONTACT_EMAIL is set`);

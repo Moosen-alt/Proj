@@ -19,6 +19,9 @@
 //     same form also has the contractor's own email box (otherwise that slot IS the contractor's);
 //   - a second address of the COMPANY's own contact ("Secondary Email" in a contractor dialog) takes
 //     it; a second address in an owner's / customer's block is the homeowner's and is left alone;
+//   - the PREPARER / submitting party's email takes it on NEM (owner direction 2026-11-02 21:25 UTC:
+//     "owner in preparer info can be keelixs for nem if needed to get their updates via email"); on a
+//     permit form only beside the contractor's own email box;
 //   - an owner / homeowner / customer / account-holder box NEVER takes it, and on a utility
 //     interconnection (NEM) the "Applicant" IS the customer: PowerClerk's Applicant email is the
 //     homeowner's, where the utility sends the e-signature and the NEM mail. Never replaced.
@@ -47,6 +50,7 @@ export type EmailSlotKind =
   | "separateContact" // a box naming a distinct extra contact (additional / alternate contact, notification, cc)
   | "companySecond"   // a second address of the company's own contact (Secondary Email in its block)
   | "agentRole"       // applicant / agent / correspondence / representative email (permit track)
+  | "preparer"        // the preparer / submitting party's email (the one filing the application)
   | null;             // says nothing — left to the existing rules
 
 function norm(text: string | null | undefined): string {
@@ -60,7 +64,11 @@ const OWNER_WORDS = /\b(?:property owners?|home ?owners?|owners?|customers?|acco
 const SEPARATE_CONTACT = /\b(?:additional|alternate|alt|secondary|other|second)\s+contacts?\b|\bnotifications?\b|\bnotify\b|\bcc\b|\bcopy to\b/;
 // A second ADDRESS of the block's own contact: "Secondary Email", "Alternate E-mail", "Email 2".
 const SECOND_ADDRESS = /\b(?:secondary|alternate|alt|other|second|2nd|additional)\b|\be-?mail\s*#?\s*2\b/;
-const COMPANY_WORDS = /\b(?:contractors?|installers?|business|company|licensed professionals?|preparer)\b/;
+const COMPANY_WORDS = /\b(?:contractors?|installers?|business|company|licensed professionals?)\b/;
+// The PREPARER is whoever fills and submits the application — the filing service itself. Owner
+// direction 2026-11-02 21:25 UTC: "also owner in preparer info can be keelixs for nem if needed to get
+// their updates via email" — on NEM the preparer's email is the filing contact's.
+const PREPARER_WORDS = /\b(?:preparers?|prepared by|submitting party|submitter)\b/;
 const AGENT_WORDS = /\b(?:applicants?|agents?|correspondence|representatives?|submitter|permit contact|primary contact|point of contact|contact person)\b|^contact e-?mail\b/;
 const SEPARATE_SECTION = /\b(?:additional|alternate|secondary|other)\s+contacts?\b|\bnotifications?\b/;
 
@@ -82,12 +90,14 @@ export function emailSlotKind(box: EmailBoxOnForm, opts: { track: ContactTrack }
     if (sectionRole === "company" && !(nem && /\bapplicants?\b/.test(section))) return "companySecond";
     return sectionRole === "owner" ? "owner" : null;
   }
+  if (PREPARER_WORDS.test(label)) return box.inContactBlock ? "company" : "preparer";
   if (COMPANY_WORDS.test(label)) return "company";
   if (!nem && AGENT_WORDS.test(label)) return box.inContactBlock ? "company" : "agentRole";
   // Then its section's. A section naming an owner at all ("Owner/Applicant", which
   // contactSectionRole declines to guess) is never the filing contact's.
   if (sectionRole === "owner") return "owner";
   if (OWNER_WORDS.test(section)) return null;
+  if (PREPARER_WORDS.test(section)) return box.inContactBlock ? "company" : "preparer";
   if (SEPARATE_SECTION.test(section)) return "separateContact";
   if (COMPANY_WORDS.test(section) || /\binspection contacts?\b/.test(section)) return "company";
   if (!nem && AGENT_WORDS.test(section)) return box.inContactBlock ? "company" : "agentRole";
@@ -107,6 +117,9 @@ export function planFilingContactEmails(boxes: EmailBoxOnForm[], opts: { track: 
   const firstAgent = kinds.indexOf("agentRole");
   return kinds.map((k, i) => {
     if (k === "separateContact" || k === "companySecond") return true;
+    // NEM: the preparer is the filing service (owner direction 21:25). On a permit it is read like an
+    // agent box: separate only beside the contractor's own email box.
+    if (k === "preparer") return opts.track === "nem" || hasCompanyBox;
     if (k === "agentRole") return opts.track === "permit" && (hasCompanyBox || i !== firstAgent);
     return false;
   });

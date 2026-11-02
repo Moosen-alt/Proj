@@ -9,6 +9,8 @@
 //      the client's email and the applicant / agent box takes the filing contact's; one company slot
 //      only → nothing changes; NEM Applicant / customer / owner boxes never; a contact dialog's own
 //      email box never; setting off → nothing.
+//      On NEM the PREPARER's email takes it (owner direction 2026-11-02 21:25 UTC); the hand-coded
+//      PowerClerk Preparer email reads it from the client overlay (powerClerk.preparerEmailFor).
 //   2. the learn-time planner pass (autoLearn.applyFilingContactEmail), the same rules on a plan.
 //   3. the replay binder (recipeReplayBinding R12): by label, never by literal; a NEM Applicant step is
 //      untouched with the setting on, and one mis-bound to the filing key goes back to the homeowner.
@@ -40,7 +42,8 @@ const { emailSlotKind, planFilingContactEmails, FILING_CONTACT_EMAIL_KEY } = awa
 const { applyFilingContactEmail, plannerFieldView } = await import("../src/autoLearn");
 const { bindRecipeForReplay, REPLAY_BLANK_FIELD } = await import("../src/recipeReplayBinding");
 const { filingContactEmailSetting } = await import("../src/filingContact");
-const { fillApplicantEmail } = await import("../../portal-bot/src/adapters/powerClerk");
+const { fillApplicantEmail, preparerEmailFor } = await import("../../portal-bot/src/adapters/powerClerk");
+const { clientStagingOverlay, createClient } = await import("../src/clients");
 const { openDatabase } = await import("../src/db");
 const { createProject, getProjectDetail } = await import("../src/repository");
 const { resolveRecipeFieldValues, deadFieldBindings } = await import("../src/portalRecipes");
@@ -107,6 +110,20 @@ for (const boxes of [
     plan[4] === true && plan[5] === false, JSON.stringify(plan));
   check("NEM: an agent-role label is never the filing contact's on an interconnection",
     planFilingContactEmails([{ label: "Contractor Email" }, { label: "Correspondence Email" }], nem).every((v) => !v));
+}
+{
+  // Owner direction 2026-11-02 21:25 UTC: on NEM the PREPARER (the one submitting) can be the filing service.
+  const boxes = [
+    { label: "Email", section: "Preparer Information" },
+    { label: "Email", section: "PGE Customer Information" },
+    { label: "Email", section: "Applicant Information" },
+  ];
+  const plan = planFilingContactEmails(boxes, nem);
+  check("NEM PREPARER: the preparer's email takes the filing contact's; the customer / Applicant boxes still never",
+    plan[0] === true && plan[1] === false && plan[2] === false && emailSlotKind(boxes[0], nem) === "preparer", JSON.stringify(plan));
+  check("PERMIT preparer: only beside the contractor's own email box",
+    planFilingContactEmails([{ label: "Preparer Email" }], permit)[0] === false
+      && planFilingContactEmails([{ label: "Contractor Email" }, { label: "Preparer Email" }], permit)[1] === true);
 }
 {
   const plan = planFilingContactEmails([
@@ -235,12 +252,20 @@ const created = createProject(db, {
   city: "Fernhollow", zip: "97498", dcKw: 7.2, homeownerName: "Finley Mockdata", homeownerEmail: OWNER,
 } as never);
 const project = getProjectDetail(db, created.project.id).project;
+const client = createClient(db, { companyName: "Kestrel Solar Test", businessEmail: CLIENT } as never);
+const stagingOff = clientStagingOverlay(db, client.id, "utility", { state: "OR", track: "nem" });
 const valuesOff = resolveRecipeFieldValues(db, project as never, "utility", "nem");
 check("DICTIONARY setting off: no filing contact key at all (today's dictionary)", !(FILING_CONTACT_EMAIL_KEY in valuesOff));
 process.env.FILING_CONTACT_EMAIL = FILING;
 const valuesOn = resolveRecipeFieldValues(db, project as never, "utility", "nem");
+const stagingOn = clientStagingOverlay(db, client.id, "utility", { state: "OR", track: "nem" });
 check("DICTIONARY setting on: the key carries the setting", valuesOn[FILING_CONTACT_EMAIL_KEY] === FILING, String(valuesOn[FILING_CONTACT_EMAIL_KEY]));
 check("DICTIONARY setting on: homeownerEmail is still the homeowner's", valuesOn.homeownerEmail === OWNER, String(valuesOn.homeownerEmail));
+check("DICTIONARY setting on: the client overlay (what the hand-coded adapters read) carries it beside installerEmail, never in place of it",
+  stagingOn.filingContactEmail === FILING && stagingOff.filingContactEmail === undefined && stagingOn.installerEmail === stagingOff.installerEmail);
+check("POWERCLERK Preparer email: the filing contact's when set, the installer's when not",
+  preparerEmailFor({ filingContactEmail: FILING }, CLIENT) === FILING && preparerEmailFor({}, CLIENT) === CLIENT
+    && preparerEmailFor({ filingContactEmail: "not an address" }, CLIENT) === CLIENT);
 {
   let typed = "";
   await fillApplicantEmail(valuesOn, { reportedMissing: [] }, async (email) => { typed = email; });
