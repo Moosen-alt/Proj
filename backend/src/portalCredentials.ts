@@ -276,6 +276,18 @@ export function selectCredentialUrlsFor(targetUrl: string, storedUrls: string[])
   return (!anySegments) ? hostMatches : [];
 }
 
+/** DOES THIS CLIENT HAVE ANY LOGIN STORED ON THIS URL'S HOST (#512)? A host-only question, with no
+ *  secret read: it only decides whether a signed-in record read is worth a browser. WHICH login is
+ *  typed is decided later, against the sign-in page the portal itself leads to
+ *  (getDecryptedCredentialByUrl on that page's URL: host + tenant path), never here. */
+export function clientHasLoginOnHost(db: AppDb, clientId: string, url: string): boolean {
+  let targetHost: string;
+  try { targetHost = new URL(url).hostname.toLowerCase(); } catch { return false; }
+  if (!clientId || !targetHost) return false;
+  return db.query<Row>("SELECT portal_url FROM portal_credentials WHERE client_id = ?", [clientId])
+    .some((r) => { try { return hostsMatch(targetHost, new URL(s(r.portal_url)).hostname.toLowerCase()); } catch { return false; } });
+}
+
 export function getDecryptedCredentialByUrl(
   db: AppDb,
   clientId: string,
@@ -544,13 +556,24 @@ export function lockedOutCredential(
   clientId: string,
   portalUrl: string,
 ): PortalCredentialView | null {
+  const hit = storedCredentialFor(db, clientId, portalUrl);
+  return hit?.stale ? hit : null;
+}
+
+/** THE STORED LOGIN THIS PORTAL URL WOULD TYPE — its view, never its secret. Matched the way
+ *  production matches (selectCredentialUrlsFor: host + first path segment, most-specific first), and
+ *  the FIRST match decides: a later one is a different portal. */
+export function storedCredentialFor(
+  db: AppDb,
+  clientId: string,
+  portalUrl: string,
+): PortalCredentialView | null {
   if (!clientId || !portalUrl) return null;
   const rows = listPortalCredentials(db, clientId);
   if (!rows.length) return null;
-  // Matched the way production matches: most-specific stored URL first.
   for (const url of selectCredentialUrlsFor(portalUrl, rows.map((c) => c.portalUrl))) {
     const hit = rows.find((c) => c.portalUrl === url);
-    if (hit) return hit.stale ? hit : null;   // the FIRST match decides; a later one is a different portal
+    if (hit) return hit;
   }
   return null;
 }

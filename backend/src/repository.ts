@@ -70,6 +70,7 @@ import path from "node:path";
 import { portalProfilesDir } from "./statePaths";
 import os from "node:os";
 import { checkStatusWithAdapter, runCorrectionReopen, stageWithAccela, stageWithMockPortal, stageWithPowerClerk, stageWithRecipe } from "../../portal-bot/src/index";
+import { readRecordLinkSignedIn } from "../../portal-bot/src/recordLinkRead";
 import { portalAutomationDisabled, resolveHeadless } from "../../portal-bot/src/browser";
 import { findCompleteRecipeForProject, findAnyRecipeForProject, resolveRecipeFieldValues, markPortalRecipeForRerecord, demoteOnReplayFailure, collectHealedSteps, persistHealedSteps, getPortalRecipe, portalEntityEvidence, recipeHostFit, findBorrowableRecipe, replayFailureBlamesRecipe, recipeStepsSignature, isNotServedRecipe, recordPortalNotServed, type BorrowedRecipeChoice } from "./portalRecipes";
 import { notServedInResult } from "../../shared/src/portalNotServed";
@@ -103,7 +104,7 @@ import { assertSubmissionPaid } from "./submissionFees";
 import { snapshotFilingQuote } from "./feeAccuracy";
 import { readAndRecordPortalFees } from "./portalFeeReadings";
 import { closeoutDocumentLines, fetchIssuedRecordDocuments, isFinishedOutcome, issuedDocumentsByTarget } from "./portalIssuedDocuments";
-import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential } from "./portalCredentials";
+import { clientHasLoginOnHost, getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential, recordLoginOutcome, storedCredentialFor } from "./portalCredentials";
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
 import { logger } from "./logger";
 import { disarmDraftCreatingSubmit, draftContinuationGaps, draftSubmitStampForReplay, openPortalDraftFor, recordPortalDraft, DRAFT_SUBMIT_UNEXPECTED_ACTION, type ObservedDraft } from "./portalDraft";
@@ -189,7 +190,9 @@ export function setRecipeStageRunnerForTests(runner: RecipeStageRunner | null): 
 // public fetch (the network) — behind the same kind of seam, so the sweep's own resolution (which
 // recipe, which URL, the track/entity judgment) runs for real in a test with nothing opened.
 // The third, recordSearch, is the Accela module search by record number (#443) — also the network.
-type StatusCheckSeams = { checkStatus?: typeof checkStatusWithAdapter | null; publicCheck?: typeof publicPermitStatusCheck | null; recordSearch?: typeof searchAccelaRecordByNumber | null };
+// The fourth, signedInLink, signs in with the client's stored login and reads the card's own record
+// link (#512) — a browser.
+type StatusCheckSeams = { checkStatus?: typeof checkStatusWithAdapter | null; publicCheck?: typeof publicPermitStatusCheck | null; recordSearch?: typeof searchAccelaRecordByNumber | null; signedInLink?: typeof readRecordLinkSignedIn | null };
 let statusCheckSeams: StatusCheckSeams = {};
 export function setStatusCheckSeamsForTests(seams: StatusCheckSeams | null): void {
   if (process.env.AUTOPILOT_TEST_SEAMS !== "1") throw new Error("setStatusCheckSeamsForTests needs AUTOPILOT_TEST_SEAMS=1 — it is a test seam only.");
@@ -198,6 +201,7 @@ export function setStatusCheckSeamsForTests(seams: StatusCheckSeams | null): voi
 const statusScrape: typeof checkStatusWithAdapter = (...args) => (statusCheckSeams.checkStatus ?? checkStatusWithAdapter)(...args);
 const publicStatusFetch: typeof publicPermitStatusCheck = (...args) => (statusCheckSeams.publicCheck ?? publicPermitStatusCheck)(...args);
 const accelaRecordSearch: typeof searchAccelaRecordByNumber = (...args) => (statusCheckSeams.recordSearch ?? searchAccelaRecordByNumber)(...args);
+const signedInLinkRead: typeof readRecordLinkSignedIn = (...args) => (statusCheckSeams.signedInLink ?? readRecordLinkSignedIn)(...args);
 
 // THE FAILURE TEXT LIVES ON THE FAILING STEP, NOT THE SUMMARY. stageWithRecipe's failure
 // result carries no top-level message - "Recipe step failed (fill - inverter quantity)" rides
@@ -7756,6 +7760,78 @@ export async function runDuePermitChecks(
         }
       }
     }
+    // A LOGIN-WALLED RECORD LINK, READ WITH THE CLIENT'S OWN STORED LOGIN (#512). The card's link
+    // was read anonymously and gave nothing — a sign-in page (PowerClerk's record pages; any portal
+    // whose records need an account), or a page the plain fetch cannot see into — and neither the
+    // recipe nor a saved session read it. When the project's client has a login stored for THAT
+    // link's host — getDecryptedCredentialByUrl: the same host and tenant path, never another
+    // portal's login and never another client's (rules 5 and 6) — open the record through its own
+    // link in a real browser, signing in only when the page asks. One shape on every portal, nothing
+    // per platform. Read-only (readRecordLinkSignedIn: the filing backstop first; the only form it
+    // submits is the login). A profile of its own, so a staging window left open on the client's
+    // portal profile is never waited on or closed by a status read.
+    //
+    // NOT ONLY A WALL THE TEXT RECOGNIZES. Live 2026-11-02: PacifiCorp's record link redirects an
+    // anonymous visitor to /MvcAccount/Login, a page whose form is drawn by script — the plain fetch
+    // saw an empty shell (null), so the read was "no_status", never "wall", and a door keyed on the
+    // wall would never have opened. Whether the page asks for a sign-in is the browser's question.
+    if (!rawStatusText && gap.publicLink !== "none") {
+      const linkUrl = safeTrackingUrl || safeTargetPortalUrl;
+      const appNums = [text(target.application_number), text(target.permit_number)].filter(Boolean);
+      // A host-only question first (no secret read): is a browser worth opening at all? WHICH login is
+      // typed is chosen against the sign-in page the portal itself leads to (credentialFor below).
+      const hasLogin = Boolean(clientId && linkUrl && clientHasLoginOnHost(db, clientId, linkUrl));
+      gap.portalHost ||= portalHostOf(linkUrl);
+      gap.hasCredential ||= hasLogin;
+      if (linkUrl && hasLogin && appNums.length > 0) {
+        portalRead = true;
+        signedInRan = true;
+        const linkHost = portalHostOf(linkUrl);
+        let signInPage = "";
+        let withheld = "";
+        let held: "login_refused" | "login_sends_code" | null = null;
+        const read = await signedInLinkRead(linkUrl, appNums, {
+          // NO KNOCKING ON A DOOR THAT SAID NO. A login the portal refused the last time is not typed
+          // again (lockedOutCredential's rule, the stage gate's own: repeated attempts are what lock an
+          // account), and a login the client's record says sends a code at every sign-in is not typed
+          // by a scheduled read (each check would send the client a code). Nothing is typed; the card
+          // says which (the sweep sets that outcome itself — statusLinkGap words it).
+          credentialFor: (signInPageUrl: string) => {
+            signInPage = signInPageUrl;
+            const stored = storedCredentialFor(db, clientId, signInPageUrl);
+            if (stored?.stale && process.env.PORTAL_CREDENTIAL_LOCKOUT !== "0") {
+              held = "login_refused";
+              withheld = `${linkHost} refused the client's stored login the last time it was tried, so a status read does not try it again (repeated attempts are what lock an account)`;
+              return null;
+            }
+            if (stored?.mfaRequired) {
+              held = "login_sends_code";
+              withheld = `the client's login for ${linkHost} sends a code at every sign-in, so a scheduled status read never signs in with it`;
+              return null;
+            }
+            return getDecryptedCredentialByUrl(db, clientId, signInPageUrl);
+          },
+          headless: true,
+          userDataDir: portalProfileDir(profileBase, clientId, "status-read", linkUrl),
+        }).catch((err) => ({ text: null, reason: `the signed-in record read failed: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`, signedIn: false, loginRefused: false }));
+        // LOGIN HEALTH, the learn's own bookkeeping (recordLoginOutcome): a login the portal accepted
+        // clears a stale mark, one it refused sets it — so neither the next check nor the next stage
+        // knocks again. Diagnostic only: never allowed to change what this check reads.
+        try {
+          if (signInPage && read.signedIn) recordLoginOutcome(db, clientId, signInPage, { ok: true, note: "login accepted (status read)" });
+          else if (signInPage && read.loginRefused) recordLoginOutcome(db, clientId, signInPage, { ok: false, note: `status read: ${read.reason}` });
+        } catch { /* diagnostic only */ }
+        if (held) gap.signedIn = held;
+        if (read.text && !isAuthWallText(read.text)) {
+          rawStatusText = read.text;
+          source = "portal";
+        } else {
+          noteReason(withheld || read.reason || "the signed-in record read found no status");
+        }
+      } else if (linkUrl && !hasLogin && gap.publicLink === "wall") {
+        noteReason(`the record link needs a sign-in, and this client has no login stored for ${portalHostOf(linkUrl)}`);
+      }
+    }
     // A CHECK THAT READ NOTHING IS NOT A STATUS — the rule and its history live on
     // shouldSkipEmptyRead, which the manual/re-check door (recordPermitStatusCheck) asks too. A
     // sweep gathers nothing when it had nothing to check at all (source stays "mock") or its URL
@@ -7768,7 +7844,9 @@ export async function runDuePermitChecks(
     // THE CARD SAYS WHY (#413): one actionable line while the filing cannot be read on its own,
     // cleared by the first sweep that reads a status. Written on both branches below — a skipped
     // read and a never-checked target's honest "manual check required" alike.
-    if (gap.signedIn !== "throttled") gap.signedIn = signedInOutcome(signedInRan, unreadableReason);
+    // Read off the first reason only when the sweep did not decide the outcome itself (throttled, or
+    // a stored login held back untyped).
+    if (gap.signedIn === "not_tried") gap.signedIn = signedInOutcome(signedInRan, unreadableReason);
     const readGap = gatheredNothing
       ? statusReadGap({
           ...gap,

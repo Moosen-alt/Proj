@@ -13,8 +13,12 @@
 import type { TrackKind } from "./permitMonitor";
 
 /** How the signed-in read ended, from the reason the scraper reported (portal-bot statusFinder /
- *  checkStatusWithAdapter word these). `not_tried` = no signed-in read ran. */
-export type SignedInOutcome = "not_tried" | "wall" | "mfa" | "not_found" | "failed" | "throttled";
+ *  checkStatusWithAdapter word these). `not_tried` = no signed-in read ran. Three are never read off
+ *  a reason — the sweep sets them itself: `throttled`, and the two where it HELD a stored login back
+ *  without typing it (#512): `login_refused` (the portal refused it the last time — repeated attempts
+ *  lock an account) and `login_sends_code` (the client's record says the portal sends a code at every
+ *  sign-in, which a scheduled read must never trigger). */
+export type SignedInOutcome = "not_tried" | "wall" | "mfa" | "not_found" | "failed" | "throttled" | "login_refused" | "login_sends_code";
 
 export function signedInOutcome(ran: boolean, reason: string): SignedInOutcome {
   if (!ran) return "not_tried";
@@ -57,6 +61,12 @@ export function statusReadGap(f: ReadGapFacts): string {
   }
   if (f.signedIn === "mfa") {
     return `Login wall: ${host || "the portal"} asked for MFA or a CAPTCHA, which the monitor never answers. Record the status by hand, or sign in once yourself to refresh the session.`;
+  }
+  if (f.signedIn === "login_refused") {
+    return `Login refused: ${host || "the portal"} refused ${client}'s stored login the last time it was tried, so the monitor does not try it again (repeated attempts lock an account). Update the login and sign in with it once (a supervised run), or record the status by hand.`;
+  }
+  if (f.signedIn === "login_sends_code") {
+    return `Login sends a code: ${client}'s login${ON(host)} sends a code at every sign-in, so the monitor never signs in with it on a schedule (every check would send one). Record the status by hand.`;
   }
   if (f.signedIn === "wall") {
     return `Login wall: ${host || "the portal"} showed its sign-in page. ${f.hasCredential ? "Refresh" : "Link"} a portal login for ${client}${ON(host)}, or record the status by hand.`;

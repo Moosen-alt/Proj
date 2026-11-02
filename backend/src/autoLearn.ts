@@ -36,6 +36,7 @@ import { resolveHeadless } from "../../portal-bot/src/browser";
 import { compareReviewFields, utilityIdentifiersEnteredBySteps } from "../../portal-bot/src/reviewScreenScraper";
 import type { LearnPlanRequest, LearnPlanResponse } from "../../portal-bot/src/adapters/autoLearnAdapter";
 import { policyProfileFor } from "../../portal-bot/src/adapters/autoLearnAdapter";
+import { loginWasRefused } from "../../portal-bot/src/adapters/loginFlow";
 import { createLLMProvider, getRecentLlmCalls } from "./llm";
 import { getDecryptedCredentialForPortal, getDecryptedCredentialByUrl, listPortalCredentials, nearestStoredLogins, recordLoginOutcome } from "./portalCredentials";
 import { learnNoteTopicsFromMisses, activeLearnedNoteTerms } from "./noteTopics";
@@ -1578,7 +1579,7 @@ async function autoLearnPortalInner(
   if (credential && project.clientId) {
     try {
       const msg = String(learn.message || "");
-      const rejected = /still on the login form|username\/password was likely rejected|login failed/i.test(msg);
+      const rejected = loginWasRefused(msg);
       const reachedPortal = learn.ok || learn.pageCount > 0 || /review|advance|fill/i.test(msg);
       if (rejected) {
         recordLoginOutcome(db, project.clientId, portalUrl, { ok: false, note: msg.slice(0, 240) });

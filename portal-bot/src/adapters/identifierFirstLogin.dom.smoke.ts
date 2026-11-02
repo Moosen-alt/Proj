@@ -31,7 +31,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { chromium, type BrowserContext, type Page } from "playwright";
-import { performLogin } from "./loginFlow";
+import { loginWasRefused, performLogin } from "./loginFlow";
 
 let failures = 0;
 const check = async (label: string, fn: () => Promise<void>): Promise<void> => {
@@ -277,7 +277,6 @@ async function freshPage(): Promise<{ context: BrowserContext; page: Page }> {
 }
 const clicksOn = async (page: Page): Promise<string[]> => page.evaluate(() => (window as unknown as { __clicks?: string[] }).__clicks ?? []).catch(() => []);
 const NEVER = /social-auth|unlock|help|enroll|forgot|remember|switchAuthenticator|cancel|send-email/;
-const REJECTED_MARKS_STALE = /still on the login form|username\/password was likely rejected|login failed/i; // backend/src/autoLearn.ts
 const results: string[] = [];
 
 await check("MUST-PASS: Tyler/Okta two-step — email + Next, then password + Verify → logged_in on the tenant", async () => {
@@ -324,7 +323,7 @@ await check("MUST-EXCLUDE: a second factor on a HEADLESS run → mfa_captcha pro
   const res = await performLogin(page, { username: USER, password: MFA_PW }); // defaults: headless → no park
   results.push(res.message);
   assert.equal(res.status, "mfa_captcha", `got ${res.status}: ${res.message}`);
-  assert.doesNotMatch(res.message, REJECTED_MARKS_STALE, "an MFA screen must not read as a refused credential");
+  assert.equal(loginWasRefused(res.message), false, "an MFA screen must not read as a refused credential");
   assert.ok(Date.now() - t0 < 25_000, `a headless run must not park (took ${Date.now() - t0} ms)`);
   assert.equal(await page.evaluate(() => (window as unknown as { __emailRequested?: boolean }).__emailRequested === true), false, "'Send me an email' must never be pressed by the bot");
   await context.close();
@@ -377,7 +376,7 @@ await check("MUST-EXCLUDE (B3 bound): a factor nobody completes ends as mfa_capt
   results.push(res.message);
   assert.equal(res.status, "mfa_captcha", `got ${res.status}: ${res.message}`);
   assert.match(res.message, /held open/);
-  assert.doesNotMatch(res.message, REJECTED_MARKS_STALE);
+  assert.equal(loginWasRefused(res.message), false, "a factor nobody completed must not read as a refused credential");
   assert.ok(Date.now() - t0 < 30_000, `the park must be bounded (took ${Date.now() - t0} ms)`);
   await context.close();
 });
