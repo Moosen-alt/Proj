@@ -2899,6 +2899,44 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
     },
   },
   {
+    version: 56,
+    name: "fee_quote_snapshots",
+    up: (db) => {
+      // WHAT THE CLIENT WAS TOLD, KEPT (#494). The fee accuracy report holds the quote up against
+      // what the jurisdiction actually billed, and the quote it needs is the one in force WHEN
+      // THE TRACK WAS FILED. Recomputing it later is not that number: the learned tier feeds on
+      // every real fee recorded since, so a quote rebuilt after the fact already contains part of
+      // the answer it is being graded against (Portland's own receipts would pull its median up
+      // and the low quote would vanish from the report that exists to find it).
+      //
+      // One row per project and BILLING track (permit | nem), written ONCE by the filing doors
+      // (markTrackSubmitted, captureConfirmation) through feeAccuracy.snapshotFilingQuote and
+      // never updated: a second building filing or a re-capture keeps the first snapshot. The
+      // amount is the RESEARCHED ladder's (learned history, published schedule, estimate,
+      // printed form), never the portal's own figure, which is the thing it is compared with.
+      // A child of projects: it reaches an org through its project and carries no org_id.
+      // A report reads it; nothing here writes a schedule or a "verified" (rule 3).
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS fee_quote_snapshots (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          track TEXT NOT NULL,
+          submission_id TEXT NOT NULL DEFAULT '',
+          state TEXT NOT NULL DEFAULT '',
+          jurisdiction TEXT NOT NULL DEFAULT '',
+          quoted_usd REAL,
+          source TEXT NOT NULL DEFAULT 'unknown',
+          confidence TEXT NOT NULL DEFAULT 'unknown',
+          basis TEXT NOT NULL DEFAULT '',
+          snapshotted_at TEXT NOT NULL,
+          FOREIGN KEY (project_id) REFERENCES projects(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_quote_snapshots_project_track
+          ON fee_quote_snapshots(project_id, track);
+      `);
+    },
+  },
+  {
     version: 57,
     name: "clients_handoff_auto_send",
     up: (db) => {

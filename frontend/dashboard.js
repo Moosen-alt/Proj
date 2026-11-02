@@ -11485,6 +11485,21 @@ async function loadKpi() {
     renderKpi(kpi);
   } catch (err) {
     $("kpiBody").innerHTML = `<p class="muted">Failed to load KPIs: ${esc(err.message)}</p>`;
+    return;
+  }
+  loadFeeAccuracy();
+}
+
+// FEE ACCURACY (#494): quoted at filing vs paid, per jurisdiction. All filed jobs, not the date
+// range above (a jurisdiction's quotes are judged on every bill we have). Its own request, so a
+// failure here leaves the KPIs standing.
+async function loadFeeAccuracy() {
+  const slot = $("kpiFeeAccuracy");
+  if (!slot || !window.FeeAccuracy) return;
+  try {
+    slot.innerHTML = window.FeeAccuracy.renderFeeAccuracy(await api("/api/fee-accuracy"));
+  } catch (err) {
+    slot.innerHTML = `<p class="muted">Fee accuracy did not load: ${esc(err.message)}</p>`;
   }
 }
 
@@ -11609,6 +11624,8 @@ function renderKpi(kpi) {
     ${renderStagingQuality(kpi.stagingQuality)}
 
     ${window.KpiFilings ? window.KpiFilings.renderFilingKpis(kpi.filings) : ""}
+
+    <div id="kpiFeeAccuracy"></div>
 
     ${kpi.byUser.length > 0 ? `
     <h3 style="margin-top:24px">Per Operator</h3>
