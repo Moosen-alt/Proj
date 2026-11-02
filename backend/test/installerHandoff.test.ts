@@ -280,6 +280,12 @@ try {
     assert.equal(packets().length, 1, `packets: ${packets().length}`);
     assert.equal(packets()[0].to, b.inbox);
     assert.match(packets()[0].data, /filename="?utility-approval-1\.pdf/);
+    // Signs off as the brand, does not tell the reader the packet "goes to your updates inbox" from
+    // inside that email, and promises no PTO turnaround.
+    const body = String(rows[0].body);
+    assert.match(body, /\n— Keelix \(automated update; reply to reach the team\)$/);
+    assert.doesNotMatch(body, /Solar Submission Autopilot|goes to your updates inbox|business days/);
+    assert.match(body, /Below are the approvals with their reference numbers/);
   });
   await check("4b. the Next step reads 'Handed off <date>' and asks nobody for anything", () => {
     const step = computeNextStep(db, b.pid);
