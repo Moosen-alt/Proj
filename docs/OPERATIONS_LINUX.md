@@ -220,7 +220,7 @@ systemctl list-timers 'keelix-*'          # (untested: no systemd in the sandbox
 mkdir -p /etc/keelix && chmod 700 /etc/keelix
 openssl rand -base64 32 > /etc/keelix/restic.pass && chmod 600 /etc/keelix/restic.pass
 cat > /etc/keelix/restic.env <<'EOF'
-RESTIC_REPOSITORY=s3:https://s3.us-west-004.backblazeb2.com/<bucket>/keelix
+RESTIC_REPOSITORY=s3:https://<the bucket's S3 endpoint>/<bucket>/keelix
 RESTIC_PASSWORD_FILE=/etc/keelix/restic.pass
 AWS_ACCESS_KEY_ID=<key id>
 AWS_SECRET_ACCESS_KEY=<application key>
@@ -299,6 +299,22 @@ sudo /opt/keelix/scripts/ops/linux/deploy.sh origin/main     # or a tag or a sha
    run on its first start).
 6. Waits until `/health` reports the new sha, appends a line to `/srv/keelix/deploys.log`, prints
    preflight, and prints the exact rollback command.
+
+**After a deploy that pulls in recipe fixes**, restore the demoted recipes, as on the desk
+(OPERATIONS.md §7.1, step 4). The script is not in the image, so it runs in a one-off container with
+the app stopped; the dry run first:
+
+```bash
+cd /opt/keelix
+docker compose stop app
+R="docker compose run --rm --no-deps -T -v /opt/keelix/scripts:/app/scripts:ro -e AUTOPILOT_DB_PATH=/app/backend/data/autopilot.sqlite app npx tsx scripts/restore-demoted-recipes.ts"
+$R            # lists RESTORE / KEEP per recipe; writes nothing
+$R --apply
+docker compose start app
+```
+
+A Submit that a portal guards with a browser `confirm()` dialog, on a run handed to a person (#472),
+is answered in the browser's own dialog by that person; nothing on the server answers it.
 
 Before step 5 nothing in production changes, and a failure puts the checkout back where it was.
 Never run `docker compose up --build` on the server: it builds an unstamped image (`unknown build`)
