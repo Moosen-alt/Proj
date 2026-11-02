@@ -2782,6 +2782,21 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       `);
     },
   },
+  {
+    version: 53,
+    name: "users_session_version",
+    up: (db) => {
+      // REVOCABLE SIGN-IN SESSIONS (#432, shared server #429). Every session cookie carries the
+      // session_version it was issued under, and currentUser accepts it only while the user's row
+      // still holds that number. A password change or reset (setUserPassword, in the same UPDATE
+      // as the hash), a deactivation or reactivation, and "Sign out everywhere" bump it
+      // (auth.ts bumpSessionVersion), so every older cookie stops working on its next request.
+      // Default 0 is also what a cookie minted before this migration reads as (it has no version
+      // field), so the deploy signs nobody out; the user's first bump ends it like any other.
+      // users is CREATEd in the base schema, so this addColumnIfMissing comes after it.
+      addColumnIfMissing(db, "users", "session_version", "INTEGER NOT NULL DEFAULT 0");
+    },
+  },
 ];
 
 /** v47 was edited in place while #218 was open (Helm's review at 0116f98a): a DB that ran an earlier

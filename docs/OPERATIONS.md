@@ -526,7 +526,8 @@ The October NEM fixes (#378 the review-page hand-over, #354, #400, #401, #385, #
 |---|---|---|
 | `AUTH_ENABLED` | off | `true` requires a login for everything except `/health`, `/login` and the public token pages |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | – | seed the first password (only while no user has one); delete the password line afterwards |
-| `AUTH_SECRET` | the session key | signs login cookies |
+| `AUTH_SECRET` | the session key | signs login cookies; changing it signs **everyone** out |
+| `AUTH_SESSION_HOURS` | 12 | how long a sign-in lasts. It ends sooner for one person when their password is changed or reset, when their login is switched off, or when they press **Team → Sign out everywhere** (`POST /api/auth/logout-everywhere`): every cookie they hold, on every device, stops working on its next request |
 | `SERVER_HOST` | `127.0.0.1` | this machine only; `0.0.0.0` = every interface (needs `AUTH_ENABLED=true`, or the server refuses to start) |
 | `ALLOW_UNAUTHENTICATED_NETWORK` | off | `1` lets a non-loopback `SERVER_HOST` start with `AUTH_ENABLED` off. Don't. |
 | `PUBLIC_BASE_URL` | localhost | the base of every link a customer receives |

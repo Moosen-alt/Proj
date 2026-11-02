@@ -11204,13 +11204,26 @@ async function changeMyPassword() {
   if (newPassword !== $("mp_repeat").value) { myPasswordStatus("The two new passwords don't match.", "error"); return; }
   try {
     await api("/api/auth/password", { method: "POST", body: JSON.stringify({ currentPassword, newPassword }) });
-    myPasswordStatus("Your password is changed. Use the new one next time you sign in.");
+    myPasswordStatus("Your password is changed, and every other device you were signed in on is signed out. You stay signed in here.");
   } catch (err) {
     myPasswordStatus(err.message || "Could not change your password.", "error");
   } finally {
     $("mp_current").value = "";
     $("mp_new").value = "";
     $("mp_repeat").value = "";
+  }
+}
+
+// Sign out everywhere (#432): the server bumps this user's session version, so every cookie they
+// hold (other browsers, a lost laptop, this tab) stops working at once, then this page goes to the
+// sign-in screen.
+async function signOutEverywhere() {
+  if (!confirm("Sign out everywhere? Every session you have open ends, on every device, including this one. You'll sign in again here.")) return;
+  try {
+    await api("/api/auth/logout-everywhere", { method: "POST", body: "{}" });
+    window.location.href = "/login";
+  } catch (err) {
+    myPasswordStatus(err.message || "Could not sign out everywhere.", "error");
   }
 }
 
@@ -11311,6 +11324,7 @@ $("u_password").addEventListener("input", () => syncUserRoleChoice(!$("userId").
 $("sl_setPasswordBtn").addEventListener("click", setStaffPassword);
 $("sl_toggleActiveBtn").addEventListener("click", toggleStaffActive);
 $("mp_saveBtn").addEventListener("click", changeMyPassword);
+$("mp_signOutEverywhereBtn").addEventListener("click", signOutEverywhere);
 $("rt_mintBtn").addEventListener("click", mintRecorderToken);
 $("rt_list").addEventListener("click", (e) => {
   const btn = e.target.closest("[data-revoke-recorder-token]");

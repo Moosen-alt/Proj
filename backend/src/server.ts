@@ -57,7 +57,7 @@ import { startMonitorScheduler } from "./scheduler";
 import { startAhjFormRefreshScheduler, startKbLinkCheckScheduler } from "./ahjFormRefresh";
 import { startCecSyncScheduler, primeCecCache, syncCecEquipment } from "./cecEquipment";
 import { extractZipToWorkdir } from "./batchZip";
-import { AUTH_ENABLED, currentUser, login, logout, me, requireAuth, seedAdminUser, setUserPassword, entitlementGate, requestOrg, createApiKey, ADMIN_ROLES, ROLE_SUPERADMIN, type SessionUser } from "./auth";
+import { AUTH_ENABLED, currentUser, login, logout, me, requireAuth, seedAdminUser, setUserPassword, entitlementGate, requestOrg, createApiKey, ADMIN_ROLES, ROLE_SUPERADMIN, bumpSessionVersion, clearSessionCookie, issueSessionCookie, type SessionUser } from "./auth";
 import { changeOwnPassword, createStaffLogin, listStaffLogins, resetStaffPassword, setStaffLoginActive } from "./staffLogins";
 import { listRecorderTokens, mintRecorderToken, recorderPrincipal, revokeRecorderToken } from "./recorderTokens";
 import { PRODUCTS, PRODUCT_KEYS, grantProduct, revokeProduct, orgEntitlements, productsForEdition } from "./entitlements";
@@ -1269,6 +1269,22 @@ app.post("/api/auth/password", (req, res) => {
   const user = currentUser(db, req);
   if (!user) throw new HttpError(401, "Not authenticated.");
   changeOwnPassword(db, user, req.body?.currentPassword, req.body?.newPassword);
+  // The new password ended every session this user had (setUserPassword bumps the session
+  // version, #432), this one included; hand THIS device a fresh cookie so only the others drop.
+  issueSessionCookie(db, req, res, user.id);
+  res.json({ ok: true });
+});
+
+// "Sign out everywhere" (#432): ends every session this user has open, on every device, this one
+// included (a lost laptop, a cookie copied off a shared machine). Under /api/auth/ like the route
+// above, so THIS HANDLER is the gate: no session, nothing to end.
+app.post("/api/auth/logout-everywhere", (req, res) => {
+  if (!AUTH_ENABLED) throw new HttpError(409, SIGN_IN_OFF, { code: "auth_disabled" });
+  const user = currentUser(db, req);
+  if (!user) throw new HttpError(401, "Not authenticated.");
+  bumpSessionVersion(db, user.id);
+  addAuditLog(db, null, "human", user.email, "user.signed_out_everywhere", { userId: user.id });
+  clearSessionCookie(res);
   res.json({ ok: true });
 });
 

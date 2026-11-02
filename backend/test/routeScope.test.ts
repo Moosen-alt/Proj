@@ -76,6 +76,9 @@ const UNSCOPED_BY_DESIGN: Record<string, string> = {
   // so the handler itself refuses a request with no session (asserted below) and only ever
   // touches the signed-in user's own row.
   "/api/auth/password": "self-service: the handler requires a session and changes only that user's own password",
+  // "Sign out everywhere" (#432). Same shape as /api/auth/password: the handler refuses a request
+  // with no session (asserted below) and bumps only the signed-in user's own session version.
+  "/api/auth/logout-everywhere": "self-service: the handler requires a session and ends only that user's own sessions",
   // Recorder tokens (#433). Under /api/auth/ like the password change, so each handler is the gate
   // (requireRecorderTokenOwner: a session, never a recorder token) and reads/writes only the
   // caller's OWN tokens; another person's token id is a 404 inside recorderTokens.ts.
@@ -273,13 +276,15 @@ run(
     /function requireStaffAdmin\(req: Request\)[\s\S]{0,300}!AUTH_ENABLED[\s\S]{0,200}requireAdmin\(req\)/.test(source),
     "requireStaffAdmin must check AUTH_ENABLED and call requireAdmin",
   );
-  const start = source.indexOf('app.post("/api/auth/password"');
-  const body = start < 0 ? "" : source.slice(start, source.indexOf("\napp.", start + 10));
-  run(
-    "POST /api/auth/password refuses without a session",
-    /const user = currentUser\(db, req\);\s*if \(!user\) throw new HttpError\(401/.test(body),
-    body.slice(0, 300),
-  );
+  for (const selfRoute of ["/api/auth/password", "/api/auth/logout-everywhere"]) {
+    const start = source.indexOf(`app.post("${selfRoute}"`);
+    const body = start < 0 ? "" : source.slice(start, source.indexOf("\napp.", start + 10));
+    run(
+      `POST ${selfRoute} refuses without a session`,
+      /const user = currentUser\(db, req\);\s*if \(!user\) throw new HttpError\(401/.test(body),
+      body.slice(0, 300),
+    );
+  }
 }
 
 // RECORDER TOKENS (#433). Exempted above by name: every /api/auth/recorder-tokens route goes

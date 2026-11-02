@@ -148,9 +148,12 @@ Env: `BACKUP_DIR`, `BACKUP_KEEP` (snapshots, default 14), `BACKUP_INTERVAL_HOURS
   `POST /api/auth/password {"currentPassword","newPassword"}`.
   The older `POST /api/orgs/:id/users {"email","name","password"}` still works.
   Passwords hashed; API keys sha256 + shown once.
-- A password reset does not end a session already open elsewhere (sessions are
-  signed cookies, up to AUTH_SESSION_HOURS). To cut someone off at once,
-  deactivate the login.
+- Sessions are signed cookies that last up to AUTH_SESSION_HOURS, and each one
+  ends early, on every device, when that person's password is changed or reset
+  or their login is switched off. A self-change keeps the device it was made on
+  signed in. Anyone can also press **Sign out everywhere** (Team → Change my
+  password section, `POST /api/auth/logout-everywhere`) to end every session
+  they have, this one included: the lost-laptop button.
 - Assign projects per user (`projects.assigned_user_id`, dashboard selector).
 - `/api/auth/login` / `/api/auth/logout`; everything else 401s without a
   session or `x-api-key`.
