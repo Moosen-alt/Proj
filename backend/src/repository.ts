@@ -4704,6 +4704,22 @@ function emailStatusText(message: ClassifiedMboxMessage): string {
   ].filter(Boolean).join("\n").slice(0, 5000);
 }
 
+/** THE ONE PREDICATE for "rows the mbox tracker reads" (#514). `email_tracking_sources` holds
+ *  IMAP inboxes too (`source_type = 'imap'`, `file_path = 'imap:<id>'`, or `''` on a row saved
+ *  before #513). Their mail is fetched by `pollImap`, which hands it to this tracker as a temp
+ *  file; read here as an mbox path, `imap:<id>` (or `''`, resolved to the working directory)
+ *  failed every tick with "not found" / "must point to a local MBOX file" and wrote that onto
+ *  the IMAP row's `last_error`, flipping its status against the poll's success. `!= 'imap'`
+ *  rather than `= 'mbox_path'` so an older row with any other type keeps being read. */
+const MBOX_TRACKER_SOURCE_FILTER = "source_type != 'imap'";
+
+/** Ids of the active sources the scheduler runs through the mbox tracker, one by one. */
+export function mboxTrackerSourceIds(db: AppDb): string[] {
+  return db
+    .query<{ id: string }>(`SELECT id FROM email_tracking_sources WHERE active = 1 AND ${MBOX_TRACKER_SOURCE_FILTER} ORDER BY updated_at DESC`)
+    .map((row) => row.id);
+}
+
 export async function runEmailTracker(
   db: AppDb,
   input: { sourceId?: string; filePath?: string; clientId?: string; orgId?: string } = {},
@@ -4722,8 +4738,9 @@ export async function runEmailTracker(
         client_id: input.clientId ?? null,
       } as Row]
     : input.sourceId
-      ? db.query<Row>("SELECT * FROM email_tracking_sources WHERE id = ?", [input.sourceId])
-      : db.query<Row>("SELECT * FROM email_tracking_sources WHERE active = 1 ORDER BY updated_at DESC");
+      // An IMAP row's id names no mbox file: it is read by pollImap, so here it checks nothing.
+      ? db.query<Row>(`SELECT * FROM email_tracking_sources WHERE id = ? AND ${MBOX_TRACKER_SOURCE_FILTER}`, [input.sourceId])
+      : db.query<Row>(`SELECT * FROM email_tracking_sources WHERE active = 1 AND ${MBOX_TRACKER_SOURCE_FILTER} ORDER BY updated_at DESC`);
 
   const result: EmailTrackerRunResult = {
     sourcesChecked: 0,

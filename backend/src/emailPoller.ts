@@ -73,6 +73,14 @@ export function imapStatus(): { configured: boolean; host: string | null; mailbo
   return { configured: cfg !== null, host: cfg?.host ?? null, mailbox: cfg?.mailbox ?? "INBOX" };
 }
 
+/** Whether the scheduler has any IMAP inbox to poll (#514): the env inbox OR an active DB
+ *  source — the same two lists `pollImap` reads. Gating the scheduled poll on
+ *  `imapStatus().configured` (env only) meant an install that keeps its inboxes only in the
+ *  database (POST /api/imap/sources) was never polled except by a manual POST /api/imap/poll. */
+export function imapPollDue(db: AppDb): boolean {
+  return envImapConfig() !== null || dbImapSources(db).length > 0;
+}
+
 // ---------------------------------------------------------------------------
 // DB-driven IMAP sources
 // ---------------------------------------------------------------------------
