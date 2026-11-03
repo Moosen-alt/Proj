@@ -259,11 +259,23 @@ check("with the data held still, the refusal is byte-identical across two differ
     }
     // And the gates it DOES apply are all still there — "no status gate" must never become
     // "no gates".
-    // The filed-track guard reads submitted AND submitted_unconfirmed (an automation click the portal
-    // did not confirm is still a filing — replayOutcome.test.ts).
-    for (const gate of ["assertSubmissionPaid", "status IN ('submitted', 'submitted_unconfirmed')", "failCount", "reviewerBlockers", "missingDocuments", "permitPathUnknown", "needsClient"]) {
+    for (const gate of ["assertSubmissionPaid", "failCount", "reviewerBlockers", "missingDocuments", "permitPathUnknown", "needsClient"]) {
       assert.ok(body.includes(gate), `prepareSubmission must still apply the \`${gate}\` gate`);
     }
+    // The filed-track guard reads submitted AND submitted_unconfirmed (an automation click the portal
+    // did not confirm is still a filing — replayOutcome.test.ts). Since #436 ruling 5 that reading is
+    // submittalTracks.trackFilingOnRecord, reached through the ONE predicate the Stage route, this job
+    // and the track card all ask (trackSubmittedAndTracked): prepareSubmission must still call it on
+    // the track, and the predicate must still read both statuses.
+    assert.ok(/trackSubmittedAndTracked\(db, projectId, track,/.test(body), "prepareSubmission must still apply the filed-track guard (trackSubmittedAndTracked on the track)");
+    const tracksSrc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "submittalTracks.ts"), "utf8");
+    const fs0 = tracksSrc.indexOf("export function trackFilingOnRecord(");
+    assert.ok(fs0 > 0, "trackFilingOnRecord must be findable");
+    assert.ok(tracksSrc.slice(fs0, tracksSrc.indexOf("\n}\n", fs0)).includes("status IN ('submitted', 'submitted_unconfirmed')"),
+      "the filed-track reading must still read submitted AND submitted_unconfirmed");
+    const ps0 = tracksSrc.indexOf("export function trackSubmittedAndTracked(");
+    assert.ok(ps0 > 0 && tracksSrc.slice(ps0, tracksSrc.indexOf("\n}\n", ps0)).includes("trackFilingOnRecord(db, projectId, track)"),
+      "trackSubmittedAndTracked must still ask trackFilingOnRecord first");
   });
   // THE ONE STATUS READ, AND IT CAN ONLY SAY NO. An operator's `blocked` hold refuses staging
   // (LNK-5): it is read through operatorHoldReason, which returns null for every status except
