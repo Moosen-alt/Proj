@@ -426,7 +426,11 @@ function disabledControlHint(label: string): string {
  *  planner-door click (clickStepBudgetMs, 90 s) — and well below the run ceiling (PORTAL_RUN_MAX_MS,
  *  25 min) and the ~15 minutes the #556 click cost: the live stall was noticed and killed by a person
  *  at five minutes. A planner call has its own, longer budget (PLANNER_STALL_DEFAULT_MS). A person's
- *  hold (MFA / CAPTCHA park) is not a stall and is not counted. AUTOLEARN_STALL_MS tunes it; 0 = off. */
+ *  hold (MFA / CAPTCHA park) is not a stall and is not counted. AUTOLEARN_STALL_MS tunes it; 0 = off.
+ *  ITS FEED IS THE DEBUG BUNDLE'S EVENTS (the constructor's onEvent hook). With no bundle
+ *  (AUTOLEARN_RUN_DEBUG=0, or LearnRunDebug.start() returning null) only a page begun, a planner reply,
+ *  a fill completing and a progress report count, and an upload phase plus slow clicks in a row can
+ *  read as a stall. Known and accepted (#556 review); the run debug bundle is on by default. */
 const STALL_WATCHDOG_DEFAULT_MS = 300_000;
 /** #556 — THE WATCHDOG'S BUDGET WHILE A PLANNER CALL IS IN FLIGHT. The LLM client gives each attempt
  *  240 s and then retries it itself (backend llm.ts: timeout 240 000, maxRetries 5) — the recovery a
