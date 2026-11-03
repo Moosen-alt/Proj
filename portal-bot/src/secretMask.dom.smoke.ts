@@ -103,7 +103,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { chromium, type Page } from "playwright";
-import { clearSecretTags, maskedFullPageScreenshot, secretMaskPatterns, tagSecretsInPage, unpaintedMaskBoxes } from "./secretMask";
+import { clearSecretTags, maskedFullPageScreenshot, secretMaskPatterns, tagSecretsForMask, tagSecretsInPage, unpaintedMaskBoxes } from "./secretMask";
 
 let failures = 0;
 let total = 0;
@@ -198,6 +198,53 @@ const STRAY: Record<string, string> = {
   shadowStray: stray(`<div><template shadowrootmode="open"><option style="${GREEN}">Account ${ACCOUNT}</option></template></div>`),
 };
 Object.assign(PAGES, STRAY);
+// #436 ROUND 4 — THE CHECKER'S r4 CORPUS, the deterministic subset it flagged (wl-scratch r4/corpus.mts
+// and r4/strayChild2.mts, their markup exactly): the three <select> carriers whose secret no single
+// option holds (text straight in an <optgroup>; two options' halves; two rich options' halves) under
+// all ten wrappers, the five strayChild2 pages bare and in an open shadow root, and three plain
+// select controls bare and in a shadow root. All the account's ink is pure green, inside the select.
+const R4G = "color:rgb(0,200,0);font-weight:bold;font-size:24px";
+const R4LB = "width:340px;height:150px";
+const R4SZ = "width:340px;height:44px";
+const R4_WRAP: Record<string, (c: string) => string> = {
+  bare: (c) => c,
+  div: (c) => `<div class="row"><span>Info</span> ${c}</div>`,
+  td: (c) => `<table><tr><th>Account</th><td>${c}</td></tr></table>`,
+  li: (c) => `<ul><li>${c}</li></ul>`,
+  fieldset: (c) => `<form><fieldset><legend>Info</legend>${c}</fieldset></form>`,
+  label: (c) => `<label>Acct: ${c}</label>`,
+  listboxDiv: (c) => `<div role="listbox">${c}</div>`,
+  shadow: (c) => `<div><template shadowrootmode="open">${c}</template></div>`,
+  dd: (c) => `<dl><dt>Account</dt><dd>${c}</dd></dl>`,
+  section2: (c) => `<section><h3>Summary</h3><div><div>${c}</div></div></section>`,
+};
+const R4_CARRY: Record<string, string> = {
+  selOptgroupText: `<select size="4" style="${R4G};${R4LB}"><optgroup label="Accounts">Acct ${ACCOUNT}<option>x</option></optgroup></select>`,
+  selOptgroupSplit: `<select size="4" style="${R4G};${R4LB}"><optgroup label="Accounts"><option>8814</option><option>402937</option></optgroup></select>`,
+  selOptgroupRichSplit: `<select size="4" style="${R4G};${R4LB}"><optgroup label="A"><option><b>8814</b></option><option><b>402937</b></option></optgroup></select>`,
+};
+const R4_CONTROL: Record<string, string> = {
+  selCollapsed: `<select style="${R4G};${R4SZ}"><option>Choose</option><option selected>${ACCOUNT}</option></select>`,
+  selListbox: `<select size="4" style="${R4G};${R4LB}"><option>Choose</option><option>${ACCOUNT}</option></select>`,
+  selMultiple: `<select multiple style="${R4G};${R4LB}"><option>Choose</option><option selected>Acct ${ACCOUNT}</option></select>`,
+};
+const R4G28 = "color:rgb(0,200,0);font-weight:bold;font-size:28px";
+const R4_STRAYCHILD2: Record<string, string> = {
+  ogTextListbox: `<select size="5" style="${R4G28};width:320px;height:150px"><optgroup label="Accounts">Account ${ACCOUNT}<option>x</option></optgroup></select>`,
+  ogTextMultiple: `<select multiple name="acct" style="${R4G28};width:360px;height:150px"><optgroup label="Service accounts">Acct: 88-1440-2937<option>Residential</option></optgroup></select>`,
+  ogTextCollapsed: `<select style="${R4G28};width:320px;height:44px"><optgroup label="Accounts">Account ${ACCOUNT}<option>x</option></optgroup></select>`,
+  ogSplitMultiple: `<select multiple style="${R4G28};width:320px;height:150px"><optgroup label="Accounts"><option>8814</option><option>402937</option></optgroup></select>`,
+  ogTextInForm: `<form><label>Account <select size="4" style="${R4G28};width:360px;height:150px"><optgroup label="On file">${ACCOUNT}<option selected>Use this account</option></optgroup></select></label></form>`,
+};
+const r4Doc = (body: string): string => `<!doctype html><html><head><meta charset="utf-8"><title>Review</title></head><body style="margin:0"><h1 style="margin:0;font-size:18px">Review and Submit</h1>${body}<p>end</p></body></html>`;
+const r4Short = (body: string): string => `<!doctype html><html><head><meta charset="utf-8"><title>Review</title></head><body style="margin:0"><h1 style="margin:0;font-size:20px">Review and Submit</h1>${body}</body></html>`;
+const R4: string[] = [];
+for (const [wn, w] of Object.entries(R4_WRAP)) for (const [cn, c] of Object.entries(R4_CARRY)) { PAGES[`r4-${wn}__${cn}`] = r4Doc(w(c)); R4.push(`r4-${wn}__${cn}`); }
+for (const [n, body] of Object.entries(R4_STRAYCHILD2)) {
+  PAGES[`r4-${n}`] = r4Short(body); R4.push(`r4-${n}`);
+  PAGES[`r4-shadow__${n}`] = r4Short(R4_WRAP.shadow(body)); R4.push(`r4-shadow__${n}`);
+}
+for (const [n, c] of Object.entries(R4_CONTROL)) for (const wn of ["bare", "shadow"]) { PAGES[`r4-${wn}__${n}`] = r4Doc(R4_WRAP[wn](c)); R4.push(`r4-${wn}__${n}`); }
 /** MAIN'S LEARNER TAGGER (origin/main d07388da, autoLearnAdapter.ts withSecretMask's inline body),
  *  copied verbatim from the diff's removed lines: the oracle the shared tagger must cover. */
 const mainTagger = (ps: Array<{ digits: string; literal: string }>): number => {
@@ -251,6 +298,33 @@ const mainTagger = (ps: Array<{ digits: string; literal: string }>): number => {
     n++;
   }
   return n;
+};
+/** Number every element, open shadow roots included, so two tag sets compare by element (round 4).
+ *  Plain loops only: no shim is evaluated before the shipped tagging runs. */
+const r4Index = (): number => {
+  let i = 0;
+  const roots: Array<Document | ShadowRoot> = [document];
+  for (let r = 0; r < roots.length; r++) {
+    for (const el of Array.from(roots[r].querySelectorAll("*"))) {
+      el.setAttribute("data-ix", String(i++));
+      const sr = (el as HTMLElement).shadowRoot;
+      if (sr) roots.push(sr);
+    }
+  }
+  return i;
+};
+/** The tagged elements, as "index:TAG", open shadow roots included. */
+const r4Tags = (): string[] => {
+  const out: string[] = [];
+  const roots: Array<Document | ShadowRoot> = [document];
+  for (let r = 0; r < roots.length; r++) {
+    for (const el of Array.from(roots[r].querySelectorAll("*"))) {
+      if (el.hasAttribute("data-al-secret")) out.push(`${el.getAttribute("data-ix")}:${el.tagName}`);
+      const sr = (el as HTMLElement).shadowRoot;
+      if (sr) roots.push(sr);
+    }
+  }
+  return out;
 };
 /** Served without the account on its first load, with it on every load after: a page that reloads
  *  itself INTO showing one. Nothing was marked before the shot, so only the document mark can tell. */
@@ -472,14 +546,16 @@ try {
         for (const el of Array.from(document.querySelectorAll("[data-al-secret]"))) { el.removeAttribute("data-al-secret"); el.setAttribute("data-main-tag", "1"); out.push(el.tagName); }
         return out;
       });
-      const nBranch = await tagSecretsInPage(pg, pats);
-      const gBranch = await greenPixels(await pg.screenshot(nBranch > 0 ? { mask: [pg.locator("[data-al-secret]")] } : {}));
+      // The learner's own tagging (round 4: the union — main's pass, then the shared tagger).
+      const u = await tagSecretsForMask(pg, pats);
+      const gBranch = await greenPixels(await pg.screenshot(u.tagged ? { mask: [pg.locator("[data-al-secret]")] } : {}));
       const branchTags = await pg.locator("[data-al-secret]").evaluateAll((els) => els.map((e) => e.tagName));
+      // Round 4: STRICT — every element main tagged is tagged itself (no "or its <select> is").
       const missed = await pg.evaluate(() => Array.from(document.querySelectorAll("[data-main-tag]"))
-        .filter((el) => !el.hasAttribute("data-al-secret") && !el.closest("select")?.hasAttribute("data-al-secret"))
+        .filter((el) => !el.hasAttribute("data-al-secret"))
         .map((el) => el.tagName));
       const seen = JSON.stringify({ mainTags, branchTags, missed, raw, gMain, gBranch });
-      check(`${name}: every element main's learner tagger tagged is tagged (or its <select> is)`, missed.length === 0, seen);
+      check(`${name}: every element main's learner tagger tagged is tagged`, missed.length === 0, seen);
       check(`${name}: the account shows unmasked, and the learner's mask leaves none of it (main's left ${gMain} px)`, raw > 30 && gBranch === 0 && gBranch <= gMain, seen);
       await clearSecretTags(pg);
       await pg.context().close();
@@ -507,6 +583,50 @@ try {
     const m = await maskedFullPageScreenshot(pg, [ACCOUNT], file);
     const green = fs.existsSync(file) ? await greenPixels(fs.readFileSync(file)) : -1;
     check("datalist: an option in a <datalist> paints nothing — ok:true, the plain account masked", m.ok && green === 0, JSON.stringify({ ...m, green }));
+    await pg.context().close();
+  }
+
+  console.log(`\n9. FACE 1 (round 4): on the checker's r4 corpus (${R4.length} pages) the learner's tagging is a superset of main's, and its mask leaves no green`);
+  {
+    const pats = secretMaskPatterns([ACCOUNT]);
+    for (const name of R4) {
+      const pg = await scripted(name);
+      await pg.evaluate(r4Index);
+      const raw = await greenPixels(await pg.screenshot());
+      // The SHIPPED path first (what withSecretMask runs), on a page where no shim was evaluated.
+      const u = await tagSecretsForMask(pg, pats);
+      const unionTags = await pg.evaluate(r4Tags);
+      const gUnion = await greenPixels(await pg.screenshot(u.tagged ? { mask: [pg.locator("[data-al-secret]")] } : {}));
+      await clearSecretTags(pg);
+      const left = await pg.evaluate(r4Tags);
+      // Then main's tagger (the oracle copied above) on the same page, under main's own mask.
+      const nMain = await pg.evaluate(mainTagger, pats);
+      const mainTags = await pg.evaluate(r4Tags);
+      const gMain = await greenPixels(await pg.screenshot(nMain > 0 ? { mask: [pg.locator("[data-al-secret]")] } : {}));
+      await clearSecretTags(pg);
+      const missed = mainTags.filter((t) => !unionTags.includes(t));
+      const seen = JSON.stringify({ ok: u.ok, mainTags, unionTags, missed, raw, gMain, gUnion });
+      check(`${name}: both passes ran, and one clear removed every tag`, u.ok && left.length === 0, seen);
+      check(`${name}: tags(learner) ⊇ tags(main) — every element main tags is tagged itself`, missed.length === 0, seen);
+      check(`${name}: the account shows (${raw} px) and the learner's mask leaves 0 of it (main's left ${gMain})`, raw > 30 && gUnion === 0, seen);
+      await pg.context().close();
+    }
+  }
+
+  console.log(`\n10. FACE 2 (round 4): the staged picture of every r4 page is KEPT with the select masked whole, none of the account in clear`);
+  for (const name of R4) {
+    const pg = await scriptless(name);
+    const raw = await greenPixels(await pg.screenshot({ fullPage: true, scale: "css" }));
+    const file = path.join(dir, `${name}.png`);
+    const m = await maskedFullPageScreenshot(pg, [ACCOUNT], file);
+    const kept = fs.existsSync(file);
+    const green = kept ? await greenPixels(fs.readFileSync(file)) : -1;
+    const seen = JSON.stringify({ ...m, kept, raw, green });
+    check(`${name}: the page shows the account unmasked (${raw} px)`, raw > 30, seen);
+    check(`${name}: refused with no picture on disk, or kept with none of the account`, (!m.ok && !kept) || (m.ok && kept && green === 0), seen);
+    // Stricter (round 4): a select whose text carries the account is tagged whole, so the picture is
+    // KEPT, masked. A refusal here would be the coverage check's backstop hiding a tagger miss.
+    check(`${name}: kept (ok:true, on disk) with 0 px of the account in clear`, m.ok && kept && green === 0, seen);
     await pg.context().close();
   }
 } finally {
