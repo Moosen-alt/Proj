@@ -233,9 +233,23 @@ export interface ClientRecord {
    *  this REQUIRED and asks for a shared inbox rather than one person's. Falls back to
    *  businessEmail in clientNotifier when blank. */
   updatesInbox: string;
+  /** The installer handoff packet (#491): '' = the server emails it to updatesInbox when a job
+   *  reaches handoff_ready; 'off' = staff send it by hand from the project page. */
+  handoffAutoSend: string;
   /** Who receives OUR invoices — a third address again: the AHJ's correspondent, the
    *  operations inbox and accounts payable are rarely one person. */
   billingContactEmail: string;
+  /** Whether the server emails this client the intake link and the one-time portal-login link on
+   *  its own when a job is held on something only the client can supply (#488): "" = yes (the
+   *  default), "off" = staff send them by hand. clientRequestLinks.ts is the one reader. */
+  requestLinksAutoSend: string;
+  /** EMAIL-IN INTAKE (#489): the tag after the + in the intake address (intake+<tag>@…) that
+   *  files a job emailed there under this client. Lower-case letters, digits, dot, dash and
+   *  underscore; "" = this client cannot email jobs in. */
+  intakeTag: string;
+  /** Extra senders (addresses, or "@domain" entries) allowed to email jobs to this client's tag,
+   *  beyond its own contact / business / updates / billing emails. Comma or newline separated. */
+  intakeSenders: string;
   /** The issuing state for the contractor licence numbers above. A bare number is ambiguous
    *  the moment a company is licensed in two states. */
   licenseState: string;
@@ -373,6 +387,9 @@ export type PermitFeeSource =
   | "learned_history"
   | "published_schedule"
   | "valuation_estimate"
+  /** The fee table printed on the AHJ's own stored form (#454) — the LAST rung, below the
+   *  valuation estimate: it answers only when nothing else prices the job, graded "estimated". */
+  | "printed_form"
   | "unknown";
 
 /** One filed record's fees, as the permit monitor last read them off the portal
@@ -453,6 +470,109 @@ export interface FeeComparison {
   note: string;
 }
 
+/** FEE ACCURACY (#494): what we quoted at filing beside what the jurisdiction was paid. */
+export type FeeAccuracyPaidSource = "actual" | "portal_record" | "receipts" | "billing_summary";
+
+export interface FeeAccuracyJob {
+  projectId: string;
+  /** The project's homeowner name as the dashboard shows it (org-scoped report), else its id. */
+  label: string;
+  filedAt: string;
+  quotedUsd: number;
+  /** The ladder tier the filing-time quote came from; "payment_row" for a job filed before
+   *  quotes were snapshotted (the estimate frozen on its paid quote). */
+  quoteSource: PermitFeeSource | "payment_row";
+  quoteConfidence: string;
+  quoteBasis: string;
+  quotedAt: string;
+  paidUsd: number;
+  paidSource: FeeAccuracyPaidSource;
+  paidBasis: string;
+  /** quoted − paid. Negative: quoted low. */
+  missUsd: number;
+  /** missUsd ÷ paid × 100, one decimal. */
+  missPct: number;
+}
+
+export interface FeeAccuracyGroup {
+  track: "permit" | "nem";
+  state: string;
+  /** The project's AHJ as entered (permit) or its utility (nem). */
+  jurisdiction: string;
+  n: number;
+  medianMissPct: number;
+  medianAbsMissPct: number;
+  /** The signed miss of the job furthest off. */
+  worstMissPct: number;
+  /** The median's direction, "on" when within the threshold. */
+  direction: "low" | "high" | "on";
+  /** medianAbsMissPct over the threshold. */
+  flagged: boolean;
+  /** Furthest off first. */
+  jobs: FeeAccuracyJob[];
+}
+
+export interface FeeAccuracyExclusion {
+  projectId: string;
+  label: string;
+  track: "permit" | "nem";
+  state: string;
+  jurisdiction: string;
+  reason:
+    | "no_quote"
+    | "quote_not_frozen"
+    | "no_researched_figure"
+    | "no_paid_figure"
+    | "partial_portal_read"
+    | "provisional_portal_read"
+    | "receipts_incomplete";
+  detail: string;
+}
+
+export interface FeeAccuracyReport {
+  thresholdPct: number;
+  generatedAt: string;
+  /** Flagged first, then by median absolute miss. */
+  groups: FeeAccuracyGroup[];
+  /** Filed jobs left out, each with why: a missing quote, or no whole, settled paid figure. */
+  excluded: FeeAccuracyExclusion[];
+  notes: string[];
+}
+
+/** One line of what a printed fee table composes for a job (#454): the permit line, or a
+ *  percentage surcharge evaluated on it (per line, never stored pre-multiplied). */
+export interface PrintedFormFeeLine {
+  label: string;
+  amountUsd: number;
+  kind: "permit" | "surcharge";
+  /** On a surcharge: the printed percentage it was evaluated from. */
+  percent?: number;
+  discipline: "electrical" | "structural";
+}
+
+/** THE QUOTE BESIDE THE FEE TABLE PRINTED ON THE AHJ'S OWN FORM (#454) — a dated, lower-trust
+ *  cross-check. A note, never a replacement: nothing in it changes the amount. */
+export interface PrintedFormFeeCheck {
+  /** "agrees" within $1; "disagrees" by differenceUsd; "no_printed_table" — no held form for this
+   *  authority prints fee amounts; "not_comparable" — a table is held but does not price this job,
+   *  the quote has no amount, or the quote IS the printed table. */
+  verdict: "agrees" | "disagrees" | "no_printed_table" | "not_comparable";
+  /** What the printed lines compose for this job; null when none priced it. */
+  printedUsd: number | null;
+  quotedUsd: number | null;
+  quotedSource: PermitFeeSource;
+  /** Sum of the compared quoted-minus-printed gaps; null when nothing was compared. */
+  differenceUsd: number | null;
+  /** What was compared: each discipline against the schedule's own line, or the whole quote. */
+  compared: Array<{ what: "electrical" | "structural" | "total"; printedUsd: number; quotedUsd: number; differenceUsd: number }>;
+  /** The printed forms that priced this job, each with its own printed date. */
+  forms: Array<{ formName: string; printedDate: string; sourceUrl: string; discipline: "electrical" | "structural"; totalUsd: number }>;
+  lines: PrintedFormFeeLine[];
+  /** Printed tables held that do not price this job, and why. */
+  skipped: string[];
+  note: string;
+}
+
 export interface SubmissionPaymentQuote {
   track: string;
   /** True when the project's client bills per submission (staging is gated). */
@@ -489,6 +609,9 @@ export interface SubmissionPaymentQuote {
   /** The portal's figure beside the researched one, whenever a portal figure exists (read off
    *  the record, or typed by the operator) — both numbers and the difference. */
   permitFeeComparison: FeeComparison | null;
+  /** The permit amount beside the fee table printed on the AHJ's own form (#454) — a note, never
+   *  a replacement. null on the NEM track (no printed permit form prices an interconnection). */
+  printedFormCheck: PrintedFormFeeCheck | null;
   /** What the permit monitor has read off this track's filed records, complete or not. */
   portalFeeRecords: PortalFeeRecordSummary | null;
   paymentMethod: FeePaymentMethod;
@@ -664,6 +787,8 @@ export interface ProjectFeeSheetLine {
   verifiedAt: string;
   /** See SubmissionPaymentQuote.permitFeeComparison / portalFeeRecords. */
   comparison: FeeComparison | null;
+  /** See SubmissionPaymentQuote.printedFormCheck. Absent on the local-review line. */
+  printedFormCheck?: PrintedFormFeeCheck | null;
   portalRecords: PortalFeeRecordSummary | null;
   paymentMethod: FeePaymentMethod;
   serviceFeeUsd: number;
@@ -777,6 +902,12 @@ export interface ProjectRecord {
   assignedUserId?: string | null;
   createdAt: string;
   updatedAt: string;
+  /** The project's edit version (#440): a counter every write to the project's DATA moves (a
+   *  trigger, so background data writers move it too; status/stage ticks don't). A dashboard editor sends back the one it loaded as
+   *  `expectedVersion` on PUT /api/projects/:id; a stale one is refused with a 409 and nothing is
+   *  written. Optional only because normalizeProject builds an in-memory record before any row
+   *  exists; every record read from the database carries it. */
+  editVersion?: number;
   /** Which permit discipline to file: "structural" (BLD) or "electrical" (ELE).
    *  Drives jurisdiction row selection (city vs county) and app-type checkbox
    *  in the Accela ACA flow. Undefined defaults to structural. */
@@ -941,6 +1072,37 @@ export interface NextStep {
   /** A draft is staged on a portal awaiting a person (an unfiled track's awaiting_human_submit
    *  run, or a reopened correction form awaiting the human resubmit), whatever `key` says. */
   hasStagedDraft: boolean;
+  /** UNSURE RECORD NUMBERS read after a person's submit in the review window (#400): a
+   *  low-confidence completion-page read, or the new rows when several appeared in the account's
+   *  list. Never written as fact — each is one click for a person to confirm (the confirmation
+   *  door, POST /api/portal-runs/:runId/capture-confirmation). Absent when there are none. */
+  recordCandidates?: SubmitCaptureCandidate[];
+  /** The intake / portal-login links the server emailed the client for this job and that are still
+   *  open (#488) — the banner's "Sent to <contact> on <date>". Detail tier only; absent when none. */
+  clientAsks?: ClientAskSent[];
+}
+/** One automatic ask of the client that is still open (clientRequestLinks.ts, client_request_sends). */
+export interface ClientAskSent {
+  kind: "intake" | "credentials";
+  /** The address it went to (the client's updates inbox, else its business email). */
+  recipient: string;
+  sentAt: string;
+  /** "sent" | "draft" (SMTP or PUBLIC_BASE_URL not set: nothing left; send it by hand from the
+   *  project's communications) | "failed" (the mail server refused). */
+  deliveryStatus: string;
+  /** What was asked, as plain labels (never a value). */
+  needs: string[];
+  reminderAt?: string;
+  reminderStatus?: string;
+}
+/** One record number a person may confirm (NextStep.recordCandidates). */
+export interface SubmitCaptureCandidate {
+  runId: string;
+  track: SubmittalTrackType;
+  recordNumber: string;
+  /** "" when no link was seen; otherwise http(s) and cleaned of session material. */
+  recordLink: string;
+  source: "completion_page" | "account_list";
 }
 export interface NextStepCompact {
   key: NextStepKey;
@@ -1092,8 +1254,30 @@ export interface PermitCheckTarget {
   portalPlatform?: string;
   /** Public AHJ portal record URL — no login required. Paste into browser to check status. */
   trackingUrl?: string;
+  /** WHY THE MONITOR COULD NOT READ THIS FILING on its last check (#413), one actionable line ("No
+   *  portal recipe learned for … yet", "Login wall: …"); absent once a status is read. */
+  readGap?: string;
+  /** THE ISSUED PERMIT / APPROVAL LETTER the monitor downloaded off this filing's record once it
+   *  read issued / approved (#492), each with its provenance; absent when none is on file. */
+  issuedDocuments?: IssuedRecordDocument[];
+  /** WHY no issued permit / approval letter was attached for this finished filing (#492), one
+   *  actionable line; absent once one is on file. */
+  issuedDocsGap?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** A closeout document the permit monitor downloaded off a filed record (#492). */
+export interface IssuedRecordDocument {
+  documentId: string;
+  /** "issued_permit" (permit track) | "utility_approval" (NEM track). */
+  docType: string;
+  filename: string;
+  recordNumber: string;
+  sourceUrl: string;
+  fetchedAt: string;
+  /** "downloaded from record <number> on <date>". */
+  provenance: string;
 }
 
 // A project's required submittal tracks (utility NEM + building/electrical permits),
@@ -1109,6 +1293,66 @@ export type SubmittalTrackStatus =
   // the fee is a human action still outstanding on this track.
   | "ready_for_issue"
   | "issued";
+
+/** #445: one input a recipe will fill that THIS job has no value for (backend recipeStageGaps) — the
+ *  stage gate's 409 and the track card read the same list. Never carries a value (rule 2). */
+export interface RecipeStageGap {
+  kind: "question" | "field" | "document";
+  /** The field key the replay reads, or the docType for a document. One entry per key. */
+  key: string;
+  /** The portal's own words for the box, or a fixed label for a secret field. */
+  label: string;
+  /** The project/client field (or document) to fill, in plain words. */
+  fieldName: string;
+  /** Where a person fills it. */
+  where: "project" | "client" | "documents" | "portal_questions";
+  /** A secret field (account, meter…): named by its fixed label only. */
+  secret: boolean;
+}
+
+/** #486: where one value on the approval sheet came from. "bill" = the customer's utility bill
+ *  (its parsed reading, or the bill-image read); "plan_set" = the plan set as saved on the project;
+ *  "person" = a person verified or set it (review queue, operator-set issuer); "client" = the
+ *  submitting company's own record; "project" = the project record, with no finer provenance
+ *  stored; "derived" = computed by the replay from other values (e.g. energy source). */
+export type ApprovalSheetSource = "bill" | "plan_set" | "person" | "client" | "project" | "derived";
+
+/** #486: one line of the Approve & auto-submit sheet. `value` is the replay's own value for THIS
+ *  filing; an account or meter number is masked to its last 4 (rule 2) and never sent whole. */
+export interface ApprovalSheetRow {
+  key: string;
+  label: string;
+  /** "" = nothing on file. */
+  value: string;
+  source: ApprovalSheetSource;
+  /** The source in words, e.g. "Utility bill (account holder)". */
+  sourceLabel: string;
+  masked?: boolean;
+  /** The cross-check against another source, when one could be made. */
+  check?: "match" | "mismatch" | "missing";
+  /** What the cross-check found, in words (masked like the value). */
+  checkNote?: string;
+}
+
+/** #486: something the approver should see before approving. Mismatches and missing values are
+ *  shown first, in red; notes are worth a look but are not disagreements. */
+export interface ApprovalSheetIssue {
+  kind: "mismatch" | "missing" | "note";
+  rowKey: string;
+  text: string;
+}
+
+/** #486: GET /api/projects/:id/approval-sheet — what Approve & auto-submit is about to file. A read:
+ *  it writes nothing, decides nothing, and the gate (mayClickFinalSubmit / automaticSubmitRefusals)
+ *  stays the only authority on whether the run may click submit. */
+export interface ApprovalSheet {
+  projectId: string;
+  track: SubmittalTrackType;
+  category: "utility" | "permit";
+  rows: ApprovalSheetRow[];
+  /** Mismatches first, then missing values, then notes. */
+  issues: ApprovalSheetIssue[];
+}
 
 export interface SubmittalTrack {
   type: SubmittalTrackType;
@@ -1151,6 +1395,10 @@ export interface SubmittalTrack {
   /** No recipe of its own: the recipe this project's LAST run of this track borrowed (another entity's,
    *  same portal — portalRecipes.findBorrowableRecipe), read from that run's result. null = none used. */
   borrowedRecipe?: { recipeId: string; recipeVersion: number | null; learnedFor: string; recordType: string; portalHost: string; lastUsedAt: string } | null;
+  /** #445: what this track's recipe will fill that the job has no value for — the same reading the
+   *  stage gate refuses on (backend recipeStageGaps), one entry per key. Labels and keys only, never a
+   *  value (rule 2). Absent when the track has no complete recipe of its own or nothing is missing. */
+  stageGaps?: RecipeStageGap[];
   /** NEM only (#308, #310): where the track stands between the signature request and the filing
    *  (backend signatureTrack.nemSignatureState) — "awaiting_signature_request" (stopped in front of
    *  Request Signatures: a person clicks it, or approves a run that does), "signature_request_unconfirmed"
@@ -2485,6 +2733,51 @@ export interface EmailTrackerRunResult {
   matches: EmailProjectMatch[];
 }
 
+// EMAIL-IN INTAKE (#489): a job emailed to intake+<client tag>@… (emailIntake.ts).
+/** created = a new project; attached = files added to the client's recent project at the same
+ *  address; unsorted = waiting on a person (reason says why); ignored = no attachments at all;
+ *  dismissed = a person cleared it from the unsorted list. */
+export type EmailIntakeStatus = "created" | "attached" | "unsorted" | "ignored" | "dismissed";
+
+export type EmailIntakeReason =
+  | "no_tag" | "unknown_tag" | "ambiguous_tag" | "unknown_sender" | "sender_not_authenticated"
+  | "no_usable_attachments" | "address_unreadable" | "plan_set_names_another_client" | "failed";
+
+export interface EmailIntakeFile {
+  name: string;
+  size: number;
+  /** The project document slot it went to (plan_set, utility_bill, meter_photo…). */
+  docType?: string;
+  /** Why it was not used — a refused file never drops the others. */
+  refused?: string;
+}
+
+export interface EmailIntakeView {
+  id: string;
+  status: EmailIntakeStatus;
+  reason: EmailIntakeReason | "";
+  /** One sentence for a person. */
+  reasonText: string;
+  sender: string;
+  intakeTag: string;
+  subject: string;
+  clientId: string | null;
+  projectId: string | null;
+  files: EmailIntakeFile[];
+  replyStatus: string;
+  receivedAt: string;
+  createdAt: string;
+}
+
+export interface EmailIntakeRunResult {
+  scanned: number;
+  created: number;
+  attached: number;
+  unsorted: number;
+  skippedDuplicates: number;
+  items: EmailIntakeView[];
+}
+
 export type OperationStepStatus = "not_started" | "in_progress" | "waiting" | "blocked" | "done";
 export type ProjectNoteType = "pm_note" | "blocker" | "client_update" | "handoff" | "system_note";
 
@@ -2622,6 +2915,9 @@ export interface ProjectHandoffPacket {
   timelineEventCount: number;
   ownerRoles: string[];
   sections: ProjectHandoffPacketSection[];
+  /** Every finished filing (permit issued / NEM approved) has its issued permit or approval
+   *  letter on file, downloaded or attached (#492). False while any is missing or none finished. */
+  closeoutDocumentsComplete: boolean;
   reportText: string;
 }
 
@@ -3010,6 +3306,13 @@ export interface ProjectDetail {
   isBlocked: boolean;
 }
 
+/** POST /api/projects/:id/permit-checks (recordPermitStatusCheck). `unreadable` is set when the
+ *  check read NOTHING on a target whose status is already known (permitMonitor.shouldSkipEmptyRead):
+ *  nothing was recorded, the target was only rescheduled, and this is the sentence that says so. */
+export interface PermitStatusCheckResult extends ProjectDetail {
+  unreadable?: string;
+}
+
 // ---------------------------------------------------------------------------
 // THE TOKENIZED, NO-LOGIN CLIENT STATUS PAGE (/api/public/status/:token → frontend/status.html).
 //
@@ -3094,6 +3397,61 @@ export interface PublicStatusTrack {
   needsRecheck: boolean;
 }
 
+/**
+ * THE CLOSEOUT MILESTONES (#497) — the steps after the agencies say yes that no portal reading
+ * produces today: the install, the final inspection, the PTO request and the PTO itself. A person
+ * records them on the project (backend/src/clientTimeline.ts recordProjectMilestone); the finals
+ * and PTO automation (#495, #496) records them through the same door when it lands.
+ */
+export type ProjectMilestoneKey = "installed" | "final_passed" | "pto_requested" | "pto_granted";
+
+/** One closeout milestone as staff see it on the project. */
+export interface ProjectMilestoneRecord {
+  key: ProjectMilestoneKey;
+  label: string;
+  /** When it happened, or null when it has not been recorded. */
+  at: string | null;
+  recordedBy: string;
+  /** Recording it sends the client an update (note + email). */
+  clientFacing: boolean;
+}
+
+/** Every step on a client's filing timeline, in the order a job moves through them. */
+export type ClientTimelineStepKey =
+  | "permit_filed" | "nem_filed" | "permit_issued" | "nem_approved" | ProjectMilestoneKey;
+
+/**
+ * One step of the client's timeline: filed → issued / approved → installed → final → PTO.
+ *
+ * Carries no record numbers, no portal text and no internal note: labels and `detail` are fixed
+ * templates, the dates are ours, the day counts are arithmetic on those dates. The application
+ * and permit numbers stay on the Applications card, where they already pass the client checks.
+ */
+export interface ClientTimelineStep {
+  key: ClientTimelineStepKey;
+  label: string;
+  /** done = it happened; current = the step the job is on now (a permit and an interconnection
+   *  run side by side, so two steps can be current at once); upcoming = not reached yet. */
+  state: "done" | "current" | "upcoming";
+  /** When a done step happened. null for an upcoming step, and for a done one whose date we do
+   *  not hold (a filing tracked without a recorded submission date). */
+  at: string | null;
+  /** A fixed client-safe line: the outcome once done ("Issued"), how far an open step got
+   *  ("1 of 2 permits issued", "Correction requested — we are on it"), or "". */
+  detail: string;
+  /** Done agency steps: whole days the step took from its start (filed → issued, requested → granted). */
+  tookDays: number | null;
+  /** Current steps: whole days since the step started, when its start date is known. */
+  daysSoFar: number | null;
+  /** Current steps: the MEASURED usual days for this agency (median of at least 3 real filings),
+   *  else null — never a seeded or one-off figure, because a client plans a crew around it. */
+  typicalDays: number | null;
+}
+
+export interface ClientTimeline {
+  steps: ClientTimelineStep[];
+}
+
 export interface PublicProjectStatusPayload {
   project: {
     address: string;
@@ -3102,6 +3460,8 @@ export interface PublicProjectStatusPayload {
     status: string;
     updatedAt: string;
   };
+  /** Filed → issued/approved → installed → final → PTO, one row per step (#497). */
+  timeline: ClientTimeline;
   tracks: PublicStatusTrack[];
   history: PublicStatusHistoryEntry[];
   submissions: Array<{ type: string; status: string; submittedAt: string | null }>;

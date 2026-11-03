@@ -22,6 +22,7 @@
 // ---------------------------------------------------------------------------
 
 import path from "node:path";
+import { portalProfilesDir, screenshotsDir } from "./statePaths";
 import fs from "node:fs";
 import type { AppDb } from "./db";
 import type { InfoPageIncident, PortalRecipe, ProjectRecord, RecipeStep } from "../../shared/src/types";
@@ -34,6 +35,8 @@ import { learnPortal, browserLimiter } from "../../portal-bot/src/index";
 import { resolveHeadless } from "../../portal-bot/src/browser";
 import { compareReviewFields, utilityIdentifiersEnteredBySteps } from "../../portal-bot/src/reviewScreenScraper";
 import type { LearnPlanRequest, LearnPlanResponse } from "../../portal-bot/src/adapters/autoLearnAdapter";
+import { policyProfileFor } from "../../portal-bot/src/adapters/autoLearnAdapter";
+import { loginWasRefused } from "../../portal-bot/src/adapters/loginFlow";
 import { createLLMProvider, getRecentLlmCalls } from "./llm";
 import { getDecryptedCredentialForPortal, getDecryptedCredentialByUrl, listPortalCredentials, nearestStoredLogins, recordLoginOutcome } from "./portalCredentials";
 import { learnNoteTopicsFromMisses, activeLearnedNoteTerms } from "./noteTopics";
@@ -60,6 +63,8 @@ import { issuingAgencyFor, projectForTrack } from "./permitProcess";
 import { DECLARED_VALUATION_FIELD, rebindsToValuation } from "./valuation";
 import { feeBracketFieldForLabel } from "./feeBracketFields";
 import { SERVICE_FEEDER_200A_FIELD, SERVICE_FEEDER_400A_FIELD } from "./batteryServiceFeeder";
+import { DESIGN_NOTE_SOURCES, EXPORT_LIMITING_NO_EVIDENCE_KEY } from "../../shared/src/exportLimiting";
+import { FILING_CONTACT_EMAIL_KEY, contactTrackOf, isOwnerEmailSlot, planFilingContactEmails } from "../../shared/src/filingContactEmail";
 
 /** The submittal track an AHJ learn files, from the recipe discipline it will be keyed under
  *  (authoritative — the value the recipe lookup asks for), else the requested permit type.
@@ -151,12 +156,9 @@ export { isPlannerSecretKey, projectSecretValues };
 export { redactSecretValues };
 
 // The parser's long narrative texts — the ones designNotesDigest reads its decision lines from.
-// One list for the digest and for the planner's view (plannerFieldView), which leaves the raw
-// texts out BECAUSE the digest already carries what in them answers a portal question.
-const DESIGN_NOTE_SOURCES = [
-  "sitePlanNotesText", "roofPlanNotesText", "projectDescriptionText", "electricalCalcText",
-  "structuralCalcText", "labelsText", "reviewFlags", "utilityUploadNotesText", "planSetExtractedText",
-] as const;
+// One list (shared exportLimiting DESIGN_NOTE_SOURCES) for the digest, for the planner's view
+// (plannerFieldView), which leaves the raw texts out BECAUSE the digest already carries what in them
+// answers a portal question, and for the one exportLimiting derivation.
 
 function digestLines(project: ProjectRecord, maxChars: number, matches: (line: string) => boolean, secrets: string[] = []): string {
   const snap = (project.parserSnapshot || {}) as Record<string, unknown>;
@@ -200,6 +202,7 @@ function digestLines(project: ProjectRecord, maxChars: number, matches: (line: s
 // Left out of what the MODEL is sent (the returned projectFields — the learn's fill and binding
 // map — is unchanged, so nothing a recipe binds goes missing at replay):
 //   - the narrative texts the digest reads (DESIGN_NOTE_SOURCES);
+//   - the exportLimiting evidence flag (EXPORT_LIMITING_NO_EVIDENCE_KEY, #356) — the replay reads it;
 //   - the parser's own review chatter (its `notes`, the packet-readiness line): what the parser
 //     doubted and what the packet lacks are questions for the reviewer, not portal answers;
 //   - a raw parser key that only repeats the canonical key it is the source of — the key the
@@ -240,7 +243,11 @@ const PLANNER_ALIAS_OF_CANONICAL: Readonly<Record<string, string>> = {
   existingInvQty: "existingInverterQty",
 };
 export function plannerFieldView(projectFields: Record<string, string>): Record<string, string> {
-  const omit = new Set<string>([...DESIGN_NOTE_SOURCES, ...PLANNER_REVIEW_PROSE_KEYS]);
+  // The exportLimiting evidence flag (#356) is the replay's to read, never the model's: the planner
+  // gets exportLimiting itself, as before, and no new text.
+  // The filing contact's email (#520) is placed by the one slot predicate after the plan
+  // (applyFilingContactEmail), never by the model: it is not the model's to choose where it goes.
+  const omit = new Set<string>([...DESIGN_NOTE_SOURCES, ...PLANNER_REVIEW_PROSE_KEYS, EXPORT_LIMITING_NO_EVIDENCE_KEY, FILING_CONTACT_EMAIL_KEY]);
   const same = (a: string | undefined, b: string | undefined) =>
     String(a ?? "").trim().toLowerCase() === String(b ?? "").trim().toLowerCase();
   const out: Record<string, string> = {};
@@ -251,6 +258,51 @@ export function plannerFieldView(projectFields: Record<string, string>): Record<
     out[k] = v;
   }
   return out;
+}
+
+/**
+ * THE FILING SERVICE'S EMAIL GOES WHERE THE ONE SLOT PREDICATE SAYS, AND NOWHERE ELSE (#520).
+ *
+ * Run on every plan the learn planner returns (the model's and the offline heuristic's alike), over
+ * the page's own email boxes: a box shared/filingContactEmail names (a separate applicant / agent /
+ * additional-contact slot) is filled from FILING_CONTACT_EMAIL and recorded BOUND to
+ * filingContactEmail, so a replay types its own server's address, never a literal. Every other box
+ * keeps the plan's own fill — the contractor's email box keeps the client's, a form with one company
+ * email slot keeps it there. A box the predicate does NOT name that came back holding the filing
+ * contact's address or key is put back to its owner: the homeowner's email on an owner / customer box
+ * (PowerClerk's NEM Applicant — the utility's e-signature goes there; owner ruling 2026-11-02), the
+ * contractor's on any other. No setting (`value` ""): nothing changes. Mutates `fills`. Exported for
+ * the unit test.
+ */
+export function applyFilingContactEmail(
+  fields: Array<{ label?: string; fieldType?: string; section?: string; selector?: { frame?: string } } | undefined>,
+  fills: Array<{ selectorIndex: number; value: string; field?: string }>,
+  opts: { track: string | null | undefined; value: string; projectFields: Record<string, string> },
+): void {
+  const value = String(opts.value ?? "").trim();
+  if (!value) return;
+  const track = contactTrackOf(opts.track);
+  const at: number[] = [];
+  const boxes: Array<{ label: string; section?: string; inContactBlock: boolean }> = [];
+  fields.forEach((f, i) => {
+    if (!f || (f.fieldType !== "text" && f.fieldType !== "other")) return;
+    at.push(i);
+    boxes.push({ label: String(f.label ?? ""), section: f.section, inContactBlock: Boolean(f.selector?.frame) });
+  });
+  const plan = planFilingContactEmails(boxes, { track, enabled: true });
+  const sameAddress = (a: unknown) => String(a ?? "").trim().toLowerCase() === value.toLowerCase();
+  boxes.forEach((box, j) => {
+    const i = at[j];
+    const k = fills.findIndex((f) => f.selectorIndex === i);
+    if (plan[j]) {
+      const fill = { selectorIndex: i, value, field: FILING_CONTACT_EMAIL_KEY };
+      if (k >= 0) fills[k] = fill; else fills.push(fill);
+      return;
+    }
+    if (k < 0 || (fills[k].field !== FILING_CONTACT_EMAIL_KEY && !sameAddress(fills[k].value))) return;
+    const key = isOwnerEmailSlot(box, { track }) ? "homeownerEmail" : "installerEmail";
+    fills[k] = { selectorIndex: i, value: String(opts.projectFields[key] ?? ""), field: key };
+  });
 }
 
 function clip(value: string | undefined, max: number): string {
@@ -594,15 +646,11 @@ export function buildPortalPlanner(
   if (digest) projectFields["designNotes"] = digest;
   // EXPORT-LIMITING ANSWER. NEM portals ask a REQUIRED "Do you propose to limit the
   // export capacity?" radio; without a bound field the planner leaves it blank and the
-  // trust gate refuses the recipe on every run (seen live on PGE). Derive it: the
-  // answer is "Yes" only when the design carries actual export-limiting evidence
-  // (PCS / power control system, export limit, non-export, NGOM) — a plain NEM system
-  // exports and answers "No". Never override an explicit parser/operator value.
-  if (!projectFields["exportLimiting"]) {
-    const evidence = `${fieldValues["exportMode"] ?? ""} ${fieldValues["pcs"] ?? ""} ${fieldValues["exportLimit"] ?? ""} ${projectFields["designNotes"] ?? ""}`;
-    projectFields["exportLimiting"] =
-      /non.?export|export.?limit\b|power control system|\bpcs\b|\bngom\b/i.test(evidence) ? "Yes" : "No";
-  }
+  // trust gate refuses the recipe on every run (seen live on PGE). The answer is the replay
+  // map's own exportLimiting (above, from resolveRecipeFieldValues): THE ONE DERIVATION
+  // (shared exportLimitingFor, #356), which reads the snapshot AND the design notes. This used to
+  // derive its own from the digest, so a PCS named only in the design notes was "Yes" here and
+  // "No" at replay.
 
   // KB CONTEXT. Fuzzy, state-aware lookup so imported reference knowledge
   // ("Portland General Electric" / "Arizona Public Service Company") still hits
@@ -700,6 +748,9 @@ export function buildPortalPlanner(
       if (at >= 0) fills[at] = { selectorIndex: i, value, field: key };
       else fills.push({ selectorIndex: i, value, field: key });
     }
+    // THE FILING SERVICE'S OWN EMAIL (#520): only into a separate applicant / agent / additional-contact
+    // slot the one predicate names; the homeowner's and the contractor's own boxes are never it.
+    applyFilingContactEmail(req.fields, fills, { track, value: projectFields[FILING_CONTACT_EMAIL_KEY] ?? "", projectFields });
     return {
       fills,
       advanceSelectorIndex: plan.advanceIndex,
@@ -1047,7 +1098,7 @@ async function autoLearnPortalInner(
   const credential = project.clientId
     ? getDecryptedCredentialForPortal(db, project.clientId, portalType, portalUrl) ?? undefined
     : undefined;
-  const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  const profileBase = portalProfilesDir();
   const userDataDir = project.clientId
     ? path.join(profileBase, project.clientId, learnProfileName(portalType, portalUrl))
     : path.join(profileBase, learnProfileName(portalType, portalUrl));
@@ -1139,8 +1190,9 @@ async function autoLearnPortalInner(
   // it will not talk to. So a run blocked that way is retried ONCE with a real window.
   //
   // Only for a bot block: a genuine 403 from an auth failure, a dead host, or any other
-  // error retries nothing. And only where a display exists — set PORTAL_HEADED_RETRY=0 on a
-  // server, where a headed launch cannot work and the retry would just cost time.
+  // error retries nothing. And only where a display exists: the Docker image brings its own
+  // virtual one (Xvfb, scripts/docker-entrypoint.sh, #434); on a bare server with no display set
+  // PORTAL_HEADED_RETRY=0, where a headed launch cannot work and the retry would just cost time.
   let headlessForAttempt = input.headless;
   let headedRetryUsed = false;
   // #344 — THE INFORMATION-PAGE PASS IS PER autoLearnPortal CALL, NOT PER ATTEMPT (round 2). Before
@@ -1406,6 +1458,16 @@ async function autoLearnPortalInner(
         moduleQty: projectFields.moduleQty || projectFields.modQty || "",
         tilt: projectFields.tilt || projectFields.arrayTilt || projectFields.roofPitch || "",
         azimuth: projectFields.azimuth || projectFields.arrayAzimuth || "",
+        // #382 — EVERY ROOF PLANE's OWN ROW. A PV Array repeater gets one row per array: the
+        // learn binds row 1 to array1* and fills rows 2..N from array{N}* with the replay's own
+        // row code, which also reads the certified module model and the system total.
+        ...Object.fromEntries(Object.entries(projectFields).filter(([k]) => /^array\d+(ModuleQuantity|ModuleManufacturer|ModuleModel|Tilt|Azimuth)$/.test(k))),
+        moduleModelCertified: projectFields.moduleModelCertified || "",
+        // #535 — the inverter's certified string too: the learner's model fill tries it first, as
+        // the replay does, so a plan-set marketing name ("IQ8+ Microinverter") still finds the
+        // portal's part-number option.
+        inverterModelCertified: projectFields.inverterModelCertified || "",
+        totalModuleQuantity: projectFields.totalModuleQuantity || "",
         // Battery/ESS repeaters on NEM apps (storage sections ask make/model/qty).
         batteryMake: projectFields.batteryMake || projectFields.battMake || "",
         batteryModel: projectFields.batteryModel || projectFields.battModel || "",
@@ -1427,11 +1489,9 @@ async function autoLearnPortalInner(
       // Deterministic policy answers (export capacity → No, UL 1741 → Yes) are standard-
       // residential-NEM domain policy: apply them only on UTILITY interconnection learns,
       // never on AHJ/permit portals. PORTAL_POLICY_DEFAULTS=off disables them everywhere
-      // (non-standard projects); the planner + project data then decide.
-      policyProfile:
-        process.env.PORTAL_POLICY_DEFAULTS === "off" || process.env.PORTAL_POLICY_DEFAULTS === "0"
-          ? "none"
-          : scopeType === "utility" ? "residential_nem" : "permit_standard",
+      // (non-standard projects); the planner + project data then decide. ONE rule, shared with
+      // the replay's answer to a required control its recipe never recorded (policyScopeFor).
+      policyProfile: policyProfileFor(scopeType),
       // The keys a REPLAY can resolve. The planner picks the field each fill binds to, and
       // a key that exists only in the planner's richer map (or one it invents outright)
       // fills "" forever. Handing the adapter the replay map stops a dead binding being
@@ -1577,7 +1637,7 @@ async function autoLearnPortalInner(
   if (credential && project.clientId) {
     try {
       const msg = String(learn.message || "");
-      const rejected = /still on the login form|username\/password was likely rejected|login failed/i.test(msg);
+      const rejected = loginWasRefused(msg);
       const reachedPortal = learn.ok || learn.pageCount > 0 || /review|advance|fill/i.test(msg);
       if (rejected) {
         recordLoginOutcome(db, project.clientId, portalUrl, { ok: false, note: msg.slice(0, 240) });
@@ -2340,7 +2400,7 @@ async function autoLearnPortalInner(
       if (debugDir) {
         dest = path.join(debugDir, "verdict.json");
       } else {
-        const screenshotDir = path.join(process.cwd(), "data", "screenshots");
+        const screenshotDir = screenshotsDir();
         fs.mkdirSync(screenshotDir, { recursive: true });
         dest = path.join(screenshotDir, `verdict-${stub.id}-${Date.now()}.json`);
       }
@@ -2400,7 +2460,7 @@ async function autoLearnPortalInner(
   }
 
     try {
-      const screenshotDir = path.join(process.cwd(), "data", "screenshots");
+      const screenshotDir = screenshotsDir();
       fs.mkdirSync(screenshotDir, { recursive: true });
       const screenshotPath = path.join(screenshotDir, `review-${stub.id}-${Date.now()}.png`);
       const pngBuf = Buffer.from(learn.reviewScreenshotBase64, "base64");

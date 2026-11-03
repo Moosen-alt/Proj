@@ -26,6 +26,7 @@ import type {
 import { findApplicationProfile, describePermitType, permitStructureAnswer, permitStructureIsCitedOrVerified, type PermitPrerequisiteStep, type PermitStructureAnswer } from "./applicationDocs";
 import { findAhjProcessProfile, jurisdictionKind, jurisdictionKindsCompatible } from "./processProfiles";
 import { findAnyRecipeForProject, findCompleteRecipeForProject } from "./portalRecipes";
+import { stageGapsForTrack } from "./recipeStageGapsView";
 import { detectPlatform } from "./publicPermitStatus";
 import { NEM_APPROVAL_OUTCOME, isNemApprovalOutcome, trackKind } from "./permitMonitor";
 import { HttpError } from "./httpError";
@@ -37,7 +38,9 @@ import { nowIso } from "./time";
 import { hasMpuScope } from "./serviceScope";
 import { essPermitStep, type EssPermitStep } from "./essRequirements";
 import { randomUUID } from "node:crypto";
+import { snapshotFilingQuote } from "./feeAccuracy";
 import { nemSignatureState, type NemSignatureView } from "./signatureTrack";
+import { notifyClientOfFiling } from "./clientFilingUpdate";
 
 /** Words that claim the statewide portal ("Oregon ePermitting", "OR E-permitting") with no URL —
  *  on a learned row, often the generic fallback's own words laundered in (portal-truth D2/D4). */
@@ -614,6 +617,73 @@ function deriveStatus(state: TrackState): SubmittalTrackStatus {
   return "not_started";
 }
 
+/**
+ * WHEN ONE TARGET FINISHED ITS TRACK: its first done reading after the last correction before it
+ * (targetFinishedTrack's own rule — a correction after issuance re-opens the filing, and the
+ * reading that closes it again is when it finished). Falls back to the target's last check when
+ * the history holds no done row (a target whose latest outcome was written without one).
+ */
+function targetDoneAt(db: AppDb, track: SubmittalTrackType, target: Row): string | null {
+  const done = track === "nem" ? NEM_APPROVAL_OUTCOME : "issued";
+  const rows = db.query<Row>(
+    `SELECT outcome, created_at FROM permit_status_checks
+      WHERE target_id = ? AND outcome IN (?, 'correction_flagged')
+      ORDER BY created_at ASC, rowid ASC`,
+    [s(target.id), done],
+  );
+  let at: string | null = null;
+  for (const row of rows) {
+    if (s(row.outcome) === "correction_flagged") at = null;
+    else if (at === null) at = s(row.created_at) || null;
+  }
+  return at ?? (target.last_checked_at != null ? s(target.last_checked_at) || null : null);
+}
+
+/** One required track's progress, for the client timeline (#497). */
+export interface TrackProgress {
+  type: SubmittalTrackType;
+  /** The tracks panel's own status (deriveStatus over readTrackState) — the ONE answer. */
+  status: SubmittalTrackStatus;
+  /** The earliest time a person actually SENT this track's filing (a `submitted` row), or null. */
+  filedAt: string | null;
+  /** When the track finished (isTrackDone's targets), or null while it is open. */
+  doneAt: string | null;
+}
+
+/**
+ * EVERY REQUIRED TRACK'S STATUS AND DATES — read-only, without the panel's channel and recipe
+ * resolution. The client timeline reads this instead of keeping a second copy of "is it filed, is
+ * it done": status is deriveStatus over the same readTrackState the panel uses, done is
+ * isTrackDone's verdict, and the done date is read off the SAME targets that verdict judged
+ * (trackTargets: the track's own, else the pool, where every target must be finished — so the
+ * track finished when its last one did).
+ *
+ * filedAt counts `submitted` rows only, the client pages' rule (clientPortal.ts): a staged
+ * application sits at awaiting_human_submit with nothing filed, and a submit the portal did not
+ * confirm is not announced as filed either.
+ */
+export function trackProgress(db: AppDb, project: ProjectRecord): TrackProgress[] {
+  const required = requiredTracks(project);
+  return required.map((type) => {
+    const state = readTrackState(db, project.id, type, required);
+    const status = deriveStatus(state);
+    const types = trackPermitTypes(type);
+    const filed = db.get<Row>(
+      `SELECT MIN(submitted_at) AS t FROM submissions
+        WHERE project_id = ? AND permit_type IN (${types.map(() => "?").join(",")})
+          AND status = 'submitted' AND submitted_at IS NOT NULL AND TRIM(submitted_at) <> ''`,
+      [project.id, ...types],
+    );
+    let doneAt: string | null = null;
+    if (state.done) {
+      const { own, pool } = trackTargets(db, project.id, type, required);
+      const dates = (own ? [own] : pool).map((t) => targetDoneAt(db, type, t)).filter((d): d is string => Boolean(d));
+      doneAt = dates.sort().pop() ?? null;
+    }
+    return { type, status, filedAt: s(filed?.t) || null, doneAt };
+  });
+}
+
 function categoryFor(type: SubmittalTrackType): "utility" | "permit" {
   return type === "nem" ? "utility" : "permit";
 }
@@ -762,7 +832,14 @@ export function getSubmittalTracks(db: AppDb, project: ProjectRecord): Submittal
     type CardRecipe = { id: string; status: string; portal_url: string };
     const cardRecipe = (r: { id: string; status?: unknown; portalUrl?: unknown } | null): CardRecipe | null =>
       r ? { id: r.id, status: s(r.status), portal_url: s(r.portalUrl) } : null;
-    let recipeRow: CardRecipe | null = cardRecipe(findCompleteRecipeForProject(db, resolverInput));
+    const completeRecipe = findCompleteRecipeForProject(db, resolverInput);
+    let recipeRow: CardRecipe | null = cardRecipe(completeRecipe);
+    // WHAT THAT RECIPE WILL FILL THAT THIS JOB HAS NO VALUE FOR (#445) — the stage gate's own reading,
+    // shown before anyone clicks Stage. Only for a complete recipe of the track's own (what the next
+    // stage replays), and only before the filing (not started, or staged and not yet submitted).
+    const stageGaps = completeRecipe && (status === "not_started" || status === "staged")
+      ? stageGapsForTrack(db, project, type, completeRecipe)
+      : [];
     // NO RECIPE OF ITS OWN IS NOT "NOTHING RAN" (operator 09-28: "if we're using the Coos Bay recipe can
     // we make it say that somewhere? They just look blank"). Stage borrows a recipe learned for another
     // entity on the same portal (portalRecipes.findBorrowableRecipe) and records it on the run
@@ -865,6 +942,7 @@ export function getSubmittalTracks(db: AppDb, project: ProjectRecord): Submittal
       recipeId: recipeRow ? s(recipeRow.id) : undefined,
       recipeScopeType: scopeType,
       borrowedRecipe,
+      ...(stageGaps.length ? { stageGaps } : {}),
       ...(type === "nem" ? { signatureRequest } : {}),
       ...(issuer ? { issuer } : {}),
     };
@@ -928,6 +1006,7 @@ export function markTrackSubmitted(
   // rollback of a half-written submission.
   refuseUtilityUrlOnPermitTarget(targetTypeFor(type), trackingUrl);
 
+  let submissionId = "";
   db.transaction(() => {
     // If a staged run left an awaiting_human_submit submission for this track, the
     // operator's manual submit RESOLVES it — update that row in place rather than
@@ -939,6 +1018,7 @@ export function markTrackSubmitted(
       [project.id, type],
     );
     if (awaiting) {
+      submissionId = s(awaiting.id);
       db.run(
         `UPDATE submissions
            SET status = 'submitted', application_number = ?, permit_number = ?,
@@ -962,7 +1042,7 @@ export function markTrackSubmitted(
            screenshots_path, notes, created_at)
          VALUES (?, ?, ?, ?, ?, 'submitted', ?, ?, ?, ?, ?, '', ?, ?)`,
         [
-          randomUUID(),
+          (submissionId = randomUUID()),
           project.id,
           null,
           type === "nem" ? "interconnection" : "permit",
@@ -1026,6 +1106,13 @@ export function markTrackSubmitted(
       nextCheckAt: ts, // check on the next poll tick
     });
   });
+  // The operator recorded a filing they made — the client hears we filed (#490). Once per track:
+  // a track already announced by its capture or auto-submit sends nothing more.
+  void notifyClientOfFiling(db, project, { track: type, applicationNumber, permitNumber, via: "mark_submitted" });
+
+  // THE QUOTE IN FORCE AS IT WAS FILED (#494), kept once per billing track for the fee accuracy
+  // report. After the transaction and never throwing: the filing is the fact that matters.
+  snapshotFilingQuote(db, project, type, submissionId);
 }
 
 // ---------------------------------------------------------------------------

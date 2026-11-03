@@ -1,9 +1,9 @@
 import type { AppDb } from "./db";
-import { imapStatus, pollImap } from "./emailPoller";
+import { imapPollDue, pollImap } from "./emailPoller";
 import { gmailStatus, pollGmail } from "./gmail";
 import { sseBroadcast } from "./events";
 import { logger } from "./logger";
-import { runDuePermitChecks, runEmailTracker } from "./repository";
+import { mboxTrackerSourceIds, runDuePermitChecks, runEmailTracker } from "./repository";
 
 // Automated monitor scheduler — makes operation hands-off. On a fixed interval it runs
 // the due permit/NEM status checks and the email tracker for every active source, so
@@ -54,30 +54,36 @@ export function startMonitorScheduler(db: AppDb): void {
       }
 
       let emailMatches = 0;
-      const sources = db.query<{ id: string }>("SELECT id FROM email_tracking_sources WHERE active = 1");
-      for (const source of sources) {
+      // Mbox rows only: an IMAP row is read by pollImap below, never as a local file (#514).
+      const sources = mboxTrackerSourceIds(db);
+      for (const sourceId of sources) {
         try {
-          const res = await runEmailTracker(db, { sourceId: source.id });
+          const res = await runEmailTracker(db, { sourceId });
           const matches = res.matches?.length ?? 0;
           emailMatches += matches;
           if (matches > 0) {
             sseBroadcast({ type: "email_matched", message: `${matches} correction/approval email(s) matched and bucketed.`, data: { matches } });
           }
         } catch (err) {
-          logger.warn("monitor", `email tracker source ${source.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+          logger.warn("monitor", `email tracker source ${sourceId} failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
 
-      // IMAP live polling — runs when EMAIL_IMAP_HOST is configured. Fetches
+      // IMAP live polling — runs when the env inbox (EMAIL_IMAP_*) OR any active database
+      // IMAP source exists (#514: env-only gating never polled DB-only installs). Fetches
       // new messages and runs them through the same email tracker pipeline as mbox.
       let imapMatches = 0;
-      if (imapStatus().configured) {
+      if (imapPollDue(db)) {
         try {
           const imap = await pollImap(db);
           imapMatches = imap.matches;
           if (imap.fetched > 0) {
             logger.info("monitor", `IMAP: fetched ${imap.fetched} message(s), ${imap.matches} match(es).`);
             sseBroadcast({ type: "imap_poll_done", message: `IMAP: ${imap.fetched} fetched, ${imap.matches} matched.`, data: { fetched: imap.fetched, matches: imap.matches } });
+          }
+          // Emailed jobs (#489): new projects, files added to a recent one, and what waits on a person.
+          if (imap.intakeCreated || imap.intakeAttached || imap.intakeUnsorted) {
+            logger.info("monitor", `Email intake: ${imap.intakeCreated} project(s) created, ${imap.intakeAttached} attached, ${imap.intakeUnsorted} unsorted.`);
           }
         } catch (err) {
           logger.warn("monitor", `IMAP poll failed: ${err instanceof Error ? err.message : String(err)}`);
@@ -100,6 +106,16 @@ export function startMonitorScheduler(db: AppDb): void {
         } catch (err) {
           logger.warn("monitor", `Gmail poll failed: ${err instanceof Error ? err.message : String(err)}`);
         }
+      }
+
+      // THE ONE REMINDER for an intake / login link the server emailed a client (#488): due
+      // CLIENT_REQUEST_REMINDER_DAYS after a send that left, re-checked against the need first.
+      try {
+        const { remindClientRequests } = await import("./clientRequestLinks");
+        const r = await remindClientRequests(db);
+        if (r.reminded > 0) logger.info("monitor", `client request reminders: ${r.reminded} sent, ${r.closed} ask(s) closed.`);
+      } catch (err) {
+        logger.warn("monitor", `client request reminders failed: ${err instanceof Error ? err.message : String(err)}`);
       }
 
       if (permit.checked > 0 || emailMatches > 0 || imapMatches > 0 || gmailMatches > 0) {

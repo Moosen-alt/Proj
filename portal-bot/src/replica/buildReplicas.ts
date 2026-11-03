@@ -2,10 +2,11 @@
 //   npm run replica:build
 import fs from "node:fs";
 import path from "node:path";
+import { runDataDir } from "../../../backend/src/statePaths";
 import { pagesFromTraceZip, pagesFromCaptureDir, mergeBundles, type ReplicaPage } from "./extractFromTrace";
 
-const RUNS = path.resolve(process.cwd(), "data/learn-runs");
-const OUT = path.resolve(process.cwd(), "data/portal-replicas");
+const RUNS = path.join(runDataDir(), "learn-runs");
+const OUT = path.join(runDataDir(), "portal-replicas");
 
 // Run folder names are "<stamp>_<portal-slug>_<id>" — the slug is the portal.
 function portalOf(dirName: string): string {

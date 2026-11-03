@@ -26,6 +26,9 @@
 //       watch, no candidate, nothing hashed into the shared table; a CSRF token still is a candidate.
 //   [E] SLOT LIFETIME: an opened slot that is not used within 20 s is gone; a GET reload closes it;
 //       a second matching POST after the admission is held (the same page served again: d8).
+//       E5 (#417, Helm nit :99 on #378, a GUARD pin): the hand-over closes it — opened, the watch armed,
+//       handOverToHuman, then a page script's synthetic el.click() on Next: held (review-lockdown), no
+//       admission, no reservation asked. Kill: remove closeInfo() from handOverToHuman.
 //   [N] NEAR MISSES with DevHub's entry live, the variant served at the SAME origin + path: every
 //       one is HELD, nothing reaches the server, no admission — c1-c28 (c21 under amendment [8]).
 //       The toggle INSIDE a <header> landmark is the one mask: c21h passes for another tenant.
@@ -33,6 +36,8 @@
 //       different permit-type tile (tile B), an own write, the sticky lock, a draft, a signature
 //       resume, earlier progress, a prior stopping abort, a near-miss entry (one component off):
 //       every one HELD.
+//   [X] #358 REDIRECT: the verified Next answered 307 to <p>/payment, <p>/SubmitApplication and the
+//       page's own next form: the hop is judged as a fresh request and refused, named, every time.
 // Against main's filingBackstop.ts (no openInfoPagePass) [A]'s watch and [B]'s pass FAIL by name
 // and every HELD line stays ok: main holds every one of these requests.
 //
@@ -61,7 +66,7 @@ const check = (label: string, ok: boolean, detail = ""): void => {
 // ------------------------------------------------------------------------------------------
 // The server: every scenario under its own prefix; the information page at <p>/permits/sfjsp.
 // ------------------------------------------------------------------------------------------
-type Variant = { html: (p: string) => string; next?: "form" | "same" | "filed" };
+type Variant = { html: (p: string) => string; next?: "form" | "same" | "filed"; redirect?: [number, string] };
 const VARIANTS: Record<string, Variant> = {};
 const hits: Array<{ method: string; path: string; names: string[]; ct: string }> = [];
 const PROJECT_FORM = (p: string): string => devhubReplica({ p, title: "Project Information", content: `<div class="form-group"><label for="addr">Site Address</label><input id="addr" name="addr" type="text"></div>` });
@@ -81,9 +86,11 @@ const server = http.createServer((q, r) => {
     if (!p) { send("<html><body><h1>Unknown</h1></body></html>"); return; }
     const v = VARIANTS[p];
     if (method === "GET" && /\/permits\/sfjsp2?$/.test(pathOnly)) { send(v.html(p)); return; }
+    if (method !== "GET" && /\/permits\/next-page$/.test(pathOnly)) { send(PROJECT_FORM(p)); return; }
     if (method !== "GET" && /\/permits\/sfjsp2?$/.test(pathOnly)) {
       const names = bodyNamesOf(ct, body);
       if (!names.includes(NEXT_NAME)) { send(v.html(p)); return; }
+      if (v.redirect) { r.writeHead(v.redirect[0], { Location: `${p}${v.redirect[1]}` }); r.end(); return; }
       if (v.next === "same") { send(v.html(p)); return; }
       if (v.next === "filed") { send("<!doctype html><html><body><h1>Application filed</h1></body></html>"); return; }
       send(PROJECT_FORM(p));
@@ -120,6 +127,8 @@ interface Run {
   p: string;
   html: (p: string) => string;
   next?: Variant["next"];
+  /** #358: the server answers the verified Next with this redirect (status, path under the prefix). */
+  redirect?: Variant["redirect"];
   entries: VerifiedInfoPage[];
   run?: (startUrl: string) => InfoPageRunState;
   query?: string;
@@ -139,7 +148,7 @@ const startUrlOf = (p: string): string => `${base}${p}/permits/sfjsp?interviewID
 const reserveCalls: Array<[string, string]> = [];
 const okReserve: InfoPageReserve = (entryId, where) => { reserveCalls.push([entryId, where]); return []; };
 async function go(o: Run): Promise<Outcome> {
-  VARIANTS[o.p] = { html: o.html, next: o.next };
+  VARIANTS[o.p] = { html: o.html, next: o.next, redirect: o.redirect };
   const before = hits.length;
   const ctx = await browser.newContext();
   await ctx.addInitScript("globalThis.__name = globalThis.__name || function (fn) { return fn; };");
@@ -427,6 +436,41 @@ if (want("E")) {
     await bs?.dispose();
     await ctx.close();
   }
+  // E5 (#417, Helm nit :99 on #378 — GUARD pin, green before by design): the hand-over closes the
+  // information-page pass. A pass opened on the run's page must not outlive handOverToHuman: from there
+  // only a person's own input lifts the lockdown. The pass opens on the exact verified page, the input
+  // watch is armed (the CDP isolated-world arm) and the page handed over; then a page script's SYNTHETIC
+  // el.click() on Next (no input event of a person's): its POST never reaches the server, it is held by
+  // the review lockdown, no admission is recorded and no reservation is asked. Kill: remove closeInfo()
+  // from handOverToHuman (the still-open slot admits the Next).
+  {
+    const e5 = await devhubEntryAt("/E5");
+    const ctx = await browser.newContext();
+    const page = await ctx.newPage();
+    const bs = await installFilingBackstop(page, "e5 hand-over");
+    await page.goto(`${base}/E5/permits/sfjsp`);
+    await page.waitForLoadState("load");
+    await sleep(400);
+    const before = hits.length;
+    const reservedBefore = reserveCalls.length;
+    const run = cleanRun(devhubPrefix(startUrlOf("/E5")));
+    const open = bs ? await bs.openInfoPagePass(page, page.locator(NEXT), { entries: e5 ? [e5] : [], run, reserve: okReserve }) : null;
+    const armed = bs ? await bs.watchHumanInput() : false;
+    const handed = bs ? bs.handOverToHuman("e5 smoke") : false;
+    await page.evaluate((sel) => { (document.querySelector(sel) as HTMLElement | null)?.click(); }, NEXT);
+    await page.waitForLoadState("load").catch(() => null);
+    await sleep(900);
+    const posts = hits.slice(before).filter((h) => h.method === "POST" && h.path.startsWith("/E5/permits/"));
+    const aborts = (bs?.aborts ?? []).map((a) => ({ rule: a.rule, where: a.where.replace(base, ""), stopping: isStoppingAbort(a), human: !!a.humanInput }));
+    check("[E] E5 premise: the pass opened on the verified page, the input watch armed, and the hand-over was accepted",
+      !!open?.opened && armed === true && handed === true, JSON.stringify({ open, armed, handed }));
+    check("[E] E5 the hand-over closes the pass: a page script's synthetic el.click() on Next sends nothing (0 POSTs), held by the review lockdown",
+      posts.length === 0 && aborts.some((a) => a.rule === "review-lockdown" && /\/E5\/permits\/sfjsp$/.test(a.where) && !a.human), JSON.stringify({ posts, aborts }));
+    check("[E] E5 …no admission is recorded and no reservation is asked",
+      (bs?.infoPageAdmissions ?? []).length === 0 && reserveCalls.length === reservedBefore, JSON.stringify({ admissions: bs?.infoPageAdmissions, reserve: reserveCalls.slice(reservedBefore) }));
+    await bs?.dispose();
+    await ctx.close();
+  }
 }
 
 // ===========================================================================================
@@ -551,6 +595,32 @@ for (const c of want("D") ? DCASES : []) {
   check("[D] control: the prefix the entry was verified with is DevHub's", !!e && JSON.stringify(e.prefix.map((s) => s[1])) === JSON.stringify(["entry url", "application entry: Apply For A Permit", "permit type: Solar Permit Request"]),
     JSON.stringify(e?.prefix));
   check("[D] control: infoPagePrefixOf keeps goto's place by query KEYS only", JSON.stringify(infoPagePrefixOf(devhubPrefix(startUrlOf("/ok")))[0][2]).endsWith("sfjsp?interviewID\""));
+}
+
+// ===========================================================================================
+// [X] #358 — THE VERIFIED REQUEST'S OWN REDIRECT. The pass admits ONE request; when the portal answers
+//     it 307, the hop is judged as a fresh request and never takes the slot (it closed at the
+//     admission): a payment or filing Location meets those rules, and even the page's own next form
+//     meets the proof hold (3b), which names the redirect. Premises: the pass opened, one use was
+//     reserved, the first leg arrived once (kill the admission and these go red).
+// ===========================================================================================
+console.log("\n[X] #358: THE VERIFIED REQUEST'S OWN REDIRECT IS JUDGED, NEVER ADMITTED");
+if (want("X")) {
+  for (const [id, to, rule, why] of [
+    ["x1", "/payment", "filing-url", /fee-payment/],
+    ["x2", "/SubmitApplication", "filing-url", /filing endpoint/],
+    ["x3", "/permits/next-page", "review-lockdown", /PROOF OF PROGRESS[^]*307 redirect/],
+  ] as const) {
+    const p = `/${id}`;
+    const e = await devhubEntryAt(p);
+    const reservedBefore = reserveCalls.length;
+    const o = await go({ p, html: (pp) => devhubReplica({ p: pp }), entries: e ? [e] : [], redirect: [307, to] });
+    const first = o.allHits.filter((h) => h.method === "POST" && h.path === `${p}/permits/sfjsp`);
+    check(`[X] ${id} premise: the pass opened, one use was reserved, the verified Next arrived once`,
+      !!o.open?.opened && reserveCalls.length - reservedBefore === 1 && first.length === 1 && o.admissions.length === 1 && o.admissions[0].exempted, brief(o));
+    check(`[X] ${id}: its 307 to ${p}${to} is refused (${rule}) and nothing reaches it`,
+      o.allHits.filter((h) => h.path === `${p}${to}`).length === 0 && o.aborts.some((a) => a.rule === rule && a.where === `${p}${to}` && a.stopping && why.test(a.why)), `${brief(o)} hits=${JSON.stringify(o.allHits.map((h) => `${h.method} ${h.path}`))}`);
+  }
 }
 void backstopFor; void PERMITTING_INFORMATION; void PREV_NEXT;
 

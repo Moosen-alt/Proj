@@ -2,6 +2,7 @@
   "name": "pdf-form-filler",
   "version": "0.1.0",
   "private": true,
+  "license": "UNLICENSED",
   "type": "module",
   "description": "Map a blank PDF form once (auto/vision/heuristic), then batch-fill it from CSV/JSON rows — split out of the SOLAR-Proj AHJ form-fill engine.",
   "scripts": {

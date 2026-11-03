@@ -22,12 +22,13 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { portalProfilesDir } from "../../backend/src/statePaths";
 import type { ProjectRecord } from "../../shared/src/types";
 import { OregonEPermittingAdapter } from "./adapters/oregonEPermitting";
 import { PowerClerkAdapter } from "./adapters/powerClerk";
 import type { PortalAdapter, PortalContext } from "./adapter";
 
-const PROFILES_DIR = path.resolve(process.cwd(), "portal-profiles");
+const PROFILES_DIR = portalProfilesDir();
 
 const PORTAL_URLS: Record<string, string> = {
   powerclerk: "https://pgenm.powerclerk.com/MvcAccount/Login",

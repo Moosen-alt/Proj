@@ -57,7 +57,7 @@ const auditFor = (action: string, recipeId: string, runId?: unknown) => fx.audit
   .filter((a) => JSON.parse(a.details).recipeId === recipeId && (runId === undefined || JSON.parse(a.details).runId === runId));
 
 // ── the classifier, on the messages production actually wrote ────────────────────────────────
-await check("classifier: production messages land in the right family (MUST-PASS and MUST-EXCLUDE)", () => {
+await check("classifier: production messages land in the right family (MUST-PASS and MUST-EXCLUDE)", async () => {
   const cases: Array<[string, "recipe" | "not_recipe" | "unknown"]> = [
     // not the recipe — harness / our lease / document gate / project data / the filing's outcome
     ["Recipe step failed (fill — Email): locator.fill: Target page, context or browser has been closed [url=https://pgenm.powerclerk.com/x]", "not_recipe"],
@@ -96,6 +96,18 @@ await check("classifier: production messages land in the right family (MUST-PASS
     ["Recipe step failed (fill — Email): page.waitForLoadState: Timeout 30000ms exceeded.", "not_recipe"],
     ["Recipe step failed (click — Next): page.waitForURL: Timeout 30000ms exceeded.", "not_recipe"],
   ];
+  // #352: the replay's stop for a REQUIRED control the recipe has no step for and this job has no
+  // value for (the AC disconnect part with no plan-set part and no client standard; an unanswered
+  // per-job question) is the PROJECT's missing data — the recipe is kept, never demoted or flagged.
+  // The adapter's own message builder, so the words the run writes are the words tested here.
+  const { missingRequiredStopMessage, UNPINNED_CONTROL_WHY } = await import("../../portal-bot/src/unrecordedControls");
+  cases.push(
+    [missingRequiredStopMessage('"advance: Next"', [{ label: "Disconnect Switch Manufacturer", key: "disconnectMake" }, { label: "Disconnect Switch Model", key: "disconnectModel" }]), "not_recipe"],
+    [missingRequiredStopMessage("review", [{ label: "Will the System be Customer-Owned or Third-Party Owned?", key: "ownershipModel" }]), "not_recipe"],
+    // PR #353 round 3: the value is on file but the empty control could not be pinned to one element
+    // (two empty namesakes) — the recipe has no step for it, so this is not the recipe's failure either.
+    [missingRequiredStopMessage('"advance: Next"', [{ label: "Disconnect Switch Model", key: "disconnectModel", why: UNPINNED_CONTROL_WHY }]), "not_recipe"],
+  );
   for (const [text, want] of cases) {
     assert.equal(recipes.replayFailureBlamesRecipe(text).attribution, want, `"${text.slice(0, 90)}" should be ${want}`);
   }

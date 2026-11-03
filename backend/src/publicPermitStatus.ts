@@ -140,6 +140,241 @@ async function fetchAccelaStatus(portalUrl: string, applicationNumbers: string[]
 }
 
 // ---------------------------------------------------------------------------
+// ACCELA: FIND A FILING'S RECORD BY ITS NUMBER THROUGH THE MODULE'S OWN SEARCH (#443)
+// ---------------------------------------------------------------------------
+// A permit filing with a record number but no status link (no recipe, no portal login, filed before
+// #400 captured links) was never read: the global search and the guessed capID triplet above never
+// find Oregon's four-part numbers (187-26-000328-STR). The module's general search does, anonymously
+// (worker-local, live, 2026-10-31 on #413): CapHome.aspx?module=Building, the permit-number box, the
+// Search control — and a number that names exactly one record lands on that record's CapDetail page.
+// The caller (runDuePermitChecks) stores that page's link as the target's tracking_url, so every later
+// check is the plain GET of strategy 1 above.
+//
+// HOW (settled against the fixture, backend/test/accelaRecordSearch.test.ts): a plain HTTP postback,
+// no browser. CapHome is an ASP.NET WebForms page; its Search control is a __doPostBack link, so a
+// browser's click submits the form with __EVENTTARGET naming the control and every other field as the
+// page rendered it. This sends exactly that form data set (HTML's own rules: hidden fields, the boxes'
+// values, each select's chosen option; no other button), with the session cookie the GET set.
+// Whether the live ACA answers a postback with no JS-set fields the same way is the local-only proof.
+//
+// RULE 1 — a query, never a filing. Two kinds of request only: GETs of the search page and of the
+// record page it lands on, and ONE postback whose event target is the module's Search control
+// (named …btnNewSearch, reading "Search"). Nothing that opens, modifies, pays or resubmits: a page
+// with no such control is not searched, and no other button's name is ever sent.
+// RULE 5 — the caller hands in `allowUrl` (a permit track, the target's own AHJ portal and tenant:
+// trackSafeUrl + samePortal); every URL this fetches, each redirect hop included, is asked first.
+//
+// A RECORD IS FOUND ONLY WHEN IT IS THE ONE THE NUMBER NAMES. The record page's own number
+// (…lblPermitNumber, or "Record <number>:") must equal the number searched, whole: a similar number
+// (…-STR-REV, a longer number starting with this one) is a different record. A results list naming
+// several records is not guessed from.
+
+/** The ACA module a record number's suffix belongs to (Oregon ePermitting: 24-001234-STR is
+ *  Building, 519-26-001666-ELEC electrical). "" for a suffix this does not know. */
+const ACCELA_SUFFIX_MODULE: Array<[RegExp, string]> = [
+  [/^(?:STR|RS|RES|BLD|BLDG|BP|COM|SOLAR|SLR|PV)$/, "Building"],
+  [/^(?:ELEC|ELE|EL|EP)$/, "Electrical"],
+  [/^(?:PLMB|PLB|PLUM)$/, "Plumbing"],
+  [/^(?:MECH|MEC)$/, "Mechanical"],
+];
+const ACCELA_DEFAULT_MODULES = ["Building", "Electrical", "Plumbing", "Mechanical"];
+
+/** Modules to search, in order: the number's own by suffix, then the portal URL's module, then the
+ *  rest. One search per check (the caller picks one from this list per check, in turn). */
+export function accelaModulesForNumber(recordNumber: string, portalUrl: string): string[] {
+  const suffix = String(recordNumber || "").trim().toUpperCase().split("-").filter(Boolean).pop() ?? "";
+  const bySuffix = ACCELA_SUFFIX_MODULE.find(([re]) => re.test(suffix))?.[1] ?? "";
+  let fromUrl = "";
+  try {
+    const u = new URL(portalUrl);
+    for (const [k, v] of u.searchParams) if (k.toLowerCase() === "module" && /^[A-Za-z]{2,30}$/.test(v)) fromUrl = v;
+  } catch { /* no module on the URL */ }
+  const out: string[] = [];
+  for (const m of [bySuffix, fromUrl, ...ACCELA_DEFAULT_MODULES]) {
+    if (m && !out.some((o) => o.toLowerCase() === m.toLowerCase())) out.push(m);
+  }
+  return out;
+}
+
+export type AccelaRecordSearch =
+  | { found: true; link: string; text: string; module: string }
+  | { found: false; module: string; reason: string };
+
+/** The record number, compared whole: case and whitespace only (dashes are part of the number). */
+const sameRecordNumber = (a: string, b: string): boolean =>
+  Boolean(a) && a.replace(/\s+/g, "").toUpperCase() === b.replace(/\s+/g, "").toUpperCase();
+
+/** Does this record page name exactly this number as ITS record? The page's own number label when
+ *  the page has one; otherwise its "Record <number>:" heading, the number bounded on both sides. */
+async function recordPageNamesNumber(html: string, recordNumber: string): Promise<boolean> {
+  const { load } = await import("cheerio");
+  const $ = load(html);
+  const label = $("[id$='lblPermitNumber']").first();
+  if (label.length) return sameRecordNumber(label.text(), recordNumber);
+  $("script, style, noscript").remove();
+  const textAll = $("body").text().replace(/\s+/g, " ");
+  const num = recordNumber.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|[^A-Za-z0-9-])Record\\s+${num}\\s*:`, "i").test(textAll);
+}
+
+/** Search one ACA module for one record number (see the block above). Never throws. */
+export async function searchAccelaRecordByNumber(
+  portalUrl: string,
+  recordNumber: string,
+  opts: { module: string; allowUrl: (url: string) => boolean; fetchImpl?: typeof fetch },
+): Promise<AccelaRecordSearch> {
+  const module = opts.module;
+  const miss = (reason: string): AccelaRecordSearch => ({ found: false, module, reason });
+  const number = String(recordNumber || "").trim();
+  if (!number || !/^[A-Za-z]{2,30}$/.test(module)) return miss("no record number or module to search");
+  const doFetch = opts.fetchImpl ?? fetch;
+  const cookies = new Map<string, string>();
+  const cookieHeader = () => [...cookies].map(([k, v]) => `${k}=${v}`).join("; ");
+  const keepCookies = (res: Response) => {
+    for (const c of res.headers.getSetCookie?.() ?? []) {
+      const pair = c.split(";")[0] ?? "";
+      const eq = pair.indexOf("=");
+      if (eq > 0) cookies.set(pair.slice(0, eq).trim(), pair.slice(eq + 1).trim());
+    }
+  };
+  /** One request, its redirects followed by hand so every hop is asked (rule 5) and keeps the
+   *  session cookie. A POST answered by a redirect continues as a GET, as a browser does. */
+  const request = async (url: string, body?: URLSearchParams): Promise<{ url: string; html: string } | { refused: string }> => {
+    let at = url;
+    let form = body;
+    for (let hop = 0; hop < 5; hop++) {
+      if (!opts.allowUrl(at)) return { refused: `${at.slice(0, 200)} is not this filing's AHJ portal` };
+      let res: Response;
+      try {
+        res = await doFetch(at, {
+          method: form ? "POST" : "GET",
+          redirect: "manual",
+          signal: AbortSignal.timeout(15000),
+          headers: {
+            "User-Agent": "Mozilla/5.0 (compatible; permit-status-bot/1.0)",
+            ...(cookies.size ? { Cookie: cookieHeader() } : {}),
+            ...(form ? { "Content-Type": "application/x-www-form-urlencoded" } : {}),
+          },
+          ...(form ? { body: form.toString() } : {}),
+        });
+      } catch (err) {
+        return { refused: `the portal did not answer (${err instanceof Error ? err.message.slice(0, 120) : String(err)})` };
+      }
+      keepCookies(res);
+      const location = res.headers.get("location");
+      if (res.status >= 300 && res.status < 400 && location) {
+        at = new URL(location, at).toString();
+        form = undefined;
+        continue;
+      }
+      if (!res.ok) return { refused: `the portal answered HTTP ${res.status}` };
+      return { url: at, html: await res.text() };
+    }
+    return { refused: "the portal redirected too many times" };
+  };
+
+  const base = accelaBaseUrl(portalUrl);
+  const searchUrl = `${base}/Cap/CapHome.aspx?module=${encodeURIComponent(module)}&TabName=${encodeURIComponent(module)}`;
+  const page = await request(searchUrl);
+  if ("refused" in page) return miss(page.refused);
+
+  const { load } = await import("cheerio");
+  const $ = load(page.html);
+  // THE SEARCH CONTROL, AND ONLY IT (rule 1). Accela's general search: the permit-number box
+  // (…txtGSPermitNumber) and the Search control (…btnNewSearch), a __doPostBack link in ACA.
+  const box = $("input[name$='txtGSPermitNumber']").first();
+  const control = $("[id$='btnNewSearch'], [name$='btnNewSearch']").first();
+  if (!box.length || !control.length) return miss(`the ${module} search page has no record-number search`);
+  if (control.text().replace(/\s+/g, " ").trim().toLowerCase() !== "search" && String(control.attr("value") ?? "").trim().toLowerCase() !== "search") {
+    return miss(`the ${module} search control does not read "Search"`);
+  }
+  const formEl = box.closest("form");
+  if (!formEl.length) return miss(`the ${module} search box is outside any form`);
+  let action: string;
+  try {
+    action = new URL(formEl.attr("action") || page.url, page.url).toString();
+  } catch {
+    return miss("the search form's action is not a URL");
+  }
+  if (!/\/Cap\/CapHome\.aspx$/i.test(new URL(action).pathname)) return miss("the search form does not post back to the search page");
+  const postBack = /__doPostBack\(\s*'([^']+)'/.exec(String(control.attr("href") ?? control.attr("onclick") ?? ""));
+  const controlName = String(control.attr("name") ?? "");
+  const eventTarget = postBack?.[1] ?? "";
+  if (eventTarget && !/btnNewSearch$/.test(eventTarget)) return miss("the Search control posts back to another control");
+  if (!eventTarget && !controlName) return miss("the Search control has no postback name");
+
+  // The form data set a browser's click would send (HTML form submission): every enabled named
+  // field as rendered — hidden fields, boxes, each select's chosen option, checked boxes — no other
+  // button; the permit-number box carries the number; __EVENTTARGET names the Search control.
+  const data = new URLSearchParams();
+  formEl.find("input[name], select[name], textarea[name]").each((_, el) => {
+    const f = $(el);
+    if (f.is("[disabled]")) return;
+    const name = String(f.attr("name"));
+    const tag = (el as { tagName?: string }).tagName?.toLowerCase();
+    if (tag === "select") {
+      const chosen = f.find("option[selected]").first();
+      const opt = chosen.length ? chosen : f.find("option").first();
+      if (opt.length) data.append(name, String(opt.attr("value") ?? opt.text()));
+      return;
+    }
+    if (tag === "textarea") { data.append(name, f.text()); return; }
+    const type = String(f.attr("type") ?? "text").toLowerCase();
+    if (["submit", "button", "image", "reset", "file"].includes(type)) return;
+    if ((type === "checkbox" || type === "radio") && !f.is("[checked]")) return;
+    data.append(name, String(f.attr("value") ?? (type === "checkbox" || type === "radio" ? "on" : "")));
+  });
+  data.set(String(box.attr("name")), number);
+  if (eventTarget) {
+    data.set("__EVENTTARGET", eventTarget);
+    data.set("__EVENTARGUMENT", "");
+  } else {
+    data.set(controlName, String(control.attr("value") ?? "Search"));
+  }
+
+  const answer = await request(action, data);
+  if ("refused" in answer) return miss(answer.refused);
+
+  // WHERE THE SEARCH LANDED. One record: ACA redirects to its CapDetail (followed above), or answers
+  // an async postback with "pageRedirect||<url>|". A list: its record links, judged below.
+  let detail: { url: string; html: string } | null = null;
+  if (/\/Cap\/CapDetail\.aspx$/i.test(new URL(answer.url).pathname)) detail = answer;
+  if (!detail) {
+    const asyncRedirect = /pageRedirect\|\|([^|]+)\|/.exec(answer.html);
+    let listed: string[] = [];
+    if (asyncRedirect) {
+      try { listed = [new URL(decodeURIComponent(asyncRedirect[1]!), answer.url).toString()]; } catch { listed = []; }
+    } else {
+      const $r = load(answer.html);
+      $r("nav, header, footer, [role='navigation']").remove();
+      const seen = new Set<string>();
+      $r("a[href]").each((_, a) => {
+        const href = String($r(a).attr("href") ?? "");
+        if (!/CapDetail\.aspx/i.test(href)) return;
+        try {
+          const u = new URL(href, answer.url).toString();
+          if (!seen.has(u)) { seen.add(u); listed.push(u); }
+        } catch { /* not a link */ }
+      });
+      if (listed.length > 1) return miss(`the ${module} search listed ${listed.length} records for ${number}; none is chosen`);
+      if (listed.length === 1) {
+        const anchorText = $r(`a[href]`).filter((_, a) => /CapDetail\.aspx/i.test(String($r(a).attr("href") ?? ""))).first().text();
+        if (!sameRecordNumber(anchorText, number)) return miss(`the ${module} search's one result is not ${number}`);
+      }
+    }
+    if (listed.length === 0) return miss(`the ${module} search found no record ${number}`);
+    const got = await request(listed[0]!);
+    if ("refused" in got) return miss(got.refused);
+    detail = got;
+  }
+  if (!/\/Cap\/CapDetail\.aspx$/i.test(new URL(detail.url).pathname)) return miss(`the ${module} search did not land on a record page`);
+  if (!(await recordPageNamesNumber(detail.html, number))) return miss(`the record page the ${module} search landed on is not ${number}`);
+  const text = await extractVisibleText(detail.html);
+  if (!text || text.length <= 40) return miss("the record page held no readable text");
+  return { found: true, link: detail.url, text, module };
+}
+
+// ---------------------------------------------------------------------------
 // EnerGov / Tyler Technologies Citizen Self-Service (CSS)
 // ---------------------------------------------------------------------------
 // CSS portals have a public permit-lookup URL like:

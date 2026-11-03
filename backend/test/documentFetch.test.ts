@@ -137,6 +137,9 @@ const server = http.createServer((req, res) => {
 await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 const port = (server.address() as { port: number }).port;
 const base = `http://127.0.0.1:${port}`;
+// The stub stands in for a public jurisdiction site, and port 1 for a dead one; the fetch guard
+// (#391) refuses loopback except at these exact origins.
+process.env.DOCUMENT_FETCH_ALLOW_ORIGINS = `${base},http://127.0.0.1:1`;
 
 // ---------------------------------------------------------------------------
 // The injected browser. Counts everything, so the test can assert not just what came back

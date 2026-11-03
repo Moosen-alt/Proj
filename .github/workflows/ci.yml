@@ -1,11 +1,13 @@
-# CI for every PR into main, plus ONE scheduled run on main each night. It never deploys
-# (deploy.yml is manual).
+# CI for every PR into main, plus ONE scheduled run on main each night. It never deploys:
+# a person deploys the server by hand (docs/SERVER_SETUP.md, DEPLOY.md).
 #
 # No run on push to main: every merge was just tested on its PR, and the post-merge run doubled
 # the metered minutes without catching anything. The nightly run on main is the safety net for two
 # PRs that were green alone and break together; `workflow_dispatch` runs it on demand.
 #
-# ONE JOB, ONE REQUIRED CHECK: "CI passed". Branch protection requires exactly that name.
+# ONE REQUIRED CHECK: "CI passed". Branch protection requires exactly that name. The second job,
+# "Server image" (#434), builds the Docker image and runs a smoke inside it; it runs only when a PR
+# touches what goes into the image's display or browser (and every night), and is not required.
 #
 # Why one job and not a matrix: this repository is private, so Actions minutes are metered, and
 # GitHub bills each JOB separately (its own npm ci, rounded up to the minute). Speed comes from
@@ -126,3 +128,47 @@ jobs:
             if [ "$r" != "success" ]; then echo "A suite ended '$r'. See its step above."; exit 1; fi
           done
           echo "Everything passed."
+
+  # #434 — THE SERVER IMAGE, BUILT AND RUN. Its own job (it is slow: the image installs LibreOffice
+  # and Chromium) and only for a PR that touches the image, its entrypoint, its dependencies or the
+  # code the smoke pins; the nightly and manual runs always build it. The smoke runs through the
+  # image's own entrypoint, so the virtual display it checks is the one production gets: a headed
+  # Chromium opens and closes, PORTAL_HEADLESS still defaults to headless, and the #333 hand-over
+  # still fails closed on a headed window nobody can touch.
+  image:
+    name: Server image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: What changed
+        id: scope
+        run: |
+          build=true
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            files=$(git diff --no-renames --name-only HEAD^1 HEAD)
+            echo "$files"
+            if ! echo "$files" | grep -qE '^(Dockerfile|\.dockerignore|docker-compose\.yml|scripts/docker-entrypoint\.sh|package(-lock)?\.json|portal-bot/src/(browser|filingBackstop|headedDisplay\.image\.smoke)\.ts|\.github/workflows/ci\.yml)$'; then
+              build=false
+              echo "Nothing that goes into the image's display or browser changed: skipping the image build."
+            fi
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+
+      - name: Build the image
+        if: steps.scope.outputs.build == 'true'
+        run: docker build --build-arg BUILD_SHA=$(git rev-parse --short HEAD) -t solar-ci .
+
+      - name: Image size
+        if: steps.scope.outputs.build == 'true'
+        run: |
+          bytes=$(docker image inspect solar-ci --format '{{.Size}}')
+          echo "Image size: $bytes bytes ($((bytes / 1048576)) MiB)"
+          echo "Server image size: $((bytes / 1048576)) MiB" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Headed Chromium on the virtual display (inside the image)
+        if: steps.scope.outputs.build == 'true'
+        run: docker run --rm solar-ci npx tsx portal-bot/src/headedDisplay.image.smoke.ts

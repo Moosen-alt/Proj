@@ -43,6 +43,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { backendDataDir } from "./statePaths";
 import { PDFDocument, StandardFonts } from "pdf-lib";
 import type { AppDb } from "./db";
 import type { GeneratedApplicationDocument, ProjectRecord } from "../../shared/src/types";
@@ -50,7 +51,7 @@ import { resolvePermitPath } from "./permitPath";
 import { logger } from "./logger";
 
 /** Same root the filled official forms use, one subfolder per project. */
-const FILLED_DIR = path.resolve(process.cwd(), "backend/data/filled");
+const FILLED_DIR = path.join(backendDataDir(), "filled");
 
 /**
  * THE ONE MAPPING: a generated document's builder id (applicationDocs.ts) → the docsByType key

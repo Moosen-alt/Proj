@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { portalProfilesDir } from "./statePaths";
 import type { ClientPartnerContact, ClientPortalIdentity, ClientRecord, ClientStateLicense, LicenceAnswer, LicenceKind } from "../../shared/src/types";
 import { canonicalLicenceKind, kindForSlot, LICENCE_KIND_SET, LICENCE_KINDS, licenceKindWords } from "../../shared/src/licenceKinds";
 import type { AppDb } from "./db";
@@ -13,6 +14,7 @@ import { nowIso } from "./time";
 import { text as s } from "./json";
 import { addAuditLog } from "./audit";
 import { deleteCustomer } from "./crm";
+import { filingContactEmailSetting } from "./filingContact";
 
 type Row = Record<string, unknown>;
 
@@ -60,7 +62,11 @@ function mapClient(row: Row, identities: ClientPortalIdentity[]): ClientRecord {
     businessPhone: s(row.business_phone),
     businessEmail: s(row.business_email),
     updatesInbox: s(row.updates_inbox),
+    handoffAutoSend: s(row.handoff_auto_send),
     billingContactEmail: s(row.billing_contact_email),
+    requestLinksAutoSend: s(row.request_links_auto_send),
+    intakeTag: s(row.intake_tag),
+    intakeSenders: s(row.intake_senders),
     licenseState: s(row.license_state),
     insuranceExpiry: s(row.insurance_expiry),
     bondExpiry: s(row.bond_expiry),
@@ -483,7 +489,11 @@ const FIELD_COLUMNS: [keyof ClientRecord, string][] = [
   ["businessPhone", "business_phone"],
   ["businessEmail", "business_email"],
   ["updatesInbox", "updates_inbox"],
+  ["handoffAutoSend", "handoff_auto_send"],
   ["billingContactEmail", "billing_contact_email"],
+  ["requestLinksAutoSend", "request_links_auto_send"],
+  ["intakeTag", "intake_tag"],
+  ["intakeSenders", "intake_senders"],
   ["licenseState", "license_state"],
   ["insuranceExpiry", "insurance_expiry"],
   ["bondExpiry", "bond_expiry"],
@@ -496,9 +506,31 @@ const FIELD_COLUMNS: [keyof ClientRecord, string][] = [
   ["serviceFeeUsd", "service_fee_usd"],
 ];
 
-// serviceFeeUsd is REAL; everything else is coerced to string.
+// serviceFeeUsd is REAL; the intake tag is normalised (#489); everything else is coerced to string.
 function fieldValue(key: keyof ClientRecord, raw: unknown): string | number | null {
+  if (key === "intakeTag") return normalizeIntakeTag(raw);
   return key === "serviceFeeUsd" ? moneyOrNull(raw) : s(raw);
+}
+
+/** The intake tag as stored: lower-case, and only what can sit after the + of an email address
+ *  without quoting. Anything else is refused rather than silently changed, so the address the
+ *  installer is told is the address that works. */
+export function normalizeIntakeTag(raw: unknown): string {
+  const tag = s(raw).trim().toLowerCase();
+  if (tag && !/^[a-z0-9][a-z0-9._-]{0,39}$/.test(tag)) {
+    throw new HttpError(400, `Intake tag "${s(raw).trim()}" can only use letters, digits, dot, dash and underscore (up to 40), starting with a letter or digit.`, { field: "intakeTag" });
+  }
+  return tag;
+}
+
+/** One client per tag inside an org: two would make every job emailed to it ambiguous. */
+function assertIntakeTagFree(db: AppDb, orgId: string, tag: string, exceptClientId: string): void {
+  if (!tag) return;
+  const other = db.get<Row>(
+    "SELECT company_name FROM clients WHERE org_id = ? AND intake_tag = ? AND id != ?",
+    [orgId, tag, exceptClientId],
+  );
+  if (other) throw new HttpError(400, `Intake tag "${tag}" is already used by ${s(other.company_name) || "another client"}.`, { field: "intakeTag" });
 }
 
 function identitiesFor(db: AppDb, clientId: string): ClientPortalIdentity[] {
@@ -594,6 +626,7 @@ export function createClient(db: AppDb, payload: Record<string, unknown>, orgId:
   const columns = ["id", "created_at", "org_id", ...FIELD_COLUMNS.map(([, col]) => col)];
   const values: (string | number | null)[] = [clientId, nowIso(), orgId, ...FIELD_COLUMNS.map(([key]) => fieldValue(key, payload[key]))];
   const placeholders = columns.map(() => "?").join(", ");
+  assertIntakeTagFree(db, orgId, normalizeIntakeTag(payload.intakeTag), clientId);
 
   return db.transaction(() => {
     db.run(`INSERT INTO clients (${columns.join(", ")}) VALUES (${placeholders})`, values);
@@ -604,8 +637,9 @@ export function createClient(db: AppDb, payload: Record<string, unknown>, orgId:
 }
 
 export function updateClient(db: AppDb, clientId: string, payload: Record<string, unknown>): ClientRecord {
-  const existing = db.get<Row>("SELECT id FROM clients WHERE id = ?", [clientId]);
+  const existing = db.get<Row>("SELECT id, org_id FROM clients WHERE id = ?", [clientId]);
   if (!existing) throw new HttpError(404, "Client not found.");
+  if ("intakeTag" in payload) assertIntakeTagFree(db, s(existing.org_id) || DEFAULT_ORG_ID, normalizeIntakeTag(payload.intakeTag), clientId);
 
   // Only update fields present in the payload (partial update supported).
   const updates = FIELD_COLUMNS.filter(([key]) => key in payload);
@@ -740,7 +774,7 @@ function sessionKeyState(): { ok: boolean; reason: string } {
 /** Resolved the same way repository.ts resolves it for every live run — read, not guessed.
  *  If these two ever disagree the purge cleans a directory nobody writes to. */
 function portalProfilesBase(): string {
-  return process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  return portalProfilesDir();
 }
 
 /** Every browser profile under this client's tree. repository.ts nests them
@@ -989,9 +1023,87 @@ export async function offboardClient(db: AppDb, clientId: string, opts: Offboard
   return { dryRun: false, inventory, sessionDirsRemoved, sessionDirsFailed };
 }
 
+// WHICH PORTAL A CLIENT'S PORTAL IDENTITY ROW BELONGS TO (#518). An identity row carries what this
+// client is called on ONE portal account (the PowerClerk "Installer Company" label) and that
+// account's existing-contact code. A contact code means "this contact on THIS account"; on another
+// account the same code can be another company's contact — and on a shared filing account the
+// Installer Company list holds every client. So a row applies only on the portal it names.
+//
+// The staging run used to key the lookup on `portalProfile?.portal_type ?? "mock"`, and nothing writes
+// portal_profiles, so a real run asked for "mock": a row keyed to a real portal never matched, and a
+// row keyed "mock" matched every portal there is. Now:
+//   - a URL names its portal by host (PORTAL_IDENTITY_HOSTS); a host with no identity type gets none;
+//   - a bare portal type counts only when it is one a row can name (the client form's list, plus
+//     "mock" for the mock portal);
+//   - "utility", "AHJ", "" and anything else name no portal, so no row applies;
+//   - "mock" is the mock portal ONLY: stagingIdentityPortal says "mock" just for a run with no real
+//     portal profile and no portal URL at all, so a "mock" row never reaches a real portal.
+export const PORTAL_IDENTITY_TYPES = ["powerclerk_pge", "accela_oregon", "mock"] as const;
+const PORTAL_IDENTITY_HOSTS: Record<string, (typeof PORTAL_IDENTITY_TYPES)[number]> = {
+  "pgenm.powerclerk.com": "powerclerk_pge",
+  "aca-oregon.accela.com": "accela_oregon",
+};
+
+/** The identity type `portal` names — a portal URL or a portal type — or "" when it names none. */
+export function portalIdentityKey(portal: string | null | undefined): string {
+  const v = String(portal ?? "").trim();
+  if (!v) return "";
+  if (/^https?:\/\//i.test(v)) {
+    let host = "";
+    try { host = new URL(v).hostname.toLowerCase(); } catch { return ""; }
+    return PORTAL_IDENTITY_HOSTS[host] ?? "";
+  }
+  return (PORTAL_IDENTITY_TYPES as readonly string[]).includes(v) ? v : "";
+}
+
+/**
+ * The identity type for a staging run, from every portal URL the run could open (the recipe's, the
+ * learner's entry, the login's) and, when it has none, the stored portal profile a hand-coded adapter
+ * drives; "mock" only when there is neither. All of the URLs must name the SAME identity type, or none
+ * applies: a run that might land on either of two portals cannot know which account's contact code is
+ * right.
+ */
+export function stagingIdentityPortal(input: { urls: Array<string | null | undefined>; profilePortalType: string; isRealPortal: boolean }): string {
+  const urls = input.urls.map((u) => String(u ?? "").trim()).filter(Boolean);
+  if (urls.length) {
+    const keys = new Set(urls.map((u) => portalIdentityKey(u)));
+    return keys.size === 1 ? [...keys][0] : "";
+  }
+  if (input.isRealPortal) {
+    const key = portalIdentityKey(input.profilePortalType);
+    return key === "mock" ? "" : key;
+  }
+  // No real profile and nothing to open: the mock portal (or a manual hand-off, which files nothing).
+  return "mock";
+}
+
+/**
+ * WHY NO IDENTITY ROW APPLIED, when the run's URLs disagree (Helm review of #527): the hosts and the
+ * identity type each names ("" = none), or null when they agree (or there are fewer than two). Hosts
+ * only — never a full URL, which can carry a query token. The realistic shape: a permit track whose
+ * login falls back to an AHJ information page while the recipe opens Oregon ePermitting, so the
+ * accela_oregon row and its contact code are dropped and the run files under the legal name — the
+ * safe side, but an operator who set the row needs to see why it did nothing.
+ */
+export function stagingIdentityDisagreement(urls: Array<string | null | undefined>): { hosts: string[]; keys: string[] } | null {
+  const seen = new Map<string, string>();
+  for (const u of urls.map((x) => String(x ?? "").trim()).filter(Boolean)) {
+    let host = "";
+    try { host = new URL(u).hostname.toLowerCase(); } catch { host = "(not a URL)"; }
+    if (!seen.has(host)) seen.set(host, portalIdentityKey(u));
+  }
+  const keys = new Set(seen.values());
+  if (keys.size < 2) return null;
+  return { hosts: [...seen.keys()], keys: [...seen.values()] };
+}
+
 // Returns the installer/licensing overlay for a project's linked client, keyed
 // to the snapshot field names the portal adapters already read. Empty object
 // when the project has no client.
+//
+// `portalType` picks the client's portal identity row: a portal URL or identity type
+// (portalIdentityKey). Anything that names no portal ("utility", "AHJ", "") uses none, and the
+// company name is the client's legal name.
 //
 // THE JOB IS REQUIRED: a licence is a state's and a permit's (licenceOverlay). On an Oregon job the
 // licence keys are the named columns exactly as before; elsewhere ccbLicenseNumber is that state's
@@ -1002,12 +1114,17 @@ export function clientStagingOverlay(db: AppDb, clientId: string | null, portalT
   const row = db.get<Row>("SELECT * FROM clients WHERE id = ?", [clientId]);
   if (!row) return {};
   const client = mapClient(row, identitiesFor(db, clientId));
-  const identity = client.portalIdentities.find((entry) => entry.portalType === portalType);
+  const identityKey = portalIdentityKey(portalType);
+  const identity = identityKey ? client.portalIdentities.find((entry) => entry.portalType === identityKey) : undefined;
   const licences = licenceOverlay(client, job);
 
   const overlay: Record<string, string> = {
     installerCompanyName: identity?.installerCompanyLabel || client.legalBusinessName || client.companyName,
     installerEmail: client.businessEmail || client.contactEmail,
+    // THE FILING SERVICE'S OWN EMAIL (#520, FILING_CONTACT_EMAIL) beside the contractor's — never in
+    // place of it. Only when configured, so with it unset the overlay is exactly what it was. The hand-
+    // coded PowerClerk adapter's Preparer email reads it (powerClerk.preparerEmailFor).
+    ...(filingContactEmailSetting() ? { filingContactEmail: filingContactEmailSetting() } : {}),
     installerPhone: client.businessPhone || client.phone,
     installerAddress: [client.businessAddress, client.businessCity, client.businessState, client.businessZip]
       .filter(Boolean)

@@ -13,6 +13,7 @@
 //   K4 fee_research job without the "already priced" re-check             → (g1) fails.
 //   K5 no per-step log line                                               → (l1) fails.
 //   K6 fee_research does not wait for a running lookup of the same agency → (g2) fails.
+//   K7 the portal step asked only after documents/fees answered (serial)   → (c1) fails.
 //
 // Run: npx tsx backend/test/permitProcessLookupLatency.test.ts
 import "./_isolate"; // FIRST
@@ -117,18 +118,49 @@ const slowPortalReader = (): PageReader => {
   };
 };
 
-await check("(c1) the portal and documents/fees steps run concurrently after the process step: three 1-unit steps finish in ~2 units, not ~3", async () => {
+await check("(c1) the portal and documents/fees steps run concurrently after the process step: three steps in two rounds, not three", async () => {
+  // PROVEN BY ORDER, NOT BY A STOPWATCH (#471). This used to time three 300 ms stubs against a
+  // 780 ms budget, which a paused CI runner failed with the steps still overlapping. Now the
+  // portal and documents/fees stubs each wait at a barrier that opens only when BOTH have been
+  // asked: a concurrent run opens it at once (nothing here sleeps), so both are in flight together.
+  // A serial run never asks the second while the first waits; the fallback timer opens the barrier
+  // so that run finishes and fails the in-flight assertion below instead of hanging. A passing run
+  // never reaches the fallback, and nothing is asserted against time.
+  const order: string[] = [];
+  const waiting = new Set<string>();
+  let inFlight = 0;
+  let maxInFlight = 0;
+  let open!: () => void;
+  const barrier = new Promise<void>((r) => { open = r; });
+  const fallback = setTimeout(() => open(), 10_000);
   const llm = {
     webLookup: async (i: Ask): Promise<WebLookupResult> => {
-      await sleep(UNIT);
-      if (i.label.endsWith(".process")) return grounded(processAnswer());
+      const part = i.label.replace(/^permitProcessLookup\./, "");
+      order.push(`ask:${part}`);
+      if (part === "process") { order.push("end:process"); return grounded(processAnswer()); }
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      waiting.add(part);
+      if (waiting.has("portal") && waiting.has("documentsFees")) open();
+      await barrier;
+      inFlight--;
+      order.push(`end:${part}`);
       return empty;
     },
   };
-  const start = Date.now();
-  await ppl.runPermitProcessLookup(db, llm, { state: "OR", ahj: "City of Twostep", reader: null });
-  const ms = Date.now() - start;
-  assert.ok(ms < UNIT * 2.6, `took ${ms} ms for steps of ${UNIT} ms (serial would be ≥ ${UNIT * 3})`);
+  try {
+    await ppl.runPermitProcessLookup(db, llm, { state: "OR", ahj: "City of Twostep", reader: null });
+  } finally {
+    clearTimeout(fallback);
+  }
+  const asked = order.filter((e) => e.startsWith("ask:"));
+  assert.deepEqual([...asked].sort(), ["ask:documentsFees", "ask:portal", "ask:process"], `three steps, each asked once: ${JSON.stringify(order)}`);
+  // Round one: the process step answers before either later step is asked (they need its agency).
+  assert.deepEqual(order.slice(0, 2), ["ask:process", "end:process"], `the process step ran first, alone: ${JSON.stringify(order)}`);
+  // Round two: both later steps were asked before either answered. Serial would be one at a time.
+  assert.equal(maxInFlight, 2, `portal and documents/fees were never in flight together (max ${maxInFlight}), so three steps took three rounds: ${JSON.stringify(order)}`);
+  const firstEnd = order.findIndex((e, k) => k > 1 && e.startsWith("end:"));
+  assert.ok(order.indexOf("ask:portal") < firstEnd && order.indexOf("ask:documentsFees") < firstEnd, `a later step was asked only after the other answered: ${JSON.stringify(order)}`);
 });
 
 await check("(c2) documents/fees is asked BEFORE the portal catalog is read (it needs only the agency and our pages), so the slow catalog read no longer delays the long-pole step", async () => {

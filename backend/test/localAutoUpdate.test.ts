@@ -46,7 +46,8 @@ const NEW = "b".repeat(40);
 type World = {
   branch?: string; dirty?: boolean; head?: string; remote?: string; diverged?: boolean;
   lockfileChanged?: boolean; mergeFails?: boolean; npmCiFails?: boolean; busy?: string[];
-  supervisor?: boolean; serverRunning?: boolean; healthy?: boolean; paused?: boolean; snapshotFails?: boolean;
+  /** null: the server processes could not be read (#188). */
+  supervisor?: boolean | null; serverRunning?: boolean; healthy?: boolean; paused?: boolean; snapshotFails?: boolean;
   stopFails?: boolean; failedTo?: string | null;
   /** /health answers at the start of the cycle (default true). `serverRunning` is the later, separate
    *  question of what `stopServer` found: false there = the server went away between the two. */
@@ -87,7 +88,7 @@ function harness(w: World) {
     npmCi: () => { calls.push("npm ci"); npmCiRuns++; return { code: w.npmCiFails && npmCiRuns === 1 ? 1 : 0, out: "" }; },
     serverUp: async () => w.serverUp !== false,
     busy: async () => w.busy ?? [],
-    supervisorRunning: () => !!w.supervisor,
+    supervisorRunning: () => (w.supervisor === null ? null : !!w.supervisor),
     snapshot: async () => { calls.push("snapshot"); return w.snapshotFails ? { ok: false, detail: "disk full" } : { ok: true, file: "autopilot-pre-update-x.sqlite" }; },
     stopServer: () => { calls.push("stop"); return w.stopFails ? { ok: false, detail: "port held" } : { ok: true, stopped: w.serverRunning === false ? 0 : 1 }; },
     startServer: () => { calls.push("start"); },
@@ -199,6 +200,16 @@ await check("supervised server -> skip (the supervisor owns restarts)", async ()
   const h = harness({ supervisor: true });
   assert.equal((await runCycle(h.deps, {})).outcome, "supervised");
   assert.deepEqual(mutating(h.calls), []);
+});
+
+await check("server processes unreadable -> skip as 'inspect-failed', said as exactly that, never 'the supervisor is running' (#188)", async () => {
+  const h = harness({ supervisor: null });
+  const r = await runCycle(h.deps, {});
+  assert.equal(r.outcome, "inspect-failed");
+  assert.deepEqual(mutating(h.calls), [], `side effects with the processes unreadable: ${h.calls.join(", ")}`);
+  assert.ok(h.lines.some((l) => l.includes("could not inspect the server processes")), h.lines.join(" | "));
+  assert.ok(!h.lines.some((l) => l.includes("run-prod-supervised.ps1 is running")), "an unreadable inspection was reported as a running supervisor");
+  assert.equal(h.marker.to, null, "a skip never writes the failure marker");
 });
 
 await check("no server answering /health -> skip: no snapshot, no stop, no pull (#290)", async () => {
@@ -424,6 +435,42 @@ await check("readBusyCounts with liveSince: only rows staged since the server st
   assert.deepEqual(busyReasons(onlyStale, { uptimeSec: 7200, jobs: { inFlightThisProcess: 0 } }), []);
   db.close?.();
 });
+
+// #188 — THE REAL INSPECTION, on Windows only (it is PowerShell + Win32_Process). The supervisor check
+// used to match the inspecting PowerShell itself (its -Command carries the script text, pattern
+// included), so every cycle skipped as "supervised" with none running. Red on that code: the first check.
+if (process.platform === "win32") {
+  console.log("local auto-update: the real server-process inspection (#188, Windows)");
+  const { inspectServer } = mod;
+  const { spawn, spawnSync } = await import("node:child_process");
+  const cfg = { port: 65_431 }; // nothing listens here: roots stay empty, only the supervisor question is asked
+  await check("no supervisor running -> supervisor false (the inspecting PowerShell never counts itself)", () => {
+    const found = inspectServer(cfg);
+    assert.ok(found, "the inspection could not read the processes");
+    assert.equal(found.supervisor, false, "the inspection matched a supervisor with none running (it found itself)");
+  });
+  await check("a PowerShell running run-prod-supervised.ps1 as its -File -> supervisor true", async () => {
+    const dir = fs.mkdtempSync(path.join(ISOLATED_CWD, "au-sup-"));
+    const script = path.join(dir, "run-prod-supervised.ps1");
+    fs.writeFileSync(script, "Start-Sleep -Seconds 60\n");
+    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script], { windowsHide: true, stdio: "ignore" });
+    try {
+      let found: { supervisor: boolean } | null = null;
+      for (let i = 0; i < 20; i++) { // the process shows in Win32_Process within a second or two
+        await new Promise((r) => setTimeout(r, 500));
+        found = inspectServer(cfg);
+        if (found?.supervisor) break;
+      }
+      assert.ok(found, "the inspection could not read the processes");
+      assert.equal(found!.supervisor, true, "a running supervisor was not seen");
+    } finally {
+      if (child.pid) spawnSync("taskkill", ["/PID", String(child.pid), "/T", "/F"], { windowsHide: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+} else {
+  console.log("local auto-update: the real server-process inspection skipped (Windows only)");
+}
 
 if (failures) { console.error(`\n${failures} check(s) failed`); process.exit(1); }
 console.log("\nall local auto-update checks passed");

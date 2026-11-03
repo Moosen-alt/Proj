@@ -1,0 +1,14 @@
+# Nightly encrypted copy of the whole state folder to object storage in another provider
+# (restic-backup.sh). docs/OPERATIONS_LINUX.md §4.
+[Unit]
+Description=Keelix nightly restic backup of the state folder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/keelix/restic.env
+ExecStart=/opt/keelix/scripts/ops/linux/restic-backup.sh
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=6h

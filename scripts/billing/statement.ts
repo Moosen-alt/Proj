@@ -20,6 +20,7 @@
 // own invoice, never to a commit.
 import fs from "node:fs";
 import path from "node:path";
+import { dbPath as stateDbPath } from "../../backend/src/statePaths";
 import Database from "better-sqlite3";
 import { LIST_RATE_CARD, monthBounds, monthLines, type Filing, type RateCard } from "./rateCard";
 
@@ -44,7 +45,7 @@ const card: RateCard = {
 };
 const { start, end } = monthBounds(month);
 
-const dbPath = process.env.AUTOPILOT_DB_PATH || path.join(process.cwd(), "backend", "data", "autopilot.sqlite");
+const dbPath = stateDbPath();
 const db = new Database(dbPath, { readonly: true, fileMustExist: true });
 
 type ClientRow = { id: string; company_name: string; billing_contact_email: string; billing_mode: string };

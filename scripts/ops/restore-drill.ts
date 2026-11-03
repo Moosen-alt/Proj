@@ -31,6 +31,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { backupDir, dbPath as stateDbPath, projectDocsDir } from "../../backend/src/statePaths";
 
 const args = process.argv.slice(2);
 const flag = (name: string): string => {
@@ -55,7 +56,7 @@ const record = (check: string, verdict: Verdict, detail: string): void => {
   line(`  ${verdict.padEnd(4)}  ${check.padEnd(10)} ${detail}`);
 };
 
-const fromArg = flag("from") || process.env.BACKUP_SECOND_DIR || process.env.BACKUP_DIR || "backend/data/backups";
+const fromArg = flag("from") || process.env.BACKUP_SECOND_DIR || backupDir();
 const fromDir = path.resolve(process.cwd(), fromArg);
 let snapshot = flag("snapshot") ? path.resolve(process.cwd(), flag("snapshot")) : "";
 if (!snapshot) {
@@ -89,10 +90,10 @@ const keepScratch = args.includes("--keep-scratch");
 const norm = (p: string): string => { const r = path.resolve(process.cwd(), p); return process.platform === "win32" ? r.toLowerCase() : r; };
 const within = (inner: string, outer: string): boolean => { const rel = path.relative(norm(outer), norm(inner)); return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel)); };
 const protectedFolders: Array<[string, string]> = [
-  ["the live database's folder (AUTOPILOT_DB_PATH)", path.dirname(path.resolve(process.cwd(), process.env.AUTOPILOT_DB_PATH || "backend/data/autopilot.sqlite"))],
-  ["BACKUP_DIR", path.resolve(process.cwd(), process.env.BACKUP_DIR || "backend/data/backups")],
+  ["the live database's folder (AUTOPILOT_DB_PATH)", path.dirname(stateDbPath())],
+  ["BACKUP_DIR", backupDir()],
   ...(process.env.BACKUP_SECOND_DIR ? [["BACKUP_SECOND_DIR", path.resolve(process.cwd(), process.env.BACKUP_SECOND_DIR)] as [string, string]] : []),
-  ["PROJECT_DOCS_DIR", path.resolve(process.cwd(), process.env.PROJECT_DOCS_DIR || "backend/data/project-documents")],
+  ["PROJECT_DOCS_DIR", projectDocsDir()],
   ["the backup folder being read", path.dirname(snapshot)],
 ];
 let scratchParent = "";

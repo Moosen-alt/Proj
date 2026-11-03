@@ -483,6 +483,33 @@ Production runs a pinned checkout, `.probe\prod-pinned`, so edits in the develop
 
 8. **Roll back** if needed: repeat steps 5–7 with `$old`. If a migration must be undone, restore the named snapshot from step 4. Run the restore drill on it first, and ask before overwriting the live database.
 
+### 7.1 Launch re-pin: before the team files NEM applications
+
+The October NEM fixes (#378 the review-page hand-over, #354, #400, #401, #385, #387, #343, #414, #415, #419) reach the operator's box only through a re-pin. Check what the install runs first: `git -C .probe\prod-pinned rev-parse --short HEAD`, and compare it with `main`. The team's runbook is [NEM_OPERATOR_RUNBOOK.md](NEM_OPERATOR_RUNBOOK.md). Do these in this order; each step waits for the one before it.
+
+1. **Snapshot.** Steps 1–4 above: a commit that passed, the rollback point, quiet, and the named restore point.
+2. **Re-pin to current `main`.** Steps 5–7 above. The first start applies the migrations; `scripts/restore-demoted-recipes.ts --apply` refuses a database older than its code (`docs/HANDOFF.md`, "RESTORE SCRIPT"). `frontend\` is served from the development tree (above), so bring that tree to the same commit too.
+3. **Set the `.env` posture** in the same stop (the server reads `.env` only at start):
+
+   ```ini
+   AUTH_ENABLED=true              # §4.1: each operator signs in; the signed-in user is the approver of record
+   PORTAL_ALLOW_FINAL_SUBMIT=1    # §4.3: lets Approve & auto-submit click a portal's application submit (never a fee)
+   PORTAL_HEADLESS=false          # office desktop only: leaves the review window open for the hand-over
+   ```
+
+   `PORTAL_ALLOW_FINAL_SUBMIT=1` with `AUTH_ENABLED` off is a preflight FAIL (§4.3), and with sign-in off the track card's Approve & auto-submit never names an approver, so it stages to review instead of filing (#422). A shared server leaves `PORTAL_HEADLESS` unset (headless): no review window, so Approve & auto-submit is the path and every fallback is a person signing in to the portal in their own browser.
+4. **Restore the demoted recipes.** Stop the server (step 5 above), dry-run, then apply, then start it again (step 7):
+
+   ```powershell
+   $env:AUTOPILOT_DB_PATH = "backend\data\autopilot.sqlite"     # or the AUTOPILOT_DB_PATH your .env sets
+   npx tsx scripts/restore-demoted-recipes.ts                   # report only; lists RESTORE / KEEP per recipe
+   npx tsx scripts/restore-demoted-recipes.ts --apply
+   Remove-Item Env:AUTOPILOT_DB_PATH
+   ```
+
+   The dry run opens the database read-only; a live WAL database may refuse that, so dry-run on a `.backup` copy if it does (the script's header).
+5. **One supervised PacifiCorp replay** (`docs/HANDOFF.md`, "RESTORE SCRIPT": one supervised replay each). With the owner watching, on a real project ready to file: **Stage in portal** on the NEM track (not Approve & auto-submit), check the review page in the window, and submit by hand or leave the draft and note it. It proves the restored recipe replays on this build before anyone approves an automatic filing on it. PGE waits for #403 (its welcome page reads as the review step) and #410. The end-to-end proof through Approve & auto-submit is #427.
+
 ## 8. Routine
 
 | When | What | Look for |
@@ -499,10 +526,19 @@ Production runs a pinned checkout, `.probe\prod-pinned`, so edits in the develop
 |---|---|---|
 | `AUTH_ENABLED` | off | `true` requires a login for everything except `/health`, `/login` and the public token pages |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | – | seed the first password (only while no user has one); delete the password line afterwards |
-| `AUTH_SECRET` | the session key | signs login cookies |
+| `AUTH_SECRET` | the session key | signs login cookies; changing it signs **everyone** out |
+| `AUTH_SESSION_HOURS` | 12 | how long a sign-in lasts. It ends sooner for one person when their password is changed or reset, when their login is switched off, or when they press **Team → Sign out everywhere** (`POST /api/auth/logout-everywhere`): every cookie they hold, on every device, stops working on its next request |
 | `SERVER_HOST` | `127.0.0.1` | this machine only; `0.0.0.0` = every interface (needs `AUTH_ENABLED=true`, or the server refuses to start) |
 | `ALLOW_UNAUTHENTICATED_NETWORK` | off | `1` lets a non-loopback `SERVER_HOST` start with `AUTH_ENABLED` off. Don't. |
 | `PUBLIC_BASE_URL` | localhost | the base of every link a customer receives |
+| `SMTP_HOST` / `SMTP_FROM` | – | client email (and the watchdog's email). Without both, client updates are only saved as drafts; preflight `client email (SMTP)` warns. Prove with `npx tsx scripts/ops/test-email.ts --to <you>` |
+| `SMTP_PORT` / `SMTP_SECURE` / `SMTP_USER` / `SMTP_PASS` | 587 / off (on for 465) / – / – | the mail server's port, TLS and sign-in |
+| `EMAIL_IMAP_HOST` / `EMAIL_IMAP_USER` / `EMAIL_IMAP_PASS` | – | the tracking inbox agency and utility mail is forwarded to; all three, or it is ignored (`EMAIL_IMAP_PORT` 993, `EMAIL_IMAP_TLS`, `EMAIL_IMAP_MAILBOX` INBOX). Preflight `tracking inbox` |
+| `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` / `GMAIL_REFRESH_TOKEN` | – | the Gmail alternative to IMAP; read only once the refresh token is set (OPERATIONS_LINUX.md §5.1) |
+| `GMAIL_REDIRECT_URI` | `http://localhost:<PORT>/api/gmail/oauth/callback` | where Google returns after consent; on a server, `<PUBLIC_BASE_URL>/api/gmail/oauth/callback` |
+| `STAFF_ALERT_TO` / `STAFF_ALERT_WEBHOOK_URL` / `STAFF_DIGEST_HOUR` | – | the team's alerts when a run stops or a job changes state, and the morning digest (#487; no effect before it is deployed). Preflight `staff alerts` |
+| `FILING_CONTACT_EMAIL` | – | your tracking address, filled ONLY into a form's separate applicant / agent / additional-contact email box (#520). The contractor's own email box keeps the client's address; the homeowner's box (PowerClerk's NEM Applicant) is never touched |
+| `MONITOR_INTERVAL_MINUTES` | 15 | portal status checks and the tracking inbox; `0` turns both off (a test copy only) |
 | `BACKUP_DIR` | `backend/data/backups` | where snapshots are written first (production: `E:/SOLAR-Proj-Backups`) |
 | `BACKUP_INTERVAL_HOURS` / `BACKUP_KEEP` | 24 / 14 | snapshot cadence and how many to keep |
 | `BACKUP_SECOND_DIR` / `BACKUP_SECOND_KEEP` | off / `BACKUP_KEEP` | the off-box copy |

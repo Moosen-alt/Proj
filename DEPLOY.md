@@ -30,11 +30,12 @@ Key variables (see `.env.example` for the full list):
 | Variable | Purpose |
 |---|---|
 | `PORT` | HTTP port (default 4173) |
-| `AUTOPILOT_DB_PATH` | SQLite file path (default `backend/data/autopilot.sqlite`) |
+| `AUTOPILOT_STATE_DIR` | One root for every piece of state (see §3). Unset = the folder layout below the working directory |
+| `AUTOPILOT_DB_PATH` | SQLite file path (default `backend/data/autopilot.sqlite`, or `<AUTOPILOT_STATE_DIR>/autopilot.sqlite`) |
 | `SESSION_ENCRYPTION_KEY` | **Required.** Encrypts portal storage-state blobs |
 | `ANTHROPIC_API_KEY` | Enables Claude AI (vision parsing, extraction, drafting) |
 | `AUTH_ENABLED` / `ADMIN_EMAIL` / `ADMIN_PASSWORD` | Turn on dashboard login |
-| `SERVER_HOST` | Listen address. Default `127.0.0.1` (this machine only); the Docker image and `fly.toml` set `0.0.0.0`. With `AUTH_ENABLED` off, a non-loopback host refuses to start unless `ALLOW_UNAUTHENTICATED_NETWORK=1` |
+| `SERVER_HOST` | Listen address. Default `127.0.0.1` (this machine only); the Docker image sets `0.0.0.0`. With `AUTH_ENABLED` off, a non-loopback host refuses to start unless `ALLOW_UNAUTHENTICATED_NETWORK=1` |
 | `AUTH_COOKIE_SECURE` / `AUTH_SESSION_HOURS` | Secure-cookie flag (HTTPS) + login lifetime |
 | `MONITOR_INTERVAL_MINUTES` | How often permit/NEM checks + email tracker run (0 = off) |
 | `SEED_TEST_INSTALLER` | Seed the TML test installer. **Set `false` in production.** |
@@ -45,6 +46,13 @@ Key variables (see `.env.example` for the full list):
 
 ## 3. Run
 
+The hosting target is **one server (a VM) running this image with docker compose**: this
+section, plus [`docs/SERVER_SETUP.md`](docs/SERVER_SETUP.md) for the VM itself (HTTPS front door,
+logins, backups). There is no Fly.io configuration any more: `fly.toml` and the Fly deploy
+workflow were removed (#434). The file sized the machine at 1 GB and one shared CPU, far below
+what a team needs (`docs/SCALE_DEPLOYMENT.md`), and declared the port twice; nobody deployed
+there, and the target became one VM (#429). Deploys are by hand (§10).
+
 ### Option A — Docker (recommended)
 
 ```bash
@@ -52,9 +60,25 @@ docker compose up -d --build
 ```
 
 - Serves on `http://localhost:${PORT:-4173}`.
-- The SQLite DB + backups persist in the named volume `solar-data`
-  (mounted at `/app/backend/data`).
+- **All state persists in the named volume `solar-data`**, mounted at `/app/backend/data`.
+  The image sets `AUTOPILOT_STATE_DIR=/app/backend/data`, so the database, project documents,
+  backups, portal login profiles (`portal-profiles/`), the draft ledger (`portal-drafts.jsonl`,
+  the record of drafts left on real portals), learn and replay runs, screenshots, `portal-debug/`
+  and `logs/` all land in it (`backend/src/statePaths.ts`). Before this, everything except the
+  database, documents and backups was written into the container and lost on every redeploy.
+  If you mount the volume somewhere else, set `AUTOPILOT_STATE_DIR` to that same path.
 - Container health is wired to `/health`; `docker ps` shows healthy/unhealthy.
+- **A virtual display (#434).** Some portals refuse a headless browser and accept a real window
+  (coosbayor.gov: 403 headless, 200 headed), so staging and auto-learn retry once with a headed
+  browser on a bot block. The image's entrypoint (`scripts/docker-entrypoint.sh`) starts Xvfb, a
+  display with no screen, and exports `DISPLAY`, so that retry can open its window. Runs still
+  start headless (`PORTAL_HEADLESS` keeps its default); only the retry goes headed, and
+  `PORTAL_HEADED_RETRY=0` still turns it off. Nobody can see or click a window on that display: it
+  is automation's, and the review-page hand-over never treats it as a person's (CI's "Server image"
+  job pins that inside the built image). `PORTAL_VIRTUAL_DISPLAY=0` skips the display; a `DISPLAY`
+  you set yourself wins. Keep `DOCUMENT_FETCH_BROWSER=0` on a server
+  ([`docs/SERVER_SETUP.md`](docs/SERVER_SETUP.md)): with a display the document-fetch window could
+  now open there too.
 
 Plain Docker (no compose):
 
@@ -67,6 +91,10 @@ docker run -d --name solar -p 4173:4173 --env-file .env \
   -v solar-data:/app/backend/data solar-submission-autopilot
 ```
 
+Leave the per-path settings (`AUTOPILOT_DB_PATH`, `PROJECT_DOCS_DIR`, `PORTAL_PROFILES_DIR`,
+`BACKUP_DIR`, …) out of a container's `.env`: each one still wins over `AUTOPILOT_STATE_DIR`, so a
+path set there can put that piece of state back outside the volume.
+
 ### Option B — bare Node
 
 ```bash
@@ -76,6 +104,12 @@ npm start          # = tsx backend/src/server.ts
 
 Run it under a process manager (systemd, pm2) so it restarts on crash/reboot.
 `tsx` is a runtime dependency, so `npm ci --omit=dev` is also fine for production.
+
+On a server, set `AUTOPILOT_STATE_DIR` to the persistent disk (for example `/var/lib/solar`) so
+every piece of state lives in one folder you can back up and move. Unset, the app keeps today's
+layout under the working directory: `backend/data/`, `data/` and `portal-profiles/`. An install
+that turns it on with a draft ledger already at `data/portal-drafts.jsonl` keeps writing that file
+and logs a warning until you move it into the new folder; it is never moved for you.
 
 ---
 
@@ -302,6 +336,11 @@ Knobs (all default on): `AUTOLEARN_RUN_DEBUG=0` disables bundles,
 git pull
 docker compose up -d --build      # or: npm ci && restart the service
 ```
+
+On the hosted Linux server, update with `scripts/ops/linux/deploy.sh` instead: it stamps the build,
+waits for running jobs, takes a named snapshot and confirms `/health`, and `rollback.sh` undoes it.
+That server's whole runbook (Cloudflare Tunnel and Access, backups, timers, deploy and rollback) is
+[docs/OPERATIONS_LINUX.md](docs/OPERATIONS_LINUX.md).
 
 The SQLite schema self-migrates on boot (new columns/indexes are added
 idempotently); your data in the volume is preserved.

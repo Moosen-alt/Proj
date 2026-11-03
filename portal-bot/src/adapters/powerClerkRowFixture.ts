@@ -2,7 +2,8 @@
 // powerClerkRowHooks.dom.smoke.ts (six arrays to review), powerClerkRowHooksStop.dom.smoke.ts
 // (rows the portal will not keep: the stop, its capture and its message), and the #348 review's
 // shapes: powerClerkRowHiddenFace / powerClerkRowModelRewrite / powerClerkRowMicroinverter
-// .dom.smoke.ts (a neighbour's text or control is never the row's). One copy of the markup, so
+// .dom.smoke.ts (a neighbour's text or control is never the row's), and the owner's hand-patched
+// rows (#386: powerClerkHandPatchedRows.dom.smoke.ts, handPatchedArrayRows.test.ts). One copy of the markup, so
 // the smokes cannot drift apart. Not a smoke itself (not discovered by the runners).
 //
 // Source: data/learn-runs/2026-09-28_16-05-17_pacificorp_0upf, page p009 (equipment only, no
@@ -38,6 +39,11 @@ export type RowVariant = {
   noRowHooks?: boolean;
   /** ?moduleFace=unknown — the module make/model faces use classes the face walk does not know. */
   moduleFaceUnknown?: boolean;
+  /** ?ownRows=1 — the #535 shape (PacifiCorp multi-array learn, 2026-11-02): the module list carries
+   *  one series in several wattages, which a plan-set name without the wattage matches every one of
+   *  (Q.TRON BLK M-G2+ 405 / 420 / 440), and the Enphase inverter list names the IQ8+ only by its
+   *  part number. */
+  ownRows?: boolean;
 };
 
 export const variantOf = (url: string): RowVariant => {
@@ -51,6 +57,7 @@ export const variantOf = (url: string): RowVariant => {
     rowMicro: q.get("micro") === "1",
     noRowHooks: q.get("noHooks") === "1",
     moduleFaceUnknown: q.get("moduleFace") === "unknown",
+    ownRows: q.get("ownRows") === "1",
   };
 };
 
@@ -72,6 +79,7 @@ export const page = (v: RowVariant = {}): string => `<!doctype html><html><head>
     var REWRITE_AZIMUTH = ${flag(v.rewriteAzimuth)}; // the portal keeps "0" for every row's azimuth
     var REWRITE_MODEL = ${flag(v.rewriteModel)}, EMPTY_VALUE = ${flag(v.emptyComboValue)}, HIDE_MODEL_FACE = ${flag(v.hideSetModelFace)};
     var MODEL_LABEL = ${flag(v.modelLabel)}, MICRO = ${flag(v.rowMicro)}, NO_HOOKS = ${flag(v.noRowHooks)}, MODULE_FACE_UNKNOWN = ${flag(v.moduleFaceUnknown)};
+    var OWN_ROWS = ${flag(v.ownRows)};
     var MODULE_MAKES = ["Hanwha Q CELLS", "Znshine PV-Tech", "REC Solar"];
     var INV_MAKES = ["Altenergy Power System", "Enphase Energy Inc."];
     var MICRO_MAKES = ["Enphase Energy Inc.", "Altenergy Power System"].concat(MODULE_MAKES); // also carries the module makes
@@ -86,6 +94,10 @@ export const page = (v: RowVariant = {}): string => `<!doctype html><html><head>
       "Altenergy Power System": ["0.8 kW (Model DS3-L {240V} [SI1])", "0.8 kW (Model DS3-LV {120V} [SI1])"],
       "Enphase Energy Inc.": ["0.96 kW (Model QT2 {240V})"]
     };
+    if (OWN_ROWS) {
+      MODELS["Hanwha Q CELLS"] = ["405W (Model Q.TRON BLK M-G2+ 405)", "420W (Model Q.TRON BLK M-G2+ 420)", "440W (Model Q.TRON BLK M-G2+ 440)"];
+      MODELS["Enphase Energy Inc."] = ["0.29 kW (Model IQ8PLUS-72-2-US {240V})", "0.32 kW (Model IQ8M-72-2-US {240V})"];
+    }
     var server = { rows: [newRow()], invMfr: "", invModel: "" };
     var idn = 53; // per-render ids, renumbered from the top: row 1's Qty is #pcInputBase56 on a learn page
     var lists = 0;
@@ -281,6 +293,36 @@ export const recipe = (url: string): PortalRecipe => ({
   createdBy: "test", createdAt: "", updatedAt: "", notes: "", discipline: "",
 } as unknown as PortalRecipe);
 
+/** #386 — THE OWNER'S HAND PATCH (PacifiCorp learn, 2026-10-21): at review the owner clicked "Add
+ *  Array" twice and typed rows 2–3, and patch-by-demonstration recorded it all before Next. The
+ *  steps are as the capture describes these controls (role + accessible name, the row's legend as
+ *  the section) and as appendHumanPatchSteps merges them for the learn project (arrays 9 / 5 / 5 / 2):
+ *  the Qty "5" matches two arrays and stays a literal, the certified make matches nothing and stays
+ *  a literal, and the certified model binds to moduleModelCertified. */
+export const handPatchedRows = (): RecipeStep[] => {
+  const section = "PV ArrayDelete Array";
+  const steps: RecipeStep[] = [
+    { action: "click", selector: { role: "button", name: "Add Array" }, note: "human-patch: Add Array" },
+    { action: "click", selector: { role: "button", name: "Add Array" }, note: "human-patch: Add Array" },
+  ];
+  for (const n of [2, 3]) {
+    steps.push(
+      { action: "fill", selector: { role: "textbox", name: "Qty" }, fingerprint: { id: `pcInputBase${61 + 6 * n}`, placeholder: "Qty", ariaLabel: "Qty", section }, value: "5", note: "human-patch: Qty" },
+      { action: "select", selector: { role: "combobox", name: "Manufacturer" }, fingerprint: { id: `pcInputBase${62 + 6 * n}`, ariaLabel: "Manufacturer", section }, value: CERT_MAKE, note: "human-patch: Manufacturer" },
+      { action: "select", selector: { role: "combobox", name: "Model" }, fingerprint: { id: `pcInputBase${63 + 6 * n}`, ariaLabel: "Model", section }, field: "moduleModelCertified", note: "human-patch: Model" },
+    );
+  }
+  return steps;
+};
+
+/** The row recipe with the owner's hand patch merged in before Next (where the merge lands it). */
+export const recipeWithHandPatchedRows = (url: string): PortalRecipe => {
+  const base = recipe(url);
+  const steps = [...base.steps];
+  steps.splice(steps.findIndex((s) => s.action === "click" && /next/i.test(String(s.note ?? ""))), 0, ...handPatchedRows());
+  return { ...base, steps };
+};
+
 // The project's arrays (synthetic project; the numbers are the plan set's geometry), with the
 // PLAN SET's make wording — the portal lists the certified "Znshine PV-Tech".
 export const ARRAYS = [
@@ -308,8 +350,11 @@ export type Committed = { rows: Array<Record<string, string>>; invMfr?: string; 
 /** Serve the fixture, open a browser context, and return a runner that drives the REAL replay
  *  path (RecipeAdapter.fillApplication) on `pathname` with `fields`. */
 export async function startRowFixture(chromium: { launch: () => Promise<Browser> }): Promise<{
-  run: (pathname: string, fields: Record<string, string>) => Promise<{ r: Awaited<ReturnType<RecipeAdapter["fillApplication"]>>; committed: Committed; filed: boolean; url: string }>;
+  run: (pathname: string, fields: Record<string, string>, recipeFor?: (url: string) => PortalRecipe) => Promise<{ r: Awaited<ReturnType<RecipeAdapter["fillApplication"]>>; committed: Committed; filed: boolean; url: string }>;
   close: () => Promise<void>;
+  /** The fixture's origin and browser context, for a smoke that drives something other than a replay. */
+  base: string;
+  context: BrowserContext;
 }> {
   const server = http.createServer((q, r) => {
     const url = String(q.url ?? "");
@@ -322,10 +367,10 @@ export async function startRowFixture(chromium: { launch: () => Promise<Browser>
   const browser = await chromium.launch();
   const context: BrowserContext = await browser.newContext();
   await context.addInitScript("globalThis.__name = globalThis.__name || function (fn) { return fn; };");
-  const run = async (pathname: string, fields: Record<string, string>) => {
+  const run = async (pathname: string, fields: Record<string, string>, recipeFor: (url: string) => PortalRecipe = recipe) => {
     const p = await context.newPage();
     await p.goto(`${base}${pathname}`);
-    const a = new RecipeAdapter(recipe(`${base}${pathname}`), fields, {}, { autoSubmit: false });
+    const a = new RecipeAdapter(recipeFor(`${base}${pathname}`), fields, {}, { autoSubmit: false });
     (a as unknown as { page: unknown }).page = p;
     const r = await a.fillApplication({} as never);
     await p.waitForTimeout(1500); // let the last debounced autosaves land
@@ -333,7 +378,7 @@ export async function startRowFixture(chromium: { launch: () => Promise<Browser>
     const filed = await p.evaluate(() => (window as unknown as { __filed?: boolean }).__filed === true);
     return { r, committed, filed, url: p.url() };
   };
-  return { run, close: async () => { await browser.close(); server.close(); } };
+  return { run, close: async () => { await browser.close(); server.close(); }, base, context };
 }
 
 // ---- Shared by the #348 review's variant smokes (two arrays each). ----

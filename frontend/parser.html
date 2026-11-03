@@ -5,6 +5,8 @@
   <link rel="icon" type="image/png" href="/assets/brand/keel-symbol-64.png" />
   <link rel="apple-touch-icon" href="/assets/brand/keel-symbol-180.png" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="copyright" content="Copyright (c) 2026 Keelix. All rights reserved. Proprietary and confidential." />
+  <meta name="keelix-provenance" content="kx-fcd3ffd4aa792bbd" />
   <title>Project intake · Keelix</title>
   <link rel="stylesheet" href="/styles.css" />
   <!-- Manrope is NOT linked here. It is vendored in frontend/vendor and declared with
@@ -3961,6 +3963,10 @@ const LLM_SNAPSHOT_KEYS = new Set([
   // Issued-permit precedents (permitPrecedents.ts, #147): the racking and roof-attachment products.
   'rackingSystem','attachmentHardware',
   'busRating','mainBreaker','pvBreaker','acDiscReq',
+  // The AC disconnect's part and rating (#384): acDiscMakeModel is the plan-set part the utility
+  // filing reads (portalRecipes -> disconnectMake / disconnectModel); amps and fusing are what the
+  // client's standard part is cross-checked against. Read before, never saved.
+  'acDiscMakeModel','acDiscQty','acDiscAmps','acDiscFused','acDiscVoltage',
   'snow','deadLoad','roofRafterSpacing','roofRafterSpan','wind','permitPath',
   // Structural prescriptive-screen fields — evaluatePrescriptiveCriteria answers
   // the AHJ checklist rows from these; dropping them here regresses to [verify].

@@ -18,10 +18,11 @@
 // ---------------------------------------------------------------------------
 import fs from "node:fs";
 import path from "node:path";
+import { runDataDir } from "./statePaths";
 import { reachedReviewFromEvents, scoreLearnOutcome, summarize, type BenchmarkRow, type LearnOutcome } from "./learnBenchmark";
 
-const RUNS_DIR = path.resolve(process.cwd(), "data", "learn-runs");
-const OUT_DIR = path.resolve(process.cwd(), "data", "learn-benchmark");
+const RUNS_DIR = path.join(runDataDir(), "learn-runs");
+const OUT_DIR = path.join(runDataDir(), "learn-benchmark");
 
 type Event = { type?: string; status?: string; ok?: boolean; trace?: string };
 

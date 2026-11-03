@@ -7,7 +7,7 @@
 // be. Confidence is the safety valve: only a `high` read may be written without a person.
 // Run: tsx portal-bot/src/recordNumber.test.ts
 import assert from "node:assert/strict";
-import { extractRecordNumber, pageConfirmsSubmission } from "./recordNumber";
+import { extractRecordNumber, pageConfirmsSubmission, recordNumberCandidates } from "./recordNumber";
 
 let failures = 0;
 const check = (label: string, fn: () => void): void => {
@@ -106,6 +106,25 @@ check("pageConfirmsSubmission separates a completed filing from a draft", () => 
   assert.equal(pageConfirmsSubmission(POWERCLERK_PAGE), true);
   assert.equal(pageConfirmsSubmission(DRAFT_PAGE), false);
   assert.equal(pageConfirmsSubmission(""), false);
+});
+
+// #333 round 4 (Helm Blocking 1): the human capture judges a completion against the review page's own
+// reading, so it needs EVERY candidate per shape tier, not just the first. A new walk beside
+// extractRecordNumber, which must read exactly as before (its constants are never given a `g` flag).
+check("recordNumberCandidates: every candidate, tier by tier (Accela, PowerClerk, labelled), in page order", () => {
+  const page = "Record Number: 26TMP-004411\nAPP-7734121 replaces APP-7734120.\n187-26-000328-STR and 187-26-000100-STR\nConfirmation #: PFP-2026-55120\nCall 503-555-1212";
+  const c = recordNumberCandidates(page);
+  assert.deepEqual(c.map((x) => `${x.source}:${x.value}`), [
+    "accela:187-26-000328-STR", "accela:187-26-000100-STR",
+    "powerclerk:APP-7734121", "powerclerk:APP-7734120",
+    "labelled:26TMP-004411", "labelled:PFP-2026-55120",
+  ]);
+  assert.deepEqual(recordNumberCandidates(""), []);
+});
+check("recordNumberCandidates leaves extractRecordNumber reading as before (no shared regex state)", () => {
+  const before = extractRecordNumber(ACCELA_PAGE);
+  recordNumberCandidates(ACCELA_PAGE); recordNumberCandidates(ACCELA_PAGE);
+  assert.deepEqual(extractRecordNumber(ACCELA_PAGE), before);
 });
 
 console.log(failures === 0

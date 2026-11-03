@@ -104,6 +104,33 @@ export function extractRecordNumber(bodyText: string): RecordNumberRead {
   return NONE;
 }
 
+/** A record-number shape tier, strongest first (Accela, PowerClerk, labelled). */
+export type RecordNumberTier = "accela" | "powerclerk" | "labelled";
+export const RECORD_NUMBER_TIERS: readonly RecordNumberTier[] = ["accela", "powerclerk", "labelled"];
+
+/**
+ * EVERY record-number candidate on the page, tier by tier (Accela, then PowerClerk, then labelled),
+ * each tier in page order, without the shapes that are never a record number (#333 round 4). The
+ * human-submit capture compares a completion page's candidates with the review page's own, so it
+ * needs them all, not just the first. The walk uses its OWN global copies of the tier regexes:
+ * ACCELA_RE and POWERCLERK_RE stay non-global for extractRecordNumber (`.match`, no lastIndex state).
+ */
+export function recordNumberCandidates(bodyText: string): Array<{ value: string; source: RecordNumberTier }> {
+  const text = String(bodyText || "");
+  const out: Array<{ value: string; source: RecordNumberTier }> = [];
+  const seen = new Set<string>();
+  const add = (raw: string, source: RecordNumberTier): void => {
+    const value = String(raw || "").trim();
+    if (!value || disqualified(value) || seen.has(`${source}|${value}`)) return;
+    seen.add(`${source}|${value}`);
+    out.push({ value, source });
+  };
+  for (const m of text.matchAll(new RegExp(ACCELA_RE.source, "g"))) add(m[0], "accela");
+  for (const m of text.matchAll(new RegExp(POWERCLERK_RE.source, "g"))) add(m[0], "powerclerk");
+  for (const m of text.matchAll(new RegExp(LABELLED_RE.source, "gi"))) if (m[1] && /\d/.test(m[1])) add(m[1], "labelled");
+  return out;
+}
+
 /** Did this page actually announce a completed submission? Exported for the callers that
  *  need the fact without the number (a filing can complete and show its number later). */
 export function pageConfirmsSubmission(bodyText: string): boolean {

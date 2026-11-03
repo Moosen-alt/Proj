@@ -29,13 +29,28 @@
 import crypto from "node:crypto";
 import type { AppDb } from "./db";
 import type {
-  ProjectStatus, PublicProjectStatusPayload, PublicStatusHistoryEntry, ReadingFreshness,
+  ClientTimeline, ProjectRecord, ProjectStatus, PublicProjectStatusPayload, PublicStatusHistoryEntry, ReadingFreshness,
 } from "../../shared/src/types";
 import { formatProjectAddress } from "./clientNotifier";
 import { getProjectDetail } from "./repository";
 import { publishedReadingFreshness, trackKind, UNCONFIRMED_READING_LABEL, type TrackKind } from "./permitMonitor";
 import { logger } from "./logger";
 import { clientFacingPermitType, clientPermitStructure } from "./clientUpdates";
+import { buildClientTimeline } from "./clientTimeline";
+
+/**
+ * The job's filed → PTO timeline (#497) for a public page. A page a client opened from an email
+ * never 500s over it: a failure is logged and the page renders without the timeline rather than
+ * without everything else.
+ */
+function timelineFor(db: AppDb, project: ProjectRecord | (() => ProjectRecord)): ClientTimeline {
+  try {
+    return buildClientTimeline(db, typeof project === "function" ? project() : project);
+  } catch (err) {
+    logger.warn("portal", `could not build a client timeline: ${err instanceof Error ? err.message : String(err)}`);
+    return { steps: [] };
+  }
+}
 
 /** The job's confirmed permit structure, asked only for a 'combo' target (the one label it changes)
  *  and once per project per page. An unreadable project is NOT confirmed. */
@@ -425,6 +440,8 @@ export interface ClientPortalProject {
   status: string;
   updatedAt: string;
   tracks: ClientPortalTrack[];
+  /** Filed → issued/approved → installed → final → PTO, one row per step (#497). */
+  timeline: ClientTimeline;
   /** What we have told this client about this job, newest first. */
   updates: ClientPortalUpdate[];
   /**
@@ -608,6 +625,9 @@ export function clientPortalPayload(db: AppDb, token: string): ClientPortalPaylo
         status: PUBLIC_STATUS_TEXT[statusKey as ProjectStatus] || "In progress",
         updatedAt: String(p.updated_at || ""),
         tracks: byProject.get(String(p.id)) || [],
+        // The project record the tracks panel reads (getProjectDetail), one per job like the
+        // history below; the ids are this client's own, read above.
+        timeline: timelineFor(db, () => getProjectDetail(db, String(p.id)).project),
         updates: updatesByProject.get(String(p.id)) || [],
         // ONE QUERY PER PROJECT, unlike the batched reads above. Deliberate: the collapse is a
         // per-target running comparison over a window of rows, and a single batched query would
@@ -659,6 +679,7 @@ export function publicProjectStatusPayload(db: AppDb, token: string): PublicProj
       status: p.status,
       updatedAt: p.updatedAt,
     },
+    timeline: timelineFor(db, p),
     tracks: (detail.permitCheckTargets || []).map((t) => ({
       type: t.targetType,
       // SAME LABEL RULE AS THE PER-CLIENT PORTAL. This page had its own copy of the hardcoded

@@ -11,7 +11,11 @@ services:
       - "${PORT:-4173}:4173"
     env_file:
       - .env
-    # Persist the SQLite database + backups across restarts/redeploys.
+    # Every piece of state (database, documents, backups, portal login profiles, draft ledger,
+    # run bundles, screenshots, logs) lives under AUTOPILOT_STATE_DIR (backend/src/statePaths.ts).
+    # Keep it equal to the volume path below, or that state is lost on every redeploy.
+    environment:
+      AUTOPILOT_STATE_DIR: /app/backend/data
     volumes:
       - solar-data:/app/backend/data
     restart: unless-stopped

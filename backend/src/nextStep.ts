@@ -48,6 +48,7 @@
 
 import type { AppDb } from "./db";
 import type {
+  ClientAskSent,
   CorrectionRecord,
   NextStep,
   NextStepCompact,
@@ -58,6 +59,7 @@ import type {
   ProjectStatus,
   ReviewerFinding,
   SubmitGateHold,
+  SubmitCaptureCandidate,
   SubmitGateReport,
   SubmittalTrackType,
 } from "../../shared/src/types";
@@ -69,6 +71,8 @@ import { billingTrack } from "./submissionFees";
 import { findingHoldScope, gateCheckDefaultScope, scopeHoldsTrack, tracksHeld } from "./gateScope";
 import { issuingAuthorityForTrack } from "./applicationDocsAgency";
 import { parseJobProgressNote } from "./jobProgress";
+import { clientAsksForProject } from "./clientAsks";
+import { installerHandoffRecords, type InstallerHandoffRecord } from "./installerHandoff";
 import { SIGNATURE_REQUEST_CONFIRMED_ACTION, reduceNemSignatureState } from "./signatureTrack";
 import { visionRelaxedBlockers } from "./reviewerVision";
 import { startedAtLabel } from "./formAcquisitionPlan";
@@ -239,6 +243,10 @@ export interface TrackFacts {
    *  electrical permit is named as the county's. Optional: absent, the answer falls back to the
    *  AHJ / utility on the facts record (agencyOf). */
   agency?: string;
+  /** UNSURE RECORD NUMBERS read after a person's submit in this track's left-open window (#400,
+   *  portal_runs.submit_capture_candidates of the staged run) — offered for one-click
+   *  confirmation, never treated as a filing. Absent when there are none. */
+  recordCandidates?: Array<{ recordNumber: string; recordLink: string; source: "completion_page" | "account_list" }>;
 }
 
 export interface NextStepFacts {
@@ -267,6 +275,12 @@ export interface NextStepFacts {
   gate?: { decision: SubmitGateReport["decision"]; blockers: Array<{ id: string; title: string; nextAction: string; holds?: SubmitGateHold[] }> };
   /** Detail tier only: reviewer blockers as the approve route judges them (each with its tracks). */
   reviewerBlockers?: ReviewerBlocker[];
+  /** Detail tier only: the intake / login links the server emailed the client that are still open
+   *  (clientAsks.ts, #488) — carried onto the answer whatever its key. */
+  clientAsks?: ClientAskSent[];
+  /** handoff_ready only: the installer handoff email on record for the CURRENT handoff
+   *  (installerHandoff.installerHandoffRecords, #491), or null when none was sent or drafted. */
+  installerHandoff?: InstallerHandoffRecord | null;
 }
 
 const ON_PORTAL = new Set(["awaiting_human_submit", "submitted", "paused_for_human"]);
@@ -398,6 +412,9 @@ export function loadNextStepFacts(db: AppDb, projects: ProjectRecord[]): Map<str
     ),
     (r) => s(r.project_id),
   );
+  // The installer handoff email (#491), read only for handed-off projects.
+  const handedOffIds = projects.filter((p) => p.status === "handoff_ready").map((p) => p.id);
+  const handoffs = installerHandoffRecords(db, handedOffIds);
   const feeDueKinds = groupBy(
     db.query<Row>(`SELECT project_id, target_type, permit_type FROM permit_check_targets WHERE project_id IN (${ph}) AND active = 1 AND latest_outcome = 'ready_for_issue'`, ids),
     (r) => s(r.project_id),
@@ -468,17 +485,19 @@ export function loadNextStepFacts(db: AppDb, projects: ProjectRecord[]): Map<str
       qcReview: pending.filter(isCriticalReviewItem).map((r) => ({ issueType: r.issueType, fieldName: r.fieldName })),
       portalReadings: pending.filter((r) => r.fieldName === "permit_status").length,
       approvedRunIds: (approvals.get(pid) ?? []).map((r) => s(parseJson<Row>(s(r.details), {}).portalRunId)).filter(Boolean),
+      ...(status === "handoff_ready" ? { installerHandoff: handoffs.get(pid) ?? null } : {}),
     });
   }
 
   // Gap-fill lists for the staged drafts only (result_json can be large; never load it for all runs).
   if (stagedRunIds.length) {
     const rph = stagedRunIds.map(() => "?").join(",");
-    const stagedRows = db.query<Row>(`SELECT id, result_json FROM portal_runs WHERE id IN (${rph})`, stagedRunIds);
+    const stagedRows = db.query<Row>(`SELECT id, result_json, submit_capture_candidates FROM portal_runs WHERE id IN (${rph})`, stagedRunIds);
     const gaps = new Map(stagedRows.map((r) => [s(r.id), reviewInfoFromResultJson(r.result_json).gapFillMissing] as const));
     // THE SIGNATURE PART OF THE NEM FLOW (#310): the staged run's review state, moved on by a person's
     // "I sent the signature request" recorded after it. Read-only, like everything here.
     const reviewStates = new Map(stagedRows.map((r) => [s(r.id), s(parseJson<Row>(s(r.result_json) || "{}", {}).reviewState)] as const));
+    const candidates = new Map(stagedRows.map((r) => [s(r.id), recordCandidatesOf(r.submit_capture_candidates)] as const));
     const confirmations = groupBy(
       db.query<Row>(`SELECT project_id, details, created_at FROM audit_logs WHERE project_id IN (${ph}) AND action = ?`, [...ids, SIGNATURE_REQUEST_CONFIRMED_ACTION]),
       (r) => s(r.project_id),
@@ -487,6 +506,8 @@ export function loadNextStepFacts(db: AppDb, projects: ProjectRecord[]): Map<str
       for (const t of facts.tracks) {
         if (!t.stagedRun) continue;
         t.gapFillMissing = gaps.get(t.stagedRun.id) ?? [];
+        const held = candidates.get(t.stagedRun.id) ?? [];
+        if (held.length) t.recordCandidates = held;
         const reviewState = reviewStates.get(t.stagedRun.id) ?? "";
         if (t.track !== "nem" || !reviewState) continue;
         const view = reduceNemSignatureState([
@@ -500,6 +521,21 @@ export function loadNextStepFacts(db: AppDb, projects: ProjectRecord[]): Map<str
   return out;
 }
 
+/** The staged run's held candidates (repository.recordSubmitCaptureCandidates), defensively read:
+ *  only a non-empty number survives, and only an http(s) link. */
+function recordCandidatesOf(raw: unknown): NonNullable<TrackFacts["recordCandidates"]> {
+  const parsed = parseJson<{ candidates?: unknown }>(s(raw) || "{}", {});
+  const list = Array.isArray(parsed?.candidates) ? parsed.candidates as Array<Record<string, unknown>> : [];
+  return list
+    .map((c) => ({
+      recordNumber: s(c?.recordNumber).trim(),
+      recordLink: /^https?:\/\//i.test(s(c?.recordLink)) ? s(c?.recordLink) : "",
+      source: (s(c?.source) === "account_list" ? "account_list" : "completion_page") as "completion_page" | "account_list",
+    }))
+    .filter((c) => c.recordNumber)
+    .slice(0, 5);
+}
+
 // ── The rule table ──────────────────────────────────────────────────────────────────────
 
 /** Every button id the rule table can emit — a test checks each exists in dashboard.html. */
@@ -511,6 +547,7 @@ export const NEXT_STEP_BUTTON_IDS = [
   "startAutopilotBtn",
   "addPermitTargetBtn",
   "copyHandoffPacketBtn",
+  "sendHandoffPacketBtn",
 ] as const;
 /** Every fixTarget id the rule table can emit — same test. */
 export const NEXT_STEP_FIX_TARGETS = [
@@ -616,6 +653,11 @@ export function decideNextStep(facts: NextStepFacts): NextStep {
   // (gateCanOverrule), so a reordered rule cannot leave a client-side key list behind.
   const allFiled = facts.tracks.length > 0 && unfinished.length === 0;
   const hasStagedDraft = !facts.archived && (unfinished.some((t) => t.stagedRun) || facts.status === "awaiting_human_resubmit");
+  // WHAT A PERSON MAY CONFIRM WITH ONE CLICK (#400), whatever the answer's key: numbers read after
+  // their submit that were not sure enough to write. Carried on every answer of an unarchived job.
+  const recordCandidates: SubmitCaptureCandidate[] = facts.archived ? [] : unfinished.flatMap((t) => (t.stagedRun && t.recordCandidates?.length
+    ? t.recordCandidates.map((c) => ({ runId: t.stagedRun!.id, track: t.track, ...c }))
+    : []));
   // Set once evaluation passes rule 7 (the submit gate). An answer produced after it, on a list
   // tier that never ran the gate, with something still to file, is one rule 7 could have pre-empted.
   let passedGateRule = false;
@@ -628,6 +670,8 @@ export function decideNextStep(facts: NextStepFacts): NextStep {
     allFiled,
     gateCanOverrule: passedGateRule && !gateChecked && unfinished.length > 0,
     hasStagedDraft,
+    ...(recordCandidates.length ? { recordCandidates } : {}),
+    ...(!facts.archived && facts.clientAsks?.length ? { clientAsks: facts.clientAsks } : {}),
   });
 
   if (facts.archived) return make("archived", "nobody", "done", "Archived — nothing is asked of anyone.", [], null);
@@ -791,23 +835,42 @@ export function decideNextStep(facts: NextStepFacts): NextStep {
       const what = awaitingApproval.length === 1
         ? `The ${trackWithAgency(facts, awaitingApproval[0])} application is staged on its portal`
         : `Staged for review: the ${tracksWithAgency(facts, awaitingApproval)}`;
-      const ask = awaitingApproval.length === 1
-        ? (gateChecked ? "review it, approve, then click its submit yourself." : "review it (the project page checks the gate before approval).")
-        : (gateChecked ? "review each on its own portal, approve, then click its submit yourself." : "review each on its own portal (the project page checks the gate before approval).");
+      // ONE APPROVE ACTION, ONE MEANING (#423). The button below takes the operator to the rail's
+      // Approve & auto-submit, which opens the track card's own door (the approver prompt, then
+      // prepare-submission { track, autoSubmit: true, approverName }): it starts its own run of the
+      // newest draft's filing from the start of the application, and the bot clicks submit only
+      // through the one gate (rule 1). It used to read "Approve & Submit" and record an approval that
+      // filed nothing. On NEM the door is HELD while a draft is staged (#435, owner ruling 2026-10-31
+      // "One click now"): a run from the start would stop on that draft or open a second
+      // application, so the draft is finished by hand and no Approve button is offered.
+      const approveHeld = newest.track === "nem";
+      const ask = approveHeld
+        ? (awaitingApproval.length === 1
+          ? (gateChecked ? "review it and click its submit on the portal yourself." : "review it (the project page checks the gate first), then click its submit on the portal yourself.")
+          : (gateChecked ? "review each on its own portal and click its submit yourself." : "review each on its own portal (the project page checks the gate first) and click its submit yourself."))
+        : awaitingApproval.length === 1
+          ? (gateChecked ? "review it, then click its submit yourself or press Approve & auto-submit." : "review it (the project page checks the gate before approval).")
+          : (gateChecked ? "review each on its own portal, then click its submit yourself or press Approve & auto-submit for the newest." : "review each on its own portal (the project page checks the gate before approval).");
+      const many = awaitingApproval.length > 1;
+      const newestName = TRACK_NAME[newest.track];
+      const approveWhy = approveHeld
+        ? why(many
+          ? `Approve & auto-submit acts on the newest draft only — the ${newestName} — and is held while that draft is staged: it would start a new run from the start of the application. Finish each draft on its portal yourself.`
+          : `Approve & auto-submit is held while the ${newestName} has a staged draft: it would start a new run from the start of the application. Finish the draft on the portal yourself.`, "portalRunsPinned")
+        : why(`${many ? `Approve & auto-submit acts on the newest draft only — the ${newestName} — and starts its own run of it` : `Approve & auto-submit starts its own run of the ${newestName}`} under your named approval; the bot clicks submit only with the server switch on and a recipe recorded through submit, otherwise it stops at review.${many ? " Each other draft needs its own review and its own submit." : ""}`, "portalRunsPinned");
       return make("staged_awaiting_submit", "me", "today",
         `${what} — ${ask}${notStagedTail}`,
         [
           // What is left to stage first: make() keeps three whys, and the per-track lines fill them.
           ...notStagedWhy,
-          // One button, one draft: Approve & Submit acts on the NEWEST awaiting draft only.
-          ...(awaitingApproval.length > 1 && !approveRefused
-            ? [why(`Approve & Submit acts on the newest draft only — the ${TRACK_NAME[newest.track]}. Each other draft needs its own review and its own submit.`, "portalRunsPinned")]
-            : []),
+          // What the one Approve action does here, or why it is held (only when it is not refused).
+          ...(approveRefused ? [] : [approveWhy]),
           // The PINNED card: the staged draft renders there, not in the folded history (#portalRuns).
-          ...awaitingApproval.map((t) => why(`${TRACK_NAME[t.track]} staged ${t.stagedRun!.startedAt.slice(0, 10)} — automation never clicks the final submit.`, "portalRunsPinned")),
-          ...(approved.length ? [why(`Approval already recorded for the ${trackList(approved)} — file it and capture the confirmation.`, "confirmationForm")] : []),
+          ...awaitingApproval.map((t) => why(`${TRACK_NAME[t.track]} staged ${t.stagedRun!.startedAt.slice(0, 10)} — automation never clicks this draft's final submit.`, "portalRunsPinned")),
+          // An approval the old rail button recorded (POST /autopilot/approve) filed nothing: say so.
+          ...(approved.length ? [why(`An approval on record for the ${trackList(approved)} filed nothing — click its submit on the portal yourself, then capture the confirmation.`, "confirmationForm")] : []),
         ],
-        approveRefused ? null : btn("approveSubmitBtn", "Approve & Submit"),
+        approveRefused || approveHeld ? null : btn("approveSubmitBtn", "Approve & auto-submit"),
         awaitingApproval[0].stagedRun!.startedAt);
     }
     return make("approved_awaiting_filing", "me", "today",
@@ -891,9 +954,32 @@ export function decideNextStep(facts: NextStepFacts): NextStep {
 
   // 18. Closeout.
   if (facts.status === "handoff_ready") {
-    return make("handoff_ready", "me", "done",
+    // THE PACKET IS EMAILED BY THE SERVER ON THE TRANSITION (#491). Sent: nobody owes anything,
+    // and the step says when and to whom. Drafted, failed, or not sent (the client sends by hand,
+    // or no inbox): a person sends it — the button re-sends through the same door.
+    const sent = facts.installerHandoff;
+    if (sent && sent.deliveryStatus === "sent") {
+      return make("handoff_ready", "nobody", "done",
+        `Handed off ${sent.at.slice(0, 10)} — the installer handoff packet went to ${sent.recipient}.`,
+        [why("Permit issued and interconnection approved. Final inspection, then the utility's permission to operate, are the installer's.")],
+        btn("sendHandoffPacketBtn", "Send handoff packet again"), sent.at);
+    }
+    // A send in flight — unless it is old enough that the process doing it must have died.
+    const sending = sent?.deliveryStatus === "pending";
+    if (sending && Date.now() - Date.parse(sent.at) < AUTO_CHAIN_FRESH_MS) {
+      return make("handoff_ready", "nobody", "done",
+        `Sending the installer handoff packet to ${sent.recipient}.`, [], null, sent.at);
+    }
+    const whyNot = sending
+      ? why(`Sending the packet to ${sent!.recipient} never finished — send it again.`)
+      : sent?.deliveryStatus === "draft"
+      ? why(`The packet to ${sent.recipient} is drafted but was not sent: mail is not set up on this server.`)
+      : sent?.deliveryStatus === "failed"
+        ? why(`Sending the packet to ${sent.recipient} failed: ${sent.detail || "the mail server refused it"}.`)
+        : null;
+    return make("handoff_ready", "me", "today",
       "Permit issued and interconnection approved — send the installer the handoff packet.",
-      [], btn("copyHandoffPacketBtn", "Copy handoff packet"));
+      whyNot ? [whyNot] : [], btn("sendHandoffPacketBtn", "Send handoff packet"));
   }
   if (facts.tracks.length && facts.tracks.every((t) => t.done)) {
     return make("done", "nobody", "done", "Every required filing is issued / approved.", [], null);
@@ -928,6 +1014,7 @@ export function loadFullNextStepFacts(db: AppDb, projectId: string): NextStepFac
         blockers: gate.checks.filter((c) => c.status === "blocker").map((c) => ({ id: c.id, title: c.title, nextAction: c.nextAction, ...(c.holds ? { holds: c.holds } : {}) })),
       },
       reviewerBlockers: reviewerBlockerList(db, project),
+      clientAsks: clientAsksForProject(db, projectId),
     };
   });
 }

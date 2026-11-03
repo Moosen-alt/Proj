@@ -76,8 +76,8 @@ export const PER_JOB_QUESTION_RULES: PerJobQuestionRule[] = [
     binding: null, why: "a meter collar / meter-mounted device is installed per job" },
   // Per-job in principle, but the operator has a STANDING answer for it ("Yes" — the standard
   // residential detail always places the lockable AC disconnect within the required distance).
-  // That standing answer lives as data in OPERATOR_POLICY_ANSWERS (intakeRequests.ts); it stays
-  // per-job HERE so a project that genuinely differs can still record its own answer and win.
+  // That standing answer lives as data in OPERATOR_POLICY_ANSWERS (below); it stays per-job HERE
+  // so a project that genuinely differs can still record its own answer and win.
   { id: "per-job:disconnect-10ft", re: DISCONNECT_DISTANCE_QUESTION,
     binding: "disconnectWithin10ft",
     why: "disconnect placement is a site fact — settled for this operator by a standing policy answer, overridable per project" },
@@ -91,6 +91,45 @@ export const PER_JOB_ANSWER_KEYS = ["ownershipModel", "systemConfiguration", "di
 export type PerJobAnswerKey = typeof PER_JOB_ANSWER_KEYS[number];
 export function isPerJobAnswerKey(key: unknown): key is PerJobAnswerKey {
   return (PER_JOB_ANSWER_KEYS as readonly string[]).includes(String(key ?? ""));
+}
+
+// ---------------------------------------------------------------------------
+// OPERATOR POLICY ANSWERS — a standing answer for a per-job binding, KEYED BY THE BINDING.
+//
+// "Is your disconnect within 10 feet of the PGE utility meter?" was reaching the
+// homeowner's intake form on every PGE job. It is per-job in PRINCIPLE, but this
+// operator has a standing call on it: the standard residential detail places the
+// lockable AC disconnect within the required distance on every install. The
+// learn-time pass already applies exactly that answer (POLICY_RADIO_DEFAULTS in
+// portal-bot/src/adapters/autoLearnAdapter.ts), so the two halves of the system
+// held opposite beliefs about the same question and the client paid for it.
+//
+// THIS IS DATA, NOT A RULE. The operator will one day have a job where the
+// answer is No, and this table is deliberately the LOWEST-ranked answer source:
+// the intake (backend intakeRequests projectAnswer) consults the parser snapshot,
+// the project record, and the v17 per-job column FIRST, and the replay's answer to
+// a required control its recipe never recorded (portal-bot unrecordedControls) takes
+// the job's own answer first — anything recorded for a specific project still wins.
+// Adding/removing a policy answer is a one-line data edit here, with its reason.
+//
+// ONE TABLE, READ BY THE KEY (PR #353 round 2). It lived in backend/intakeRequests.ts,
+// out of portal-bot's reach, and the replay re-derived the standing answer by matching
+// the question's WORDING against the learner's regexes: four wordings the per-job rule
+// reads as the distance question ("Is the AC disconnect within ten feet of the utility
+// meter?") matched no regex there, and the run stopped mid-wizard instead of filing the
+// standing "Yes". Whoever has the per-job KEY (perJobAnswerKeyFor) asks this table by it.
+const OPERATOR_POLICY_ANSWERS: Readonly<Record<string, { answer: string; why: string }>> = Object.freeze({
+  disconnectWithin10ft: {
+    answer: "Yes",
+    why: "standard residential detail places the lockable AC disconnect within the required distance on every install — the operator's standing answer, and the same one autoLearnAdapter's POLICY_RADIO_DEFAULTS files at learn time",
+  },
+});
+
+/** The operator's standing answer for a binding, or "" when there is none. Own keys only — a key
+ *  named like an Object.prototype member ("constructor") has no standing answer. */
+export function operatorPolicyAnswer(key: string): string {
+  const k = String(key ?? "");
+  return Object.prototype.hasOwnProperty.call(OPERATOR_POLICY_ANSWERS, k) ? OPERATOR_POLICY_ANSWERS[k].answer : "";
 }
 
 /** How an answer to each person-answered key is worded (separators and case ignored). A recorded

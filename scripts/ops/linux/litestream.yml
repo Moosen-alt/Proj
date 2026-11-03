@@ -1,0 +1,22 @@
+# Litestream on the Linux server's HOST (keelix-litestream.service), reading the database through
+# the bind-mounted state folder. The repo-root litestream.yml is the in-container variant.
+# Settings from /etc/keelix/litestream.env: LITESTREAM_BUCKET, LITESTREAM_ENDPOINT (an R2 or B2
+# S3 endpoint), LITESTREAM_ACCESS_KEY_ID, LITESTREAM_SECRET_ACCESS_KEY. No ${VAR:-default}
+# forms: Litestream expands plain $VAR / ${VAR} only.
+#
+# Restore (to a scratch file first, never over the live database while the app runs):
+#   sudo -u '#1000' env $(cat /etc/keelix/litestream.env | xargs) \
+#     litestream restore -config /opt/keelix/scripts/ops/linux/litestream.yml \
+#     -o /srv/keelix/restore-test.sqlite /srv/keelix/backend-data/autopilot.sqlite
+dbs:
+  - path: /srv/keelix/backend-data/autopilot.sqlite
+    replicas:
+      - type: s3
+        bucket: ${LITESTREAM_BUCKET}
+        path: keelix/autopilot
+        endpoint: ${LITESTREAM_ENDPOINT}
+        region: auto
+        access-key-id: ${LITESTREAM_ACCESS_KEY_ID}
+        secret-access-key: ${LITESTREAM_SECRET_ACCESS_KEY}
+        snapshot-interval: 6h
+        retention: 168h

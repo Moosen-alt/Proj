@@ -25,9 +25,18 @@
    execution policy, `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
    Portal RECORDING (visible browser) always runs on a local machine like
    this — use the "Record this portal" button's generated command/.bat.
+   A server started in a console window (`cmd /k npm start`, `start.bat`)
+   turns QuickEdit off for that window at boot, so a click or text selection
+   in it can no longer freeze the server (#360). No launcher change is needed;
+   `AUTOPILOT_KEEP_QUICKEDIT=1` keeps QuickEdit on. Edit → Mark and Ctrl+S
+   (scroll lock) still pause console output until Esc is pressed.
 
 
 ## Deploy (one VM, ~$20–40/mo: Hetzner / DigitalOcean / Lightsail; 4GB+ RAM)
+
+> **The team's hosted server** (Docker behind Cloudflare Tunnel and Access, with backup timers and
+> image deploys) follows [OPERATIONS_LINUX.md](OPERATIONS_LINUX.md). The bare-VM steps below (Caddy,
+> a systemd unit running Node directly) remain an alternative.
 
 ```bash
 git clone <repo> && cd SOLAR-Proj && npm install
@@ -38,13 +47,15 @@ Create `/etc/solar-autopilot.env` (chmod 600):
 ```
 AUTH_ENABLED=true
 SERVER_HOST=0.0.0.0                     # listen beyond loopback ON PURPOSE (the default is 127.0.0.1)
+SERVER_IS_SHARED=1                      # dashboard hides/relabels controls that read the SERVER'S disk (#439); detected anyway with the two lines above
 ADMIN_EMAIL=you@company.com
 ADMIN_PASSWORD=<strong password>        # first login; change after
 ANTHROPIC_API_KEY=sk-ant-...
 SESSION_ENCRYPTION_KEY=<openssl rand -hex 32>   # portal credentials at rest — LOSING THIS LOSES STORED LOGINS
 ALLOWED_ORIGINS=https://autopilot.yourco.com     # lock CORS to your domain
-AUTOPILOT_DB_PATH=/var/lib/solar/autopilot.db   # persistent disk
+AUTOPILOT_STATE_DIR=/var/lib/solar            # persistent disk: database, documents, backups, portal logins, draft ledger, runs, logs
 PORTAL_HEADLESS=true
+DOCUMENT_FETCH_BROWSER=0                # no headed-browser fallback for walled documents: a server has no display
 PUBLIC_BASE_URL=https://autopilot.yourco.com   # client-facing links in emails; NEVER leave the localhost default in production
 PORT=4000
 ```
@@ -63,6 +74,14 @@ WantedBy=multi-user.target
 HTTPS front door (Caddy — automatic certificates):
 `caddy reverse-proxy --from autopilot.yourco.com --to localhost:4000`
 
+One state root: `AUTOPILOT_STATE_DIR` puts every piece of state under one folder
+(`backend/src/statePaths.ts`): `autopilot.sqlite`, `project-documents/`, `backups/`,
+`portal-profiles/` (the live portal logins), `portal-drafts.jsonl` (the draft ledger),
+`learn-runs/`, `replay-runs/`, `screenshots/`, `portal-debug/` and `logs/`. Back up and move that
+one folder. Do not also set `AUTOPILOT_DB_PATH`, `PROJECT_DOCS_DIR` or `PORTAL_PROFILES_DIR`: each
+still wins over the root and splits the state again. In Docker the image already sets it to the
+mounted volume, `/app/backend/data` (DEPLOY.md §3).
+
 Rules: ONE instance only (SQLite). Updates: `git pull && npm install
 && npm run smoke && systemctl restart solar` — migrations self-apply.
 Confirm the restart took: the banner / `curl localhost:4000/health` → `build.label`
@@ -77,6 +96,15 @@ another machine (a load balancer, Fly's proxy, a published Docker port) must
 connect directly. With `AUTH_ENABLED` off and a non-loopback `SERVER_HOST`, the
 server refuses to start and says why; `ALLOW_UNAUTHENTICATED_NETWORK=1` overrides
 that, and then every customer's data is open to the network without a login.
+
+Outbound document fetches (#391): blank forms and fee schedules are downloaded
+server-side, and the form-fill tool (`/api/tools/form-fill/*`, reachable with an
+org API key) fetches URLs its caller chose. Every such fetch refuses private,
+loopback and link-local addresses (cloud metadata included) on the URL and on
+every redirect hop. Those tool routes never open the headed-browser fallback;
+`DOCUMENT_FETCH_BROWSER=0` turns it off for every caller and belongs on any
+server. Leave `DOCUMENT_FETCH_ALLOW_ORIGINS` unset: it exists for the test
+suites' local stub servers.
 
 ### Backups — two halves, and you need both
 
@@ -97,7 +125,9 @@ snapshot does both:
 
 `litestream.yml` replicates **only the SQLite file** — continuous DB replication,
 not files. So the off-box copy still matters: nightly `restic`/`rclone` of the
-whole data dir (or at minimum `backups/`) to S3/R2. Restore = `litestream restore`
+whole `AUTOPILOT_STATE_DIR` (or at minimum `backups/`) to S3/R2. The backup, the
+restore drill (`scripts/ops/restore-drill.ts`), preflight and the watchdog read the
+same resolver as the server, so they find the database and folders under it. Restore = `litestream restore`
 (or the newest snapshot) **plus** the document tree; do the files first, so the
 restored rows point at something.
 
@@ -107,11 +137,27 @@ Env: `BACKUP_DIR`, `BACKUP_KEEP` (snapshots, default 14), `BACKUP_INTERVAL_HOURS
 ## Employee logins
 
 - Log in as admin (ADMIN_EMAIL/PASSWORD) at the dashboard → session cookie.
-- Create login-capable workers with the org users API:
-  `POST /api/orgs/:id/users {"email","name","password"}` (your own org's id is
-  `org-default`). NOTE: the plain `POST /api/users` route and the dashboard
-  Users panel create directory entries only — they take no password and cannot
-  produce a login. Passwords hashed; API keys sha256 + shown once.
+- Give teammates logins from the dashboard: **Team** → **Add**, fill name and
+  email, type a **Sign-in password** (10+ characters; Operator or Admin), Save.
+  Tell them the password privately. For someone already on the team without a
+  login, select them and use **Set password** in the **Sign-in** section; the
+  same section resets a password and switches a login off (they are signed out
+  on their next click) or back on. Everyone changes their own password under
+  **Change my password** (asks for the current one). Admins only, your own org
+  only, every action in the audit log with who did it. With sign-in off these
+  sections say so and do nothing.
+  API behind it: `GET/POST /api/staff/logins`,
+  `POST /api/staff/logins/:id/password {"password"}`,
+  `POST /api/staff/logins/:id/active {"active"}`,
+  `POST /api/auth/password {"currentPassword","newPassword"}`.
+  The older `POST /api/orgs/:id/users {"email","name","password"}` still works.
+  Passwords hashed; API keys sha256 + shown once.
+- Sessions are signed cookies that last up to AUTH_SESSION_HOURS, and each one
+  ends early, on every device, when that person's password is changed or reset
+  or their login is switched off. A self-change keeps the device it was made on
+  signed in. Anyone can also press **Sign out everywhere** (Team → Change my
+  password section, `POST /api/auth/logout-everywhere`) to end every session
+  they have, this one included: the lost-laptop button.
 - Assign projects per user (`projects.assigned_user_id`, dashboard selector).
 - `/api/auth/login` / `/api/auth/logout`; everything else 401s without a
   session or `x-api-key`.
@@ -133,6 +179,27 @@ The human "record this portal" capture runs on an operator's LOCAL machine
 (needs a visible browser) and talks to the server API — set the server URL in
 the record command the dashboard generates. Learning/staging runs headless on
 the server itself.
+
+With sign-in on (`AUTH_ENABLED=true`) the recorder needs the person's own
+**recorder token** (#433):
+
+1. In the dashboard: **Team → Recorder tokens → Make a recorder token**. It is
+   shown once (the server keeps only a hash), lasts 30 days by default (at most
+   90), and can be revoked there. Switching a person's login off stops their
+   tokens too.
+2. On the recording computer, put it in `RECORDER_TOKEN` before running the
+   command (`set RECORDER_TOKEN=…` on Windows, `export RECORDER_TOKEN=…`
+   elsewhere). The downloaded `record-portal.bat` asks for it. `--token` works
+   too, but the shell history keeps it.
+3. Behind Cloudflare Access, also set `CF_ACCESS_CLIENT_ID` and
+   `CF_ACCESS_CLIENT_SECRET` to an Access **service token** (or
+   `--cf-access-client-id` / `--cf-access-client-secret`).
+
+A recorder token reaches only the recorder's four endpoints (start a recording,
+read the recording project's field values, suggest bindings, save the steps),
+as its person: audit rows name them. It can never stage, approve or submit a
+filing, administer anything, or mint another token. With sign-in off nothing
+changes and no token is needed.
 
 ## Stripe — collecting client payments (per-submission billing)
 

@@ -131,7 +131,9 @@ await check("v50 creates both tables and all four indexes (and the pass table ha
   assert.deepEqual(names, ["idx_info_page_cand_project", "idx_info_page_pass_origin", "portal_info_page_candidates", "portal_info_page_passes", "ux_info_page_cand_live", "ux_info_page_pass_identity"]);
   const cols = db.query<{ name: string }>("PRAGMA table_info(portal_info_page_passes)").map((r) => r.name);
   assert.ok(!cols.some((c) => /withdrawn/.test(c)), JSON.stringify(cols));
-  assert.equal(Number(db.get<{ v: number }>("SELECT MAX(version) AS v FROM schema_meta")!.v), 50);
+  // v50 is recorded as run. A later migration (v51, #440) may sit above it, as the replay check below already allows.
+  assert.ok(db.get("SELECT version FROM schema_meta WHERE version = 50"), "schema_meta has no v50 row");
+  assert.equal(Number(db.get<{ v: number }>("SELECT MAX(version) AS v FROM schema_meta")!.v) >= 50, true);
 });
 await check("listing on a fresh DB writes nothing (reads write nothing)", () => {
   const before = Number(db.get<{ n: number }>("SELECT total_changes() AS n")!.n);

@@ -5,6 +5,8 @@
   <link rel="icon" type="image/png" href="/assets/brand/keel-symbol-64.png" />
   <link rel="apple-touch-icon" href="/assets/brand/keel-symbol-180.png" />
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="copyright" content="Copyright (c) 2026 Keelix. All rights reserved. Proprietary and confidential." />
+  <meta name="keelix-provenance" content="kx-fcd3ffd4aa792bbd" />
   <!-- The token is in the URL, so keep this page out of indexes and out of Referer headers.
        status.html and intake.html now carry both too. -->
   <meta name="robots" content="noindex, nofollow">
@@ -156,6 +158,26 @@
 
     /* The updates strip sits on the quiet surface at the foot of the card — the
        same move the site's mock card makes with its tinted "Recommended action" box. */
+    /* THE JOB'S TIMELINE (#497): filed → issued / approved → installed → final → PTO. A dot per
+       step on a rail: filled for done, ringed for the step the job is on now (a permit and an
+       interconnection run side by side, so two can be ringed), hollow for what is still ahead. */
+    .steps { list-style: none; margin: 0; padding: 4px 0 2px; }
+    .step { position: relative; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 16px; padding: 9px 0 9px 26px; font-size: 13px; }
+    .step::before { content: ""; position: absolute; left: 3px; top: 14px; width: 10px; height: 10px; border-radius: 999px; border: 2px solid var(--line); background: var(--surface); }
+    .step::after { content: ""; position: absolute; left: 8px; top: 28px; bottom: -14px; width: 2px; background: var(--line); }
+    .step:last-child::after { display: none; }
+    .step.done::before { background: var(--primary); border-color: var(--primary); }
+    .step.done::after { background: color-mix(in oklab, var(--primary) 45%, var(--line)); }
+    .step.current::before { border-color: var(--primary); box-shadow: 0 0 0 4px color-mix(in oklab, var(--primary) 18%, transparent); }
+    .step .what { flex: 1 1 220px; min-width: 0; }
+    .step .name { font-weight: 600; letter-spacing: -.005em; }
+    .step.current .name { color: var(--primary); }
+    .step.upcoming .name { color: var(--muted); font-weight: 500; }
+    .step .note { font-size: 12px; color: var(--muted); font-weight: 500; }
+    .step .when { white-space: nowrap; font-size: 12px; font-weight: 500; color: var(--muted); }
+    .step.current .when { color: var(--primary); font-weight: 700; }
+    .timeline { border-top: 1px solid var(--line); padding: 4px 18px 8px; }
+    .timeline .head { font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); padding: 13px 0 2px; }
     .updates { background: var(--surface-2); border-top: 1px solid var(--line); padding: 4px 18px 14px; }
     .updates .head { font-size: 11px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); padding: 13px 0 2px; }
     .upd { padding: 9px 0 0; font-size: 13px; line-height: 1.55; }
@@ -204,6 +226,30 @@
     // told a client their approved permit had not been filed.
     const BEFORE_FILING = new Set(["pending", "parsed", "qc_failed", "qc_passed", "ready_to_stage", "awaiting_human_submit", "blocked"]);
     const cls = (key) => NEEDS_YOU.has(key) ? "you" : DONE.has(key) ? "good" : WARN.has(key) ? "warn" : "";
+
+    // THE TIMELINE (#497). Every value is escaped, the numbers included: the payload is built from
+    // fixed templates server-side (backend/src/clientTimeline.ts), and this page still trusts none
+    // of it. The state is matched against the three known values, never interpolated.
+    const STEP_STATE = { done: "done", current: "current", upcoming: "upcoming" };
+    const days = (n) => `${esc(n)} day${Number(n) === 1 ? "" : "s"}`;
+    const stepNote = (s) => [
+      s.detail ? esc(s.detail) : "",
+      s.state === "done" && s.tookDays != null ? `took ${days(s.tookDays)}` : "",
+      s.state === "current" && s.daysSoFar != null ? `${days(s.daysSoFar)} so far` : "",
+      s.state === "current" && s.typicalDays != null ? `usually about ${days(s.typicalDays)}` : "",
+    ].filter(Boolean).join(" · ");
+    const stepWhen = (s) => s.state === "done" ? (s.at ? esc(when(s.at)) : "Done") : s.state === "current" ? "Now" : "";
+    const timelineHtml = (timeline) => {
+      const steps = (timeline && timeline.steps) || [];
+      if (!steps.length) return "";
+      return `<ol class="steps">${steps.map((s) => {
+        const note = stepNote(s);
+        return `<li class="step ${STEP_STATE[s.state] || "upcoming"}">
+            <div class="what"><div class="name">${esc(s.label)}</div>${note ? `<div class="note">${note}</div>` : ""}</div>
+            <span class="when">${stepWhen(s)}</span>
+          </li>`;
+      }).join("")}</ol>`;
+    };
 
     async function load() {
       const app = document.getElementById("app");
@@ -267,6 +313,7 @@
           // The latest few updates, in the words we actually sent them. Same sentences as the
           // email for the same event — one source, two channels (backend/src/clientUpdates.ts).
           // Capped so a long-running job does not bury the current status under its own history.
+          const timeline = timelineHtml(p.timeline);
           const updates = (p.updates || []).slice(0, 4).map((u) => `
             <div class="upd"><span class="when">${when(u.at)}</span>${esc(u.body)}</div>`).join("");
           return `
@@ -280,6 +327,7 @@
                 <span class="badge ${cls(p.statusKey)}">${esc(p.status)}</span>
               </div>
               <div class="card-body">${tracks}</div>
+              ${timeline ? `<div class="timeline"><div class="head">Timeline</div>${timeline}</div>` : ""}
               ${updates ? `<div class="updates"><div class="head">Latest updates</div>${updates}</div>` : ""}
             </div>`;
         }).join("");

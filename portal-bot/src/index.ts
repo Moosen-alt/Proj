@@ -11,8 +11,10 @@ import { decryptStorageState } from "./cryptoStorage";
 import { resolveHeadless } from "./browser";
 import { HUMAN_REVIEW_MESSAGE } from "./adapter";
 import { clearReviewOpen, markReviewOpen } from "./reviewSession";
+import { leaveDialogsToPerson } from "./personDialogs";
 import { draftReferenceFromUrl } from "./adapters/submissionLedger";
 import { readDraftCreated, type DraftCreatedRead } from "./draftCreated";
+import type { SubmitRecordRead } from "./adapters/submissionLedger";
 import { draftTenantKey } from "./draftSubmitGate";
 import { HUMAN_SUBMIT_OBSERVED_NOTE } from "./humanCapture";
 
@@ -287,6 +289,10 @@ interface StageOptions {
     source: string;
     reason: string;
     recordLink: string;
+    /** UNSURE READS (#400): numbers seen after the submit — an unconfident completion-page read,
+     *  or the new rows when several appeared in the account's list — for a person to confirm.
+     *  Never written as fact. Present only on a low-confidence capture. */
+    candidates?: Array<{ recordNumber: string; recordLink: string; source: string }>;
     /** The click only CREATED A DRAFT (#302): nothing was filed, recordNumber is "", and the
      *  caller records the draft for the next stage to continue — never a submission. */
     draftCreated?: DraftCreatedObserved;
@@ -331,7 +337,7 @@ const openStagingAdapters = new Map<string, import("./adapter").PortalAdapter>()
  * every downstream check keys on it. The read carries its own confidence and the caller
  * decides; an unconfident read leaves the operator's manual form exactly as it is today.
  */
-async function armSubmitCapture(
+export async function armSubmitCapture(
   adapter: import("./adapter").PortalAdapter,
   options: StageOptions,
 ): Promise<void> {
@@ -355,6 +361,21 @@ async function armSubmitCapture(
               recordNumber: "", confidence: "low", source: "draft_created", reason: capture.message,
               recordLink: String(data.recordLink ?? ""),
               draftCreated: { ...draft, clickedLabel: String(clickedLabel ?? ""), tenantKey: String(data.draftTenantKey ?? "") },
+            });
+            return;
+          }
+          // THE ADAPTER'S OWN JUDGEMENT, when it gives one (#400, RecipeAdapter: submissionLedger
+          // chooseSubmittedRecord): its confidence, its best link, and the unsure candidates. Every
+          // other adapter keeps the reading below.
+          const chosen = data.recordRead as SubmitRecordRead | undefined;
+          if (chosen && typeof chosen === "object" && typeof chosen.confidence === "string") {
+            options.onSubmitCaptured?.({
+              recordNumber: chosen.confidence === "high" ? String(chosen.recordNumber ?? "") : "",
+              confidence: chosen.confidence === "high" ? "high" : "low",
+              source: String(chosen.source ?? "none"),
+              reason: String(chosen.reason || capture.message),
+              recordLink: String(chosen.recordLink ?? ""),
+              ...(chosen.confidence !== "high" && chosen.candidates?.length ? { candidates: chosen.candidates } : {}),
             });
             return;
           }
@@ -390,6 +411,11 @@ export function trackOpenAdapter(userDataDir: string, adapter: import("./adapter
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const page = (adapter as any).page;
+    // #381 — THE WINDOW IS THE PERSON'S NOW: a native dialog on it (a Submit's confirm()) waits for
+    // their answer instead of being dismissed by Playwright. Automation never answers one. (A replay
+    // that handed its review page over did this at the hand-over already; this covers every other
+    // window left open — a refused hand-over, a hand-coded adapter, a paused run, the learner.)
+    leaveDialogsToPerson(page);
     const ctx = page && typeof page.context === "function" ? page.context() : null;
     if (ctx && typeof ctx.on === "function") {
       ctx.on("close", () => {
@@ -705,6 +731,8 @@ export async function stageWithRecipe(
     owedAttachments: options.owedAttachments,
     siteDraft: options.siteDraft,
     draftSubmitStamp: options.draftSubmitStamp ?? null,
+    // The review page is handed to a person only when this caller watches for their submit (#333).
+    handOverReview: typeof options.onSubmitCaptured === "function",
   }), project, files, options));
 }
 
@@ -1021,7 +1049,11 @@ export async function learnPortal(input: {
 export async function checkStatusWithAdapter(
   adapterType: "accela" | "powerclerk" | "recipe",
   applicationNumbers: string[],
-  options: StageOptions & { recipe?: PortalRecipe; fieldValues?: Record<string, string>; docsByType?: Record<string, string>; onReason?: (reason: string) => void },
+  options: StageOptions & {
+    recipe?: PortalRecipe; fieldValues?: Record<string, string>; docsByType?: Record<string, string>; onReason?: (reason: string) => void;
+    /** The found filing's own record link (#413), reported only beside a status that was read. */
+    onRecordLink?: (link: string) => void;
+  },
 ): Promise<string | null> {
   let tmpStatePath: string | undefined;
   let adapter: import("./adapter").PortalAdapter | null = null;
@@ -1050,6 +1082,8 @@ export async function checkStatusWithAdapter(
 
     const text = await adapter.checkStatus(applicationNumbers);
     if (!text) report(adapter.lastStatusReason || "the portal page held no status for this application");
+    const recordLink = text ? String(adapter.lastStatusRecordLink || "") : "";
+    if (recordLink) { try { options.onRecordLink?.(recordLink); } catch { /* reporting never breaks a check */ } }
     return text;
   } catch (err) {
     report(`the status read failed: ${err instanceof Error ? err.message.slice(0, 200) : String(err)}`);

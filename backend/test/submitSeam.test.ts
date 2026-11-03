@@ -465,11 +465,15 @@ check("1k. and the approve button stays available (a later track still needs it)
     "GATE_ANSWER_TTL_MS", "gateStampFor", "boardStepFor", "compactGateAnswer", "rememberGateAnswer", "BOARD_WHO_SHORT", "boardWhoHtml",
     "STATUS_LABELS", "statusLabel", "PRE_STAGE_STATUSES", "statusBoxView", "renderStatusBox",
     "NON_QC_REVIEW_FIELDS", "ADVISORY_REVIEW_ISSUE_TYPES", "reviewItemBuckets", "reopenResultMessage", "showSubmitBlockerNote",
+    // The rail's Approve & auto-submit holds where the track card holds it (#423); applyAutopilotState calls these.
+    "APPROVE_HELD_BY_STAGED_DRAFT", "RAIL_APPROVE_TITLE", "RAIL_APPROVE_NO_TRACK", "railApproveHold",
     "applyAutopilotState", "startAutopilot", "fmtDate", "boardReviewCountChip", "boardCardHtml",
     "resetAutopilotRail", "AUTOPILOT_LOAD_FAILED_TEXT", "refreshAutopilot", "selectProject",
     "permitTargetKindLabel", "portalSaysFor", "renderPermitMonitor", "TRACK_STATE_WORDS", "trackStateWords", "kbConfidenceBadge",
     "permitTargetOptionLabel", "renderPermitStatusTargetPicker", "permitStatusTargetId", "recordPermitStatus", "handleStaleRecheckClick",
     "syncPermitForm",
+    // The per-card Edit / Record status (#411) that renderPermitMonitor now draws each card with.
+    "PERMIT_STATUS_PICKS", "issuedDocumentsHtml", "permitTargetCardHtml",
     "plural", "statusBadge", "briefClass", "submitGateClass", "bandHead", "gateEvidenceSplit", "renderSubmitGate",
   ];
   const code = NAMES.map(lift).join("\n\n");
@@ -522,6 +526,16 @@ check("1k. and the approve button stays available (a later track still needs it)
     /2 · Build &amp; Validate/.test(b1.innerHTML) && !/Stage 3/.test(b1.innerHTML) && !/3 · Submit/.test(b1.innerHTML), b1.innerHTML.slice(0, 160));
   check("10b3. MUST EXCLUDE: headline and why are esc()'d into innerHTML", !/<b>|<img/.test(b1.innerHTML) && /&lt;img/.test(b1.innerHTML));
   check("10b4. it says who acts, and links the why to its panel", /Who acts: <strong>You<\/strong>/.test(b1.innerHTML) && /data-fix-target="portalRuns"/.test(b1.innerHTML));
+  // #400: unsure record numbers read after a person's submit are offered for one-click confirmation,
+  // every value esc()'d (a portal's own text is untrusted), never a link that is not http(s).
+  const bCand = renderWith({ selectedProjectId: "p-build", detail: { project: buildProject, stageIndex: 1, portalRuns: [] }, nextStepProjectId: "p-build", projects: [],
+    nextStep: { ...serverAnswer, recordCandidates: [
+      { runId: "r1", track: "building", recordNumber: "PC-<img src=x onerror=alert(1)>", recordLink: "https://grid.example.test/rec?ProjectId=1&x=\"><script>", source: "account_list" },
+      { runId: "r1", track: "building", recordNumber: "PC-0042200", recordLink: "", source: "account_list" },
+    ] } });
+  check("10b4b. #400: each record candidate renders with its own confirm button, esc()'d",
+    (bCand.innerHTML.match(/data-confirm-record="/g) || []).length === 2 && !/<img|<script/.test(bCand.innerHTML) && /PC-&lt;img/.test(bCand.innerHTML)
+      && (bCand.innerHTML.match(/open ↗/g) || []).length === 1, bCand.innerHTML.slice(0, 400));
   // The old status-table path (server answer unavailable) must ALSO use the real stage.
   const b2 = renderWith({ selectedProjectId: "p-build", detail: { project: buildProject, stageIndex: 1, portalRuns: [{ status: "failed", permitType: "building", startedAt: "2026-09-21" }] }, nextStep: null, projects: [] });
   check("10b5. fallback banner (no server answer) still names the real stage and keeps its qualifier",
@@ -628,7 +642,7 @@ check("1k. and the approve button stays available (a later track still needs it)
   const offText = (apEls.autopilotOffReasons.kids as Array<{ textContent: string }>).map((k) => k.textContent).join(" | ");
   check("10h. canStage:false switches Stage portals OFF", apEls.startAutopilotBtn.disabled === true);
   check("10h2. ...and says why as visible text (not only a tooltip)", apEls.autopilotOffReasons.hidden === false && /already staged or filed/.test(offText), offText);
-  check("10h3. Approve & Submit's disabled reason is visible text too", /Approve & Submit is off: Nothing is staged/.test(offText), offText);
+  check("10h3. Approve & auto-submit's disabled reason is visible text too", /Approve & auto-submit is off: Nothing is staged/.test(offText), offText);
   apLib.applyAutopilotState({ projectId: "p1", phase: "idle", canApprove: false, canStage: true, stageDisabledReason: null, blockers: [] });
   check("10h4. MUST PASS: canStage:true switches it back ON", apEls.startAutopilotBtn.disabled === false);
   apLib.applyAutopilotState({ projectId: "p-other", phase: "idle", canApprove: true, canStage: false, blockers: [] });
@@ -810,6 +824,21 @@ check("1k. and the approve button stays available (a later track still needs it)
     await pl5.recordPermitStatus("public_url", "t2");
     check("10l9. MUST PASS: an explicit target id (stale-panel fetch) is posted as given",
       (posted as Record<string, unknown> | null)?.targetId === "t2");
+    // 10l9b — A RE-CHECK THAT READ NOTHING (#412): the server records nothing and says so in
+    // `unreadable`. The newest row is then the OLD one, so "Permit check classified: Issued" would
+    // tell the operator a read that found nothing came back Issued.
+    {
+      const said: Array<[string, string]> = [];
+      const unreadable = "The portal gave no readable status (the public page held no readable status) — nothing recorded. The filing keeps its last known status: Issued.";
+      const apiUnread = async () => ({ permitCheckTargets: [t1, t2], permitStatusChecks: [{ statusLabel: "Issued" }], unreadable });
+      const stU: Record<string, unknown> = { selectedProjectId: "p1", recheckTargetId: null, detail: { permitCheckTargets: [t1, t2] } };
+      const plU = load(pickEls(), stU, { api: apiUnread, ...loaders, showMessage: (m: string, k = "info") => { said.push([m, k]); } });
+      await plU.recordPermitStatus("public_url", "t1");
+      check("10l9b. a re-check the server did not record shows ITS sentence as a warning, never the old row's label",
+        said.length === 1 && said[0][0] === unreadable && said[0][1] === "warning", JSON.stringify(said));
+      check("10l9c. ...and the answer is not kept on state.detail (it is the call's, not the project's)",
+        !("unreadable" in (stU.detail as Record<string, unknown>)) && Array.isArray((stU.detail as Record<string, unknown>).permitCheckTargets));
+    }
     // The stale panel's "Paste a fresh status" (no portal URL) promises the paste is recorded
     // against ITS filing. The selector wins at POST time, so the panel must move the selector —
     // else the operator's paste goes to whatever the selector happened to show.

@@ -212,7 +212,12 @@ await check("C2", "KILL (real path): a staged NEM draft is approvable over a str
   assert.equal(s.canApprove, true, `refused: ${s.approveDisabledReason}`);
   const step = computeNextStep(db, pid);
   assert.equal(step.key, "staged_awaiting_submit", step.headline);
-  assert.equal(step.button?.id, "approveSubmitBtn", "the next step hides Approve");
+  // #423/#435: on a staged NEM draft the one Approve action is HELD (finish the draft by hand), so no
+  // button is offered on any NEM draft. The next step still does NOT refuse it over the structural
+  // finding: the hold's why is written only when no reviewer blocker holds the draft's track
+  // (approveRefused false) — a structural finding scoped onto the NEM draft drops that line.
+  assert.equal(step.button, null, "a held Approve & auto-submit offered on a staged NEM draft");
+  assert.ok(step.why.some((w) => /Approve & auto-submit is held/.test(w.text)), `the next step refused the NEM draft over the structural finding: ${JSON.stringify(step.why)}`);
   let err: unknown = null;
   try { await runAutopilotApproval(db, pid, { approverName: "Test Approver", track: "nem" }); } catch (e) { err = e; }
   assert.ok(!(err instanceof HttpError && /reviewer gate still has blockers/.test(err.message)), `approval route refused: ${err instanceof Error ? err.message : err}`);

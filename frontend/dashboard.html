@@ -3,6 +3,8 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="copyright" content="Copyright (c) 2026 Keelix. All rights reserved. Proprietary and confidential." />
+  <meta name="keelix-provenance" content="kx-fcd3ffd4aa792bbd" />
   <title>Keelix · Solar Submission Autopilot</title>
   <!-- Manrope now arrives from @font-face in styles.css, served out of
        frontend/vendor alongside lucide below — same convention, same reason.
@@ -439,7 +441,8 @@
           <div class="actions autopilot-actions">
             <span class="actions-label">Autopilot:</span>
             <button id="startAutopilotBtn" class="primary"><i data-lucide="rocket"></i><span>Stage portals · Autopilot</span></button>
-            <button id="approveSubmitBtn" class="primary" disabled><i data-lucide="check-circle-2"></i><span>Approve &amp; Submit</span></button>
+            <!-- #423: the SAME action as the track card's Approve & auto-submit (one door, one meaning). -->
+            <button id="approveSubmitBtn" class="primary" disabled><i data-lucide="check-check"></i><span>Approve &amp; auto-submit</span></button>
             <span id="autopilotStatus" class="badge">idle</span>
             <!-- The badge's reason, as TEXT. It used to exist only as the Approve
                  button's tooltip, so "Blocked" said nothing about why. Written by
@@ -449,9 +452,15 @@
                  this line says so, so "off with no reason" never reads as a verdict. Written by
                  refreshAutopilot via textContent; cleared when a state arrives. -->
             <p id="autopilotLoadFailed" class="autopilot-reason" role="status" hidden></p>
-            <!-- Why Stage portals / Approve & Submit are switched off, as TEXT (the server's
+            <!-- Why Stage portals / Approve & auto-submit are switched off, as TEXT (the server's
                  stageDisabledReason / approveDisabledReason, written via textContent). -->
             <ul id="autopilotOffReasons" class="autopilot-off" hidden></ul>
+          </div>
+          <!-- #491: the installer handoff packet. The server emails it when the job reaches handoff_ready;
+               this sends it (again) by hand. Shown only on a handed-off project (renderHandoffPacket). -->
+          <div id="handoffActions" class="actions" hidden>
+            <span class="actions-label">Closeout:</span>
+            <button id="sendHandoffPacketBtn" type="button" class="secondary"><i data-lucide="send"></i><span>Send handoff packet</span></button>
           </div>
           <div id="submitBlockerNote" class="submit-blocker-note" hidden></div>
           <div id="reviewMismatchBanner" style="display:none;margin:6px 0 2px;padding:8px 12px;background:#fff3cd;border:1px solid #ffc107;border-radius:6px;font-size:12px;color:#664d03">
@@ -533,6 +542,8 @@
                     <option value="ground_footing">Ground-mount footing / racking detail</option>
                     <option value="trench_detail">Trench / burial-depth detail</option>
                     <option value="zoning_approval">Zoning / land-use approval</option>
+                    <option value="issued_permit">Issued permit / permit card</option>
+                    <option value="utility_approval">Utility approval / PTO letter</option>
                     <option value="module_spec">Module spec</option>
                     <option value="inverter_spec">Inverter spec</option>
                     <option value="battery_spec">Battery / ESS spec</option>
@@ -721,9 +732,10 @@
                 </label>
               </div>
               <div class="record-launch">
-                <button id="launchRecordBtn" class="primary"><i data-lucide="play"></i><span>Launch record session</span></button>
+                <!-- #439: opens a terminal on the SERVER — hidden when the server is shared (body.server-shared). -->
+                <button id="launchRecordBtn" class="primary local-disk-only"><i data-lucide="play"></i><span>Launch record session</span></button>
                 <div class="record-alt">
-                  <span class="muted">No launcher here?</span>
+                  <span class="muted local-disk-only">No launcher here?</span>
                   <button id="downloadRecordBatBtn" class="secondary ghost"><i data-lucide="download"></i><span>Download record.bat</span></button>
                   <button id="copyRecordCmdBtn" class="secondary ghost"><i data-lucide="clipboard-copy"></i><span>Copy command</span></button>
                 </div>
@@ -732,6 +744,8 @@
                 <button id="autoLearnBtn" class="secondary" title="The bot logs in with this client's stored credential, fills the form from the project data up to the review screen, records a reusable recipe, and verifies the fill. It NEVER clicks final submit — you authorize that with one click on the track card."><i data-lucide="sparkles"></i><span>Auto-learn this portal (AI)</span></button>
                 <span class="muted" style="font-size:12px">No recording needed — the bot fills it to the review screen and verifies. Final submit always stays your one-click approval.</span>
               </div>
+              <!-- #439: shown only on a shared server; dashboard.js fills it (server URL + recorder token). -->
+              <div id="recordSharedNote" class="shared-server-note"></div>
               <div id="autoLearnStatus" style="display:none;margin:6px 0;font-size:13px"></div>
               <div id="launchRecordStatus" style="display:none;margin:6px 0;font-size:13px"></div>
               <details class="kb-accordion" style="margin-top:6px">
@@ -825,6 +839,7 @@
               </details>
               <details class="kb-accordion" style="margin-top:4px">
                 <summary class="kb-summary"><span>Record command (advanced)</span></summary>
+                <div id="recordCmdSharedNote" class="shared-server-note"></div>
                 <pre id="recordCmdPreview" class="record-cmd"></pre>
               </details>
                 </div>
@@ -1023,7 +1038,8 @@
           </div>
           <div class="progress-track"><div id="mboxProgressBar" class="progress-bar"></div></div>
         </div>
-        <div class="mbox-path-form">
+        <!-- #439: Import Path reads a file on the SERVER — hidden when the server is shared. -->
+        <div class="mbox-path-form local-disk-only">
           <input id="mboxPath" placeholder="Optional local MBOX path if browser upload fails" />
           <button id="importMboxPathBtn" class="secondary"><i data-lucide="folder-input"></i><span>Import Path</span></button>
         </div>
@@ -1032,7 +1048,14 @@
           <button id="saveEmailWatchBtn" class="secondary"><i data-lucide="mail-check"></i><span>Watch</span></button>
           <button id="runEmailTrackerBtn" class="secondary"><i data-lucide="radio-tower"></i><span>Scan Email</span></button>
         </div>
+        <div id="emailWatchSharedNote" class="shared-server-note">Watch and Scan Email read an MBOX file on the server, not on your computer. To import mail from your computer, drop the .mbox file above.</div>
         <div id="emailTrackerStatus" class="email-tracker-status muted">No email watch source configured.</div>
+        <!-- #489: jobs emailed to intake+<client tag>@… — the ones waiting on a person, and the latest placed. -->
+        <div id="emailIntakePanel" hidden>
+          <div class="section-head subhead" style="margin-top:8px"><h2>Emailed jobs</h2></div>
+          <div id="emailIntakeAddress" class="muted" style="font-size:12px"></div>
+          <div id="emailIntakeList" class="stack"></div>
+        </div>
 
         <!-- Batch PDF import -->
         <div class="section-head subhead" style="margin-top:8px">
@@ -1054,6 +1077,7 @@
           </label>
           <button id="startBatchScanBtn" class="primary"><i data-lucide="folder-search"></i><span>Scan Folder</span></button>
         </div>
+        <div id="batchFolderSharedNote" class="shared-server-note">Scan Folder reads a folder on the server, not on your computer. To learn from PDFs on your computer, drop a .zip of them above.</div>
         <div id="batchScanStatus" class="muted" style="font-size:13px;padding:6px 0"></div>
         <div id="batchScanResults" hidden></div>
 
@@ -1312,6 +1336,23 @@
             </label>
             <label>Service fee per submission ($)<input id="c_serviceFeeUsd" type="number" min="0" step="0.01" placeholder="blank = env default" /></label>
           </div>
+          <label>Intake &amp; portal-login links
+            <select id="c_requestLinksAutoSend">
+              <option value="">Email them to the client automatically when a job waits on them</option>
+              <option value="off">Off: staff send them by hand</option>
+            </select>
+          </label>
+          <!-- #491: the installer handoff packet, emailed when a job is permit-issued + NEM-approved. -->
+          <label>Installer handoff packet
+            <select id="c_handoffAutoSend">
+              <option value="">Email it to the client automatically when the job is approved</option>
+              <option value="off">Off: staff send it by hand</option>
+            </select>
+          </label>
+          <div class="form-row">
+            <label>Email-in intake tag<input id="c_intakeTag" placeholder="e.g. acme, for intake+acme@…" autocomplete="off" /></label>
+            <label>Other senders allowed to email jobs<input id="c_intakeSenders" placeholder="pm@acme.com, @acme.com" autocomplete="off" /></label>
+          </div>
 
           <h3>Licensing</h3>
           <div class="form-row">
@@ -1444,7 +1485,11 @@
         <h2 id="usersModalTitle">Team Members</h2>
         <button id="closeUsersBtn" class="secondary"><i data-lucide="x"></i><span>Close</span></button>
       </div>
-      <div class="modal-body split-modal-body">
+      <!-- Two columns: the member LIST, and the selected member's editor. The editor pane holds the
+           member form AND the sign-in sections (#431), wrapped in ONE element so .modal-body's
+           two-column grid never gets a third child (the Clients modal's old layout bug). The
+           sign-in sections stay OUTSIDE #userForm so Enter in a password box never saves the member. -->
+      <div class="modal-body split-modal-body users-modal-body">
         <div class="clients-list-pane">
           <div class="section-head">
             <h3>Operators</h3>
@@ -1452,6 +1497,7 @@
           </div>
           <div id="usersList" class="stack compact"></div>
         </div>
+        <div class="users-editor-pane">
         <form id="userForm" class="clients-form-pane stack">
           <input type="hidden" id="userId" />
           <div id="userFormStatus" class="message" hidden></div>
@@ -1467,10 +1513,64 @@
             <label>Color<input id="u_color" type="color" value="#6366f1" /></label>
           </div>
           <p id="u_roleHint" class="muted field-hint" hidden>New members start as Operator; promote them after saving.</p>
+          <label id="u_passwordWrap" hidden>Sign-in password (optional)<input id="u_password" type="password" autocomplete="new-password" minlength="10" /></label>
+          <p id="u_passwordHint" class="muted field-hint" hidden>Give a password of 10 or more characters to create their sign-in now. Tell it to them privately; they can change it under Change my password.</p>
           <div class="actions">
             <button type="submit" class="primary"><i data-lucide="save"></i><span>Save</span></button>
           </div>
         </form>
+        <section id="staffSignIn" class="users-signin" aria-labelledby="staffSignInTitle">
+          <h3 id="staffSignInTitle">Sign-in</h3>
+          <p id="staffSignInState" class="muted"></p>
+          <div id="staffSignInControls" class="stack" hidden>
+            <label>New password<input id="sl_password" type="password" autocomplete="new-password" minlength="10" /></label>
+            <div class="actions">
+              <button type="button" id="sl_setPasswordBtn" class="secondary"><i data-lucide="key-round"></i><span>Set password</span></button>
+              <button type="button" id="sl_toggleActiveBtn" class="secondary" hidden><span>Deactivate login</span></button>
+            </div>
+          </div>
+          <p id="staffSignInStatus" class="muted" role="status"></p>
+        </section>
+        <section id="myPasswordPane" class="users-signin" aria-labelledby="myPasswordTitle">
+          <h3 id="myPasswordTitle">Change my password</h3>
+          <p id="myPasswordState" class="muted"></p>
+          <div id="myPasswordControls" class="stack" hidden>
+            <label>Current password<input id="mp_current" type="password" autocomplete="current-password" /></label>
+            <div class="form-row">
+              <label>New password<input id="mp_new" type="password" autocomplete="new-password" minlength="10" /></label>
+              <label>Repeat new password<input id="mp_repeat" type="password" autocomplete="new-password" minlength="10" /></label>
+            </div>
+            <div class="actions">
+              <button type="button" id="mp_saveBtn" class="secondary"><i data-lucide="lock"></i><span>Change my password</span></button>
+            </div>
+            <p class="muted field-hint">Lost a laptop, or signed in on a shared computer? Sign out everywhere ends every session you have open, on every device, this one included. Recorder tokens are separate: revoke those below.</p>
+            <div class="actions">
+              <button type="button" id="mp_signOutEverywhereBtn" class="secondary"><i data-lucide="log-out"></i><span>Sign out everywhere</span></button>
+            </div>
+          </div>
+          <p id="myPasswordStatus" class="muted" role="status"></p>
+        </section>
+        <!-- #433: per-person token for the portal recorder CLI on a shared server with sign-in on. -->
+        <section id="recorderTokensPane" class="users-signin" aria-labelledby="recorderTokensTitle">
+          <h3 id="recorderTokensTitle">Recorder tokens</h3>
+          <p id="recorderTokensState" class="muted"></p>
+          <div id="recorderTokensControls" class="stack" hidden>
+            <div class="form-row">
+              <label>Name (which computer)<input id="rt_name" type="text" maxlength="60" placeholder="e.g. my laptop" autocomplete="off" /></label>
+              <label>Expires after (days)<input id="rt_days" type="number" min="1" max="90" value="30" /></label>
+            </div>
+            <div class="actions">
+              <button type="button" id="rt_mintBtn" class="secondary"><i data-lucide="key-round"></i><span>Make a recorder token</span></button>
+            </div>
+            <div id="rt_newTokenWrap" class="stack" hidden>
+              <label>Your new token (shown only once: copy it now)<input id="rt_newToken" type="text" readonly autocomplete="off" spellcheck="false" /></label>
+              <p class="muted field-hint">On your computer, set it as RECORDER_TOKEN before you run the record command (Windows: <code>set RECORDER_TOKEN=&lt;token&gt;</code>; Mac/Linux: <code>export RECORDER_TOKEN=&lt;token&gt;</code>). The downloaded record.bat asks for it. Keep it private: it records portals as you.</p>
+            </div>
+            <ul id="rt_list" class="stack compact"></ul>
+          </div>
+          <p id="recorderTokensStatus" class="muted" role="status"></p>
+        </section>
+        </div>
       </div>
     </div>
   </div>
@@ -1509,6 +1609,8 @@
 
   <!-- Classic script before the module: the KPI panel's filing rows (window.KpiFilings, #74). -->
   <script src="/kpi-filings.js"></script>
+  <!-- The KPI panel's fee accuracy section, quoted vs paid per jurisdiction (window.FeeAccuracy, #494). -->
+  <script src="/fee-accuracy.js"></script>
   <script src="/corrections-filing.js"></script>
   <script src="/correction-notice.js"></script>
   <!-- The pending edition proposals on a code-profile KB card (window.EditionProposals, #172). -->

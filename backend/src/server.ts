@@ -6,12 +6,14 @@ import express, { type NextFunction, type Request, type Response } from "express
 import cors from "cors";
 import fs from "node:fs";
 import path from "node:path";
+import { applyStateDirEnvDefaults, dbPath as stateDbPath, learnRunsDir, portalProfilesDir } from "./statePaths";
 import { openDatabase } from "./db";
 import { HttpError } from "./httpError";
 import { llmUsageForProject, runWithLlmContext } from "./llmAccounting";
 import { parseJson } from "./json";
 import { collectDiagnostics, logErrorBlock, logger, requestLogger, startupBanner } from "./logger";
 import { buildInfo, publicBuildInfo, versionString } from "./buildInfo";
+import { COPYRIGHT_NOTICE, PROVENANCE_ID } from "../../shared/src/provenance";
 import { checkConcurrencyConfig, readConcurrencyConfig } from "./concurrencyConfig";
 import { deleteKnowledgeProfile, findLearnedProfileForProject, retractCorrectionLearning, saveVerifiedAhjProfile, saveVerifiedUtilityProfile } from "./knowledgeBase";
 import {
@@ -53,16 +55,20 @@ import { createUser, getUserWorkload, listUsers, updateUser, assignProjectToUser
 import { listBackups, runBackup, startBackupScheduler } from "./backup";
 import { startArtifactRetention } from "./artifactRetention";
 import { startMonitorScheduler } from "./scheduler";
+import { startStaffDigestScheduler } from "./staffAlerts";
 import { startAhjFormRefreshScheduler, startKbLinkCheckScheduler } from "./ahjFormRefresh";
 import { startCecSyncScheduler, primeCecCache, syncCecEquipment } from "./cecEquipment";
 import { extractZipToWorkdir } from "./batchZip";
-import { AUTH_ENABLED, currentUser, login, logout, me, requireAuth, seedAdminUser, entitlementGate, requestOrg, createApiKey, ADMIN_ROLES, ROLE_SUPERADMIN } from "./auth";
+import { AUTH_ENABLED, currentUser, login, logout, me, requireAuth, seedAdminUser, setUserPassword, entitlementGate, requestOrg, createApiKey, ADMIN_ROLES, ROLE_SUPERADMIN, bumpSessionVersion, clearSessionCookie, issueSessionCookie, type SessionUser } from "./auth";
+import { changeOwnPassword, createStaffLogin, listStaffLogins, resetStaffPassword, setStaffLoginActive } from "./staffLogins";
+import { listRecorderTokens, mintRecorderToken, recorderPrincipal, revokeRecorderToken } from "./recorderTokens";
 import { PRODUCTS, PRODUCT_KEYS, grantProduct, revokeProduct, orgEntitlements, productsForEdition } from "./entitlements";
 import { requestScope, orgFilter, orgClause, reqOrgFilter, assertInScope, auditCrossOrgAccess } from "./scope";
 import { folderScanPayload } from "./batchZip";
 import type { RequestScope } from "./scope";
 import { DEFAULT_ORG_ID } from "./db";
 import { ensureStatusShareToken, statusShareUrl } from "./clientNotifier";
+import { sendInstallerHandoff } from "./installerHandoff";
 import { listCodeProfiles, listRowlessDesignLookups, getCodeProfile, saveResearchedCodeProfile, saveVerifiedCodeProfile, codeProfileKey, applyEditionProposal, dismissEditionProposal } from "./codeProfiles";
 import { applyCorrectionApproval } from "./correctionAgent";
 import { runStandaloneReview, getReviewSubmission, listReviewSubmissions, reviewSubjectToProject } from "./reviewSubject";
@@ -82,6 +88,7 @@ import {
   updateCustomer,
 } from "./crm";
 import { clientPortalPayload, clientPortalUrl, ensureClientPortalToken, publicProjectStatusPayload, trackLabel } from "./clientPortal";
+import { buildClientTimeline, clearProjectMilestone, projectMilestones, recordProjectMilestone } from "./clientTimeline";
 import { scanStaleStatusClassifications } from "./permitMonitor";
 import { getKpiReport, requestNoticedAt } from "./kpi";
 import {
@@ -115,6 +122,7 @@ import {
   captureConfirmation,
   markCorrectionResubmitted,
   createPermitCheckTarget,
+  updatePermitCheckTarget,
   createProject,
   updateProject,
   setProjectStatusByOperator,
@@ -161,12 +169,24 @@ import {
 import { createSignatureRequestApproval } from "./signatureRequestApproval";
 import { confirmSignatureRequestSent } from "./signatureTrack";
 import { getSubmittalTracks, markTrackSubmitted } from "./submittalTracks";
+import { buildApprovalSheet } from "./approvalSheet";
 import { projectForTrack } from "./permitProcess";
 import { ahjProcessKnowledgeStatus, AHJ_PROCESS_REFERENCE_ENV } from "./processProfiles";
 import { enqueueStageSteps } from "./autoStageSteps";
 import type { ClientResolution, EditionProposalDecisionResult, ParserExtractionResponse, SubmittalTrackType } from "../../shared/src/types";
 import { FINAL_SUBMIT_GATE_SENTENCE } from "../../shared/src/portalSafety";
 import { resolveListenHost } from "./listenHost";
+import { disableConsoleQuickEdit } from "./consoleQuickEdit";
+
+// First thing, before the first log line: a click in this window must never freeze the
+// server (#360). Runs only when stdout is a real Windows console; see consoleQuickEdit.ts.
+{
+  const quickEdit = disableConsoleQuickEdit();
+  if (!quickEdit.skipped) {
+    if (quickEdit.ok) logger.info("console", "QuickEdit off for this window: a click or selection here no longer blocks the server", { mode: `${quickEdit.before?.toString(16)}->${quickEdit.after?.toString(16)}` });
+    else logger.warn("console", `Could not turn QuickEdit off for this window (${quickEdit.error}); a click inside it can still freeze the server until Esc is pressed`);
+  }
+}
 
 const app = express();
 
@@ -237,7 +257,10 @@ logger.info("build", `Running ${BUILD.label}`, {
   version: BUILD.version, sha: BUILD.sha, commitDate: BUILD.commitDate, dirty: BUILD.dirty,
   pinned: BUILD.pinned, source: BUILD.source, codeRoot: BUILD.codeRoot,
 });
-const dbPath = path.resolve(process.cwd(), process.env.AUTOPILOT_DB_PATH || "backend/data/autopilot.sqlite");
+// Ownership notice (#545): proprietary Keelix code; the provenance id is fixed, see shared/src/provenance.ts.
+logger.info("build", COPYRIGHT_NOTICE, { provenance: PROVENANCE_ID });
+const dbPath = stateDbPath();
+applyStateDirEnvDefaults(); // replay output under AUTOPILOT_STATE_DIR too (statePaths.ts)
 
 const asyncHandler =
   (handler: (req: Request, res: Response, next: NextFunction) => Promise<unknown>) =>
@@ -504,11 +527,23 @@ app.post("/api/projects", (req, res) => {
 });
 
 app.put("/api/projects/:id", (req, res) => {
-  const payload = req.body?.parserPayload ?? req.body?.payload ?? req.body;
-  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+  const rawPayload = req.body?.parserPayload ?? req.body?.payload ?? req.body;
+  if (!rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload)) {
     throw new HttpError(400, "Project payload must be an object.");
   }
-  const updated = updateProject(db, String(req.params.id), payload);
+  // THE VERSION THE EDITOR LOADED (#440). Top-level on the body, never a project field: when the
+  // body IS the payload it is lifted out so it never lands in the parser snapshot. The dashboard
+  // always sends it; the parser and API keys don't, and their saves stay unconditional.
+  const { expectedVersion: rawExpected, ...payload } = rawPayload as Record<string, unknown>;
+  const expectedSource = rawPayload === req.body ? rawExpected : req.body?.expectedVersion;
+  let expectedVersion: number | undefined;
+  if (expectedSource !== undefined && expectedSource !== null) {
+    expectedVersion = Number(expectedSource);
+    if (!Number.isInteger(expectedVersion) || expectedVersion < 0) {
+      throw new HttpError(400, "expectedVersion must be the project's editVersion (a whole number).", { field: "expectedVersion" });
+    }
+  }
+  const updated = updateProject(db, String(req.params.id), payload, { expectedVersion });
   // A re-save from the parser is the repair door for a qc_failed project — the operator fixed
   // the intake, so the chain gets a fresh start. Guarded inside: only statuses the chain owns
   // (parsed/qc_passed/ready_to_stage) do anything; a submitted project no-ops.
@@ -653,6 +688,30 @@ app.post("/api/ahj-forms/inspect", asyncHandler(async (req, res) => {
 app.post("/api/projects/:id/filled-forms", asyncHandler(async (req, res) => {
   const detail = getProjectDetail(db, String(req.params.id));
   res.json(await buildFilledFormsForProject(db, detail.project));
+}));
+
+// "VERIFY FILL WITH VISION" on a filled-form card (issue #428): read the filled PDF back page by
+// page and table each value against the printed label it sits under. Opt-in (the operator's
+// click), one vision call per page with a value, reports only — never corrects (rule 4). The
+// prompt carries printed labels, never values; a page printing a secret field is not sent (rule 2).
+app.post("/api/projects/:id/filled-forms/:formId/verify-vision", asyncHandler(async (req, res) => {
+  const projectId = String(req.params.id);
+  getProjectDetail(db, projectId); // 404 for a project out of scope
+  const formId = String(req.params.formId);
+  const file = filledFormPath(projectId, formId);
+  if (!fs.existsSync(file)) throw new HttpError(404, "Filled form not found. Build it first.");
+  const filled = new Uint8Array(fs.readFileSync(file));
+  const { intendedFromAcroForm, intendedFromOverlay, verifyFilledForm } = await import("./formFillVision");
+  let intended = await intendedFromAcroForm(filled);
+  if (!intended.length) {
+    // An overlay fill: what it drew is what the filled page prints and its blank does not.
+    const row = db.get<{ pdf_blob?: Uint8Array | null }>("SELECT pdf_blob FROM ahj_form_templates WHERE id = ?", [formId.replace(/^tmpl-/, "")]);
+    if (row?.pdf_blob) intended = await intendedFromOverlay(new Uint8Array(row.pdf_blob), filled);
+  }
+  if (!intended.length) throw new HttpError(422, "Nothing to verify: no filled values could be read from this form.");
+  const { createLLMProvider } = await import("./llm");
+  try { res.json(await verifyFilledForm(createLLMProvider(), filled, intended)); }
+  catch (err) { throw normalizeLlmError(err); }
 }));
 
 app.get("/api/projects/:id/filled-forms/:formId", (req, res) => {
@@ -1152,12 +1211,12 @@ app.post("/api/orgs/:id/users", (req, res) => {
   if (!email || !password) throw new HttpError(400, "email and password are required.");
   if (db.get("SELECT id FROM users WHERE email = ?", [email])) throw new HttpError(409, "A user with that email already exists.");
   const userId = crypto.randomUUID();
-  const salt = crypto.randomBytes(16);
-  const hash = crypto.scryptSync(password, salt, 64);
   db.run(
-    "INSERT INTO users (id, name, email, role, color, active, created_at, password_hash, org_id) VALUES (?, ?, ?, 'operator', '#0ea5e9', 1, ?, ?, ?)",
-    [userId, name, email, new Date().toISOString(), `${salt.toString("hex")}:${hash.toString("hex")}`, orgId],
+    "INSERT INTO users (id, name, email, role, color, active, created_at, org_id) VALUES (?, ?, ?, 'operator', '#0ea5e9', 1, ?, ?)",
+    [userId, name, email, new Date().toISOString(), orgId],
   );
+  // The one hash writer (auth.ts). This route used to inline its own copy of the scrypt format.
+  setUserPassword(db, userId, password);
   addAuditLog(db, null, "human", currentUser(db, req)?.email || "operator", "org.user_created", { orgId, email });
   res.status(201).json({ user: { id: userId, name, email, orgId } });
 });
@@ -1169,6 +1228,100 @@ app.post("/api/orgs/:id/api-keys", (req, res) => {
   const created = createApiKey(db, orgId, String(req.body?.name || "api key"));
   addAuditLog(db, null, "human", currentUser(db, req)?.email || "operator", "org.api_key_created", { orgId, keyId: created.id });
   res.status(201).json({ id: created.id, key: created.key, note: "Store this key now — it is shown only once." });
+});
+
+// ---------------------------------------------------------------------------
+// Staff logins (issue #431): the dashboard's Team panel makes, resets and switches off
+// teammates' sign-ins. Admin-gated (requireAdmin) and scoped to the ADMIN'S OWN ORG inside
+// staffLogins.ts: another org's user id is a 404, never a 403 (rule 6), and nobody
+// administers across orgs (owner ruling 2026-10-10). With sign-in off there is nothing to
+// manage, so these say so (409 auth_disabled) instead of quietly writing passwords nobody uses.
+// ---------------------------------------------------------------------------
+const SIGN_IN_OFF = "Sign-in is off on this server (AUTH_ENABLED is not true), so logins and passwords are not used here.";
+
+function requireStaffAdmin(req: Request): SessionUser {
+  if (!AUTH_ENABLED) throw new HttpError(409, SIGN_IN_OFF, { code: "auth_disabled" });
+  requireAdmin(req);
+  const actor = currentUser(db, req);
+  if (!actor) throw new HttpError(401, "Not authenticated.");
+  return actor;
+}
+
+app.get("/api/staff/logins", (req, res) => {
+  if (!AUTH_ENABLED) { res.json({ authEnabled: false, logins: [] }); return; }
+  const actor = requireStaffAdmin(req);
+  res.json({ authEnabled: true, logins: listStaffLogins(db, actor) });
+});
+
+app.post("/api/staff/logins", (req, res) => {
+  const actor = requireStaffAdmin(req);
+  res.status(201).json({ login: createStaffLogin(db, actor, req.body || {}) });
+});
+
+app.post("/api/staff/logins/:id/password", (req, res) => {
+  const actor = requireStaffAdmin(req);
+  res.json({ login: resetStaffPassword(db, actor, String(req.params.id), req.body?.password) });
+});
+
+app.post("/api/staff/logins/:id/active", (req, res) => {
+  const actor = requireStaffAdmin(req);
+  if (typeof req.body?.active !== "boolean") throw new HttpError(400, "active must be true or false.");
+  res.json({ login: setStaffLoginActive(db, actor, String(req.params.id), req.body.active) });
+});
+
+// Self-service password change. It sits under /api/auth/, which the sign-in gate lets through
+// (the login route lives there), so THIS HANDLER is the gate: no session, no change.
+app.post("/api/auth/password", (req, res) => {
+  if (!AUTH_ENABLED) throw new HttpError(409, SIGN_IN_OFF, { code: "auth_disabled" });
+  const user = currentUser(db, req);
+  if (!user) throw new HttpError(401, "Not authenticated.");
+  changeOwnPassword(db, user, req.body?.currentPassword, req.body?.newPassword);
+  // The new password ended every session this user had (setUserPassword bumps the session
+  // version, #432), this one included; hand THIS device a fresh cookie so only the others drop.
+  issueSessionCookie(db, req, res, user.id);
+  res.json({ ok: true });
+});
+
+// "Sign out everywhere" (#432): ends every session this user has open, on every device, this one
+// included (a lost laptop, a cookie copied off a shared machine). Under /api/auth/ like the route
+// above, so THIS HANDLER is the gate: no session, nothing to end.
+app.post("/api/auth/logout-everywhere", (req, res) => {
+  if (!AUTH_ENABLED) throw new HttpError(409, SIGN_IN_OFF, { code: "auth_disabled" });
+  const user = currentUser(db, req);
+  if (!user) throw new HttpError(401, "Not authenticated.");
+  bumpSessionVersion(db, user.id);
+  addAuditLog(db, null, "human", user.email, "user.signed_out_everywhere", { userId: user.id });
+  clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+// Recorder tokens (#433): a signed-in person mints, lists and revokes their OWN tokens for the
+// portal recorder CLI (recorderTokens.ts). Under /api/auth/, which the sign-in gate lets through,
+// so THESE HANDLERS are the gate: a session cookie or nothing. A recorder token never authenticates
+// these (requireAuth attaches a token's person only on the recorder's four routes), so a token can
+// never mint another token or outlive its own revocation by re-minting.
+function requireRecorderTokenOwner(req: Request): SessionUser {
+  if (!AUTH_ENABLED) throw new HttpError(409, `${SIGN_IN_OFF} The recorder needs no token here.`, { code: "auth_disabled" });
+  const user = currentUser(db, req);
+  if (!user || recorderPrincipal(req)) throw new HttpError(401, "Not authenticated.");
+  return user;
+}
+
+app.get("/api/auth/recorder-tokens", (req, res) => {
+  if (!AUTH_ENABLED) { res.json({ authEnabled: false, tokens: [] }); return; }
+  const user = requireRecorderTokenOwner(req);
+  res.json({ authEnabled: true, tokens: listRecorderTokens(db, user) });
+});
+
+app.post("/api/auth/recorder-tokens", (req, res) => {
+  const user = requireRecorderTokenOwner(req);
+  const minted = mintRecorderToken(db, user, { name: req.body?.name, days: req.body?.days });
+  res.status(201).json({ token: minted.token, recorderToken: minted.info, note: "Copy this token now. It is shown only once." });
+});
+
+app.delete("/api/auth/recorder-tokens/:id", (req, res) => {
+  const user = requireRecorderTokenOwner(req);
+  res.json({ recorderToken: revokeRecorderToken(db, user, String(req.params.id)) });
 });
 
 // Shareable read-only report link (e.g. the AHJ forwards a pre-review to an applicant).
@@ -1287,6 +1440,26 @@ app.delete("/api/knowledge-base/:profileKey", (req, res) => {
   });
   res.json({ deleted: true, profileKey, removed });
 });
+
+// EMAIL-IN INTAKE (#489): jobs emailed to intake+<client tag>@… that are waiting on a person, and
+// the latest ones placed. Each row carries the org of its client (else of the polling source), so
+// the list reads through reqOrgFilter and a row outside the caller's org is a 404.
+app.get("/api/email-intake", asyncHandler(async (req, res) => {
+  const { listEmailIntake } = await import("./emailIntake");
+  res.json(listEmailIntake(db, reqOrgFilter(db, req)));
+}));
+app.get("/api/email-intake/:id/files/:index", asyncHandler(async (req, res) => {
+  const { emailIntakeFile } = await import("./emailIntake");
+  const file = emailIntakeFile(db, String(req.params.id), Number(req.params.index), reqOrgFilter(db, req));
+  // Whatever an unknown sender attached is served as a download, never rendered in the page.
+  res.setHeader("Content-Type", "application/octet-stream");
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.download(file.path, file.filename);
+}));
+app.post("/api/email-intake/:id/dismiss", asyncHandler(async (req, res) => {
+  const { dismissEmailIntake } = await import("./emailIntake");
+  res.json(dismissEmailIntake(db, String(req.params.id), reqOrgFilter(db, req), currentUser(db, req)?.email || "operator"));
+}));
 
 app.get("/api/email-tracker", (req, res) => {
   res.json(getEmailTrackerStatus(db, reqOrgFilter(db, req)));
@@ -1436,6 +1609,17 @@ app.get("/api/projects/:id/handoff-packet", (req, res) => {
   res.json(getProjectHandoffPacket(db, req.params.id));
 });
 
+// SEND THE INSTALLER HANDOFF PACKET (#491) — the operator's door: the first send when the client
+// sends by hand or the automatic one did not go, and every re-send. Under /api/projects/:id, so the
+// tenant scope guard covers it; the recipient is always the project's own client.
+app.post("/api/projects/:id/handoff-packet/send", asyncHandler(async (req, res) => {
+  const projectId = String(req.params.id);
+  const { project } = getProjectDetail(db, projectId); // 404 if missing
+  const result = await sendInstallerHandoff(db, project, { trigger: "manual", actor: currentUser(db, req)?.email || "operator" });
+  if (result.deliveryStatus === "skipped") throw new HttpError(result.refusedStatus ?? 409, result.detail);
+  res.json(result);
+}));
+
 app.get("/api/projects/:id/communication-drafts", (req, res) => {
   res.json(getProjectCommunicationDrafts(db, req.params.id));
 });
@@ -1476,6 +1660,29 @@ app.post("/api/projects/:id/ops-steps/:stepId", (req, res) => {
 
 app.post("/api/projects/:id/notes", (req, res) => {
   res.status(201).json(addProjectNote(db, req.params.id, req.body || {}));
+});
+
+// THE CLOSEOUT MILESTONES (#497): installed, final passed, PTO requested, PTO granted — recorded by
+// a person on the project page, read back with the client's timeline as the client sees it. Under
+// /api/projects/:id, so each inherits the project scope guard (rule 6: out-of-scope 404) and the
+// entitlement gate; no new top-level path. Recording a client-facing one sends the client update
+// once (clientTimeline.recordProjectMilestone); the route does not wait on the email.
+app.get("/api/projects/:id/milestones", (req, res) => {
+  const detail = getProjectDetail(db, String(req.params.id));
+  res.json({ milestones: projectMilestones(db, detail.project.id), timeline: buildClientTimeline(db, detail.project) });
+});
+
+app.post("/api/projects/:id/milestones", (req, res) => {
+  const { milestones } = recordProjectMilestone(db, String(req.params.id), {
+    milestone: String(req.body?.milestone ?? ""),
+    at: req.body?.at,
+    recordedBy: currentUser(db, req)?.email || "operator",
+  });
+  res.status(201).json({ milestones });
+});
+
+app.delete("/api/projects/:id/milestones/:milestone", (req, res) => {
+  res.json({ milestones: clearProjectMilestone(db, String(req.params.id), String(req.params.milestone), currentUser(db, req)?.email || "operator") });
 });
 
 app.post("/api/projects/:id/workflow", (req, res) => {
@@ -1695,6 +1902,22 @@ app.post("/api/projects/:id/permit-targets", (req, res) => {
   res.status(201).json(createPermitCheckTarget(db, req.params.id, req.body || {}));
 });
 
+// The tracked-filing card's Edit (#411). Under /api/projects/:id, so the project's org scope is the
+// mounted guard's; the target must belong to the project (updatePermitCheckTarget: else 404). Only
+// the named fields pass through — never a status (a status is a reading: POST .../permit-checks).
+app.patch("/api/projects/:id/permit-targets/:targetId", (req, res) => {
+  const body = req.body || {};
+  res.json(updatePermitCheckTarget(db, String(req.params.id), String(req.params.targetId), {
+    portalUrl: body.portalUrl,
+    trackingUrl: body.trackingUrl,
+    applicationNumber: body.applicationNumber,
+    permitNumber: body.permitNumber,
+    portalName: body.portalName,
+    checkFrequencyDays: body.checkFrequencyDays,
+    active: body.active,
+  }, currentUser(db, req)?.email || "operator"));
+});
+
 // Onboard a new AHJ with the LLM (easy "add a jurisdiction" workflow for new
 // hires): research requirements + portal + docs and save them to the KB.
 app.post("/api/knowledge-base/research-ahj", asyncHandler(async (req, res) => {
@@ -1804,24 +2027,36 @@ app.post("/api/portal-recipes/record", (req, res) => {
       url: String(b.portalUrl),
     });
   }
-  res.status(201).json(
-    startPortalRecording(db, {
-      scopeType,
-      state: b.state ? String(b.state) : undefined,
-      ahj: b.ahj ? String(b.ahj) : undefined,
-      utility: b.utility ? String(b.utility) : undefined,
-      portalPlatform: b.portalPlatform ? String(b.portalPlatform) : undefined,
-      portalUrl: b.portalUrl ? String(b.portalUrl) : undefined,
-      createdBy: b.createdBy ? String(b.createdBy) : undefined,
-    }),
-  );
+  // WHO RECORDED (#433): the signed-in person (a session, or the recorder token they minted) is
+  // the author; a body-supplied createdBy is only a fallback when nobody is signed in (sign-in off).
+  const user = currentUser(db, req);
+  const recipe = startPortalRecording(db, {
+    scopeType,
+    state: b.state ? String(b.state) : undefined,
+    ahj: b.ahj ? String(b.ahj) : undefined,
+    utility: b.utility ? String(b.utility) : undefined,
+    portalPlatform: b.portalPlatform ? String(b.portalPlatform) : undefined,
+    portalUrl: b.portalUrl ? String(b.portalUrl) : undefined,
+    createdBy: user ? (user.name || user.email) : b.createdBy ? String(b.createdBy) : undefined,
+  });
+  addAuditLog(db, null, "human", user?.email || "operator", "portal_recipe.recording_started", {
+    recipeId: recipe.id, profileKey: recipe.profileKey, via: recorderPrincipal(req) ? "recorder_token" : user ? "session" : "none", orgId: user?.orgId ?? null,
+  });
+  res.status(201).json(recipe);
 });
 app.put("/api/portal-recipes/:id/steps", (req, res) => {
   const steps = Array.isArray(req.body?.steps) ? req.body.steps : [];
-  res.json(savePortalRecipeSteps(db, String(req.params.id), steps, {
+  const saved = savePortalRecipeSteps(db, String(req.params.id), steps, {
     status: req.body?.status,
     notes: req.body?.notes ? String(req.body.notes) : undefined,
-  }));
+  });
+  // Audited with who saved them (#433): through the recorder CLI that is the token's person.
+  const user = currentUser(db, req);
+  addAuditLog(db, null, "human", user?.email || "operator", "portal_recipe.steps_saved", {
+    recipeId: saved.id, profileKey: saved.profileKey, steps: steps.length, status: saved.status,
+    via: recorderPrincipal(req) ? "recorder_token" : user ? "session" : "none", orgId: user?.orgId ?? null,
+  });
+  res.json(saved);
 });
 // Close the review browsers for one client + track. Fire-and-forget (a wedged Chromium
 // shutdown must never hang the operator's HTTP response), sanitized clientId (a raw
@@ -1830,7 +2065,7 @@ app.put("/api/portal-recipes/:id/steps", (req, res) => {
 function closeReviewBrowsers(clientId: string, scope: "utility" | "ahj"): void {
   const safeClientId = clientId.replace(/[^A-Za-z0-9_-]/g, "");
   if (!safeClientId || !db.get("SELECT id FROM clients WHERE id = ?", [safeClientId])) return;
-  const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  const profileBase = portalProfilesDir();
   void import("../../portal-bot/src/index")
     .then(({ closeStagingBrowsersForTrack }) => closeStagingBrowsersForTrack(path.join(profileBase, safeClientId), scope))
     .catch(() => { /* browser close is best-effort — it may already be closed */ });
@@ -2045,6 +2280,9 @@ app.post("/api/projects/:id/auto-learn", (req, res) => {
 app.post("/api/portal-recipes/:id/suggest-bindings", asyncHandler(async (req, res) => {
   const steps = Array.isArray(req.body?.steps) ? req.body.steps : [];
   const projectId = String(req.body?.projectId || "").trim();
+  // The project id arrives in the BODY, where no mounted scope guard reaches it. This route is one
+  // of the four a recorder token reaches (#433), so check it here: another org's project is a 404.
+  assertRefInScope(requestScope(db, req), "projects", projectId, "Project");
   let fieldValues: Record<string, string> = {};
   if (projectId) {
     try {
@@ -2113,7 +2351,10 @@ app.post("/api/projects/:id/permit-checks", asyncHandler(async (req, res) => {
   // 400 — passed through, a garbage value would silently become no date at all — and an accepted
   // one reaches the stamp in one shape (ISO), whatever form the caller wrote it in.
   const body = req.body || {};
-  res.status(201).json(await recordPermitStatusCheck(db, String(req.params.id), { ...body, noticedAt: requestNoticedAt(body.noticedAt) }));
+  // A check that read nothing on a target with a known status records nothing (shouldSkipEmptyRead,
+  // #412): 200, not 201, and `unreadable` carries the sentence the dashboard shows.
+  const result = await recordPermitStatusCheck(db, String(req.params.id), { ...body, noticedAt: requestNoticedAt(body.noticedAt) });
+  res.status(result.unreadable ? 200 : 201).json(result);
 }));
 
 // WHICH OF THIS PROJECT'S STORED READINGS TODAY'S RULES WOULD CHANGE — and how to get a real one.
@@ -2481,7 +2722,7 @@ app.post("/api/tools/form-fill/batch", express.json({ limit: "8mb" }), asyncHand
   const rows = Array.isArray(req.body?.rows) ? req.body.rows : [];
   if (!rows.length) throw new HttpError(400, "rows required.");
   if (rows.length > 200) throw new HttpError(400, "Max 200 rows per batch.");
-  const { fetchPdf } = await import("./ahjFormAuto");
+  const { fetchPdfOutcome, FORM_FILL_TOOL_FETCH } = await import("./ahjFormAuto");
   const { autoFillByFieldName, listAcroFields, overlayText, isPdf } = await import("./formFiller");
   const { extractLabels, hasTextLayer, autoPlaceFromData } = await import("./formTextLayer");
   const AdmZip = (await import("adm-zip")).default;
@@ -2505,7 +2746,7 @@ app.post("/api/tools/form-fill/batch", express.json({ limit: "8mb" }), asyncHand
   // common case: load one AHJ form at the top, then batch-fill many rows).
   const sharedB64 = String(req.body?.sharedPdfBase64 || "");
   const shared = sharedB64 ? new Uint8Array(Buffer.from(sharedB64, "base64")) : null;
-  const blankCache = new Map<string, Uint8Array | null>();
+  const blankCache = new Map<string, { bytes: Uint8Array | null; privateTarget?: string; reason?: string }>();
   const results: Array<{ index: number; ok: boolean; filename?: string; matched?: number; error?: string }> = [];
   const usedNames = new Set<string>();
   for (let i = 0; i < rows.length; i++) {
@@ -2515,8 +2756,11 @@ app.post("/api/tools/form-fill/batch", express.json({ limit: "8mb" }), asyncHand
     try {
       let blank: Uint8Array | null;
       if (/^https?:\/\//i.test(url)) {
-        const cached = blankCache.get(url);
-        if (cached === undefined) { blank = await fetchPdf(url); blankCache.set(url, blank); } else { blank = cached; }
+        let got = blankCache.get(url);
+        if (got === undefined) { got = await fetchPdfOutcome(url, FORM_FILL_TOOL_FETCH); blankCache.set(url, got); }
+        // A refused address is the row's answer, said plainly — not "did not return a PDF".
+        if (got.privateTarget) throw new Error(got.reason || "Refused: that URL points at a private address.");
+        blank = got.bytes;
       } else {
         blank = shared; // no per-row URL → use the loaded form
       }
@@ -2540,10 +2784,13 @@ app.post("/api/tools/form-fill/batch", express.json({ limit: "8mb" }), asyncHand
 app.post("/api/tools/form-fill/fetch", express.json({ limit: "1mb" }), asyncHandler(async (req, res) => {
   const url = String(req.body?.url || "").trim();
   if (!/^https?:\/\//i.test(url)) throw new HttpError(400, "A http(s) URL is required.");
-  const { fetchPdf } = await import("./ahjFormAuto");
-  const bytes = await fetchPdf(url);
-  if (!bytes) throw new HttpError(422, "Could not fetch a PDF from that URL (not reachable, or not a PDF).");
-  res.type("application/pdf").send(Buffer.from(bytes));
+  const { fetchPdfOutcome, FORM_FILL_TOOL_FETCH } = await import("./ahjFormAuto");
+  const got = await fetchPdfOutcome(url, FORM_FILL_TOOL_FETCH);
+  // A private/loopback/link-local target (or a redirect to one) is a bad request, not a fetch
+  // that failed: 400, and nothing was sent there (issue #391).
+  if (got.privateTarget) throw new HttpError(400, got.reason || "Refused: that URL points at a private address.");
+  if (!got.bytes) throw new HttpError(422, `Could not fetch a PDF from that URL${got.reason ? `: ${got.reason}` : " (not reachable, or not a PDF)."}`);
+  res.type("application/pdf").send(Buffer.from(got.bytes));
 }));
 
 // Look up an AHJ's form from its website (LLM web-search), then fetch the blank
@@ -2554,14 +2801,14 @@ app.post("/api/tools/form-fill/lookup", express.json({ limit: "1mb" }), asyncHan
   const formType = String(req.body?.formType || "").trim() || undefined;
   if (!ahj) throw new HttpError(400, "ahj is required.");
   const { createLLMProvider } = await import("./llm");
-  const { fetchPdf } = await import("./ahjFormAuto");
+  const { fetchPdf, FORM_FILL_TOOL_FETCH } = await import("./ahjFormAuto");
   let research;
   try { research = await createLLMProvider().findAhjFormUrl({ ahj, state, formType }); }
   catch (err) { throw normalizeLlmError(err); }
   if (research.provider === "stub") throw new HttpError(422, "Form lookup needs an LLM (set ANTHROPIC_API_KEY). Paste the form URL instead.");
   // Try candidate URLs best-first; return the first that yields a real PDF.
   for (const url of research.candidateUrls || []) {
-    const bytes = await fetchPdf(url);
+    const bytes = await fetchPdf(url, FORM_FILL_TOOL_FETCH);
     if (bytes) { res.json({ found: true, formName: research.formName, sourceUrl: url, pdfBase64: Buffer.from(bytes).toString("base64"), notes: research.notes }); return; }
   }
   // None were directly downloadable — hand back what we found so the operator can grab it.
@@ -2591,6 +2838,28 @@ app.post("/api/tools/form-fill/auto", express.json({ limit: "60mb" }), asyncHand
     return;
   }
   res.json({ mode: "manual", placements: [], message: "This form has no fillable fields or text layer — place values manually." });
+}));
+
+// "Verify fill with vision" for the standalone tool (issue #428): the filled PDF, plus — for a
+// flat form — the placements the auto-fill made ({page, label, text}); a fillable form's values
+// and printed captions are read off the PDF itself. Opt-in, one vision call per page with a
+// value, reports only (rule 4); labels only in the prompt and no page that prints a secret field
+// (rule 2). Stateless like every other /api/tools/form-fill route: nothing is stored.
+app.post("/api/tools/form-fill/verify", express.json({ limit: "60mb" }), asyncHandler(async (req, res) => {
+  const pdfBase64 = String(req.body?.pdfBase64 || "");
+  if (!pdfBase64) throw new HttpError(400, "pdfBase64 required.");
+  const bytes = new Uint8Array(Buffer.from(pdfBase64, "base64"));
+  const { isPdf } = await import("./formFiller");
+  if (!isPdf(bytes)) throw new HttpError(400, "pdfBase64 is not a PDF.");
+  const { intendedFromAcroForm, verifyFilledForm } = await import("./formFillVision");
+  const given = Array.isArray(req.body?.placements) ? req.body.placements as Array<Record<string, unknown>> : [];
+  const intended = given.length
+    ? given.slice(0, 400).map((p) => ({ page: Number(p.page) || 0, label: String(p.label ?? ""), value: String(p.text ?? p.value ?? "") })).filter((r) => r.value.trim())
+    : await intendedFromAcroForm(bytes);
+  if (!intended.length) throw new HttpError(422, "Nothing to verify: auto-fill the form first.");
+  const { createLLMProvider } = await import("./llm");
+  try { res.json(await verifyFilledForm(createLLMProvider(), bytes, intended)); }
+  catch (err) { throw normalizeLlmError(err); }
 }));
 
 app.post("/api/tools/form-fill/fill", express.json({ limit: "60mb" }), asyncHandler(async (req, res) => {
@@ -2785,38 +3054,13 @@ app.post("/api/parser/llm-extract", asyncHandler(async (req, res) => {
   const { createLLMProvider } = await import("./llm");
   const llm = createLLMProvider();
   try {
-    const result = await llm.extractProjectFields({ planText, utilityBillText, meterText, structuralLetterText, defaultState });
-    const { supplementStructuralIntake } = await import("./structuralIntake");
-    let extraction = supplementStructuralIntake(result, planText);
-    // The packet's own permit application / contract page (contract value, homeowner phone) and
-    // the racking callouts, read deterministically with their source page cited (#201).
-    const { supplementPacketApplication } = await import("./packetApplication");
-    extraction = supplementPacketApplication(extraction, planText);
-    // HYBRID PLAN SET: the parser page first posted the PDF to /api/parser/plan-scan-extract, which
-    // read the set's image-only pages (datasheets pasted in as pictures) by vision; that read rides
-    // back here and is merged UNDER this text read — the text wins every field it answered
-    // (scannedPlanSet.mergeImagePageRead validates the posted shape).
-    if (req.body?.planImageRead && typeof req.body.planImageRead === "object") {
-      const { mergeImagePageRead } = await import("./scannedPlanSet");
-      extraction = mergeImagePageRead(extraction, req.body.planImageRead);
-    }
-    // WHICH COMPANY IS THIS? The prompt has always read the title-block installer and
-    // always dropped it. Resolve it here, on the response the parser page already
-    // waits for, so the (still required) client picker can fill itself instead of
-    // asking the coordinator to pick blind. Tenancy-scoped with the same org filter
-    // every other read uses — suggesting another tenant's company would be exactly
-    // the cross-company error this feature exists to prevent. A resolution failure
-    // must never take down a parse that otherwise worked.
-    let clientResolution: ClientResolution | undefined;
-    try {
-      const { resolveClientForExtraction } = await import("./clientMatch");
-      clientResolution = resolveClientForExtraction(db, extraction.fields, reqOrgFilter(db, req), planText);
-    } catch (err) {
-      logger.warn("parser", "client resolution failed — parse returned without a client suggestion", {
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-    res.json({ ...extraction, clientResolution } satisfies ParserExtractionResponse);
+    // The supplements, the hybrid merge and the client suggestion live in parserExtraction.ts,
+    // shared with email-in intake (#489) so the two doors read a plan set the same way.
+    const { extractParserFields } = await import("./parserExtraction");
+    const extraction = await extractParserFields(db, llm, {
+      planText, utilityBillText, meterText, structuralLetterText, defaultState, planImageRead: req.body?.planImageRead,
+    }, reqOrgFilter(db, req));
+    res.json(extraction satisfies ParserExtractionResponse);
   } catch (err) {
     throw normalizeLlmError(err);
   }
@@ -2931,6 +3175,15 @@ app.post("/api/projects/:id/payment/record-fee", asyncHandler(async (req, res) =
     track: quote.track, permitFeeUsd: quote.permitFeeUsd,
   });
   res.json({ quote });
+}));
+
+// FEE ACCURACY (#494) — what we quoted at filing beside what was paid, per AHJ/utility and track,
+// flagging any jurisdiction whose quotes miss by more than ?thresholdPct (default 10, or
+// FEE_ACCURACY_THRESHOLD_PCT). A new top-level path, so it is tenant-scoped here (reqOrgFilter)
+// and declared in routeScope.test. Read-only: never writes "verified", never touches a schedule.
+app.get("/api/fee-accuracy", asyncHandler(async (req, res) => {
+  const { buildFeeAccuracyReport } = await import("./feeAccuracy");
+  res.json(buildFeeAccuracyReport(db, reqOrgFilter(db, req), { thresholdPct: req.query.thresholdPct }));
 }));
 
 // THE FEE SHEET — "what does this job cost, and where did that number come from?"
@@ -3197,7 +3450,7 @@ app.post("/api/projects/:id/prepare-submission", (req, res) => {
   // THE APPROVAL IS BOUND TO THIS REQUEST (trust skeptic M1): the job carries the flag AND the
   // approval's id only when this request minted one; a request that named nobody is enqueued as
   // an ordinary run (autoSubmit false) — it can never pick up an approval someone else minted.
-  let approval: { id: string } | null = null;
+  let approval: { id: string; approver: string } | null = null;
   if (autoSubmit || allowFinalSubmit) {
     const user = currentUser(db, req);
     if (AUTH_ENABLED && !user) throw new HttpError(401, "Sign in to approve a final submit.");
@@ -3278,7 +3531,13 @@ app.post("/api/projects/:id/prepare-submission", (req, res) => {
       logger.warn("prepare-submission", `staging error: ${reason}`, { projectId });
     });
   sseBroadcast({ type: "staging_started", projectId, message: "Staging started — preparing the portal application." });
-  res.status(202).json({ jobId: job.id, state: getAutopilotState(db, projectId) });
+  // SAY WHETHER AN APPROVAL WAS RECORDED (#422): with sign-in off a request that named nobody used
+  // to stage silently to review after the dashboard promised the click. The answer is this
+  // request's own: recorded only when THIS request minted an approval, with the name it carries.
+  const finalSubmitApproval = autoSubmit || allowFinalSubmit
+    ? { recorded: Boolean(approval), approver: approval ? approval.approver : null }
+    : undefined;
+  res.status(202).json({ jobId: job.id, state: getAutopilotState(db, projectId), ...(finalSubmitApproval ? { finalSubmitApproval } : {}) });
 });
 
 // AUTOPILOT — autonomous run to the approval gate. Start enqueues Segment A (QC →
@@ -3467,8 +3726,7 @@ app.get("/api/projects/:id/portal-runs/:runId/review-screenshot", (req, res) => 
 // These two endpoints are the troubleshooting handoff: list the runs, download one
 // zipped, and paste/send the zip when asking for help with a failed learn.
 // ---------------------------------------------------------------------------
-const learnRunsBase = (): string =>
-  process.env.AUTOLEARN_RUN_DIR ? path.resolve(process.env.AUTOLEARN_RUN_DIR) : path.resolve(process.cwd(), "data", "learn-runs");
+const learnRunsBase = (): string => learnRunsDir();
 const SAFE_RUN_ID = /^[A-Za-z0-9._-]+$/;
 
 app.get("/api/learn-runs", (req, res) => {
@@ -3531,6 +3789,18 @@ app.get("/api/projects/:id/submittal-tracks", (req, res) => {
 });
 
 const SUBMITTAL_TRACK_TYPES: SubmittalTrackType[] = ["nem", "building", "electrical", "combo", "permit", "mpu"];
+
+// THE APPROVAL SHEET (#486): what Approve & auto-submit is about to file for this track — the
+// replay's own values, account / meter masked to the last 4, every disagreement with the bill or the
+// plan set named first. A READ: it writes nothing and decides nothing; the approve request
+// (POST prepare-submission) and the gate are unchanged. Under /api/projects/:id, so the org scope
+// guard answers another org's project with a 404 before this handler runs (rule 6).
+app.get("/api/projects/:id/approval-sheet", (req, res) => {
+  const track = String(req.query.track ?? "").trim() as SubmittalTrackType;
+  if (!SUBMITTAL_TRACK_TYPES.includes(track)) throw new HttpError(400, `track must be one of ${SUBMITTAL_TRACK_TYPES.join(", ")}.`);
+  const detail = getProjectDetail(db, String(req.params.id));
+  res.json({ sheet: buildApprovalSheet(db, detail.project, track) });
+});
 
 // "I SENT THE SIGNATURE REQUEST" (#310): a named person clicked the utility portal's Request
 // Signatures themselves. Recorded with who and when; the NEM track then waits on the homeowner's
@@ -3677,7 +3947,7 @@ const server = app.listen(port, listen.host, () => {
   if (process.env.BACKGROUND_WORKERS !== "off") void (async () => {
     try {
       const { reapOrphanedProfileBrowsers } = await import("../../portal-bot/src/browser");
-      const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+      const profileBase = portalProfilesDir();
       const killed = await reapOrphanedProfileBrowsers(profileBase);
       if (killed > 0) logger.warn("portal", `Reaped ${killed} orphaned portal browser(s) left by a previous run — their profiles are free again.`);
     } catch { /* cleanup is best-effort; never block startup */ }
@@ -3697,6 +3967,7 @@ const server = app.listen(port, listen.host, () => {
   startBackupScheduler(db);
   startArtifactRetention();
   startMonitorScheduler(db);
+  startStaffDigestScheduler(db);
   startAhjFormRefreshScheduler(db);
   startKbLinkCheckScheduler(db);
   startCecSyncScheduler(db);

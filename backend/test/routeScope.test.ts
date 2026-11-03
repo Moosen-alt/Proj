@@ -72,6 +72,26 @@ const UNSCOPED_BY_DESIGN: Record<string, string> = {
   "/api/auth/login": "establishes the session",
   "/api/auth/logout": "ends the session",
   "/api/auth/me": "reports the current session",
+  // Self-service password change (#431). Under /api/auth/, which the sign-in gate lets through,
+  // so the handler itself refuses a request with no session (asserted below) and only ever
+  // touches the signed-in user's own row.
+  "/api/auth/password": "self-service: the handler requires a session and changes only that user's own password",
+  // "Sign out everywhere" (#432). Same shape as /api/auth/password: the handler refuses a request
+  // with no session (asserted below) and bumps only the signed-in user's own session version.
+  "/api/auth/logout-everywhere": "self-service: the handler requires a session and ends only that user's own sessions",
+  // Recorder tokens (#433). Under /api/auth/ like the password change, so each handler is the gate
+  // (requireRecorderTokenOwner: a session, never a recorder token) and reads/writes only the
+  // caller's OWN tokens; another person's token id is a 404 inside recorderTokens.ts.
+  "/api/auth/recorder-tokens": "self-service: requireRecorderTokenOwner requires a session; lists/mints only the caller's own tokens",
+  "/api/auth/recorder-tokens/:id": "self-service: requireRecorderTokenOwner requires a session; revokeRecorderToken 404s on another person's token",
+
+  // Staff logins (#431): admin-gated (requireStaffAdmin = sign-in on + requireAdmin) and scoped
+  // INSIDE staffLogins.ts to the acting admin's own org, where another org's id is a 404.
+  // Each route is asserted below to call requireStaffAdmin; staffLogins.test.ts boots the
+  // server and proves the 404.
+  "/api/staff/logins": "admin-gated; listStaffLogins reads only the admin's own org",
+  "/api/staff/logins/:id/password": "admin-gated; resetStaffPassword 404s on an id outside the admin's org",
+  "/api/staff/logins/:id/active": "admin-gated; setStaffLoginActive 404s on an id outside the admin's org",
 
   // Org/licence administration. Gated by requireAdmin (role + autopilot entitlement),
   // which is a stronger check than org scoping.
@@ -124,6 +144,9 @@ const UNSCOPED_BY_DESIGN: Record<string, string> = {
   "/api/imap": "operator-level mail integration",
   "/api/email-tracker/sources": "creates a source stamped with the caller's org",
   "/api/email-tracker/run": "takes the org from the session, never the body",
+  // Email-in intake (#489): each row is stamped with its client's org (else the polling source's)
+  // and the handlers 404 a row outside reqOrgFilter (emailIntake.rowInScope; emailIntake.test).
+  "/api/email-intake": "rows carry their client's org; handlers read through reqOrgFilter and 404 outside it",
   "/api/permit-monitor/run": "global background sweep; runs as system",
   "/api/nem-monitor/run": "global background sweep; runs as system",
   "/api/portal-pauses": "global automation kill-switches",
@@ -141,6 +164,7 @@ const SCOPED_LIST_ROUTES: Record<string, string> = {
   "/api/users": "reqOrgFilter",
   "/api/users/workload": "reqOrgFilter",
   "/api/email-tracker": "reqOrgFilter",
+  "/api/email-intake": "reqOrgFilter",
   "/api/customers": "reqOrgFilter",
   "/api/kpi": "reqOrgFilter",
   "/api/corrections/overdue": "reqOrgFilter",
@@ -148,6 +172,7 @@ const SCOPED_LIST_ROUTES: Record<string, string> = {
   "/api/signatures": "reqOrgFilter",
   "/api/ops-actions": "reqOrgFilter",
   "/api/ops-report": "reqOrgFilter",
+  "/api/fee-accuracy": "reqOrgFilter",
 };
 
 const topLevel = (p: string): string => {
@@ -239,6 +264,69 @@ run(
   apiRoutes.some((r) => r.verb === "post" && r.path === "/api/projects/:id/status"),
   `POST /api/projects/:id/status is not registered at that path: ${JSON.stringify(apiRoutes.filter((r) => r.path.endsWith("/status")))}`,
 );
+
+// STAFF LOGINS (#431). Exempted above by name, so assert what the exemption leans on: every
+// /api/staff route goes through requireStaffAdmin, and the self-service change refuses a
+// request with no session (it sits under /api/auth/, which the sign-in gate waves through).
+{
+  const staffRoutes = apiRoutes.filter((r) => r.path.startsWith("/api/staff"));
+  run("the staff-login routes are registered", staffRoutes.length >= 4, JSON.stringify(staffRoutes));
+  for (const route of staffRoutes) {
+    const start = source.indexOf(`app.${route.verb}("${route.path}"`);
+    const body = start < 0 ? "" : source.slice(start, source.indexOf("\napp.", start + 10));
+    run(`${route.verb.toUpperCase()} ${route.path} is admin-gated`, /requireStaffAdmin\(req\)/.test(body), body.slice(0, 300));
+  }
+  run(
+    "requireStaffAdmin runs requireAdmin and refuses when sign-in is off",
+    /function requireStaffAdmin\(req: Request\)[\s\S]{0,300}!AUTH_ENABLED[\s\S]{0,200}requireAdmin\(req\)/.test(source),
+    "requireStaffAdmin must check AUTH_ENABLED and call requireAdmin",
+  );
+  for (const selfRoute of ["/api/auth/password", "/api/auth/logout-everywhere"]) {
+    const start = source.indexOf(`app.post("${selfRoute}"`);
+    const body = start < 0 ? "" : source.slice(start, source.indexOf("\napp.", start + 10));
+    run(
+      `POST ${selfRoute} refuses without a session`,
+      /const user = currentUser\(db, req\);\s*if \(!user\) throw new HttpError\(401/.test(body),
+      body.slice(0, 300),
+    );
+  }
+}
+
+// RECORDER TOKENS (#433). Exempted above by name: every /api/auth/recorder-tokens route goes
+// through requireRecorderTokenOwner, which refuses with sign-in off and without a session, and
+// refuses a request a recorder token authenticated.
+{
+  const tokenRoutes = apiRoutes.filter((r) => r.path.startsWith("/api/auth/recorder-tokens"));
+  run("the recorder-token routes are registered", tokenRoutes.length >= 3, JSON.stringify(tokenRoutes));
+  for (const route of tokenRoutes) {
+    const start = source.indexOf(`app.${route.verb}("${route.path}"`);
+    const body = start < 0 ? "" : source.slice(start, source.indexOf("\napp.", start + 10));
+    run(`${route.verb.toUpperCase()} ${route.path} requires the token's owner session`, /requireRecorderTokenOwner\(req\)/.test(body), body.slice(0, 300));
+  }
+  // The routes a recorder token reaches (recorderTokens.RECORDER_ROUTES) are exactly four, each an
+  // existing registration in server.ts under the same verb. A renamed route must take its entry
+  // along; a fifth entry is a widening of what a token reaches and shows up here in review.
+  const tokenSource = fs.readFileSync(path.resolve(process.cwd(), "backend/src/recorderTokens.ts"), "utf8");
+  const reach = [...tokenSource.matchAll(/\{ method: "([A-Z]+)", route: "([^"]+)", pattern:/g)].map((m) => ({ verb: m[1].toLowerCase(), path: m[2] }));
+  run(
+    "a recorder token reaches exactly the four recorder routes",
+    JSON.stringify(reach.map((r) => `${r.verb} ${r.path}`).sort()) === JSON.stringify([
+      "get /api/projects/:id/staging-field-values",
+      "post /api/portal-recipes/:id/suggest-bindings",
+      "post /api/portal-recipes/record",
+      "put /api/portal-recipes/:id/steps",
+    ]),
+    JSON.stringify(reach),
+  );
+  for (const r of reach) {
+    run(`recorder route ${r.verb.toUpperCase()} ${r.path} is registered in server.ts`, apiRoutes.some((a) => a.verb === r.verb && a.path === r.path), "");
+  }
+  run(
+    "requireRecorderTokenOwner refuses with sign-in off, without a session, and for a recorder-token principal",
+    /function requireRecorderTokenOwner\(req: Request\)[\s\S]{0,200}!AUTH_ENABLED[\s\S]{0,250}currentUser\(db, req\);\s*if \(!user \|\| recorderPrincipal\(req\)\) throw new HttpError\(401/.test(source),
+    "requireRecorderTokenOwner must check AUTH_ENABLED, require currentUser, and refuse a recorderPrincipal",
+  );
+}
 
 // The guards must not have been quietly removed.
 for (const expected of ["/api/projects", "/api/clients", "/api/customers"]) {

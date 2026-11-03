@@ -5,7 +5,8 @@ import type { AppDb } from "./db";
 import { HttpError } from "./httpError";
 import { runEmailTracker } from "./repository";
 import { writeMboxMessage } from "./mbox";
-import type { EmailTrackerRunResult } from "../../shared/src/types";
+import { intakeEnabled, isIntakeMessage, processIntakeMessages } from "./emailIntake";
+import type { EmailIntakeRunResult, EmailTrackerRunResult } from "../../shared/src/types";
 
 // =============================================================================
 // Live Gmail polling.
@@ -113,7 +114,7 @@ interface GmailListResponse {
 
 // Fetches recent messages and writes them to a temp MBOX file. Returns the path
 // and the number of messages written. Default query pulls the last 30 days.
-export async function fetchGmailToMbox(query = "newer_than:30d", maxResults = 100): Promise<{ filePath: string; count: number }> {
+export async function fetchGmailToMbox(query = "newer_than:30d", maxResults = 100): Promise<{ filePath: string; count: number; intake: Buffer[] }> {
   const token = await getAccessToken();
   const auth = { Authorization: `Bearer ${token}` };
 
@@ -125,6 +126,11 @@ export async function fetchGmailToMbox(query = "newer_than:30d", maxResults = 10
   const mboxPath = path.join(os.tmpdir(), `gmail-${Date.now()}.mbox`);
   const out = fs.createWriteStream(mboxPath, { encoding: "utf8" });
   let count = 0;
+  // EMAIL-IN INTAKE (#489): mail to the intake address is a new job, not a status email — it goes
+  // to emailIntake.ts and never into the tracker's MBOX (emailPoller.ts does the same).
+  const intakeOn = intakeEnabled();
+  const intake: Buffer[] = [];
+  const { simpleParser } = await import("mailparser");
 
   for (const id of ids) {
     const msgRes = await fetch(`${GMAIL_API}/messages/${id}?format=raw`, { headers: auth });
@@ -132,7 +138,12 @@ export async function fetchGmailToMbox(query = "newer_than:30d", maxResults = 10
     const msg = (await msgRes.json().catch(() => ({}))) as { raw?: string };
     if (!msg.raw) continue;
     // Gmail returns the full RFC822 message base64url-encoded.
-    const rfc822 = Buffer.from(msg.raw.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8");
+    const bytes = Buffer.from(msg.raw.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+    if (intakeOn) {
+      const parsed = await simpleParser(bytes).catch(() => null);
+      if (parsed && isIntakeMessage(parsed)) { intake.push(bytes); continue; }
+    }
+    const rfc822 = bytes.toString("utf8");
     // MBOX separator line + escape any lines that start with "From " in the body.
     writeMboxMessage(out, rfc822, "gmail@local");
     count += 1;
@@ -141,15 +152,17 @@ export async function fetchGmailToMbox(query = "newer_than:30d", maxResults = 10
   await new Promise<void>((resolve, reject) => {
     out.end((err?: Error | null) => (err ? reject(err) : resolve()));
   });
-  return { filePath: mboxPath, count };
+  return { filePath: mboxPath, count, intake };
 }
 
 // Polls Gmail and runs the fetched messages through the existing email tracker.
-export async function pollGmail(db: AppDb, query?: string): Promise<EmailTrackerRunResult & { fetched: number }> {
-  const { filePath, count } = await fetchGmailToMbox(query);
+export async function pollGmail(db: AppDb, query?: string): Promise<EmailTrackerRunResult & { fetched: number; intake: EmailIntakeRunResult | null }> {
+  const { filePath, count, intake } = await fetchGmailToMbox(query);
   try {
+    // The Gmail inbox is operator-level, like the central IMAP inbox: a tag in any org may match.
+    const intakeRun = intake.length ? await processIntakeMessages(db, intake) : null;
     const result = await runEmailTracker(db, { filePath });
-    return { ...result, fetched: count };
+    return { ...result, fetched: count, intake: intakeRun };
   } finally {
     if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
   }

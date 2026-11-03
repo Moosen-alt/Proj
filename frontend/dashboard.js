@@ -4,6 +4,9 @@ const state = {
   boardAll: null,
   selectedProjectId: null,
   detail: null,
+  // THIS EDITOR'S UNSAVED EDIT of the open project (#440): { projectId, baseVersion, dirty:Set<id> }.
+  // baseVersion is the project's editVersion when the edit began; null when nothing is unsaved.
+  projectEdit: null,
   // The server's full next-step answer for the open project (GET /api/projects/:id/next-step,
   // refreshed by every autopilot state), and which project it belongs to.
   nextStep: null,
@@ -43,6 +46,10 @@ const state = {
   // status" on a stale row. Cleared on project switch and after every recorded check — a stale
   // target id would file the next paste against the wrong permit.
   recheckTargetId: null,
+  // Which tracked-filing card has its Edit / Record status form open (#411) — a target id or null.
+  // State, not DOM, so a background re-render keeps the form open; cleared on project switch.
+  permitTargetEditing: null,
+  permitTargetRecording: null,
   // "<projectId>|<targetId>" the permit form's fields were last filled from (syncPermitForm);
   // recordPermitStatus posts the form's numbers only with THAT filing's check.
   permitFormFor: null,
@@ -1032,6 +1039,53 @@ async function loadEmailTracker() {
   } catch (err) {
     $("emailTrackerStatus").textContent = err.message || "Email tracker status unavailable.";
   }
+  loadEmailIntake().catch(() => null);
+}
+
+// EMAILED JOBS (#489). Built with DOM calls, never innerHTML: every string here came from an email.
+async function loadEmailIntake() {
+  const panel = $("emailIntakePanel");
+  const list = $("emailIntakeList");
+  if (!panel || !list) return;
+  const data = await api("/api/email-intake");
+  panel.hidden = !data.enabled && !(data.unsorted || []).length && !(data.recent || []).length;
+  $("emailIntakeAddress").textContent = data.enabled
+    ? `Installers email new jobs (plan set + bill) to ${data.address}. Set each client's tag under Clients.`
+    : "Email-in intake is off (EMAIL_INTAKE_ADDRESS is not set).";
+  const el = (tag, props = {}, children = []) => {
+    const node = document.createElement(tag);
+    Object.assign(node, props);
+    node.append(...children);
+    return node;
+  };
+  const rows = [];
+  for (const item of data.unsorted || []) {
+    const files = (item.files || []).map((f, i) => el("li", {}, [
+      el("a", { href: `/api/email-intake/${encodeURIComponent(item.id)}/files/${i}`, textContent: f.name }),
+      f.refused ? ` (${f.refused})` : "",
+    ]));
+    const dismiss = el("button", { className: "secondary", type: "button", textContent: "Dismiss" });
+    dismiss.addEventListener("click", async () => {
+      dismiss.disabled = true;
+      try { await api(`/api/email-intake/${encodeURIComponent(item.id)}/dismiss`, { method: "POST" }); await loadEmailIntake(); }
+      catch (err) { dismiss.disabled = false; showMessage(err.message || "Could not dismiss.", "error"); }
+    });
+    rows.push(el("div", { className: "panel" }, [
+      el("strong", { textContent: `Needs a person: ${item.subject || "(no subject)"}` }),
+      el("div", { className: "muted", textContent: `From ${item.sender || "unknown sender"}${item.intakeTag ? ` to tag "${item.intakeTag}"` : ""}, ${new Date(item.receivedAt || item.createdAt).toLocaleString()}` }),
+      el("div", { textContent: item.reasonText }),
+      el("ul", {}, files),
+      dismiss,
+    ]));
+  }
+  for (const item of data.recent || []) {
+    const open = el("a", { href: "#", textContent: item.status === "attached" ? "Files added to project" : "Project created" });
+    open.addEventListener("click", (e) => { e.preventDefault(); if (item.projectId) selectProject(item.projectId); });
+    rows.push(el("div", { className: "muted" }, [
+      open, ` from ${item.sender}: ${item.subject || "(no subject)"} (${new Date(item.createdAt).toLocaleString()}; reply ${item.replyStatus || "none"})`,
+    ]));
+  }
+  list.replaceChildren(...rows);
 }
 
 // The ops plan + brief, runbook, handoff packet, communication drafts and installer actions panels
@@ -2319,6 +2373,9 @@ async function selectProject(projectId) {
   // nulling state.autopilot alone left project A's enabled Stage / reasons on screen for B
   // until (and, if B's fetch failed, after) B's own answer arrived.
   if (state.selectedProjectId !== projectId || (state.autopilot && state.autopilot.projectId !== projectId)) resetAutopilotRail();
+  // An unsaved edit belongs to the project it was made on (#440): opening another one drops it, so
+  // coming back never shows the other project's typing as this one's.
+  if (state.selectedProjectId !== projectId) state.projectEdit = null;
   state.selectedProjectId = projectId;
   state.detail = await api(`/api/projects/${projectId}`);
   state.workflow = null;
@@ -2339,7 +2396,10 @@ async function selectProject(projectId) {
   state.submitGate = null;
   state.staleReadings = null;
   state.recheckTargetId = null;
+  state.permitTargetEditing = null;
+  state.permitTargetRecording = null;
   state.submittalTracks = null;
+  state.projectMilestones = null;
   state.paymentQuotes = null;
   state.feeReceipts = [];
   state.feeSheet = null;
@@ -2453,6 +2513,7 @@ const FEE_SOURCE_LABELS = {
   published_schedule: "published fee schedule",
   learned_history: "learned from past submissions here",
   valuation_estimate: "estimate from valuation",
+  printed_form: "fee table printed on the AHJ's form (may be out of date)",
   unknown: "unknown — enter the portal fee",
 };
 
@@ -2472,6 +2533,7 @@ function renderPaymentQuoteCard(quote) {
         <tr style="border-top:1px solid var(--border)"><td style="padding:3px 14px 1px 0"><strong>Client total</strong></td><td style="text-align:right"><strong>${money(quote.totalUsd)}</strong></td><td></td></tr>
       </table>
       <p class="muted" style="margin:2px 0;font-size:11px">${esc(quote.permitFeeBasis || "")}</p>
+      ${printedFormCheckHtml(quote.printedFormCheck)}
       ${status === "paid" ? `<p style="margin:2px 0;font-size:12px">Paid ${p.paidAt ? new Date(p.paidAt).toLocaleString() : ""}${p.paymentReference ? ` — ref: ${esc(p.paymentReference)}` : ""}</p>` : ""}
       ${status !== "paid" ? `
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:6px">
@@ -2614,6 +2676,7 @@ const FEE_SOURCE_TEXT = {
   published_schedule: "the jurisdiction's published fee schedule",
   learned_history: "the median of real fees seen here before",
   valuation_estimate: "a percentage of the project valuation",
+  printed_form: "the fee table printed on the AHJ's own form, which may be out of date",
   unknown: "nowhere yet",
 };
 
@@ -2813,6 +2876,19 @@ function feeComparisonHtml(line) {
     </div>`;
 }
 
+// THE FEE TABLE PRINTED ON THE AHJ'S OWN FORM, BESIDE THE AMOUNT (#454) — a dated, lower-trust
+// cross-check. Drawn only when it agrees or disagrees: "no printed table" is not news on a card.
+// A disagreement is a note under the amount, never a second amount. Every value escaped.
+function printedFormCheckHtml(check) {
+  if (!check || (check.verdict !== "agrees" && check.verdict !== "disagrees")) return "";
+  const lines = Array.isArray(check.lines) ? check.lines : [];
+  const fmt = (v) => `$${Number(v).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+  return `<details class="provenance fee-printed-check" style="margin:2px 0;font-size:12px">
+      <summary>${check.verdict === "disagrees" ? `<span class="badge badge-warning">printed form disagrees</span> ` : `<span class="badge badge-pass">printed form agrees</span> `}${esc(check.note || "")}</summary>
+      <ul>${lines.map((l) => `<li>${esc(l.label)}: ${esc(fmt(l.amountUsd))}</li>`).join("")}</ul>
+    </details>`;
+}
+
 // WHAT THE PERMIT MONITOR READ OFF EACH FILED RECORD, one click away: the invoices it saw, when,
 // and — for a record it could not read — why (never a $0).
 function feePortalRecordsHtml(line) {
@@ -2885,6 +2961,7 @@ function renderFeeSheetLine(line) {
       ${portalProvenance}
       ${verifiedNote}
       ${feeComparisonHtml(line)}
+      ${printedFormCheckHtml(line.printedFormCheck)}
       ${confirmControl}
       ${renderFeeCharges(line)}
       ${feePortalRecordsHtml(line)}
@@ -3365,6 +3442,17 @@ const NEXT_STEP_WHO = {
 // Answers that describe something wrong (amber), as opposed to routine next work (neutral).
 const NEXT_STEP_PROBLEM_KEYS = ["operator_blocked", "portal_paused", "staging_failed", "qc_failed", "gate_blocked", "gap_fill_missing", "unknown"];
 
+// One open automatic ask of the client, as a sentence. Pure; the caller esc()s it.
+function clientAskLine(a) {
+  const what = a.kind === "credentials" ? "Portal-login link" : "Intake link";
+  const day = String(a.sentAt || "").slice(0, 10);
+  const needs = Array.isArray(a.needs) && a.needs.length ? ` (${a.needs.slice(0, 3).join("; ")}${a.needs.length > 3 ? "; …" : ""})` : "";
+  const reminder = a.reminderAt ? ` Reminder ${a.reminderStatus === "sent" ? "sent" : `not sent (${a.reminderStatus || "unknown"})`} ${String(a.reminderAt).slice(0, 10)}.` : "";
+  if (a.deliveryStatus === "sent") return `${what} sent to ${a.recipient} on ${day}${needs}.${reminder}`;
+  if (a.deliveryStatus === "failed") return `${what} for ${a.recipient} could not be sent on ${day}${needs}: see the project's communications and send it by hand.`;
+  return `${what} drafted for ${a.recipient} on ${day}${needs}: email is not set up, so nothing left; send it by hand from the project's communications.`;
+}
+
 // The banner for ONE server answer. Pure: returns { className, html }. Every server string
 // (headline, why, labels) is esc()'d — they are prose, never markup. `exists(id)` says whether
 // a fix target / button is on this page; a missing one is simply not linked.
@@ -3379,6 +3467,8 @@ function nextStepBannerHtml(step, ctx) {
   const who = NEXT_STEP_WHO[step.who] || "You";
   const since = step.since ? String(step.since).slice(0, 10) : "";
   const whys = Array.isArray(step.why) ? step.why.slice(0, 3) : [];
+  const cands = Array.isArray(step.recordCandidates) ? step.recordCandidates.filter((cand) => cand && cand.runId && cand.recordNumber) : [];
+  const asks = Array.isArray(step.clientAsks) ? step.clientAsks.filter((a) => a && a.recipient && a.sentAt) : [];
   const button = step.button && step.button.id && exists(step.button.id) ? step.button : null;
   const provisional = !step.gateChecked
     ? `<span class="next-step-provisional">${esc(c.full === false
@@ -3394,6 +3484,19 @@ function nextStepBannerHtml(step, ctx) {
         ? ` <button type="button" class="linklike next-step-fix" data-fix-target="${esc(w.fixTarget)}">Show</button>` : ""}</li>`).join("")}</ul>`
       : "")
     + (button ? `<button type="button" class="secondary next-step-go" data-next-button="${esc(button.id)}">${esc(button.label)} ↓</button>` : "")
+    // UNSURE RECORD NUMBERS (#400): read off the portal after a person's submit, not sure enough to
+    // save. Each is one click to confirm; nothing is saved until then. esc() on every value.
+    + (cands.length
+      ? `<span class="next-step-candidates"><span class="next-step-provisional">Read off the portal after the submit, not saved until you confirm:</span>`
+        + `<ul class="next-step-whys">${cands.map((cand, i) => `<li>${esc(humanize(cand.track || ""))}: <strong>${esc(cand.recordNumber || "")}</strong>`
+          + (cand.recordLink ? ` <a href="${esc(cand.recordLink)}" target="_blank" rel="noopener">open ↗</a>` : "")
+          + ` <button type="button" class="secondary next-step-confirm" data-confirm-record="${i}">Confirm this number</button></li>`).join("")}</ul></span>`
+      : "")
+    // THE LINKS THE SERVER EMAILED THE CLIENT (#488): "Sent to <contact> on <date>", or why it did
+    // not leave. esc() on every value.
+    + (asks.length
+      ? `<ul class="next-step-whys next-step-client-asks">${asks.map((a) => `<li>${esc(clientAskLine(a))}</li>`).join("")}</ul>`
+      : "")
     + provisional
     + `</span>`;
   return { className: `next-step-banner is-server${tone}`, html };
@@ -3424,10 +3527,11 @@ const NEXT_STEP_BUTTON_LABELS = {
   applyStatusOverrideBtn: "Change status",
   runQcBtn: "Run QC",
   openReviewerPacketBtn: "Open Correction Packet",
-  approveSubmitBtn: "Approve & Submit",
+  approveSubmitBtn: "Approve & auto-submit",
   startAutopilotBtn: "Stage portals · Autopilot",
   addPermitTargetBtn: "Add tracking target",
   copyHandoffPacketBtn: "Copy handoff packet",
+  sendHandoffPacketBtn: "Send handoff packet",
 };
 
 // Take the operator TO a control or panel: open every <details> it sits in (stage accordion,
@@ -3506,6 +3610,13 @@ function renderNextStep() {
     }
     banner.querySelectorAll("button[data-fix-target]").forEach((b) => {
       b.addEventListener("click", () => revealElement($(b.dataset.fixTarget)));
+    });
+    // ONE CLICK CONFIRMS AN UNSURE RECORD NUMBER (#400) through the confirmation door the manual
+    // form uses, with the link that was seen beside it.
+    const cands = Array.isArray(current.step.recordCandidates) ? current.step.recordCandidates.filter((cand) => cand && cand.runId && cand.recordNumber) : [];
+    banner.querySelectorAll("button[data-confirm-record]").forEach((b) => {
+      const cand = cands[Number(b.dataset.confirmRecord)];
+      if (cand) b.addEventListener("click", () => confirmRecordCandidate(cand, b));
     });
     return;
   }
@@ -3984,9 +4095,12 @@ function renderRecordPortal() {
 
   // Manual-entry inputs — prefill from the snapshot, but never clobber what the
   // operator is actively typing (a background re-render must not wipe the field).
+  // An UNSAVED edit is never clobbered either (#440): a field the operator changed and left keeps
+  // its value through every refresh (another teammate's save, a background write's SSE refetch, a
+  // conflict reload) until it is saved or the project is closed.
   const setIfIdle = (id, value) => {
     const el = $(id);
-    if (el && document.activeElement !== el) el.value = value ?? "";
+    if (el && document.activeElement !== el && !projectEditIsDirty(id)) el.value = value ?? "";
   };
   setIfIdle("manualJobValue", snap.jobValue != null ? String(snap.jobValue) : "");
   setIfIdle("manualProjectType", snap.projectType != null ? String(snap.projectType) : "");
@@ -4006,6 +4120,57 @@ function renderRecordPortal() {
   setIfIdle("manualHomeownerEmail", snap.homeownerEmail != null ? String(snap.homeownerEmail) : "");
   setIfIdle("manualHomeownerPhone", snap.homeownerPhone != null ? String(snap.homeownerPhone) : "");
   setIfIdle("manualDescription", desc);
+}
+
+// ---------------------------------------------------------------------------
+// TWO TEAMMATES, ONE PROJECT (#440). A save carries the project's editVersion as it was when this
+// editor STARTED changing the form — not the latest one a background refresh fetched, which would
+// quietly bless whatever a teammate saved in between. The server refuses a stale one with a 409
+// (details.editConflict) and writes nothing; the page reloads the project, keeps the fields the
+// operator changed (setIfIdle skips them), and asks them to check and save again.
+// ---------------------------------------------------------------------------
+const PROJECT_EDIT_CONFLICT_TEXT =
+  "Not saved — someone else changed this project since you started editing. It has been reloaded with their changes; your unsaved entries are still in the form. Check them and save again.";
+
+/** Start (or extend) this editor's edit of the open project: remember the version it loaded and
+ *  which fields were changed. Called from the manual-entry form's input/change events. */
+function noteProjectEdit(fieldId) {
+  const projectId = state.selectedProjectId;
+  if (!projectId) return;
+  if (!state.projectEdit || state.projectEdit.projectId !== projectId) {
+    state.projectEdit = { projectId, baseVersion: state.detail?.project?.editVersion, dirty: new Set() };
+  }
+  if (fieldId) state.projectEdit.dirty.add(fieldId);
+}
+
+function projectEditIsDirty(fieldId) {
+  const edit = state.projectEdit;
+  return !!(edit && edit.projectId === state.selectedProjectId && edit.dirty.has(fieldId));
+}
+
+/** The version a save from this editor is made against: where its edit began, else what is shown. */
+function projectEditBaseVersion() {
+  const edit = state.projectEdit;
+  const v = edit && edit.projectId === state.selectedProjectId ? edit.baseVersion : state.detail?.project?.editVersion;
+  return Number.isInteger(v) ? v : undefined;
+}
+
+function isProjectEditConflict(err) {
+  return !!(err && err.details && err.details.editConflict);
+}
+
+/** After a 409: reload the project (the unsaved fields stay, see setIfIdle). For the manual-entry
+ *  form's own conflict (rebaseManualEdit), rebase its edit on what was just loaded, so the operator's
+ *  next Save — made with the teammate's changes and the conflict message in view — goes through.
+ *  Another save's conflict leaves the form's edit stale: that form has not said anything yet. */
+async function reloadAfterEditConflict({ rebaseManualEdit }) {
+  const projectId = state.selectedProjectId;
+  if (!projectId) return;
+  await selectProject(projectId);
+  if (state.selectedProjectId !== projectId || !rebaseManualEdit) return;
+  if (state.projectEdit && state.projectEdit.projectId === projectId) {
+    state.projectEdit.baseVersion = state.detail?.project?.editVersion;
+  }
 }
 
 async function saveManualEntry() {
@@ -4057,14 +4222,20 @@ async function saveManualEntry() {
   }
   if (btn) btn.disabled = true;
   if (status) { status.textContent = "Saving…"; status.className = "muted"; }
+  const expectedVersion = projectEditBaseVersion();
   try {
-    const detail = await api(`/api/projects/${state.selectedProjectId}`, { method: "PUT", body: JSON.stringify(payload) });
+    const detail = await api(`/api/projects/${state.selectedProjectId}`, { method: "PUT", body: JSON.stringify({ ...payload, expectedVersion }) });
     if (detail && detail.project) state.detail = detail;
+    state.projectEdit = null; // saved: nothing unsaved left to protect
     if (status) { status.textContent = "Saved."; status.className = "muted"; }
     renderDetail();
     showMessage("Project data saved.", "info");
   } catch (err) {
-    if (status) { status.textContent = "Save failed: " + (err.message || err); status.className = "muted"; }
+    if (isProjectEditConflict(err)) {
+      try { await reloadAfterEditConflict({ rebaseManualEdit: true }); } catch { /* the message still stands; the next Save re-checks */ }
+      if (status) { status.textContent = PROJECT_EDIT_CONFLICT_TEXT; status.className = "muted"; }
+      showMessage(PROJECT_EDIT_CONFLICT_TEXT, "warning");
+    } else if (status) { status.textContent = "Save failed: " + (err.message || err); status.className = "muted"; }
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -4342,7 +4513,7 @@ async function launchRecordSession() {
 function downloadRecordBat() {
   const cmd = buildRecordCommand();
   if (!cmd) { showMessage("Open a project first.", "warning"); return; }
-  const bat = `@echo off\r\nREM Record this portal and save the recipe to the central server.\r\nREM Save this file in your SOLAR-Proj folder, then double-click it.\r\ncd /d "%~dp0"\r\n${cmd}\r\npause\r\n`;
+  const bat = `@echo off\r\nREM Record this portal and save the recipe to the central server.\r\nREM Save this file in your SOLAR-Proj folder, then double-click it.\r\n${sharedServerBatLines()}cd /d "%~dp0"\r\n${cmd}\r\npause\r\n`;
   const blob = new Blob([bat], { type: "application/octet-stream" });
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
@@ -4351,6 +4522,87 @@ function downloadRecordBat() {
   a.click();
   a.remove();
   URL.revokeObjectURL(a.href);
+}
+
+// ----- Shared server posture (#439) -----
+// On the owner's own PC "the server" and "my computer" are the same box, so pasting a local MBOX
+// path, scanning a folder, or launching a recorder window "here" just works. On a shared server
+// every one of those reads the SERVER'S disk or opens a window nobody can see. GET /api/auth/me
+// says which (serverIsShared, backend/src/serverPosture.ts); with it on, body.server-shared hides
+// the .local-disk-only controls and shows the .shared-server-note lines (styles.css), and the
+// record helper names the server URL and the recorder token. With it off nothing changes.
+function serverIsSharedNow() {
+  return !!(state.authMe && state.authMe.serverIsShared === true);
+}
+
+// Sign-in on: the recorder CLI needs the person's own recorder token (#433), wherever the server is.
+function recorderNeedsTokenNow() {
+  return !!(state.authMe && state.authMe.enabled);
+}
+
+const RECORDER_TOKEN_WHERE = "Sign-in is on here, so the recorder needs your personal recorder token: make one under Team, Recorder tokens, and set it as RECORDER_TOKEN on your computer before you run the command (record.bat asks for it). If this server sits behind Cloudflare Access, also set CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET (ask your admin).";
+
+function recordSharedNoteText() {
+  const origin = window.location.origin;
+  let text = serverIsSharedNow()
+    ? `This dashboard runs on a shared server, so the recorder runs on your own computer, not here: download record.bat or copy the command, and run it in your SOLAR-Proj folder. It saves the recipe to this server: ${origin} (the --api flag).`
+    : "";
+  if (recorderNeedsTokenNow()) text += `${text ? " " : ""}${RECORDER_TOKEN_WHERE}`;
+  return text;
+}
+
+function sharedServerBatLines() {
+  let lines = "";
+  // REM lines are inert; the origin comes from the browser's own location bar, never the server.
+  const origin = window.location.origin.replace(/[\r\n%^&|<>]/g, "");
+  if (serverIsSharedNow()) lines += `REM Saves to the shared server ${origin} (the --api flag below).\r\n`;
+  if (recorderNeedsTokenNow()) {
+    // The token is ASKED FOR when the file runs, never written into it: a .bat sitting in a
+    // Downloads folder must not carry a credential. Already set in this window? Then it is used as is.
+    lines += "REM Sign-in is on there: the recorder needs your personal recorder token (dashboard: Team, Recorder tokens).\r\n";
+    lines += "REM Behind Cloudflare Access? Set CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET first (ask your admin).\r\n";
+    lines += "if not defined RECORDER_TOKEN set /p RECORDER_TOKEN=Paste your recorder token and press Enter: \r\n";
+  }
+  return lines;
+}
+
+function applyServerPosture() {
+  const shared = serverIsSharedNow();
+  document.body.classList.toggle("server-shared", shared);
+  // The record notes also show on an unshared server with sign-in on: they say where the token goes.
+  document.body.classList.toggle("recorder-needs-token", recorderNeedsTokenNow());
+  const note = shared || recorderNeedsTokenNow() ? recordSharedNoteText() : "";
+  for (const id of ["recordSharedNote", "recordCmdSharedNote"]) {
+    const el = $(id);
+    if (el) el.textContent = note;
+  }
+  // Say "on the server" in the controls that stay (an admin may put a file there on purpose).
+  // Off: put back exactly what dashboard.html shipped.
+  const relabel = (id, prop, sharedText) => {
+    const el = $(id);
+    if (!el) return;
+    const key = `localText_${prop}`;
+    if (el.dataset[key] === undefined) el.dataset[key] = el[prop];
+    el[prop] = shared ? sharedText : el.dataset[key];
+  };
+  relabel("batchFolderPath", "placeholder", "Folder path ON THE SERVER (not your computer)");
+  relabel("emailWatchPath", "placeholder", "MBOX path ON THE SERVER to watch (not your computer)");
+  const scanLabel = $("startBatchScanBtn")?.querySelector("span");
+  if (scanLabel) {
+    if (scanLabel.dataset.localText === undefined) scanLabel.dataset.localText = scanLabel.textContent;
+    scanLabel.textContent = shared ? "Scan Server Folder" : scanLabel.dataset.localText;
+  }
+}
+
+async function loadServerPosture() {
+  try { state.authMe = await api("/api/auth/me"); } catch { /* an older server: treat as not shared */ }
+  applyServerPosture();
+}
+
+// The MBOX upload's own error text used to send everyone to Import Path; on a shared server that
+// control is hidden (it would read the server's disk), so the hint is left out there.
+function mboxPathFallbackHint(text) {
+  return serverIsSharedNow() ? "" : text;
 }
 
 // Run a render step in isolation: a failure in one panel (e.g. unexpected project
@@ -4759,6 +5011,7 @@ async function loadSubmittalTracks() {
   } catch {
     state.submittalTracks = null;
   }
+  await loadProjectMilestones();
   updatePortalLoginsSummary();
   syncRecordPermitType();
 }
@@ -4991,15 +5244,90 @@ async function saveTrackIssuer(type, value, btn) {
   if (!key || !state.selectedProjectId) return;
   if (btn) btn.disabled = true;
   try {
-    const detail = await api(`/api/projects/${state.selectedProjectId}`, { method: "PUT", body: JSON.stringify({ [key]: value }) });
+    // Saved against the version ON SCREEN (the card is drawn from it), not the manual-entry form's
+    // edit base. An unsaved manual edit that began at that same version is rebased onto this save,
+    // so the operator's own issuer save never makes their own form stale; one that began earlier
+    // stays stale (a teammate's save came in between) and still gets the conflict.
+    const sentVersion = state.detail?.project?.editVersion;
+    const detail = await api(`/api/projects/${state.selectedProjectId}`, { method: "PUT", body: JSON.stringify({ [key]: value, expectedVersion: Number.isInteger(sentVersion) ? sentVersion : undefined }) });
     if (detail && detail.project) state.detail = detail;
+    const edit = state.projectEdit;
+    if (edit && edit.projectId === state.selectedProjectId && edit.baseVersion === sentVersion) edit.baseVersion = detail?.project?.editVersion;
     await loadSubmittalTracks();
     renderDetail();
     showMessage(value ? `Saved — ${value} issues this ${humanize(type)} permit.` : `Cleared — the project's AHJ issues this ${humanize(type)} permit.`, "info");
   } catch (err) {
+    if (isProjectEditConflict(err)) {
+      // The card re-renders on reload, so the typed agency is said back in the message.
+      try { await reloadAfterEditConflict({ rebaseManualEdit: false }); } catch { /* ditto */ }
+      showMessage(`Not saved — someone else changed this project since you opened it. It has been reloaded with their changes. Your entry for this ${humanize(type)} permit was "${value || "(cleared)"}": check it and save again.`, "warning");
+      if (btn) btn.disabled = false;
+      return;
+    }
     showMessage(err.message || "Could not save the issuing agency.", "error");
     if (btn) btn.disabled = false;
   }
+}
+
+// WHAT THIS TRACK'S RECIPE WILL FILL THAT THE JOB HAS NO VALUE FOR (#445, owner 2026-10-31: "automated
+// fill is right every time"). The server's own reading (backend recipeStageGaps — the list the stage
+// gate refuses on), shown before anyone clicks Stage: each box in the portal's words, what to fill,
+// and a link to where it is filled. Labels and keys only; the server never sends a value (rule 2).
+// Untrusted text: esc() everything.
+const STAGE_GAP_LINK = {
+  project: "Fill it on the project",
+  client: "Fill it on the client",
+  documents: "Upload it",
+  portal_questions: "Answer it",
+};
+function trackStageGapsHtml(t) {
+  const gaps = Array.isArray(t && t.stageGaps) ? t.stageGaps : [];
+  if (!gaps.length) return "";
+  const what = (g) => g.kind === "document"
+    ? `needs a ${g.fieldName} document`
+    : g.kind === "question"
+      ? "a question only a person can answer for this job"
+      : `needs ${g.fieldName}${g.where === "client" ? " (client record)" : ""}`;
+  const items = gaps.map((g) => `<li data-stage-gap="${esc(g.key)}" data-stage-gap-kind="${esc(g.kind)}">
+        <span>“${esc(g.label || g.fieldName)}” — ${esc(what(g))}</span>
+        <a href="#" data-stage-gap-open="${esc(g.where)}" data-stage-gap-key="${esc(g.key)}">${esc(STAGE_GAP_LINK[g.where] || "Open")}</a>
+      </li>`).join("");
+  return `<div class="track-stage-gaps" data-track-stage-gaps="${esc(t.type)}" style="margin:0 0 6px;font-size:12px;color:var(--warning)">
+    <strong>Fill before staging — the recipe fills ${gaps.length === 1 ? "this box" : `these ${gaps.length} boxes`} and this job has no value, so staging will stop here:</strong>
+    <ul style="margin:2px 0 0 18px;padding:0">${items}</ul>
+  </div>`;
+}
+// Where each gap is filled. A project field with its own box on the project-data form is focused;
+// anything else opens the form it lives on.
+const STAGE_GAP_PROJECT_INPUT = {
+  homeownerEmail: "manualHomeownerEmail", ubAccountHolderEmail: "manualHomeownerEmail",
+  homeownerPhone: "manualHomeownerPhone", ubAccountHolderPhone: "manualHomeownerPhone",
+  workDescription: "manualDescription", jobValue: "manualJobValue",
+};
+function openStageGap(where, key) {
+  const reveal = (el) => {
+    if (!el) return;
+    // Every collapsed section it sits in (the stage accordion and the project-data panel) opens.
+    for (let d = el.closest ? el.closest("details") : null; d; d = d.parentElement ? d.parentElement.closest("details") : null) d.open = true;
+    if (el.scrollIntoView) el.scrollIntoView({ block: "center" });
+    if (el.focus) el.focus();
+  };
+  if (where === "documents") {
+    const sel = $("docUploadType");
+    if (sel && Array.from(sel.options || []).some((o) => o.value === key)) sel.value = key;
+    reveal(sel);
+    return;
+  }
+  if (where === "client") {
+    const clientId = state.detail && state.detail.project ? state.detail.project.clientId : "";
+    Promise.resolve(openClientsModal()).then(() => { if (clientId) editClient(clientId); }).catch(() => {});
+    return;
+  }
+  if (where === "portal_questions") {
+    reveal(document.getElementById("portalQuestionsChip") || document.querySelector(".intake-link-row"));
+    return;
+  }
+  reveal($(STAGE_GAP_PROJECT_INPUT[key] || "") || $("manualEntryForm"));
 }
 
 function trackCardHtml(t) {
@@ -5051,6 +5379,16 @@ function trackCardHtml(t) {
         </div>
       </div>`;
 
+  // ONE CLICK, NOT STAGE-THEN-APPROVE (#435; owner ruling 2026-10-31 "One click now"). On the NEM
+  // track an approved run replays the application from its first page; with a Stage's unsubmitted
+  // draft on the account it stops on that draft (the gate is then asked with no recipe, so nothing is
+  // filed and the approval is spent) or, when the list row does not match the address, starts a
+  // SECOND application. So while the track holds a staged draft the button is held with the reason.
+  // (The words are APPROVE_HELD_BY_STAGED_DRAFT's, spelled here so the card renders on its own.)
+  const approveHeld = t.type === "nem" && t.status === "staged"
+    ? "This filing has a staged draft; finish it from the review window or by staging again, then a person submits."
+    : "";
+
   return `
   <article class="item ${cls} track-card">
     <div class="item-title">
@@ -5063,13 +5401,17 @@ function trackCardHtml(t) {
     ${trackPrerequisitesHtml(t)}
     ${trackEssStepHtml(t)}
     <p style="margin:0 0 6px;font-size:12px">→ ${linkifyText(trackNextActionText(t))}</p>
+    ${trackStageGapsHtml(t)}
     ${captured ? `<p style="margin:0 0 4px">${captured} ${trackLink ? "&nbsp;·&nbsp; " + trackLink : ""}</p>` : (trackLink ? `<p style="margin:0 0 4px">${trackLink}</p>` : "")}
     ${t.recipeId && (t.recipeStatus === "complete" || t.recipeStatus === "recording")
       && !screenshotMisses.has(screenshotKey(state.selectedProjectId, t.recipeId, t.recipeStatus))
       ? `<div style="margin:6px 0 4px" data-shot-wrap><a href="/api/projects/${esc(state.selectedProjectId)}/portal-runs/${esc(t.recipeId)}/review-screenshot" target="_blank" rel="noopener" title="Open the full-size capture"><img src="/api/projects/${esc(state.selectedProjectId)}/portal-runs/${esc(t.recipeId)}/review-screenshot" alt="Auto-captured portal page" class="review-shot" style="max-width:100%;border:1px solid var(--border);border-radius:var(--radius-sm)" data-shot-key="${esc(screenshotKey(state.selectedProjectId, t.recipeId, t.recipeStatus))}" onerror="window.__noteMissingReviewShot(this)" /></a><p class="muted" style="font-size:11px;margin:2px 0 0">${t.recipeStatus === "complete" ? "Portal review screen (auto-captured) — click for full size" : "Last captured page — recording not complete. If this is a login page, add this portal's login under “Manage logins” and re-stage."}</p></div>` : ""}
     <div class="track-actions">
       <button type="button" class="secondary" data-track-stage="${esc(t.type)}" title="Auto-fill this filing's portal up to the final review screen — you submit manually"><i data-lucide="bot"></i><span>Stage in portal</span></button>
-      <button type="button" class="secondary" data-track-approve="${esc(t.type)}" title="Your approval of THIS run lets the bot click the portal's application submit (needs the server switch PORTAL_ALLOW_FINAL_SUBMIT=1 and a recipe recorded through submit; otherwise it stages to review for you). Never pays fees; stops for CAPTCHA/MFA."><i data-lucide="check-check"></i><span>Approve &amp; auto-submit</span></button>
+      ${approveHeld
+        ? `<button type="button" class="secondary" data-track-approve="${esc(t.type)}" disabled aria-disabled="true" title="${esc(approveHeld)}"><i data-lucide="check-check"></i><span>Approve &amp; auto-submit</span></button>
+      <span class="muted" style="font-size:11px" data-track-approve-held>${esc(approveHeld)}</span>`
+        : `<button type="button" class="secondary" data-track-approve="${esc(t.type)}" title="Starts its own run from the start of the application. Your approval of THIS run lets the bot click the portal's application submit (needs the server switch PORTAL_ALLOW_FINAL_SUBMIT=1 and a recipe recorded through submit; otherwise it stops at review for you). Never pays fees; stops for CAPTCHA/MFA."><i data-lucide="check-check"></i><span>Approve &amp; auto-submit</span></button>`}
       ${t.signatureRequest && t.signatureRequest.state === "awaiting_signature_request"
         ? `<button type="button" class="secondary" data-track-request-signatures="${esc(t.type)}" title="The last run stopped in front of the utility portal's Request Signatures. Your approval of THIS run lets the bot click it once: the utility emails the homeowner a DocuSign request. It files nothing; the application is submitted only after the homeowner signs."><i data-lucide="pen-line"></i><span>Approve &amp; request signatures</span></button>`
         : ""}
@@ -5143,7 +5485,8 @@ function renderSubmittalTracks() {
   // "Utility net metering (NEM) / interconnection", "… interconnection + export credit (net
   // billing …)", "… interconnection only …", or "… (net-metering program not yet confirmed)");
   // the header repeats that phrase and falls back to the neutral "interconnection".
-  wrap.innerHTML = group(utilityGroupTitle(utility), utility) + group("AHJ — Permit(s)", permits);
+  wrap.innerHTML = group(utilityGroupTitle(utility), utility) + group("AHJ — Permit(s)", permits) + closeoutGroupHtml();
+  bindCloseoutMilestones(wrap);
 
   wrap.querySelectorAll("button[data-track-submit]").forEach((btn) => {
     btn.addEventListener("click", () => markSubmittalTrack(btn.dataset.trackSubmit));
@@ -5159,10 +5502,7 @@ function renderSubmittalTracks() {
     btn.addEventListener("click", () => saveTrackIssuer(btn.dataset.trackIssuerClear, "", btn));
   });
   wrap.querySelectorAll("button[data-track-approve]").forEach((btn) => {
-    btn.addEventListener("click", () => {
-      if (!confirm("Approve & auto-submit this filing?\n\nThis is your approval of THIS run, recorded under your name: with the server's PORTAL_ALLOW_FINAL_SUBMIT switch on and a recipe recorded through submit, the bot clicks the portal's application submit (never fee payment) and stops for any CAPTCHA/MFA. If the switch is off or the recipe stops short, it stages to the review screen for you to submit.")) return;
-      stageSubmittalTrack(btn.dataset.trackApprove, btn, true);
-    });
+    btn.addEventListener("click", () => approveAndAutoSubmitTrack(btn.dataset.trackApprove, btn));
   });
   wrap.querySelectorAll("button[data-track-request-signatures]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -5195,6 +5535,9 @@ function renderSubmittalTracks() {
   });
   wrap.querySelectorAll("button[data-track-stage]").forEach((btn) => {
     btn.addEventListener("click", () => stageSubmittalTrack(btn.dataset.trackStage, btn));
+  });
+  wrap.querySelectorAll("a[data-stage-gap-open]").forEach((a) => {
+    a.addEventListener("click", (ev) => { ev.preventDefault(); openStageGap(a.dataset.stageGapOpen, a.dataset.stageGapKey); });
   });
   wrap.querySelectorAll("button[data-track-open-recorder]").forEach((btn) => {
     btn.addEventListener("click", () => launchTrackRecorder(btn.dataset.trackOpenRecorder, btn.dataset.scope, btn));
@@ -5230,17 +5573,159 @@ function renderSubmittalTracks() {
   if (window.lucide) window.lucide.createIcons();
 }
 
-async function stageSubmittalTrack(type, btn, autoSubmit = false, extra = null) {
+// APPROVE & AUTO-SUBMIT NAMES A PERSON (#422). The owner's "click Stage and Submit from the CRM and
+// it does it all" (2026-10-31) makes this button the team's primary path. With sign-in off the
+// server records an approval only under a name the dashboard sends; this button used to send none,
+// so every click staged to review after promising the submit. Now: with sign-in off the person types
+// (or confirms, prefilled from the last name typed in this browser) their name for THIS run, exactly
+// as the signature-request button asks; a blank or cancelled name stages a plain run and says so,
+// never a nameless approval and never a default name. With sign-in on the server records the
+// signed-in person and ignores any name sent. Nothing here decides a click: the server's gate
+// (mayClickFinalSubmit / automaticSubmitRefusals) is unchanged.
+const APPROVE_AUTO_SUBMIT_LEDE = "Approve & auto-submit this filing?\n\nThis is your approval of THIS run, recorded under your name. It starts its own run from the start of the application; it does not submit an application an earlier Stage left on the portal. The bot clicks the portal's application submit (never fee payment, and it stops for any CAPTCHA/MFA) only when all three hold: a named approver, the server's PORTAL_ALLOW_FINAL_SUBMIT switch on, and a recipe recorded through submit for this portal. Otherwise it stops at the review screen for you to submit; that stop is not a failure.";
+const APPROVE_HELD_BY_STAGED_DRAFT = "This filing has a staged draft; finish it from the review window or by staging again, then a person submits.";
+// The name namedPersonConsent remembers: one person, one name per browser.
+const APPROVER_NAME_KEY = "feeConfirmName";
+
+// THE APPROVAL SHEET (#486). The approve prompt was a fixed paragraph that showed none of the values
+// about to be filed, so the legality check (NEM_OPERATOR_RUNBOOK §3) meant opening several panels and
+// a wrong-bill or wrong-size job could be approved unseen. The prompt is now one screen: the replay's
+// own values for THIS filing (GET /api/projects/:id/approval-sheet — the account and meter arrive
+// masked to the last 4, never whole), each with its source, and every disagreement with the bill or
+// the plan set listed first, in red. Approving is still the same single action: this resolves
+// true/false exactly where confirm() did, and the name prompt, the request and the server's gate
+// (mayClickFinalSubmit / automaticSubmitRefusals) are unchanged. If the sheet cannot be read (an older
+// server, a network error) the plain confirm is shown and says so: the sheet never blocks an approval.
+function approvalSheetHtml(sheet, recordedAs) {
+  const issues = Array.isArray(sheet.issues) ? sheet.issues : [];
+  const red = issues.filter((i) => i.kind === "mismatch" || i.kind === "missing");
+  const notes = issues.filter((i) => i.kind === "note");
+  const issueList = (list, color) => `<ul style="margin:4px 0 0 18px;padding:0;color:${color}">${list.map((i) => `<li>${esc(i.text)}</li>`).join("")}</ul>`;
+  const rows = (Array.isArray(sheet.rows) ? sheet.rows : []).map((r) => {
+    const bad = r.check === "mismatch" || r.check === "missing";
+    const value = r.value ? esc(r.value) : `<span style="color:var(--destructive)">Not on file</span>`;
+    const check = r.check === "match" ? `<div class="muted" style="font-size:12px;color:var(--ink-pass)">✓ ${esc(r.checkNote || "Matches")}</div>`
+      : r.check === "mismatch" ? `<div style="font-size:12px;color:var(--destructive)">✗ ${esc(r.checkNote || "Does not match")}</div>` : "";
+    return `<tr data-approval-row="${esc(r.key)}"${bad ? ` style="background:var(--tint-fail)"` : ""}>
+      <th scope="row" style="text-align:left;padding:6px 10px 6px 0;vertical-align:top;white-space:nowrap">${esc(r.label)}</th>
+      <td style="padding:6px 10px 6px 0;vertical-align:top">${r.value && r.masked ? `<span class="mono">${value}</span>` : value}${check}</td>
+      <td class="muted" style="padding:6px 0;vertical-align:top;font-size:12px">${esc(r.sourceLabel || "")}</td>
+    </tr>`;
+  }).join("");
+  return `${red.length
+      ? `<div data-approval-mismatches style="border:1px solid var(--edge-fail);background:var(--tint-fail);color:var(--ink-fail);border-radius:var(--radius-sm);padding:10px 12px"><strong>${red.length === 1 ? "1 thing disagrees or is missing" : `${red.length} things disagree or are missing`} — check before approving</strong>${issueList(red, "var(--ink-fail)")}</div>`
+      : `<div data-approval-clean style="border:1px solid var(--edge-pass);background:var(--tint-pass);color:var(--ink-pass);border-radius:var(--radius-sm);padding:10px 12px">No disagreement found between the project, the bill and the plan set.</div>`}
+    ${notes.length ? `<div data-approval-notes style="border:1px solid var(--edge-warn);background:var(--tint-warn);border-radius:var(--radius-sm);padding:10px 12px"><strong>Worth a look</strong>${issueList(notes, "inherit")}</div>` : ""}
+    <table style="width:100%;border-collapse:collapse"><thead><tr><th style="text-align:left" class="muted">Field</th><th style="text-align:left" class="muted">What will be filed</th><th style="text-align:left" class="muted">Source</th></tr></thead><tbody>${rows}</tbody></table>
+    <p class="muted" style="font-size:12px;white-space:pre-line">${esc(APPROVE_AUTO_SUBMIT_LEDE.replace(/^Approve & auto-submit this filing\?\n\n/, ""))}</p>
+    ${recordedAs ? `<p style="margin:0"><strong>Recorded as:</strong> ${esc(recordedAs)}</p>` : ""}`;
+}
+
+async function confirmApprovalSheet(type, recordedAs = "") {
+  let sheet = null;
+  try {
+    const res = await api(`/api/projects/${state.selectedProjectId}/approval-sheet?track=${encodeURIComponent(type)}`);
+    sheet = res && res.sheet && Array.isArray(res.sheet.rows) ? res.sheet : null;
+  } catch { sheet = null; }
+  if (!sheet) {
+    return confirm(`${APPROVE_AUTO_SUBMIT_LEDE}\n\n(The approval sheet could not be loaded: check the values on the project before approving.)${recordedAs ? `\n\nRecorded as: ${recordedAs}` : ""}`);
+  }
+  let modal = document.getElementById("approvalSheetModal");
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = "approvalSheetModal";
+    modal.className = "modal";
+    modal.hidden = true;
+    modal.setAttribute("role", "dialog");
+    modal.setAttribute("aria-modal", "true");
+    modal.setAttribute("aria-labelledby", "approvalSheetTitle");
+    document.body.appendChild(modal);
+  }
+  modal.innerHTML = `<div class="modal-card modal-card-wide">
+      <div class="modal-head"><h2 id="approvalSheetTitle" tabindex="-1">Approve &amp; auto-submit: ${esc(type === "nem" ? "the utility (NEM) application" : `the ${humanize(type).toLowerCase()} permit`)}</h2></div>
+      <div class="modal-body modal-body-stack">${approvalSheetHtml(sheet, recordedAs)}</div>
+      <div class="actions" style="display:flex;gap:8px;justify-content:flex-end;padding:12px 20px;border-top:1px solid var(--line)">
+        <button type="button" class="secondary" data-approval-cancel>Cancel</button>
+        <button type="button" class="primary" data-approval-approve>Approve &amp; auto-submit</button>
+      </div>
+    </div>`;
+  modal.hidden = false;
+  return new Promise((resolve) => {
+    const done = (answer) => {
+      modal.hidden = true;
+      document.removeEventListener("keydown", onKey, true);
+      resolve(answer);
+    };
+    const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); done(false); } };
+    document.addEventListener("keydown", onKey, true);
+    modal.querySelector("[data-approval-cancel]").addEventListener("click", () => done(false));
+    modal.querySelector("[data-approval-approve]").addEventListener("click", () => done(true));
+    modal.addEventListener("click", (e) => { if (e.target === modal) done(false); }, { once: true });
+    const title = modal.querySelector("#approvalSheetTitle");
+    if (title && title.focus) title.focus();
+  });
+}
+
+async function approveAndAutoSubmitTrack(type, btn) {
+  if (!state.selectedProjectId || !type) return;
+  // The card holds the button while a NEM draft is staged (#435); a click from a card drawn before
+  // the Stage finished is held here too, never a second run on the account.
+  const track = (state.submittalTracks || []).find((t) => t.type === type);
+  if (track && track.type === "nem" && track.status === "staged") { showMessage(APPROVE_HELD_BY_STAGED_DRAFT, "warning"); return; }
+  const auth = await authForDecision();
+  if (auth && auth.enabled) {
+    if (!(await confirmApprovalSheet(type, (auth.user && (auth.user.name || auth.user.email)) || "you"))) return;
+    return stageSubmittalTrack(type, btn, true);
+  }
+  if (!(await confirmApprovalSheet(type))) return;
+  let last = "";
+  try { last = localStorage.getItem(APPROVER_NAME_KEY) || ""; } catch { last = ""; }
+  const typed = prompt("Your name, recorded as the approver of this run:", last);
+  const approverName = String(typed == null ? "" : typed).trim();
+  if (!approverName) {
+    // No name, no approval: a plain run that stops at review, and the operator is told so.
+    return stageSubmittalTrack(type, btn, false, null, { noApproval: true });
+  }
+  try { localStorage.setItem(APPROVER_NAME_KEY, approverName); } catch { /* per-viewer convenience only */ }
+  return stageSubmittalTrack(type, btn, true, { approverName });
+}
+
+// THREE OUTCOMES, THREE LINES (#422): filed by automation under a named approval; stopped at review
+// with the gate's own reason (not a failure); or no approval recorded. A plain Stage keeps its line.
+function stagedResultLine(type, result, { autoSubmit = false, approvalMissing = false, approvedBy = "" } = {}) {
+  const label = humanize(type);
+  if (result && result.status === "submitted") {
+    return `${label} filed by automation under ${approvedBy || "your"}${approvedBy ? "'s" : ""} approval of this run (application submit only — no fees paid). Capture/verify the record number below.`;
+  }
+  if (approvalMissing) return `${label}: ${NO_APPROVAL_RECORDED_TEXT}`;
+  if (autoSubmit) {
+    const reasons = result && Array.isArray(result.autoSubmitDeclined) && result.autoSubmitDeclined.length
+      ? result.autoSubmitDeclined.join("; ")
+      : (result && result.message) || "the run did not reach the recorded submit";
+    return `${label} stopped at review: ${reasons}. Nothing was filed and this is not a failure — verify every field, then submit manually in the portal and capture the number here.`;
+  }
+  return `${label} staged to final review. Verify every field, then submit manually in the portal and capture the number here.`;
+}
+
+const NO_APPROVAL_RECORDED_TEXT = "No approval recorded (no name given); staged to the review screen for your manual submit.";
+
+async function stageSubmittalTrack(type, btn, autoSubmit = false, extra = null, ui = null) {
   if (!state.selectedProjectId || !type) return;
   if (btn) { btn.disabled = true; }
+  const named = extra && typeof extra.approverName === "string" && extra.approverName ? ` under ${extra.approverName}'s approval` : "";
   showMessage(autoSubmit
-    ? `Approving ${humanize(type)} — replaying the portal; it will submit only if this portal is trusted, and never pays fees…`
-    : `Staging ${humanize(type)} in its portal — automation stops at the final review screen for your manual submit…`, "info");
+    ? `Approving ${humanize(type)}${named} — replaying the portal; it files only if the switch is on and the recipe reaches submit, and never pays fees…`
+    : ui && ui.noApproval
+      ? `No approval recorded (no name given) — staging ${humanize(type)} to the review screen for your manual submit…`
+      : `Staging ${humanize(type)} in its portal — automation stops at the final review screen for your manual submit…`, "info");
   try {
     // Staging runs as a background job (202 + jobId); poll to completion, then refetch detail.
-    const { jobId } = await api(`/api/projects/${state.selectedProjectId}/prepare-submission`, {
+    const { jobId, finalSubmitApproval } = await api(`/api/projects/${state.selectedProjectId}/prepare-submission`, {
       method: "POST", body: JSON.stringify({ track: type, autoSubmit, ...(extra || {}) }),
     });
+    // The server's answer, not the button's hope: an approval exists only when THIS request minted one.
+    const approvalMissing = (ui && ui.noApproval) || (autoSubmit && finalSubmitApproval && finalSubmitApproval.recorded === false);
+    const approvedBy = autoSubmit && finalSubmitApproval && finalSubmitApproval.recorded ? String(finalSubmitApproval.approver || "") : "";
     const job = await waitForStagingJob(jobId);
     if (job.status === "failed") {
       showMessage(job.error || `Could not stage ${type}.`, "error");
@@ -5269,9 +5754,7 @@ async function stageSubmittalTrack(type, btn, autoSubmit = false, extra = null) 
     if (detail && detail.project) state.detail = detail;
     await loadSubmittalTracks();
     renderDetail();
-    showMessage(job.result && job.result.status === "submitted"
-      ? `${humanize(type)} submitted by the bot under your approval of this run (application submit only — no fees paid). Capture/verify the record number below.`
-      : `${humanize(type)} staged to final review. Verify every field, then submit manually in the portal and capture the number here.`, "info");
+    showMessage(stagedResultLine(type, job.result, { autoSubmit, approvalMissing, approvedBy }), approvalMissing ? "warning" : "info");
   } catch (err) {
     showMessage(err.message || `Could not stage ${type}.`, "error");
   } finally {
@@ -5300,15 +5783,15 @@ function applyAutopilotState(s) {
     badge.title = s.message || "";
   }
   const approveBtn = $("approveSubmitBtn");
+  // ONE DOOR (#423): the rail's Approve & auto-submit is the track card's button for the newest
+  // draft's filing (s.approveTrack), held exactly where the card holds it (#435).
+  const approveOff = s.canApprove ? railApproveHold(s) : (s.approveDisabledReason
+    || (s.blockers && s.blockers.length
+      ? `Blocked: ${reasonList(s.blockers.map((b) => b.detail))}`
+      : "Available once the project is staged to the portal review screen."));
   if (approveBtn) {
-    approveBtn.disabled = !s.canApprove;
-    const approveOff = s.canApprove ? "" : (s.approveDisabledReason
-      || (s.blockers && s.blockers.length
-        ? `Blocked: ${reasonList(s.blockers.map((b) => b.detail))}`
-        : "Available once the project is staged to the portal review screen."));
-    approveBtn.title = s.canApprove
-      ? "Authorize and file. The system completes the portal submit (or you finish it in the portal)."
-      : approveOff;
+    approveBtn.disabled = Boolean(approveOff);
+    approveBtn.title = approveOff || RAIL_APPROVE_TITLE;
     if (approveBtn.dataset) approveBtn.dataset.disabledReason = approveOff;
   }
   // S8 — "Stage portals" is switched off when the server says a run would do nothing useful
@@ -5326,7 +5809,8 @@ function applyAutopilotState(s) {
   if (offEl && typeof offEl.replaceChildren === "function") {
     const lines = [];
     if (typeof s.canStage === "boolean" && !s.canStage) lines.push(`Stage portals is off: ${s.stageDisabledReason || "staging is not available right now."}`);
-    if (!s.canApprove && s.approveDisabledReason) lines.push(`Approve & Submit is off: ${s.approveDisabledReason}`);
+    if (!s.canApprove && s.approveDisabledReason) lines.push(`Approve & auto-submit is off: ${s.approveDisabledReason}`);
+    else if (s.canApprove && approveOff) lines.push(`Approve & auto-submit is off: ${approveOff}`);
     offEl.replaceChildren(...lines.map((line) => { const li = document.createElement("li"); li.textContent = line; return li; }));
     offEl.hidden = lines.length === 0;
   }
@@ -5498,7 +5982,7 @@ async function startAutopilot() {
   try {
     await api(`/api/projects/${state.selectedProjectId}/autopilot/start`, { method: "POST", body: "{}" });
     const s = await pollAutopilot();
-    if (s && s.phase === "awaiting_approval") showMessage("Staged to portal review. Verify, then click Approve & Submit to file.", "info");
+    if (s && s.phase === "awaiting_approval") showMessage("Staged to portal review. Verify every field, then click its submit on the portal yourself and capture the number here.", "info");
     else if (s && s.phase === "blocked") showMessage(`Autopilot blocked: ${(s.blockers || []).map((b) => String(b.detail || "").trim().replace(/[.;\s]+$/, "")).filter(Boolean).join("; ")}.`, "error");
     else if (s && s.phase === "failed") showMessage(s.message || "Staging failed — see the portal run.", "error");
   } catch (err) {
@@ -5510,25 +5994,107 @@ async function startAutopilot() {
   }
 }
 
+// THE RAIL'S APPROVE IS THE CARD'S APPROVE (#423). It used to post /autopilot/approve, which on
+// every real portal records an approval and files nothing, under a label ("Approve & Submit") an
+// operator reads as the track card's "Approve & auto-submit", which may file. Now there is one
+// approval action with one meaning: this button opens the card's own door for the newest staged
+// draft's filing (state.autopilot.approveTrack) — approveAndAutoSubmitTrack: the confirm, the
+// approver prompt with sign-in off, then prepare-submission { track, autoSubmit: true,
+// approverName }, with the card's refusals (#435: held while a NEM draft is staged). It decides no
+// click: the server's gate (mayClickFinalSubmit / automaticSubmitRefusals,
+// PORTAL_ALLOW_FINAL_SUBMIT, the recipe shape) is the one answer, unchanged. /autopilot/approve
+// stays on the server as it was; no dashboard button posts to it.
+const RAIL_APPROVE_TITLE = "Same as the track card's Approve & auto-submit, for the newest staged draft's filing. It starts its own run from the start of the application; your approval of THIS run lets the bot click the portal's application submit only with the server switch PORTAL_ALLOW_FINAL_SUBMIT=1 and a recipe recorded through submit, otherwise it stops at review for you. Never pays fees; stops for CAPTCHA/MFA.";
+const RAIL_APPROVE_NO_TRACK = "This draft is not one filing's track; approve it from its track card.";
+
+/** The card's hold for the filing the rail's Approve & auto-submit acts on ("" = none), asked only
+ *  once the server says the draft is approvable (canApprove). */
+function railApproveHold(s) {
+  if (!s || !s.approveTrack) return RAIL_APPROVE_NO_TRACK;
+  // An awaiting NEM draft IS a staged NEM track: the card's #435 hold, in the card's words.
+  if (s.approveTrack === "nem") return APPROVE_HELD_BY_STAGED_DRAFT;
+  return "";
+}
+
 async function approveAndSubmit() {
   if (!state.selectedProjectId) return;
-  if (!confirm("Authorize this regulatory submission? This records your approval and files (or stages for your final click in) the portal.")) return;
   const btn = $("approveSubmitBtn");
-  btn.disabled = true;
-  showMessage("Approval recorded — completing the portal submission…", "info");
+  const s = state.autopilot;
+  const off = !s || !s.canApprove
+    ? ((s && s.approveDisabledReason) || "Available once the project is staged to the portal review screen.")
+    : railApproveHold(s);
+  if (off) { showMessage(off, "warning"); return; }
+  if (btn) btn.disabled = true;
   try {
-    const { state: s } = await api(`/api/projects/${state.selectedProjectId}/autopilot/approve`, { method: "POST", body: "{}" });
-    applyAutopilotState(s);
-    if (state.detail) state.detail = await api(`/api/projects/${state.selectedProjectId}`);
-    renderDetail();
-    // A toast disappears; the banner renderDetail just drew does not. Say the same thing both
-    // places and point at the banner, so an operator who blinks still has the instruction.
-    showMessage(s.phase === "submitted"
-      ? "Approved & submitted — confirmation captured."
-      : "Approval recorded — NOT submitted. Open the portal, click its submit yourself, then use Capture Confirmation. The banner at the top of this project keeps the instruction.", "warning");
+    await approveAndAutoSubmitTrack(state.autopilot.approveTrack, null);
+  } finally {
+    // Re-enable only what the server allows now, never blindly.
+    await refreshAutopilot();
+  }
+}
+
+// ----- Closeout milestones (#497): installed, final passed, PTO requested, PTO granted -----
+// No portal reading produces these yet (the finals / PTO automation is #495 / #496), so a person
+// records them here. They fill the client's timeline on the status page and tracker; the three
+// marked "emails the client" send the client update once, the first time they are recorded.
+async function loadProjectMilestones() {
+  if (!state.selectedProjectId) { state.projectMilestones = null; return; }
+  try {
+    const res = await api(`/api/projects/${state.selectedProjectId}/milestones`);
+    state.projectMilestones = res.milestones || [];
+  } catch {
+    state.projectMilestones = null;
+  }
+}
+
+function closeoutGroupHtml() {
+  const milestones = state.projectMilestones;
+  if (!milestones || !milestones.length) return "";
+  const today = new Date().toISOString().slice(0, 10);
+  const rows = milestones.map((m) => {
+    const key = esc(m.key);
+    const recorded = m.at
+      ? `<span>${statusBadge("done")} ${esc(new Date(m.at).toLocaleDateString())}${m.recordedBy ? ` <span class="muted">by ${esc(m.recordedBy)}</span>` : ""}</span>
+         <button class="ghost" type="button" data-milestone-clear="${key}">Clear</button>`
+      : `<input type="date" max="${esc(today)}" value="${esc(today)}" data-milestone-date="${key}" aria-label="${esc(m.label)} date" />
+         <button class="secondary" type="button" data-milestone-record="${key}">Record</button>`;
+    return `
+      <article class="item">
+        <div class="item-title"><span>${esc(m.label)}</span>${m.clientFacing ? `<span class="muted">emails the client</span>` : ""}</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;font-size:12px">${recorded}</div>
+      </article>`;
+  }).join("");
+  return `<div class="track-group"><div class="track-group-head">Closeout — install, final, PTO</div>${rows}</div>`;
+}
+
+function bindCloseoutMilestones(wrap) {
+  wrap.querySelectorAll("button[data-milestone-record]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const key = btn.dataset.milestoneRecord;
+      const input = Array.from(wrap.querySelectorAll("input[data-milestone-date]")).find((el) => el.dataset.milestoneDate === key);
+      saveProjectMilestone(key, String(input?.value || "").trim(), btn, "POST");
+    });
+  });
+  wrap.querySelectorAll("button[data-milestone-clear]").forEach((btn) => {
+    btn.addEventListener("click", () => saveProjectMilestone(btn.dataset.milestoneClear, "", btn, "DELETE"));
+  });
+}
+
+async function saveProjectMilestone(key, at, btn, method) {
+  if (!state.selectedProjectId || !key) return;
+  if (btn) btn.disabled = true;
+  try {
+    const base = `/api/projects/${state.selectedProjectId}/milestones`;
+    const res = method === "DELETE"
+      ? await api(`${base}/${encodeURIComponent(key)}`, { method: "DELETE" })
+      : await api(base, { method: "POST", body: JSON.stringify({ milestone: key, at }) });
+    state.projectMilestones = res.milestones || state.projectMilestones;
+    renderSubmittalTracks();
+    const label = (state.projectMilestones || []).find((m) => m.key === key)?.label || humanize(key);
+    showMessage(method === "DELETE" ? `${label} cleared.` : `${label} recorded.`, "info");
   } catch (err) {
-    showMessage(err.message || "Could not approve.", "error");
-    btn.disabled = !(state.autopilot && state.autopilot.canApprove);
+    if (btn) btn.disabled = false;
+    showMessage(err.message || "Could not save the milestone.", "error");
   }
 }
 
@@ -5724,6 +6290,9 @@ function renderRunbook() {
 
 function renderHandoffPacket() {
   const packet = state.handoffPacket;
+  // #491: the Send button lives in the rail, and only a handed-off project offers it.
+  const handoffActions = $("handoffActions");
+  if (handoffActions) handoffActions.hidden = !(state.detail && state.detail.project && state.detail.project.status === "handoff_ready");
   if (!packet) {
     $("handoffPacketStatus").textContent = "not synced";
     $("handoffPacket").innerHTML = `<p class="muted">Open a project to generate the project handoff packet.</p>`;
@@ -6739,6 +7308,7 @@ function renderFilledForms(projectId) {
         </div>` : ""}
       ${builtIn ? `<p class="muted">Built-in map written for this exact official revision (matched by the blank's fingerprint) — no mapping verification needed. Review the filled PDF before filing.</p>` : ""}
       ${ok && !isStored && !f.signaturesLocked ? `<p class="muted"><button type="button" class="secondary" data-detect-sign="${esc(f.formId)}" style="font-size:12px">Detect signature lines (AI)</button> — stamp your stored signature on this form.</p>` : ""}
+      ${ok ? `<p class="muted"><button type="button" class="secondary" data-verify-vision="${esc(f.formId)}" style="font-size:12px">Verify fill with vision</button> — reads the filled PDF back and lists each value under the printed label it sits beside. Reports only; it never changes the form.</p><div data-vision-result="${esc(f.formId)}"></div>` : ""}
       ${ok && !isStored && f.signaturesLocked ? `<p class="muted">✓ Built-in form — signature + date auto-placed on the authorized-signature line. No verification needed.</p>` : ""}
       ${f.documentStale ? `<p class="muted"><strong>This blank dates itself “${esc(f.documentDate)}”</strong> — over two years old. Re-check the AHJ's current forms page before filing${f.sourceUrl ? ` (<a href="${esc(f.sourceUrl)}" target="_blank" rel="noopener noreferrer">source</a>)` : ""}. Check any printed fee rates against the current schedule.</p>` : ""}
       ${extra ? `<p class="muted">${esc(extra)}</p>` : ""}
@@ -7146,6 +7716,32 @@ function bindFilledFormControls() {
   document.querySelectorAll("[data-verify-form]").forEach((b) => b.addEventListener("click", () => verifyFilledForm(b.getAttribute("data-verify-form"))));
   document.querySelectorAll("[data-remap-form]").forEach((b) => b.addEventListener("click", () => remapFilledForm(b.getAttribute("data-remap-form"), b)));
   document.querySelectorAll("[data-detect-sign]").forEach((b) => b.addEventListener("click", () => detectRegistrySignatures(b.getAttribute("data-detect-sign"))));
+  document.querySelectorAll("[data-verify-vision]").forEach((b) => b.addEventListener("click", () => verifyFillWithVision(b.getAttribute("data-verify-vision"), b)));
+}
+
+/** The "Verify fill with vision" table (issue #428): one row per filled value, what vision read and
+ *  under which printed label, and the verdict. Shared by the filled-form card and nothing else. */
+function fillVisionTableHtml(report) {
+  const rows = (report.rows || []).map((r) => `<tr><td>${esc(String((r.page ?? 0) + 1))}</td><td>${esc(r.label || "—")}</td><td>${esc(r.intended)}</td><td>${esc(r.read || "—")}</td><td>${esc(r.readUnder || "—")}</td><td><strong>${esc(r.verdict)}</strong></td></tr>`).join("");
+  const extra = (report.unexpected || []).map((u) => `<tr><td>${esc(String((u.page ?? 0) + 1))}</td><td>—</td><td>—</td><td>${esc(u.read)}</td><td>${esc(u.label || "—")}</td><td><strong>not intended</strong></td></tr>`).join("");
+  const skipped = (report.skippedPages || []).map((p) => `<li>Page ${esc(String(p.page + 1))}: ${esc(p.reason)}</li>`).join("");
+  const wrong = (report.rows || []).filter((r) => r.verdict !== "right" && r.verdict !== "read (no intended label)").length;
+  return `<p class="muted">${esc(`${(report.checkedPages || []).length} page(s) read, ${report.calls || 0} vision call(s). ${wrong ? `${wrong} value(s) need a look.` : "Every intended value read back under its label."}`)}</p>
+    ${skipped ? `<ul class="muted" style="margin:2px 0 6px 18px">${skipped}</ul>` : ""}
+    ${rows || extra ? `<table style="font-size:12px;border-collapse:collapse;width:100%"><thead><tr><th>Page</th><th>Printed label</th><th>Filled</th><th>Vision read</th><th>Read under</th><th>Verdict</th></tr></thead><tbody>${rows}${extra}</tbody></table>` : ""}`;
+}
+
+async function verifyFillWithVision(formId, btn) {
+  if (!formId || !state.selectedProjectId) return;
+  const out = document.querySelector(`[data-vision-result="${CSS.escape(formId)}"]`);
+  if (btn) btn.disabled = true;
+  if (out) out.innerHTML = `<p class="muted">Reading the filled form back with vision (one call per page)…</p>`;
+  try {
+    const report = await api(`/api/projects/${encodeURIComponent(state.selectedProjectId)}/filled-forms/${encodeURIComponent(formId)}/verify-vision`, { method: "POST", body: "{}" });
+    if (out) out.innerHTML = fillVisionTableHtml(report);
+  } catch (err) {
+    if (out) out.innerHTML = `<p class="muted">${esc(err.message || "Vision check failed.")}</p>`;
+  } finally { if (btn) btn.disabled = false; }
 }
 
 // Rebuild the filled forms after a change (verify/remap/detect) and refresh the
@@ -7403,27 +7999,190 @@ function portalSaysFor(target, checks) {
   return text ? { text, at: newest.createdAt } : null;
 }
 
+// RECORD STATUS FROM THE CARD (#411) — the words each pick posts, chosen so the classifier reads
+// them as that status. A bare "Issued" classifies as needs_human_review; "Permit issued" is the
+// issued reading. Pinned through the real classifier by backend/test/permitTargetCard.test.ts.
+// The words are only a reading: what it may finish is still readingMayFinishTrack's call.
+const PERMIT_STATUS_PICKS = [
+  { key: "issued", label: "Issued", text: "Permit issued" },
+  { key: "approved", label: "Approved", text: "Approved" },
+  { key: "in_review", label: "In review", text: "In review" },
+  { key: "corrections", label: "Corrections required", text: "Corrections required" },
+  { key: "fees_due", label: "Fees due", text: "Fees due" },
+  { key: "other", label: "Other (type it)", text: "" },
+];
+
+// The status text one card's Record form posts: the pick's words, or the operator's own for Other.
+function permitTargetStatusText(pickKey, otherText) {
+  if (pickKey === "other") return String(otherText || "").trim();
+  return (PERMIT_STATUS_PICKS.find((p) => p.key === pickKey) || { text: "" }).text;
+}
+
+// Only what the operator CHANGED goes in the PATCH. The card's frequency is the EFFECTIVE cadence
+// (an open filing reads 1 day whatever is stored), so sending every field back would rewrite a
+// stored 7 to 1 on every save of an untouched form.
+function permitTargetEditPatch(target, values) {
+  const patch = {};
+  for (const key of ["portalUrl", "trackingUrl", "applicationNumber", "permitNumber", "portalName"]) {
+    const value = String(values[key] ?? "").trim();
+    if (value !== String(target[key] ?? "").trim()) patch[key] = value;
+  }
+  const days = Number(values.checkFrequencyDays);
+  if (String(values.checkFrequencyDays ?? "").trim() !== "" && days !== Number(target.checkFrequencyDays)) patch.checkFrequencyDays = days;
+  if (typeof values.active === "boolean" && values.active !== (target.active !== false)) patch.active = values.active;
+  return patch;
+}
+
+// ONE TRACKED FILING'S CARD, with its own Edit and Record status (#411). Pure — lifted by
+// backend/test/permitTargetCard.test.ts. Every control carries THIS card's target id; the inputs are
+// found inside the card (data-edit-field / data-record-field), never by page-wide id, because the
+// cards repeat. `ui` says which form, if any, is open on this card (state, so a re-render keeps it).
+// THE ISSUED PERMIT / APPROVAL LETTER the monitor downloaded off this filing's record (#492), each
+// linked with its provenance ("downloaded from record X on date"), or the one line saying why none
+// is on file. Pinned by backend/test/portalIssuedDocuments.test.ts.
+function issuedDocumentsHtml(target) {
+  const docs = Array.isArray(target.issuedDocuments) ? target.issuedDocuments : [];
+  const what = target.targetType === "nem" ? "Approval letter" : "Issued permit";
+  if (docs.length) {
+    return `<p data-issued-docs><strong>${esc(what)}:</strong> ${docs.map((d) => `<a href="/api/projects/${encodeURIComponent(target.projectId)}/documents/${encodeURIComponent(d.documentId)}">${esc(d.filename)}</a> <span class="muted">· ${esc(d.provenance)}</span>`).join("; ")}</p>`;
+  }
+  if (target.issuedDocsGap) {
+    return `<p data-issued-docs-gap style="border-left:3px solid var(--warn, #b7791f);padding-left:6px"><strong>${esc(what)} not on file:</strong> ${esc(target.issuedDocsGap)}</p>`;
+  }
+  return "";
+}
+
+function permitTargetCardHtml(target, checks, ui) {
+  const id = esc(target.id);
+  const platformLabel = target.portalPlatform && target.portalPlatform !== "unknown" && target.portalPlatform !== "public_url"
+    ? `<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:var(--info);color:#fff;margin-left:6px">${esc(target.portalPlatform)}</span>`
+    : "";
+  const sourceLabel = ` · ${esc(permitTargetKindLabel(target))}`;
+  const said = portalSaysFor(target, checks);
+  const stopped = target.active === false;
+  const field = (key, label, value, type = "text") => `
+        <label style="display:block;font-size:12px;margin-top:6px">${esc(label)}
+          <input type="${type}" data-edit-field="${key}" value="${esc(value ?? "")}" style="width:100%"${type === "number" ? ` min="1" max="365" step="1"` : ""}>
+        </label>`;
+  const editForm = ui?.editing ? `
+      <div class="permit-target-edit" style="margin-top:8px">${field("portalUrl", "Portal / record URL (the monitor reads this)", target.portalUrl)}${field("trackingUrl", "Public status URL", target.trackingUrl)}${field("applicationNumber", "Application number", target.applicationNumber)}${field("permitNumber", "Permit number", target.permitNumber)}${field("portalName", "Portal name", target.portalName)}${field("checkFrequencyDays", "Check every (days) — an open filing is still read daily", target.checkFrequencyDays, "number")}
+        <label style="display:block;font-size:12px;margin-top:6px"><input type="checkbox" data-edit-field="active"${stopped ? "" : " checked"}> Keep checking this filing</label>
+        <div style="margin-top:8px">
+          <button type="button" data-target-action="save" data-target-id="${id}">Save</button>
+          <button type="button" class="secondary" data-target-action="cancel" data-target-id="${id}">Cancel</button>
+        </div>
+      </div>` : "";
+  const recordForm = ui?.recording ? `
+      <div class="permit-target-record" style="margin-top:8px">
+        <label style="display:block;font-size:12px">What the ${esc(target.targetType === "nem" ? "utility" : "jurisdiction")} says now
+          <select data-record-field="pick">${PERMIT_STATUS_PICKS.map((p) => `<option value="${esc(p.key)}">${esc(p.label)}</option>`).join("")}</select>
+        </label>
+        <label style="display:block;font-size:12px;margin-top:6px">Other — the status in your words
+          <input type="text" data-record-field="other" style="width:100%">
+        </label>
+        <div style="margin-top:8px">
+          <button type="button" data-target-action="record-save" data-target-id="${id}">Record status</button>
+          <button type="button" class="secondary" data-target-action="cancel" data-target-id="${id}">Cancel</button>
+        </div>
+      </div>` : "";
+  return `
+    <article class="item info" data-permit-target="${id}">
+      <div class="item-title"><span>${esc(target.portalName || target.jurisdiction || "Permit target")}${sourceLabel}</span>${statusBadge(target.latestOutcome || (stopped ? "not tracked" : "active"))}${platformLabel}</div>
+      ${said ? `<p><strong>Portal says:</strong> “${esc(said.text)}” <span class="muted">· read ${esc(new Date(said.at).toLocaleString())}</span></p>` : ""}
+      <p>${esc([target.applicationNumber && `Application ${target.applicationNumber}`, target.permitNumber && `Permit ${target.permitNumber}`].filter(Boolean).join(" | ") || "No application/permit number recorded yet.")}</p>
+      ${target.portalUrl ? `<p class="muted" style="word-break:break-all">${esc(target.portalUrl)}</p>` : ""}
+      ${target.trackingUrl && target.trackingUrl !== target.portalUrl ? `<p class="muted" style="word-break:break-all">Status link: ${esc(target.trackingUrl)}</p>` : ""}
+      ${target.readGap && !stopped ? `<p data-read-gap style="border-left:3px solid var(--warn, #b7791f);padding-left:6px"><strong>Can't read on its own:</strong> ${esc(target.readGap)}</p>` : ""}
+      ${issuedDocumentsHtml(target)}
+      <p class="muted">${stopped ? "Tracking stopped — the monitor no longer reads this filing." : `Checks every ${esc(target.checkFrequencyDays)} day(s) · Next: ${target.nextCheckAt ? esc(new Date(target.nextCheckAt).toLocaleString()) : "not scheduled"}`} · Source strategy: ${esc(target.portalPlatform || "auto")}</p>
+      ${ui?.editing || ui?.recording ? "" : `<div style="margin-top:6px">
+        <button type="button" class="secondary" style="font-size:12px" data-target-action="edit" data-target-id="${id}">Edit</button>
+        <button type="button" class="secondary" style="font-size:12px" data-target-action="record" data-target-id="${id}">Record status</button>
+      </div>`}${editForm}${recordForm}
+    </article>`;
+}
+
+// Delegated on #permitTargets (rebuilt on every render), registered once. The target id is the
+// clicked control's own — a Record on the second card is that card's filing, never targets[0].
+function handlePermitTargetClick(event) {
+  const el = event.target;
+  if (!(el instanceof Element)) return;
+  const button = el.closest("button[data-target-action]");
+  if (!button) return;
+  const targetId = button.dataset.targetId;
+  const action = button.dataset.targetAction;
+  const card = button.closest("article[data-permit-target]");
+  if (action === "edit" || action === "record") {
+    state.permitTargetEditing = action === "edit" ? targetId : null;
+    state.permitTargetRecording = action === "record" ? targetId : null;
+    renderPermitMonitor();
+    return;
+  }
+  if (action === "cancel") {
+    state.permitTargetEditing = null;
+    state.permitTargetRecording = null;
+    renderPermitMonitor();
+    return;
+  }
+  if (action === "save") {
+    const target = (state.detail?.permitCheckTargets || []).find((t) => t.id === targetId);
+    if (!target || !card) return;
+    const values = {};
+    for (const input of card.querySelectorAll("[data-edit-field]")) {
+      values[input.dataset.editField] = input.type === "checkbox" ? input.checked : input.value;
+    }
+    savePermitTargetEdit(targetId, permitTargetEditPatch(target, values));
+    return;
+  }
+  if (action === "record-save") {
+    const pick = card?.querySelector('[data-record-field="pick"]')?.value || "";
+    const statusText = permitTargetStatusText(pick, card?.querySelector('[data-record-field="other"]')?.value);
+    if (!statusText) {
+      showMessage("Type the status the portal shows, or pick one from the list.", "warning");
+      return;
+    }
+    // recordPermitStatus closes this form and re-renders on success.
+    recordPermitStatus("manual", targetId, statusText)
+      .catch((err) => showMessage(err.message || "Could not record the status.", "error"));
+  }
+}
+
+// PATCH one filing and re-render from what the server says it now is. A refusal (rule 5, a
+// non-web URL, a number cleared to nothing) is the server's own message, shown — never swallowed.
+async function savePermitTargetEdit(targetId, patch) {
+  if (!state.selectedProjectId) return;
+  if (!Object.keys(patch).length) {
+    state.permitTargetEditing = null;
+    renderPermitMonitor();
+    showMessage("Nothing changed on this filing.", "info");
+    return;
+  }
+  try {
+    state.detail = await api(`/api/projects/${state.selectedProjectId}/permit-targets/${encodeURIComponent(targetId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    });
+  } catch (err) {
+    showMessage(err.message || "Could not save this filing.", "error");
+    return;
+  }
+  state.permitTargetEditing = null;
+  showMessage("Filing updated.");
+  renderDetail();
+}
+
 function renderPermitMonitor() {
   const targets = state.detail.permitCheckTargets || [];
   const checks = state.detail.permitStatusChecks || [];
   const emailMatches = state.detail.emailProjectMatches || [];
   renderPermitStatusTargetPicker();
 
-  $("permitTargets").innerHTML = targets.length ? targets.map((target) => {
-    const platformLabel = target.portalPlatform && target.portalPlatform !== "unknown" && target.portalPlatform !== "public_url"
-      ? `<span style="font-size:11px;padding:1px 6px;border-radius:4px;background:var(--info);color:#fff;margin-left:6px">${esc(target.portalPlatform)}</span>`
-      : "";
-    const sourceLabel = ` · ${esc(permitTargetKindLabel(target))}`;
-    const said = portalSaysFor(target, checks);
-    return `
-    <article class="item info">
-      <div class="item-title"><span>${esc(target.portalName || target.jurisdiction || "Permit target")}${sourceLabel}</span>${statusBadge(target.latestOutcome || "active")}${platformLabel}</div>
-      ${said ? `<p><strong>Portal says:</strong> “${esc(said.text)}” <span class="muted">· read ${esc(new Date(said.at).toLocaleString())}</span></p>` : ""}
-      <p>${esc([target.applicationNumber && `Application ${target.applicationNumber}`, target.permitNumber && `Permit ${target.permitNumber}`].filter(Boolean).join(" | ") || "No application/permit number recorded yet.")}</p>
-      ${target.portalUrl ? `<p class="muted" style="word-break:break-all">${esc(target.portalUrl)}</p>` : ""}
-      <p class="muted">Checks every ${target.checkFrequencyDays} day(s) · Next: ${target.nextCheckAt ? esc(new Date(target.nextCheckAt).toLocaleString()) : "not scheduled"} · Source strategy: ${esc(target.portalPlatform || "auto")}</p>
-    </article>`;
-  }).join("") : `<p class="muted">No permit check targets yet.</p>`;
+  $("permitTargets").innerHTML = targets.length
+    ? targets.map((target) => permitTargetCardHtml(target, checks, {
+      editing: state.permitTargetEditing === target.id,
+      recording: state.permitTargetRecording === target.id,
+    })).join("")
+    : `<p class="muted">No permit check targets yet.</p>`;
 
   // The API returns up to 50 status checks and most are literal duplicates — a
   // monitor that runs every few days re-records "In review" until something
@@ -8757,9 +9516,12 @@ async function addPermitTarget() {
 // FIRST target — was the only behaviour, and on a project with a structural and an electrical
 // permit (Coos Bay: both, one stalled) it silently recorded every re-check against whichever
 // happened to be first. The stale panel always passes the target its row is about.
-async function recordPermitStatus(source = "manual", targetId = null) {
+// `cardStatusText` is a card's Record status pick (#411): the status comes from the card, not the
+// paste box, so the box and the form's number fields are neither read nor cleared.
+async function recordPermitStatus(source = "manual", targetId = null, cardStatusText = null) {
   if (!state.selectedProjectId) return;
-  const rawStatusText = source === "mock" ? "" : $("permitStatusText").value.trim();
+  const fromCard = cardStatusText !== null;
+  const rawStatusText = fromCard ? String(cardStatusText).trim() : source === "mock" ? "" : $("permitStatusText").value.trim();
   if (source === "manual" && !rawStatusText) {
     showMessage("Paste AHJ/portal status text before classifying.", "warning");
     return;
@@ -8768,8 +9530,10 @@ async function recordPermitStatus(source = "manual", targetId = null) {
   // The number fields above were filled from ONE filing (syncPermitForm, recorded in
   // state.permitFormFor). Sent with another filing's check they would stamp that filing's number
   // on this one's row; sent empty, the server records the chosen filing's own numbers.
-  const formIsChosen = !chosenId || state.permitFormFor === `${state.detail.project?.id || ""}|${chosenId}`;
-  state.detail = await api(`/api/projects/${state.selectedProjectId}/permit-checks`, {
+  const formIsChosen = !fromCard && (!chosenId || state.permitFormFor === `${state.detail.project?.id || ""}|${chosenId}`);
+  // `unreadable`: the check read nothing on a filing whose status is known, so the server recorded
+  // nothing (#412). Kept off state.detail — it is this call's answer, not part of the project.
+  const { unreadable, ...detail } = await api(`/api/projects/${state.selectedProjectId}/permit-checks`, {
     method: "POST",
     body: JSON.stringify({
       targetId: chosenId,
@@ -8779,8 +9543,10 @@ async function recordPermitStatus(source = "manual", targetId = null) {
       permitNumber: formIsChosen ? $("permitTrackingNumber").value : "",
     }),
   });
-  $("permitStatusText").value = "";
+  state.detail = detail;
+  if (!fromCard) $("permitStatusText").value = "";
   state.recheckTargetId = null;
+  state.permitTargetRecording = null;
   state.workflow = null;
   state.historicalReport = null;
   await loadOpsPlan();
@@ -8792,8 +9558,12 @@ async function recordPermitStatus(source = "manual", targetId = null) {
   // The new row is the CURE for a stale reading, so re-run the drift report: a mark that survives
   // a fresh check is noise, and one that vanishes without a check would be a lie.
   await loadStaleReadings();
+  // The newest row is NOT this check's when nothing was recorded — announcing it would say a read
+  // that found nothing came back "Issued". showMessage writes textContent, so the server's
+  // sentence needs no escaping.
   const latest = state.detail.permitStatusChecks?.[0];
-  showMessage(latest ? `Permit check classified: ${latest.statusLabel}` : "Permit check recorded.");
+  if (unreadable) showMessage(unreadable, "warning");
+  else showMessage(latest ? `Permit check classified: ${latest.statusLabel}` : "Permit check recorded.");
   renderDetail();
   await loadProjects();
 }
@@ -8908,7 +9678,7 @@ function uploadMboxFile(file) {
       }
       resolve(data);
     };
-    xhr.onerror = () => reject(new Error("Browser could not upload the selected MBOX file. Paste the local file path below and use Import Path."));
+    xhr.onerror = () => reject(new Error(`Browser could not upload the selected MBOX file.${mboxPathFallbackHint(" Paste the local file path below and use Import Path.")}`));
     xhr.onabort = () => reject(new Error("MBOX import was canceled."));
     setMboxProgress(1, `Starting upload for ${file.name} (${formatBytes(file.size)})...`);
     xhr.send(file);
@@ -8942,7 +9712,7 @@ async function importMbox(event) {
   } catch (err) {
     event.target.value = "";
     setMboxProgress(0, "Import failed.", true);
-    showMessage(`${err.message || "MBOX import failed."}\nIf the file is cloud-only, locked by Outlook, or too large for browser upload, paste its full local path and click Import Path.`, "error");
+    showMessage(`${err.message || "MBOX import failed."}${mboxPathFallbackHint("\nIf the file is cloud-only, locked by Outlook, or too large for browser upload, paste its full local path and click Import Path.")}`, "error");
   }
 }
 
@@ -9101,6 +9871,33 @@ async function captureConfirmation(event) {
       notes: $("confirmationNotes").value,
     }),
   });
+  await afterConfirmationCaptured();
+}
+
+// A person confirmed a record number read off the portal after their submit (#400, the next-step
+// panel's candidates): the same confirmation door, with the number and the link that was seen.
+async function confirmRecordCandidate(cand, button) {
+  if (button) button.disabled = true;
+  try {
+    state.detail = await api(`/api/portal-runs/${encodeURIComponent(cand.runId)}/capture-confirmation`, {
+      method: "POST",
+      body: JSON.stringify({
+        applicationNumber: cand.recordNumber,
+        recordLink: cand.recordLink || "",
+        submittedBy: "confirmed from the next-step panel",
+        notes: cand.source === "account_list"
+          ? "A person confirmed this number from the new rows in the portal's application list."
+          : "A person confirmed this number read off the portal's completion page.",
+      }),
+    });
+    await afterConfirmationCaptured();
+  } catch (err) {
+    showMessage(err.message || "Could not confirm the record number.", "error");
+    if (button) button.disabled = false;
+  }
+}
+
+async function afterConfirmationCaptured() {
   state.workflow = null;
   state.historicalReport = null;
   await loadOpsPlan();
@@ -9109,6 +9906,8 @@ async function captureConfirmation(event) {
   await loadProjectTimeline();
   await loadProcessMap();
   await loadInstallerPacket();
+  // The banner's answer changed too (the filing is in; a confirmed candidate is answered).
+  if (state.detail && state.detail.project && state.detail.project.id) await loadNextStep(state.detail.project.id);
   showMessage("Confirmation captured after human submit.");
   renderDetail();
   await loadProjects();
@@ -9123,6 +9922,25 @@ $("addOpsNoteBtn").addEventListener("click", addOpsNote);
 $("copyHandoffBtn").addEventListener("click", copyHandoff);
 $("copyRunbookBtn").addEventListener("click", copyRunbook);
 $("copyHandoffPacketBtn").addEventListener("click", copyHandoffPacket);
+// #491: email the installer handoff packet to the project's client now (first send or again).
+$("sendHandoffPacketBtn")?.addEventListener("click", async () => {
+  const p = state.detail?.project;
+  if (!p) { showMessage("Open a project first.", "warning"); return; }
+  const btnEl = $("sendHandoffPacketBtn");
+  btnEl.disabled = true;
+  try {
+    const res = await api(`/api/projects/${p.id}/handoff-packet/send`, { method: "POST", body: "{}" });
+    const docs = (res.attachments || []).length ? ` with ${res.attachments.join(", ")}` : "";
+    if (res.deliveryStatus === "sent") showMessage(`Handoff packet sent to ${res.recipient}${docs}.`);
+    else if (res.deliveryStatus === "draft") showMessage(`Handoff packet drafted for ${res.recipient}, not sent: mail is not set up on this server.`, "warning");
+    else showMessage(`Sending the handoff packet to ${res.recipient} failed: ${res.detail || "the mail server refused it"}.`, "error");
+    await selectProject(p.id);
+  } catch (err) {
+    showMessage(err.message || "Could not send the handoff packet.", "error");
+  } finally {
+    btnEl.disabled = false;
+  }
+});
 $("copyCommunicationDraftsBtn").addEventListener("click", copyCommunicationDrafts);
 // Tokenized read-only status page for the client — created on demand, then copied.
 // The same link is auto-included in automated client update emails.
@@ -9164,6 +9982,8 @@ $("permitStatusTarget")?.addEventListener("change", syncPermitForm);
 // The stale-reading panel renders inside #permitChecks and is rebuilt on every refresh, so its
 // re-check buttons are bound by delegation on the container, once.
 $("permitChecks").addEventListener("click", handleStaleRecheckClick);
+// Each tracked filing's Edit / Record status controls (#411), the same way: delegated, once.
+$("permitTargets").addEventListener("click", handlePermitTargetClick);
 // Mock Check removed for production: it recorded a FABRICATED status check on a
 // real project's permit history. Simulated checks live in tests, not the UI.
 $("mockPermitCheckBtn")?.addEventListener("click", () => recordPermitStatus("mock"));
@@ -9279,6 +10099,7 @@ async function handleBatchDrop(file) {
 // ----- Clients & contractor licensing -----
 const CLIENT_TEXT_FIELDS = [
   "companyName", "legalBusinessName", "dba", "contactName", "contactEmail", "phone", "billingStatus", "billingMode", "serviceFeeUsd",
+  "requestLinksAutoSend", "handoffAutoSend", "intakeTag", "intakeSenders",
   "ccbLicenseNumber", "ccbExpiration", "electricalLicenseNumber", "metroCityLicenseNumber",
   "electricalSupervisorName", "electricianLicenseNumber",
   "ein", "bondCarrier", "insuranceCarrier", "businessAddress", "businessCity", "businessState",
@@ -9687,6 +10508,10 @@ if ($("buildSplitBtn")) $("buildSplitBtn").addEventListener("click", buildDocume
 if ($("autofillSpecsBtn")) $("autofillSpecsBtn").addEventListener("click", autofillSpecs);
 if ($("genIntakeLinkBtn")) $("genIntakeLinkBtn").addEventListener("click", generateIntakeLink);
 if ($("saveManualEntryBtn")) $("saveManualEntryBtn").addEventListener("click", saveManualEntry);
+// Typing in the manual-entry form starts an edit against the version on screen (#440).
+for (const evt of ["input", "change"]) {
+  if ($("manualEntryForm")) $("manualEntryForm").addEventListener(evt, (e) => { if (e.target && e.target.id) noteProjectEdit(e.target.id); });
+}
 // Record manual stage open/close so a pinned-open stage (e.g. Submit) survives
 // re-renders. A summary click is user-only (programmatic el.open never fires it),
 // and the open state flips AFTER this handler, so the upcoming value is !el.open.
@@ -10426,16 +11251,21 @@ function editUser(userId) {
   $("u_role").value = user.role;
   $("u_color").value = user.color;
   renderUsersList();
+  staffSignInStatus("");
+  renderStaffSignIn();
 }
 
 // A NEW member is always created as an Operator (users.ts createUser — creation is not an
 // elevation path). Offering "Admin" on the Add form saved an Operator and still said "Saved.",
 // so the choice is shut on a new member and opens once they exist (promotion is an edit).
+// One exception (#431): a new member given a sign-in password is created through the admin-gated
+// POST /api/staff/logins, which takes the role, so Admin opens for that case only.
 function syncUserRoleChoice(isNew) {
+  const withLogin = !!isNew && newMemberGetsLogin();
   const admin = $("u_role")?.querySelector('option[value="admin"]');
-  if (admin) admin.disabled = !!isNew;
-  if (isNew && $("u_role")) $("u_role").value = "operator";
-  if ($("u_roleHint")) $("u_roleHint").hidden = !isNew;
+  if (admin) admin.disabled = !!isNew && !withLogin;
+  if (isNew && !withLogin && $("u_role")) $("u_role").value = "operator";
+  if ($("u_roleHint")) $("u_roleHint").hidden = !isNew || withLogin;
 }
 
 function blankUserForm() {
@@ -10446,7 +11276,10 @@ function blankUserForm() {
   $("u_email").value = "";
   syncUserRoleChoice(true);
   $("u_color").value = "#6366f1";
+  if ($("u_password")) $("u_password").value = "";
   renderUsersList();
+  staffSignInStatus("");
+  renderStaffSignIn();
 }
 
 // The Team modal is opened from the dashboard, where #message (inside the project view) is
@@ -10468,8 +11301,9 @@ async function saveUser(event) {
     color: $("u_color").value,
   };
   if (!payload.name || !payload.email) { userFormStatus("Name and email are required.", "warning"); return; }
+  const userId = $("userId").value;
+  if (!userId && newMemberGetsLogin()) { await createMemberWithLogin(payload); return; }
   try {
-    const userId = $("userId").value;
     if (userId) {
       await api(`/api/users/${userId}`, { method: "PUT", body: JSON.stringify(payload) });
     } else {
@@ -10487,20 +11321,266 @@ async function saveUser(event) {
   }
 }
 
+// ----- Staff sign-ins (#431) -----
+// The Team modal's "Sign-in" section: an admin sets or resets a teammate's password and switches
+// a login off or on; "Change my password" lets anyone signed in change their own (current password
+// required). With sign-in off on the server there is nothing to manage, and both sections say so
+// rather than offering buttons that would write passwords nobody uses. A password typed here goes
+// to the server once and is cleared from the box; it is never shown back or kept in state.
+const STAFF_MIN_PASSWORD = 10;
+
+async function loadStaffSignIn() {
+  const auth = await authForDecision();
+  if (!auth || !auth.enabled) { state.staffSignIn = { mode: "off", me: null, logins: [] }; return; }
+  try {
+    const data = await api("/api/staff/logins");
+    state.staffSignIn = { mode: data.authEnabled ? "admin" : "off", me: auth.user, logins: Array.isArray(data.logins) ? data.logins : [] };
+  } catch {
+    state.staffSignIn = { mode: "member", me: auth.user, logins: [] };
+  }
+}
+
+function newMemberGetsLogin() {
+  return state.staffSignIn?.mode === "admin" && Boolean($("u_password")?.value);
+}
+
+function staffSignInStatus(text, kind) {
+  const el = $("staffSignInStatus");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = kind === "error" ? "message error" : "muted";
+}
+
+function myPasswordStatus(text, kind) {
+  const el = $("myPasswordStatus");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = kind === "error" ? "message error" : "muted";
+}
+
+function renderStaffSignIn() {
+  const info = state.staffSignIn || { mode: "off", me: null, logins: [] };
+  const off = info.mode === "off";
+  const offText = "Sign-in is off on this server, so there are no logins or passwords to manage here. An admin turns it on with AUTH_ENABLED=true (see docs/SERVER_SETUP.md).";
+  const isNew = !$("userId")?.value;
+  if ($("u_passwordWrap")) $("u_passwordWrap").hidden = !(isNew && info.mode === "admin");
+  if ($("u_passwordHint")) $("u_passwordHint").hidden = !(isNew && info.mode === "admin");
+  syncUserRoleChoice(isNew);
+
+  // Change my password: anyone signed in.
+  $("myPasswordState").textContent = off ? offText : `Signed in as ${(info.me && (info.me.name || info.me.email)) || "you"}.`;
+  $("myPasswordControls").hidden = off || !info.me;
+
+  // The selected member's sign-in.
+  const stateEl = $("staffSignInState");
+  const controls = $("staffSignInControls");
+  const toggle = $("sl_toggleActiveBtn");
+  controls.hidden = true;
+  toggle.hidden = true;
+  if (off) { stateEl.textContent = offText; return; }
+  if (info.mode !== "admin") { stateEl.textContent = "Only an admin can set or reset team sign-ins."; return; }
+  const userId = $("userId").value;
+  if (!userId) { stateEl.textContent = "Add a sign-in password above to give a new member a login when you save them."; return; }
+  const login = info.logins.find((l) => l.id === userId);
+  if (!login) { stateEl.textContent = "This member is not in your organization's sign-in list."; return; }
+  if (info.me && login.id === info.me.id) { stateEl.textContent = "This is you. Use Change my password below."; return; }
+  if (login.role === "superadmin" && info.me?.role !== "superadmin") { stateEl.textContent = "Only a superadmin can manage this login."; return; }
+  stateEl.textContent = !login.hasLogin
+    ? `${login.name} has no sign-in yet. Set a password to give them one.`
+    : login.active ? `${login.name} can sign in.` : `${login.name}'s sign-in is switched off.`;
+  controls.hidden = false;
+  $("sl_setPasswordBtn").querySelector("span").textContent = login.hasLogin ? "Reset password" : "Set password";
+  if (login.hasLogin || !login.active) {
+    toggle.hidden = false;
+    toggle.querySelector("span").textContent = login.active ? "Deactivate login" : "Reactivate login";
+  }
+}
+
+async function refreshStaffSignIn() {
+  await loadStaffSignIn();
+  renderStaffSignIn();
+}
+
+async function createMemberWithLogin(payload) {
+  const password = $("u_password").value;
+  if (password.length < STAFF_MIN_PASSWORD) { userFormStatus(`The sign-in password must be at least ${STAFF_MIN_PASSWORD} characters.`, "warning"); return; }
+  try {
+    const created = await api("/api/staff/logins", { method: "POST", body: JSON.stringify({ name: payload.name, email: payload.email, role: payload.role, password }) });
+    $("u_password").value = "";
+    await loadUsers();
+    await refreshStaffSignIn();
+    if (created?.login?.id) editUser(created.login.id);
+    userFormStatus(`Added with a sign-in as ${created?.login?.role === "admin" ? "an Admin" : "an Operator"}. Tell them the password privately.`, "info");
+  } catch (err) {
+    userFormStatus(err.message || "Could not create the sign-in.", "error");
+  }
+}
+
+async function setStaffPassword() {
+  const userId = $("userId").value;
+  const password = $("sl_password").value;
+  if (!userId) return;
+  if (password.length < STAFF_MIN_PASSWORD) { staffSignInStatus(`The password must be at least ${STAFF_MIN_PASSWORD} characters.`, "error"); return; }
+  try {
+    await api(`/api/staff/logins/${encodeURIComponent(userId)}/password`, { method: "POST", body: JSON.stringify({ password }) });
+    $("sl_password").value = "";
+    await refreshStaffSignIn();
+    staffSignInStatus("Password set. Tell it to them privately; they can change it under Change my password.");
+  } catch (err) {
+    staffSignInStatus(err.message || "Could not set the password.", "error");
+  }
+}
+
+async function toggleStaffActive() {
+  const userId = $("userId").value;
+  const login = (state.staffSignIn?.logins || []).find((l) => l.id === userId);
+  if (!login) return;
+  const turnOff = login.active;
+  if (turnOff && !confirm(`Switch off ${login.name}'s sign-in? They are signed out at once and can't sign in until an admin switches it back on.`)) return;
+  try {
+    await api(`/api/staff/logins/${encodeURIComponent(userId)}/active`, { method: "POST", body: JSON.stringify({ active: !turnOff }) });
+    await loadUsers();
+    await refreshStaffSignIn();
+    staffSignInStatus(turnOff ? "Sign-in switched off." : "Sign-in switched back on.");
+  } catch (err) {
+    staffSignInStatus(err.message || "Could not change the sign-in.", "error");
+  }
+}
+
+async function changeMyPassword() {
+  const currentPassword = $("mp_current").value;
+  const newPassword = $("mp_new").value;
+  if (!currentPassword) { myPasswordStatus("Enter your current password.", "error"); return; }
+  if (newPassword.length < STAFF_MIN_PASSWORD) { myPasswordStatus(`The new password must be at least ${STAFF_MIN_PASSWORD} characters.`, "error"); return; }
+  if (newPassword !== $("mp_repeat").value) { myPasswordStatus("The two new passwords don't match.", "error"); return; }
+  try {
+    await api("/api/auth/password", { method: "POST", body: JSON.stringify({ currentPassword, newPassword }) });
+    myPasswordStatus("Your password is changed, and every other device you were signed in on is signed out. You stay signed in here.");
+  } catch (err) {
+    myPasswordStatus(err.message || "Could not change your password.", "error");
+  } finally {
+    $("mp_current").value = "";
+    $("mp_new").value = "";
+    $("mp_repeat").value = "";
+  }
+}
+
+// Sign out everywhere (#432): the server bumps this user's session version, so every cookie they
+// hold (other browsers, a lost laptop, this tab) stops working at once, then this page goes to the
+// sign-in screen.
+async function signOutEverywhere() {
+  if (!confirm("Sign out everywhere? Every session you have open ends, on every device, including this one. You'll sign in again here.")) return;
+  try {
+    await api("/api/auth/logout-everywhere", { method: "POST", body: "{}" });
+    window.location.href = "/login";
+  } catch (err) {
+    myPasswordStatus(err.message || "Could not sign out everywhere.", "error");
+  }
+}
+
+// ----- Recorder tokens (#433) -----
+// A signed-in person's own tokens for the portal recorder CLI (npm run portal:record) when it saves
+// to a server with sign-in on. Shown ONCE at mint (the server keeps only a hash); listed by name and
+// dates, never the token; revocable. With sign-in off the recorder needs none, and this says so.
+function recorderTokensStatus(text, kind) {
+  const el = $("recorderTokensStatus");
+  if (!el) return;
+  el.textContent = text || "";
+  el.className = kind === "error" ? "message error" : "muted";
+}
+
+function renderRecorderTokens(data) {
+  const off = !data || data.authEnabled === false;
+  $("recorderTokensState").textContent = off
+    ? "Sign-in is off on this server, so the recorder needs no token here."
+    : "The portal recorder on your own computer uses one of these to save recordings to this server as you. It reaches only the recorder's endpoints: it cannot stage, approve or submit anything.";
+  $("recorderTokensControls").hidden = off;
+  const list = $("rt_list");
+  if (!list) return;
+  const tokens = off ? [] : (Array.isArray(data.tokens) ? data.tokens : []);
+  list.innerHTML = tokens.length
+    ? tokens.map((t) => {
+      const status = t.revokedAt ? `revoked ${esc(fmtDate(t.revokedAt))}` : t.live ? `expires ${esc(fmtDate(t.expiresAt, true))}` : `expired ${esc(fmtDate(t.expiresAt, true))}`;
+      const used = t.lastUsedAt ? `last used ${esc(fmtDate(t.lastUsedAt))}` : "never used";
+      const revoke = t.live ? ` <button type="button" class="secondary ghost" data-revoke-recorder-token="${esc(t.id)}"><span>Revoke</span></button>` : "";
+      return `<li><strong>${esc(t.name || "recorder")}</strong> <span class="muted">made ${esc(fmtDate(t.createdAt, true))}, ${status}, ${used}</span>${revoke}</li>`;
+    }).join("")
+    : (off ? "" : `<li class="muted">You have no recorder tokens yet.</li>`);
+}
+
+async function loadRecorderTokens() {
+  const auth = await authForDecision();
+  if (!auth || !auth.enabled || !auth.user) { renderRecorderTokens({ authEnabled: false, tokens: [] }); return; }
+  try {
+    renderRecorderTokens(await api("/api/auth/recorder-tokens"));
+  } catch (err) {
+    renderRecorderTokens({ authEnabled: true, tokens: [] });
+    recorderTokensStatus(err.message || "Could not load your recorder tokens.", "error");
+  }
+}
+
+async function mintRecorderToken() {
+  const name = $("rt_name").value.trim();
+  const days = Number($("rt_days").value || 30);
+  try {
+    const res = await api("/api/auth/recorder-tokens", { method: "POST", body: JSON.stringify({ name, days }) });
+    $("rt_newToken").value = res.token || "";
+    $("rt_newTokenWrap").hidden = !res.token;
+    $("rt_name").value = "";
+    $("rt_newToken").focus();
+    $("rt_newToken").select();
+    recorderTokensStatus("Token made. Copy it now: it is not shown again.");
+    await loadRecorderTokens();
+  } catch (err) {
+    recorderTokensStatus(err.message || "Could not make a recorder token.", "error");
+  }
+}
+
+async function revokeRecorderToken(id) {
+  if (!id || !confirm("Revoke this recorder token? A recorder using it is refused from its next request.")) return;
+  try {
+    await api(`/api/auth/recorder-tokens/${encodeURIComponent(id)}`, { method: "DELETE" });
+    recorderTokensStatus("Token revoked.");
+    await loadRecorderTokens();
+  } catch (err) {
+    recorderTokensStatus(err.message || "Could not revoke the token.", "error");
+  }
+}
+
+function clearNewRecorderToken() {
+  if ($("rt_newToken")) $("rt_newToken").value = "";
+  if ($("rt_newTokenWrap")) $("rt_newTokenWrap").hidden = true;
+  recorderTokensStatus("");
+}
+
 async function openUsersModal() {
   $("usersModal").hidden = false;
+  clearNewRecorderToken();
+  void loadRecorderTokens();
+  await loadStaffSignIn();
   await loadUsers();
   if ((state.users || []).length > 0) editUser(state.users[0].id);
   else blankUserForm();
   if (window.lucide) window.lucide.createIcons();
 }
 
-function closeUsersModal() { $("usersModal").hidden = true; }
+// Closing the Team window forgets a just-made token: it was shown once.
+function closeUsersModal() { $("usersModal").hidden = true; clearNewRecorderToken(); }
 
 $("openUsersBtn").addEventListener("click", openUsersModal);
 $("closeUsersBtn").addEventListener("click", closeUsersModal);
 $("newUserBtn").addEventListener("click", blankUserForm);
 $("userForm").addEventListener("submit", saveUser);
+$("u_password").addEventListener("input", () => syncUserRoleChoice(!$("userId").value));
+$("sl_setPasswordBtn").addEventListener("click", setStaffPassword);
+$("sl_toggleActiveBtn").addEventListener("click", toggleStaffActive);
+$("mp_saveBtn").addEventListener("click", changeMyPassword);
+$("mp_signOutEverywhereBtn").addEventListener("click", signOutEverywhere);
+$("rt_mintBtn").addEventListener("click", mintRecorderToken);
+$("rt_list").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-revoke-recorder-token]");
+  if (btn) revokeRecorderToken(btn.getAttribute("data-revoke-recorder-token"));
+});
 $("usersModal").addEventListener("click", (e) => { if (e.target.id === "usersModal") closeUsersModal(); });
 
 // ----- KPI Dashboard -----
@@ -10520,6 +11600,21 @@ async function loadKpi() {
     renderKpi(kpi);
   } catch (err) {
     $("kpiBody").innerHTML = `<p class="muted">Failed to load KPIs: ${esc(err.message)}</p>`;
+    return;
+  }
+  loadFeeAccuracy();
+}
+
+// FEE ACCURACY (#494): quoted at filing vs paid, per jurisdiction. All filed jobs, not the date
+// range above (a jurisdiction's quotes are judged on every bill we have). Its own request, so a
+// failure here leaves the KPIs standing.
+async function loadFeeAccuracy() {
+  const slot = $("kpiFeeAccuracy");
+  if (!slot || !window.FeeAccuracy) return;
+  try {
+    slot.innerHTML = window.FeeAccuracy.renderFeeAccuracy(await api("/api/fee-accuracy"));
+  } catch (err) {
+    slot.innerHTML = `<p class="muted">Fee accuracy did not load: ${esc(err.message)}</p>`;
   }
 }
 
@@ -10645,6 +11740,8 @@ function renderKpi(kpi) {
 
     ${window.KpiFilings ? window.KpiFilings.renderFilingKpis(kpi.filings) : ""}
 
+    <div id="kpiFeeAccuracy"></div>
+
     ${kpi.byUser.length > 0 ? `
     <h3 style="margin-top:24px">Per Operator</h3>
     <div class="table-wrap">
@@ -10692,6 +11789,7 @@ $("kpiModal").addEventListener("click", (e) => { if (e.target.id === "kpiModal")
   if (bootPage !== "project") showPage(VALID_PAGES.includes(bootPage) ? bootPage : "dashboard", { skipLoad: true });
 }
 await checkHealth();
+await loadServerPosture();
 // Independent loads, in parallel: the board no longer waits on clients and users in series.
 await Promise.all([loadProjects(), loadClients(), loadUsers()]);
 // Users arrive in parallel with the board, so repaint once for the assignee dots.

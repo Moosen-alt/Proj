@@ -20,7 +20,8 @@
 // reading it now, nothing for you to do yet" is the same fact and a completely different
 // Tuesday. Every update below ends with it, including when the answer is "nothing".
 //
-// WHY THESE ARE TEMPLATES AND NOT LLM-WRITTEN. The event set is four outcomes, so a template
+// WHY THESE ARE TEMPLATES AND NOT LLM-WRITTEN. The event set is four outcomes, a filing and three
+// closeout milestones, so a template
 // can be genuinely well written once and then be right every time. An LLM would cost per event,
 // and — the real objection — it would occasionally claim something we do not know, in text sent
 // to a paying customer under our name. The variation a model would add is not worth a single
@@ -54,6 +55,15 @@ export interface ClientUpdateContext {
   /** The jurisdiction's own reference, when the portal gave us one. */
   permitNumber?: string;
   applicationNumber?: string;
+  /** THE FILING EVENT ONLY (#490): who received the filing, already resolved for THIS track by the
+   *  notifier — the utility for NEM, the track's issuing agency for a permit (a split-issuer job
+   *  files its electrical permit with a different office than its building permit). Blank falls
+   *  back to the project's AHJ / utility. */
+  agency?: string;
+  /** THE FILING EVENT ONLY: the measured median days from filing to issued/approved for that
+   *  agency, when the KB has enough filings to say it (clientNotifier.usualReviewDays). Never a
+   *  seeded or one-off figure: a client plans a crew around this number. */
+  reviewDays?: number | null;
 }
 
 export interface ClientUpdate {
@@ -141,6 +151,33 @@ export const CLIENT_FACING_OUTCOMES = ["issued", "ready_for_issue", "nem_approve
 
 export function isClientFacingOutcome(outcome: string): boolean {
   return (CLIENT_FACING_OUTCOMES as readonly string[]).includes(outcome);
+}
+
+/**
+ * "WE FILED IT" (#490). Clients heard from us only when something came back, so the day their
+ * review clock started was the day they phoned to ask whether we had filed yet.
+ *
+ * DELIBERATELY NOT IN CLIENT_FACING_OUTCOMES. That list is the MONITOR's gate (shouldNotifyClient
+ * fires on a change of a polled reading), and a filing is not a reading: no portal poll ever
+ * produces it. It is sent only by clientNotifier.notifyClientOfFiling, from the doors that record
+ * a confirmed filing, once per track — so a monitor re-read can never send it, and a submit the
+ * portal did not confirm (submitted_unconfirmed) is never announced as filed.
+ */
+export const CLIENT_FILED_EVENT = "filed";
+
+/**
+ * THE CLOSEOUT MILESTONES A CLIENT HEARS ABOUT (#497): final inspection passed, PTO requested,
+ * PTO granted. "installed" is not here on purpose — the client is the installer, and the one
+ * thing they do not need is us telling them their own crew finished.
+ *
+ * Kept out of CLIENT_FACING_OUTCOMES for the same reason as CLIENT_FILED_EVENT: that list is the
+ * MONITOR's gate on a change of a polled reading, and none of these is a reading. They are sent
+ * only by clientTimeline.recordProjectMilestone, once per milestone, when it is recorded.
+ */
+export const CLIENT_MILESTONE_EVENTS = ["final_passed", "pto_requested", "pto_granted"] as const;
+
+export function isClientMilestoneEvent(milestone: string): boolean {
+  return (CLIENT_MILESTONE_EVENTS as readonly string[]).includes(milestone);
 }
 
 /**
@@ -268,6 +305,66 @@ export function clientUpdateFor(
           : "Nothing needed from you.",
       };
 
+    case CLIENT_FILED_EVENT: {
+      // WHICH filing, WITH WHOM, and the number — the three things that let a client look it up
+      // themselves. The usual review time only when it was measured (see reviewDays above); with
+      // none, the sentence says the clock started and promises nothing about when it stops.
+      const nem = trackKind(String(ctx.targetType || ""), text(ctx.permitType)) === "nem";
+      const agency = text(ctx.agency) || (nem ? utility : ahj);
+      const days = Number(ctx.reviewDays);
+      const usual = Number.isFinite(days) && days > 0
+        ? ` Recent filings with ${agency} have taken about ${Math.max(1, Math.round(days))} day${Math.round(days) === 1 ? "" : "s"} to be ${nem ? "approved" : "issued"}.`
+        : "";
+      return {
+        subject: nem ? "Interconnection application filed" : "Permit application filed",
+        headline: nem
+          ? `We have filed the interconnection application with ${agency}${refPhrase}.`
+          : `We have filed ${whichApplication} with ${agency}${refPhrase}.`,
+        meaning: `Their review has started.${usual}`,
+        action: "Nothing needed from you. We are watching it and will tell you the day it moves.",
+      };
+    }
+
+    // THE CLOSEOUT (#497). Recorded by a person (or the finals / PTO automation) through
+    // clientTimeline.recordProjectMilestone, never read off a portal. None of the three promises a
+    // date: there is no measured history for these steps yet, and a client books around it.
+    //
+    // WHO REQUESTS PTO: the installer, for now (owner, 2026-11-02: "to start they request pto").
+    // The handoff packet's checklist already tells them to send the signed final inspection card to
+    // the utility, so these two say the same thing: after the final passes the next move is THEIRS,
+    // and the "requested" update never claims we sent it. Revisit when the PTO package (#496) files
+    // it for them.
+    case "final_passed":
+      return {
+        subject: "Final inspection passed",
+        headline: `${ahj} has passed the final inspection.`,
+        // The utility's permission to operate is the next gate only on a job that has one.
+        meaning: text(project.utility)
+          ? `That closes out the permit. The last step is ${utility}'s permission to operate.`
+          : "That closes out the permit.",
+        action: text(project.utility)
+          ? `Next for you: send the signed final inspection card to ${utility} to request permission to operate, and let us know when it has gone in.`
+          : "Nothing needed from you.",
+      };
+
+    case "pto_requested":
+      return {
+        subject: "Permission to operate requested",
+        headline: `Permission to operate has been requested from ${utility}.`,
+        // The sentence that saves a phone call AND a problem: an installed system is not a
+        // system the homeowner may switch on.
+        meaning: "The system stays off until they grant it.",
+        action: "Nothing needed from you. We are watching it and will tell you the day it is granted.",
+      };
+
+    case "pto_granted":
+      return {
+        subject: "Permission to operate granted",
+        headline: `${utility} has granted permission to operate.`,
+        meaning: "The system can be turned on.",
+        action: "Nothing needed from you.",
+      };
+
     case "correction_flagged":
       return {
         subject: "Correction requested",
@@ -308,7 +405,7 @@ export function clientUpdateEmailBody(
     "",
     `Live status page (no login needed): ${opts.link}`,
     "",
-    "— Solar Submission Autopilot (automated update; reply to reach the team)",
+    `— ${BRAND} (automated update; reply to reach the team)`,
   ].join("\n");
 }
 

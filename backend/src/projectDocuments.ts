@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { projectDocsDir } from "./statePaths";
 import type { AppDb } from "./db";
 import { HttpError } from "./httpError";
 import { addAuditLog } from "./audit";
@@ -138,7 +139,7 @@ export function planSetTextForProject(db: AppDb, projectId: string): string {
 
 // Uploaded files live OUTSIDE the SQLite database, so anything that backs the system
 // up has to know where they are. Exported for backup.ts — the two must never drift.
-export const DOCS_DIR = path.resolve(process.cwd(), process.env.PROJECT_DOCS_DIR || "backend/data/project-documents");
+export const DOCS_DIR = projectDocsDir();
 
 export interface ProjectDocumentView {
   id: string;
@@ -185,7 +186,9 @@ const PDF_REQUIRED_DOC_TYPES = new Set([
 
 // Slots that hold a photo or a scan. A PDF is fine here too — people scan the meter
 // tag and the utility bill to PDF constantly.
-const IMAGE_OR_PDF_DOC_TYPES = new Set(["meter_photo", "site_photo", "roof_photo", "utility_bill", "photo"]);
+// The issued permit and the utility's approval / PTO letter (#492): downloaded off the filed record
+// by the permit monitor, or attached by a person — a permit card is often a phone photo.
+const IMAGE_OR_PDF_DOC_TYPES = new Set(["meter_photo", "site_photo", "roof_photo", "utility_bill", "photo", "issued_permit", "utility_approval"]);
 
 // Where a native CAD file is allowed to live: as reference material an operator can
 // download, never as something the pipeline will try to read.

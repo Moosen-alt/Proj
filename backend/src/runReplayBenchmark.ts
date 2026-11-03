@@ -20,6 +20,7 @@ process.env.SKIP_CODE_RESEARCH = "1";
 process.env.AUTOPILOT_AUTO_START = "0";
 import fs from "node:fs";
 import path from "node:path";
+import { portalProfilesDir, runDataDir } from "./statePaths";
 import { openDatabase } from "./db";
 import { createProject, deleteProject } from "./repository";
 import { getDecryptedCredential, getDecryptedCredentialAny, getDecryptedCredentialByUrl, listPortalCredentials } from "./portalCredentials";
@@ -31,7 +32,7 @@ import { getPortalRecipe, resolveRecipeFieldValues } from "./portalRecipes";
 import { writeBenchmarkPlaceholderDoc } from "./benchmarkPlaceholderDoc";
 import type { ProjectRecord } from "../../shared/src/types";
 
-const OUT_DIR = path.resolve(process.cwd(), "data", "replay-benchmark");
+const OUT_DIR = path.join(runDataDir(), "replay-benchmark");
 const CLIENT = process.env.BENCHMARK_CLIENT_ID || "tml-international-llc";
 
 const arg = (name: string): string | undefined => {
@@ -333,7 +334,7 @@ async function main(): Promise<void> {
       // this client/portal" — while the dry run listed that very credential as ok, because
       // the dry run reads the credential TABLE and the run needs it DECRYPTED and handed in.
       // Mirrors repository.ts: exact portalType first, then by URL, then any for this client.
-      const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+      const profileBase = portalProfilesDir();
       // ONE PROFILE PER PORTAL, NOT PER PORTAL TYPE.
       //
       // Sharing a profile across every utility portal is why Ameren scored 73/75 alone and

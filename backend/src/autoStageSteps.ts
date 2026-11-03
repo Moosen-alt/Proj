@@ -93,6 +93,26 @@ export function enqueueStageSteps(db: AppDb, projectId: string): boolean {
  * step fails to advance. The worker calls this; a test may call it directly.
  */
 export async function processStageStep(db: AppDb, projectId: string, opts: StageStepOptions = {}): Promise<StageStepOutcome> {
+  const outcome = await runLocalSteps(db, projectId, opts);
+  // WHERE THE CHAIN STOPS ON THE CLIENT, THE CLIENT IS ASKED (#488): the bill, a portal question
+  // or the utility portal login is emailed as the intake / one-time login link, once per open
+  // ask (clientRequestLinks.ts). Never a portal, never a throw — the chain's outcome stands either
+  // way. Off with AUTO_STAGE_STEPS too, since the chain did not run.
+  if (autoStageStepsEnabled()) {
+    try {
+      const { autoSendClientRequests } = await import("./clientRequestLinks");
+      const asked = await autoSendClientRequests(db, projectId);
+      for (const a of asked.sent) outcome.ran.push(`ask_client(${a.kind}:${a.status})`);
+    } catch (err) {
+      logger.warn("stage-auto", "automatic client request failed; the chain's result stands", {
+        project: projectId, err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return outcome;
+}
+
+async function runLocalSteps(db: AppDb, projectId: string, opts: StageStepOptions): Promise<StageStepOutcome> {
   const ran: string[] = [];
   const status = (): string =>
     String(db.get<{ status?: string }>("SELECT status FROM projects WHERE id = ?", [projectId])?.status ?? "");

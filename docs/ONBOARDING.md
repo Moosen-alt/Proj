@@ -12,6 +12,8 @@ Read first, in this order:
    which is what the provisioning script actually consumes.
 3. `docs/onboarding/CAPABILITIES.md` — the measured detail behind what we can and cannot do.
 4. This file — the runbook that ties them together.
+5. `docs/NEM_OPERATOR_RUNBOOK.md` — for the team member who files: what to click on a NEM
+   filing, what the tool does after each click, and what to do when a run stops.
 
 If you only remember one thing, remember this: **we stage, a human files.** Every number,
 promise and caveat below follows from that.
@@ -892,6 +894,9 @@ per-run decision, not part of onboarding. There is no per-recipe "trusted" arm.
 
 Do the first one yourself, watching, with the customer told it is a supervised first run.
 
+For a NEM filing, the click-by-click version (Approve & auto-submit, the hand-over fallback, PSE,
+tracking) is `docs/NEM_OPERATOR_RUNBOOK.md`.
+
 1. **Intake.** Create the project from the parsed plan set, then bind the client:
    `POST /api/projects/:id/client {"clientId":"..."}`. Until a client is bound, staging refuses
    with `needsClient`. If you need the installer to supply the job valuation or the homeowner's
@@ -918,10 +923,13 @@ Do the first one yourself, watching, with the customer told it is a supervised f
    review screenshot and a learn or portal run artifact exist. For a brand-new jurisdiction,
    see §6 — a mock stage looks exactly like this one.
 7. **A human submits.** A person opens the staged application on the portal, reads the filled
-   fields, and presses submit. Fees are paid there, by them. If they use our Approve & Submit
-   button, that action is auth-gated and audit-logged with their name, because a filing must
-   always be attributable to a person — and for most portals it still hands off to the human
-   for the final click rather than clicking it itself.
+   fields, and presses submit. Fees are paid there, by them. If they use our Approve & auto-submit
+   button (on the rail or the track card, the same action), it records their named approval of
+   that one run, because a filing must always be attributable to a person. It starts its own run
+   from the start of the application, and the bot clicks the portal's submit only with
+   `PORTAL_ALLOW_FINAL_SUBMIT=1` and a recipe recorded through submit; otherwise it stops at the
+   review screen for the human's final click. On a staged NEM draft it is held: the human
+   finishes that draft.
 8. **After.** The permit monitor watches for status changes and corrections. A correction
    reopens the filing through a named form; the automation refills and a human files again.
 

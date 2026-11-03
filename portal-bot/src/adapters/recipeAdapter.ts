@@ -3,7 +3,7 @@ import path from "path";
 import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep } from "../../../shared/src/types";
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, ok, fail, type PortalContext, type PortalStepResult } from "../adapter";
 import { applyFormatHint } from "../formatHint";
-import { extractRecordNumber, pageConfirmsSubmission } from "../recordNumber";
+import { extractRecordNumber, pageConfirmsSubmission, recordNumberCandidates, RECORD_NUMBER_TIERS } from "../recordNumber";
 import { findSiteDraft, readDraftCreated } from "../draftCreated";
 import { completeStamp, draftCreatingClickRefusals, draftLabelKey, draftStepLabel, draftTenantKey, readDraftAfterClick, type DraftCreatingStamp } from "../draftSubmitGate";
 import { armHumanCaptureOnPage, HUMAN_SUBMIT_OBSERVED_NOTE } from "../humanCapture";
@@ -84,25 +84,196 @@ export function looksLikeProjectData(label: string, value: string): boolean {
 import { rankAddressVersions } from "../addressVersion";
 import { isCompanyIdentityLabel } from "../../../shared/src/companyFacts";
 import { licenceKeyForLabel } from "../../../shared/src/licenceKinds";
-import { labelWords } from "../../../shared/src/portalSafety";
+import { completionEvidence, labelWords } from "../../../shared/src/portalSafety";
 import { batteryControlKind, batteryControlOfStep, batteryDeclarationAnswer, parseHasBattery } from "../../../shared/src/batteryControls";
 import { imageToPdfBytes, shouldConvertToPdf } from "../imageToPdf";
 import { removeUploadStaging, uploadPayloadFor, type PreparedUpload } from "./uploadPayload";
 import { attachmentTypeFor, isDocumentTypeList } from "./attachmentTypes";
-import { cleanRecordLink, readApplicationLedgerInPage, type LedgerEntry } from "./submissionLedger";
+import { chooseSubmittedRecord, cleanRecordLink, readApplicationLedgerInPage, recordLinkForNumberInPage, type LedgerEntry } from "./submissionLedger";
 import { exactUploadDocType, fileTypeAllowed, UPLOAD_LABEL_PATTERNS, uploadForbidsSubstitute } from "./autoLearnAdapter";
 import { reviewComparison, scrapeReviewScreen as scrapeReviewScreenShared, utilityIdentifiersEnteredBySteps, type ReviewMismatch } from "../reviewScreenScraper";
-import { sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
+import { controlReadsUnanswered, pinEmptyRequiredControl, PINNED_CONTROL_ATTR, SWEPT_BLANK_ATTR, sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
 import { openPortal } from "../browser";
-import { selectWithFallback, comboboxFaceInPage } from "../comboboxFill";
+import { selectWithFallback, comboboxFaceInPage, type ComboboxPick } from "../comboboxFill";
+import { assertFilerIdentityHeld, FilerIdentityStop, filerIdentityFieldForSelect, filerIdentityStopMessage, isFilerIdentityField, isUnansweredOption, readNativeSelect, selectFilerIdentity } from "../filerIdentitySelect";
 import {
   classifySubmissionText, finalSubmitEnvAllows, finalSubmitRefusals, isFinalSubmitControl, isPayFee, isPayNowDialogText, mayClickFinalSubmit,
-  isRecipeShapeValid, isSignatureNameLabel, isSignatureRequestControl, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
+  isPayRequestUrl, isRecipeShapeValid, isSignatureNameLabel, isSignatureRequestControl, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
   type HealedStep, type RunApproval, type SubmissionOutcome,
 } from "../../../shared/src/portalSafety";
 import { commitField, installSettleProbe, waitForSettled } from "../settle";
 import { siteOfUrl } from "../siteOf";
-import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, type FilingBackstop } from "../filingBackstop";
+import { dialogOpenedSince, readUnlessDialog } from "../personDialogs";
+import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, withAutomationInput, describeBackstopAbort, backstopSentLine, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine, isStoppingAbort, type BackstopAbort, type FilingBackstop, type BackstopHumanRequest } from "../filingBackstop";
+
+/** #333: the run did not hand the review page over — its input watch could not be armed, or (Helm
+ *  Should-fix 3) a stopping abort the watch did not flag as the person's is on record, so the run
+ *  fails by name — and the review lockdown holds until the stage finishes: said plainly, never
+ *  silently, and never "the page is yours". */
+export const NOT_HANDED_OVER_NOTE = "THE RUN COULD NOT HAND THE REVIEW PAGE OVER TO YOU: the review lockdown holds until the stage says it has finished, so click submit only then (an earlier click is held back, and nothing is sent).";
+/** #381: the review read-back was skipped — a native dialog waits for the person on the handed-over
+ *  window (automation never answers one, and an open dialog stalls every page read). Appended to the
+ *  run's "stopped at review." sentence. */
+export const REVIEW_READ_SKIPPED_SUMMARY = " The review screen was not read back: a dialog the portal opened is waiting in the window for your answer (automation never answers one), so verify every field yourself.";
+/** #381: what the capture says when a native dialog waits for the person on the window. */
+export const DIALOG_WAITING_CAPTURE = "A dialog the portal opened is waiting in the window for your answer (automation never answers one): the page was not read and nothing was recorded.";
+/** #381: said beside a click the portal answered with a native dialog — never "click again" there. */
+const CONFIRMATION_ASKED = " The portal asked for a confirmation after that click: only you answer it, in the window (automation never answers one).";
+/** #333: why the run's own input is refused once it has started handing the page over. */
+const INPUT_CLOSED = "the run has stopped at review and is handing the page to a person — it makes no input of its own on the page from here";
+
+/** #333: what the person is told when their own click on the review page came before the run had
+ *  handed it over — a click the ARMED watch saw (the abort is flagged humanInput + beforeHandOver);
+ *  the backstop held it, nothing was sent, and the run is still handed over. A click before the watch
+ *  listened (during the run's last writes or its arm) is held unflagged: the run is not handed over
+ *  (NOT_HANDED_OVER_NOTE) and fails by name, and this note is never said (Helm Should-fix 3). */
+export const HUMAN_CLICK_HELD_NOTE ="YOUR CLICK WAS HELD BACK: you clicked on the review page before the run had handed it over to you, so that request was stopped and nothing was sent. If the window shows an error page, go Back to the review page; then click submit again — the run has let go of the page now.";
+/** #333 round 3 (skeptic r2b): a request from the handed-over page went through after the person
+ *  touched it, and the click detector did not see a final submit (an unknown label, a fetch submit). It
+ *  may have been the filing: never "click submit" or "nothing was filed" to someone who may have.
+ *  #417 (Helm Should-fix 7 on #378): the backstop records a request as the person's when it follows
+ *  their input on the page, so the portal's OWN batched save of the stage's answers, drained after the
+ *  hand-over, can be one (B7). The record stays (judging by the drain first breaks B7); the note no
+ *  longer says "you sent" it. It names the handed-over page and where the request went, each by origin
+ *  and path only (never a query: rule 2, a portal can carry an account number there), and hedges. Every
+ *  push dedupes on this prefix. */
+export const PERSON_REQUEST_WENT_PREFIX = "A REQUEST FROM THE REVIEW PAGE WENT THROUGH";
+/** scheme://host:port/path of an address: no query, no #fragment (rule 2). */
+const originAndPath = (url: string): string => {
+  try { const u = new URL(url); return u.origin && u.origin !== "null" ? `${u.origin}${u.pathname}` : ""; } catch { return String(url || "").split(/[?#]/)[0].slice(0, 200); }
+};
+export function personRequestWentNote(fromPage: string, where: string): string {
+  const page = originAndPath(fromPage);
+  const to = originAndPath(where);
+  return `${PERSON_REQUEST_WENT_PREFIX}${page ? ` (${page})` : ""} while the stage was finishing (automation clicked nothing)${to ? `, to ${to}` : ""}. It followed your input on the page, but it may also have been the portal saving the stage's answers. If it was your submit, the filing may have gone: check the portal and enter its record number with the capture form — do not stage this track again before you have. If it was not, finish in the open window.`;
+}
+/** #417 (Helm Should-fix 5 on #378): the person's own PAYMENT click after the hand-over was held — rule 1
+ *  never lifts (automation never pays), and the run still held the page. Said whole: never "you moved
+ *  on", never "click submit again" or "click submit manually" on a payment. A click the watch saw as the
+ *  final submit gets humanPaymentHeldNote from its verdict instead (one payment note, never two). */
+export const PAYMENT_HELD_NOTE = "YOUR PAYMENT WAS HELD BACK: automation never pays, and the run still held the review page, so the payment request from your click was stopped. NOTHING WAS PAID. Check the portal before you click anything again, and pay there yourself once you have seen whether the application was submitted. If the window shows an error page, go Back to the review page first.";
+/** #333 round 2 (skeptic r2 F5): the person filed from the review window while the stage finished —
+ *  on the record in the hand-off notes (the project's next-step panel), whether or not the
+ *  completion page's number can be read. */
+export const HUMAN_SUBMITTED_NOTE = "YOU SUBMITTED FROM THE REVIEW WINDOW while the stage was finishing (automation clicked nothing). The record number is read off the completion page and recorded only when it is read confidently — if the project does not show it, enter it with the capture form. Do not stage this track again: it has been filed.";
+
+// #333 round 4 (Helm Blocking 2) — WHAT THE REVIEW STEP SAYS ABOUT THE PERSON'S CLICK, BUILT WHOLE.
+// "Filed" (HUMAN_SUBMITTED_NOTE) only for a committed submit whose page read as a completion; every
+// other outcome has its own whole note below. Each names the click by its label and says only what the
+// run saw: never "nothing was sent" when it saw no request (it cannot know), "click again" only beside
+// what the window shows, and never a note saying the filing went beside a held or unsent click.
+/** The person's submit went, then a request the page it led to made was held back, and the window shows
+ *  Chromium's error page. */
+export const HUMAN_FOLLOW_UP_HELD_NOTE = "YOUR SUBMIT WENT TO THE PORTAL, BUT A REQUEST THE NEXT PAGE MADE WAS HELD BACK and the window shows an error page (automation clicked nothing). Check the portal: if the application shows as submitted, enter its record number with the capture form; if it does not, go Back to the review page and submit again.";
+/** #381: the same when the portal asked for a confirmation after the click — no "submit again". */
+export const HUMAN_FOLLOW_UP_HELD_CONFIRM_NOTE = "YOUR SUBMIT WENT TO THE PORTAL, BUT A REQUEST THE NEXT PAGE MADE WAS HELD BACK and the window shows an error page (automation clicked nothing). Check the portal: if the application shows as submitted, enter its record number with the capture form; if it does not, go Back to the review page and check it there.";
+const clickedLabel = (label: string | undefined): string => `"${String(label || "the submit").slice(0, 60)}"`;
+/** "YOU CLICKED "X" ON THE REVIEW PAGE" — or, for a click with no input of the person's in the 2 s
+ *  before it (a page script's el.click()), "A CLICK ON "X" WAS SEEN ON THE REVIEW PAGE". */
+const clickedOnReview = (label: string | undefined, personInput: boolean | undefined): string =>
+  personInput === false ? `A CLICK ON ${clickedLabel(label)} WAS SEEN ON THE REVIEW PAGE` : `YOU CLICKED ${clickedLabel(label)} ON THE REVIEW PAGE`;
+const ERROR_PAGE_GO_BACK = " The window shows an error page: go Back to the review page first.";
+/** A sighting the run saw no request of the person's follow. `confirmation` (#381): the portal opened a
+ *  native dialog after the click — it waits for the person, and the note says so. */
+export function humanClickUnconfirmedNote(label: string | undefined, errorPage: boolean, personInput?: boolean, confirmation = false): string {
+  return `${clickedOnReview(label, personInput)} while the stage was finishing (automation clicked nothing), and the run saw no request go from that click.${confirmation ? CONFIRMATION_ASKED : ""} Check the portal: if the application shows as submitted, enter its record number with the capture form; if it does not, finish in the open window.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
+}
+/** A committed click (a request of the person's went after it) whose page did not read as a completion.
+ *  `confirmation` (#381): a native dialog followed the click — never "click again" beside it. */
+export function humanClickStandsNote(label: string | undefined, personInput?: boolean, confirmation = false): string {
+  return confirmation
+    ? `${clickedOnReview(label, personInput)} while the stage was finishing (automation clicked nothing), and a request of yours went to the portal, but no completion page was read.${CONFIRMATION_ASKED} The filing may have gone: check the portal; if it shows as submitted, enter its record number with the capture form.`
+    : `${clickedOnReview(label, personInput)} while the stage was finishing (automation clicked nothing), and a request of yours went to the portal, but no completion page was read. The filing may have gone: check the portal before you click again; if it shows as submitted, enter its record number with the capture form.`;
+}
+/** A click a stopping abort held, with no filing-shaped request of the person's after it. Never begins
+ *  "YOUR CLICK WAS HELD BACK" (HUMAN_CLICK_HELD_NOTE: a click before the hand-over). */
+export function humanClickHeldNote(label: string | undefined, abort: BackstopAbort, errorPage: boolean, personInput?: boolean, confirmation = false): string {
+  return `${personInput === false ? "A CLICK ON" : "YOUR CLICK ON"} ${clickedLabel(label)} ON THE REVIEW PAGE WAS HELD BACK: the submit itself was not sent — ${describeBackstopAbort(abort)}.${confirmation ? `${CONFIRMATION_ASKED} Check the portal.` : " Check the portal before you click again."}${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
+}
+/** A payment request after the person's final-submit click, held by rule 1 (automation never pays); no
+ *  "click again" on a payment. A payment click the watch did not see as a submit: PAYMENT_HELD_NOTE. */
+export function humanPaymentHeldNote(abort: BackstopAbort, errorPage: boolean): string {
+  return `A PAYMENT REQUEST FROM THE REVIEW PAGE WAS HELD BACK — ${describeBackstopAbort(abort)}. Automation never pays, and nothing was paid: check the portal, and pay there yourself once you have seen whether the application was submitted.${errorPage ? ERROR_PAGE_GO_BACK : ""}`;
+}
+/** The person's submit was answered with a draft (PSE Part 1): nothing is filed, the track is staged
+ *  again (the next run continues the draft), and the draft's number is never entered as a filing. */
+export function humanDraftCreatedNote(applicationNumber: string, nextForm: string): string {
+  return `YOUR SUBMIT FROM THE REVIEW WINDOW CREATED DRAFT ${applicationNumber || "(no number shown)"}, not a filing (automation clicked nothing). NOTHING WAS FILED.${nextForm ? ` The filing is in "${nextForm}".` : ""} Stage this track again: the next run opens this draft and continues it. Do not enter the draft's number in the capture form.`;
+}
+
+// #333 round 4 (Helm Blocking 1) — THE PERSON'S SUBMIT CLICK IS A SIGHTING, COMMITTED ON EVIDENCE.
+/** A final-submit click the replay's own watch saw after the hand-over: provisional until a request
+ *  of the person's that followed it commits it (RecipeAdapter.judgeHumanClick). */
+interface HumanClickSighting {
+  label?: string;
+  /** When the sighting reached the run (Date.now()). */
+  at: number;
+  /** The handed-over backstop's record sizes when it was seen. */
+  abortsBefore: number;
+  requestsBefore: number;
+  /** The person's own input reached the page in the 2 s before it: true / false while a live,
+   *  handed-over backstop could tell; undefined once the run had let the page go. */
+  personInput: boolean | undefined;
+  /** Set when a capture found the review (or error) page and reopened the watch: only evidence that
+   *  completed after this may commit it again. */
+  evidenceAfter?: number;
+  /** The commit rested on a document or filing-shaped request (the slow-server re-read's condition). */
+  filingEvidence?: boolean;
+  /** The one slow-server re-read after a reopen was scheduled. */
+  slowRereadDone?: boolean;
+}
+/** #333 round 4 (Helm Blocking 2) — what became of the person's click, as the review step reports it
+ *  (RecipeAdapter.humanClickVerdict). */
+interface HumanClickVerdict {
+  verdict: "followUpHeld" | "filed" | "draft" | "stands" | "held" | "unconfirmed";
+  click: { label?: string; at: number; personInput?: boolean } | null;
+  /** The stopping abort that held the click (held only). */
+  held: BackstopAbort | null;
+  /** A payment request held after the click (rule 1). */
+  payment: BackstopAbort | null;
+  /** The window shows Chromium's error page now. */
+  errorPage: boolean;
+  draft?: { applicationNumber: string; nextForm: string };
+}
+/** The review page's own reading, taken at the hand-over while the lockdown still held the page: what
+ *  the capture judges a later page against (never its URL). */
+interface ReviewReading {
+  /** Every record-number candidate the review page showed. */
+  numbers: Set<string>;
+  /** The review's submit control ("" = none found, or the read failed). */
+  filingControl: string;
+  reviewPage?: boolean;
+  /** Completion wording the review page itself showed ("Once your application has been submitted…"). */
+  completionPhrase: string | null;
+}
+/** A page read for the capture: its text, the same text with table cells taken out, and its controls. */
+interface CapturePageRead { text: string; cellFree: string; filingControl: string; reviewPage?: boolean }
+/** How long after a sighting a request of the person's may still commit it (Helm's 2.5 s / 4 s / 8 s
+ *  shapes fit inside). */
+const HUMAN_CLICK_COMMIT_MS = 10_000;
+/** A main-frame document or filing-shaped request may precede its sighting by this much (the click's
+ *  form POST and its sighting travel different CDP event streams). A plain fetch must follow it. */
+const HUMAN_CLICK_EARLY_MS = 300;
+/** #381 — a native dialog that opened this long before the click's sighting still answers that click
+ *  (the dialog and the sighting reach the run on different event streams). */
+const CONFIRMATION_EARLY_MS = 1_000;
+/** A sighting with only a plain fetch, or with a stopping abort, is judged only this long after it:
+ *  the click's filing request may still be on its way. */
+const HUMAN_CLICK_SETTLE_MS = 1_500;
+/** A capture that reopened a click committed on a filing request reads the page once more this much
+ *  later (the slow-server shape). */
+const HUMAN_CLICK_SLOW_REREAD_MS = 6_000;
+/** A late plain fetch is followed by one page read this much later (an in-place SPA submit). */
+const HUMAN_CLICK_SPA_REREAD_MS = 1_200;
+
+/** #333 round 4 — THE ONE "IS THIS REQUEST OF THE PERSON'S FILING-SHAPED?" PREDICATE: a main-frame
+ *  document request (a form submission, to any URL), or a fetch/XHR to a submit or payment URL —
+ *  never a GET and never a beacon or other resource type, whatever its URL says. */
+function filingShapedHumanRequest(r: { document?: boolean; method?: string; resourceType?: string; where: string }): boolean {
+  return String(r.method ?? "").toUpperCase() !== "GET"
+    && (!!r.document || (/^(fetch|xhr)$/i.test(String(r.resourceType ?? "")) && isSubmitOrPayRequestUrl(r.where)));
+}
+const normPhrase = (s: string | null | undefined): string => String(s ?? "").toLowerCase().replace(/\s+/g, " ").trim();
 
 // How long the drift precheck waits for an async-rendered form to paint before concluding
 // the replay is on the wrong page. PowerClerk's Ameren form reports zero inputs for several
@@ -110,10 +281,13 @@ import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describe
 const DRIFT_SETTLE_MS = Math.max(2000, Number(process.env.RECIPE_DRIFT_SETTLE_MS ?? 15000));
 import { redactCaptureText, readbackMatches, detectChallengeFrame, frameSelectorFor, hasNumericValidationError, RETRY_BACKOFF_MS, sleep, smartWait, toBareNumber, waitForElement, waitForInteractiveControls } from "../safeAction";
 import { findFilingStatus } from "../statusFinder";
+import { UNRECORDED_WRITE_ATTR, gapFillMayAnswer, isSubmitIntentField, questionsOfRaw } from "../llmGapFill";
 import { performLogin, portalErrorPage } from "./loginFlow";
 import { chooseCorrectionForm, correctionFormSelector, isRefusal, scanProjectForms, type ProjectFormRow } from "./correctionForm";
-import { type ExtractedField, EXTRACT_SEL, extractFieldsInPage, toExtractedField, dismissPageModals, clearPageOverlays, equipmentMakeCandidates, pageFingerprintOf, collectValidationErrorsFrom, acaApplyEntryFrom, advanceSignatureOf } from "./autoLearnAdapter";
-import { tagUploadControls, visibleBodyText } from "./autoLearnAdapter";
+import { type ExtractedField, type RawField, EXTRACT_SEL, extractFieldsInPage, toExtractedField, dismissPageModals, clearPageOverlays, equipmentMakeCandidates, pageFingerprintOf, collectValidationErrorsFrom, acaApplyEntryFrom, advanceSignatureOf } from "./autoLearnAdapter";
+import { tagUploadControls, visibleBodyText, policyScopeFor } from "./autoLearnAdapter";
+import { answerForUnrecordedControl, missingRequiredStopMessage, UNPINNED_CONTROL_WHY, type MissingRequired } from "../unrecordedControls";
+import { isComputeTotalsStep, prepareComputeSettle, waitForComputeSettled } from "../computeSettle";
 import { portalSaysNotServed } from "../../../shared/src/portalNotServed";
 
 // RecipeAdapter — replays a recorded portal recipe (see portal_recipes / the recorder).
@@ -241,6 +415,43 @@ const ADVANCE_SETTLE_MS = 600;
 // Escape an id for a css selector on the NODE side (CSS.escape is browser-only).
 const CSS_ESCAPE = (v: string): string => v.replace(/([^a-zA-Z0-9_-])/g, "\$1");
 const IDENTITY_CHECKED = new Set(["fill", "select", "check", "uncheck"]);
+/** A widget face showing no answer yet ("Please select...", "Choose one", "Nothing selected",
+ *  "-- none --"): never evidence that a pick held (#327). */
+const FACE_PLACEHOLDER = /^\W*(please\s+)?(select|choose)\b|^\W*(nothing|none|not)\s+selected|^\W*no\s+selection|^\W*--/i;
+/** A widget face's words for EQUALITY with the option clicked (selectionHeld): case, whitespace
+ *  (nbsp too) and plain punctuation folded, the symbols that tell options apart kept — "≤ 10 kW"
+ *  and "> 10 kW" must not both read "10kw", nor "Solar + Storage" read as "Solar Storage".
+ *  In order, on the raw text (#327 round 4): every dash (U+2010/2011, minus, en, em) reads "-";
+ *  a dash BETWEEN two letters or digits is a separator ("IQ8PLUS-72-2-US" is "IQ8PLUS 72 2 US");
+ *  "/" and "." are kept only between two digits ("1/0 AWG" is not "10 AWG", "7.6 kW" is not
+ *  "76 kW", while "Enphase Energy Inc." is "Enphase Energy Inc"); edge dashes go ("-- None --"),
+ *  except a lone leading minus on a number ("-5°" is not "5°"). */
+const faceWords = (t: string): string =>
+  (t || "").toLowerCase().replace(/<=/g, "≤").replace(/>=/g, "≥")
+    .replace(/[\u2010\u2011−–—]/g, "-")
+    .replace(/([\p{L}\p{N}])-(?=[\p{L}\p{N}])/gu, "$1 ")
+    .replace(/(?<!\p{N})[/.]|[/.](?!\p{N})/gu, "")
+    .replace(/[^\p{L}\p{N}<>≤≥+\-/.]/gu, "")
+    .replace(/-+$/u, "")
+    .replace(/^-+/u, (m: string, _at: number, all: string) => (m === "-" && /^\p{N}/u.test(all.slice(1)) ? m : ""));
+/** The numbers a text carries, by value ("7.60" is 7.6). */
+const numbersIn = (t: string): number[] => ((t || "").match(/\d+(?:\.\d+)?/g) ?? []).map(Number);
+/** Does a clicked option answer the step? readbackMatches' containment either way, AND the same
+ *  with the symbols kept: "≤ 10 kW" does not answer "> 10 kW" (#327 review round 3). A
+ *  containment that CHANGES A NUMBER is no answer: "Schedule 1" sits inside "Schedule 10" but
+ *  does not answer it, while "7.6" still answers "7.60 kW" — every number on the shorter side
+ *  must be, by value, a number on the longer one (#327 round 4). */
+const clickedAnswers = (clicked: string, want: string): boolean => {
+  const a = faceWords(clicked), b = faceWords(want);
+  if (!readbackMatches(clicked, want) || !a || !b) return false;
+  if (a === b) return true;
+  if (!a.includes(b) && !b.includes(a)) return false;
+  const [short, long] = a.length <= b.length ? [clicked, want] : [want, clicked];
+  const theirs = numbersIn(long);
+  return numbersIn(short).every((n) => theirs.includes(n));
+};
+/** A concealed backing input's key and own face, read before a pick (selectionHeld). */
+type BackingSnapshot = { key: string; face: string };
 /** Steps that write project data. A missing control for one of these can legitimately mean
  *  "this portal did not ask that for this project" — unlike a missing button, which means
  *  the flow itself has drifted. */
@@ -486,6 +697,129 @@ const ROW_FIELD_HOOKS: Record<string, { role: string; name: string }> = {
   array1Tracking: { role: "tracking-select", name: "Tracking" },
 };
 
+/** The PV-array adder's own words — the same wording addAnotherArrayRow looks for. "array" stays
+ *  required: a bare "Add Row" could belong to any repeater on the page. */
+const ARRAY_ADDER_WORDS = /^\+?\s*add\s*(another\s*)?(pv\s*)?array$/i;
+
+/**
+ * #382 — IS THIS RECORDED STEP A CLICK ON THE PV-ARRAY ADDER? Live (PacifiCorp, 2026-10-21) the
+ * owner clicked "Add Array" twice by hand at review, patch-by-demonstration recorded both clicks,
+ * and every later replay would add exactly two rows whatever the project's array count. How many
+ * rows a project needs is its own data (its arrays), so a recorded adder click is never replayed:
+ * the rows come from afterArrayBlock, one per array. Read from the click's own name, text, label
+ * or note ("human-patch: Add Array", "advance: Add Array"), or its PowerClerk test hook.
+ */
+export function isArrayAdderClick(step: RecipeStep | undefined): boolean {
+  if (!step || step.action !== "click" || step.isFinalSubmit) return false;
+  const sel = step.selector ?? {};
+  const words = [sel.name, sel.text, sel.label, ...(sel.fallbacks ?? []).flatMap((f) => [f.name, f.text, f.label]),
+    String(step.note ?? "").replace(/^(human-patch|advance|click)\s*:?\s*/i, "")];
+  if (words.some((w) => ARRAY_ADDER_WORDS.test(String(w ?? "").replace(/\s+/g, " ").trim()))) return true;
+  return [sel.css, ...(sel.fallbacks ?? []).map((f) => f.css)].some((c) => /data-test-role=["']?add-array-btn\b/i.test(String(c ?? "")));
+}
+
+/** The words a PV-array row labels its own controls with (ROW_FIELD_HOOKS' names, the learner's
+ *  humanised hook, the plan-set words). Read only from a step that names no other section. */
+const ROW_CONTROL_WORDS = /^(qty|quantity|(pv\s*)?array\s*quantity|module\s*quantity|manufacturer|make|model|tilt|azimuth|tracking)$/i;
+/** A row-owned field: array<N>* (array2ModuleQuantity, array3ModuleManufacturer…) and the module
+ *  make/model every row files, as the merge binds them (moduleModelCertified for the portal's own
+ *  certified wording). */
+const ROW_FIELD = /^(array\d+[A-Z]\w*|moduleMake|moduleModel|moduleModelCertified)$/;
+const ROW_HOOK_ROLES = new Set(Object.values(ROW_FIELD_HOOKS).map((h) => h.role));
+
+/** Which PV-array row a recorded step names, 0 when it names none: its field's array number, its
+ *  section ("PV Array 3"), or a row hook css with an nth (nth 1 = row 2). */
+function recordedArrayRow(step: RecipeStep): number {
+  const f = /^array(\d+)[A-Z]/.exec(String(step.field ?? ""));
+  if (f) return Number(f[1]);
+  const s = /\bpv\s*array\s*#?\s*(\d+)\b/i.exec(String(step.fingerprint?.section ?? ""));
+  if (s) return Number(s[1]);
+  const sel = step.selector ?? {};
+  for (const x of [sel, ...(sel.fallbacks ?? [])]) {
+    const role = /data-test-role=["']?([\w-]+)/i.exec(String(x.css ?? ""))?.[1] ?? "";
+    if (role && ROW_HOOK_ROLES.has(role) && typeof x.nth === "number") return x.nth + 1;
+  }
+  return 0;
+}
+
+/** Does this recorded write name a PV-array row's own control (Qty / make / model / tilt / azimuth
+ *  / tracking)? By its field, a row hook, a "PV Array" section, or — when its section names no
+ *  OTHER one (the inverter's "Manufacturer" sits in "Inverter") — the row's own words. */
+function isArrayRowControl(step: RecipeStep): boolean {
+  if (step.action !== "fill" && step.action !== "select") return false;
+  if (ROW_FIELD.test(String(step.field ?? ""))) return true;
+  const sel = step.selector ?? {};
+  const all = [sel, ...(sel.fallbacks ?? [])];
+  if (all.some((x) => {
+    const role = /data-test-role=["']?([\w-]+)/i.exec(String(x.css ?? ""))?.[1] ?? "";
+    return ROW_HOOK_ROLES.has(role) || /^pv-array-/i.test(role);
+  })) return true;
+  const section = String(step.fingerprint?.section ?? "").trim();
+  // No \b after "array": the legend's text runs into its own button ("PV ArrayDelete Array").
+  if (section) return /\bpv\s*array/i.test(section);
+  const words = [...all.flatMap((x) => [x.name, x.label, x.placeholder, x.text]), step.fingerprint?.ariaLabel, step.fingerprint?.placeholder,
+    String(step.note ?? "").replace(/^human-patch\s*:?\s*/i, "")];
+  return words.some((w) => ROW_CONTROL_WORDS.test(String(w ?? "").replace(/\s+/g, " ").trim()));
+}
+
+const isHumanPatch = (step: RecipeStep | undefined): boolean => /^human-patch\b/i.test(String(step?.note ?? ""));
+
+/**
+ * #386 — THE HAND-PATCHED PV-ARRAY ROW WRITES A REPLAY MUST NOT REPEAT, by step index, each with
+ * why (for the run's notes). Live (PacifiCorp, 2026-10-21) the owner added rows 2–4 at review;
+ * patch-by-demonstration recorded the two "Add Array" clicks (#382 stops those replaying) AND the
+ * Qty / make / model typed into the new rows. Replayed, those are the LEARN project's numbers
+ * aimed at bare "Qty" / "Manufacturer" labels: a Qty of "5" (two of that project's arrays) lands
+ * on row 1 or the inverter's Qty, and on a one-array project rows 2–3 do not exist at all. The
+ * rows a project needs are its own data — row mode fills every one from the project's arrays —
+ * so a human-patched step counts when it writes a row control
+ *   - of a row past the first (array2*, "PV Array 3", a row hook's nth), or
+ *   - anywhere after a recorded "Add Array" click in the same human-patched run of steps.
+ * Row 1's own fixes and every other control replay as before. Read at replay, not dropped at the
+ * merge: recipes already saved hold these steps.
+ */
+export function handPatchedArrayRowSteps(steps: RecipeStep[]): Map<number, string> {
+  const out = new Map<number, string>();
+  let adderAt = -1; // the recorded adder click this human-patched run follows, -1 when none
+  steps.forEach((s, i) => {
+    if (isArrayAdderClick(s)) { adderAt = i; return; }
+    if (!isHumanPatch(s)) { adderAt = -1; return; }
+    if (!isArrayRowControl(s)) return;
+    const row = recordedArrayRow(s);
+    if (row >= 2) out.set(i, `it writes PV array row ${row}`);
+    else if (adderAt >= 0) out.set(i, `it writes a PV array row after the recorded "Add Array" click (step ${adderAt + 1})`);
+  });
+  return out;
+}
+
+/** The recorded control of a write step as an id css (#362): its `#id` selector, an `[id=…]` one, or
+ *  its fingerprint id. "" when the step names no id — then only its own document and view make a
+ *  re-assert of it this page's own. */
+/** The attribute a re-assert puts on the one control it checked (#362, Helm review of 381204a, C8):
+ *  the step then runs through a selector for that element alone. */
+const REASSERT_PIN_ATTR = "data-al-reassert";
+const isPinnedReassert = (step: RecipeStep): boolean => String(step.selector?.css ?? "").startsWith(`[${REASSERT_PIN_ATTR}=`);
+function recordedControlCss(step: RecipeStep): string {
+  const css = String(step.selector?.css ?? "").trim();
+  if (/^#[A-Za-z_][\w:.-]*$/.test(css) || /^\[id="[^"]+"\]$/.test(css)) return css;
+  const id = String(step.fingerprint?.id ?? "").trim();
+  return id ? `[id="${id.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"]` : "";
+}
+
+/** THE FIRST WORDS OF A STOP FOR PICKS (#362, Helm review of 4081f12, SF1). The run card and the
+ *  project's stage line read the first line of the stop message (backend pausedRunSentence, behind
+ *  "stopped before review — "), and the dashboard's why-line cuts it at 240 characters, so this
+ *  sentence leads the message and stays within 200: what was NOT clicked, how many answers
+ *  automation picked, which (labels only, never values beyond the option word), and what to do. */
+export function draftPickStopTell(stampLabel: string, picks: string[]): string {
+  const head = `NOT CLICKED "${String(stampLabel || "Submit").replace(/\s+/g, " ").trim().slice(0, 30)}": automation picked ${picks.length} answer(s) with no project data behind them (`;
+  const tail = ") — check them, then click it yourself.";
+  const room = Math.max(24, 200 - head.length - tail.length);
+  let brief = picks.map((p) => String(p).replace(/\s+/g, " ").trim()).join("; ");
+  if (brief.length > room) brief = `${brief.slice(0, room - 1).trimEnd()}…`;
+  return `${head}${brief}${tail}`;
+}
+
 export class RecipeAdapter extends BasePortalAdapter {
   portalName: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -520,12 +854,232 @@ export class RecipeAdapter extends BasePortalAdapter {
   /** The page identity the last gap-fill ran against, so the end-of-run pass can tell a page
    *  that still needs one from a page that has just had one. */
   private gapFilledPage = "";
+  /** WHAT AUTOMATION WROTE THAT NO RECORDED STEP WROTE (#362), for the whole run: labels, never
+   *  values, each of one KIND (owner ruling 2026-10-18, "Data is enough, the whole idea is to keep
+   *  it pretty autonomous"):
+   *   - "data": straight from this project's data — a gap-fill fill bound to a project field
+   *     (gapFillWriteKind), an unrecorded upload slot or owed document from the project's files, the
+   *     Type chosen for that document's row, a service-line or kVA box from the project, a contact
+   *     dialog corrected to the project's contact, the project's extra PV array rows. Kept as
+   *     information; never stops the click.
+   *   - "pick": an answer with no project data behind it — a gap-fill checkbox / radio / select
+   *     answered with no bound project field, or another page's recorded value re-asserted into a
+   *     blank here. Read by clickDraftCreatingSubmit: the stamped draft click only happens on the
+   *     page the stamp saw, and a page that needed an AI's pick is not that page.
+   *  KEYED TO THE CONTROL AND ITS QUESTION, NOT TO "LEAVING THE PAGE": a pick's element carries
+   *  UNRECORDED_WRITE_ATTR, and its id, name, every question it was read under, document and view
+   *  are kept. At the draft click a pick is IN FRONT when its control is still stamped; or it was
+   *  made in this document and this view (a re-mount under a new id, a removed dialog — an advance
+   *  that only reveals more of the same page keeps the view); or a control with its id OR name is
+   *  here and, in another document, does not readably ask something else (a revisit; an earlier
+   *  page's reused id that asks another question is not it); or an answered control asks its
+   *  question (a revisit under new ids). So a pick left on an EARLIER page is left behind by a real
+   *  navigation unless Part 1 asks the same question (the owner's "Submit page only" scope, pending
+   *  his card). See unrecordedPicksInFront. */
+  /** The stop's first words when the stamped draft click was refused for picks (#362). */
+  private draftPickTell: string | null = null;
+  private unrecordedWrites: Array<{ kind: "data" | "pick"; label: string; id: string; name: string; doc: string; view: number; question: string; option: string; questions: string[] }> = [];
+  /** WHICH VIEW (#362). Within one document a new view begins only when the URL PATH changes or the
+   *  controls on screen were REPLACED: most of the last ones gone AND most of the ones now showing
+   *  new (a single-document app's "Proceed to Part 1"). Never on heading text or `location.search`
+   *  alone (a re-render, a postback, a "Saved" toast), never when controls only appear (a reveal,
+   *  a dialog opening) or only go (a dialog closing). -1 = unreadable, which never matches. */
+  private viewSeq = 0;
+  private lastView: { path: string; ids: string[] } | null = null;
+  /** Where each recorded write ran (#362, Helm review of 381204a, A2): its document, its view, its
+   *  URL path and the recorded control (an id css), so a re-assert can tell THIS page's own value
+   *  from one carried over from a page with the same URL. */
+  private recordedStepView = new Map<number, { doc: string; view: number; path: string; ctl: string }>();
+  /** The element the current recorded step actually wrote (executeStepInner), or null when it wrote
+   *  nothing (a no-battery skip, a fee tier, a control not offered) — what recordingOverwrotePick
+   *  clears, never the control the step's selector names now. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private writtenTarget: any = null;
+  private reassertSeq = 0;
+  private async observeView(): Promise<number> {
+    if (!this.page || typeof this.page.evaluate !== "function") return -1;
+    const read = await this.page.evaluate(() => {
+      const vis = (el: Element): boolean => { const r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; };
+      const ids = Array.from(document.querySelectorAll("input:not([type=hidden]), select, textarea"))
+        .filter(vis).map((el) => el.getAttribute("id") || el.getAttribute("name") || "").filter(Boolean).slice(0, 300);
+      return { path: location.pathname, ids };
+    }).catch(() => null) as { path: string; ids: string[] } | null;
+    if (!read || typeof read.path !== "string" || !Array.isArray(read.ids)) return -1;
+    const last = this.lastView;
+    if (last) {
+      const lost = last.ids.filter((i) => !read.ids.includes(i)).length;
+      const fresh = read.ids.filter((i) => !last.ids.includes(i)).length;
+      const replaced = last.ids.length > 0 && read.ids.length > 0 && lost * 2 > last.ids.length && fresh * 2 > read.ids.length;
+      if (read.path !== last.path || replaced) this.viewSeq++;
+    }
+    this.lastView = read;
+    return this.viewSeq;
+  }
+  /** The main document's token: set once on its <html>, so a new document reads a new one. "*" when
+   *  it cannot be read — which then matches every document (fail closed). */
+  private async docToken(): Promise<string> {
+    if (!this.page || typeof this.page.evaluate !== "function") return "*";
+    const t = await this.page.evaluate(() => {
+      const d = document.documentElement;
+      let tok = d.getAttribute("data-al-doc");
+      if (!tok) { tok = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`; d.setAttribute("data-al-doc", tok); }
+      return tok;
+    }).catch(() => "");
+    return String(t || "") || "*";
+  }
+  private async noteUnrecordedWrite(kind: "data" | "pick", what: string, control?: { id?: string; name?: string; question?: string; option?: string; questions?: string[] }): Promise<void> {
+    const label = String(what || "").replace(/\s+/g, " ").trim().slice(0, 100) || "a control";
+    const id = String(control?.id ?? "");
+    const name = String(control?.name ?? "");
+    const clean = (t: unknown): string => String(t ?? "").replace(/\s+/g, " ").trim();
+    const question = clean(control?.question);
+    const option = clean(control?.option).slice(0, 200);
+    // EVERY QUESTION, WHOLE (Helm review of 381204a, A1): what reads the pick back on a revisit.
+    const questions = Array.from(new Set([question, ...(control?.questions ?? []).map(clean)].filter(Boolean))).slice(0, 16);
+    const doc = await this.docToken();
+    const view = await this.observeView();
+    if (this.unrecordedWrites.some((w) => w.kind === kind && w.label === label && w.id === id && w.name === name && w.doc === doc)) return;
+    this.unrecordedWrites.push({ kind, label, id, name, doc, view, question, option, questions });
+  }
+  /** Note a write to the control a locator resolves: keep its id / name, and stamp it when it is a
+   *  pick. A control that cannot be read is tied to the document instead. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async noteUnrecordedWriteAt(kind: "data" | "pick", what: string, loc: any): Promise<void> {
+    const label = String(what || "").replace(/\s+/g, " ").trim().slice(0, 100) || "a control";
+    const ctl = loc && typeof loc.evaluate === "function"
+      ? await loc.evaluate((el: Element, a: { attr: string; label: string; stamp: boolean }) => {
+        if (a.stamp) el.setAttribute(a.attr, a.label);
+        return { id: el.getAttribute("id") || "", name: el.getAttribute("name") || "" };
+      }, { attr: UNRECORDED_WRITE_ATTR, label, stamp: kind === "pick" }, { timeout: 1500 }).catch(() => null) as { id: string; name: string } | null
+      : null;
+    await this.noteUnrecordedWrite(kind, label, ctl ?? undefined);
+  }
+  /** Which PICKS are still in front of the draft click (see unrecordedWrites). Unreadable = every
+   *  pick of the run (fail closed). Data-backed writes never count. One entry per pick: two
+   *  controls sharing a label are two picks, and a stamp cloned onto a re-render of a noted pick's
+   *  own control is that pick. */
+  private async unrecordedPicksInFront(): Promise<string[]> {
+    const picks = this.unrecordedWrites.filter((w) => w.kind === "pick");
+    if (!picks.length) return [];
+    const all = (): string[] => picks.map((w) => w.label);
+    if (!this.page || typeof this.page.evaluate !== "function") return all();
+    const doc = await this.docToken();
+    // IN FRONT, PER PICK (Helm reviews of 4081f12 and 381204a, "Submit page only"), any of:
+    //   - its control is still stamped (UNRECORDED_WRITE_ATTR rides the element itself, so this
+    //     holds even where its id, name and question are all unreadable);
+    //   - it was made in THIS document and THIS view (observeView) — even if its control was
+    //     re-created under a new id or removed (a re-mount, a re-render, a dialog that copied its
+    //     answer and closed). A pick with no id, name or question: made in this document;
+    //   - a control with its id OR its name is here: in this document always; in another document
+    //     (a revisit, a reload) unless that control READABLY asks something else — unknown counts
+    //     as in front;
+    //   - an ANSWERED, visible control asks the pick's own question (a revisit under new ids; a
+    //     checked radio also by its option word; a checkbox by its own sentence).
+    // "Asks" is the extractor's own reading (questionsOf, through extractFieldsInPage), compared
+    // whole with every question the pick was read under — the same reading the guard used.
+    const view = await this.observeView();
+    const PQ = "data-al-pq";
+    type Info = { id: string; name: string; type: string; answered: boolean; visible: boolean; stamp: string | null };
+    const scan = await this.page.evaluate((a: { attr: string; pq: string; writes: Array<{ id: string; name: string }> }) => {
+      for (const el of Array.from(document.querySelectorAll(`[${a.pq}]`))) el.removeAttribute(a.pq);
+      const vis = (el: Element): boolean => { const r = el.getBoundingClientRect(); return r.width > 0 || r.height > 0; };
+      const answered = (el: Element): boolean => {
+        const i = el as HTMLInputElement;
+        const ty = (el.getAttribute("type") || "").toLowerCase();
+        if (ty === "radio" || ty === "checkbox") return i.checked;
+        if (el.tagName === "SELECT") { const s = el as HTMLSelectElement; return s.selectedIndex > 0 || (!!s.value && s.selectedIndex >= 0); }
+        return !!String(i.value || "").trim();
+      };
+      const els: Element[] = [];
+      const keyOf = (el: Element): number => {
+        let k = els.indexOf(el);
+        if (k < 0) { k = els.length; els.push(el); el.setAttribute(a.pq, String(k)); }
+        return k;
+      };
+      const isControl = (el: Element): boolean => /^(INPUT|SELECT|TEXTAREA)$/.test(el.tagName) || !!el.getAttribute("role");
+      const byKey = a.writes.map((w) => Array.from(new Set([
+        ...(w.id ? Array.from(document.querySelectorAll(`[id="${CSS.escape(w.id)}"]`)) : []),
+        ...(w.name ? Array.from(document.getElementsByName(w.name)) : []),
+      ])).filter(isControl).slice(0, 20).map(keyOf));
+      const shown = (el: Element): boolean => vis(el) || Array.from((el as HTMLInputElement).labels ?? []).some(vis);
+      const answeredKs = Array.from(document.querySelectorAll("input:not([type=hidden]), select, textarea"))
+        .filter((el) => shown(el) && answered(el)).slice(0, 300).map(keyOf);
+      const stampedKs = Array.from(document.querySelectorAll(`[${a.attr}]`)).map(keyOf);
+      const info = els.map((el) => ({
+        id: el.getAttribute("id") || "", name: el.getAttribute("name") || "",
+        type: ((el as HTMLInputElement).type || el.tagName || "").toLowerCase(),
+        answered: answered(el), visible: shown(el), stamp: el.getAttribute(a.attr),
+      }));
+      return { byKey, answeredKs, stampedKs, info };
+    }, { attr: UNRECORDED_WRITE_ATTR, pq: PQ, writes: picks.map((w) => ({ id: w.id, name: w.name })) })
+      .catch(() => null) as { byKey: number[][]; answeredKs: number[]; stampedKs: number[]; info: Info[] } | null;
+    if (!scan || !Array.isArray(scan.info) || !Array.isArray(scan.byKey)) return all();
+    // The extractor's reading of every probed element, tied back by its probe mark.
+    const rawOf = new Map<number, RawField>();
+    if (typeof this.page.locator === "function") {
+      const raws = await this.page.locator(`[${PQ}]`).evaluateAll(extractFieldsInPage).catch(() => null) as RawField[] | null;
+      for (const r of Array.isArray(raws) ? raws : []) if (r && r.probe != null) rawOf.set(Number(r.probe), r);
+    }
+    await this.page.evaluate((pq: string) => { for (const el of Array.from(document.querySelectorAll(`[${pq}]`))) el.removeAttribute(pq); }, PQ).catch(() => null);
+    const norm = (t: string | null | undefined): string => String(t || "").replace(/[\s*:?]+/g, " ").trim().toLowerCase();
+    // THREE-VALUED (Helm review of 381204a, A1): "yes" it asks the pick's question; "no" it readably
+    // asks something else; "unknown" — no question stored, or none readable on the live control.
+    const asks = (k: number, w: (typeof picks)[number]): "yes" | "no" | "unknown" => {
+      const pq = w.questions.map(norm).filter(Boolean);
+      const inf = scan.info[k];
+      if (!pq.length || !inf) return "unknown";
+      if ((inf.id && pq.includes(norm(inf.id))) || (inf.name && pq.includes(norm(inf.name)))) return "yes";
+      const raw = rawOf.get(k);
+      if (!raw) return "unknown";
+      const live = questionsOfRaw(raw).map(norm).filter((q) => q && q !== norm(inf.id) && q !== norm(inf.name));
+      if (!live.length) return "unknown";
+      return pq.some((q) => live.includes(q)) ? "yes" : "no";
+    };
+    const optionOk = (k: number, w: (typeof picks)[number]): boolean => {
+      const inf = scan.info[k];
+      if (inf?.type !== "radio" || !w.option) return true;
+      const raw = rawOf.get(k);
+      return !!raw && norm(raw.label) === norm(w.option);
+    };
+    const out: string[] = [];
+    const claimed = new Set<number>();
+    picks.forEach((w, i) => {
+      const keyed = scan.byKey[i] ?? [];
+      const mine = keyed.filter((k) => scan.stampedKs.includes(k));
+      mine.forEach((k) => claimed.add(k));
+      const sameDoc = w.doc === "*" || doc === "*" || w.doc === doc;
+      const keyless = !w.id && !w.name && !w.questions.length;
+      const sameView = sameDoc && (keyless || w.view < 0 || view < 0 || w.view === view);
+      const keyHere = keyed.length > 0 && (sameDoc || keyed.some((k) => asks(k, w) !== "no"));
+      const askedHere = scan.answeredKs.some((k) => !!scan.info[k]?.visible && asks(k, w) === "yes" && optionOk(k, w));
+      if (mine.length || sameView || keyHere || askedHere) out.push(w.label);
+    });
+    // A stamp no noted pick claims (a re-render cloned it under a new id): counted unless it is a
+    // pick already counted under the same label.
+    for (const k of scan.stampedKs) {
+      if (claimed.has(k)) continue;
+      const lbl = scan.info[k]?.stamp || "a control";
+      if (!out.includes(lbl)) out.push(lbl);
+      claimed.add(k);
+    }
+    // ...and a stamp a gap-fill left inside a frame (a dialog the planner filled).
+    const frames = typeof this.page.frames === "function" ? this.page.frames() : [];
+    for (const fr of Array.isArray(frames) ? frames : []) {
+      if (typeof this.page.mainFrame === "function" && fr === this.page.mainFrame()) continue;
+      const got = await fr.evaluate((attr: string) => Array.from(document.querySelectorAll(`[${attr}]`)).map((el) => el.getAttribute(attr) || "a control"), UNRECORDED_WRITE_ATTR).catch(() => [] as string[]);
+      for (const lbl of Array.isArray(got) ? got : []) if (!out.includes(lbl)) out.push(lbl);
+    }
+    return out;
+  }
   private stoppedAtPayment = false;
   /** Set by a fill step whose control the in-page reading marks as a signature box when this
    *  client has no authorized signer: runAll pauses signature_no_signer right after it. */
   private liveSignaturePause: string | null = null;
   private requiredFieldsSeen: string[] = [];
   private fieldsVerified: string[] = [];
+  /** The option the current select step's picker CLICKED (comboboxFill fills it per call). Per
+   *  adapter, never module-wide: two jobs replaying at once must not confirm each other (#327). */
+  private selectPick: ComboboxPick = { text: "" };
   private fieldsUnverified: string[] = [];
   /** Why each selector level was accepted or rejected, for the step currently resolving.
    *  Reported only when a step fails — see the note in resolveLocator. */
@@ -582,10 +1136,13 @@ export class RecipeAdapter extends BasePortalAdapter {
   private arrayBlockEnd = -1;
   /** The post-pass held-check runs exactly once, after the last array pass. */
   private arrayVerifyDone = false;
-  /** #339 — ROW MODE: a multi-array project on a page whose PV Array rows are countable (each
-   *  owns a "Delete Array" marker). Per-array steps then run INSIDE their own row container,
+  /** #339 — ROW MODE: a page whose PV Array rows are countable (each owns a "Delete Array"
+   *  marker) — for every project, one array or several (#382). Per-array steps then run INSIDE their own row container,
    *  never by a page-wide nth. null until the first per-array step decides it. */
   private arrayRowMode: boolean | null = null;
+  /** #386 — the hand-patched row writes this run did not replay (step indices): a later re-assert
+   *  of a blank never runs one of them either. */
+  private handPatchedRowsSkipped = new Set<number>();
   /** The row (1-based) every resolution is scoped to while a row is being filled; 0 = page. */
   private arrayRowScope = 0;
   /** Which project arrays each rendered row holds: [[1],[2],…] by default. A merge (the
@@ -622,11 +1179,19 @@ export class RecipeAdapter extends BasePortalAdapter {
   /** runs-finish item 3: the run ended on a page NOT verified as the review page — where, in the
    *  page's own words. stopAtReview then says so instead of "staged to the review screen". */
   private stoppedBeforeReview = "";
+  /** …and the reading it was built from: stopAtReview re-words it with what it knows by then (a
+   *  request of the person's that landed after the tail read it is said, never "Nothing was filed"). */
+  private stoppedBeforeReviewAt: { where: string; refused: string[] } | null = null;
   /** Policy-default steps whose control was absent when their turn came — re-tried once
    *  just before the page's advance, when a conditional section has had every chance to
    *  render. Cleared on each advance. */
   private pendingPolicyRetries: RecipeStep[] = [];
   private inPolicyRetry = false;
+  /** Required controls the recipe has no step for, answered from this job (answerUnrecordedRequired,
+   *  issue #352) — labels, never values. */
+  private unrecordedAnswered: string[] = [];
+  /** A fresh token per pin (pinEmptyRequiredControl), so a stamp from an earlier pass never matches. */
+  private unrecordedPinSeq = 0;
   /** Drift-precheck annotations ("this page barely matches the recipe") — surfaced
    *  in every result payload so a run that squeaked through via heals still tells
    *  the operator the portal likely changed. */
@@ -664,6 +1229,9 @@ export class RecipeAdapter extends BasePortalAdapter {
   private draftSubmitAttempted = false;
   /** The draft the replay's own draft-creating click made, as the page after it read (#330). */
   private draftSubmitOutcome: (ReturnType<typeof readDraftCreated> & { clickedLabel: string; tenantKey: string }) | null = null;
+  /** The account's application list as the sign-in landed on it (openSubmission) — the "before"
+   *  of the person's filing (#400). null when the page could not be read. */
+  private ledgerBefore: LedgerEntry[] | null = null;
   /** The recipe step index the loop is on — the final-submit gate's "is this the terminal step". */
   private currentStepIdx = -1;
   /** The step whose selector resolveLocator is resolving right now (for disambiguation). */
@@ -704,6 +1272,11 @@ export class RecipeAdapter extends BasePortalAdapter {
        *  after it must read as draft-created. Not an approval to file: the final-submit gate never
        *  reads it. */
       draftSubmitStamp?: DraftCreatingStamp | null;
+      /** A PERSON WILL TAKE THE REVIEW PAGE, AND THE CALLER WATCHES FOR THEIR SUBMIT (#333, Helm
+       *  Should-fix 4). index.ts stageWithRecipe passes it only when StageOptions.onSubmitCaptured is a
+       *  function; the learn self-test, the cross-project replay, the benchmark and the correction /
+       *  status constructions never hand over, so a click in their tail is held as on main. */
+      handOverReview?: boolean;
     } = {},
   ) {
     super();
@@ -793,9 +1366,14 @@ export class RecipeAdapter extends BasePortalAdapter {
     // landed on is read, nothing is clicked. A draft found here is reported (existingDraft) for the
     // backend to record, so the next stage opens THAT draft's next form instead of replaying an
     // application start that would mint a second number for the same house.
+    // The same read is the BEFORE of a person's filing in this window (#400): the row that is new
+    // on the page they are left on is the application they filed.
+    if (this.page && typeof this.page.evaluate === "function") {
+      this.ledgerBefore = (await this.page.evaluate(readApplicationLedgerInPage).catch(() => null)) as LedgerEntry[] | null;
+    }
     const street = String(this.options.siteDraft?.street ?? "").trim();
-    if (street && this.page && typeof this.page.evaluate === "function") {
-      const entries = (await this.page.evaluate(readApplicationLedgerInPage).catch(() => [])) as LedgerEntry[];
+    if (street && this.ledgerBefore) {
+      const entries = this.ledgerBefore;
       const find = findSiteDraft(entries, { ...this.options.siteDraft, street });
       if (find.found || find.ambiguous) {
         const appNo = find.found ? find.entry.id : "";
@@ -827,7 +1405,18 @@ export class RecipeAdapter extends BasePortalAdapter {
         return;
       }
     }
-    return super.runGapFill(page);
+    try {
+      return await super.runGapFill(page);
+    } finally {
+      for (const w of this.lastGapFillWrites) await this.noteUnrecordedWrite(w.kind === "data" ? "data" : "pick", `gap-fill: ${w.label}`, w);
+      // #524: a company / contact-code list the gap-fill could not make this client's stops the run
+      // (sticky: the next step, click or key press refuses), exactly like a recorded step's miss.
+      const filer = this.lastGapFillFilerRefused[0];
+      if (filer && !this.filerIdentityStop) {
+        this.filerIdentityStop = filer;
+        this.driftWarnings.push(`STOPPED: ${filer}`);
+      }
+    }
   }
 
   /** Does the in-page reading (portalSafety signatureStepInPage — the learner's own, run fresh on
@@ -858,8 +1447,17 @@ export class RecipeAdapter extends BasePortalAdapter {
     // before this returns: the operator submits by hand in this same page after stopAtReview
     // (armSubmitWatch), and a route left behind would abort the person's own filing.
     this.backstop = await installFilingBackstop(this.page, "replay run").catch(() => null);
+    if (this.backstop?.redirectGuardNote) this.driftWarnings.push(this.backstop.redirectGuardNote);
     try {
-      const ran = await this.runAll(project);
+      // A FilerIdentityStop that escaped the step loop (a click between steps) is the run's answer too.
+      const ranRaw = await this.runAll(project).catch((err: unknown) => {
+        if (err instanceof FilerIdentityStop) return fail(err.message, { driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals });
+        throw err;
+      });
+      // ...and a stop recorded on a path that swallowed it never ends as "reached review".
+      const ran = this.filerIdentityStop && ranRaw.ok
+        ? fail(this.filerIdentityStop, { ...(ranRaw.data ?? {}), driftWarnings: this.driftWarnings, guardRefusals: this.guardRefusals })
+        : ranRaw;
       // A dismissed dialog cancelled the approved click: the result says so in data too.
       const r = this.finalSubmitNothingSent ? { ...ran, data: { ...(ran.data ?? {}), finalSubmitClicked: false, finalSubmitRequestSent: false } } : ran;
       // Hand-off: the route comes off FIRST, then every abort up to that moment is counted (an
@@ -909,7 +1507,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // ...and a fetch the window admitted is not the filing when the clicked page's OWN form submission
     // (a state-changing document request, not a payment) was then aborted as a filing (autosubmit-close-2
     // skeptic s4ValidateSubmit: fetch('/api/validate-submit') took the window, the form's POST was aborted).
-    const formPostAborted = bs.aborts.some((x) => x.rule === "filing-url" && /^document$/i.test(String(x.resourceType || ""))
+    const formPostAborted = bs.aborts.some((x) => x.rule === "filing-url" && !x.redirect && /^document$/i.test(String(x.resourceType || ""))
       && !/^(GET|HEAD)$/i.test(String(x.method || "")) && !/fee-payment/i.test(String(x.why || "")));
     const isFiling = (a: { filing: boolean; navigation: boolean }): boolean => a.filing && (a.navigation || !formPostAborted);
     const sent = bs.approvedAdmissions.some(isFiling) || bs.approvedNavigations.length > 0;
@@ -928,21 +1526,45 @@ export class RecipeAdapter extends BasePortalAdapter {
     }
     const dialogs = bs.approvedDialogs.filter((d) => d.action === "accepted");
     if (dialogs.length) notes.push(`accepted the click's own ${dialogs.map((d) => `${d.type} ("${d.message.slice(0, 60)}")`).join(", ")}`);
-    const others = bs.aborts;
+    // THE ADMITTED REQUEST'S OWN REDIRECT (#358): it went (sent stays true) and the portal answered it
+    // with a redirect the backstop did not follow — named as that, not as "another request".
+    const admittedWhere = new Set(bs.approvedAdmissions.map((a) => a.where));
+    const ownRedirects = bs.aborts.filter((x) => x.redirect && x.redirect.hop === 1 && admittedWhere.has(x.redirect.from));
+    for (const x of ownRedirects) notes.push(`the portal answered the approved click's request with a ${x.redirect!.status} redirect to ${x.where}, and the backstop did not follow it (${describeBackstopAbort(x)})`);
+    const others = bs.aborts.filter((x) => !ownRedirects.includes(x));
     if (others.length) {
       notes.push(`the network backstop aborted ${others.length} other state-changing request(s) during/after it (${describeBackstopAbort(others[0])}) — only one request in the approved click's slot was admitted`);
     }
     const line = `APPROVED FINAL SUBMIT: ${notes.join("; ")}.`;
-    if ((others.length || !sent) && !this.driftWarnings.includes(line)) this.driftWarnings.push(line);
+    if ((others.length || ownRedirects.length || !sent) && !this.driftWarnings.includes(line)) this.driftWarnings.push(line);
     const data = {
       ...(r.data ?? {}), approvedRequests: [...bs.approvedRequests], approvedNavigations: [...bs.approvedNavigations],
-      finalSubmitRequestSent: sent, backstopAborts: others.length, driftWarnings: this.driftWarnings, guardRefusals: this.guardRefusals,
+      finalSubmitRequestSent: sent, backstopAborts: others.length + ownRedirects.length, driftWarnings: this.driftWarnings, guardRefusals: this.guardRefusals,
     };
     return { ...r, message: `${String(r.message ?? "")} ${line}`.trim(), data };
   }
 
   private backstop: FilingBackstop | null = null;
   private backstopReported = 0;
+  /** #333 — set the moment the input watch is armed (before the hand-over): from then on the run's own
+   *  guarded clicks, presses and steps refuse, so a trusted input the watch sees can only be a
+   *  person's. Never cleared on a run. */
+  private inputsClosed = "";
+  /** #524 — WHO IS FILING could not be made this client's (a company / contact-code select missed,
+   *  matched twice, or did not hold). Sticky for the run: every later step, click and key press
+   *  refuses, so a caller that swallows the stop (a gap-fill write, an array re-run) cannot carry the
+   *  run on to Next under the portal's default company. */
+  private filerIdentityStop = "";
+  /** #333: after the hand-over, a person's own main-frame form request went (their submit, or a
+   *  postback they made) — the run's end page is theirs now, not where the run "stopped". */
+  private personMovedOn = false;
+  /** #333 round 2 — the address of the page the run handed over (no #fragment). */
+  private handOverUrl = "";
+  /** #333 round 3 — a request the person's own input sent went through after the hand-over. */
+  private personRequestWent = false;
+  /** #333 round 3 — the backstop the run handed over: its record of the person's requests is read
+   *  when the run reports (stopAtReview), after the run has let it go (its record stays). */
+  private handedOverBackstop: FilingBackstop | null = null;
   /** What the person taking the review page must know before submitting (B3 / B14) — carried into
    *  stopAtReview's hand-off message and data. */
   private reviewHandoffNotes: string[] = [];
@@ -975,6 +1597,192 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  filing/payment request (the filing-URL rule), else "". A window abort (a dismisser click or
    *  a terminal-page Enter fired a state-changing request — often a consent XHR) is reported and
    *  the run goes on: nothing was sent. */
+  /** #333 — the abort index at the first request a person's input sent OFF THE HANDED-OVER PAGE
+   *  (their own document submit or navigation there): what follows is the page their own action led
+   *  to. A popup's or another tab's document request is not it (Helm nit :97). */
+  private firstHumanDocument(): number {
+    const r = this.humanDocumentFromHandedOverPage(this.backstop);
+    return r ? r.abortsBefore : Infinity;
+  }
+
+  /** #333 (Helm nit :97) — THE ONE PREDICATE for "the person's own main-frame document request from the
+   *  page the run handed over" (their submit or navigation there): the first such entry in `bs`'s
+   *  record, or null. The record names the requesting Page (request.frame().page()); the run's page is
+   *  `this.page`, the page the backstop was installed on and handed over. A popup's or another tab's
+   *  document request (a contact form the person sent) is another Page and never counts, and neither
+   *  does an entry whose page could not be read (null never matches, even with no page in hand). */
+  private humanDocumentFromHandedOverPage(bs: FilingBackstop | null): BackstopHumanRequest | null {
+    const runPage = this.page;
+    if (runPage == null) return null;
+    return (bs?.humanRequests ?? []).find((h) => h.document && h.page === runPage) ?? null;
+  }
+
+  /** #333 round 4 — THE ONE PREDICATE for "a FILING-SHAPED request of the person's went at or after
+   *  `at`" (the capture's committed/held split and the review step's wording both read it): a
+   *  main-frame document request (a form submission, to any URL), or a fetch/XHR to a submit or
+   *  payment URL — never a GET (a navigation is not evidence of a filing) and never a beacon or any
+   *  other resource type, whatever its URL says (an analytics "/form_submit" beacon matches the
+   *  filing-URL vocabulary). Read off the HANDED-OVER backstop's record only: by the time the run
+   *  reports, fillApplication's finally has let `this.backstop` go. And from the RUN'S OWN PAGE only
+   *  (round 5, Helm item 2), as humanDocumentFromHandedOverPage: a popup's contact-form POST after
+   *  the click must not turn a held click into "stands". */
+  private personFilingShapedRequestAfter(at: number): boolean {
+    const runPage = this.page;
+    if (runPage == null) return false;
+    const rs = this.handedOverBackstop?.humanRequests ?? [];
+    return rs.some((r) => r.page === runPage && typeof r.at === "number" && r.at >= at && filingShapedHumanRequest(r));
+  }
+
+  /** #333 round 4 (Helm Blocking 2) — the person's own document request from the handed-over page went,
+   *  a stopping abort came after it, and the window shows Chromium's error page now: the page their
+   *  submit led to made a follow-up request the backstop held. Read at report time, off the HANDED-OVER
+   *  backstop only (fillApplication's finally has let `this.backstop` go by then). */
+  private followUpHeldOnErrorPage(): boolean {
+    const bs = this.handedOverBackstop;
+    const doc = this.humanDocumentFromHandedOverPage(bs);
+    if (!bs || !doc || !/^chrome-error:/i.test(this.pageUrlNoHash())) return false;
+    return bs.aborts.some((a, i) => i >= doc.abortsBefore && isStoppingAbort(a));
+  }
+
+  /** #333 round 4 (Helm Blocking 2) — the person's click the review step reports: the latest sighting,
+   *  whatever became of it — committed (humanSubmit), still pending (a reopened one included), or held.
+   *  null: the watch saw no final-submit click. */
+  private reportedHumanClick(): { click: { label?: string; at: number; personInput?: boolean; evidenceAfter?: number }; state: "committed" | "pending" | "held" } | null {
+    const seen: Array<{ click: { label?: string; at: number; personInput?: boolean; evidenceAfter?: number }; state: "committed" | "pending" | "held" }> = [];
+    if (this.humanSubmit) seen.push({ click: { label: this.humanSubmit.label, at: this.humanSubmit.at ?? 0, personInput: this.humanSubmit.personInput }, state: "committed" });
+    if (this.pendingHumanClick) seen.push({ click: this.pendingHumanClick, state: "pending" });
+    if (this.heldHumanClickAfterHandOver) seen.push({ click: this.heldHumanClickAfterHandOver, state: "held" });
+    return seen.sort((a, b) => b.click.at - a.click.at)[0] ?? null;
+  }
+
+  /** #333 round 4 (Helm Blocking 2) — WHAT BECAME OF THE PERSON'S CLICK, read when the run reports. In
+   *  order: the follow-up held on an error page; HELD (a stopping abort on the handed-over backstop after
+   *  the click, flagged as the person's or not, with no filing-shaped request of theirs after it); a
+   *  DRAFT the page reads as created; FILED (committed, and the page read as the completion — the
+   *  capture's judgeCompletion, read here once more because the runner's capture reads only after the
+   *  run reports); STANDS (committed, or a request of theirs went after it, with no completion read);
+   *  UNCONFIRMED (no request of theirs seen after it). A pending click is never "filed". Read-only: the
+   *  page is read, never touched, and the capture's state is not moved. */
+  private async humanClickVerdict(): Promise<HumanClickVerdict | null> {
+    const errorPage = /^chrome-error:/i.test(this.pageUrlNoHash());
+    const seen = this.reportedHumanClick();
+    if (this.followUpHeldOnErrorPage()) return { verdict: "followUpHeld", click: seen?.click ?? null, held: null, payment: null, errorPage };
+    if (!seen) return null;
+    const { click, state } = seen;
+    // The click's form POST and its sighting travel different event streams: an abort, or a filing-shaped
+    // request, may land just before the sighting (the capture's own allowance).
+    const early = click.at - HUMAN_CLICK_EARLY_MS;
+    const stoppedAfter = (this.handedOverBackstop?.aborts ?? []).filter((a) => isStoppingAbort(a) && !a.beforeHandOver && typeof a.at === "number" && a.at >= early);
+    const payment = stoppedAfter.find((a) => isPayRequestUrl(a.where)) ?? null;
+    const filingWent = this.personFilingShapedRequestAfter(early);
+    const runPage = this.page;
+    const requestWent = filingWent || (this.handedOverBackstop?.humanRequests ?? []).some((r) => r.page === runPage && typeof r.at === "number" && r.at >= click.at && String(r.method ?? "").toUpperCase() !== "GET");
+    const base = { click, payment, errorPage };
+    if (state === "held" || (state === "pending" && click.evidenceAfter === undefined && stoppedAfter.length > 0 && !filingWent)) {
+      return { ...base, verdict: "held", held: payment ?? stoppedAfter[0] ?? null };
+    }
+    if (state === "committed") {
+      const read = errorPage ? null : await this.readPageForCapture();
+      if (read) {
+        const d = readDraftCreated(read.text);
+        if (d.draft) return { ...base, verdict: "draft", held: null, draft: { applicationNumber: d.applicationNumber, nextForm: d.nextForm } };
+        if (!this.completionConfirmed) this.judgeCompletion(read, click.at);
+      }
+      return { ...base, verdict: this.completionConfirmed ? "filed" : "stands", held: null };
+    }
+    // Pending: a reopened click (a request went, the page came back as the review), or one a request of
+    // the person's followed that the capture has not committed yet, stands; else the run saw nothing go.
+    return { ...base, verdict: click.evidenceAfter !== undefined || requestWent ? "stands" : "unconfirmed", held: null };
+  }
+
+  /** #333 round 4 (Helm Blocking 2) — the review step's report for a verdict, each built WHOLE: the note
+   *  for the hand-off (and the payment note beside a click that stands), the one sentence the caller
+   *  puts between "handed it to you; " and " No fee payment was automated.", and the step's data. The
+   *  portal is named only by the caller. */
+  private humanClickReport(v: HumanClickVerdict): { notes: string[]; sentence: string; data: Record<string, unknown> } {
+    const label = v.click?.label;
+    const pi = v.click?.personInput;
+    // #381 — A CONFIRMATION WAS INVOLVED: the portal opened a native dialog after the click (it waits for
+    // the person; automation never answers it). "Click again" is never the advice beside it.
+    const confirmation = !!v.click && dialogOpenedSince(this.page, v.click.at - CONFIRMATION_EARLY_MS);
+    const thenCheck = confirmation ? "check the portal." : "check the portal before you click again.";
+    const clicked = pi === false ? `a click on ${clickedLabel(label)} was seen on the review page` : `you clicked ${clickedLabel(label)} on the review page`;
+    const yourClick = pi === false ? `a click on ${clickedLabel(label)}` : `your click on ${clickedLabel(label)}`;
+    const data: Record<string, unknown> = {
+      humanSubmittedInReviewWindow: v.verdict === "filed",
+      ...(v.click ? { humanClick: { label: String(label ?? ""), verdict: v.verdict }, humanSubmitPersonInput: pi } : { humanClick: { label: "", verdict: v.verdict } }),
+    };
+    switch (v.verdict) {
+      case "followUpHeld":
+        return confirmation
+          ? { notes: [HUMAN_FOLLOW_UP_HELD_CONFIRM_NOTE], data, sentence: "your submit went, then a request the next page made was held back and the window shows an error page — check the portal, then go Back to the review page if the application is not there." }
+          : { notes: [HUMAN_FOLLOW_UP_HELD_NOTE], data, sentence: "your submit went, then a request the next page made was held back and the window shows an error page — check the portal, then go Back and submit again if the application is not there." };
+      case "filed":
+        return { notes: [HUMAN_SUBMITTED_NOTE], data, sentence: "you submitted from the review window while the run was finishing — automation clicked nothing. The completion page was read: its record number is recorded on the project only when it is read confidently — if the project does not show it, enter it with the capture form." };
+      case "draft": {
+        const n = v.draft?.applicationNumber || "(no number shown)";
+        return {
+          notes: [humanDraftCreatedNote(v.draft?.applicationNumber ?? "", v.draft?.nextForm ?? "")],
+          data: { ...data, humanDraftCreated: { applicationNumber: v.draft?.applicationNumber ?? "", nextForm: v.draft?.nextForm ?? "" } },
+          sentence: `your submit from the review window created draft ${n} — the submit this portal answers with a draft, never the filing. NOTHING WAS FILED: stage this track again, and the next run opens this draft.`,
+        };
+      }
+      case "stands":
+        return {
+          notes: [humanClickStandsNote(label, pi, confirmation), ...(v.payment ? [humanPaymentHeldNote(v.payment, v.errorPage)] : [])], data,
+          sentence: `${clicked} and a request of yours went to the portal, but no completion page was read — the filing may have gone: ${thenCheck}`,
+        };
+      case "held":
+        // A held payment gets ONE note, the payment's; any other held request, the held-click note.
+        if (v.payment) {
+          return { notes: [humanPaymentHeldNote(v.payment, v.errorPage)], data, sentence: `${yourClick} was held back with the payment request it sent — automation never pays, and no filing request went from it; check the portal.` };
+        }
+        return {
+          notes: v.held ? [humanClickHeldNote(label, v.held, v.errorPage, pi, confirmation)] : [humanClickUnconfirmedNote(label, v.errorPage, pi, confirmation)], data,
+          sentence: `${yourClick} was held back — the submit itself was not sent; ${thenCheck}`,
+        };
+      default:
+        return { notes: [humanClickUnconfirmedNote(label, v.errorPage, pi, confirmation)], data, sentence: `${clicked} and the run saw no request go from that click — check the portal before anything else.` };
+    }
+  }
+
+  /** #333 — a person's click held back BEFORE the hand-over (a stopping abort flagged humanInput).
+   *  After it, a flagged abort is the person's own payment (rule 1 never lifts): not "click again".
+   *  Only on a run that DID hand the page over (round 5, Helm item 1): after a refused hand-over the
+   *  watch can still be armed, so a click at NOT_HANDED_OVER_NOTE is flagged too, but that run fails
+   *  and never let go of the page, so "click submit again" would be false. */
+  private heldHumanClick(): boolean {
+    const bs = this.backstop;
+    if (!bs || !this.handedOverBackstop) return false;
+    const first = this.firstHumanDocument();
+    return bs.aborts.some((a, i) => isStoppingAbort(a) && !!a.humanInput && !!a.beforeHandOver && i < first);
+  }
+
+  /** #417 (Helm Should-fix 5 on #378) — the person's own payment click AFTER the hand-over was held: a
+   *  stopping abort flagged as the person's input, not before the hand-over, to a URL rule 1 knows as a
+   *  payment. Read off the handed-over backstop when there is one (at report time fillApplication's
+   *  finally has let `this.backstop` go), else the live one. A refused hand-over has none: every flagged
+   *  abort there is `beforeHandOver`. Read-only; the abort stands (rule 1). */
+  private heldHumanPayment(): boolean {
+    const bs = this.handedOverBackstop ?? this.backstop;
+    if (!bs) return false;
+    return bs.aborts.some((a) => isStoppingAbort(a) && !!a.humanInput && !a.beforeHandOver && isPayRequestUrl(a.where));
+  }
+
+  /** #417 — the request-went note for this run: the handed-over page and the first request recorded as
+   *  the person's, each by origin and path (personRequestWentNote strips any query). */
+  private personRequestWentNoteNow(): string {
+    return personRequestWentNote(this.handOverUrl, this.handedOverBackstop?.humanRequests[0]?.where ?? "");
+  }
+
+  /** The run's page address without its #fragment ("" when unreadable). */
+  private pageUrlNoHash(): string {
+    try {
+      const p = this.page as { url?: () => string } | null;
+      return typeof p?.url === "function" ? String(p.url() ?? "").split("#")[0] : "";
+    } catch { return ""; }
+  }
+
   private backstopStop(): string {
     const bs = this.backstop;
     if (!bs) return "";
@@ -983,9 +1791,29 @@ export class RecipeAdapter extends BasePortalAdapter {
       this.guardRefusals.push(line);
       this.driftWarnings.push(line);
     }
-    const stopping = bs.stoppingAborts();
+    // #333 — NEITHER OF THESE IS THE PAGE ACTING BY ITSELF: an abort that followed a person's own
+    // input (their click came before the run handed the page over: nothing was sent, and they are
+    // told to click again), and anything after a request a person's input sent past the hand-over
+    // (the page their own submit led to). Neither fails a run that reached review.
+    // Only a request that LEFT the page counts (skeptic round 1): a person's harmless click whose
+    // background fetch went must not hide a page script that tries to file afterwards.
+    const firstHuman = this.firstHumanDocument();
+    const stopping = bs.aborts.filter((a, i) => isStoppingAbort(a) && !a.humanInput && i < firstHuman);
+    if (this.heldHumanClick()) {
+      if (!this.reviewHandoffNotes.includes(HUMAN_CLICK_HELD_NOTE)) this.reviewHandoffNotes.push(HUMAN_CLICK_HELD_NOTE);
+      if (!this.driftWarnings.includes(HUMAN_CLICK_HELD_NOTE)) this.driftWarnings.push(HUMAN_CLICK_HELD_NOTE);
+    }
+    // #417: the person's payment after the hand-over, held (rule 1) — said, never silent. Not a failure:
+    // a flagged abort is never in `stopping` above.
+    if (this.heldHumanPayment()) {
+      if (!this.reviewHandoffNotes.includes(PAYMENT_HELD_NOTE)) this.reviewHandoffNotes.push(PAYMENT_HELD_NOTE);
+      if (!this.driftWarnings.includes(PAYMENT_HELD_NOTE)) this.driftWarnings.push(PAYMENT_HELD_NOTE);
+    }
     if (!stopping.length) return "";
     const first = stopping[0];
+    // A REFUSED REDIRECT (#358): the run's own request went and the portal redirected it somewhere the
+    // backstop would not let a request go. It is not a recipe step acting as a filing control.
+    if (first.redirect) return `STOPPED BY THE NETWORK BACKSTOP: the portal answered a request of this run with a ${first.redirect.status} redirect, and the backstop did not follow it — ${describeBackstopAbort(first)}. ${backstopSentLine(first)} Check on the portal what it did with that request before the next run.`;
     return first.rule === "review-lockdown"
       ? `STOPPED BY THE NETWORK BACKSTOP: the page tried to send a state-changing request while the run was at review, and it was aborted — ${describeBackstopAbort(first)}. Nothing was sent. At review nothing legitimate posts until a person takes the page; a step of this recipe (or a page script) acted on the review page.`
       : `STOPPED BY THE NETWORK BACKSTOP: the page tried to file or pay with no named approval for this run, and the request was aborted — ${describeBackstopAbort(first)}. Nothing was sent. A step of this recipe (or a page script it triggered) is a filing control the word gates did not recognise; review the recipe before the next run.`;
@@ -1002,7 +1830,12 @@ export class RecipeAdapter extends BasePortalAdapter {
   // POST (bypass-reload.log: 2 POSTs). Now: only navigation RESPONSES that commit a document are
   // kept (not 204/205, not a 3xx hop, not an attachment), and the method is the one whose URL is
   // the page's current URL. A URL no committing response produced (a pushState) is unknown.
-  private navDocuments: Array<{ url: string; method: string }> = [];
+  // #333 round 4: each entry also says WHEN the document committed (`at`, Date.now() at its response —
+  // not when its request went), which the capture's "a main-frame document committed by a non-GET
+  // request within a short bound" reads.
+  // `sentAt` is when its request went (Playwright's request timing; absent when unreadable): a slow
+  // server's document commits long after the click whose request it answers.
+  private navDocuments: Array<{ url: string; method: string; at: number; sentAt?: number }> = [];
   private get lastDocumentMethod(): string | null {
     const here = typeof this.page?.url === "function" ? String(this.page.url() ?? "").split("#")[0] : "";
     if (!here) return null;
@@ -1018,14 +1851,17 @@ export class RecipeAdapter extends BasePortalAdapter {
     this.documentMethodHooked = true;
     page.on("response", (resp: unknown) => {
       try {
-        const r = resp as { url: () => string; status: () => number; headers: () => Record<string, string>; request: () => { isNavigationRequest: () => boolean; frame: () => unknown; method: () => string } };
+        const r = resp as { url: () => string; status: () => number; headers: () => Record<string, string>; request: () => { isNavigationRequest: () => boolean; frame: () => unknown; method: () => string; timing?: () => { startTime?: number } } };
         const req = r.request();
         if (!req.isNavigationRequest() || req.frame() !== page.mainFrame!()) return;
         const status = Number(r.status());
         const cd = String((r.headers() || {})["content-disposition"] || "");
         if (status === 204 || status === 205 || (status >= 300 && status < 400) || /\battachment\b/i.test(cd)) return;
-        this.navDocuments.push({ url: String(r.url() || "").split("#")[0], method: String(req.method() || "").toUpperCase() });
+        const started = Number((typeof req.timing === "function" ? req.timing() : null)?.startTime ?? 0);
+        this.navDocuments.push({ url: String(r.url() || "").split("#")[0], method: String(req.method() || "").toUpperCase(), at: Date.now(), ...(started > 0 ? { sentAt: Math.round(started) } : {}) });
         if (this.navDocuments.length > 60) this.navDocuments.shift();
+        // A document the person's click committed is evidence for a pending sighting (round 4).
+        this.judgeHumanClick();
       } catch { /* a response we cannot read adds nothing: the method stays unknown */ }
     });
   }
@@ -1051,16 +1887,78 @@ export class RecipeAdapter extends BasePortalAdapter {
         { finalSubmitClicked: false, draftSubmitClickedByAutomation: true },
       );
     }
+    // A request the person sent may land after the run's tail read it, and before the run let the page
+    // go: the handed-over backstop's record is read again now (round 3).
+    if ((this.handedOverBackstop?.humanRequests.length ?? 0) > 0) this.personRequestWent = true;
+    // Never "staged to the review screen" for a run that did not verifiably reach it (runs-finish 3) —
+    // even when the person moved on from that page (Helm Should-fix 4). The stop message is the one
+    // sentence about a request that went (no second note naming "the review page" it never was).
+    if (this.stoppedBeforeReview && !this.humanSubmit) {
+      const notes = this.reviewHandoffNotes;
+      const handoff = notes.length ? ` ${notes.join(" ")}` : "";
+      const handoffData = notes.length ? { reviewHandoffNotes: [...notes], reviewPageBlockedCalls: [...this.reviewPageBlockedCalls] } : {};
+      const at = this.stoppedBeforeReviewAt;
+      const stopped = at ? this.stoppedBeforeReviewMessage(at.where, at.refused, this.personRequestWent) : this.stoppedBeforeReview;
+      return ok(
+        `${HUMAN_REVIEW_MESSAGE} The recipe did NOT stage ${this.portalName} at its review screen — it ${stopped}${handoff} AUTOMATION HAS STOPPED.`,
+        { finalSubmitClicked: false, stoppedBeforeReview: true, personMovedOn: this.personMovedOn, ...handoffData },
+      );
+    }
+    // THE PERSON CLICKED THE SUBMIT (OR MOVED ON) FROM THE REVIEW WINDOW WHILE THE RUN WAS FINISHING
+    // (#333). Automation clicked nothing; the run staged the page and handed it over. Round 4 (Helm
+    // Blocking 2): what the step says comes from what became of the click (humanClickVerdict) — "filed"
+    // only for a committed submit whose page read as the completion — each outcome built whole, with
+    // the portal named once, by this frame. The outcome's note leads the hand-off notes (nextStep keeps
+    // the first six). The request-went note (personRequestWentNote) is said only when the watch saw no
+    // click at all, once (deduped on its prefix).
+    const verdict = await this.humanClickVerdict();
+    const requestWentSaid = (): boolean => this.reviewHandoffNotes.some((n) => n.startsWith(PERSON_REQUEST_WENT_PREFIX));
+    if (verdict || this.personMovedOn) {
+      const report: { notes: string[]; sentence: string; data: Record<string, unknown> } = verdict ? this.humanClickReport(verdict) : {
+        notes: this.personRequestWent && !requestWentSaid() ? [this.personRequestWentNoteNow()] : [], data: { humanSubmittedInReviewWindow: false },
+        // Hedged (#417): moving on is not proof of a filing — "may have gone", never "the filing went".
+        sentence: "you moved on from the review window while the run was finishing — automation clicked nothing. If that was the submit, the filing may have gone: check the portal and enter its record number with the capture form; if not, finish in the open window.",
+      };
+      // ONE PAYMENT NOTE (#417): a verdict that names the held payment (humanPaymentHeldNote, beside a
+      // click that is held or stands) replaces the general PAYMENT_HELD_NOTE backstopStop pushed.
+      if (verdict?.payment && (verdict.verdict === "held" || verdict.verdict === "stands")) this.reviewHandoffNotes = this.reviewHandoffNotes.filter((n) => n !== PAYMENT_HELD_NOTE);
+      // On the record (skeptic r2 F5): the hand-off notes reach the project's next-step panel.
+      for (const n of [...report.notes].reverse()) if (!this.reviewHandoffNotes.includes(n)) this.reviewHandoffNotes.unshift(n);
+      return ok(
+        `${this.portalName}: the recipe staged the review screen and handed it to you; ${report.sentence} No fee payment was automated. AUTOMATION HAS STOPPED.`,
+        {
+          finalSubmitClicked: false, ...report.data,
+          ...(this.reviewHandoffNotes.length ? { reviewHandoffNotes: [...this.reviewHandoffNotes] } : {}),
+        },
+      );
+    }
+    // A request went through after the person touched the page and the click detector did not see a
+    // final submit (round 3): on the record, and never "click submit manually" as if nothing had
+    // happened. (No sighting exists here: a click the watch saw is reported above.)
+    if (this.personRequestWent && !requestWentSaid()) this.reviewHandoffNotes.push(this.personRequestWentNoteNow());
+    // THE PERSON'S PAYMENT AFTER THE HAND-OVER WAS HELD (#417, Helm Should-fix 5 on #378), with no click
+    // the watch saw as the final submit: built whole — PAYMENT_HELD_NOTE leads the hand-off, and the step
+    // never says "click submit manually" or "click again" over a payment. Rule 1 is unchanged: the
+    // payment stayed aborted; this only names it.
+    if (this.heldHumanPayment()) {
+      this.reviewHandoffNotes = [PAYMENT_HELD_NOTE, ...this.reviewHandoffNotes.filter((n) => n !== PAYMENT_HELD_NOTE)];
+      const pNotes = this.reviewHandoffNotes;
+      // The sentence says what PAYMENT_HELD_NOTE says; the message carries the other notes after it.
+      const rest = pNotes.slice(1);
+      return ok(
+        `${this.portalName}: the recipe staged the review screen and handed it to you; a payment request from your click on it was held back — automation never pays, and NOTHING WAS PAID. Check the portal before anything else, and pay there yourself once you have seen whether the application was submitted.${rest.length ? ` ${rest.join(" ")}` : ""} AUTOMATION HAS STOPPED.`,
+        { finalSubmitClicked: false, humanPaymentHeld: true, ...(this.personRequestWent ? { personRequestWent: true } : {}), reviewHandoffNotes: [...pNotes], reviewPageBlockedCalls: [...this.reviewPageBlockedCalls] },
+      );
+    }
     // WHAT THE PERSON MUST KNOW BEFORE SUBMITTING (dryrun-0928 B3 / B14): answers the portal may
     // not have saved, and the portal's own background calls the lockdown held back on this page.
     const notes = this.reviewHandoffNotes;
     const handoff = notes.length ? ` ${notes.join(" ")}` : "";
     const handoffData = notes.length ? { reviewHandoffNotes: [...notes], reviewPageBlockedCalls: [...this.reviewPageBlockedCalls] } : {};
-    // Never "staged to the review screen" for a run that did not verifiably reach it (runs-finish 3).
-    if (this.stoppedBeforeReview) {
+    if (this.personRequestWent) {
       return ok(
-        `${HUMAN_REVIEW_MESSAGE} The recipe did NOT stage ${this.portalName} at its review screen — it ${this.stoppedBeforeReview}${handoff} AUTOMATION HAS STOPPED.`,
-        { finalSubmitClicked: false, stoppedBeforeReview: true, ...handoffData },
+        `${this.portalName}: the recipe staged the review screen and handed it to you, and a request from it went through after you touched the page while the run was finishing (it may also have been the portal saving the stage's answers) — automation clicked nothing. If that was your submit, the filing may have gone: check the portal and enter its record number with the capture form. If not, verify every field and uploaded file, handle any MFA/fee, then click submit.${handoff} AUTOMATION HAS STOPPED.`,
+        { finalSubmitClicked: false, personRequestWent: true, ...handoffData },
       );
     }
     return ok(
@@ -1081,14 +1979,337 @@ export class RecipeAdapter extends BasePortalAdapter {
    */
   async armSubmitWatch(onSubmitObserved: (clickedLabel?: string) => void): Promise<boolean> {
     if (!this.page) return false;
-    return armHumanCaptureOnPage(this.page, (step) => {
-      // The detector emits one submitObserved step when the final submit is clicked; every
-      // other captured step belongs to the learn path and is ignored here.
-      if (String(step.note || "").includes(HUMAN_SUBMIT_OBSERVED_NOTE)) onSubmitObserved(step.value || undefined);
-    }).catch(() => false);
+    // A submit the person made after the hand-over, before the runner asked (#333), is handed on now.
+    const seen = this.humanSubmit;
+    this.submitObservers.push(onSubmitObserved);
+    const armed = await this.armOwnSubmitWatch();
+    if (seen) { try { onSubmitObserved(seen.label); } catch { /* an observer never breaks the run */ } }
+    return armed;
   }
 
+  /** #333 — THE PERSON'S OWN SUBMIT, COMMITTED, whoever asks (the hand-over arms the watch; the runner's
+   *  armSubmitWatch later registers on the same watch — the page binding can be exposed only once).
+   *  Round 4 (Helm Blocking 1): after a hand-over this is set only when evidence committed the click
+   *  (judgeHumanClick), and a capture that finds the review or error page clears it again
+   *  (reopenHumanSubmit). Never handed over: the click commits on sight, as on main. */
+  private humanSubmit: { label?: string; at?: number; personInput?: boolean } | null = null;
+  private submitObservers: Array<(clickedLabel?: string) => void> = [];
+  private submitWatch: Promise<boolean> | null = null;
+  /** Round 4 — the click seen and not yet committed or held. */
+  private pendingHumanClick: HumanClickSighting | null = null;
+  /** Round 4 — the last committed click (what a reopen restores). */
+  private lastCommittedClick: HumanClickSighting | null = null;
+  /** Round 4 — a click after the hand-over that a stopping abort held with no filing-shaped request of
+   *  the person's after it (the review step's wording reads it; nothing was sent from it). */
+  private heldHumanClickAfterHandOver: HumanClickSighting | null = null;
+  /** Round 4 — set ONLY by judgeCompletion: a page after the person's click read as their completion.
+   *  Separate from humanSubmit: production reports (stopAtReview) before the capture reads the page. */
+  private completionConfirmed = false;
+  /** Round 4 — the review page's own reading, taken at the hand-over (null: never handed over — the
+   *  approved path and every other caller keep today's read). */
+  private reviewReading: ReviewReading | null = null;
+  /** Round 4 — filing-shaped requests of the person's that went AFTER the backstop let the page go. */
+  private lateHumanRequests: Array<{ where: string; document: boolean; method: string; resourceType: string; at: number; doneAt: number }> = [];
+  /** Round 4 — no evidence before this may commit a later sighting (the previous click's moment). */
+  private clickFloor = 0;
+  private judgeTimer: ReturnType<typeof setInterval> | null = null;
+  private rereadTimer: ReturnType<typeof setTimeout> | null = null;
+  private lateHooked = false;
+  private noteHumanSubmit(label?: string, at?: number, personInput?: boolean): void {
+    if (this.humanSubmit) return;
+    this.humanSubmit = { label, at: at ?? Date.now(), personInput };
+    for (const fn of this.submitObservers) { try { fn(label); } catch { /* an observer never breaks the run */ } }
+  }
+
+  /** Round 4 — the watch saw a final-submit click. After a hand-over it is PROVISIONAL: it does not set
+   *  humanSubmit, notify the observers or disarm the watch (the sink keeps reporting, oneShot:false);
+   *  the evidence that follows commits it (judgeHumanClick). With no hand-over (an approved run, a
+   *  refused hand-over: the runner arms after the run), the click commits on sight, as on main. */
+  private sightHumanSubmit(label?: string): void {
+    if (this.humanSubmit) return;
+    const live = this.backstop;
+    const personInput = live && typeof live.handedOver === "function" && live.handedOver() && typeof live.personActedSinceHandOver === "function"
+      ? live.personActedSinceHandOver(this.page, 2000) : undefined;
+    const at = Date.now();
+    const bs = this.handedOverBackstop;
+    if (!bs) { this.noteHumanSubmit(label, at, personInput); return; }
+    if (this.pendingHumanClick) this.clickFloor = Math.max(this.clickFloor, this.pendingHumanClick.at);
+    this.pendingHumanClick = { label, at, abortsBefore: bs.aborts.length, requestsBefore: bs.humanRequests.length, personInput };
+    this.judgeHumanClick();
+    this.startJudging();
+  }
+
+  /** Round 4 — re-judge the pending click every 200 ms until it is committed or held, or its bound
+   *  lapsed: the backstop's record (humanRequests, aborts) grows with no callback to the run. */
+  private startJudging(): void {
+    if (this.judgeTimer) return;
+    const t = setInterval(() => {
+      const p = this.pendingHumanClick;
+      if (!p || this.humanSubmit || Date.now() - p.at > HUMAN_CLICK_COMMIT_MS + HUMAN_CLICK_SETTLE_MS) {
+        clearInterval(t);
+        this.judgeTimer = null;
+        return;
+      }
+      this.judgeHumanClick();
+    }, 200);
+    (t as { unref?: () => void }).unref?.();
+    this.judgeTimer = t;
+  }
+
+  /** Round 4 (Helm Blocking 1) — JUDGE THE PENDING CLICK ON WHAT FOLLOWED IT. Evidence: a non-GET
+   *  request of the person's (the handed-over backstop's record, or a filing-shaped one that went after
+   *  it let go) or a main-frame document a non-GET request committed — on ANY URL, the review page's own
+   *  included (a postback); never a GET navigation, never on Chromium's error page. A document or
+   *  filing-shaped request may precede the sighting by HUMAN_CLICK_EARLY_MS; a plain fetch must follow
+   *  it, and commits only once HUMAN_CLICK_SETTLE_MS passed with no stopping abort. A stopping abort
+   *  after the click with no filing-shaped request of the person's makes it HELD. */
+  private judgeHumanClick(): "committed" | "held" | "pending" | null {
+    const p = this.pendingHumanClick;
+    const bs = this.handedOverBackstop;
+    if (!p || !bs || this.humanSubmit) return null;
+    const now = Date.now();
+    const after = Math.max(p.evidenceAfter ?? 0, this.clickFloor);
+    const early = Math.max(p.at - HUMAN_CLICK_EARLY_MS, after);
+    const until = p.at + HUMAN_CLICK_COMMIT_MS;
+    const runPage = this.page;
+    const evidence: Array<{ sent: number; done: number; filing: boolean }> = [];
+    for (const r of bs.humanRequests) {
+      if (r.page !== runPage || typeof r.at !== "number" || String(r.method ?? "").toUpperCase() === "GET") continue;
+      evidence.push({ sent: r.at, done: r.at, filing: filingShapedHumanRequest(r) });
+    }
+    for (const r of this.lateHumanRequests) evidence.push({ sent: r.at, done: r.doneAt, filing: true });
+    for (const d of this.navDocuments) if (d.method && d.method !== "GET") evidence.push({ sent: d.sentAt ?? d.at, done: d.at, filing: true });
+    const counts = (e: { sent: number; done: number; filing: boolean }): boolean => e.done > after && e.sent <= until && e.sent >= (e.filing ? early : Math.max(p.at, after));
+    const filingEv = evidence.some((e) => e.filing && counts(e));
+    const plainEv = evidence.some((e) => !e.filing && counts(e));
+    const onErrorPage = /^chrome-error:/i.test(this.pageUrlNoHash());
+    if (filingEv && !onErrorPage) return this.commitHumanClick(p, true);
+    const settled = now - p.at >= HUMAN_CLICK_SETTLE_MS;
+    const held = bs.aborts.some((a) => isStoppingAbort(a) && !a.beforeHandOver && typeof a.at === "number" && a.at >= early && a.at > after);
+    if (held && !this.personFilingShapedRequestAfter(early)) {
+      if (!settled) return "pending";
+      this.heldHumanClickAfterHandOver = p;
+      this.pendingHumanClick = null;
+      return "held";
+    }
+    if (plainEv && !held && !onErrorPage && settled) return this.commitHumanClick(p, false);
+    return "pending";
+  }
+
+  /** Round 4 — commit a judged click: humanSubmit is set and the observers (the runner's capture) told. */
+  private commitHumanClick(p: HumanClickSighting, filing: boolean): "committed" {
+    this.pendingHumanClick = null;
+    this.lastCommittedClick = { ...p, filingEvidence: filing };
+    this.noteHumanSubmit(p.label, p.at, p.personInput);
+    return "committed";
+  }
+
+  /** Round 4 — the capture found the review (or Chromium's error) page after a committed click: the
+   *  watch reopens. Only evidence completed after now, a new sighting, or (when the commit rested on a
+   *  filing request) one slow-server re-read may commit it again — never the same evidence. */
+  private reopenHumanSubmit(): void {
+    const last = this.lastCommittedClick;
+    if (!last || !this.humanSubmit) return;
+    this.humanSubmit = null;
+    this.completionConfirmed = false;
+    const p: HumanClickSighting = { ...last, evidenceAfter: Date.now() };
+    this.pendingHumanClick = p;
+    if (last.filingEvidence && !last.slowRereadDone) {
+      p.slowRereadDone = true;
+      this.scheduleCompletionReread(HUMAN_CLICK_SLOW_REREAD_MS);
+    }
+  }
+
+  /** Round 4 — hook the person's requests that were answered after the backstop let the page go: on the
+   *  response or requestfinished, whichever comes (a fetch answered 204 may raise no requestfinished),
+   *  never on "request", which fires before the route handler would have judged it — an aborted request
+   *  is never answered, so it never counts. A filing-shaped one is late evidence; a plain fetch
+   *  schedules one page read (an in-place SPA submit commits only if that read holds). While the
+   *  backstop still holds the page, its record is the evidence: the hooks only re-judge. Listeners
+   *  only: nothing is routed, aborted or clicked. */
+  private hookLateHumanRequests(): void {
+    const page = this.page as { on?: (ev: string, fn: (x: unknown) => void) => void; mainFrame?: () => unknown } | null;
+    if (this.lateHooked || !page || typeof page.on !== "function") return;
+    this.lateHooked = true;
+    const seen = new WeakSet<object>();
+    const onAnswered = (request: unknown): void => {
+      try {
+        const p = this.pendingHumanClick;
+        if (!p || this.humanSubmit || !request || typeof request !== "object" || seen.has(request)) return;
+        seen.add(request);
+        const req = request as { method: () => string; url: () => string; resourceType: () => string; isNavigationRequest: () => boolean; frame: () => { page?: () => unknown }; timing?: () => { startTime?: number } };
+        const method = String(req.method() || "").toUpperCase();
+        if (method === "GET" || method === "HEAD" || method === "OPTIONS") return;
+        const frame = req.frame();
+        if (typeof frame?.page !== "function" || frame.page() !== this.page) return;
+        if (this.handedOverBackstop?.handedOver()) { this.judgeHumanClick(); return; }
+        const started = Number((typeof req.timing === "function" ? req.timing() : null)?.startTime ?? 0);
+        const sent = started > 0 ? Math.round(started) : Date.now();
+        if (sent > p.at + HUMAN_CLICK_COMMIT_MS || sent < p.at - HUMAN_CLICK_EARLY_MS) return;
+        let where = "";
+        try { const u = new URL(String(req.url() || "")); where = `${u.origin}${u.pathname}`; } catch { return; }
+        const entry = { where, document: req.isNavigationRequest() && typeof page.mainFrame === "function" && frame === page.mainFrame(), method, resourceType: String(req.resourceType() || ""), at: sent, doneAt: Date.now() };
+        if (filingShapedHumanRequest(entry)) {
+          this.lateHumanRequests.push(entry);
+          this.judgeHumanClick();
+        } else {
+          this.scheduleCompletionReread(HUMAN_CLICK_SPA_REREAD_MS);
+        }
+      } catch { /* a request we cannot read adds no evidence */ }
+    };
+    page.on("requestfinished", onAnswered);
+    page.on("response", (resp: unknown) => {
+      try { onAnswered((resp as { request: () => unknown }).request()); } catch { /* no request: no evidence */ }
+    });
+    page.on("requestfailed", () => { try { this.judgeHumanClick(); } catch { /* nothing to judge */ } });
+  }
+
+  /** Round 4 — one page read later (one at a time), for an in-place SPA submit or a slow server. */
+  private scheduleCompletionReread(ms: number): void {
+    if (this.rereadTimer) return;
+    const t = setTimeout(() => { this.rereadTimer = null; void this.rereadForCompletion(); }, ms);
+    (t as { unref?: () => void }).unref?.();
+    this.rereadTimer = t;
+  }
+
+  /** Round 4 — read the page for the pending click: it commits only when the completion reading holds. */
+  private async rereadForCompletion(): Promise<void> {
+    const p = this.pendingHumanClick;
+    if (!p || this.humanSubmit || !this.reviewReading) return;
+    const read = await this.readPageForCapture();
+    if (!read || /^chrome-error:/i.test(this.pageUrlNoHash()) || this.pendingHumanClick !== p || this.humanSubmit) return;
+    const judged = this.judgeCompletion(read, p.at);
+    if (judged.number || judged.confirmed) this.commitHumanClick(p, !!p.filingEvidence);
+  }
+
+  /** Round 4 — the page's text, the same text with every attached table cell's own text taken out (a
+   *  list's status cells never count as completion wording; nothing on the page is changed), and its
+   *  submit control. null when it cannot be read (the page is gone or navigating). */
+  private async readPageForCapture(): Promise<CapturePageRead | null> {
+    const page = this.page;
+    if (!page || typeof page.evaluate !== "function") return null;
+    // #381: skipped (null: "cannot be read") while a dialog waits for the person, never answered.
+    return readUnlessDialog(page, () => this.readPageForCaptureNow(), null);
+  }
+
+  private async readPageForCaptureNow(): Promise<CapturePageRead | null> {
+    const page = this.page;
+    if (!page || typeof page.evaluate !== "function") return null;
+    try {
+      const texts = await Promise.race([
+        page.evaluate(() => {
+          const body = document.body;
+          const text = body ? body.innerText : "";
+          let cellFree = text;
+          if (body) {
+            for (const cell of Array.from(body.querySelectorAll("td, th, [role=cell], [role=gridcell]"))) {
+              const own = String((cell as HTMLElement).innerText || "").trim();
+              if (own) cellFree = cellFree.replace(own, " ");
+            }
+          }
+          return { text, cellFree };
+        }),
+        sleep(3000).then(() => null),
+      ]) as { text?: string; cellFree?: string } | null;
+      if (!texts) return null;
+      const ctx = await this.pageSafetyContext();
+      return { text: String(texts.text ?? ""), cellFree: String(texts.cellFree ?? ""), filingControl: String(ctx.filingControl ?? ""), reviewPage: ctx.reviewPage };
+    } catch { return null; }
+  }
+
+  /** Round 4 — the review page's own reading for the capture; on a failed read, no numbers and no known
+   *  control (only completion wording with its veto clear can then count — never today's loose read). */
+  private async readReviewForCapture(): Promise<ReviewReading> {
+    const read = await this.readPageForCapture().catch(() => null);
+    if (!read) return { numbers: new Set(), filingControl: "", completionPhrase: null };
+    return {
+      numbers: new Set(recordNumberCandidates(read.text).map((c) => c.value)),
+      filingControl: read.filingControl,
+      reviewPage: read.reviewPage,
+      completionPhrase: completionEvidence(read.cellFree).phrase,
+    };
+  }
+
+  /** Round 4 (Helm Blocking 1) — JUDGE A PAGE AFTER THE PERSON'S CLICK AGAINST THE REVIEW'S OWN READING,
+   *  by number and content, never by URL. Numbers: the strongest shape tier with a candidate, never a
+   *  weaker one; in it, the first number the review did not show — which counts when the review's form
+   *  is gone (formLost) or completion wording stands with its veto clear — else the review's own number,
+   *  only beside formLost AND wording the review page did not already show. A page reached by a GET
+   *  navigation after the click, with no document request of the person's since, yields no number. */
+  private judgeCompletion(read: CapturePageRead, clickAt: number): { number: string; confirmed: boolean; stillReview: boolean } {
+    const rr = this.reviewReading ?? { numbers: new Set<string>(), filingControl: "", completionPhrase: null };
+    const formLost = rr.filingControl !== "" && read.filingControl === "" && read.reviewPage !== true;
+    const words = completionEvidence(read.cellFree);
+    const phraseOk = !!words.phrase && !words.veto;
+    const phraseFresh = phraseOk && normPhrase(words.phrase) !== normPhrase(rr.completionPhrase);
+    const here = this.pageUrlNoHash();
+    let doc: { method: string; at: number } | null = null;
+    for (let i = this.navDocuments.length - 1; i >= 0 && !doc; i--) if (this.navDocuments[i].url === here) doc = this.navDocuments[i];
+    const documentPostSince = (this.handedOverBackstop?.humanRequests ?? []).some((h) => h.document && h.page === this.page && typeof h.at === "number" && h.at >= clickAt - HUMAN_CLICK_EARLY_MS && String(h.method ?? "").toUpperCase() !== "GET")
+      || this.lateHumanRequests.some((h) => h.document && h.at >= clickAt - HUMAN_CLICK_EARLY_MS);
+    const navigationOnly = !!doc && doc.method === "GET" && doc.at > clickAt && !documentPostSince;
+    const candidates = recordNumberCandidates(read.text);
+    const tier = RECORD_NUMBER_TIERS.find((t) => candidates.some((c) => c.source === t));
+    const inTier = tier ? candidates.filter((c) => c.source === tier).map((c) => c.value) : [];
+    const fresh = inTier.filter((v) => !rr.numbers.has(v));
+    const own = inTier.filter((v) => rr.numbers.has(v));
+    let number = "";
+    if (!navigationOnly) {
+      if (fresh.length) { if (formLost || phraseOk) number = fresh[0]; }
+      else if (own.length && formLost && phraseFresh) number = own[0];
+    }
+    const confirmed = !navigationOnly && (number !== "" || (phraseOk && formLost));
+    if (confirmed) this.completionConfirmed = true;
+    return { number, confirmed, stillReview: number === "" && read.filingControl !== "" };
+  }
+
+  private armOwnSubmitWatch(): Promise<boolean> {
+    if (this.submitWatch) return this.submitWatch;
+    const page = this.page;
+    if (!page) return Promise.resolve(false);
+    this.hookLateHumanRequests();
+    // ONLY THE CLICK DETECTOR SAYS "THE PERSON SUBMITTED" (#333 skeptic r2b). A page-text signal — a
+    // completion-looking page after a person's request — failed both ways: a step page reading "once
+    // your application is submitted…" after the person's own Previous click read as a filing (with a
+    // draft's id), and real completion pages with a "* required field" legend did not. What a page
+    // says is never what made the filing; a request the person sent is said plainly instead
+    // (personRequestWentNote), and the number is theirs to enter.
+    // The click detector the learn path already uses: a submitObserved step when the FINAL submit is
+    // clicked; every other captured step belongs to the learn path and is ignored here. Round 4: it
+    // keeps watching (oneShot:false) — a click is a sighting, committed on the evidence after it.
+    this.submitWatch = armHumanCaptureOnPage(page, (step) => {
+      if (String(step.note || "").includes(HUMAN_SUBMIT_OBSERVED_NOTE)) this.sightHumanSubmit(step.value || undefined);
+    }, { oneShot: false }).catch(() => false);
+    return this.submitWatch;
+  }
+
+  /** #333 — HAND THE REVIEW PAGE TO THE PERSON, before the run's read-only housekeeping. The backstop
+   *  lets their own click through from here (filingBackstop handOverToHuman), and the submit watch is
+   *  armed now, not after the run returns: a filing made in the run's last seconds is captured. */
+  private async handOverReviewPage(): Promise<boolean> {
+    // Round 4: FIRST, while the lockdown still holds the page, the review page's own reading — what the
+    // capture judges every later page against (a fast click's completion must never land in it).
+    const reading = await this.readReviewForCapture();
+    const bs = this.backstop;
+    if (!bs || !bs.handOverToHuman(`replay staged ${this.recipe.id} to review`)) return false;
+    this.reviewReading = reading;
+    // The page handed over: a person who acted and left it moved on (runAll's report).
+    this.handOverUrl = this.pageUrlNoHash();
+    this.handedOverBackstop = bs;
+    const armed = this.armOwnSubmitWatch();
+    await Promise.race([armed, sleep(3000)]);
+    return true;
+  }
+
+  /** #381 — THE CAPTURE TOLERATES AN OPEN DIALOG: while a native dialog waits for the person on the
+   *  window (or one opens during the read), the page is not read and nothing is recorded — never
+   *  "answered so the read can go on". */
   async captureSubmissionConfirmation(): Promise<PortalStepResult> {
+    if (!this.page) return ok("No open page to capture confirmation from.", { permitNumber: "", recordLink: "" });
+    return readUnlessDialog(this.page, () => this.readSubmissionConfirmation(), ok(DIALOG_WAITING_CAPTURE, { permitNumber: "", recordLink: "", dialogOpen: true }));
+  }
+
+  private async readSubmissionConfirmation(): Promise<PortalStepResult> {
     if (!this.page) return ok("No open page to capture confirmation from.", { permitNumber: "", recordLink: "" });
     try {
       await smartWait(this.page);
@@ -1113,10 +2334,6 @@ export class RecipeAdapter extends BasePortalAdapter {
           draftTenantKey: draftTenantKey(here),
         });
       }
-      const read = extractRecordNumber(bodyText);
-      const permitNumber = read.value;
-      // Accela record suffix encodes the discipline: -STR (structural), -ELE (electrical), etc.
-      const discipline = permitNumber.match(/-([A-Z]{2,4})$/)?.[1] ?? null;
       // Keep origin+path only — completion-page URLs can embed session-scoped query tokens
       // (capId/agency/auth tickets) that would persist session material in the stored run
       // result and won't work when clicked later anyway.
@@ -1124,7 +2341,70 @@ export class RecipeAdapter extends BasePortalAdapter {
       // ProjectId/ProgramId identify the record, not the session — dropping them made the stored
       // link useless (a bare /MvcProjects/EditProject reaches nothing). ONE list: cleanRecordLink
       // (these two lists disagreed until dryrun-0928 B11).
-      const recordLink = cleanRecordLink(rawUrl);
+      // WHICH NUMBER AND WHICH LINK (#400, chooseSubmittedRecord): the link the portal puts on the
+      // number first, then the new row's in the account list, then the cleaned page URL; with no
+      // confident number, the before/after list diff. READ ONLY: both reads look at the page the
+      // person is left on — nothing navigates, clicks or opens a tab to reach a list.
+      const canRead = typeof this.page.evaluate === "function";
+      const page = this.page;
+      const chooseRecord = async (read: { value: string; confidence: "high" | "low"; reason: string }) => {
+        const numberHref = read.value && canRead
+          ? String((await page.evaluate(recordLinkForNumberInPage, read.value).catch(() => "")) || "")
+          : "";
+        const after = canRead ? ((await page.evaluate(readApplicationLedgerInPage).catch(() => null)) as LedgerEntry[] | null) : null;
+        // The site (NEM tracks: siteDraft) holds the one new row to this project's address.
+        return chooseSubmittedRecord({ read, numberHref, before: this.ledgerBefore, after, pageUrl: rawUrl, site: this.options.siteDraft ?? null });
+      };
+      // #333 round 4 (Helm Blocking 1): A PAGE AFTER THE PERSON'S OWN CLICK ON A HANDED-OVER REVIEW is
+      // judged against the review's own reading (judgeCompletion), never read loosely: the review's
+      // own id, a list's numbers, a duplicate's or a validation re-render's are not the filing's. The
+      // review (its submit control still there, no number) or Chromium's error page reopens the watch.
+      // #400's list diff and link choice apply on top of that judgement, never in place of it: a new
+      // row in the account list is taken as the filing only on a page judged to be the completion;
+      // on any other page it is offered as a candidate for a person to confirm (a draft lists too).
+      if (this.reviewReading) {
+        const errorPage = /^chrome-error:/i.test(rawUrl);
+        const read = errorPage ? null : await this.readPageForCapture();
+        const judged = read ? this.judgeCompletion(read, this.lastCommittedClick?.at ?? 0) : { number: "", confirmed: false, stillReview: false };
+        if (judged.number) {
+          const recordRead = await chooseRecord({ value: judged.number, confidence: "high", reason: `Captured submission confirmation: ${judged.number}.` });
+          return ok(`Captured submission confirmation: ${judged.number}.`, {
+            permitNumber: judged.number, confirmationNumber: judged.number,
+            discipline: judged.number.match(/-([A-Z]{2,4})$/)?.[1] ?? null, recordLink: recordRead.recordLink, recordRead,
+          });
+        }
+        if (judged.stillReview || errorPage) {
+          this.reopenHumanSubmit();
+          return ok(
+            errorPage ? "The window shows the browser's error page: nothing recorded, and the submit watch is open again."
+              : "The page still reads as the review page: nothing recorded, and the submit watch is open again.",
+            { permitNumber: "", recordLink: cleanRecordLink(rawUrl), stillReview: judged.stillReview, errorPage },
+          );
+        }
+        const unread = judged.confirmed ? "Submitted; no record number found on the completion page yet."
+          : "This page does not read as the application's completion: no record number recorded.";
+        const listed = await chooseRecord({ value: "", confidence: "low", reason: unread });
+        const recordRead = listed.confidence === "high" && !judged.confirmed
+          ? {
+            ...listed, recordNumber: "", confidence: "low" as const, source: "none" as const,
+            reason: "One new application appeared in the account's list, but the page after the submit does not read as the application's completion — a person confirms whether it is this filing.",
+            candidates: [{ recordNumber: listed.recordNumber, recordLink: listed.recordLink, source: "account_list" as const }],
+          }
+          // With nothing in the list to offer, the reason is the page's judgement, as before #400.
+          : listed.confidence === "low" && !listed.candidates.length ? { ...listed, reason: unread } : listed;
+        return ok(
+          recordRead.confidence === "high" ? `Submitted; ${recordRead.recordNumber} is the one new application in the account's list.` : unread,
+          { permitNumber: "", recordLink: recordRead.recordLink || cleanRecordLink(rawUrl), stillReview: false, errorPage: false, recordRead },
+        );
+      }
+      const read = extractRecordNumber(bodyText);
+      const permitNumber = read.value;
+      // Accela record suffix encodes the discipline: -STR (structural), -ELE (electrical), etc.
+      const discipline = permitNumber.match(/-([A-Z]{2,4})$/)?.[1] ?? null;
+      const recordRead = await chooseRecord(read);
+      const recordLink = permitNumber
+        ? (recordRead.recordNumber === permitNumber ? recordRead.recordLink : recordRead.candidates.find((c) => c.recordNumber === permitNumber)?.recordLink || cleanRecordLink(rawUrl))
+        : recordRead.recordLink || cleanRecordLink(rawUrl);
       const submitted = pageConfirmsSubmission(bodyText);
       if (permitNumber || submitted) {
         return ok(`Captured submission confirmation${permitNumber ? `: ${permitNumber}` : ""}.`, {
@@ -1132,9 +2412,12 @@ export class RecipeAdapter extends BasePortalAdapter {
           confirmationNumber: permitNumber,
           discipline,
           recordLink,
+          recordRead,
         });
       }
-      return ok("Submitted; no record number found on the completion page yet.", { permitNumber: "", recordLink });
+      return ok(recordRead.recordNumber
+        ? `Submitted; ${recordRead.recordNumber} is the one new application in the account's list.`
+        : "Submitted; no record number found on the completion page yet.", { permitNumber: "", recordLink, recordRead });
     } catch (err) {
       return ok(`Confirmation capture skipped: ${err instanceof Error ? err.message : String(err)}`, { permitNumber: "", recordLink: "" });
     }
@@ -1146,6 +2429,8 @@ export class RecipeAdapter extends BasePortalAdapter {
   // account/meter numbers) is masked and the text is capped to a short snippet.
   /** Why the last checkStatus() read nothing usable (issue #161); the status checker reports it. */
   lastStatusReason = "";
+  /** The found filing's own record link (#413; statusFinder.exactRecordLinkInPage), "" when none. */
+  lastStatusRecordLink = "";
 
   // READ THE STATUS WHERE THE SIGN-IN LEFT US (issue #161). This used to reload recipe.portalUrl
   // first. For a recipe recorded from the portal's LOGIN page (every PowerClerk recipe ends in
@@ -1155,6 +2440,7 @@ export class RecipeAdapter extends BasePortalAdapter {
   // projects/applications list, and that list's pages, by read-only navigation only.
   async checkStatus(applicationNumbers: string[]): Promise<string | null> {
     this.lastStatusReason = "";
+    this.lastStatusRecordLink = "";
     if (!this.page) { this.lastStatusReason = "the portal never opened"; return null; }
     if (!applicationNumbers.length) { this.lastStatusReason = "no application number to look for"; return null; }
     try {
@@ -1168,6 +2454,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         onProgress: (m) => this.progress("wait", `Status read: ${m}`, Date.now() - t0),
       });
       this.lastStatusReason = found.reason;
+      this.lastStatusRecordLink = found.text ? String(found.recordLink || "") : "";
       return found.text;
     } catch (err) {
       this.lastStatusReason = `the status read failed: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`;
@@ -1193,13 +2480,17 @@ export class RecipeAdapter extends BasePortalAdapter {
     // this returns — the person clicks the portal's resubmit themselves in this page. A
     // filing/payment abort turns the reopen into a named failure.
     this.backstop = await installFilingBackstop(this.page, "correction reopen").catch(() => null);
+    // #394: the reopen acts on the page login left loaded (it never navigates first) — a page the
+    // redirect guard could not cover is said, never silent.
+    const guardNote = this.backstop?.redirectGuardNote ?? "";
+    if (guardNote) this.driftWarnings.push(guardNote);
     this.backstopReported = 0;
     try {
       const r = await this.reopenSuspendedFilingImpl(applicationNumber);
       await this.backstop?.dispose().catch(() => null);
       const stop = this.backstopStop();
       if (stop) return fail(`${stop} (The reopen then reported: ${String(r.message ?? "").slice(0, 300)})`, { ...(r.data ?? {}), needsHuman: true, driftWarnings: this.driftWarnings, guardRefusals: this.guardRefusals });
-      return r;
+      return guardNote ? { ...r, message: `${String(r.message ?? "")} ${guardNote}`.trim() } : r;
     } finally {
       await this.backstop?.dispose().catch(() => null);
       this.backstop = null;
@@ -1361,8 +2652,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     const none = { summary: "", fieldsSeen: 0, confirmed: 0, mismatches: [] as ReviewMismatch[] };
     if (!this.page || !project) return none;
     try {
-      const fields = await scrapeReviewScreenShared(this.page);
-      const body = String(await this.page.locator("body").innerText().catch(() => ""));
+      const { fields, body, confirmed, mismatches } = await this.reviewValuesOnPage(project);
       // A REVIEW SCREEN WE COULD NOT READ MUST LEAVE ITS PAGE BEHIND.
       //
       // The first live replay benchmark scored PacifiCorp `replayed_clean` — 98 steps, no
@@ -1380,16 +2670,12 @@ export class RecipeAdapter extends BasePortalAdapter {
           await this.page.screenshot({ path: path.join(dir, `review-unreadable-${stamp}.png`), fullPage: true }).catch(() => {});
         } catch { /* diagnostics must never change the outcome */ }
       }
-      // A utility identifier is checked only when THIS recipe typed it (B8) — never a meter on a
-      // permit application that has no meter field.
-      const cmp = reviewComparison(fields, project, utilityIdentifiersEnteredBySteps(this.recipe.steps), body);
-      const mismatches = cmp.mismatches;
       if (!mismatches.length) {
         // SAY WHAT WAS CONFIRMED, NOT JUST THAT NOTHING COMPLAINED. Zero mismatches on a page
         // where nothing could be compared is not a verified filing.
         return {
-          summary: ` Review screen checked against the project: ${fields.length} field(s) read, ${cmp.confirmed} project value(s) confirmed present, no mismatch.`,
-          fieldsSeen: fields.length, confirmed: cmp.confirmed, mismatches,
+          summary: ` Review screen checked against the project: ${fields.length} field(s) read, ${confirmed} project value(s) confirmed present, no mismatch.`,
+          fieldsSeen: fields.length, confirmed, mismatches,
         };
       }
       const named = mismatches.slice(0, 4)
@@ -1398,12 +2684,28 @@ export class RecipeAdapter extends BasePortalAdapter {
       return {
         summary: ` VERIFY BEFORE SUBMITTING — the review screen does not match the project on ${mismatches.length} field(s): ${named}${mismatches.length > 4 ? ", …" : ""}.`,
         fieldsSeen: fields.length,
-        confirmed: cmp.confirmed,
+        confirmed,
         mismatches,
       };
     } catch {
       return none;
     }
+  }
+
+  /** THE PROJECT'S VALUES ON THE PAGE NOW — the review read-back's comparison, READ ONLY (no capture
+   *  written, no input). verifyReviewScreen reports from it; the hand-over's early "where did the run
+   *  stop" read (Helm Should-fix 4) takes the same `confirmed`, so both readings of one page carry the
+   *  same evidence. Throws only what the scrape throws; callers catch. */
+  private async reviewValuesOnPage(
+    project: ProjectRecord,
+  ): Promise<{ fields: Awaited<ReturnType<typeof scrapeReviewScreenShared>>; body: string; confirmed: number; mismatches: ReviewMismatch[] }> {
+    if (!this.page) return { fields: [], body: "", confirmed: 0, mismatches: [] };
+    const fields = await scrapeReviewScreenShared(this.page);
+    const body = String(await this.page.locator("body").innerText().catch(() => ""));
+    // A utility identifier is checked only when THIS recipe typed it (B8) — never a meter on a
+    // permit application that has no meter field.
+    const cmp = reviewComparison(fields, project, utilityIdentifiersEnteredBySteps(this.recipe.steps), body);
+    return { fields, body, confirmed: cmp.confirmed, mismatches: cmp.mismatches };
   }
 
   private async runAll(project?: ProjectRecord): Promise<PortalStepResult> {
@@ -1459,9 +2761,13 @@ export class RecipeAdapter extends BasePortalAdapter {
     // several roof planes. Measured: Bren Trask has FOUR arrays (10+3+5+6 = 24 modules) and
     // the recipe learned on him types "10"; Randal Rowland has two (18+5 = 23) and gets 18.
     // A 10.32 kW system was being filed as roughly 4.4 kW.
+    // #386 — hand-patched row writes never replay, so they never stretch the block either (a row-2
+    // Qty the merge bound to array1ModuleQuantity by value would otherwise become its last step).
+    const handPatchedRows = handPatchedArrayRowSteps(this.recipe.steps);
+    const recipeAddsRows = this.recipe.steps.some((s2) => isArrayAdderClick(s2));
     const arrayBound = this.recipe.steps
       .map((s2, i) => ({ s2, i }))
-      .filter(({ s2 }) => /^array1[A-Z]/.test(String(s2.field ?? "")));
+      .filter(({ s2, i }) => /^array1[A-Z]/.test(String(s2.field ?? "")) && !handPatchedRows.has(i));
     this.arrayBlockStart = arrayBound.length ? arrayBound[0].i : -1;
     this.arrayBlockEnd = arrayBound.length ? arrayBound[arrayBound.length - 1].i : -1;
     const slowSteps: Array<{ i: number; action: string; note: string; ms: number; phases?: Record<string, number> }> = [];
@@ -1487,6 +2793,11 @@ export class RecipeAdapter extends BasePortalAdapter {
         const bsStop = this.backstopStop();
         if (bsStop) return fail(bsStop, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: Math.max(0, stepIdx - 1), trace });
       }
+      // WHO IS FILING STOPPED THE RUN (#524) on a path that swallowed the throw (a gap-fill write, an
+      // array re-run): stop here, named, before the next step.
+      if (this.filerIdentityStop) {
+        return fail(this.filerIdentityStop, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: Math.max(0, stepIdx - 1), trace, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified });
+      }
       // THE PORTAL SAYS THIS ADDRESS IS NOT SERVED HERE (portal-truth D5): after every step that
       // moved the page (a click, a goto), ask the one predicate of the page's visible text. A replay
       // that lands on "No Building services were returned for this address" stops here, named, with
@@ -1500,6 +2811,29 @@ export class RecipeAdapter extends BasePortalAdapter {
       }
       const recordedStep = this.recipe.steps[stepIdx];
       this.currentStepIdx = stepIdx;
+      // #382 — A RECORDED "ADD ARRAY" CLICK IS NEVER REPLAYED. It adds a fixed number of rows (the
+      // learn project's), whatever this project has; the rows this project needs are added after
+      // the array block, one per array (afterArrayBlock), and only there.
+      if (isArrayAdderClick(recordedStep)) {
+        const why = `recorded "Add Array" click (step ${stepIdx + 1}) not replayed — the project's ${this.projectArrayCount()} array(s) decide how many rows are added`;
+        if (!this.driftWarnings.includes(why)) this.driftWarnings.push(why);
+        trace.push({ i: stepIdx, action: "click", note: String(recordedStep.note ?? "Add Array").slice(0, 52), outcome: "not replayed (rows come from the project's arrays)", page: await currentPageLabel() });
+        continue;
+      }
+      // #386 — NOR ARE THE ROW FILLS A PERSON TYPED INTO ROWS THAT CLICK ADDED. They carry the learn
+      // project's numbers to bare row labels; the rows come from the project's arrays (row mode, or
+      // the recorded block's nth pass), which is why they are skipped only where the recipe has that
+      // block AND the rows are added (countable rows, or a recorded adder). Named, never silent.
+      {
+        const why = handPatchedRows.get(stepIdx);
+        if (why && this.arrayBlockStart >= 0 && (this.arrayRowMode === true || recipeAddsRows)) {
+          const label = String(recordedStep.note ?? recordedStep.action).replace(/^human-patch\s*:?\s*/i, "").slice(0, 40) || recordedStep.action;
+          this.driftWarnings.push(`hand-patched step ${stepIdx + 1} ("${label}") not replayed — ${why}; every row is filled from the project's ${this.projectArrayCount()} array(s)`);
+          trace.push({ i: stepIdx, action: String(recordedStep.action), note: String(recordedStep.note ?? "").slice(0, 52), outcome: "not replayed (hand-patched array row; rows come from the project's arrays)", page: await currentPageLabel() });
+          this.handPatchedRowsSkipped.add(stepIdx);
+          continue;
+        }
+      }
       const inArrayBlock = this.arrayBlockStart >= 0
         && stepIdx >= this.arrayBlockStart && stepIdx <= this.arrayBlockEnd;
       // ON A REPEAT PASS, ONLY THE PER-ARRAY STEPS RUN AGAIN. The block's bounds are
@@ -1561,6 +2895,24 @@ export class RecipeAdapter extends BasePortalAdapter {
       // moments when whatever the page reveals is finally all present.
       if (step.action === "click" || step.action === "stopForReview") {
         await this.timed("upload-sweep", () => this.sweepUnrecordedUploads().catch(() => 0));
+      }
+      // A REQUIRED CONTROL THE RECIPE HAS NO STEP FOR (issue #352) — answered from this job before the
+      // page is handed to a person (the review stop / the recorded final submit), never past review.
+      // The gap-fill those two run next sees what was typed; a control it knows but this job has no
+      // value for stops the run here, by name. (An ADVANCING click asks the same question further
+      // down, only once the extra-advance guard has decided the page is really being left.)
+      // AND IN FRONT OF A STAMPED DRAFT-CREATING SUBMIT, in both recipe shapes (Helm review of PR
+      // #353, item 2): the auto-learner records PSE's Part 1 Submit with no stopForReview before it,
+      // so that click step itself is where the page is answered — before clickDraftCreatingSubmit
+      // reads it. A known control with no value stops here by name, before any click.
+      if (!pastReview && (step.action === "stopForReview" || isFinalSubmitStep(step) || this.draftCreatingStepAt(stepIdx) >= 0)) {
+        const unrecorded = await this.timed("unrecorded-required", () => this.answerUnrecordedRequired());
+        if (unrecorded.filled.length) { prevWasInput = true; wroteToThisPage = true; }
+        if (unrecorded.missing.length) {
+          closePrevStepTiming();
+          return await this.stopForMissingRequired(unrecorded.missing, `"${String(step.note ?? step.action).slice(0, 44)}"`,
+            { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: stepIdx, trace, slowSteps, gapFill: this.gapFillReport, unresolvedFields: this.unresolvedFields, stoppedAtPayment: this.stoppedAtPayment });
+        }
       }
 
       // THE E-SIGNATURE IS TYPED ONLY AS THE CLIENT'S AUTHORIZED SIGNER (operator ruling
@@ -1675,6 +3027,65 @@ export class RecipeAdapter extends BasePortalAdapter {
       if (step.action === "click") await this.timed("autosave-wait", () => this.waitForAutosaveCommitted());
       // Nor while its loading mask is up ("Please wait..."): a click under it lands nowhere (runs-finish item 4).
       if (step.action === "click") await this.timed("overlay-wait", () => this.waitForLoadingMaskClear(`"${String(step.note ?? "the click").slice(0, 50)}"`));
+
+      // DO NOT ADVANCE PAST A PAGE YOU STILL NEED TO FILL.
+      //
+      // One portal, many jurisdictions, DIFFERENT PAGE COUNTS. Oregon ePermitting lets each
+      // participating city configure its own Building application, so a recipe learned in
+      // one city can carry an advance the next city does not need. Measured live: the Coos
+      // Bay recipe has TWO consecutive "advance: Continue Application" steps, and replaying
+      // it in Hood River the second one skipped clean over the page holding Job Value,
+      // Category of Construction and Project Name — the run then stopped reporting 0 of 4
+      // fields, from inside the wizard, two pages past where it should have been.
+      //
+      // So before an advancing click, look at what the NEXT segment expects: if those fields
+      // are on the page right now, this advance is one the recipe brought from another
+      // jurisdiction. Skip it and let the fills happen. Deliberately conservative — it needs
+      // a real overlap of the next segment's labels, not a single incidental match.
+      //
+      // DECIDED HERE, BEFORE THE UNRECORDED-REQUIRED ANSWER CAN WRITE TO THE PAGE (PR #353 round 2).
+      // For an advancing click, what runs above this point is what ran before #352 (the top-of-
+      // iteration answer is for the review stop and a recorded final submit, which leave the loop
+      // before here). The persist-settle below used to come first, but it only ever ran when
+      // wroteToThisPage was already set (prevWasInput is set only together with it) — i.e. when this
+      // guard cannot skip — and it never touches wroteToThisPage. So the decision is the one it
+      // always was. Asked BEFORE this guard, the unrecorded answer's fill marked the page as
+      // written, the guard stood down, and a duplicate Next carried the next section's values one
+      // page too far (identicalSections.dom.smoke case 3).
+      if (step.action === "click" && /^advance\b/i.test(String(step.note ?? ""))) {
+        const upcoming = this.expectedLabelsForSegment(stepIdx + 1);
+        // NEVER skip an advance off a page we just filled. Label overlap alone cannot tell
+        // two DIFFERENT sections apart when a portal reuses one contact block — PowerClerk's
+        // "Preparer Information" and "Customer Information" pages carry byte-identical
+        // labels (Name, Last, Address, City, State, Zip, Email, Phone), so this guard saw
+        // the customer segment "already on the page", skipped the Next, and the homeowner
+        // steps overwrote the installer's details. Measured live: Charles Bitton of TML
+        // INTERNATIONAL replaced by the homeowner Randal Rowland, with the homeowner's
+        // site address, in the PREPARER block of a real interconnection application.
+        // Recorded steps carry section="" so there is no heading to disambiguate with —
+        // but "we just wrote to this page" is decisive on its own and needs no recording.
+        if (upcoming.length >= 3 && !wroteToThisPage && await this.segmentIsOnThisPage(upcoming)) {
+          this.driftWarnings.push(`skipped an advance this jurisdiction does not need — the next section's fields (${upcoming.slice(0, 3).join(", ")}…) are already on this page`);
+          continue;
+        }
+      }
+
+      // A REQUIRED CONTROL THE RECIPE HAS NO STEP FOR (issue #352), on the advance that REALLY leaves
+      // the page — the guard above has just kept it. Answered from this job with the page as filled
+      // as the recipe makes it (and its autosave and loading mask settled); what was typed makes
+      // this an input page, so the persist-settle and gap-fill below run before the click. A control
+      // it knows but this job has no value for stops the run here, by name. Never past review; a
+      // recorded final submit asked it at the top of the iteration.
+      if (!pastReview && step.action === "click" && /^advance\b/i.test(String(step.note ?? "")) && !isFinalSubmitStep(step)) {
+        const unrecorded = await this.timed("unrecorded-required", () => this.answerUnrecordedRequired());
+        if (unrecorded.filled.length) { prevWasInput = true; wroteToThisPage = true; }
+        if (unrecorded.missing.length) {
+          closePrevStepTiming();
+          return await this.stopForMissingRequired(unrecorded.missing, `"${String(step.note ?? step.action).slice(0, 44)}"`,
+            { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: stepIdx, trace, slowSteps, gapFill: this.gapFillReport, unresolvedFields: this.unresolvedFields, stoppedAtPayment: this.stoppedAtPayment });
+        }
+      }
+
       // PERSIST SETTLE before an advancing click. PowerClerk autosaves each page (~3s) and
       // only commits fields on blur; advancing too soon saves a BLANK draft. If the prior
       // steps filled fields, wait for the autosave to settle before this click.
@@ -1698,38 +3109,6 @@ export class RecipeAdapter extends BasePortalAdapter {
         await this.timed("gap-fill", () => this.withProgress("wait", "Checking the page for required fields the recipe missed", () => this.runGapFill(this.page), stepIdx));
         this.gapFilledPage = await this.pageIdentity().catch(() => "");
         prevWasInput = false;
-      }
-
-      // DO NOT ADVANCE PAST A PAGE YOU STILL NEED TO FILL.
-      //
-      // One portal, many jurisdictions, DIFFERENT PAGE COUNTS. Oregon ePermitting lets each
-      // participating city configure its own Building application, so a recipe learned in
-      // one city can carry an advance the next city does not need. Measured live: the Coos
-      // Bay recipe has TWO consecutive "advance: Continue Application" steps, and replaying
-      // it in Hood River the second one skipped clean over the page holding Job Value,
-      // Category of Construction and Project Name — the run then stopped reporting 0 of 4
-      // fields, from inside the wizard, two pages past where it should have been.
-      //
-      // So before an advancing click, look at what the NEXT segment expects: if those fields
-      // are on the page right now, this advance is one the recipe brought from another
-      // jurisdiction. Skip it and let the fills happen. Deliberately conservative — it needs
-      // a real overlap of the next segment's labels, not a single incidental match.
-      if (step.action === "click" && /^advance\b/i.test(String(step.note ?? ""))) {
-        const upcoming = this.expectedLabelsForSegment(stepIdx + 1);
-        // NEVER skip an advance off a page we just filled. Label overlap alone cannot tell
-        // two DIFFERENT sections apart when a portal reuses one contact block — PowerClerk's
-        // "Preparer Information" and "Customer Information" pages carry byte-identical
-        // labels (Name, Last, Address, City, State, Zip, Email, Phone), so this guard saw
-        // the customer segment "already on the page", skipped the Next, and the homeowner
-        // steps overwrote the installer's details. Measured live: Charles Bitton of TML
-        // INTERNATIONAL replaced by the homeowner Randal Rowland, with the homeowner's
-        // site address, in the PREPARER block of a real interconnection application.
-        // Recorded steps carry section="" so there is no heading to disambiguate with —
-        // but "we just wrote to this page" is decisive on its own and needs no recording.
-        if (upcoming.length >= 3 && !wroteToThisPage && await this.segmentIsOnThisPage(upcoming)) {
-          this.driftWarnings.push(`skipped an advance this jurisdiction does not need — the next section's fields (${upcoming.slice(0, 3).join(", ")}…) are already on this page`);
-          continue;
-        }
       }
 
       // CLEAR THE WAY BEFORE A CLICK. Replay had no modal handling at all, while the
@@ -1888,6 +3267,14 @@ export class RecipeAdapter extends BasePortalAdapter {
             const base = fail(err.pauseReason ? err.message : `Recipe step failed (${step.action}${step.note ? ` — ${step.note}` : ""}): ${err.message}`,
               { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: stepIdx, trace, slowSteps, finalSubmitClicked: this.finalSubmitClicked, ...(err.pauseReason ? { needsHuman: true } : {}), pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath });
             return err.pauseReason ? { ...base, pauseReason: err.pauseReason } : base;
+          }
+          // WHO IS FILING (#524): never retried, healed or skipped as optional — a retry or a heal
+          // re-asks the same list the same question, and an optional skip leaves the portal's default
+          // company standing.
+          if (err instanceof FilerIdentityStop) {
+            closePrevStepTiming();
+            trace.push({ i: stepIdx, action: step.action, note: String(step.note ?? "").slice(0, 52), outcome: "FAILED", page: await currentPageLabel() });
+            return fail(err.message, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: stepIdx, trace, slowSteps, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath });
           }
           if (!failureContext) failureContext = await this.timed("failure-context", () => this.captureFailureContext(step, stepIdx).catch(() => ""));
           const isTimeout = err instanceof Error && /timeout|TimeoutError/i.test(err.message);
@@ -2220,6 +3607,7 @@ export class RecipeAdapter extends BasePortalAdapter {
           clickedLabel: d.clickedLabel, tenantKey: d.tenantKey,
         },
         gapFill: this.gapFillReport, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, slowSteps, requiredStillEmpty: this.requiredStillEmpty, unresolvedFields: this.unresolvedFields, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, requiredFieldsSeen: this.requiredFieldsSeen, pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath,
+        unrecordedAnswered: this.unrecordedAnswered,
       });
     }
 
@@ -2261,6 +3649,16 @@ export class RecipeAdapter extends BasePortalAdapter {
     // way out of earlier pages, and then left blank on the final page because no advance
     // ever followed them. Five required fields, on the page a person is asked to check.
     // Nothing here clicks; it only re-fills values the run already decided.
+    // ...and FIRST, a required control the recipe has no step for (issue #352), answered from this
+    // job — the run that simply runs out of recorded steps reaches review through here without an
+    // advance or a review step to ask it. Never past review, never on the payment stop.
+    if (!pastReview && !this.stoppedAtPayment) {
+      const unrecorded = await this.answerUnrecordedRequired();
+      if (unrecorded.missing.length) {
+        return await this.stopForMissingRequired(unrecorded.missing, "review",
+          { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, trace, slowSteps, gapFill: this.gapFillReport, unresolvedFields: this.unresolvedFields, stoppedAtPayment: this.stoppedAtPayment });
+      }
+    }
     await this.reassertBlanksOnce(false);
     // AND GAP-FILL IT, for the same reason and in the right order. Re-asserting can only put
     // back a value the recipe already knows how to write; it cannot fill a required field the
@@ -2307,27 +3705,118 @@ export class RecipeAdapter extends BasePortalAdapter {
     // aborted and stops the run, named. ...BUT NOT BEFORE THE PORTAL HAS SAVED WHAT THE RUN WROTE
     // (dryrun-0928 B3): PowerClerk batches a page's answers into one save seconds after the first
     // change; the final-submit refusal and stopForReview exits both arrive here with it pending.
+    // #333 — FROM HERE THE RUN MAKES NO INPUT ON THIS PAGE, so a person's own click can be told from
+    // it: the backstop's input watch is armed now (a guided-manual run only — an approved run clicks
+    // its own final submit and is never handed over) — and only for a caller that watches for the
+    // person's submit (Helm Should-fix 4: handOverReview, which index.ts passes only with
+    // onSubmitCaptured). The learn self-test, the cross-project replay and the benchmark never see that
+    // submit, so a click in their tail is held by the lockdown and fails the run by name, as on main.
+    const handingOver = this.options.handOverReview === true && !this.options.autoSubmit && !this.finalSubmitClicked && !!this.backstop;
+    let handedOver = false;
+    // WHERE THE RUN STOPPED, READ BEFORE THE PAGE IS HANDED OVER (Helm Should-fix 4): once the person
+    // acts, the page is theirs and no longer where the run stopped. Read-only, with the same evidence
+    // as the review read-back (the project's values on the page).
+    let earlyStop: { where: string; refused: string[]; message: string } | null = null;
+    if (handingOver) {
+      earlyStop = !pastReview && !this.stoppedAtPayment
+        ? await this.whereTheRunStopped(project ? (await this.reviewValuesOnPage(project).catch(() => ({ confirmed: 0 }))).confirmed : 0)
+        : null;
+      // THE RUN'S OWN INPUT ENDS HERE (#333): its guarded clicks, presses and steps refuse from now on,
+      // so the input watch armed next can only ever record a person's input.
+      this.inputsClosed = `${INPUT_CLOSED} (${this.recipe.id})`;
+      // A FAILING RUN IS NEVER HANDED OVER (Helm Should-fix 3): a stopping abort the input watch did
+      // not flag as the person's (a click before the watch listened — during the run's last writes or
+      // its arm — or the page acting by itself) fails the run by name below. Asked BEFORE the arm (an
+      // armed watch would flag the person's next click as a held one, and the failing run would tell
+      // them to click again) and again just before the hand-over (an abort recorded during the arm).
+      // A click the armed watch saw is flagged, so it still hands over. Never asked earlier: the run's
+      // own helper input is not fenced, so arming sooner would flag automation's aborts as the person's.
+      const unflaggedStop = (): boolean => !!this.backstop && this.backstop.stoppingAborts().some((a) => !a.humanInput);
+      const handOverArmed = !unflaggedStop() && await this.backstop!.watchHumanInput().catch(() => false);
+      // THE HAND-OVER (#333, owner ruling 2026-10-14) — BEFORE the drain and the read-only
+      // housekeeping below (skeptic r2 F2): a person who clicks while the portal is still saving the
+      // run's last answer is let through and their request recorded as theirs — the drain's and the
+      // own-write window's own-save exemptions never take it. The page's own scripts posting with no
+      // input of the person's still meet the lockdown below until fillApplication returns, and they
+      // cannot forge that input: the watch runs in a CDP isolated world no page script can reach or
+      // drive (Helm Should-fix 1; the filingBackstop.ts header states its residual).
+      handedOver = handOverArmed && !unflaggedStop() && await this.handOverReviewPage();
+    }
     await this.drainBeforeReviewLock();
     this.backstop?.lockReview(`replay stopped at review (${this.recipe.id})`);
-    const review = await this.verifyReviewScreen(project);
+    if (handingOver) {
+      // Told only once the run's own save has drained — not an invitation to click while the portal
+      // reads "Saving…" (an eager click is still let through, and recorded).
+      // A run that stopped before review says so here too — never "Staged to review" (Should-fix 4).
+      if (handedOver) {
+        this.progress("wait", earlyStop
+          ? `Stopped on "${earlyStop.where}" — NOT the review page; the page is yours to finish, continue to review, verify and submit`
+          : "Staged to review — the page is yours to verify and submit", 0);
+      }
+      else {
+        // Fail closed AND say so, now and in the hand-off: the lockdown holds until the stage finishes
+        // (a failed arm, or an unflagged stop on record — the run then fails by name).
+        if (!this.reviewHandoffNotes.includes(NOT_HANDED_OVER_NOTE)) this.reviewHandoffNotes.push(NOT_HANDED_OVER_NOTE);
+        if (!this.driftWarnings.includes(NOT_HANDED_OVER_NOTE)) this.driftWarnings.push(NOT_HANDED_OVER_NOTE);
+        this.progress("wait", NOT_HANDED_OVER_NOTE, 0);
+      }
+    }
+    // #381 — THE REVIEW READ-BACK TOLERATES AN OPEN DIALOG: after the hand-over a native dialog on the
+    // window waits for the person (automation never answers it) and stalls every page read, so the
+    // read is skipped — said so in the summary — and never decides where the run stopped.
+    const reviewSkipped = { summary: REVIEW_READ_SKIPPED_SUMMARY, fieldsSeen: 0, confirmed: 0, mismatches: [] as ReviewMismatch[], skipped: true };
+    const review: { summary: string; fieldsSeen: number; confirmed: number; mismatches: ReviewMismatch[]; skipped?: boolean } =
+      await readUnlessDialog(this.page, () => this.verifyReviewScreen(project), reviewSkipped);
     const data = {
       executed, skipped, finalSubmitClicked: false, gapFill: this.gapFillReport,
       healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, slowSteps,
       requiredStillEmpty: this.requiredStillEmpty, unresolvedFields: this.unresolvedFields, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, requiredFieldsSeen: this.requiredFieldsSeen, stoppedAtPayment: this.stoppedAtPayment, pageShotDir: this.pageShotDir,
       outcomeShotPath: this.outcomeShotPath,
       reviewFieldsSeen: review.fieldsSeen, reviewFieldsConfirmed: review.confirmed, reviewMismatches: review.mismatches,
-      attachmentLedger: this.attachmentLedger,
+      ...(review.skipped ? { reviewReadSkipped: "a dialog waits for the person in the window" } : {}),
+      attachmentLedger: this.attachmentLedger, unrecordedAnswered: this.unrecordedAnswered,
     };
     // HONEST STATUS (runs-finish item 3). Live run 191e45c8 said "stopped at review" on Accela's
     // attachments page with 0 of 5 project values found, and was recorded ready-to-submit. A run
     // that ends on a page the shared reading says is NOT the review page, showing none of the
     // project's values, pauses for a person, named — never "staged to the review screen".
-    const stop = !pastReview && !this.stoppedAtPayment ? await this.whereTheRunStopped(review.confirmed) : null;
+    // A page the person already moved on from (their own submit or postback went) is not where the
+    // run stopped: the run did reach it and handed it over.
+    // Moved on (skeptic r2 F3): their own request left the page (a document submit or postback),
+    // their own submit was seen, or they acted after the hand-over and the page is no longer the one
+    // handed over (a fetch submit that then loads its completion page; a GET to "My Records"). A
+    // harmless touch that only rode along with the run's own autosave is none of these. And a click
+    // of theirs HELD BACK before the hand-over can leave Chromium's error page in the window: that is
+    // not where the run stopped either (F6) — that page only (round 3).
+    // #417 (Helm Should-fix 5 on #378): Chromium's error page is never "a page the person moved on to".
+    // A held request (their payment after the hand-over, held by rule 1) leaves it in the window; read
+    // before personMovedOn, so the third clause below cannot take it for the person's own navigation
+    // (which said "If that was the submit, the filing went" over a payment that was held).
+    const bsNow = this.backstop;
+    const hereNow = this.pageUrlNoHash();
+    const onErrorPage = /^chrome-error:/i.test(hereNow);
+    const personMovedOn = !!this.humanDocumentFromHandedOverPage(bsNow) || !!this.humanSubmit
+      || (!!bsNow && this.handOverUrl !== "" && hereNow !== "" && hereNow !== this.handOverUrl && !onErrorPage && bsNow.personActedSinceHandOver(this.page));
+    this.personMovedOn = personMovedOn;
+    this.personRequestWent = (bsNow?.humanRequests ?? []).length > 0;
+    // …nor where the run stopped: a held click before the hand-over, or a held payment after it.
+    const onHeldErrorPage = (this.heldHumanClick() || this.heldHumanPayment()) && onErrorPage;
+    // A person who moved on from a page the run did NOT stage at review (Helm Should-fix 4: their
+    // Continue on an attachments step) is told where the run stopped, from the reading taken before the
+    // hand-over. A final submit the click detector saw is not decided here (the review step's wording).
+    const stop = !pastReview && !this.stoppedAtPayment && !onHeldErrorPage
+      ? (personMovedOn && !this.humanSubmit
+        ? (earlyStop && { where: earlyStop.where, refused: earlyStop.refused, message: this.stoppedBeforeReviewMessage(earlyStop.where, earlyStop.refused, this.personRequestWent) })
+        : (personMovedOn || review.skipped ? null : await readUnlessDialog(this.page, () => this.whereTheRunStopped(review.confirmed, this.personRequestWent), null)))
+      : null;
     if (stop) {
       this.stoppedBeforeReview = stop.message;
-      return { ...ok(`Replayed ${executed} recorded step(s); ${stop.message}${review.summary}`, { ...data, stoppedBeforeReview: stop.where }), pauseReason: "stopped_before_review" };
+      this.stoppedBeforeReviewAt = { where: stop.where, refused: stop.refused };
+      // THE PICKS FIRST (#362): the run card and the stage line read this message's first line (the
+      // backend's pausedRunSentence), so what automation picked leads it, before the where-it-stopped.
+      return { ...ok(`${this.draftPickTell ? `${this.draftPickTell} ` : ""}Replayed ${executed} recorded step(s); ${stop.message}${review.summary}`, { ...data, stoppedBeforeReview: stop.where }), pauseReason: "stopped_before_review" };
     }
-    return ok(`Replayed ${executed} recorded step(s); stopped at review.${review.summary}`, data);
+    return ok(`${this.draftPickTell ? `${this.draftPickTell} ` : ""}Replayed ${executed} recorded step(s); stopped at review.${review.summary}`, data);
   }
 
   /** WHERE DID THE RUN STOP, IF NOT AT REVIEW? (runs-finish item 3, the part that needs no wizard-
@@ -2336,7 +3825,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  say "not review" — a page that cannot be read (a unit-test double) keeps today's report.
    *  Otherwise: the page is readable, is not the review page, and shows none of the project's
    *  values — the run stopped before review, and says where in the page's own words. */
-  private async whereTheRunStopped(confirmed: number): Promise<{ where: string; message: string } | null> {
+  private async whereTheRunStopped(confirmed: number, personRequestWent = false): Promise<{ where: string; refused: string[]; message: string } | null> {
     if (confirmed > 0) return null;
     const at = await this.pageSafetyContext();
     if (at.reviewPage !== false) return null;
@@ -2355,12 +3844,21 @@ export class RecipeAdapter extends BasePortalAdapter {
     }).catch(() => "")) : "";
     const where = titled || (await this.pageLabelNow().catch(() => "")) || "the last page the recipe reached";
     const refused = (await this.readPortalRefusal().catch(() => [] as string[])).slice(0, 3).map((t) => t.replace(/[.\s]+$/, ""));
-    return {
-      where,
-      message: `STOPPED on "${where}" — NOT the review page (the page does not read as the portal's review step, and none of the project's values are on it), so the application is NOT staged at review.`
-        + `${refused.length ? ` The portal says: ${refused.join(" | ")}.` : ""}`
-        + ` Next: in the portal, finish that page (check every attachment is listed and nothing is flagged required), continue to the review page, verify every field there, then submit. Nothing was filed.`,
-    };
+    return { where, refused, message: this.stoppedBeforeReviewMessage(where, refused, personRequestWent) };
+  }
+
+  /** THE STOPPED-BEFORE-REVIEW SENTENCE, whole (pure). Built from a reading taken before the hand-over
+   *  too (Helm Should-fix 4): a person who moved on from the page the run stopped on is told where the
+   *  run stopped, never that it staged the review screen. */
+  private stoppedBeforeReviewMessage(where: string, refused: string[], personRequestWent: boolean): string {
+    return `STOPPED on "${where}" — NOT the review page (the page does not read as the portal's review step, and none of the project's values are on it), so the application is NOT staged at review.`
+      + `${refused.length ? ` The portal says: ${refused.join(" | ")}.` : ""}`
+      // A request went through after the person touched the page past the hand-over (round 3): it may
+      // have been the filing — never "Nothing was filed"; this sentence is the one that says so. Hedged
+      // (#417): it may also have been the portal's own save.
+      + (personRequestWent
+        ? ` A request from the page went through after you touched it while the stage was finishing (it may also have been the portal saving the stage's answers) — check the portal before anything else.`
+        : ` Next: in the portal, finish that page (check every attachment is listed and nothing is flagged required), continue to the review page, verify every field there, then submit. Nothing was filed.`);
   }
 
   /** Binding keys the planner invented that the dictionary does not define — reported once
@@ -2448,6 +3946,16 @@ export class RecipeAdapter extends BasePortalAdapter {
       // electrical contractor's number the generic key held on this track.
       const lic = licenceKeyForLabel(step.field, String(step.selector?.label || step.selector?.name || step.selector?.text || step.note || ""));
       if (lic) return lic.key ? String(this.fieldValues[lic.key] ?? "") : "";
+      // #382 — A ROW FILES ITS OWN ARRAY'S MODULE. The recorded row binds moduleMake / moduleModel
+      // (the first array's); a plan set whose roof planes carry different modules gives array N
+      // its own make/model (array{N}ModuleManufacturer / array{N}ModuleModel), and row N files
+      // that. The same module as array 1 falls through to the shared path (its certified name).
+      if (this.arrayPass > 1 && (step.field === "moduleMake" || step.field === "moduleModel")) {
+        const part = step.field === "moduleMake" ? "Manufacturer" : "Model";
+        const own = String(this.fieldValues[`array${this.arrayPass}Module${part}`] ?? "").trim();
+        const first = String(this.fieldValues[`array1Module${part}`] ?? this.fieldValues[step.field] ?? "").trim();
+        if (own && own.toLowerCase() !== first.toLowerCase()) return own;
+      }
       // PREFER THE PORTAL'S OWN STRING for equipment models. The backend resolves
       // "<field>Certified" from the CEC list — the same list the portal builds its dropdown
       // from — so "DS3-L" arrives as "DS3-L {240V}" and "Q.TRON BLK M-G2.C1+/AC" as the
@@ -2645,18 +4153,23 @@ export class RecipeAdapter extends BasePortalAdapter {
   // #339 — ROW MODE: each array is written INSIDE ITS OWN ROW, then proved there.
   // ---------------------------------------------------------------------------
 
-  /** Decide once, at the first per-array step: a project with more than one array, on a page
-   *  whose rows are countable. Anything else keeps the recorded-selector path unchanged — a
-   *  single-array project (the common case) and a portal with no "Delete Array" marker. */
+  /** Decide once, at the first per-array step: a page whose rows are countable. A portal with
+   *  no "Delete Array" marker keeps the recorded-selector path unchanged.
+   *
+   *  #382 — A SINGLE-ARRAY PROJECT IS ONE ROW, FILLED AS A ROW. Its recorded row steps point at
+   *  learn-time ids (#pcInputBase57) and bare labels ranked against the learn page; on the
+   *  captured PacifiCorp markup, where a fresh row renders only its Qty, the module make's
+   *  recorded step resolved to the INVERTER's "Manufacturer" (#pcInputBase54 by then) — the
+   *  same wrong-control write #339 fixed for row 2+ — and the row never filled. One row is
+   *  looked for once (no wait: an unpainted row keeps the recorded path, as before); several
+   *  arrays look a few times, as the row may still be painting. */
   private async useArrayRowMode(): Promise<boolean> {
     if (this.arrayRowMode === null) {
       let rows = 0;
-      if (this.projectArrayCount() > 1) {
-        // The row may still be painting when the block is reached; look a few times.
-        for (let k = 0; k < 6 && rows === 0; k++) {
-          rows = await this.markArrayRows();
-          if (!rows) await sleep(500);
-        }
+      const looks = this.projectArrayCount() > 1 ? 6 : 1;
+      for (let k = 0; k < looks && rows === 0; k++) {
+        rows = await this.markArrayRows();
+        if (!rows && k + 1 < looks) await sleep(500);
       }
       this.arrayRowMode = rows >= 1;
       if (this.arrayRowMode) this.rowArrays = [[1]];
@@ -2669,6 +4182,8 @@ export class RecipeAdapter extends BasePortalAdapter {
   private async afterArrayBlock(): Promise<{ repeat: boolean; stop?: string }> {
     const want = this.projectArrayCount();
     if (this.arrayPass < want) {
+      // Every add, merge and row-N fill passes here: rows the recording never had (#362).
+      await this.noteUnrecordedWrite("data", `PV array rows beyond the recorded one (project has ${want} arrays)`);
       if (await this.addAnotherArrayRow()) {
         this.arrayPass++;
         if (this.arrayRowMode) this.rowArrays.push([this.arrayPass]);
@@ -2697,6 +4212,57 @@ export class RecipeAdapter extends BasePortalAdapter {
       await this.verifyEquipmentSelectsHeld();
     }
     return stop ? { repeat: false, stop } : { repeat: false };
+  }
+
+  /**
+   * #382 — THE LEARNER'S DOOR TO THE ROW LOGIC. A learn walks a FRESH application, which renders
+   * one PV Array row, so it records one row's steps — and before this it left every other roof
+   * plane for a person: live (PacifiCorp NEM, 2026-10-21, arrays of 9 / 5 / 5 / 2) the learner
+   * filled row 1 and never clicked "Add Array"; the owner added rows 2–4 by hand.
+   *
+   * The learner builds a RecipeAdapter on its OWN page from the row steps it just recorded (the
+   * per-array steps; nothing else) and calls this. Rows are then added and filled by the replay's
+   * own code — the same adder (addAnotherArrayRow), the same fill inside the Nth row container
+   * (fillArrayRow), the same row-by-row read-back with its one repair (verifyArrayRowsByRow), the
+   * same merge when the portal refuses a row — so a learn and a replay cannot disagree about what
+   * a row is or what it holds. Rows already on the page count (a learn that re-plans the same page
+   * adds none twice); the read-back proves every row, row 1 included, against ITS array. Nothing
+   * here becomes a recipe step: a replay adds rows 2..N from the project's arrays the same way.
+   * `page` is the learner's own page (a RecipeAdapter built for this has not opened one). Never
+   * throws; `stop` is the read-back's named stop (a row that will not hold its own array).
+   */
+  async fillRemainingArrayRows(page?: unknown): Promise<{ arrays: number; rows: number; stop: string | null; warnings: string[]; stillWrong: string[] }> {
+    if (page && !this.page) this.page = page;
+    const want = this.projectArrayCount();
+    const steps = this.recipe.steps ?? [];
+    const perArray = steps.map((s, i) => ({ s, i })).filter(({ s }) => this.isPerArrayStep(s));
+    const done = async (stop: string | null) => ({
+      arrays: want, rows: await this.countArrayRows().catch(() => 0), stop,
+      warnings: [...this.driftWarnings], stillWrong: [...this.requiredStillEmpty],
+    });
+    if (want < 2 || !perArray.length || !perArray.some(({ s }) => /^array1[A-Z]/.test(String(s.field ?? "")))) return done(null);
+    this.arrayBlockStart = perArray[0].i;
+    this.arrayBlockEnd = perArray[perArray.length - 1].i;
+    try {
+      if (!(await this.useArrayRowMode())) {
+        this.driftWarnings.push(`project has ${want} arrays but no PV Array row could be counted on this page — rows 2..${want} were not added`);
+        return done(null);
+      }
+      // THE ROWS ALREADY THERE ARE ROWS: start the add from the page's own count.
+      const onPage = Math.min(await this.countArrayRows(), want);
+      for (let r = 2; r <= onPage; r++) this.rowArrays.push([r]);
+      this.arrayPass = Math.max(1, onPage);
+      for (let guard = 0; guard <= want; guard++) {
+        const next = await this.afterArrayBlock();
+        if (next.stop) return done(next.stop);
+        if (!next.repeat) break;
+        await this.fillArrayRow(this.arrayPass);
+      }
+      return done(null);
+    } catch (err) {
+      // Rows that were not proven are not "filled": say so as a stop, never as a quiet success.
+      return done(`PV array rows were not completed: ${err instanceof Error ? err.message.slice(0, 160) : String(err).slice(0, 160)}`);
+    }
   }
 
   /** The block's per-array steps in the order a row unlocks itself: Qty, then the module
@@ -3154,6 +4720,55 @@ export class RecipeAdapter extends BasePortalAdapter {
       }
       return rows;
     }).catch(() => []) as Array<Array<{ label: string; tag: string; value: string; placeholder: boolean }>>;
+  }
+
+  /** #524 — the submitting company's name, for a stop's message. */
+  private filerCompanyName(): string {
+    return String(this.fieldValues.installerCompanyName ?? "").replace(/\s+/g, " ").trim();
+  }
+
+  /** #524 — record WHO IS FILING's stop (sticky for the run) and throw it. */
+  private stopOnFilerIdentity(step: RecipeStep, why: string, err?: unknown): never {
+    const field = String(step.field ?? "");
+    const msg = err instanceof FilerIdentityStop ? err.message : filerIdentityStopMessage({
+      field, control: this.stepLabel(step) || String(step.note ?? ""), company: this.filerCompanyName(),
+      code: field === "installerCompanyName" ? undefined : String(this.fieldValues[field] ?? ""), why,
+    });
+    this.filerIdentityStop = msg;
+    if (!this.driftWarnings.includes(`STOPPED: ${msg}`)) this.driftWarnings.push(`STOPPED: ${msg}`);
+    const name = String(step.note ?? step.field ?? step.action).slice(0, 60);
+    if (!this.fieldsUnverified.includes(name)) this.fieldsUnverified.push(name);
+    throw err instanceof FilerIdentityStop ? err : new FilerIdentityStop(msg, field);
+  }
+
+  /** #524 — A SELECT THAT NAMES WHO IS FILING: this client's option (exact, else the one folded-equal
+   *  name; a contact code exactly), committed the way every replayed select is, then read back after
+   *  the autosave settled. Any miss stops the run (stopOnFilerIdentity). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async selectFilerIdentityStep(step: RecipeStep, scoped: any, v: string): Promise<boolean> {
+    const field = String(step.field ?? "");
+    const input = { field, value: v, control: this.stepLabel(step) || String(step.note ?? ""), company: this.filerCompanyName() };
+    let hit;
+    try {
+      hit = await selectFilerIdentity(scoped, input);
+    } catch (err) {
+      return this.stopOnFilerIdentity(step, `the list could not be read or set (${err instanceof Error ? err.message.slice(0, 120) : String(err)})`, err);
+    }
+    // COMMIT (native: focus, then blur + settle — see the generic select's commit) and wait out the
+    // autosave, then read it back: a re-render that put another company back is a stop, not a retry.
+    if (typeof scoped?.focus === "function") await scoped.focus({ timeout: 2000 }).catch(() => null);
+    await this.commitAndSettle(scoped);
+    await this.waitForAutosaveCommitted();
+    try {
+      await assertFilerIdentityHeld(scoped, hit, input);
+    } catch (err) {
+      return this.stopOnFilerIdentity(step, "the list did not keep the client's option", err);
+    }
+    if (hit.label !== v) this.agingNotes.push(`${input.control || field}: "${v}" matched the list's "${hit.label}" (same name, case/punctuation folded)`);
+    const name = String(step.note ?? step.field ?? step.action).slice(0, 60);
+    if (!this.fieldsVerified.includes(name)) this.fieldsVerified.push(name);
+    this.writtenTarget = scoped;
+    return true;
   }
 
   /** The label a recorded step would resolve by — its selector's, or the first fallback's. */
@@ -3714,7 +5329,10 @@ export class RecipeAdapter extends BasePortalAdapter {
     // which it was, between the declaration commit and this one: isBatteryDeclaration said
     // "declaration" for every check step and skipForNoBattery then executed it.
     if (kind === "declaration") return step.action === "check";
-    return true; // a spec of a battery that does not exist
+    // A spec of a battery that does not exist — and an ATTESTATION about one (#536: "The battery
+    // system will not backfeed into the grid" is never ticked for a battery that is not there; on
+    // such a job the portal does not render it, so a recorded tick skips rather than fails).
+    return true;
   }
 
   // A SLOT THAT ONLY EXISTS AT REPLAY CAN ONLY BE FILLED AT REPLAY.
@@ -3834,6 +5452,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       // basename carries the on-disk UUID prefix into what the portal reviewer sees.
       const payload = this.stageUpload(uploadPayloadFor(file, pdf));
       this.options.beforeUpload?.(hit.docType, file);
+      await this.noteUnrecordedWriteAt("data", `upload: ${label}`, loc);
       // A REFUSED ATTACH IS REPORTED, NEVER SWALLOWED. This was `.catch(() => false)` and a
       // bare continue: a document Playwright refused (a 50MB+ buffer did, every time) was
       // simply not attached, with no warning — a missing document nobody was told about.
@@ -4051,8 +5670,60 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  review lockdown's live reading let it through. Its filing/payment rules and the run's own
    *  review lock (set at stopForReview) are untouched. Clicks, presses and gotos get no window. */
   private async executeStep(step: RecipeStep, pastReview: boolean): Promise<boolean> {
-    if (!RecipeAdapter.WRITE_ACTIONS.has(step.action) || !this.backstop) return this.executeStepInner(step, pastReview);
-    return withOwnWriteWindow(this.page, `recorded ${step.action}${step.note ? ` (${String(step.note).slice(0, 50)})` : ""}`, () => this.executeStepInner(step, pastReview));
+    if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (step ${String(step.note || step.action)})`);
+    if (this.filerIdentityStop) throw new FilerIdentityStop(this.filerIdentityStop, String(step.field ?? ""));
+    // Which view each recorded write ran in (#362: a re-assert from another page is a pick).
+    if (RecipeAdapter.WRITE_ACTIONS.has(step.action) && !this.inPolicyRetry) {
+      const idx = this.recipe.steps.indexOf(step);
+      if (idx >= 0) {
+        const view = await this.observeView();
+        this.recordedStepView.set(idx, { doc: await this.docToken(), view, path: this.lastView?.path ?? "", ctl: recordedControlCss(step) });
+      }
+    }
+    if (!RecipeAdapter.WRITE_ACTIONS.has(step.action)) return this.executeStepInner(step, pastReview);
+    this.writtenTarget = null;
+    const done = !this.backstop ? await this.executeStepInner(step, pastReview)
+      : await withOwnWriteWindow(this.page, `recorded ${step.action}${step.note ? ` (${String(step.note).slice(0, 50)})` : ""}`, () => this.executeStepInner(step, pastReview));
+    const written = this.writtenTarget;
+    this.writtenTarget = null;
+    if (done && !this.inPolicyRetry) await this.recordingOverwrotePick(written);
+    return done;
+  }
+
+  /** A PICK THE RECORDING THEN ANSWERS IS NO LONGER A PICK (#362). The mid-page gap-fill can answer
+   *  a control a later recorded step fills with its own value; once that step has landed, the
+   *  answer on that control is the recording's. Read from the element the step ACTUALLY wrote
+   *  (Helm review of 381204a, A3) — never the control its selector names now (a re-anchored step
+   *  wrote another one) — and nothing when it wrote nothing (a no-battery skip, a fee tier, not
+   *  offered). In this document only. A radio clears its group (by name); a checkbox only itself
+   *  (its id, or its name and option); any other control its id, or its name when the pick had no
+   *  id. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async recordingOverwrotePick(written: any): Promise<void> {
+    if (!written || typeof written.evaluate !== "function") return;
+    if (!this.unrecordedWrites.some((w) => w.kind === "pick" && (w.id || w.name))) return;
+    const target = typeof written.first === "function" ? written.first() : written;
+    const ctl = await target.evaluate((el: Element, attr: string) => {
+      const ty = ((el as HTMLInputElement).type || "").toLowerCase();
+      const name = el.getAttribute("name") || "";
+      if (ty === "radio" && name) for (const m of Array.from(document.getElementsByName(name))) m.removeAttribute(attr);
+      el.removeAttribute(attr);
+      const lbl = Array.from((el as HTMLInputElement).labels ?? []).map((l) => (l.textContent || "").replace(/\s+/g, " ").trim()).find(Boolean) || "";
+      return { id: el.getAttribute("id") || "", name, type: ty, label: lbl };
+    }, UNRECORDED_WRITE_ATTR, { timeout: 1500 }).catch(() => null) as { id: string; name: string; type: string; label: string } | null;
+    if (!ctl) return;
+    const doc = await this.docToken();
+    const norm = (t: string): string => t.replace(/\s+/g, " ").trim().toLowerCase();
+    const hit = (w: (typeof this.unrecordedWrites)[number]): boolean => {
+      if (w.kind !== "pick") return false;
+      if (!(w.doc === "*" || doc === "*" || w.doc === doc)) return false;
+      if (ctl.type === "radio") return (!!ctl.id && w.id === ctl.id) || (!!ctl.name && w.name === ctl.name);
+      if (ctl.type === "checkbox") {
+        return (!!ctl.id && w.id === ctl.id) || (!ctl.id && !w.id && !!ctl.name && w.name === ctl.name && !!w.option && norm(w.option) === norm(ctl.label));
+      }
+      return (!!ctl.id && w.id === ctl.id) || (!!ctl.name && w.name === ctl.name && !w.id);
+    };
+    this.unrecordedWrites = this.unrecordedWrites.filter((w) => !hit(w));
   }
   private static readonly WRITE_ACTIONS: ReadonlySet<string> = new Set(["fill", "select", "check", "uncheck", "upload"]);
 
@@ -4094,14 +5765,14 @@ export class RecipeAdapter extends BasePortalAdapter {
         exactCount = await exact.count().catch(() => 0);
       }
       if (exactCount === 1) {
-        await exact.first().check({ timeout: 10000 });
+        await withAutomationInput(this.page, () => exact.first().check({ timeout: 10000 }));
         this.driftWarnings.push(`record type "${wanted}" selected by label (positional fallback refused)`);
         return true;
       }
       const loose = this.page.getByRole("checkbox", { name: wanted, exact: false });
       const looseCount = exactCount > 1 ? exactCount : await loose.count().catch(() => 0);
       if (looseCount === 1) {
-        await loose.first().check({ timeout: 10000 });
+        await withAutomationInput(this.page, () => loose.first().check({ timeout: 10000 }));
         this.driftWarnings.push(`record type "${wanted}" selected by label (positional fallback refused)`);
         return true;
       }
@@ -4183,7 +5854,9 @@ export class RecipeAdapter extends BasePortalAdapter {
     // "Model" selects differ only by "Inverter Clone System" versus "PV ArrayDelete Array",
     // and that string has been sitting in every such step's fingerprint since the day it was
     // learned. Consulted last, because a working selector needs no rescue.
-    if (!isToggle && await this.looksOutOfReach(scoped)) {
+    // A PINNED RE-ASSERT (#362) writes the one element it checked, or nothing: no rescue.
+    const pinned = isPinnedReassert(step);
+    if (!pinned && !isToggle && await this.looksOutOfReach(scoped)) {
       // THE PORTAL'S OWN NAME FOR THE CONTROL FIRST. A test hook is stable across renders and
       // says which side it belongs to; a recorded id is neither.
       // A RESCUE THAT HANDS BACK AN UNUSABLE CONTROL IS NOT A RESCUE.
@@ -4248,7 +5921,7 @@ export class RecipeAdapter extends BasePortalAdapter {
     // filed the RIGHT ANSWER IN THE WRONG BOX on a live interconnection application, with
     // nothing reported. So confirm the control's own label still agrees with what was
     // recorded before touching it, and re-anchor by label when it does not.
-    if (IDENTITY_CHECKED.has(step.action)) {
+    if (IDENTITY_CHECKED.has(step.action) && !pinned) {
       const anchored = await this.reanchorIfWrongControl(step, scoped);
       if (anchored === "abort") return false;
       if (anchored) scoped = anchored;
@@ -4325,8 +5998,8 @@ export class RecipeAdapter extends BasePortalAdapter {
         if (maskedStep) {
           if (typeof scoped!.focus === "function") await scoped!.focus().catch(() => null);
           await scoped!.fill("").catch(() => null);
-          if (typeof scoped!.pressSequentially === "function") await scoped!.pressSequentially(v, { delay: 35 }).catch(() => null);
-          else if (typeof scoped!.type === "function") await scoped!.type(v, { delay: 35 }).catch(() => null);
+          if (typeof scoped!.pressSequentially === "function") await withAutomationInput(this.page, () => scoped!.pressSequentially!(v, { delay: 35 })).catch(() => null);
+          else if (typeof scoped!.type === "function") await withAutomationInput(this.page, () => scoped!.type!(v, { delay: 35 })).catch(() => null);
           else await scoped!.fill(v, { timeout: FILL_TIMEOUT_MS });
         } else {
           // BOUNDED. Replay does NOT go through the learner's applyFill, so the visibility
@@ -4379,7 +6052,7 @@ export class RecipeAdapter extends BasePortalAdapter {
           if (maskedStep && typeof scoped!.pressSequentially === "function") {
             if (typeof scoped!.focus === "function") await scoped!.focus().catch(() => null);
             await scoped!.fill("").catch(() => null);
-            await scoped!.pressSequentially(v, { delay: 35 }).catch(() => null);
+            await withAutomationInput(this.page, () => scoped!.pressSequentially!(v, { delay: 35 })).catch(() => null);
           } else {
             await scoped!.fill(v, { timeout: FILL_TIMEOUT_MS }).catch(() => null);
           }
@@ -4397,10 +6070,30 @@ export class RecipeAdapter extends BasePortalAdapter {
           // The retry held: verified after all.
           if (!this.fieldsVerified.includes(fieldName)) this.fieldsVerified.push(fieldName);
         }
+        this.writtenTarget = scoped;
         return true;
       }
       case "select": {
+        // WHO IS FILING (#524): a select bound to the submitting company or its contact code — or a
+        // step on the INSTALLER'S company list that recorded a literal: the company the recipe was
+        // learned on, which on a shared account is another client. That one takes THIS client's name.
+        const companyList = !isFilerIdentityField(step.field) && filerIdentityFieldForSelect(this.stepLabel(step) || step.note, "") === "installerCompanyName";
+        const literalCompany = companyList && !step.field;
+        if (literalCompany && String(step.value ?? "").trim()) {
+          this.agingNotes.push(`"${this.stepLabel(step) || "Installer Company"}": the recorded company "${String(step.value).slice(0, 40)}" is the learn's — this client's own name is used instead`);
+        }
+        if (companyList) step = { ...step, field: "installerCompanyName", ...(literalCompany ? { value: undefined } : {}) };
         const v = this.resolveValue(step);
+        const filerIdentity = isFilerIdentityField(step.field);
+        if (!v && filerIdentity) {
+          // No company is never "skip": the list would keep whatever the portal shows. No contact
+          // code is a skip only while the list shows nothing chosen.
+          const shown = String(step.field) === "installerCompanyName" ? null : await readNativeSelect(scoped).catch(() => null);
+          if (String(step.field) !== "installerCompanyName" && (!shown || isUnansweredOption(shown.selected))) { this.noteUnresolved(step); return false; }
+          return this.stopOnFilerIdentity(step, String(step.field) === "installerCompanyName"
+            ? "no submitting company on the project"
+            : `no contact code on file for this client, and the list shows "${shown?.selected?.label ?? ""}"`);
+        }
         if (!v) { this.noteUnresolved(step); return false; }
         // TWO "Manufacturer" SELECTS, ONE LABEL — THE FIELD NAME CARRIES THE SIDE.
         //
@@ -4441,6 +6134,9 @@ export class RecipeAdapter extends BasePortalAdapter {
           }
         }
         await waitForElement(scoped);
+        // WHO IS FILING (#524): never the contains match, the model rules, a certified alias or a
+        // label re-resolve — this client's option exactly once, read back after the commit, or stop.
+        if (filerIdentity) return this.selectFilerIdentityStep(step, scoped, v);
         // Native <select> first; fall back to the custom-combobox interaction for styled
         // div dropdowns (PowerClerk "Please select...", select2, ExtJS) selectOption can't drive.
         // MODEL FIRST — before the generic select. selectWithFallback matches "exact, then
@@ -4453,6 +6149,10 @@ export class RecipeAdapter extends BasePortalAdapter {
         /** The exact value the select landed as (a model listing, a certified alias) — what the
          *  read-back compares against. */
         let landedAs = v;
+        /** A concealed backing input's key and face BEFORE the pick, so the read-back can tell a
+         *  pick that moved the key from a face that changed over a key that did not (#327). */
+        let backingBefore = await this.backingSnapshot(scoped);
+        this.selectPick = { text: "" };
         // The page-side model rules can only read a NATIVE <select>. PowerClerk renders a
         // Vue combobox <input> on its spec pages, which exposes no <option> elements — and
         // treating "cannot read this control" as "no match" made the guard refuse every
@@ -4490,7 +6190,7 @@ export class RecipeAdapter extends BasePortalAdapter {
             await sleep(ADVANCE_SETTLE_MS);
           }
           if (picked) {
-            selected = await selectWithFallback(this.page, scoped, picked);
+            selected = await selectWithFallback(this.page, scoped, picked, this.selectPick);
             if (selected) landedAs = picked;
             if (selected && picked !== v) this.driftWarnings.push(`model "${v}" matched the portal's listing "${picked}"`);
           } else {
@@ -4534,7 +6234,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         // is an EMPTY or placeholder-only list, so gate on that.
         for (let attempt = 0; !selected && attempt < 3 && await this.optionsLookUnloaded(scoped); attempt++) {
           await sleep(800);
-          selected = await selectWithFallback(this.page, scoped, v);
+          selected = await selectWithFallback(this.page, scoped, v, this.selectPick);
           if (selected) this.driftWarnings.push(`select "${String(step.note ?? step.field ?? "")}" needed ${(attempt + 1) * 800}ms for its control to appear (cascade)`);
         }
         // A VOLATILE PRIMARY CAN RESOLVE TO THE WRONG CONTROL MID-RUN. The recorded css id
@@ -4553,6 +6253,7 @@ export class RecipeAdapter extends BasePortalAdapter {
                 (el: Element, cssId: string) => `#${el.getAttribute("id") || ""}` === cssId, step.selector.css,
               ).catch(() => false);
               if (!same) {
+                const reloxBefore = await this.backingSnapshot(relox.first());
                 {
                   const r = await this.trySelect(relox.first(), v, step);
                   selected = r.selected;
@@ -4567,6 +6268,7 @@ export class RecipeAdapter extends BasePortalAdapter {
                 if (selected) {
                   this.driftWarnings.push(`select "${String(step.note ?? step.field ?? "")}" landed via its LABEL fallback — the recorded id resolved to a different control mid-run`);
                   scoped = relox.first();
+                  backingBefore = reloxBefore;
                   isNativeSelect = await this.isNativeSelect(scoped); // the commit path needs the RETRIED widget's type
                 }
               }
@@ -4639,12 +6341,12 @@ export class RecipeAdapter extends BasePortalAdapter {
         // that re-rendered the panel, or a pick that landed on another widget, shows up only
         // here. A mismatch is re-asserted ONCE with the proper commit, then it is a failed step.
         if (selected) {
-          const held = await this.selectionHeld(scoped, landedAs);
+          const held = await this.selectionHeld(scoped, landedAs, backingBefore);
           if (held === false) {
-            const again = await selectWithFallback(this.page, scoped, landedAs).catch(() => false);
+            const again = await selectWithFallback(this.page, scoped, landedAs, this.selectPick).catch(() => false);
             if (again) await this.commitAndSettle(scoped);
             await this.waitForAutosaveCommitted();
-            if ((await this.selectionHeld(scoped, landedAs)) !== true) {
+            if ((await this.selectionHeld(scoped, landedAs, backingBefore)) !== true) {
               this.driftWarnings.push(`FAILED select "${String(step.note ?? step.field ?? "").slice(0, 48)}": the control does not show ${JSON.stringify(landedAs.slice(0, 40))} after commit + settle and one re-assert (re-rendered away, or the pick landed on another control)`);
               selected = false;
             } else {
@@ -4655,6 +6357,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         const selName = String(step.note ?? step.field ?? step.action).slice(0, 60);
         if (selected) { if (!this.fieldsVerified.includes(selName)) this.fieldsVerified.push(selName); }
         else if (!this.fieldsUnverified.includes(selName)) this.fieldsUnverified.push(selName);
+        if (selected) this.writtenTarget = scoped;
         // Propagate the miss: a select that landed NOTHING must not report success.
         return selected;
       }
@@ -4712,7 +6415,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         // the recorded id was unusable) — force must follow !usable alone, or the check
         // waits out its full actionability timeout on an element that can never be visible.
         try {
-          await target!.check({ force: !usable });
+          await withAutomationInput(this.page, () => target!.check({ force: !usable }));
         } catch (err) {
           // "CLICKING THE CHECKBOX DID NOT CHANGE ITS STATE" IS NOT A MISSING CONTROL.
           //
@@ -4738,11 +6441,13 @@ export class RecipeAdapter extends BasePortalAdapter {
         // PacifiCorp recipe was the answer the review lockdown then aborted. Inside this step's
         // own-write window, so the save it waits for is let through.
         await this.waitForAutosaveCommitted();
+        this.writtenTarget = target;
         return true;
       }
       case "uncheck":
         await waitForElement(scoped);
-        await scoped!.uncheck();
+        await withAutomationInput(this.page, () => scoped!.uncheck());
+        this.writtenTarget = scoped;
         return true;
       case "press":
         await waitForElement(scoped);
@@ -4994,6 +6699,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       return;
     }
     this.rowsTypedByDocument.add(commitStep);
+    if (r.status === "chosen" || r.status === "not-taken") await this.noteUnrecordedWrite("data", `attachment Type for the ${doc}`);
     if (r.status === "chosen") {
       this.agingNotes.push(`the recorded attachment row for the ${doc} has no Type step — chose "${r.pick}" by the document from the portal's own list`);
     } else if (r.status === "no-fit") {
@@ -5119,6 +6825,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         continue;
       }
       await this.waitForLoadingMaskClear(`attaching ${label.slice(0, 40)}`);
+      await this.noteUnrecordedWrite("data", `owed document: ${label}`);
       const uploaded = await this.executeStep({ ...row.upload, docType: o.docType, note: `upload ${o.docType}: ${slotLabel}` }, false).catch(() => false);
       if (!uploaded) { fail("the page's file control did not take it"); continue; }
       // THE ROW IS NOW ON THE PAGE, UNSAVED. Anything that stops here leaves it pending, and the NEXT
@@ -5500,6 +7207,8 @@ export class RecipeAdapter extends BasePortalAdapter {
 
   /** Every click in replay. Refused → throws ReplayGuardRefusal (named), nothing clicked. */
   private async guardedClick(target: unknown, why: string, opts?: { timeout?: number; force?: boolean }, flags: { passThrough?: boolean; finalSubmitApproved?: boolean; draftCreatingApproved?: boolean } = {}): Promise<void> {
+    if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (${why})`);
+    if (this.filerIdentityStop) throw new FilerIdentityStop(this.filerIdentityStop, "");
     const reason = await this.guardAction({ kind: "click", target, why, ...flags });
     if (reason) throw new ReplayGuardRefusal(reason);
     // THE APPROVED FINAL SUBMIT (and its confirm dialog) is the one click whose FILING request
@@ -5511,11 +7220,22 @@ export class RecipeAdapter extends BasePortalAdapter {
     // portal's "submit" endpoint too (the backstop's filing-URL rule would abort it otherwise), and
     // it is checked after the click by the page it produced, not by its URL.
     if (flags.finalSubmitApproved || flags.draftCreatingApproved) this.backstop?.allowApprovedFiling(20_000, { page: this.page });
-    await (target as { click: (o?: unknown) => Promise<void> }).click(opts);
+    // #333 — THE FENCE: the run's own click is never recorded as a person's input.
+    await withAutomationInput(this.inputPageOf(target), () => (target as { click: (o?: unknown) => Promise<void> }).click(opts));
+  }
+
+  /** The page a target acts on (a locator in a popup acts on the popup), else the run's page. */
+  private inputPageOf(target: unknown): unknown {
+    try {
+      const p = target && typeof (target as { page?: unknown }).page === "function" ? (target as { page: () => unknown }).page() : null;
+      return p && typeof p === "object" ? p : this.page;
+    } catch { return this.page; }
   }
 
   /** Every key press in replay. Enter/Space are clicks on the focused control. */
   private async guardedPress(target: unknown, key: string, why: string): Promise<void> {
+    if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (${why})`);
+    if (this.filerIdentityStop) throw new FilerIdentityStop(this.filerIdentityStop, "");
     const focused = /^(enter|numpadenter|space| )$/i.test(key) && this.page && typeof this.page.locator === "function"
       ? (target && typeof (target as { evaluate?: unknown }).evaluate === "function" ? target : this.page.locator(":focus"))
       : target;
@@ -5528,11 +7248,11 @@ export class RecipeAdapter extends BasePortalAdapter {
       const ctx = await this.pageSafetyContext();
       if (ctx.reviewPage === true || (ctx.readOnlyPage === true && !!ctx.filingControl)) {
         await withBackstopWindow(this.page, "enter-window", `${why} on a ${ctx.reviewPage ? "review" : "read-only terminal"} page`,
-          () => (target as { press: (k: string) => Promise<void> }).press(key));
+          () => withAutomationInput(this.inputPageOf(target), () => (target as { press: (k: string) => Promise<void> }).press(key)));
         return;
       }
     }
-    await (target as { press: (k: string) => Promise<void> }).press(key);
+    await withAutomationInput(this.inputPageOf(target), () => (target as { press: (k: string) => Promise<void> }).press(key));
   }
 
   /** The overlay dismisser, with every click it makes routed through guardAction. It was the one
@@ -5632,6 +7352,24 @@ export class RecipeAdapter extends BasePortalAdapter {
     await this.reassertBlanksOnce(false).catch(() => [] as string[]);
     await this.runGapFill(this.page).catch(() => null);
     this.gapFilledPage = await this.pageIdentity().catch(() => "");
+    // NOT THE PAGE THE STAMP SAW (#362, owner rulings 2026-10-17 "Stop for me" and 2026-10-18 "Data
+    // is enough"). The stamp vouches that the recorded steps replayed unchanged. An extra answer
+    // straight from this project's data goes ahead; an answer automation PICKED with no project data
+    // behind it (a gap-fill choice with no bound field, another page's recorded value re-asserted
+    // here — see unrecordedWrites) still in front of the click stops the run here like a review
+    // stop: the answers stay on the page for a person to check, the stamp is kept, and nothing is
+    // clicked. Never an incident.
+    const inFront = await this.unrecordedPicksInFront();
+    if (inFront.length) {
+      const shown = inFront.slice(0, 6).join(", ");
+      const more = inFront.length > 6 ? ` and ${inFront.length - 6} more` : "";
+      // THE PERSON IS TOLD, not only the run log: the stop message LEADS with it (the run card reads
+      // its first line, cut short), and reviewHandoffNotes carries the full list.
+      this.draftPickTell = draftPickStopTell(stamp.label, inFront);
+      const tell = `AUTOMATION PICKED ANSWERS WITH NO PROJECT DATA BEHIND THEM before "${stamp.label.slice(0, 40)}" (${shown}${more}): it did NOT click it — check those answers, then click it yourself.`;
+      if (!this.reviewHandoffNotes.includes(tell)) this.reviewHandoffNotes.push(tell);
+      return { kind: "refused", refusals: [`automation picked ${inFront.length} answer(s) with no project data behind them, which the recorded steps never fill (${shown}${more}) — a person checks them and clicks Submit`] };
+    }
     const empty = await this.emptyRequiredControls().catch(() => [] as string[]);
     if (empty.length) return { kind: "refused", refusals: [`required field(s) still empty on the page: ${empty.slice(0, 4).join(", ")}`] };
     const before = await detectChallengeFrame(this.page).catch(() => null);
@@ -5989,12 +7727,25 @@ export class RecipeAdapter extends BasePortalAdapter {
     // Values too, not just identity — so a click that computed a total can prove it did.
     const beforeEffect = await this.pageEffect();
 
+    // A "compute totals" click (Calculate) is done when the RESULT is on the page, not when the click
+    // returns (issue #352): PacifiCorp renders its required AC disconnect section from the computed
+    // rating, and the advance that followed at once swept the page with Calculate still spinning.
+    // The probe goes in before the click so the request it starts is counted.
+    const computing = isComputeTotalsStep(step);
+    if (computing) await prepareComputeSettle(this.page);
     await waitForElement(scoped);
     await this.guardedClick(scoped, `recipe click${step.note ? ` (${String(step.note).slice(0, 50)})` : ""}`);
     // A recorded Next/Continue advances a Vue wizard to a not-yet-bound section. Wait for an
     // interactive control to mount before the next fill so we never type onto an unmounted page
     // (best-effort; never skips — the retry/reload loop still recovers a genuine miss).
     await waitForInteractiveControls(this.page);
+    if (computing) {
+      // Before the effect comparison below, so "did the click do anything" reads the computed page.
+      const computed = await this.timed("compute-settle", () => waitForComputeSettled(this.page));
+      if (!computed.settled) {
+        this.driftWarnings.push(`"${String(step.note ?? "Calculate").slice(0, 44)}": the page still showed it was computing after ${Math.round(computed.waitedMs / 1000)}s (${computed.reason.slice(0, 120)}) — went on; check the totals and any section they reveal before submit`);
+      }
+    }
     await this.assertAdvanced(step, beforeUrl, beforeFp, beforeEffect);
     return true;
   }
@@ -6246,6 +7997,16 @@ export class RecipeAdapter extends BasePortalAdapter {
    * benefit. `inverterModel` becomes ["inverter","model"], which matches
    * `inverter-model-select` and cannot match `pv-array-model-select`. Every token must
    * appear, so a partial overlap never wins.
+   *
+   * THE RECORDED SECTION OUTRANKS THE SHORTEST HOOK (#380). Tokens say which side, not which
+   * block: an "Existing Inverter" fieldset's `existing-inverter-model-select` carries every token
+   * of `inverterModel` too, and when the real inverter Model has no hook of its own it was the
+   * only hit, so it won. On a new form instance the recorded id is gone, nothing redirects the
+   * write, and the existing system's Model was filled and reported verified. So among the hits,
+   * one in exactly the recorded section wins, then one whose section overlaps it, then one whose
+   * section cannot be read; a hit under a heading that shares nothing with the recorded section
+   * is not the recorded control and is never returned, which leaves the step to the section
+   * rescue. The section is read with resolveBySection's algorithm, which is the learner's.
    */
   private async resolveByTestHook(step: RecipeStep): Promise<unknown | null> {
     if (!this.page || typeof this.page.evaluate !== "function") return null;
@@ -6258,9 +8019,39 @@ export class RecipeAdapter extends BasePortalAdapter {
       .map((t) => (t === "module" ? "array" : t === "pv" ? "array" : t))
       .filter((t) => t.length > 2 && !["the", "certified", "make"].includes(t));
     if (tokens.length < 2) return null;
-    const found = await this.page.evaluate((toks: string[]) => {
+    const want = String(step.fingerprint?.section ?? "").trim();
+    const found = await this.page.evaluate((arg: { toks: string[]; want: string }) => {
+      const toks = arg.toks;
+      const clean = (t: string | null | undefined): string => (t || "").replace(/\s+/g, " ").trim().slice(0, 80);
+      const norm = (t: string): string => clean(t).toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      // resolveBySection's sectionOf, verbatim: a section read differently never matches.
+      const sectionOf = (el: Element): string => {
+        const fs = el.closest("fieldset");
+        const legend = fs ? fs.querySelector("legend") : null;
+        if (legend && clean(legend.textContent)) return clean(legend.textContent);
+        const container = el.closest('section, [class*="panel"], [class*="card"], [class*="section"], [class*="form-section"], [class*="block"], [role="group"], [role="region"]');
+        if (container) {
+          const h = container.querySelector('legend, h1, h2, h3, h4, h5, h6, .panel-title, .card-title, .card-header, .section-title, .panel-heading');
+          if (h && clean(h.textContent)) return clean(h.textContent);
+        }
+        let node: Element | null = el;
+        for (let hops = 0; node && hops < 6; hops++) {
+          let sib: Element | null = node.previousElementSibling;
+          while (sib) {
+            if (/^(H[1-6]|LEGEND)$/.test(sib.tagName) && clean(sib.textContent)) return clean(sib.textContent);
+            const inner = sib.querySelector ? sib.querySelector("h1, h2, h3, h4, h5, h6, legend") : null;
+            if (inner && clean(inner.textContent)) return clean(inner.textContent);
+            sib = sib.previousElementSibling;
+          }
+          node = node.parentElement;
+        }
+        return "";
+      };
+      const wantS = norm(arg.want);
       let best: HTMLElement | null = null;
+      let bestTier = -1;
       let bestLen = Infinity;
+      let outside = "";
       for (const el of Array.from(document.querySelectorAll("[data-test-role], [data-testid], [data-test-id]")) as HTMLElement[]) {
         const hook = (el.getAttribute("data-test-role") || el.getAttribute("data-testid") || el.getAttribute("data-test-id") || "")
           .toLowerCase().replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[^a-z]+/g, " ");
@@ -6269,14 +8060,26 @@ export class RecipeAdapter extends BasePortalAdapter {
         // The control itself, or the nearest one this hook wraps.
         const ctl = (el.matches("input, select, textarea") ? el : el.querySelector("input, select, textarea")) as HTMLElement | null;
         if (!ctl) continue;
-        if (hook.length < bestLen) { bestLen = hook.length; best = ctl; }
+        // 3 exact section, 2 overlapping, 1 unreadable (or no section recorded); another section: never.
+        let tier = 1;
+        if (wantS) {
+          const sec = norm(sectionOf(ctl));
+          if (sec === wantS) tier = 3;
+          else if (sec && (sec.includes(wantS) || wantS.includes(sec))) tier = 2;
+          else if (sec) { outside = outside || sectionOf(ctl); continue; }
+        }
+        if (tier > bestTier || (tier === bestTier && hook.length < bestLen)) { bestTier = tier; bestLen = hook.length; best = ctl; }
       }
-      if (!best) return "";
       document.querySelectorAll("[data-rc-hook-hit]").forEach((e) => e.removeAttribute("data-rc-hook-hit"));
+      if (!best) return outside ? `\u0000${outside}` : "";
       best.setAttribute("data-rc-hook-hit", "1");
       return best.closest("[data-test-role], [data-testid], [data-test-id]")?.getAttribute("data-test-role")
         || best.getAttribute("data-test-role") || "hook";
-    }, tokens).catch(() => "") as string;
+    }, { toks: tokens, want }).catch(() => "") as string;
+    if (found.startsWith("\u0000")) {
+      this.resolveTrail.push(`  ...rescue: the only test hook naming ${JSON.stringify(field.slice(0, 30))} sits under ${JSON.stringify(found.slice(1, 35))}, not the recorded section ${JSON.stringify(want.slice(0, 34))} — not taken`);
+      return null;
+    }
     if (!found) return null;
     this.agingNotes.push(
       `"${String(step.note ?? field).slice(0, 34)}" resolved by the portal's own test hook ${JSON.stringify(found.slice(0, 40))} — stabler than the recorded id`,
@@ -6352,10 +8155,15 @@ export class RecipeAdapter extends BasePortalAdapter {
         const r = el.getBoundingClientRect();
         const cs = getComputedStyle(el);
         const shown = r.width > 2 && r.height > 2 && cs.visibility !== "hidden" && cs.display !== "none" && Number(cs.opacity) !== 0;
+        // Then an EXACT label beats one that only contains it (#380): a visible "Existing Model"
+        // ahead of the real "Model" in the same panel tied with it here and, being first, won.
+        // Label exactness outranks visibility too, so a concealed exact namesake comes back as
+        // still concealed (the original is kept) rather than handing the write to a neighbour.
         let score = -1;
-        if (sec === wantS) score = 4;
-        else if (sec.includes(wantS) || wantS.includes(sec)) score = 2;
+        if (sec === wantS) score = 8;
+        else if (sec.includes(wantS) || wantS.includes(sec)) score = 4;
         if (score < 0) continue;
+        if (l === wantL) score += 2;
         if (shown) score += 1;
         if (score > bestScore) { bestScore = score; best = el; }
       }
@@ -7054,6 +8862,8 @@ export class RecipeAdapter extends BasePortalAdapter {
       this.feeTierFilled.set(pageKey, chosen.id);
       this.agingNotes.push(`kVA tier read from the page: ${ratingRaw} kVA → "${chosenLabel}" = ${chosen.value}${scheduleTierKey ? " (the stored fee schedule agrees)" : " (no fee schedule needed — the page prints its own bounds)"}`);
       const recorded = readTierLabel(stepLabel);
+      // Not provably the recorded box: an unrecorded write (#362).
+      if (!recorded || !sameFeeTier(recorded, chosen.bounds)) await this.noteUnrecordedWriteAt("data", chosenLabel, loc);
       if (recorded && !sameFeeTier(recorded, chosen.bounds)) {
         this.agingNotes.push(`the recorded box "${stepLabel}" is not this project's tier — "${chosenLabel}" was ticked instead, and the recorded box was left empty`);
       }
@@ -7147,11 +8957,13 @@ export class RecipeAdapter extends BasePortalAdapter {
       const loc = frame.locator(`[id="${b.id}"]`).first();
       if (!want) {
         if (b.tag !== "select" && otherVal && holds(b.kind, b, otherVal)) {
+          await this.noteUnrecordedWrite("data", `contact: ${b.label}`);
           if (await loc.fill("", { timeout: FILL_TIMEOUT_MS }).then(() => true).catch(() => false)) fixed++;
         }
         continue;
       }
       if (holds(b.kind, b, want)) continue;
+      await this.noteUnrecordedWrite("data", `contact: ${b.label}`);
       let ok = false;
       if (b.tag === "select") {
         ok = await loc.selectOption(want).then(() => true).catch(async () => loc.selectOption({ label: want }).then(() => true).catch(() => false));
@@ -7159,7 +8971,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         // Masked boxes validate KEYSTROKES (the learner's typeMasked).
         const typed = b.kind === "zip" ? want.replace(/\D/g, "").slice(0, 5) || want : want;
         await loc.fill("", { timeout: FILL_TIMEOUT_MS }).catch(() => null);
-        ok = await loc.pressSequentially(typed, { delay: 25 }).then(() => true).catch(() => false);
+        ok = await withAutomationInput(this.page, () => loc.pressSequentially(typed, { delay: 25 })).then(() => true).catch(() => false);
       } else {
         ok = await loc.fill(want, { timeout: FILL_TIMEOUT_MS }).then(() => true).catch(() => false);
       }
@@ -7227,6 +9039,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         if (!this.fieldsVerified.includes(label)) this.fieldsVerified.push(label);
         continue;
       }
+      await this.noteUnrecordedWriteAt("data", label, loc);
       const typed = await loc.fill(value, { timeout: FILL_TIMEOUT_MS }).then(() => true).catch(() => false);
       if (typed) await this.commitAndSettle(loc);
       const held = String((await loc.inputValue().catch(() => "")) ?? "").trim();
@@ -7267,6 +9080,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  select). An unloaded or non-native control takes the old path unchanged. */
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private async trySelect(loc: any, value: string, step: RecipeStep): Promise<{ selected: boolean; landedAs: string; how: "" | "meaning" | "known_negative" }> {
+    this.selectPick = { text: "" };
     const native = await this.isNativeSelect(loc);
     if (native && !(await this.optionsLookUnloaded(loc))) {
       // TEXT AND VALUE. selectOption(value) matches the option's VALUE attribute first, and a
@@ -7299,7 +9113,7 @@ export class RecipeAdapter extends BasePortalAdapter {
         return { selected: false, landedAs: value, how: "known_negative" };
       }
     }
-    const selected = await selectWithFallback(this.page, loc, value);
+    const selected = await selectWithFallback(this.page, loc, value, this.selectPick);
     return { selected, landedAs: value, how: "" };
   }
 
@@ -7392,12 +9206,89 @@ export class RecipeAdapter extends BasePortalAdapter {
   /** Does the intended select/combobox show `want`? Reads the SELECTED OPTION (text and value)
    *  of a native select, the value/text of a combobox face. null = could not read (not
    *  evidence either way). */
-  private async selectionHeld(scoped: unknown, want: string): Promise<boolean | null> {
+  private async selectionHeld(scoped: unknown, want: string, before: BackingSnapshot | null = null): Promise<boolean | null> {
     if (!want.trim()) return null;
     const shown = await this.shownBy(scoped);
     if (!shown) return null;
     if (!shown.text.trim() && !shown.value.trim()) return false;
-    return readbackMatches(shown.text, want) || (!!shown.value && readbackMatches(shown.value, want));
+    // A CONCEALED BACKING INPUT'S KEY IS NOT A FRAGMENT OF THE ANSWER. readbackMatches accepts
+    // containment either way, so a key "1" read back for "> 10 kW" matched ("10kw" contains
+    // "1") and a re-render that restored "≤ 10 kW" (key "1") verified (#327 review round 3).
+    // For such an input the value must SHOW the answer (equal, or the answer inside it), with
+    // the symbols kept; a native select or a visible input is judged exactly as before.
+    if (before) {
+      const sw = faceWords(shown.text), ww = faceWords(want);
+      if (sw && ww && (sw === ww || sw.includes(ww)) && readbackMatches(shown.text, want)) return true;
+    } else if (readbackMatches(shown.text, want) || (!!shown.value && readbackMatches(shown.value, want))) return true;
+    // A WIDGET'S BACKING INPUT HOLDS THE OPTION'S KEY, NOT ITS TEXT (#327). Miami's Telerik Job
+    // Category keeps <input id="JobCategoryID" style="display:none"> behind its face: picking
+    // "STAND-ALONE" writes "5" there and "STAND-ALONE" on the face. Since fb9d5d56 added this
+    // read-back, that landed pick was re-asserted, called FAILED and reported skipped
+    // (widgetDropdownReplay.dom.smoke). So for a concealed <input> holding SOME value (the
+    // pick did land in the form) that is not the answer's text, the widget's face decides —
+    // but only as strict evidence, because a face is easy to misread as "held":
+    //   - a placeholder ("Select an option...") is not an answer, whatever it contains;
+    //   - the face must EQUAL the option that was clicked (the answer when the picker reports
+    //     none), not merely overlap it: "Solar" must not confirm "Solar + Storage";
+    //   - it must be THIS input's own face, not the neighbouring widget a mis-aimed click
+    //     opened (comboboxFaceInPage "own");
+    //   - and the key must have MOVED during this step, unless the draft already held the
+    //     answer before the pick: a face that changed over an unchanged key still posts the
+    //     old option.
+    // A native select or a visible input is judged exactly as before.
+    //   - the option clicked must itself be an answer to the step (readbackMatches): a
+    //     trailing-token pass that clicked "Rule 21 - 7 kW or less" for "Schedule 7" is a
+    //     wrong pick, however faithfully the face then shows it;
+    //   - "equal" keeps the symbols that tell options apart: "≤ 10 kW" is not "> 10 kW", nor
+    //     "1/0 AWG" "10 AWG", nor "-5°" "5°" (faceWords, above: case, whitespace, plain
+    //     punctuation, a separating dash and a placeholder's edge dashes are folded; the
+    //     placeholder test is what refuses "-- None --").
+    //   - "moved" and "already held" are read from the input's OWN value, never from what
+    //     shownBy reports (for an empty role=combobox input that is the face's text).
+    //   - A KEY THAT IS THE OPTION'S TEXT (a Telerik-style widget whose face the walk does not
+    //     know), or an input the widget NEVER writes (PowerClerk's filtered select, empty before
+    //     and after) whose own face shows the option clicked, held the pick (#327 round 4): a
+    //     shorter certified name, "Enphase Energy" for "Enphase Energy Inc.", was FAILED there.
+    //   - When the key did NOT move, the face counts only when it sits right beside the input
+    //     (comboboxFaceInPage "adjacent"): a bare Battery key before "Generator [Yes]" in a
+    //     captioned row read the Generator's face as its own.
+    if (!before || !(await this.isConcealedInput(scoped))) return false;
+    const loc = scoped as { evaluate: (fn: unknown, arg?: unknown) => Promise<unknown> };
+    const face = String(await loc.evaluate(comboboxFaceInPage, "own").catch(() => "") ?? "");
+    const clicked = this.selectPick.text;
+    if (clicked && !clickedAnswers(clicked, want)) return false;
+    const key = String(await loc.evaluate((el: Element) => (el as HTMLInputElement).value || "").catch(() => "") ?? "");
+    if (clicked && !FACE_PLACEHOLDER.test(face)) {
+      const picked = faceWords(clicked);
+      if (key.trim() && faceWords(key) === picked) return true;
+      if (!before.key.trim() && !key.trim() && face && faceWords(face) === picked
+        && faceWords(String(await loc.evaluate(comboboxFaceInPage, "adjacent").catch(() => "") ?? "")) === picked) return true;
+    }
+    if (!face || FACE_PLACEHOLDER.test(face)) return false;
+    const target = faceWords(clicked || want);
+    if (!target || faceWords(face) !== target) return false;
+    if (!key.trim()) return false;
+    if (before.key !== key) return true;
+    if (!before.key.trim() || faceWords(before.face) !== target) return false;
+    return faceWords(String(await loc.evaluate(comboboxFaceInPage, "adjacent").catch(() => "") ?? "")) === target;
+  }
+
+  /** A widget's concealed backing <input> (display:none, opacity:0, a 1px sliver, type=hidden)? */
+  private async isConcealedInput(loc: unknown): Promise<boolean> {
+    const l = loc as { evaluate?: (fn: unknown, arg?: unknown) => Promise<unknown> } | null;
+    if (!l || typeof l.evaluate !== "function") return false;
+    if (!(await l.evaluate((el: Element) => el.tagName === "INPUT").catch(() => false))) return false;
+    return !(await this.isTrulyVisible(loc as never).catch(() => true));
+  }
+
+  /** The key a concealed backing input holds and its own face's words, before a pick. null for
+   *  anything else (the read-back's face branch never runs for it). */
+  private async backingSnapshot(loc: unknown): Promise<BackingSnapshot | null> {
+    if (!(await this.isConcealedInput(loc))) return null;
+    const l = loc as { evaluate: (fn: unknown, arg?: unknown) => Promise<unknown> };
+    const key = String(await l.evaluate((el: Element) => (el as HTMLInputElement).value || "").catch(() => "") ?? "");
+    const face = String(await l.evaluate(comboboxFaceInPage, "own").catch(() => "") ?? "");
+    return { key, face };
   }
 
   /** WHAT A CONTROL SHOWS — the one reader for the select held-check and the array-row
@@ -7683,9 +9574,45 @@ export class RecipeAdapter extends BasePortalAdapter {
     for (const name of found.requiredSeen) {
       if (!this.requiredFieldsSeen.includes(name)) this.requiredFieldsSeen.push(name);
     }
-    const held = await this.uploadSlotsHeld(found.empty.map((e) => e.name));
-    if (held.size) return { ...found, empty: found.empty.filter((e) => !held.has(e.name)) };
-    return found;
+    // ONLY A FILE BOX'S OWN BLANK CAN BE A HELD UPLOAD (#327). A radio group is named by the text
+    // of the row that holds it, and a row that also holds the uploaded "Plan set" slot ("Plan set *
+    // [file] Is the system grid-tied? * Yes No") matched that slot's label and read as held: the
+    // unanswered group was discharged and the draft created. uploadSlotsHeld matches names by
+    // containment, so a required "Plan set revision *" text box under the slot, or a text box
+    // captioned exactly "Plan set *", read as held too. So the sweep marks an entry `file` only
+    // when every control under its name is an <input type=file>, and only those are ever asked
+    // about or discharged (a whitelist: an unattributed complaint, a radio row, a checkbox and a
+    // text box never are).
+    const dischargeable = (e: EmptyRequired): boolean => e.file === true;
+    // A RUNNER-UP CAN BE A HELD UPLOAD TOO. A complaint re-attributed from a held "Plan set *" to the
+    // optional "Site photo" beside it, which the run also uploaded, named an attached document as
+    // the blank. So the runner-up names are read back with the rest; a held one falls back to the
+    // unattributed complaint below.
+    const nexts = found.empty.flatMap((e) => (e.handed ?? []).map((h) => h.next)).filter(Boolean);
+    const held = await this.uploadSlotsHeld([...new Set([...found.empty.filter(dischargeable).map((e) => e.name), ...nexts])]);
+    if (!held.size) return found;
+    const discharged = (e: EmptyRequired): boolean => dischargeable(e) && held.has(e.name);
+    // A HELD UPLOAD DISCHARGES ITS OWN EMPTY BOX, NEVER THE PORTAL'S COMPLAINT (#327).
+    //
+    // The read-back proves the FILE is on the portal. It proves nothing about a "This field is
+    // required." the sweep's proximity happened to hand that slot: on the PSE Part 1 page the
+    // complaint under Customer phone went to the held slot ending on its line, was dropped with
+    // the slot, and the draft-creating click went ahead with Customer phone blank. So a
+    // complaint-derived blank on a held slot goes to the next-nearest empty control that is not
+    // itself held, or, with none, is reported as the unattributed complaint it then is. Either
+    // way it stays a blank: a page the portal is refusing is never pass-through. EVERY held
+    // entry's hand-offs, whatever it was reported for: two slots sharing a caption are one entry
+    // (asterisk, from the first), and the complaint the second was handed rides on it.
+    const empty = found.empty.filter((e) => !discharged(e));
+    for (const e of found.empty) {
+      if (!discharged(e)) continue;
+      for (const h of e.handed ?? []) {
+        const toNext = !!h.next && !held.has(h.next);
+        const name = toNext ? h.next : h.unattributed;
+        if (name && !empty.some((k) => k.name === name)) empty.push({ name, why: toNext ? "complaint" : "unattributed-complaint" });
+      }
+    }
+    return { ...found, empty };
   }
 
   private noteUploadPerformed(label: string, file: unknown, docType?: string): void {
@@ -7757,6 +9684,177 @@ export class RecipeAdapter extends BasePortalAdapter {
     return held;
   }
 
+  /** A REQUIRED CONTROL THE RECIPE HAS NO STEP FOR, ANSWERED FROM THIS JOB (issue #352).
+   *
+   *  A recipe records what its learn project triggered. PacifiCorp's AC disconnect section renders
+   *  only when the computed rating requires one, and the live recipe was learned on a 5.4 kW system:
+   *  no step for "Disconnect Switch Manufacturer" *, "Disconnect Switch Model" *, the knife-blade or
+   *  the distance question. A 16 kW job reached review with all four blank and the report clean.
+   *
+   *  Asked when the page is as filled as the recipe will make it — on the advancing click that really
+   *  leaves the page (after the extra-advance guard has decided it is not skipped: an answer given
+   *  before that guard read as "this page was written to" and stood it down), at the review stop and
+   *  at the end of the run. The required sweep (the one predicate for "required and still empty", which
+   *  also records what the portal asked for) names the candidates; the page extraction gives each
+   *  one's control, options and selector; answerForUnrecordedControl (unrecordedControls.ts) is the
+   *  one answer: the AC disconnect part from disconnectMake / disconnectModel, a per-job question
+   *  from the job's own answer (else the operator's standing one), a policy question from the
+   *  learner's own table. Anything else is left to gap-fill and the sweep, as before.
+   *
+   *  Writes go through executeStep as a synthesized step, so commit, read-back and fieldsVerified
+   *  are the same as a recorded step's.
+   *
+   *  THE CONTROL WRITTEN IS THE ELEMENT THE SWEEP FOUND EMPTY, AND ONLY THAT ONE (PR #353 round 3).
+   *  Round 2 re-resolved the sweep's NAME: by id, else by an ordinal among same-label controls — and a
+   *  label resolves through a case-insensitive SUBSTRING match, so with no ids "Disconnect Switch
+   *  Model".nth(1) was the optional "Disconnect Switch Model Notes" box between a filled namesake and
+   *  the empty one. The AC part went into Notes, the required box stayed blank, and the report said
+   *  it was answered. Now the page runs the sweep itself and stamps the one visible, required,
+   *  unanswered control of that name (pinEmptyRequiredControl); the answer is read from THAT
+   *  element's own extraction, whose label must clean to the sweep's name; and the step targets it —
+   *  by its id only when no other element carries the id, else by the stamp. A name the pin cannot
+   *  tie to exactly one element (several empty namesakes, or none found again) is NEVER typed: with a
+   *  value on file it is returned in `missing` with that reason (UNPINNED_CONTROL_WHY), and the run
+   *  stops by name.
+   *
+   *  Never overwrites: the pinned control reads unanswered by the sweep's own predicate
+   *  (controlReadsUnanswered), asked again just before the write. Never drives a concealed control:
+   *  executeStep's rescue for a control that is not truly visible looks for ANOTHER one (a test hook,
+   *  a section) — the very wrong-control write the pin prevents — so a pinned control that is not
+   *  truly visible is left to gap-fill and the sweep, as before #352. A control it knows but this
+   *  job has NO value for is returned in `missing` — the caller stops the run by name; it is never
+   *  typed blank and never guessed. */
+  private async answerUnrecordedRequired(): Promise<{ filled: string[]; missing: MissingRequired[] }> {
+    const out = { filled: [] as string[], missing: [] as MissingRequired[] };
+    if (!this.page || typeof this.page.$$eval !== "function" || typeof this.page.evaluate !== "function") return out;
+    const swept = await this.sweepRequired().catch(() => null);
+    if (!swept || !swept.empty.length) return out;
+    // The sweep's own cleaning (requiredControlSweep's cleanName): a name here IS a name from its list.
+    const clean = (s: string): string => String(s || "").replace(/\s*\*\s*$/, "").replace(/\s+/g, " ").trim().slice(0, 70);
+    let raws: unknown[] = [];
+    try { raws = (await this.page.$$eval(EXTRACT_SEL, extractFieldsInPage)) as unknown[]; } catch { return out; }
+    if (!Array.isArray(raws)) return out;
+    const scope = policyScopeFor(this.recipe.scopeType);
+    type Raw = Parameters<typeof toExtractedField>[0];
+    const fields = (raws as Raw[]).map(toExtractedField);
+    // ONE ANSWER PER NAME PER PASS: the sweep lists each empty name once.
+    const seen = new Set<string>();
+    let stamped = false;
+    try {
+      for (const e of swept.empty) {
+        const name = clean(e.name);
+        if (!name || seen.has(name) || isPayFee(name)) continue;
+        seen.add(name);
+        // A CONTROL THIS MODULE KNOWS? Asked of the extracted controls carrying the name, before
+        // anything is touched — a name none of them answers stays gap-fill's and the sweep's.
+        const known = fields.filter((f) => clean(f.label) === name)
+          .map((f) => answerForUnrecordedControl(f, this.fieldValues, scope))
+          .find((a) => a !== null) ?? null;
+        if (!known) continue;
+        // PIN THE ELEMENT THE SWEEP FOUND EMPTY, then read the answer from THAT element.
+        const token = `u${++this.unrecordedPinSeq}`;
+        const count = await pinEmptyRequiredControl(this.page, name, token).catch(() => 0);
+        stamped = true;
+        const pinnedSel = `[${PINNED_CONTROL_ATTR}="${token}"]`;
+        let raw: Raw | null = null;
+        if (count === 1) {
+          const one = await this.page.$$eval(pinnedSel, extractFieldsInPage).catch(() => null) as Raw[] | null;
+          if (Array.isArray(one) && one.length === 1) raw = one[0];
+        }
+        const f = raw ? toExtractedField(raw) : null;
+        if (!f || clean(f.label) !== name) {
+          // NOT PINNED TO ONE ELEMENT: never typed. With a value on file the stop gives the replay's
+          // own reason; with none, the ordinary missing value.
+          const hasValue = known.kind !== "unbound" && !!known.value;
+          out.missing.push({ label: name, key: known.kind === "bound" ? known.key : null, ...(hasValue ? { why: UNPINNED_CONTROL_WHY } : {}) });
+          continue;
+        }
+        if (isPayFee(f.label)) continue;
+        const ans = answerForUnrecordedControl(f, this.fieldValues, scope);
+        if (!ans) continue; // the pinned control itself is not one this module answers
+        // NO VALUE TO GIVE IT (a disconnect part no project key answers, or a bound key this project
+        // has nothing for): named, never typed.
+        if (ans.kind === "unbound" || !ans.value) {
+          out.missing.push({ label: f.label, key: ans.kind === "bound" ? ans.key : null });
+          continue;
+        }
+        // THIS element: by its id only when the id is on no other element (an id survives a
+        // re-render, a stamp does not), else by the stamp.
+        const rawId = String(raw?.id ?? "");
+        const idSel = rawId ? `[id=${JSON.stringify(rawId)}]` : "";
+        const idUnique = !!idSel && (await this.page.locator(idSel).count().catch(() => 0)) === 1;
+        const selector: RecipeSelector = { css: idUnique ? idSel : pinnedSel };
+        const control = this.page.locator(selector.css as string).first();
+        // NOT A CONCEALED CONTROL (executeStep's rescues would look for another one).
+        if (!(await this.isTrulyVisible(control))) continue;
+        // NEVER OVER A VALUE: the sweep's own reading (controlReadsUnanswered — a "-- Select --" with a
+        // value attribute is unanswered to both), asked of this control now.
+        const empty = await control.evaluate(controlReadsUnanswered).catch(() => null);
+        if (empty !== true) continue;
+        const step = {
+          action: f.fieldType === "select" || (f.fieldType === "other" && (f.options?.length ?? 0) > 0) ? "select" : "fill",
+          phase: "fill",
+          selector,
+          note: f.label.replace(/\s+/g, " ").trim().slice(0, 120),
+          ...(ans.kind === "bound" ? { field: ans.key } : { value: ans.value }),
+        } as RecipeStep;
+        const shown = f.label.replace(/\s+/g, " ").trim().slice(0, 60);
+        // NOTED AS DATA, ON EVERY ATTEMPT (Helm review of PR #353, item 1, under the owner's
+        // 2026-10-18 "Data is enough" as #373 built it): a bound answer is this project's value, a
+        // standing / policy answer is the operator's own standing data — never an AI's pick, so it
+        // never stops the stamped draft click, and it is on the run's record of what automation wrote
+        // that no recorded step wrote. Noted BEFORE the write: a write that fails part-way may still
+        // have landed.
+        await this.noteUnrecordedWrite("data", ans.kind === "bound" ? `${ans.key}: ${shown}` : `standing answer: ${shown}`,
+          { id: rawId, name: String(raw?.name ?? ""), question: f.label });
+        const done = await this.executeStep(step, false).catch(() => false);
+        if (done) {
+          out.filled.push(shown);
+          if (!this.unrecordedAnswered.includes(shown)) this.unrecordedAnswered.push(shown);
+          // The value landed and was read back; only the RECIPE is aging (it has no step for this).
+          this.agingNotes.push(`answered "${shown}" from ${ans.kind === "bound" ? ans.key : ans.why} — a required control the recipe has no step for`);
+        } else {
+          this.driftWarnings.push(`"${shown}" is required and the recipe has no step for it; ${ans.kind === "bound" ? ans.key : "the standing answer"} could not be entered — enter it by hand before submit`);
+        }
+      }
+    } finally {
+      // The stamp is ours: take it off the portal's page once the pass is done.
+      if (stamped) {
+        await this.page.evaluate((attr: string) => {
+          document.querySelectorAll(`[${attr}]`).forEach((el) => el.removeAttribute(attr));
+        }, PINNED_CONTROL_ATTR).catch(() => null);
+      }
+    }
+    return out;
+  }
+
+  /** The required controls answerUnrecordedRequired knows but this job has no value for: named in
+   *  the report, photographed, and the run STOPS here — before the click that would leave the page,
+   *  or before review. The words say "no value was supplied", which the backend's failure classifier
+   *  reads as the project's data (never the recipe's drift), so the recipe is neither demoted nor
+   *  flagged for it. */
+  private async stopForMissingRequired(
+    missing: MissingRequired[],
+    before: string,
+    data: Record<string, unknown>,
+  ): Promise<PortalStepResult> {
+    const where = await this.pageLabelNow().catch(() => "");
+    for (const m of missing) {
+      const shown = m.label.replace(/\s+/g, " ").trim().slice(0, 70);
+      const named = where ? `${shown} [${where}]` : shown;
+      if (!this.requiredStillEmpty.includes(named)) this.requiredStillEmpty.push(named);
+    }
+    await this.capturePageShot("REQUIRED-NO-VALUE", true).catch(() => null);
+    return {
+      ...fail(missingRequiredStopMessage(before, missing), {
+        ...data, needsHuman: true, requiredStillEmpty: this.requiredStillEmpty, unrecordedAnswered: this.unrecordedAnswered,
+        requiredFieldsSeen: this.requiredFieldsSeen, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified,
+        pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath,
+      }),
+      pauseReason: "required_value_missing",
+    };
+  }
+
   /** A FIELD WE FILLED THAT HAS SINCE GONE BLANK IS A RE-RENDER, NOT A MISSING VALUE.
    *
    *  Coos Bay's electrical recipe fills "*Other Category of Construction" and reports
@@ -7796,22 +9894,66 @@ export class RecipeAdapter extends BasePortalAdapter {
 
   /** One pass of the re-assert. See reassertBlanksOnce for why there is more than one. */
   private async reassertPass(pastReview: boolean): Promise<string[]> {
-    let blanks = await this.emptyRequiredControls();
+    const swept = await this.sweepRequired();
+    const named = (f: { name: string; why: string }): string => (f.why === "complaint" || f.why === "unattributed-complaint"
+      ? `${f.name} — the portal flagged this field`
+      : f.name);
+    let blanks = swept.empty.map(named);
     if (blanks.length && !this.inPolicyRetry) {
       const norm = (t: string): string => t.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-      const refills = this.recipe.steps.filter((rs) => {
-        if (rs.action !== "fill" && rs.action !== "select") return false;
-        const name = norm(String(rs.note ?? rs.selector?.label ?? ""));
-        return !!name && blanks.some((b) => {
-          const nb = norm(b.replace(/ — the portal flagged this field$/, ""));
-          return nb === name || (nb.length > 6 && name.includes(nb)) || (name.length > 6 && nb.includes(name));
-        });
-      }).slice(0, REASSERT_MAX_FIELDS);
+      const bare = (b: string): string => b.replace(/ — the portal flagged this field$/, "");
+      const sameName = (a: string, b: string): boolean => {
+        const na = norm(a); const nb = norm(b);
+        return !!na && !!nb && (na === nb || (nb.length > 6 && na.includes(nb)) || (na.length > 6 && nb.includes(na)));
+      };
+      // A RADIO-GROUP OR CHECKBOX BLANK IS NEVER RE-RUN (#362): a radio group's "name" is the row's
+      // whole text, and another page's select matched it and waited out its timeout, again and
+      // again; another page's select re-run against a required agreement checkbox toggled it five
+      // times (Helm review of 381204a). Still reported.
+      const open = swept.empty.filter((e) => e.why !== "radio-group" && e.why !== "checkbox").map(named);
+      // AN EXACT BLANK BEFORE A SUBSTRING ONE (Helm review of 381204a, C7): "Net Metering" is the
+      // "Net Metering" blank when there is one, never "Are you ready to submit your Net Metering…".
+      const matchOf = (rs: RecipeStep): string => {
+        const name = String(rs.note ?? rs.selector?.label ?? "");
+        if (!norm(name)) return "";
+        return open.find((b) => norm(name) === norm(bare(b))) ?? open.find((b) => sameName(name, bare(b))) ?? "";
+      };
+      const matched = this.recipe.steps.filter((rs, i) => (rs.action === "fill" || rs.action === "select") && !this.handPatchedRowsSkipped.has(i) && !!matchOf(rs));
+      const own = await this.ownRecordedSteps(matched);
+      const ownView = (rs: RecipeStep): boolean => own.has(rs);
+      // THIS VIEW'S OWN STEP WINS ITS BLANK: another page's step sharing the label is not also re-run.
+      const ownBlanks = new Set(matched.filter(ownView).map(matchOf));
+      const refills = matched.filter((rs) => ownView(rs) || !ownBlanks.has(matchOf(rs))).slice(0, REASSERT_MAX_FIELDS);
       if (refills.length) {
         this.inPolicyRetry = true;   // reuses the re-entry guard: no retry of a retry
         try {
           for (const rs of refills) {
-            const done = await this.executeStep(rs, pastReview).catch(() => false);
+            const blank = bare(matchOf(rs));
+            const carried = !ownView(rs);
+            // NEVER INTO A BLANK THAT READS AS SUBMITTING (#362), own value or carried (Helm review of
+            // 381204a, C7): an earlier page's "Net Metering" = Yes matched "Are you ready to submit
+            // your Net Metering (kWh) application?" by label, and the stamped draft Submit then
+            // filed; Part 1's own "Net Metering" did the same by substring. Left blank, a person
+            // answers it.
+            if (isSubmitIntentField(blank)) continue;
+            // THE CONTROL THE STEP WILL WRITE, RESOLVED FIRST AND WRITTEN ONLY THROUGH ITSELF: it must
+            // be the control the sweep called that blank, it must be on the page now (a step whose
+            // control is gone waits out its whole timeout), and no question of it may read as
+            // submitting. The write then goes through that one element (C8), so no fallback, rescue
+            // or heal can re-resolve it onto another control.
+            const target = await this.reassertTargetOf(rs, blank);
+            if (target.skip) {
+              this.driftWarnings.push(`"${String(rs.note ?? rs.field ?? "").slice(0, 40)}" was not re-asserted into "${blank.slice(0, 40)}": ${target.skip}`);
+              continue;
+            }
+            // A RECORDED VALUE FROM ANOTHER VIEW IS A PICK HERE (#362), on every attempt, landed or
+            // not, named by the live control it is written into.
+            if (carried) {
+              await this.noteUnrecordedWrite("pick", `re-assert into "${(target.label || blank).slice(0, 60)}" (the recorded "${String(rs.note ?? rs.field ?? "").slice(0, 40)}")`, { ...(target.control ?? {}), question: target.label || blank, questions: target.questions });
+            }
+            const step = target.pinned ? { ...rs, selector: target.pinned, fingerprint: undefined } as RecipeStep : rs;
+            const done = await this.executeStep(step, pastReview).catch(() => false);
+            if (target.pinned) await this.unpinReassert(target.pinned);
             // BOTH OUTCOMES, or this becomes the sixth silent path in this file. A
             // re-assert that fails says something different from one that was never
             // attempted, and today proved repeatedly that the difference is the whole
@@ -7830,6 +9972,78 @@ export class RecipeAdapter extends BasePortalAdapter {
       }
     }
     return blanks;
+  }
+
+  /** WHICH RECORDED STEPS ARE THIS PAGE'S OWN (#362, Helm review of 381204a, A2 and the view-churn
+   *  should-fix): decided by the document and the control the recorded write landed on. A step with
+   *  a recorded id is this page's own while that control is on the page now — in this document and
+   *  view, or in a new document at the same URL path (a reload after Save, a postback, a session
+   *  timeout). A step with no recorded id: recorded in this document and this view. Two documents
+   *  at one URL with a shared header, or a persistent header over a replaced form, are not one
+   *  page: an earlier page's step whose control is gone is carried over. Unreadable = none (every
+   *  re-assert then counts as carried: the safe direction). */
+  private async ownRecordedSteps(steps: RecipeStep[]): Promise<Set<RecipeStep>> {
+    const own = new Set<RecipeStep>();
+    const view = await this.observeView();
+    if (view < 0) return own;
+    const doc = await this.docToken();
+    const path = this.lastView?.path ?? "";
+    const recs = steps.map((rs) => ({ rs, rec: this.recordedStepView.get(this.recipe.steps.indexOf(rs)) }));
+    const probe = Array.from(new Set(recs.filter((r) => r.rec && r.rec.ctl).map((r) => r.rec!.ctl)));
+    const present = probe.length && typeof this.page?.evaluate === "function"
+      ? await this.page.evaluate((list: string[]) => list.filter((css) => { try { return !!document.querySelector(css); } catch { return false; } }), probe).catch(() => [] as string[]) as string[]
+      : [];
+    for (const { rs, rec } of recs) {
+      if (!rec || rec.view < 0 || doc === "*" || rec.doc === "*") continue;
+      const here = !!rec.ctl && present.includes(rec.ctl);
+      // No recorded id: its own document and view. An id: that control is still here, in this
+      // document and view, or in a new document at the same URL path.
+      if (!rec.ctl ? rec.doc === doc && rec.view === view : here && (rec.doc === doc ? rec.view === view : rec.path === path)) own.add(rs);
+    }
+    return own;
+  }
+
+  /** What a re-assert of `rs` would write (#362): skip it unless its own locator resolves NOW to the
+   *  very control the sweep named that blank (SWEPT_BLANK_ATTR), by the extractor's reading of that
+   *  element no question of which reads as submitting. The element is then tagged, and `pinned` is
+   *  a selector for it alone. A page double that cannot be read keeps main's behaviour. */
+  private async reassertTargetOf(rs: RecipeStep, blank: string): Promise<{ skip?: string; label?: string; control?: { id: string; name: string }; questions?: string[]; pinned?: RecipeSelector }> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const loc: any = await this.resolveLocator(rs.selector, String(rs.note ?? "")).catch(() => null);
+    if (!loc) return { skip: "its control is not on this page" };
+    if (typeof loc.evaluateAll !== "function" || typeof loc.first !== "function") return {};
+    const one = loc.first();
+    const tag = `ra${++this.reassertSeq}`;
+    const tagIt = (): Promise<string | null | undefined> => one.evaluate((el: Element, a: { pin: string; tag: string; blank: string }) => {
+      el.setAttribute(a.pin, a.tag);
+      return el.getAttribute(a.blank);
+    }, { pin: REASSERT_PIN_ATTR, tag, blank: SWEPT_BLANK_ATTR }, { timeout: 1500 }).catch(() => undefined) as Promise<string | null | undefined>;
+    let swept = await tagIt();
+    if (swept === undefined) return { skip: "its control is not on this page" };
+    // An earlier re-assert's re-render can drop the sweep's mark: sweep once more and read again.
+    if (!swept) { await this.sweepRequired(); swept = await tagIt(); }
+    if (swept === undefined) return { skip: "its control is not on this page" };
+    const pinned: RecipeSelector = { css: `[${REASSERT_PIN_ATTR}="${tag}"]`, ...(rs.selector?.frame ? { frame: rs.selector.frame } : {}) };
+    const norm = (t: string): string => String(t || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+    const raws = await one.evaluateAll(extractFieldsInPage).catch(() => null) as RawField[] | null;
+    const raw = Array.isArray(raws) && raws.length === 1 ? raws[0] : null;
+    if (!raw) { await this.unpinReassert(pinned); return { skip: "its control could not be read" }; }
+    if (!swept || norm(swept) !== norm(blank)) {
+      await this.unpinReassert(pinned);
+      return { skip: `its locator resolves to "${String(raw.label || "another control").slice(0, 50)}", not that blank` };
+    }
+    if (!gapFillMayAnswer({ label: raw.label, groupPrompt: raw.groupPrompt, options: raw.options, questions: raw.questions })) {
+      await this.unpinReassert(pinned);
+      return { skip: "that control reads as submitting the application — a person answers it" };
+    }
+    return { label: String(raw.label || ""), control: { id: raw.id || "", name: raw.name || "" }, questions: questionsOfRaw(raw), pinned };
+  }
+  private async unpinReassert(pinned: RecipeSelector): Promise<void> {
+    const m = /="([^"]+)"\]$/.exec(String(pinned.css ?? ""));
+    if (!m || typeof this.page?.evaluate !== "function") return;
+    await this.page.evaluate((a: { pin: string; tag: string }) => {
+      for (const el of Array.from(document.querySelectorAll(`[${a.pin}="${a.tag}"]`))) el.removeAttribute(a.pin);
+    }, { pin: REASSERT_PIN_ATTR, tag: m[1] }).catch(() => null);
   }
 
   private async emptyRequiredControls(): Promise<string[]> {

@@ -13,6 +13,7 @@
 // ---------------------------------------------------------------------------
 import fs from "node:fs";
 import path from "node:path";
+import { backendDataDir } from "./statePaths";
 import type { AppDb } from "./db";
 import type { AiPlanReviewResult, ProjectRecord, ReviewerReport, ReviewSubject, ReviewWorkType } from "../../shared/src/types";
 import { resolveEffectiveCodeContext, ensureCodeProfilesResearched } from "./codeProfiles";
@@ -103,7 +104,7 @@ export function listReviewSubmissions(db: AppDb, orgId: string, limit = 50): Rev
     .map(mapSubmission);
 }
 
-const REVIEW_FILES_DIR = () => path.resolve(process.cwd(), "backend/data/review-submissions");
+const REVIEW_FILES_DIR = () => path.join(backendDataDir(), "review-submissions");
 
 /** The full standalone review flow. Never leaks internals: a failure records a
  *  failed submission with the reason instead of a 500 with a stack. */

@@ -136,7 +136,7 @@ const readyForIssuePattern =
   /\b(ready for issue|ready to issue|ready for issuance|permit ready|ready for pickup|ready for pick up|approved pending payment|pay fees?|fees? due|issuance fees?|final fees?|ready to be issued)\b/i;
 
 const issuedPattern =
-  /\b(permit issued|issued permit|status:\s*issued|issued on|download permit|permit card|inspection card|permit has been issued)\b/i;
+  /\b(permit issued|issued permit|status:\s*(?:issued|finaled)|issued on|download permit|permit card|inspection card|permit has been issued)\b/i;
 
 const nemApprovalPattern =
   /\b(pto granted|permission to operate|net metering approved|customer generation approved|(?:interconnection|nem)(?:\s+\w+){0,3}\s+approved|approved(?:\s+\w+){0,3}\s+(?:interconnection|nem)|authorization to (?:install|interconnect|operate))\b/i;
@@ -442,7 +442,11 @@ function classifyScannedText(text: string, stated: string, track: TrackKind): Pe
     };
   }
 
-  if (issuedPattern.test(text) || statedIssuedPattern.test(stated)) {
+  // A BARE STATUS IS ITS OWN STATED STATUS. Text that is nothing but "Issued" (a status pasted into the
+  // monitor, the one word an operator reads off a list) has no "Status:" label for extractStatedStatus
+  // to find, so `stated` is "" and the whole text is scanned — where issuedPattern wants a phrase. The
+  // pattern is anchored, so only text that IS the status reads this way, never prose that holds it.
+  if (issuedPattern.test(text) || statedIssuedPattern.test(stated) || (!stated && statedIssuedPattern.test(text))) {
     return {
       outcome: "issued",
       statusLabel: "Permit issued",
@@ -667,6 +671,29 @@ export function shouldRecordStatusCheck(
     || previousLabel !== String(next.statusLabel ?? "").trim();
 }
 
+/**
+ * A CHECK THAT READ NOTHING IS NOT A STATUS. Two ways a check gathers no evidence: it had nothing
+ * to check at all (source "mock": no portal URL, no recipe), or it had a URL that could not be read
+ * — a PowerClerk project page behind a login, an Accela global search that "returned no results".
+ * Recording either as a status classifies the honest "no status available" text as
+ * needs_human_review, which on a target we ALREADY know the status of is a downgrade: one sweep
+ * turned three verified "In review" NEM rows into "Needs human review" and stomped each project's
+ * current_stage with it, and one stale-panel re-check (#412, 7ddfbe48) replaced an issued
+ * building permit with "Needs human review".
+ *
+ * true = record nothing; the caller only reschedules the target. A never-checked target is the one
+ * exception: recording the honest "manual check required" is how the operator learns the link
+ * needs a login.
+ *
+ * ONE ANSWER, TWO DOORS: the scheduled sweep (checkDuePermitTargets) and the manual/re-check door
+ * (recordPermitStatusCheck, POST /api/projects/:id/permit-checks) both ask this, so "is an empty
+ * read a status?" is not answered twice. `gatheredNothing` is the caller's own evidence — a pasted
+ * text is never "nothing" unless it is literally blank.
+ */
+export function shouldSkipEmptyRead(read: { gatheredNothing: boolean; source: PermitCheckSource; alreadyKnown: boolean }): boolean {
+  return read.gatheredNothing && (read.source === "mock" || read.alreadyKnown);
+}
+
 // AN OPEN FILING IS READ DAILY (2026-09-28: a Marion County building permit went "Ready to Issue"
 // the same day while the card said "Waiting" — its last read was 14 hours old and the next was a
 // week out). A filing the agency has not finished with is re-read at most OPEN_FILING_CHECK_DAYS
@@ -785,9 +812,9 @@ export interface StaleStatusReading extends StoredClassificationDrift {
   applicationNumber: string;
   /**
    * Whether a re-check can actually FETCH anything. A `public_url` re-check against a target with
-   * no portal URL resolves to "No status text available…" and writes a needs_human_review row —
-   * an honest answer, but it replaces one stale reading with a blanker one, so an operator being
-   * offered the trigger has to be told which of the two they are about to get.
+   * no portal URL reads nothing, so it records nothing (shouldSkipEmptyRead — the stale reading
+   * stays and the operator is told so), and an operator being offered the trigger has to be told
+   * which of the two they are about to get.
    */
   hasPortalUrl: boolean;
 }

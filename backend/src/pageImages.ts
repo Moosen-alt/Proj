@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { backendDataDir } from "./statePaths";
 import { createRequire } from "node:module";
 import type { AppDb } from "./db";
 import type { EvidenceTopic } from "./projectEvidence";
@@ -20,7 +21,7 @@ import { pdfjsDocumentOptions } from "./pdfjsOptions";
 // installs without a native toolchain on the operator's Windows box.
 // ---------------------------------------------------------------------------
 
-const CACHE_DIR = path.resolve(process.cwd(), process.env.PAGE_IMAGE_CACHE_DIR || "backend/data/page-images");
+const CACHE_DIR = process.env.PAGE_IMAGE_CACHE_DIR ? path.resolve(process.env.PAGE_IMAGE_CACHE_DIR) : path.join(backendDataDir(), "page-images");
 
 type PdfjsRenderModule = {
   getDocument: (opts: { data: Uint8Array; useSystemFonts?: boolean; disableWorker?: boolean; standardFontDataUrl?: string }) => { promise: Promise<PdfjsRenderDoc> };

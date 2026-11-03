@@ -3,10 +3,11 @@ import { preferredRowLabel, rankAddressVersions, type SiteIdentity } from "../ad
 import { imageToPdfBytes, pdfNameFor, shouldConvertToPdf } from "../imageToPdf";
 import path from "path";
 import type { Page, Frame, Locator } from "playwright";
-import type { ProjectRecord, RecipeSelector, RecipeStep, StepFingerprint } from "../../../shared/src/types";
+import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep, StepFingerprint } from "../../../shared/src/types";
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, type PortalContext, type PortalStepResult } from "../adapter";
 import { openPortal } from "../browser";
 import { selectWithFallback, readClosedComboboxOptions } from "../comboboxFill";
+import { assertFilerIdentityHeld, FilerIdentityStop, filerIdentityFieldForSelect, filerIdentityStopMessage, selectFilerIdentity } from "../filerIdentitySelect";
 import { detectChallengeFrame, frameSelectorFor, maskId, readbackMatches, redactCaptureText, redactStatusText, safeAction, sleep, smartWait, waitForElement, waitForInteractiveControls } from "../safeAction";
 import { applyFormatHint } from "../formatHint";
 import { scrapeReviewScreen as scrapeReviewScreenShared } from "../reviewScreenScraper";
@@ -50,8 +51,8 @@ export interface ContinueDraft {
   awaitingSignature?: boolean;
 }
 import { PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, isFinalSubmitControl, isInterstitialForwardLabel as sharedIsInterstitialForwardLabel, isSignatureNameLabel, isSignatureRequestControl, isTypeSignatureToggleLabel, looksLikeReviewUrl, redactSecretValues, reviewSignals as sharedReviewSignals, splitSignerName } from "../../../shared/src/portalSafety";
-import { BATTERY_DECLARATION_QUESTION, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
-import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
+import { BATTERY_DECLARATION_QUESTION, batteryAttestationAnswer, batteryControlKind, batteryDeclarationAnswer } from "../../../shared/src/batteryControls";
+import { installFilingBackstop, withBackstopWindow, withOwnWriteWindow, describeBackstopAbort, backstopSentLine, backstopFor, isStoppingAbort, drainOwnWrites, unsavedAtReviewWarning, portalOwnCallsBlockedAtReview, reviewBlockedCallsLine } from "../filingBackstop";
 // Types only (erased): the information-page door is reached duck-typed on the installed backstop.
 import type { FilingBackstop, InfoPageCandidateTake, InfoPagePassOpen } from "../filingBackstop";
 import { INFO_PAGE_PRIOR_PROGRESS_REFUSAL, infoPageEvidence, infoPageProofOfProgressRefusals, infoPageProofStepRefusals, type InfoPageProofStep, type InfoPageRunState, type InfoPageRunStep } from "../../../shared/src/infoPagePass";
@@ -63,6 +64,7 @@ import {
   type ContactFieldKind, type ContactRole, type ContactTrack,
 } from "../../../shared/src/contactRoles";
 import { portalSaysNotServed } from "../../../shared/src/portalNotServed";
+import { prepareComputeSettle, waitForComputeSettled } from "../computeSettle";
 
 // AutoLearnAdapter — AUTONOMOUSLY learns an unknown AHJ/utility portal form instead of
 // having a human record it. Each page is scraped into a structured snapshot
@@ -143,6 +145,19 @@ export interface ExtractedField {
    *  post-reveal re-scan — this key lets it recognize (and never re-answer) a group that
    *  already has a recorded answer, which would silently flip the selection. */
   group?: string;
+  /** A radio's / checkbox's GROUP QUESTION (#362): its own label is the option word ("Yes"), and
+   *  the question ("Are you ready to submit…?") lives in the fieldset legend, the radiogroup's
+   *  accessible name, or a group label tied to no single option. Read by the gap-fill's
+   *  submit-intent guard; never sent to a planner. */
+  groupPrompt?: string;
+  /** EVERY text that may be this control's question (#362), from every source rather than the
+   *  first: each enclosing fieldset legend, its own and its group's aria-labelledby / aria-label,
+   *  its label (a choice control's own option word excluded), and the text around it in the
+   *  smallest container holding only it (or only its group): a row's <th> or first cell, a
+   *  leading span / p / strong, a .control-label — plus a text-only element just before that
+   *  container. Headings and option words are never part of it. Read by the gap-fill's
+   *  submit-intent guard on the element about to be written; never sent to a planner. */
+  questions?: string[];
   /** True when the control cannot be operated right now — :disabled (which also covers a
    *  control inside <fieldset disabled>), aria-disabled="true", or a `disabled` class token.
    *  Carried because A DISABLED NEXT IS A GATE, NOT AN ABSENCE: a wizard step whose Next
@@ -194,6 +209,24 @@ export interface LearnPlanResponse {
 
 export type LearnPlanner = (req: LearnPlanRequest) => Promise<LearnPlanResponse>;
 
+/** #536 — WHAT A PAGE ENDED WITH THAT A PERSON WOULD NOT CALL CLEAN, read just before the walk
+ *  leaves it (after every fill, the rescans, the policy / declaration / attestation passes and the
+ *  required sweep). Labels and the portal's own message text only, scrubbed of secrets.
+ *   - validationErrors: a field the portal shows as invalid after the fills — "Total System Export
+ *     (kW): Please enter a valid decimal number" (the PacifiCorp battery learn, 2026-11-02). The
+ *     advance was not refused (PowerClerk validates at submit), so validationBlocks never saw it.
+ *   - requiredUnchecked: a REQUIRED checkbox still unchecked. `acknowledgment` marks the boxes the
+ *     walk leaves for a person by design (the review gate's "will not be submitted until…", terms).
+ *   - strayWrites: an equipment write that reached another control (put back, not recorded) or
+ *     whose selector reached another field's control (not typed). */
+export type PageTrustEvidence = {
+  page: number;
+  where: string;
+  validationErrors: string[];
+  requiredUnchecked: Array<{ label: string; acknowledgment: boolean }>;
+  strayWrites: string[];
+};
+
 export interface LearnResult {
   ok: boolean;
   portalName: string;
@@ -232,6 +265,10 @@ export interface LearnResult {
   missingRequiredDocs?: string[];
   /** Inline validation errors the portal raised when an advance was blocked. */
   validationBlocks?: string[];
+  /** #536 — PER-PAGE TRUST EVIDENCE, one entry per page that ended with any (see
+   *  PageTrustEvidence). Recorded for the trust gate to read (#534); this field alone changes no
+   *  decision. Undefined when no page had any. */
+  trustEvidence?: PageTrustEvidence[];
   /** Page-level messages the PORTAL printed during the walk, on any page, whether or not
    *  it advanced ("Property Address not found."). Distinct from validationBlocks, which
    *  only ever means "an advance was refused". */
@@ -244,6 +281,10 @@ export interface LearnResult {
    *  has no value on file — labels only. Not a trust blocker (the recipe binds them by name); a
    *  person types them at review. Undefined when none. */
   secretsLeftBlank?: string[];
+  /** #524 — WHO IS FILING lists this learn would not answer: an Installer Company / contact-code
+   *  select with no option that is exactly this client's (or two). Nothing was selected there, and
+   *  no step was recorded for it. Undefined when none. */
+  filerIdentityRefused?: string[];
   /** The FULL url (query string included) of the application this run worked on, captured
    *  where it stopped. Without it there is no way to audit the right application afterwards:
    *  a portal list can hold several drafts for the same customer, and auditing "the first" or
@@ -344,6 +385,10 @@ const PAY_FEE = /\b(pay\s*(and|&)\s*submit|pay fees?|pay fee|pay now|submit\s*(&
  *  Three allows a legitimate re-render plus one retry; Miami's Property Search was walked
  *  SEVEN times, which bought nothing and spent the whole budget. */
 const REPEAT_PAGE_LIMIT = 3;
+/** #382 — after the late equipment pass fills a control, how long a debounced autosave gets to
+ *  land and render what it unlocks (a PowerClerk row's Model after its make) before the next
+ *  re-scrape. Only paid when that pass actually filled something. */
+const LATE_EQUIP_REVEAL_GRACE_MS = 2_000;
 
 const SUBMIT_INTENT = /\b(continue application|submit application|file application|submit|finish|finalize|confirm submission|place order|complete submission)\b/i;
 /** A login-worded control ("Sign In", "Log in", "Login", "Log On"). Never a walk advance while its
@@ -462,8 +507,15 @@ const OTHER_SPECIFY_VALUE = "Solar";
 
 // `scope`: "nem" (the default) applies on utility interconnection learns (profile residential_nem);
 // "permit" applies on AHJ/permit learns (profile permit_standard). A policy never crosses scopes.
-const POLICY_RADIO_DEFAULTS: Array<{ question: RegExp; answer: "Yes" | "No"; enforce?: boolean; scope?: "nem" | "permit" }> = [
-  { question: /do you propose to limit the export capacity/i, answer: "No" },
+// `jobKey`: the replay-map key (backend resolveRecipeFieldValues) that carries THIS job's own answer
+// to the question; the replay of a control its recipe never recorded binds that key ahead of the
+// standing answer (unrecordedControls POLICY_QUESTION_JOB_KEYS, derived from this table — so the
+// question is ONE regex, here). A rule without one has only the standing answer.
+// Every `question` is a non-global regex: the replay tests the same RegExp objects, so a `g`/`y` flag
+// would carry lastIndex between the two callers.
+export type PolicyRadioRule = Readonly<{ question: RegExp; answer: "Yes" | "No"; enforce?: boolean; scope?: "nem" | "permit"; jobKey?: string }>;
+export const POLICY_RADIO_DEFAULTS: ReadonlyArray<PolicyRadioRule> = Object.freeze(([
+  { question: /do you propose to limit the export capacity/i, answer: "No", jobKey: "exportLimiting" },
   // HYPHENS COUNT. Ameren Illinois asks "Is the inverter lab-certified as that term is
   // defined in the Illinois Distributed Generation Interconnection Standard?" — hyphenated,
   // which a whitespace-only pattern misses, leaving a REQUIRED question blank on every
@@ -491,7 +543,8 @@ const POLICY_RADIO_DEFAULTS: Array<{ question: RegExp; answer: "Yes" | "No"; enf
   // the application is submitted, so this is a commercial decision encoded as a default, not
   // a mechanical one. enforce=false, so anything already answered — by a human or from
   // project data — always wins.
-  { question: /net\s*k?wh|kwh\s*netting|net\s*metering\s*\(k?wh\)/i, answer: "Yes" },
+  // `\bnet`: "internet wh…" is not net kWh (Helm review of PR #353).
+  { question: /\bnet\s*k?wh|kwh\s*netting|net\s*metering\s*\(k?wh\)/i, answer: "Yes" },
   { question: /monetiz/i, answer: "Yes" },
   // Ameren Illinois: "requires a Manual, External Knife-Blade Type Disconnect OR a Circuit
   // Breaker in a Secured Compartment/Enclosure … along with signage … no less than 5\" by 7\"
@@ -509,7 +562,51 @@ const POLICY_RADIO_DEFAULTS: Array<{ question: RegExp; answer: "Yes" | "No"; enf
   // project." — "can be yes"; the learn picked No and the operator corrected it mid-run). enforce: a
   // planner's No is corrected.
   { question: /consent\s+to\s+drone|drones?\b.{0,60}\binspections?\b|drone\s+inspection/i, answer: "Yes", enforce: true, scope: "permit" },
-];
+] as PolicyRadioRule[]).map((rule) => Object.freeze(rule)));
+
+/** A POLICY SCOPE: "nem" on a utility interconnection, "permit" on an AHJ, "none" when the operator
+ *  turned the policy answers off (PORTAL_POLICY_DEFAULTS=off). Read from policyProfileFor below — the
+ *  one rule the learn (backend autoLearn.ts) and the replay (policyScopeFor) both ask. */
+export type PolicyScope = "nem" | "permit" | "none";
+
+/** Which deterministic policy-answer set a run may use (the learner's constructor option). */
+export type PolicyProfile = "residential_nem" | "permit_standard" | "none";
+
+/** THE ONE RULE FOR WHICH POLICY ANSWERS APPLY (PR #353 round 2: the backend's learn and the replay
+ *  each carried a copy). Deterministic policy answers (export capacity → No, UL 1741 → Yes) are
+ *  standard-residential-NEM domain policy: a UTILITY interconnection gets them, an AHJ/permit portal
+ *  gets the permit set, and PORTAL_POLICY_DEFAULTS=off (or 0) disables them everywhere (non-standard
+ *  projects; the planner + project data then decide). */
+export function policyProfileFor(scopeType: string | null | undefined, env: NodeJS.ProcessEnv = process.env): PolicyProfile {
+  if (env.PORTAL_POLICY_DEFAULTS === "off" || env.PORTAL_POLICY_DEFAULTS === "0") return "none";
+  return scopeType === "utility" ? "residential_nem" : "permit_standard";
+}
+
+/** THE LEARNER'S STANDING ANSWER TO A QUESTION, read from POLICY_RADIO_DEFAULTS — the one table
+ *  (issue #352). The replay asks it for a REQUIRED control its recipe has no step for (PacifiCorp's
+ *  knife-blade question renders only for a larger system, so a recipe learned on a small one never
+ *  recorded it), so a learn and a replay give one question one answer. "" when no rule matches or the
+ *  scope is "none". `enforce` is the learner's correction of a planner's other pick; a caller that
+ *  only ever answers an EMPTY control has nothing to correct, so it does not apply. */
+export function policyDefaultAnswerFor(question: string, scope: PolicyScope): "Yes" | "No" | "" {
+  return policyDefaultRuleFor(question, scope)?.answer ?? "";
+}
+
+/** The POLICY_RADIO_DEFAULTS rule that answers a question in this scope, or null — what
+ *  policyDefaultAnswerFor reads, for a caller that also needs the rule's own regex (the replay's
+ *  negation check reads the sentence the rule matched). */
+export function policyDefaultRuleFor(question: string, scope: PolicyScope): PolicyRadioRule | null {
+  if (scope === "none") return null;
+  const text = String(question ?? "");
+  return POLICY_RADIO_DEFAULTS.find((p) => (p.scope ?? "nem") === scope && p.question.test(text)) ?? null;
+}
+
+/** The policy scope a replay runs under: the learn's own profile (policyProfileFor) for the recipe's
+ *  scope, as the scope POLICY_RADIO_DEFAULTS rules carry. */
+export function policyScopeFor(scopeType: string | null | undefined, env: NodeJS.ProcessEnv = process.env): PolicyScope {
+  const profile = policyProfileFor(scopeType, env);
+  return profile === "none" ? "none" : profile === "residential_nem" ? "nem" : "permit";
+}
 
 // Sensitive field labels whose literal value must NEVER be stored in a recorded step.
 // FREE-TEXT IDENTIFIERS. An account or meter number is typed; it is never one of three
@@ -1318,6 +1415,13 @@ export interface RawField {
   offstage?: boolean;
   /** True when the control is not operable right now. See ExtractedField.disabled. */
   disabled?: boolean;
+  /** See ExtractedField.groupPrompt. */
+  groupPrompt?: string;
+  /** See ExtractedField.questions. */
+  questions?: string[];
+  /** A probe mark the draft click's pick read put on the element (data-al-pq), echoed back so its
+   *  reading can be tied to the element (#362). Nothing else sets or reads it. */
+  probe?: string;
   /** A choice tile (markChoiceTilesInPage): a card clicked as a whole, labelled by its title.
    *  Its selector is the title TEXT — getByRole finds nothing on a plain container. */
   tile?: boolean;
@@ -1444,6 +1548,110 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
     const text = (el.textContent || "").trim();
     if (text) return text;
     return "";
+  }
+
+  // THE OPTION WORDS OF A CHOICE GROUP (#362): the labels of every radio / checkbox sharing this
+  // one's name (just its own for an unnamed one). Never a question.
+  function optionWordsOf(el: Element): string[] {
+    const ty = (el.getAttribute("type") || "").toLowerCase();
+    if (el.tagName.toLowerCase() !== "input" || (ty !== "radio" && ty !== "checkbox")) return [];
+    const nm = el.getAttribute("name");
+    const root = el.getRootNode() as Document | ShadowRoot;
+    const members = nm ? Array.from(root.querySelectorAll(`input[name="${CSS.escape(nm)}"]`)) : [el];
+    // Its label, its value and a <label for> right AFTER it (Miami's radios share one id, and their
+    // labels point at "Yes"/"No", so labelFor cannot tie them): every one is an option's own word.
+    // Never the element before the first option: that is where the group's question label sits.
+    const words: string[] = [];
+    for (const m of members) {
+      words.push(labelFor(m), m.getAttribute("value") || "");
+      const sib = m.nextElementSibling;
+      if (sib && sib.tagName === "LABEL" && sib.hasAttribute("for") && !sib.querySelector("input, select, textarea")) words.push(sib.textContent || "");
+    }
+    return words.map((w) => w.replace(/\s+/g, " ").trim()).filter(Boolean);
+  }
+
+  // THE CONTROL'S QUESTION FROM EVERY SOURCE (#362) — see ExtractedField.questions. One reading
+  // for the extractor and for the gap-fill's last check before a write (claimForWrite runs this
+  // function on the element itself), so the two can never disagree.
+  //   - every legend of every enclosing fieldset, nested anywhere in it (not a nested fieldset's);
+  //   - aria-labelledby, aria-label and aria-describedby, on the control and on its group;
+  //   - a non-choice control's own label;
+  //   - a choice control or a select (never a free-text box: its question is its label, aria and
+  //     legend): the text BEFORE it in the smallest container whose only ANSWER controls are this
+  //     one or its group — a help, info or Clear button in the row is not an answer and does not
+  //     end the climb — each part (≤200) and the parts joined (≤200); then one text-only element
+  //     just before that container. Never text after the control (help, a hint), never script,
+  //     style, template, a heading, a button's own words, or an option's own word.
+  function questionsOf(el: Element, kind: string, ownLabel: string): string[] {
+    const clean = (t: string | null | undefined): string => String(t || "").replace(/\s+/g, " ").trim();
+    const out: string[] = [];
+    const add = (t: string | null | undefined): void => {
+      const c = clean(t).slice(0, 300);
+      if (c && !out.includes(c)) out.push(c);
+    };
+    const root = el.getRootNode() as Document | ShadowRoot;
+    const byId = (r: string): Element | null => (typeof root.getElementById === "function" ? root.getElementById(r) : null) || document.getElementById(r);
+    const byIds = (ids: string | null): string => (ids || "").split(/\s+/).filter(Boolean)
+      .map((r) => clean(byId(r)?.textContent)).filter(Boolean).join(" ");
+    const choice = kind === "radio" || kind === "checkbox";
+    const role = (el.getAttribute("role") || "").toLowerCase();
+    const listish = kind === "select" || el.tagName === "SELECT" || role === "combobox" || role === "listbox";
+    const words = new Set(optionWordsOf(el).map((w) => w.toLowerCase()));
+    for (let fs = el.closest("fieldset"); fs; fs = fs.parentElement ? fs.parentElement.closest("fieldset") : null) {
+      for (const lg of Array.from(fs.querySelectorAll("legend"))) if (lg.closest("fieldset") === fs) add(lg.textContent);
+    }
+    add(byIds(el.getAttribute("aria-labelledby")));
+    add(el.getAttribute("aria-label"));
+    add(byIds(el.getAttribute("aria-describedby")));
+    const grp = el.closest('[role="radiogroup"], [role="group"]');
+    if (grp) { add(byIds(grp.getAttribute("aria-labelledby"))); add(grp.getAttribute("aria-label")); add(byIds(grp.getAttribute("aria-describedby"))); }
+    if (!choice) add(ownLabel);
+    if (!choice && !listish) return out;
+    // A select with its OWN label is asked by that label: an instruction above it ("When you are
+    // ready to submit, click Submit below") is not its question.
+    if (!choice) {
+      const id = el.getAttribute("id");
+      const ownLbl = (id && document.querySelector(`label[for="${CSS.escape(id)}"]`)) || el.closest("label");
+      if ((ownLbl && clean(ownLbl.textContent)) || clean(el.getAttribute("aria-label")) || byIds(el.getAttribute("aria-labelledby"))) return out;
+    }
+    // The smallest container holding only this control's answers (a choice control: its group).
+    const nm = choice ? el.getAttribute("name") : null;
+    const ours = (c: Element): boolean => c === el || (!!nm && c.getAttribute("name") === nm);
+    const ANSWERS = 'input:not([type=hidden]):not([type=button]):not([type=submit]):not([type=reset]):not([type=image]), select, textarea, [role=combobox], [role=listbox], [role=radio], [role=checkbox]';
+    let box: Element = el;
+    for (let up = el.parentElement; up && up !== document.body && up.tagName !== "FORM"; up = up.parentElement) {
+      if (!Array.from(up.querySelectorAll(ANSWERS)).every(ours)) break;
+      box = up;
+    }
+    const SKIP = "h1, h2, h3, h4, h5, h6, option, script, style, template, noscript, legend, button, [role=button], select";
+    if (box !== el) {
+      const first = Array.from(box.querySelectorAll(ANSWERS)).find(ours) || el;
+      const parts: string[] = [];
+      const walker = document.createTreeWalker(box, NodeFilter.SHOW_TEXT);
+      for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+        // Only text BEFORE the control: what follows it is help, a hint or an option's word.
+        if (!(first.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_PRECEDING)) continue;
+        const host = n.parentElement;
+        if (!host || host.closest(SKIP)) continue;
+        const t = clean(n.textContent);
+        if (!t || words.has(t.toLowerCase()) || (choice && t === ownLabel)) continue;
+        parts.push(t);
+      }
+      // A container of prose is not a question (instructions that mention submitting): a caption
+      // is short, as the required sweep reads one (≤160 there; 200 here for a long question).
+      for (const p of parts) if (p.length <= 200) add(p);
+      const joined = parts.join(" ");
+      if (joined.length <= 200) add(joined);
+    }
+    // A text-only element just before that container ("<p>Question?</p><select>").
+    let sib = box.previousElementSibling;
+    for (let k = 0; sib && k < 2; k++, sib = sib.previousElementSibling) {
+      if (sib.matches("script, style, template, noscript")) { k--; continue; }
+      if (sib.querySelector(ANSWERS) || /^H[1-6]$/.test(sib.tagName)) break;
+      const t = clean(sib.textContent);
+      if (t && t.length <= 200) { add(t); break; }
+    }
+    return out;
   }
 
   // Derive the SECTION a field lives under — its fieldset legend / enclosing card-or-panel
@@ -1747,6 +1955,40 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       requiredByAsterisk = labelHasAsterisk(forLbl?.textContent) || labelHasAsterisk(wrapLbl?.textContent);
     }
     const required = (el as HTMLInputElement).required || el.getAttribute("aria-required") === "true" || requiredByAsterisk || undefined;
+    // THE GROUP'S OWN QUESTION (#362), in order: the fieldset legend; the radiogroup/group's
+    // aria-labelledby / aria-label; then a label in the group's container tied to no single option
+    // (no for=, or a for= naming no choice control, and not wrapping one) or a .control-label.
+    let groupPrompt = "";
+    if (fieldType === "radio" || fieldType === "checkbox") {
+      const clean = (t: string | null | undefined): string => String(t || "").replace(/\s+/g, " ").trim();
+      const legend = el.closest("fieldset")?.querySelector("legend");
+      groupPrompt = clean(legend?.textContent);
+      if (!groupPrompt) {
+        const rg = el.closest('[role="radiogroup"], [role="group"]');
+        if (rg) {
+          const by = (rg.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean)
+            .map((ref) => clean(document.getElementById(ref)?.textContent)).filter(Boolean).join(" ");
+          groupPrompt = by || clean(rg.getAttribute("aria-label"));
+        }
+      }
+      if (!groupPrompt) {
+        const box = el.closest("fieldset, .form-group, [class*='form-group'], [class*='field'], .row, [class*='row']");
+        const lbls = box ? Array.from(box.querySelectorAll("label, .control-label, .field-label")) : [];
+        // An OPTION'S OWN WORD is never the question: Miami's <label for="No">No</label> names an
+        // id that does not exist, so the for= test alone let "No" become the question.
+        const words = new Set(optionWordsOf(el).map((w) => w.toLowerCase()));
+        for (const l of lbls) {
+          if (l.querySelector("input, select, textarea")) continue;
+          const f = l.getAttribute("for");
+          const tgt = f ? document.getElementById(f) : null;
+          if (tgt && /^(radio|checkbox)$/i.test((tgt as HTMLInputElement).type || "")) continue;
+          const t = clean(l.textContent);
+          if (t && t !== label && !words.has(t.toLowerCase())) { groupPrompt = t; break; }
+        }
+      }
+      groupPrompt = groupPrompt.slice(0, 200);
+    }
+    const questions = fieldType === "button" || fieldType === "file" ? [] : questionsOf(el, fieldType, label);
 
     out.push({
       label, fieldType, options, role, name, placeholder, id, text, href,
@@ -1754,6 +1996,9 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       required: required || undefined,
       section: sectionFor(el) || undefined,
       testCss,
+      groupPrompt: groupPrompt || undefined,
+      questions: questions.length ? questions : undefined,
+      probe: el.getAttribute("data-al-pq") || undefined,
       ariaLabel: el.getAttribute("aria-label")?.trim() || undefined,
       inActiveScope: scopeEl ? scopeEl.contains(el) : undefined,
       offstage: scopeEl ? !!el.closest('[aria-hidden="true"], [inert]') : undefined,
@@ -1877,6 +2122,8 @@ export function toExtractedField(raw: RawField): ExtractedField {
     };
   }
   if (raw.fieldType === "radio" && raw.name) field.group = raw.name;
+  if (raw.groupPrompt) field.groupPrompt = raw.groupPrompt;
+  if (raw.questions?.length) field.questions = [...raw.questions];
   return field;
 }
 
@@ -2208,6 +2455,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    *  required-field sweep excludes secret boxes (a project with no account on file must not block
    *  a recipe's promotion forever), so without this list the blank was silent. */
   private readonly secretsLeftBlank: Array<{ label: string; bound: boolean }> = [];
+  /** #524 — company / contact-code selects refused (see LearnResult.filerIdentityRefused). */
+  private readonly filerIdentityRefused: string[] = [];
   /** True once the delegated final submit actually went through. Read by the caller. */
   finalSubmitClicked = false;
   /** The completion/receipt page as text + URL, captured while standing on it. */
@@ -2265,6 +2514,17 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   // Equipment fields whose select verification failed for EVERY candidate this
   // run — retrying them each rescan pass just burns waitForOptionReady caps.
   private equipmentFillFailed = new Set<string>();
+  /** #535 — The candidate an equipment fill landed, per field (the equipmentFillFailed key): a later
+   *  pass reads it as held even when it is the plan-set fallback, not the certified string. */
+  private equipmentLanded = new Map<string, string>();
+  /** #536 — every equipment write that reached (or would have reached) a control it was not aimed
+   *  at, for the whole walk (labels only), and the ones on the page being walked now. */
+  private equipmentStrays: string[] = [];
+  private pageEquipmentStrays: string[] = [];
+  /** #536 — per-page TRUST EVIDENCE (labels and the portal's own words, scrubbed): a visible
+   *  validation error after the fills, a required checkbox left unchecked, a stray equipment write.
+   *  Recorded only; the trust gate's reading of it is #534's. */
+  private trustEvidence: PageTrustEvidence[] = [];
   /** The run's own credential (from login()); used mid-run only on the start URL's site. */
   private runCredential: { username: string; password: string } | undefined;
   /** The URL the run was opened at — the run's own credential belongs to its host + first path
@@ -2469,7 +2729,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     context: string,
     fallbackSide?: "inverter" | "module",
     bareSelect = false,
-  ): { key: string; candidates: string[]; side: "inverter" | "module" | null } | null {
+    /** The page shows PV Array repeater rows (arrayRowsInPage, the replay's own row predicate). */
+    arrayRowPage = false,
+  ): { key: string; candidates: string[]; side: "inverter" | "module" | null; held?: string[] } | null {
     const l = (context || "").toLowerCase();
     const isModel = /\bmodel\b/.test(l);
     const isMake = /manufacturer|\bmake\b|\bbrand\b/.test(l);
@@ -2500,6 +2762,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const make = (this.equipment[`${prefix}Make`] || "").trim();
       if (!model && !make) return null;
       const candidates: string[] = [];
+      // #535: the portal's own string first (see certifiedModel below).
+      const certifiedBare = bareBattery ? "" : this.certifiedModel(prefix as "inverter" | "module");
+      if (certifiedBare) candidates.push(certifiedBare);
       if (model) {
         candidates.push(model);
         const tokens = model.split(/[\s,()[\]{}]+/).filter((t) => /\d/.test(t) && t.length >= 3);
@@ -2511,7 +2776,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         const compactMake0 = make.toLowerCase().replace(/[^a-z0-9]/g, "");
         candidates.push(...(EQUIPMENT_MAKE_ALIASES[compactMake0] ?? []), ...(this.certifiedAliases[compactMake0] ?? []));
       }
-      return { key: `${prefix}Model`, candidates: [...new Set(candidates)], side: bareBattery ? null : bareSide };
+      return { key: `${prefix}Model`, candidates: [...new Set(candidates)], side: bareBattery ? null : bareSide, ...(certifiedBare ? { held: [certifiedBare] } : {}) };
     }
     // NEGATIVE GUARD: service equipment, storage, EV gear, generators, racking,
     // optimizers, monitoring — anything with its own make/model that is NOT the
@@ -2541,9 +2806,19 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     const explicitlyPv = /module|pv ?array|solar|photovoltaic/.test(l);
     if (EQUIPMENT_NEGATIVE_GUARD.test(l) && !explicitlyPv) return null;
 
+    // #382 — A PV ARRAY ROW IS ARRAY 1's ROW. On a page of PV Array repeater rows, the row a fresh
+    // application renders is where the learn meets the first roof plane, so its Qty / Tilt /
+    // Azimuth bind array1*: the replay re-reads array1* as array N in row N, and the learn fills
+    // rows 2..N from the same keys (fillRemainingArrayRows). The project-wide total ("moduleQty")
+    // in row 1 filed the whole system as one plane. Without per-array data, without rows on the
+    // page, or for a control whose context does not name the array, nothing changes.
+    const arrayRow = arrayRowPage && /pv ?array|\barray\b/.test(l);
+    const rowKey = (k: string): string | null => (arrayRow && (this.equipment[k] || "").trim() ? k : null);
+
     // Array-geometry fields are side-agnostic — fill straight from project data.
     if (isTilt || isAzimuth || isTracking) {
-      const key = isTilt ? "tilt" : isAzimuth ? "azimuth" : "tracking";
+      const key = (isTilt && rowKey("array1Tilt")) || (isAzimuth && rowKey("array1Azimuth"))
+        || (isTilt ? "tilt" : isAzimuth ? "azimuth" : "tracking");
       const value = (this.equipment[key] || "").trim();
       return value ? { key, candidates: [value], side: null } : null;
     }
@@ -2556,10 +2831,20 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     if (!side) return null;
     const key = side === "inverter"
       ? (isQty ? "inverterQty" : isModel ? "inverterModel" : "inverterMake")
-      : (isQty ? "moduleQty" : isModel ? "moduleModel" : "moduleMake");
+      : (isQty ? (rowKey("array1ModuleQuantity") ?? "moduleQty") : isModel ? "moduleModel" : "moduleMake");
     const value = (this.equipment[key] || "").trim();
     if (!value) return null;
     const candidates = [value];
+    // #535 — THE PORTAL'S OWN STRING FIRST, as the replay does (recipeAdapter: a */model$ step reads
+    // <field>Certified before the plan-set value). The plan set often names a module series without
+    // its wattage ("Q.TRON BLK M-G2+"), which EVERY wattage of the series contains, so the option
+    // matcher took the first one (405 W); the rows the learn adds run the replay's code and took the
+    // certified one (440 W), and the job filed two modules for one. An inverter the plan set names by
+    // its marketing name ("IQ8+ Microinverter") matched nothing and stayed blank, while the list
+    // names it by the part number its certified string carries. The plan-set value stays behind it
+    // for a portal whose list the CEC name does not match.
+    const certified = isModel ? this.certifiedModel(side) : "";
+    if (certified) candidates.unshift(certified);
     if (isMake) {
       const compactMake2 = value.toLowerCase().replace(/[^a-z0-9]/g, "");
       candidates.push(...(EQUIPMENT_MAKE_ALIASES[compactMake2] ?? []), ...(this.certifiedAliases[compactMake2] ?? []));
@@ -2573,7 +2858,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const core = tokens.sort((a, b) => b.length - a.length)[0];
       if (core && core.toLowerCase() !== value.toLowerCase()) candidates.push(core);
     }
-    return { key, candidates: [...new Set(candidates)], side };
+    // With a certified string, only IT says the control already holds our model: the bare series
+    // name "holds" in the 405 W option as well as the 440 W one.
+    return { key, candidates: [...new Set(candidates)], side, ...(certified ? { held: [certified] } : {}) };
+  }
+
+  /** #535 — The backend's certified model string for this side (portalRecipes certifiedModelFields:
+   *  the CEC name the portal builds its list from), or "". */
+  private certifiedModel(side: "inverter" | "module"): string {
+    return String(this.equipment[`${side}ModelCertified`] ?? "").trim();
   }
 
   /** The control's CURRENT value(s): for selects, the selected option's TEXT and
@@ -2647,6 +2940,59 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     return false;
   }
 
+  /** How many PV Array repeater rows the page shows — the replay's own row predicate
+   *  (arrayRowsInPage), imported lazily (recipeAdapter imports this module). 0 when unreadable. */
+  private async pageArrayRowCount(): Promise<number> {
+    if (!this.page || typeof this.page.evaluate !== "function") return 0;
+    try {
+      const { arrayRowsInPage } = await import("./recipeAdapter");
+      return Number(await this.page.evaluate(arrayRowsInPage, "mark").catch(() => 0)) || 0;
+    } catch { return 0; }
+  }
+
+  /** The project's PV array count: array1ModuleQuantity, array2…, as the replay counts them. */
+  private projectArrayCount(): number {
+    let n = 0;
+    for (let i = 1; i <= 12; i++) {
+      if ((this.equipment[`array${i}ModuleQuantity`] || "").trim()) n = i;
+      else break;
+    }
+    return n || 1;
+  }
+
+  /**
+   * #382 — EVERY ROOF PLANE GETS ITS OWN ROW IN THE LEARN TOO. Live (PacifiCorp NEM, 2026-10-21,
+   * four arrays 9 / 5 / 5 / 2) the learn filled the one row a fresh application renders and never
+   * clicked "Add Array"; the owner added rows 2–4 by hand, and those clicks were recorded.
+   *
+   * The rows are NOT a second copy of the row logic: the row steps this page recorded (the
+   * per-array ones, nothing else) go to a RecipeAdapter on this same page, whose
+   * fillRemainingArrayRows adds a row per remaining array and fills each inside its own row, then
+   * proves every row against ITS array (row 1 included) — exactly what a replay of this recipe
+   * does. Nothing it writes is recorded: rows 2..N are the project's data, and a replay derives
+   * them from the project's arrays the same way (a recorded "Add Array" never replays). A row that
+   * will not hold, or arrays the portal would not take a row for, are this run's misses.
+   */
+  private async fillRemainingArrayRows(pageSteps: RecipeStep[]): Promise<{ added: number; stop: string | null; review: string[] }> {
+    const none = { added: 0, stop: null, review: [] as string[] };
+    const arrays = this.projectArrayCount();
+    if (!this.page || arrays < 2) return none;
+    const perArray = (s: RecipeStep): boolean => /^array1[A-Z]/.test(String(s.field ?? "")) || s.field === "moduleMake" || s.field === "moduleModel";
+    const rowSteps = pageSteps.filter((s) => (s.action === "fill" || s.action === "select") && perArray(s));
+    if (!rowSteps.some((s) => /^array1[A-Z]/.test(String(s.field ?? "")))) return none;
+    const before = await this.pageArrayRowCount();
+    if (before < 1) return none;
+    const { RecipeAdapter } = await import("./recipeAdapter");
+    const rows = new RecipeAdapter(
+      { id: "learn-array-rows", steps: rowSteps, portalUrl: String(this.page.url?.() ?? "") } as unknown as PortalRecipe,
+      { ...this.equipment }, {}, { autoSubmit: false },
+    );
+    const r = await rows.fillRemainingArrayRows(this.page);
+    const review = r.warnings.filter((w) => /REVIEW BEFORE SUBMIT|not added|NOT filed/i.test(w));
+    this.debug?.event({ type: "array_rows", arrays, rowsBefore: before, rowsAfter: r.rows, stop: (r.stop ?? "").slice(0, 300), warnings: r.warnings.slice(0, 8).map((w) => w.slice(0, 200)) });
+    return { added: Math.max(0, r.rows - before), stop: r.stop, review };
+  }
+
   /** Fill unresolved equipment manufacturer/model/quantity + array-geometry fields
    *  from project data. Returns how many were filled; appends recipe steps + labels
    *  like other passes. Fills in DOM order so a manufacturer select's AJAX postback
@@ -2679,6 +3025,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // Ordinal of bare combined selects seen within a spec-flavored section — see
     // the side heuristic below.
     let specBareSelectSeen = 0;
+    // #382 — does this page render PV Array repeater rows? Asked once, of the replay's own row
+    // predicate, so "a row" means the same thing to the learn and to the replay.
+    const arrayRowPage = (await this.pageArrayRowCount()) > 0;
     for (let i = 0; i < fields.length; i++) {
       const field = fields[i];
       // Unlabeled / generic-labeled SELECTS stay in the pass: the PowerClerk
@@ -2696,7 +3045,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       labelSeen.set(field.label || "", occurrence + 1);
       if (field.fieldType === "button" || field.fieldType === "file" || field.fieldType === "checkbox" || field.fieldType === "radio") continue;
       const dupLabel = (labelCounts.get(field.label || "") || 0) > 1;
-      if (field.label && !dupLabel && alreadyFilledLabels.includes(field.label)) continue;
+      // #535 — A PV ARRAY ROW'S CONTROLS ARE PROJECT DATA, WHOEVER FILLED THEM FIRST. The row's Qty
+      // is the page's only "pv array quantity", so once the planner had typed the SYSTEM total
+      // there (8, for two arrays of 4) this skip left it: array1ModuleQuantity was never typed or
+      // recorded, and the rows the learn adds from the recorded array1* steps got no Qty at all.
+      // On a page of array rows, a control inside a row is never skipped for its label; the value
+      // check below leaves one already holding this project's value alone.
+      const rowControl = arrayRowPage && /pv ?array|\barray\b/i.test(`${field.section || ""} ${field.label || ""}`);
+      if (field.label && !dupLabel && !rowControl && alreadyFilledLabels.includes(field.label)) continue;
       // Proximity only carries WITHIN one section and only a few fields deep.
       if ((field.section || "") !== lastSection) {
         lastSide = undefined;
@@ -2718,7 +3074,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       if (bareSelect && !fallbackSide && specSection) {
         fallbackSide = specBareSelectSeen === 0 ? "inverter" : "module";
       }
-      const resolved = this.equipmentValueFor(context, fallbackSide, bareSelect);
+      const resolved = this.equipmentValueFor(context, fallbackSide, bareSelect, arrayRowPage);
       if (bareSelect && specSection) specBareSelectSeen++;
       if (!resolved) continue;
       // A combined bare select never seeds proximity inheritance — its side may
@@ -2727,6 +3083,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       if (resolved.side && !bareSelect) { lastSide = resolved.side; lastSideAt = i; }
       const failKey = `${resolved.key}::${context}`;
       if (this.equipmentFillFailed.has(failKey)) continue;
+      // #536: a refusal for reaching ANOTHER control is about this one occurrence's selector — a
+      // repeated label's other occurrence (the cloned system's box) still gets its own try.
+      const strayKey = `${failKey}::#${occurrence}`;
+      if (this.equipmentFillFailed.has(strayKey)) continue;
       // DUPLICATE LABELS make a label selector ambiguous — getByLabel("Quantity")
       // resolves to the FIRST match, so the inverter quantity would overwrite the
       // module quantity. Prefer the element's unique #id fallback (kept as the
@@ -2756,34 +3116,80 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           ? { ...field, selector: { css: cssFb.css, ...frame, fallbacks: labelFb } }
           : { ...field, selector: { ...field.selector, nth: occurrence } };
       }
+      // #536 — THE CONTROL THIS SELECTOR RESOLVES TO MUST BE THE ONE THE FIELD NAMES. A field's
+      // selector is read when the page is scraped; PowerClerk re-renders a section when a box in
+      // it is ticked and renumbers its per-render ids, so by the time this pass runs a recorded
+      // #pcInputBaseNN can name the NEIGHBOURING control. Live (PacifiCorp battery learn,
+      // 2026-11-02): batteryModel, aimed at "Battery Inverter Model", was typed into Total System
+      // Export (kW) — "Please enter a valid decimal number". When the element the selector reaches
+      // calls itself by ANOTHER field's label on this page (and not by this one's), nothing is
+      // typed: the field is reported and left alone.
+      const wrongControl = await this.equipmentTargetIsAnotherField(target, field, fields);
+      if (wrongControl) {
+        this.equipmentFillFailed.add(strayKey);
+        this.noteEquipmentStray({ label: String(field.label ?? ""), key: resolved.key, other: wrongControl, reverted: false, refusedBeforeWrite: true });
+        this.debug?.event({ type: "equipment_fill_wrong_control", label: context.slice(0, 80), key: resolved.key, resolvedTo: wrongControl.slice(0, 80) });
+        continue;
+      }
       // Already holding one of our values (e.g. a rescan pass)? Leave it alone —
       // re-selecting a manufacturer re-fires the portal's cascade and WIPES the
       // dependent model select that was just filled.
       const currentRaw = await this.currentControlValue(target);
-      if (currentRaw && resolved.candidates.some((c) => AutoLearnAdapter.equipmentValueMatches(currentRaw, c))) {
+      // #535: with a certified model only it (or what this pass already landed here) counts as held.
+      const landed = this.equipmentLanded.get(failKey);
+      const heldBy = [...(resolved.held ?? resolved.candidates), ...(landed ? [landed] : [])];
+      if (currentRaw && heldBy.some((c) => AutoLearnAdapter.equipmentValueMatches(currentRaw, c))) {
         if (field.label) alreadyFilledLabels.push(field.label);
+        // A row control the planner filled with this project's value but bound to another key
+        // (the total, a bare "tilt") is rebound, so the rows the learn adds — and every replay —
+        // read this array's own key.
+        if (rowControl) this.rebindRowStep(steps, field, resolved.key);
         continue;
       }
       let sawNotHeld = false;
       let success = false;
+      let strayed = false;
       for (const candidate of resolved.candidates) {
+        // #536 — what every OTHER text box on the page holds before this write, so a write that
+        // landed somewhere else is seen, put back and reported (equipmentStrayWrites).
+        const before = await this.snapshotOtherTextControls(target);
         const step = await this.applyFill(target, { value: candidate, field: resolved.key }, false);
+        const strays = before ? await this.equipmentStrayWrites(before, candidate) : [];
+        if (strays.length) {
+          // The write reached a control it was not aimed at. Put each one back to what it held,
+          // record NO step (a replay would repeat the stray write on every project), and stop
+          // trying this field for the run — a person checks both controls.
+          const reverted = await this.revertStrayWrites(strays);
+          for (const s of strays) {
+            this.noteEquipmentStray({ label: String(field.label ?? ""), key: resolved.key, other: s.label, reverted: reverted.has(s.mark), refusedBeforeWrite: false });
+          }
+          this.debug?.event({ type: "equipment_fill_stray_write", label: context.slice(0, 80), key: resolved.key, candidate: candidate.slice(0, 60), changed: strays.map((s) => s.label.slice(0, 60)), reverted: strays.filter((s) => reverted.has(s.mark)).length });
+          this.equipmentFillFailed.add(strayKey);
+          strayed = true;
+          break;
+        }
+        await this.clearEquipmentSnapshotMarks();
         if (!step) continue;
         // VERIFY the select actually took the value: the custom-combobox fallback
         // can report success without changing a native select (seen with alias
         // candidate ordering — "AP Systems" no-ops, then the loop never reached
         // "Altenergy Power System"). A fill that didn't land tries the next candidate.
-        if (target.fieldType === "select") {
+        // #536: a typed box is read back too — the value must be in the control it was aimed at.
+        if (target.fieldType === "select" || target.fieldType === "text") {
           const raw = await this.currentControlValue(target);
           // null = unreadable (trust applyFill); a READ value must actually match.
-          if (raw !== null && !AutoLearnAdapter.equipmentValueMatches(raw, candidate)) {
+          if (raw !== null && !AutoLearnAdapter.equipmentReadBackHolds(raw, candidate)) {
             sawNotHeld = true;
             this.debug?.event({ type: "equipment_fill_not_held", label: context.slice(0, 80), key: resolved.key, candidate: candidate.slice(0, 60) });
             continue;
           }
         }
+        // #535: a row control's earlier write this page (the planner's system total, a 405 W pick)
+        // is superseded: its step goes, so the recipe types this control once, from this key.
+        if (rowControl) this.dropSupersededRowSteps(steps, field);
         steps.push(step);
         if (field.label) alreadyFilledLabels.push(field.label);
+        this.equipmentLanded.set(failKey, candidate);
         filled++;
         success = true;
         this.debug?.event({ type: "equipment_fill", label: context.slice(0, 80), key: resolved.key, candidate: candidate.slice(0, 60) });
@@ -2791,9 +3197,214 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       }
       // Every candidate applied but none held: remember and stop retrying this
       // field for the rest of the run (each retry burns option-wait caps).
-      if (!success && sawNotHeld) this.equipmentFillFailed.add(failKey);
+      if (!success && sawNotHeld && !strayed) this.equipmentFillFailed.add(failKey);
     }
     return filled;
+  }
+
+  /** #535 — This page's earlier fill/select steps aimed at `field`'s control: the same scraped
+   *  selector (the planner and this pass read one scrape), searched back to the page's last
+   *  advance — another page's per-render id is another control. */
+  private rowStepsFor(steps: RecipeStep[], field: ExtractedField): number[] {
+    const sel = JSON.stringify(field.selector);
+    const out: number[] = [];
+    for (let k = steps.length - 1; k >= 0; k--) {
+      const s = steps[k];
+      if (s.action === "goto" || (s.action === "click" && /^advance:/.test(String(s.note ?? "")))) break;
+      if ((s.action === "fill" || s.action === "select") && JSON.stringify(s.selector) === sel) out.push(k);
+    }
+    return out;
+  }
+
+  /** #535 — Drop this page's earlier steps on a row control the equipment pass just filled. */
+  private dropSupersededRowSteps(steps: RecipeStep[], field: ExtractedField): void {
+    const idx = this.rowStepsFor(steps, field);
+    for (const k of idx) {
+      this.debug?.event({ type: "row_step_superseded", label: String(field.label ?? "").slice(0, 60), field: String(steps[k].field ?? "").slice(0, 60) });
+      steps.splice(k, 1); // descending order: earlier indices stay valid
+    }
+  }
+
+  /** #535 — Rebind this page's step on a row control that already holds this project's value for
+   *  `key` (the planner bound it to another key, or typed it as a literal). */
+  private rebindRowStep(steps: RecipeStep[], field: ExtractedField, key: string): void {
+    for (const k of this.rowStepsFor(steps, field)) {
+      const s = steps[k];
+      if (s.field === key) continue;
+      this.debug?.event({ type: "row_step_rebound", label: String(field.label ?? "").slice(0, 60), from: String(s.field ?? "(literal)").slice(0, 60), to: key });
+      const { value: _literal, ...rest } = s;
+      steps[k] = { ...rest, field: key };
+    }
+  }
+
+  /** A read-back of an equipment value: the select/text matcher, plus numbers compared as numbers
+   *  ("1" typed into a quantity box the portal shows as "1.00" held). */
+  private static equipmentReadBackHolds(raw: string, candidate: string): boolean {
+    if (AutoLearnAdapter.equipmentValueMatches(raw, candidate)) return true;
+    const num = (s: string): number => (/^\s*-?[\d,]*\.?\d+\s*$/.test(s) ? Number(s.replace(/,/g, "")) : NaN);
+    const c = num(candidate);
+    return Number.isFinite(c) && raw.split("\u0007").some((p) => num(p) === c);
+  }
+
+  /** #536 — Does the element this field's selector resolves to call itself by ANOTHER field's label
+   *  on this page, and not by this field's own? Returns that other label, or null (the same
+   *  control, or one that cannot tell — no own label, an unreadable page, a field without a label).
+   *  "Calls itself": label[for], a wrapping label, aria-label, aria-labelledby — the extractor's own
+   *  order. Only a POSITIVE identification as a different field refuses; an odd label source on a
+   *  custom widget never does. */
+  private async equipmentTargetIsAnotherField(target: ExtractedField, field: ExtractedField, fields: ExtractedField[]): Promise<string | null> {
+    // A generic prompt ("Please select…", "Select", "Qty") names no field: it never identifies one.
+    const GENERIC = /^(?:please )?(?:select|choose)\b.*$|^(?:qty|quantity|model|manufacturer|make)$/;
+    const norm = (s: unknown): string => String(s ?? "").toLowerCase().replace(/\*/g, " ").replace(/[^a-z0-9]+/g, " ").trim();
+    const mine = norm(field.label);
+    if (!mine) return null;
+    const others = new Map<string, string>();
+    for (const f of fields) {
+      const n = norm(f.label);
+      if (n && n !== mine && f !== field && !GENERIC.test(n)) others.set(n, String(f.label));
+    }
+    if (!others.size) return null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const loc = (await this.locator(target.selector).catch(() => null)) as any;
+    if (!loc || typeof loc.evaluate !== "function") return null;
+    const own = await loc.evaluate((el: Element) => {
+      const out: string[] = [];
+      const root = el.getRootNode() as Document | ShadowRoot;
+      const id = el.getAttribute("id");
+      if (id && typeof (root as Document).querySelector === "function") {
+        for (const l of Array.from((root as Document).querySelectorAll(`label[for="${CSS.escape(id)}"]`))) out.push(l.textContent || "");
+      }
+      const wrap = el.closest("label");
+      if (wrap) out.push(wrap.textContent || "");
+      const aria = el.getAttribute("aria-label");
+      if (aria) out.push(aria);
+      for (const ref of (el.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean)) {
+        out.push(el.ownerDocument?.getElementById(ref)?.textContent || "");
+      }
+      return out;
+    }).catch(() => null) as string[] | null;
+    if (!Array.isArray(own)) return null;
+    const ownNorm = own.map(norm).filter(Boolean);
+    if (!ownNorm.length) return null;
+    if (ownNorm.some((o) => o === mine || o.includes(mine) || mine.includes(o))) return null;
+    for (const o of ownNorm) {
+      const hit = others.get(o);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  /** #536 — every visible, editable TEXT box on the target's page other than the target (and its
+   *  own widget), stamped so it can be found again, with what it holds now. Text boxes only:
+   *  a select is LEGITIMATELY changed by an equipment pick (a manufacturer's cascade empties its
+   *  model), and a search box belongs to whichever combobox is open. null = cannot read (a fake page,
+   *  a framed control): the write goes ahead exactly as before. */
+  private async snapshotOtherTextControls(target: ExtractedField): Promise<Array<{ mark: string; label: string; value: string }> | null> {
+    if (!this.page || typeof this.page.evaluate !== "function" || target.selector?.frame) return null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const loc = (await this.locator(target.selector).catch(() => null)) as any;
+    if (!loc || typeof loc.evaluate !== "function") return null;
+    const snap = await loc.evaluate((el: Element) => {
+      const doc = el.ownerDocument;
+      if (!doc) return null;
+      doc.querySelectorAll("[data-al-eqs]").forEach((n) => n.removeAttribute("data-al-eqs"));
+      // The target's own widget: the nearest combobox-ish ancestor within three levels.
+      let widget: Element | null = null;
+      let a: Element | null = el;
+      for (let i = 0; i < 3 && a; i++, a = a.parentElement) {
+        if (/select|combo|dropdown|autocomplete|typeahead/i.test(`${a.getAttribute("class") || ""} ${a.getAttribute("role") || ""}`)) { widget = a; break; }
+      }
+      const TEXTISH = new Set(["", "text", "number", "tel", "email", "url", "decimal"]);
+      const norm = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim();
+      const labelOf = (c: Element): string => {
+        const id = c.getAttribute("id");
+        if (id) { const l = doc.querySelector(`label[for="${CSS.escape(id)}"]`); if (l?.textContent?.trim()) return norm(l.textContent); }
+        const w = c.closest("label"); if (w?.textContent?.trim()) return norm(w.textContent);
+        return norm(c.getAttribute("aria-label") || c.getAttribute("placeholder") || c.getAttribute("name") || id || "");
+      };
+      const out: Array<{ mark: string; label: string; value: string }> = [];
+      let n = 0;
+      for (const c of Array.from(doc.querySelectorAll("input, textarea"))) {
+        if (c === el || el.contains(c) || c.contains(el) || (widget && widget.contains(c))) continue;
+        const tag = c.tagName.toLowerCase();
+        const type = (c.getAttribute("type") || "").toLowerCase();
+        if (tag === "input" && !TEXTISH.has(type)) continue;
+        if (c.getAttribute("role") === "combobox" || c.hasAttribute("aria-autocomplete")) continue;
+        const ic = c as HTMLInputElement;
+        if (ic.readOnly || ic.disabled) continue;
+        const r = (c as HTMLElement).getBoundingClientRect();
+        const st = getComputedStyle(c as HTMLElement);
+        if (!(r.width > 0 && r.height > 0) || st.visibility === "hidden" || st.display === "none") continue;
+        const mark = `eqs${n++}`;
+        c.setAttribute("data-al-eqs", mark);
+        out.push({ mark, label: labelOf(c).slice(0, 120), value: ic.value || "" });
+        if (n >= 200) break;
+      }
+      return out;
+    }).catch(() => null) as Array<{ mark: string; label: string; value: string }> | null;
+    return Array.isArray(snap) ? snap : null;
+  }
+
+  /** #536 — the stamped boxes whose value CHANGED during the write to carry this job's value: the
+   *  value they hold now is not empty and contains the candidate (or is a 4+ character piece of
+   *  it). A box the portal filled from the pick (a rating populated from the certified list) holds
+   *  a different value and is left alone — that write was the portal's, not ours. */
+  private async equipmentStrayWrites(before: Array<{ mark: string; label: string; value: string }>, candidate: string): Promise<Array<{ mark: string; label: string; before: string }>> {
+    if (!before.length || !this.page) return [];
+    const nowByMark = await this.page.evaluate(() => {
+      const out: Record<string, string> = {};
+      for (const c of Array.from(document.querySelectorAll("[data-al-eqs]"))) out[c.getAttribute("data-al-eqs") || ""] = (c as HTMLInputElement).value || "";
+      return out;
+    }).catch(() => null) as Record<string, string> | null;
+    if (!nowByMark || typeof nowByMark !== "object") return [];
+    const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim();
+    const cand = norm(candidate);
+    if (!cand) return [];
+    const out: Array<{ mark: string; label: string; before: string }> = [];
+    for (const b of before) {
+      const now = nowByMark[b.mark];
+      if (typeof now !== "string" || now === b.value) continue;
+      const n = norm(now);
+      if (!n) continue;
+      const carries = n.includes(cand) || (n.length >= 4 && cand.includes(n) && !norm(b.value).includes(n));
+      if (carries) out.push({ mark: b.mark, label: b.label, before: b.value });
+    }
+    return out;
+  }
+
+  /** #536 — put each stray box back to what it held (typed + blurred, so a per-field autosave
+   *  stores the old value again), then read it back. Returns the marks that hold their old value. */
+  private async revertStrayWrites(strays: Array<{ mark: string; label: string; before: string }>): Promise<Set<string>> {
+    const ok = new Set<string>();
+    if (!this.page) return ok;
+    for (const s of strays) {
+      try {
+        const loc = this.page.locator(`[data-al-eqs="${s.mark}"]`).first();
+        await withOwnWriteWindow(this.page, `learner revert of a stray equipment write (${s.label.slice(0, 40)})`, async () => {
+          await loc.fill(s.before, { timeout: 5000 });
+          if (typeof loc.blur === "function") await loc.blur().catch(() => {});
+        });
+        const back = await loc.inputValue().catch(() => null);
+        if (back === s.before) ok.add(s.mark);
+      } catch { /* reported as not reverted */ }
+    }
+    await this.clearEquipmentSnapshotMarks();
+    return ok;
+  }
+
+  private async clearEquipmentSnapshotMarks(): Promise<void> {
+    if (!this.page || typeof this.page.evaluate !== "function") return;
+    await this.page.evaluate(() => { document.querySelectorAll("[data-al-eqs]").forEach((n) => n.removeAttribute("data-al-eqs")); }).catch(() => null);
+  }
+
+  /** #536 — an equipment write that reached (or would have reached) another control: kept for the
+   *  hand-off and the page's trust evidence. Labels only — never a value. */
+  private noteEquipmentStray(s: { label: string; key: string; other: string; reverted: boolean; refusedBeforeWrite: boolean }): void {
+    const line = s.refusedBeforeWrite
+      ? `${s.label || s.key}: its selector now reaches "${s.other}" — not filled`
+      : `${s.label || s.key}: the write also changed "${s.other}" — ${s.reverted ? "put back" : "COULD NOT be put back, check it"}; not recorded`;
+    if (!this.equipmentStrays.includes(line)) this.equipmentStrays.push(line);
+    if (!this.pageEquipmentStrays.includes(line)) this.pageEquipmentStrays.push(line);
   }
 
   // Resolve the document file to attach to a given file-input field. Matches the field's
@@ -2826,7 +3437,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     return size < 0 || size <= cap;
   }
 
-  private resolveUpload(field: ExtractedField, required = true, accept = ""): { docType: string; file: string } | null {
+  private resolveUpload(field: ExtractedField, required = true, accept = "", exactOnly = false): { docType: string; file: string } | null {
     const label = field.label || "";
     const cap = this.uploadMaxBytes();
     // A candidate must fit the size cap AND be a type this control accepts. Folding the type
@@ -2842,6 +3453,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // by a plan-set fallback, in either upload mode. Record only the exact type
     // so learning cannot teach replay to repeat a substitute indefinitely.
     const namedType = UPLOAD_LABEL_PATTERNS.find(({ re }) => re.test(label))?.docType;
+    // THE REVIEW PAGE TAKES ONLY THE DOCUMENT ITS SLOT NAMES (#383): no substitute, no fallback
+    // tier, no combined-mode plan set — a slot we cannot match exactly is left for the person.
+    if (exactOnly) return namedType && fits(namedType) ? { docType: namedType, file: this.docsByType[namedType] } : null;
     if (uploadForbidsSubstitute(label)) {
       if (namedType && fits(namedType)) return { docType: namedType, file: this.docsByType[namedType] };
       this.debug?.event({ type: "upload_no_substitute", label: label.slice(0, 60) });
@@ -2934,8 +3548,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   }
 
   // Resolve a docType for an upload control by its label only (no ExtractedField wrapper).
-  private resolveUploadByLabel(label: string, required = true, accept = ""): { docType: string; file: string } | null {
-    return this.resolveUpload({ selector: {}, label, fieldType: "file" }, required, accept);
+  private resolveUploadByLabel(label: string, required = true, accept = "", exactOnly = false): { docType: string; file: string } | null {
+    return this.resolveUpload({ selector: {}, label, fieldType: "file" }, required, accept, exactOnly);
   }
 
   // Capture a full-page PNG of the current page as base64 for VISION-ASSISTED PLANNING, so the
@@ -3116,9 +3730,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     } catch { return []; }
   }
 
+  // `reviewPage` (#383): the page reads as review, so the pass is ATTACH-ONLY — a native file
+  // input whose label names a document we hold, set directly. Nothing is clicked (a custom
+  // Browse widget needs a click, and on a review page a click is how a portal files), no
+  // substitute document is filed, and every required slot left empty is reported.
   private async performUploads(
     steps: RecipeStep[],
     alreadyFilledLabels: string[],
+    opts: { reviewPage?: boolean } = {},
   ): Promise<{ filled: string[]; missingRequired: string[]; attached: number }> {
     const filled: string[] = [];
     const missingRequired: string[] = [];
@@ -3164,7 +3783,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     let pathKey = "";
     try { pathKey = new URL(String(this.page.url?.() ?? "")).pathname.toLowerCase(); } catch { pathKey = ""; }
     for (const slot of slots) {
-      const resolved = this.resolveUploadByLabel(slot.label, !!slot.required, slot.accept || "");
+      if (opts.reviewPage && slot.kind !== "input") {
+        this.debug?.event({ type: "upload_review_widget_left", label: (slot.label || "").slice(0, 80) });
+        if (slot.required) missingRequired.push(`${slot.label || "Required document"} (on the review page — attach it by hand; automation clicks no upload widget there)`);
+        continue;
+      }
+      const resolved = this.resolveUploadByLabel(slot.label, !!slot.required, slot.accept || "", !!opts.reviewPage);
       if (!resolved) {
         // No document for this control — never fake it. Report it if the portal requires it.
         if (slot.required) missingRequired.push(slot.label || "Required document");
@@ -3228,9 +3852,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         async () => {
           if (slot.kind === "input") {
             // Native input — set files directly even when visually hidden behind a button.
+            // The run's OWN write: the portal's async upload request that follows is this
+            // attach committing, and must not meet the review lockdown's live reading (rule
+            // 4b) on a page that reads as review — PowerClerk's attachments sit on exactly
+            // that page (#383). Payment, the filing-URL rule and the sticky lock still apply.
             const loc = this.page!.locator(selector.css!);
             this.options.beforeUpload?.(resolved.docType, resolved.file);
-            await loc.setInputFiles(uploadPayload ?? resolved.file);
+            await withOwnWriteWindow(this.page, `learner upload (${resolved.docType})`, () => loc.setInputFiles(uploadPayload ?? resolved.file));
           } else {
             // Custom widget — the real <input> is created on click, so intercept the
             // browser's file-chooser dialog (works for ANY uploader, no DOM coupling).
@@ -3673,6 +4301,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // so no request of it may file or pay, whichever control or script fired it. Removed in the
     // finally below, before anything hands this page to a person.
     const backstop = await installFilingBackstop(this.page, "learn run").catch(() => null);
+    const guardNote = backstop?.redirectGuardNote ?? "";
     try {
       // What discipline this run is filing. Held on the instance so the fill guard can refuse
       // a record type that contradicts it — the planner sees one page at a time and does not.
@@ -3697,10 +4326,19 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // left, ended, stopped or found nothing fillable on without entering this job's own data there
       // — the incident, settled here (every exit of the walk), before the backstop is disposed.
       result = this.settleInfoPageProof(result, backstop);
+      // #394: the walk starts on the page login left loaded — if the redirect guard could not
+      // cover it, the result says so (never silent).
+      if (guardNote) result = { ...result, message: `${result.message} ${guardNote}`.trim() };
       // The message quotes the portal (validation errors, notices) — a portal can echo an account.
       result = { ...result, message: this.scrubSecrets(result.message) };
       // #344: the unverified information page this walk held (for a person to verify), and every
       // verified one it passed (each use of the relaxation is on record).
+      // #536: per-page trust evidence (for the gate, #534) and, in the hand-off, any equipment write
+      // that reached another control — a person checks both boxes before submitting.
+      if (this.trustEvidence.length) result = { ...result, trustEvidence: this.trustEvidence.map((e) => ({ ...e, validationErrors: [...e.validationErrors], requiredUnchecked: e.requiredUnchecked.map((u) => ({ ...u })), strayWrites: [...e.strayWrites] })) };
+      if (this.equipmentStrays.length) {
+        result = { ...result, message: `${result.message} EQUIPMENT FILL REACHED ANOTHER CONTROL — check before submitting: ${this.equipmentStrays.slice(0, 6).map((l) => this.scrubSecrets(l)).join("; ")}.` };
+      }
       if (this.infoPageCandidate) result = { ...result, infoPageCandidate: this.infoPageCandidate };
       if (this.infoPagePassed.length) result = { ...result, infoPagePassed: [...this.infoPagePassed] };
       if (this.infoPageIncidents.length) result = { ...result, infoPageIncidents: this.infoPageIncidents.map((i) => ({ ...i, why: i.why.map((w) => this.scrubSecrets(w)) })) };
@@ -5356,6 +5994,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // a 6-page budget; a refusal already knows what went wrong, so it says so immediately.
     let pendingHint = "";
     const MAX_RECOVERY = 3;
+    // THE PLAN ACTS ON THE PAGE IT WAS MADE FOR (#410). Re-reads of a page that changed between
+    // its scrape and its plan being applied — bounded per run, so a page that keeps repainting
+    // itself cannot spend the budget re-planning; past the cap the walk behaves as before.
+    let pageMovedReplans = 0;
+    const PAGE_MOVED_REPLAN_MAX = 4;
+    // A REQUIRED BLANK STOPS THE ADVANCE (#410): pages (by identity) already given their one
+    // re-plan for required fields still blank, and a per-run cap on those planner calls.
+    const requiredReplanned = new Set<string>();
+    const REQUIRED_REPLAN_MAX = 8;
     // Validation blockers: collected when an advance click fails to move the page forward
     // (portal blocked the step due to required-field errors). Injected into the recovery hint
     // and surfaced in the final message so the operator can see WHICH fields the portal rejected.
@@ -5479,6 +6126,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         break;
       }
       pageCount++;
+      // Where this page's recorded steps begin (#382: the PV Array row steps it records).
+      const pageStepsFrom = steps.length;
       // THE BACKSTOP ABORTED A FILING, A PAYMENT OR A REVIEW-PAGE POST: stop here, named. Walking
       // on would drive the same page (and its filing control) again. learn() reports every abort.
       {
@@ -5510,11 +6159,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // can do about it.
           if (this.infoPageHeldVerified.length) {
             return {
-              ...fail(steps, this.portalName, `HELD AT A VERIFIED INFORMATION PAGE: ${describeBackstopAbort(stopping[0])}. Nothing was sent. The page is one a person verified, but this project already made progress on this portal (an earlier run passed this page, may have entered data, reached review, or a number, draft or filing is on record), so automation does not pass it again. Check this project's application on the portal; a person can then allow the pass once more for this project (project → Portal runs).`, null, pageCount, portalNotices),
+              ...fail(steps, this.portalName, `HELD AT A VERIFIED INFORMATION PAGE: ${describeBackstopAbort(stopping[0])}. ${backstopSentLine(stopping[0])} The page is one a person verified, but this project already made progress on this portal (an earlier run passed this page, may have entered data, reached review, or a number, draft or filing is on record), so automation does not pass it again. Check this project's application on the portal; a person can then allow the pass once more for this project (project → Portal runs).`, null, pageCount, portalNotices),
               stopReason: "backstop_abort",
             };
           }
-          return { ...fail(steps, this.portalName, `Stopped by the network backstop: ${describeBackstopAbort(stopping[0])}. Nothing was sent; the step (or page script) that fired it must be reviewed.`, null, pageCount, portalNotices), stopReason: "backstop_abort" };
+          return { ...fail(steps, this.portalName, stopping[0].redirect
+            ? `Stopped by the network backstop: the portal answered a request of this run with a ${stopping[0].redirect.status} redirect it would not follow — ${describeBackstopAbort(stopping[0])}. ${backstopSentLine(stopping[0])} Check on the portal what it did with that request.`
+            : `Stopped by the network backstop: ${describeBackstopAbort(stopping[0])}. Nothing was sent; the step (or page script) that fired it must be reviewed.`, null, pageCount, portalNotices), stopReason: "backstop_abort" };
         }
       }
       // Reset per-page label tracking so the planner sees a clean slate on each page —
@@ -5582,6 +6233,36 @@ export class AutoLearnAdapter extends BasePortalAdapter {
 
       // Debug: capture the page as-seen BEFORE any fills.
       await saveDebugShot(`p${pageCount.toString().padStart(3, "0")}-before-${(pageTitle || "page").replace(/\s+/g, "_").slice(0, 40)}`);
+
+      // THE PAGE THIS ITERATION'S PLAN IS FOR (#410), read with the scrape. Everything between
+      // here and the first fill (the entry pass, the type chooser, the planner call itself) can
+      // leave a different page on screen; `pageMovedUnderPlan` asks before the plan is applied.
+      const scrapedIdentity = await pageIdentityOf(this.page);
+      const stepsAtScrape = steps.length;
+      const pageMovedUnderPlan = async (phase: "before the planner was asked" | "while the planner worked"): Promise<boolean> => {
+        if (!scrapedIdentity || pageMovedReplans >= PAGE_MOVED_REPLAN_MAX) return false;
+        const now = await pageIdentityOf(this.page);
+        if (!now || (now.where === scrapedIdentity.where && now.controls === scrapedIdentity.controls)) return false;
+        pageMovedReplans++;
+        const headingOf = (w: string): string => w.slice(w.indexOf("|") + 1) || "(no heading)";
+        const before = new Set(scrapedIdentity.controls.split(",").filter(Boolean));
+        const shared = now.controls.split(",").filter((c) => c && before.has(c)).length;
+        // ANOTHER PAGE, not the same page painting more controls after it was read: its path or
+        // heading moved, or not one control it was read with is still there.
+        const anotherPage = now.where !== scrapedIdentity.where || (before.size > 0 && shared === 0);
+        const recorded = steps.length > stepsAtScrape;
+        this.debug?.event({
+          type: "page_changed_under_plan", page: pageCount, phase, anotherPage, recorded,
+          from: headingOf(scrapedIdentity.where).slice(0, 60), to: headingOf(now.where).slice(0, 60),
+        });
+        // ANY PAGE CHANGE THE WALK CAUSED IS A STEP, OR IT IS SAID. A change with no recorded step
+        // since the scrape cannot be replayed: the person at review hears where it happened.
+        if (anotherPage && !recorded) {
+          const note = `The portal moved from "${headingOf(scrapedIdentity.where).slice(0, 60)}" to "${headingOf(now.where).slice(0, 60)}" ${phase} on page ${pageCount}, without a recorded step. The walk re-read and re-planned the new page, but a replay of this recipe has no step for that change; if a replay stops there, re-record the portal.`;
+          if (!this.pageReviewNotes.includes(note)) this.pageReviewNotes.push(note);
+        }
+        return true;
+      };
 
       // PAGE CLASSIFICATION. A page with NO fillable inputs is EITHER a dashboard/home
       // (just navigation links — the portal entry screen after login) OR a read-only
@@ -6043,7 +6724,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // and the pass finds the identical button again — the second click TOGGLES the
         // drawer shut and the step lands in the recipe twice. The finder refuses it outright
         // now, so no click happens and nothing is recorded.
-        const entered = await enterApplicationFlow(this.page, { skipLabels: this.entryLabelsClicked }).catch(() => null);
+        // ONCE AN ENTRY CLICK HAS LANDED, ONE LOOK ONLY (#410): the walk is inside an application
+        // now, and the deep search's menu clicks and reload of the page it started on are page
+        // changes no step records (PGE: the reload resumed the wizard at Preparer, under a plan made
+        // for Welcome). A second entry on the page it opened is still found by the one look.
+        const entered = await enterApplicationFlow(this.page, { skipLabels: this.entryLabelsClicked, shallow: this.entryLabelsClicked.size > 0 }).catch(() => null);
         if (entered?.alreadyClicked) {
           this.debug?.event({ type: "application_entry_repeat_ignored", label: (entered.label || "").slice(0, 60) });
         } else if (entered?.ok && entered.label) {
@@ -6305,6 +6990,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //    THE PLANNER NEVER SEES A SIGNATURE BOX (one signer rule). The signature controls are
       //    taken out of the request; the planner's indices are into that shorter list and are
       //    mapped back here, so every consumer below still indexes `fields`.
+      // THE PAGE MUST STILL BE THE ONE READ (#410). A pass above (the entry pass, the type
+      // chooser) can leave another page on screen without asking the loop to re-read; planning
+      // `fields` then plans a page that is gone. Re-read instead — before paying for the call.
+      // Not after the typed signature: the bot's own signing changes the page it signs.
+      if (!signatureDone && await pageMovedUnderPlan("before the planner was asked")) continue;
       let plan: LearnPlanResponse;
       const planShot = await this.capturePlanScreenshot();
       const visibleIdx = fields.map((_f, i) => i).filter((i) => !signatureFieldIdx.has(i));
@@ -6344,6 +7034,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           this.debug?.event({ type: "signature_step_not_review", page: pageCount });
         }
       }
+      // ...AND STILL THE ONE READ WHEN THE PLAN COMES BACK (#410). Nothing has been applied yet:
+      // a plan whose page moved while it was being made is dropped and the new page is re-read.
+      if (!signatureDone && await pageMovedUnderPlan("while the planner worked")) continue;
 
       // c2) STRUCTURAL REVIEW GUARD — the Accela "Continue Application" trap.
       // On a review page its primary button (e.g. "Continue Application") SUBMITS, so we
@@ -6948,19 +7641,26 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //     "Browse"/"Upload"/"Choose File" widgets whose real input is created only on click
       //     (driven via the browser's filechooser event). Required slots with no matching
       //     document are reported (never faked) so the human can complete them.
-      // A REVIEW/confirm screen is a read-only summary of what was already staged — it
-      // lists the attachments rather than accepting new ones. Uploading there re-attaches
-      // a document that is already committed and then re-runs the attachment Save on a
-      // page that has nothing to commit (operator-observed on ACA's Step 3: Review).
-      if (isReviewPage || plan.atReview) {
-        this.debug?.event({ type: "upload_skipped_on_review", page: pageCount });
-      } else {
-        this.debug?.event({ type: "upload_phase_start", page: pageCount });
-        const seenSlotLabels = new Set<string>(await this.uploadSlotLabels());
+      // A REVIEW/confirm screen USUALLY lists the attachments rather than accepting new ones,
+      // and uploading there once re-attached a committed document and re-ran the attachment
+      // Save (operator-observed on ACA's Step 3: Review). But PowerClerk's FINAL page carries
+      // both the review text and the attachments — live on PacifiCorp NEM the pass was
+      // skipped there and the meter photo never went in (#383). So on a review page the pass
+      // still runs, ATTACH-ONLY (performUploads' reviewPage): a native file input whose label
+      // names a document we hold, nothing clicked, no substitute, no attachment Save — and the
+      // run stops at review afterwards exactly as before, naming any required slot left empty.
+      // ACA's unlabeled attachment rows name no document, so they are still left alone.
+      // Page-scoped, not block-scoped: the pass after this page's answers (d3e) reads both —
+      // the same attach-only rule, and the slot labels this pass already offered.
+      const reviewUpload = isReviewPage || plan.atReview === true;
+      const seenSlotLabels = new Set<string>();
+      {
+        this.debug?.event({ type: "upload_phase_start", page: pageCount, ...(reviewUpload ? { attachOnly: true } : {}) });
+        for (const l of await this.uploadSlotLabels()) seenSlotLabels.add(l);
         const up = await this.withPhaseTimeout(
           "uploads",
           150_000,
-          () => this.performUploads(steps, alreadyFilledLabels),
+          () => this.performUploads(steps, alreadyFilledLabels, { reviewPage: reviewUpload }),
           { filled: [] as string[], missingRequired: [] as string[], attached: 0 },
         );
         this.debug?.event({ type: "upload_phase_done", page: pageCount, attached: up.attached, missing: up.missingRequired.length });
@@ -6984,7 +7684,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           const late = await this.withPhaseTimeout(
             "uploads_late",
             90_000,
-            () => this.performUploads(steps, alreadyFilledLabels),
+            () => this.performUploads(steps, alreadyFilledLabels, { reviewPage: reviewUpload }),
             { filled: [] as string[], missingRequired: [] as string[], attached: 0 },
           );
           up.attached += late.attached;
@@ -6994,7 +7694,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         for (const m of up.missingRequired) if (!missingRequiredDocs.includes(m)) missingRequiredDocs.push(m);
         // ACA commits attachments only on the section's own Save (Continue Application
         // leaves them pending) — and each pending row needs its Description + Type first.
-        if (up.attached > 0 && this.isAcaPage(url, fields) && acaAttachmentSaves < 3) {
+        // Never on a review page: the Save is a click, and the attach-only pass clicks nothing.
+        if (up.attached > 0 && !reviewUpload && this.isAcaPage(url, fields) && acaAttachmentSaves < 3) {
           acaAttachmentSaves++;
           const saved = await this.withPhaseTimeout(
             "attachment_save",
@@ -7048,6 +7749,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
 
       let pageFillCountPre = 0;
       let answeredAnyPicker = false;
+      // The contact-source pickers answered below, label → the option chosen. Read by (d), which
+      // must not choose the same option again (#530).
+      const answeredPickers = new Map<string, string>();
       // c4c) A CONTACT BLOCK'S SOURCE PICKER MUST BE ANSWERED BEFORE ITS FIELDS ARE TYPED.
       //
       // PowerClerk renders each contact block with a select — "Existing contact to use for
@@ -7077,6 +7781,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             steps.push(step);
             pageFillCountPre++;
             this.debug?.event({ type: "contact_source_answered", page: pageCount, label: String(f.label ?? "").slice(0, 50), chose: chosen });
+            answeredPickers.set(String(f.label ?? ""), String(chosen));
             // CHOOSING RE-RENDERS THE BLOCK. PowerClerk rebuilds the contact fields when the
             // source changes, and their ids are render-order counters (pcInputBase15…), so a
             // fill applied against the pre-render list lands on a detached node or the wrong
@@ -7158,6 +7863,21 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         const field = fields[fillReq.selectorIndex];
         if (!field) continue; // out-of-range index from the planner — skip safely.
         if (field.fieldType === "file") continue; // handled by the upload pass above.
+        // A CONTACT-SOURCE PICKER IS ANSWERED ONCE (#530). The planner sees the same required
+        // select c4c just answered and asks for "New Contact" again. Choosing it again fires the
+        // picker's change a second time, and PowerClerk re-renders the block on every change:
+        // whatever this page filled before it in plan order (PacifiCorp's "Will the System be
+        // Customer-Owned or Third-Party Owned?") is reset. The learn's read-back can re-fill it,
+        // but the recorded steps keep the second pick AFTER that answer, so every replay resets
+        // it again and files the page with it blank. Same option = nothing to do.
+        if (field.fieldType === "select" && answeredPickers.has(String(field.label ?? ""))) {
+          const chose = answeredPickers.get(String(field.label ?? "")) ?? "";
+          const loose = (v: string): string => String(v ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+          if (loose(fillReq.value) === loose(chose)) {
+            this.debug?.event({ type: "contact_source_repick_skipped", page: pageCount, label: String(field.label ?? "").slice(0, 50) });
+            continue;
+          }
+        }
         const sensitive = isSensitiveLabel(field.label);
         const step = await this.applyFill(field, fillReq, sensitive);
         if (step) {
@@ -7239,7 +7959,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // whatever the computation then reveals (e.g. an export-capacity question).
         const MAX_RESCAN_PASSES = 7;
         let computedThisPage = false;
-        let lateEquipTried = false;
+        // The reveal the late equipment pass last looked at (null = not yet). #382: a PV Array row
+        // reveals its controls one save at a time (Manufacturer after Qty, Model after the make), and
+        // each arrives under a label the page already "filled" — so the pass looks again whenever
+        // the set of revealed controls has changed, and never twice at the same set.
+        let lateEquipSig: string | null = null;
         let lastRevealSig = "";
         for (let rescanPass = 0; rescanPass < MAX_RESCAN_PASSES; rescanPass++) {
           let revealedThisPass = 0;
@@ -7296,14 +8020,21 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             if (newFillable.length === 0) {
               // A cascade can reveal a SECOND section reusing bare labels the first
               // section already "filled" ("Manufacturer"/"Model") — those are invisible
-              // to the label-based newFillable filter, so give the equipment pass ONE
-              // look before giving up (once per page: it self-guards via value-held
-              // skip + fail memory, but pages whose values can't be read back must
-              // not loop here).
-              if (!lateEquipTried) {
-                lateEquipTried = true;
+              // to the label-based newFillable filter, so give the equipment pass a
+              // look before giving up — once per set of revealed controls (it self-guards
+              // via value-held skip + fail memory, but pages whose values can't be read
+              // back must not loop here; MAX_RESCAN_PASSES bounds it too).
+              if (lateEquipSig !== lastRevealSig) {
+                lateEquipSig = lastRevealSig;
                 const lateEquip = await this.fillEquipmentSelects(postFields, alreadyFilledLabels, steps);
-                if (lateEquip > 0) { pageFillCount += lateEquip; continue; }
+                if (lateEquip > 0) {
+                  pageFillCount += lateEquip;
+                  // A DEBOUNCED autosave is invisible to the settle (nothing is on the wire for a
+                  // beat after the pick), and the control it unlocks renders only after it lands —
+                  // let it, or the next scrape sees the same page and the cascade ends one short.
+                  await sleep(LATE_EQUIP_REVEAL_GRACE_MS);
+                  continue;
+                }
               }
               // No more cascade reveals. Before giving up, click any Calculate/Update-Totals
               // button once and loop again so the values it computes (and any field it then
@@ -7404,6 +8135,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
               const equipFilled = await this.fillEquipmentSelects(postFields, alreadyFilledLabels, steps);
               pageFillCount += equipFilled;
               revealedThisPass += equipFilled;
+              // #535 — the same grace as the late pass above. Here a control the pass cannot fill (an
+              // inverter Model nothing matched) keeps the revealed set non-empty, and without it the
+              // row's next control (its Model, after the make's debounced save) arrived after the
+              // last scrape: the row ended without a model, tilt or azimuth.
+              if (equipFilled > 0) await sleep(LATE_EQUIP_REVEAL_GRACE_MS);
             } catch { /* best-effort */ }
 
             // Debug: dump what appeared after the reveal so the operator can audit it.
@@ -7458,6 +8194,76 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           steps.push(bd.step);
           pageFillCount++;
           appliedThisPage.push(bd.applied);
+        }
+        // d3c') BATTERY-ATTESTATION PASS (#536) — the statements the declaration revealed, ticked
+        //       only where the owner ruled for this portal (see applyBatteryAttestations).
+        for (const ba of await this.applyBatteryAttestations(alreadyFilledLabels).catch(() => [])) {
+          steps.push(ba.step);
+          pageFillCount++;
+          appliedThisPage.push(ba.applied);
+        }
+      }
+
+      // d3d) EVERY PV ARRAY ITS OWN ROW (#382) — after every other pass on the page, so nothing
+      //      else re-plans the rows this adds; before the persist settle, so their autosaves land.
+      //      Never on a page that reads as review: no Add Array click or row write lands there.
+      if (!isReviewPage && !plan.atReview && !isDashboard && this.page) {
+        try {
+          const rowsOut = await this.fillRemainingArrayRows(steps.slice(Math.min(pageStepsFrom, steps.length)));
+          pageFillCount += rowsOut.added;
+          for (const m of [...(rowsOut.stop ? [rowsOut.stop] : []), ...rowsOut.review]) {
+            if (!fillVerifyMisses.includes(m)) fillVerifyMisses.push(m);
+            if (!missesDidNotHold.includes(m)) missesDidNotHold.push(m);
+          }
+        } catch { /* best-effort: row 1 stands as the learn filled it */ }
+      }
+
+      // d3e) AN UPLOAD SLOT THIS PAGE'S OWN ANSWERS REVEALED GETS THE SAME PASS (#529).
+      //
+      // Live on PacifiCorp's PowerClerk NEM (2026-11-02): "Description of Service" shows its
+      // required "Upload a photo of meter where system will be interconnected" only after an
+      // answer on the same page. The upload pass (d0) runs at page entry, BEFORE the fills, and
+      // its late look (two 1.5 s waits) only catches slots a cascade reveals on its own. The
+      // re-scan (d3) saw the slot appear (revealed_controls) but deliberately fills no file
+      // control. So nothing offered the slot to performUploads: the meter photo we held was
+      // never attached, and nothing reported the required slot as empty.
+      //
+      // After every pass that answers questions on this page (planner, re-scan, policy
+      // defaults, array rows), look again; any slot label d0 never offered gets one more
+      // performUploads — attach-only on a review page, exactly as d0 — and a required one with
+      // no document joins missingRequiredDocs. Before the persist settle (d1), so the upload's
+      // own save lands with the page's answers. A page that answered nothing reveals nothing.
+      if (pageFillCount > 0 && this.page) {
+        await this.waitForDynamicFieldsSettle().catch(() => null);
+        const fresh = (await this.uploadSlotLabels()).filter((l) => !seenSlotLabels.has(l));
+        if (fresh.length > 0) {
+          for (const l of fresh) seenSlotLabels.add(l);
+          this.debug?.event({ type: "upload_revealed_slots", page: pageCount, labels: fresh.slice(0, 6).join(" | ").slice(0, 200) });
+          const rev = await this.withPhaseTimeout(
+            "uploads_revealed",
+            90_000,
+            () => this.performUploads(steps, alreadyFilledLabels, { reviewPage: reviewUpload }),
+            { filled: [] as string[], missingRequired: [] as string[], attached: 0 },
+          );
+          this.debug?.event({ type: "upload_phase_done", page: pageCount, pass: "revealed", attached: rev.attached, missing: rev.missingRequired.length, ...(reviewUpload ? { attachOnly: true } : {}) });
+          for (const m of rev.missingRequired) if (!missingRequiredDocs.includes(m)) missingRequiredDocs.push(m);
+          // ACA commits an attachment only on its section's Save (see d0). The answers on this
+          // page are already in, so commit in place rather than re-entering the page — and say
+          // so when the Save did not take, never leave the file silently pending.
+          if (rev.attached > 0 && !reviewUpload && this.isAcaPage(url, fields) && acaAttachmentSaves < 3) {
+            acaAttachmentSaves++;
+            const saved = await this.withPhaseTimeout(
+              "attachment_save",
+              90_000,
+              () => this.accelaAttachmentSavePass(_project, steps),
+              false,
+            );
+            this.debug?.event({ type: "aca_attachment_save_pass", page: pageCount, saved, pass: "revealed" });
+            if (!saved) {
+              const warn = "Attachments were uploaded but the portal's Save did not confirm them — re-attach and click Save by hand before submitting.";
+              if (!missingRequiredDocs.includes(warn)) missingRequiredDocs.push(warn);
+            }
+          }
         }
       }
 
@@ -7519,7 +8325,26 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       //      "trusted" recipe. Only on real form pages (skip dashboards/review). Sensitive +
       //      acknowledgment fields are excluded inside the sweep.
       if (!plan.atReview && !isDashboard && hasFillable) {
-        const unfilled = await this.collectUnfilledRequired();
+        let unfilled = await this.collectUnfilledRequired();
+        // A REQUIRED BLANK STOPS THE ADVANCE (#410). Live PGE: this sweep named the Preparer's
+        // Name and Address blank on the very page it was about to leave, and the walk pressed Next
+        // anyway. Now the page gets ONE re-plan for exactly those blanks first, and the walk
+        // advances only after it; anything still blank is reported below, as before. Once per page
+        // (by identity) and capped per run, so a blank no data can answer costs one planner call,
+        // never a loop. Not on a page the bot signed (the signature boxes are the signature pass's).
+        if (unfilled.length && !signatureDone && requiredReplanned.size < REQUIRED_REPLAN_MAX) {
+          const replanKey = scrapedIdentity ? `${scrapedIdentity.where}#${scrapedIdentity.controls}` : deadPageKey(url, fields.length);
+          if (!requiredReplanned.has(replanKey)) {
+            requiredReplanned.add(replanKey);
+            const filled = await this.replanRequiredBlanks({ blanks: unfilled, url, pageTitle, steps, alreadyFilledLabels, appliedThisPage });
+            this.debug?.event({ type: "required_blank_replan", page: pageCount, blanks: unfilled.slice(0, 8), filled });
+            if (filled > 0) {
+              await this.waitForAutosaveIndicator(3000);
+              await sleep(400);
+              unfilled = await this.collectUnfilledRequired();
+            }
+          }
+        }
         for (const m of unfilled) {
           if (!fillVerifyMisses.includes(m)) fillVerifyMisses.push(m);
           if (!missesNeverFilled.includes(m) && !missesDidNotHold.includes(m)) missesNeverFilled.push(m);
@@ -7542,6 +8367,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           }
         }
       }
+
+      // d4c) TRUST EVIDENCE (#536) — what the page ends with: a field the portal shows as invalid,
+      //      a required box left unchecked, an equipment write that strayed. Recorded for the trust
+      //      gate (#534) to read; nothing here changes the walk.
+      if (!isDashboard && hasFillable) await this.recordPageTrustEvidence(pageCount, url).catch(() => null);
 
       // e) Record the final submit (if any). Clicked ONLY on the operator's explicit
       //    delegation; otherwise recorded and left for a human. Pay/fee buttons rejected.
@@ -8095,10 +8925,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       + (unboundBlank.length
         ? ` 🔒 Left blank for you — required, and no binding a replay can resolve: ${unboundBlank.slice(0, 6).join(", ")}. A person types it on every filing until a project field exists for it.`
         : "");
+    // #524: who is filing is never a near-match — said, with the company, wherever the walk ended.
+    const filerWarning = this.filerIdentityRefused.length
+      ? ` 🏢 Not chosen — ${this.filerIdentityRefused.slice(0, 3).join(" | ")}`
+      : "";
     const message = reachedReview
-      ? `${HUMAN_REVIEW_MESSAGE} Auto-learn reached the review screen after ${pageCount} page(s). Verify every field/value below before a human submits.${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`
+      ? `${HUMAN_REVIEW_MESSAGE} Auto-learn reached the review screen after ${pageCount} page(s). Verify every field/value below before a human submits.${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${filerWarning}${noticeWarning}${choiceWarning}`
       : filledSomething
-        ? `Auto-learn filled ${pageCount} page(s) and recorded the steps, but did not reach a review screen. Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`
+        ? `Auto-learn filled ${pageCount} page(s) and recorded the steps, but did not reach a review screen. Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${filerWarning}${noticeWarning}${choiceWarning}`
         : tileStop
           ? `Auto-learn stopped at a page of ${tileStop.tiles.length} choice tile(s): ${tileStop.why}. The page offered: ${tileStop.tiles.map((t) => `"${t}"`).join(" | ")}. If one of these is the way in, a person clicks it; record that step manually. (${pageCount} page(s), no steps recorded.) Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`
           : `Auto-learn found nothing fillable on ${pageCount} page(s); no steps recorded.${nothingFillableHint} Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`;
@@ -8152,6 +8986,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       validationBlocks,
       portalNotices: portalNotices.length ? portalNotices.slice(0, 5) : undefined,
       secretsLeftBlank: this.secretsLeftBlank.length ? this.secretsLeftBlank.map((s) => s.label) : undefined,
+      filerIdentityRefused: this.filerIdentityRefused.length ? [...this.filerIdentityRefused] : undefined,
     };
   }
 
@@ -8250,6 +9085,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           });
           if (real.some((o) => norm(o.textContent || "") === w || norm(o.value) === w)) return true;
           if (w !== "" && options.some((o) => norm(o.value) === w)) return true;
+          // selectWithFallback's punctuation-blind exact pass (#530): "Customer Owned" is ready
+          // when "Customer-Owned" is listed, instead of burning the whole cap.
+          const loose = (s: string) => norm(s).replace(/[^a-z0-9]+/g, " ").trim();
+          const lw = loose(want);
+          if (lw && real.some((o) => loose(o.textContent || "") === lw)) return true;
           return real.some((o) => {
             const t = norm(o.textContent || "");
             return t.includes(w) || w.includes(t);
@@ -8363,6 +9203,49 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     if (!picked) return [];
     this.debug?.event({ type: "battery_declaration_answered", label: picked.applied.label.slice(0, 70), answer: picked.applied.expected, planner: "none" });
     return [picked];
+  }
+
+  /** THE ATTESTATIONS THE DECLARATION REVEALED, ANSWERED FROM THE OWNER'S RULING (#536).
+   *
+   *  Live PacifiCorp battery learn (2026-11-02): the declaring tick revealed "The battery system
+   *  will not backfeed into the grid." * and "The battery system includes a transfer switch (or
+   *  equivalent) to ensure proper isolation before going off grid (islanding)." *, the planner
+   *  left both unticked, and nothing else on the page would ever tick them. The owner ruled both
+   *  checked on PacifiCorp battery jobs. This pass reads the page as it stands after the
+   *  declaration and the rescans, and ticks each VISIBLE, UNCHECKED checkbox whose statement has a
+   *  ruling for this portal (shared batteryAttestationAnswer — the fill guard in applyFillInner
+   *  asks the same function, so the planner can neither skip nor invent one). Battery jobs only;
+   *  a portal with no ruling, or a statement nobody ruled on, is left alone (a person ticks it,
+   *  and the trust evidence names it as a required box left unchecked). Records a replayable
+   *  `check` whose note names the ruling. */
+  private async applyBatteryAttestations(alreadyFilledLabels: string[]): Promise<Array<{ step: RecipeStep; applied: AppliedFill }>> {
+    const out: Array<{ step: RecipeStep; applied: AppliedFill }> = [];
+    if (this.hasBattery !== true || !this.page) return out;
+    let fields: ExtractedField[] = [];
+    try { fields = (await this.extractAllFrames(EXTRACT_SEL)).map(toExtractedField); } catch { return out; }
+    for (const field of fields) {
+      if (field.fieldType !== "checkbox" || !field.label) continue;
+      const ruled = batteryAttestationAnswer(this.portalName, field.label, this.hasBattery);
+      if (!ruled) continue;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const loc = (await this.locator(field.selector).catch(() => null)) as any;
+      if (!loc) continue;
+      if (typeof loc.isVisible === "function" && !(await loc.isVisible().catch(() => false))) continue;
+      if (typeof loc.isChecked === "function" && await loc.isChecked().catch(() => false)) {
+        if (!alreadyFilledLabels.includes(field.label)) alreadyFilledLabels.push(field.label);
+        continue; // already answered as ruled
+      }
+      const step = await this.applyFill(field, { value: "true" }, false);
+      if (!step) continue;
+      step.note = `battery attestation: ${field.label.slice(0, 120)} → checked (${ruled.ruling.slice(0, 120)})`;
+      if (!alreadyFilledLabels.includes(field.label)) alreadyFilledLabels.push(field.label);
+      this.debug?.event({ type: "battery_attestation_answered", label: field.label.slice(0, 80), statement: ruled.statement, planner: "none" });
+      out.push({
+        step,
+        applied: { selector: field.selector, label: field.label, fieldType: "checkbox", expected: "true", sensitive: false, required: !!field.required },
+      });
+    }
+    return out;
   }
 
   // A DISAMBIGUATION GRID IS A CHOICE ABOUT WHOSE PROPERTY WE ARE FILING ON.
@@ -9222,6 +10105,47 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     };
   }
 
+  /** #524 — the filer-identity key a learn select answers, or "": the planner's binding when it is
+   *  one, else the company for a select whose label names the installer's company list. */
+  private filerIdentityFieldFor(field: ExtractedField, binding: string | undefined): string {
+    return filerIdentityFieldForSelect(field.label, binding);
+  }
+
+  /** #524 — select this client's option on a company / contact-code list, commit and read it back,
+   *  and record a step BOUND to the key (replay resolves it per client; a literal company would be
+   *  this client's on every later filing). The company is the filing company's own name
+   *  (contactIdentity), never the planner's. A miss: nothing selected, nothing recorded, said. The
+   *  option that landed is written back to fillReq.value, so the page's read-back (AppliedFill
+   *  .expected) and its one re-apply ask for that exact label, never the planner's wording. */
+  private async applyFilerIdentitySelect(field: ExtractedField, filer: string, fillReq: { value: string; field?: string }): Promise<RecipeStep | null> {
+    const company = String(this.contactIdentity.companyName ?? "").replace(/\s+/g, " ").trim();
+    const value = filer === "installerCompanyName" ? company : String(fillReq.value ?? "").trim();
+    const input = { field: filer, value, control: String(field.label ?? "").slice(0, 60), company };
+    try {
+      const loc = await this.locator(field.selector);
+      if (!loc) throw new Error("selector unresolved");
+      const hit = await selectFilerIdentity(loc, input);
+      if (typeof loc.blur === "function") await loc.blur().catch(() => {});
+      await assertFilerIdentityHeld(loc, hit, input);
+      fillReq.value = hit.label;
+      this.debug?.event({ type: "filer_identity_selected", label: input.control, field: filer, folded: hit.label !== value });
+    } catch (err) {
+      const msg = err instanceof FilerIdentityStop ? err.message
+        : filerIdentityStopMessage({ ...input, code: filer === "installerCompanyName" ? undefined : value, why: `the list could not be read or set (${err instanceof Error ? err.message.slice(0, 120) : String(err)})` });
+      if (!this.filerIdentityRefused.includes(msg)) this.filerIdentityRefused.push(msg);
+      this.debug?.event({ type: "filer_identity_refused", label: input.control, field: filer });
+      return null;
+    }
+    return {
+      action: "select",
+      phase: "fill",
+      selector: field.selector,
+      note: field.label || undefined,
+      field: filer,
+      ...(field.fingerprint ? { fingerprint: field.fingerprint } : {}),
+    };
+  }
+
   private async applyFillInner(
     field: ExtractedField,
     fillReq: { value: string; field?: string },
@@ -9329,6 +10253,29 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     //   PROGRAM     "Will you be participating in the Wattsmart Battery Program?" is required of
     //               every applicant, battery or not — never refused (PacifiCorp rejected a
     //               filing by name when it was left blank), never forced.
+    // DETERMINISTIC GUARD: A BATTERY ATTESTATION IS A STATEMENT ON THE FILING (#536).
+    //
+    // "The battery system will not backfeed into the grid." and "…includes a transfer switch (or
+    // equivalent) to ensure proper isolation before going off grid (islanding)." are things the
+    // applicant SAYS about this battery. Who may say them is an owner ruling per portal
+    // (shared BATTERY_ATTESTATION_RULINGS — PacifiCorp, 2026-11-02: both checked), never the
+    // planner's judgement: with a ruling the box is ticked (whatever the planner offered); without
+    // one, or on a job whose battery is absent or unknown, nothing is ticked or recorded and the
+    // box stays for a person. Only a checkbox is answered — the ruling says "checked".
+    if (batteryControlKind(field.label || "", { control: field.fieldType, options: field.options }) === "attestation") {
+      const label = String(field.label ?? "");
+      const ruled = field.fieldType === "checkbox" ? batteryAttestationAnswer(this.portalName, label, this.hasBattery) : null;
+      if (!ruled) {
+        this.debug?.event({ type: "battery_attestation_left_for_person", label: label.slice(0, 80), hasBattery: this.hasBattery ?? null, control: field.fieldType });
+        return null;
+      }
+      if (value.trim() !== "true") {
+        this.debug?.event({ type: "battery_attestation_answered", label: label.slice(0, 80), statement: ruled.statement, planner: value.trim() ? "corrected" : "none" });
+        value = "true";
+        fillReq.value = value;
+      }
+    }
+
     if (this.hasBattery !== undefined) {
       const label = field.label || "";
       const kind = batteryControlKind(label, { control: field.fieldType, options: field.options });
@@ -9388,6 +10335,16 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       : false;
     if (negated) return null; // leave unselected — no action and no recorded step
 
+    // DETERMINISTIC GUARD: WHO IS FILING IS NOT A PLANNER CHOICE, AND NEVER A NEAR MATCH (#524).
+    // A select the planner bound to the company / a contact code, or one whose label names the
+    // installer's company list, takes THIS client's option exactly (filerIdentitySelect) — the
+    // contains match below would put "Sun Co" on "Sun Co Northwest". A miss selects nothing,
+    // records nothing, and is said in the result.
+    if (action === "select") {
+      const filer = this.filerIdentityFieldFor(field, fillReq.field);
+      if (filer) return this.applyFilerIdentitySelect(field, filer, fillReq);
+    }
+
     const res = await safeAction(
       // The label is non-PII enough for a log line, but keep it short.
       (field.label || field.fieldType).slice(0, 40),
@@ -9434,7 +10391,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // interaction for styled-div dropdowns. Shared with replay via selectWithFallback so
           // a value like "Schedule 7" resolves to "Schedule 7 - Residential…" identically in
           // both paths (a learn that fills it must replay it the same way).
-          await selectWithFallback(this.page, loc, value);
+          const took = await selectWithFallback(this.page, loc, value);
+          // A CHOICE THE LIST DOES NOT HOLD IS SAID, WITH THE LIST (#530). This miss used to be
+          // silent here and surface only later as "fills_did_not_hold" + "required_never_filled",
+          // which cannot tell a portal that cleared the answer from one that never offered it.
+          if (!took) await this.noteSelectNotOffered(loc, field.label || "", value, sensitive);
         } else if (action === "check") {
           if (negated) {
             // Explicit false/no → uncheck the box (leave it unchecked).
@@ -9586,7 +10547,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const label = ((await btn.textContent().catch(() => "")) || "").trim();
       // Defense in depth: never click something that's actually a pay or submit control.
       if (isPayFee(label) || SUBMIT_INTENT.test(label)) return false;
+      // WAIT FOR THE RESULT, NOT THE CLICK (issue #352). A question the computed rating decides
+      // (PacifiCorp's AC disconnect section) renders only when the result is back; reading the page
+      // before that recorded nothing for it, and the learn's own sweep then found it required and
+      // never filled. The shared settle reads the page's own "still computing" signals, bounded.
+      await prepareComputeSettle(this.page);
       await this.clickResilient(btn);
+      const computed = await waitForComputeSettled(this.page);
+      this.debug?.event({ type: "compute_settled", label: label.slice(0, 40), settled: computed.settled, ms: computed.waitedMs, reason: computed.reason.slice(0, 160) });
       await this.waitForDynamicFieldsSettle();
       await this.clearOverlays();
       steps.push({
@@ -9610,6 +10578,90 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   // flagging them would block every PowerClerk recipe from ever being trusted. The standard
   // "I understand my form will not be submitted…" acknowledgment is excluded too — it's the
   // review-gate checkbox, ticked at the review screen, not a data field. Returns visible labels.
+  /** A REQUIRED BLANK STOPS THE ADVANCE (#410): the page's ONE re-plan, for the required fields
+   *  the sweep just found blank on the page the walk is about to leave. The page is re-read (its
+   *  indices are the live page's), the planner is asked again with the blanks named, and only a
+   *  fill aimed at one of those blanks, on a control still empty, is applied: what the page
+   *  already holds is never re-typed, and nothing else on the page is re-run (the deterministic
+   *  passes have had their turn). The values are the planner's binding of this job's data, as on
+   *  any page (a Preparer / Submitter section is whoever submits, by the planner's own rules);
+   *  sensitive boxes stay excluded (the sweep never names one, and the label check refuses one).
+   *  Returns the number of fills applied; the caller sweeps again and reports what is still blank. */
+  private async replanRequiredBlanks(ctx: {
+    blanks: string[];
+    url: string;
+    pageTitle: string;
+    steps: RecipeStep[];
+    alreadyFilledLabels: string[];
+    appliedThisPage: AppliedFill[];
+  }): Promise<number> {
+    if (!this.page) return 0;
+    const norm = (s: string): string => String(s ?? "").replace(/[*:]/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+    const blanks = ctx.blanks.map(norm).filter(Boolean);
+    const aimsAtBlank = (label: string): boolean => {
+      const l = norm(label);
+      return !!l && blanks.some((b) => b === l || (l.length >= 4 && (b.startsWith(`${l} `) || l.startsWith(`${b} `))));
+    };
+    let fields: ExtractedField[] = [];
+    let bodyText = "";
+    try {
+      await this.waitForDynamicFieldsSettle().catch(() => null);
+      fields = (await this.extractAllFrames(EXTRACT_SEL)).map(toExtractedField);
+      const rawBody = await this.page.locator("body").innerText().catch(() => "");
+      bodyText = (redactStatusText(this.scrubSecrets(String(rawBody))) ?? "").slice(0, 2000);
+    } catch { return 0; }
+    if (!fields.length) return 0;
+    const named = ctx.blanks.slice(0, 8).map((b) => `"${b.slice(0, 60)}"`).join(", ");
+    let plan: LearnPlanResponse;
+    try {
+      plan = await this.askPlanner({
+        url: ctx.url,
+        pageTitle: ctx.pageTitle,
+        fields,
+        bodyText,
+        alreadyFilledLabels: ctx.alreadyFilledLabels,
+        isDashboard: false,
+        recoveryHint: `REQUIRED fields on THIS page are still blank and the walk is about to leave it: ${named}. ` +
+          `Fill each of them with this job's data, bound the way you bind every field (a Preparer / Submitter / Agent section is whoever submits the application, as your rules say). ` +
+          `Leave a field blank rather than invent a value. Do not change any field that already holds a value. Return only fills; the page's advance is already chosen.`,
+        screenshotBase64: await this.capturePlanScreenshot(),
+      });
+    } catch (err) {
+      this.debug?.event({ type: "required_blank_replan_error", message: (err instanceof Error ? err.message : String(err)).slice(0, 200) });
+      return 0;
+    }
+    let applied = 0;
+    for (const fillReq of plan.fills ?? []) {
+      const field = fields[fillReq.selectorIndex];
+      if (!field || field.fieldType === "button" || field.fieldType === "file") continue;
+      if (isSensitiveLabel(field.label)) continue;
+      if (!aimsAtBlank(field.label)) continue;
+      // A label can repeat on a page (PowerClerk's "Name" under two sections): only a control that
+      // is still empty is the blank. A box that already holds a value is never re-typed here.
+      if (field.fieldType === "text" || field.fieldType === "other") {
+        const loc = await this.locator(field.selector).catch(() => null);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const held = loc && typeof (loc as any).inputValue === "function" ? String(await (loc as any).inputValue({ timeout: 2000 }).catch(() => "")) : "";
+        if (held.trim()) continue;
+      }
+      const step = await this.applyFill(field, fillReq, false);
+      if (!step) continue;
+      ctx.steps.push(step);
+      applied++;
+      if (field.label) ctx.alreadyFilledLabels.push(field.label);
+      ctx.appliedThisPage.push({
+        selector: field.selector,
+        label: field.label || "",
+        fieldType: field.fieldType,
+        expected: fillReq.value ?? "",
+        sensitive: false,
+        required: !!field.required,
+        group: field.group,
+      });
+    }
+    return applied;
+  }
+
   private async collectUnfilledRequired(): Promise<string[]> {
     if (!this.page || typeof this.page.evaluate !== "function") return [];
     const labels = await this.page.evaluate(() => {
@@ -9698,8 +10750,150 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     return kept;
   }
 
+  /** #536 — THE PAGE'S TRUST EVIDENCE, recorded as the walk is about to leave it (see
+   *  PageTrustEvidence). Two in-page readings plus the equipment pass's own stray writes:
+   *   - a control the portal marks INVALID (aria-invalid="true", Bootstrap's .is-invalid, or a
+   *     native constraint failure on a box that holds a value) with the message beside it, and any
+   *     visible field-level message element (.invalid-feedback, .field-validation-error,
+   *     [class*=validation-message], [class*=error-message]) — named by its field. Page banners
+   *     (role=alert summaries) are portalNotices' channel, not this one: a notice is not a field
+   *     the walk got wrong.
+   *   - a REQUIRED checkbox (required / aria-required / an asterisk on its own or its group's
+   *     label) still unchecked, flagged `acknowledgment` when it is a box the walk leaves for a
+   *     person by design (the same wording collectUnfilledRequired excludes).
+   *  Nothing here changes what the walk does next. */
+  private async recordPageTrustEvidence(page: number, url: string): Promise<void> {
+    const strayWrites = this.pageEquipmentStrays.splice(0);
+    type Read = { validationErrors: string[]; requiredUnchecked: Array<{ label: string; acknowledgment: boolean }> };
+    let read = null as Read | null;
+    if (this.page && typeof this.page.evaluate === "function") {
+      read = await this.page.evaluate(() => {
+        const norm = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim();
+        const ACK = /will not be submitted until|i understand\b|i acknowledge|accept (the )?terms|terms (and|&) conditions/i;
+        const GROUP = "fieldset, .form-group, [class*='form-group'], [class*='field'], .row, [class*='row']";
+        const visible = (el: Element) => {
+          const r = (el as HTMLElement).getBoundingClientRect?.();
+          if (!r || !(r.width > 0 && r.height > 0)) return false;
+          const st = getComputedStyle(el as HTMLElement);
+          return st.visibility !== "hidden" && st.display !== "none";
+        };
+        const labelOf = (el: Element): string => {
+          const id = el.getAttribute("id");
+          if (id) { const l = document.querySelector(`label[for="${CSS.escape(id)}"]`); if (l?.textContent?.trim()) return norm(l.textContent); }
+          const w = el.closest("label"); if (w?.textContent?.trim()) return norm(w.textContent);
+          const aria = el.getAttribute("aria-label"); if (aria) return norm(aria);
+          const grp = el.closest(GROUP);
+          const gl = grp?.querySelector("legend, label, .control-label, .field-label");
+          return norm(gl?.textContent || el.getAttribute("name") || "");
+        };
+        const clean = (l: string) => l.replace(/\s*\*\s*$/, "").replace(/\s*\*\s*/g, " ").trim();
+        const MSG = ".invalid-feedback, .field-validation-error, [class*='validation-message'], [class*='error-message']";
+        const errors = new Set<string>();
+        const controls = Array.from(document.querySelectorAll("input, select, textarea")) as Array<HTMLInputElement>;
+        for (const c of controls) {
+          const type = (c.getAttribute("type") || "").toLowerCase();
+          if (type === "hidden" || type === "button" || type === "submit") continue;
+          if (!visible(c)) continue;
+          const flagged = c.getAttribute("aria-invalid") === "true" || c.classList.contains("is-invalid")
+            // A native number box holding a non-number. Other native constraints (step, range,
+            // pattern) are not read: a novalidate form may never enforce them, and evidence the
+            // portal itself would not complain about is noise for the gate.
+            || (!!c.validity && c.validity.badInput === true);
+          if (!flagged) continue;
+          const grp = c.closest(GROUP) || c.parentElement;
+          const msgEl = grp ? Array.from(grp.querySelectorAll(MSG)).find((m) => visible(m) && norm(m.textContent)) : null;
+          const msg = norm(msgEl?.textContent) || norm(c.validationMessage) || "shown as invalid";
+          errors.add(`${clean(labelOf(c)) || "field"}: ${msg}`.slice(0, 200));
+        }
+        for (const m of Array.from(document.querySelectorAll(MSG))) {
+          if (!visible(m)) continue;
+          const t = norm(m.textContent);
+          if (t.length < 4) continue;
+          const grp = m.closest(GROUP) || m.parentElement;
+          const c = grp?.querySelector("input:not([type=hidden]), select, textarea");
+          const line = `${c ? clean(labelOf(c)) || "field" : "field"}: ${t}`.slice(0, 200);
+          if (![...errors].some((e) => e.endsWith(`: ${t}`) || e === line)) errors.add(line);
+        }
+        const unchecked: Array<{ label: string; acknowledgment: boolean }> = [];
+        const seen = new Set<string>();
+        for (const c of Array.from(document.querySelectorAll("input[type=checkbox]")) as HTMLInputElement[]) {
+          if (c.checked) continue;
+          // A styled checkbox's input is often visually hidden behind its label: visible if either is.
+          const id = c.getAttribute("id");
+          const forLbl = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+          if (!visible(c) && !(forLbl && visible(forLbl)) && !(c.closest("label") && visible(c.closest("label") as Element))) continue;
+          const own = norm(forLbl?.textContent || c.closest("label")?.textContent || c.getAttribute("aria-label") || "");
+          const grp = c.closest(GROUP);
+          const gl = grp?.querySelector("legend, label, .control-label, .field-label");
+          // PowerClerk puts the red asterisk in a sibling span after the label
+          // (data-test-role="required-indicator"), so a lone "*" element in the box that holds only
+          // this checkbox counts as well.
+          const box = grp || c.parentElement;
+          const lone = !!box && box.querySelectorAll("input[type=checkbox]").length === 1;
+          const indicator = lone && !!box && Array.from(box.querySelectorAll("span, abbr, sup, i, b, strong")).some((e) => /^\s*\*\s*$/.test(e.textContent || ""));
+          const required = c.required || c.getAttribute("aria-required") === "true" || /\*/.test(own) || (!own && /\*/.test(gl?.textContent || "")) || indicator;
+          if (!required) continue;
+          const label = clean(own || norm(gl?.textContent) || c.getAttribute("name") || "checkbox").slice(0, 200);
+          if (seen.has(label)) continue;
+          seen.add(label);
+          unchecked.push({ label, acknowledgment: ACK.test(label) });
+        }
+        return { validationErrors: Array.from(errors).slice(0, 20), requiredUnchecked: unchecked.slice(0, 20) };
+      }).catch(() => null) as Read | null;
+    }
+    const shape = read && Array.isArray(read.validationErrors) && Array.isArray(read.requiredUnchecked) ? read : { validationErrors: [], requiredUnchecked: [] };
+    const entry: PageTrustEvidence = {
+      page,
+      where: safeHostPath(url),
+      validationErrors: shape.validationErrors.map((e) => this.scrubSecrets(String(e))),
+      requiredUnchecked: shape.requiredUnchecked.map((u) => ({ label: this.scrubSecrets(String(u.label)), acknowledgment: u.acknowledgment === true })),
+      strayWrites: strayWrites.map((w) => this.scrubSecrets(w)),
+    };
+    if (!entry.validationErrors.length && !entry.requiredUnchecked.length && !entry.strayWrites.length) return;
+    this.trustEvidence.push(entry);
+    // One event per kind of evidence, named for what it is (the gate's reader, #534, keys on them).
+    if (entry.validationErrors.length) {
+      this.debug?.event({ type: "validation_error_after_fill", page, where: entry.where, errors: entry.validationErrors.slice(0, 12) });
+    }
+    if (entry.requiredUnchecked.length) {
+      this.debug?.event({ type: "required_checkbox_unchecked", page, where: entry.where, boxes: entry.requiredUnchecked.slice(0, 12) });
+    }
+    if (entry.strayWrites.length) {
+      this.debug?.event({ type: "equipment_fill_reached_other_control", page, where: entry.where, writes: entry.strayWrites.slice(0, 12) });
+    }
+  }
+
   // Read each applied fill back; re-apply once if it didn't hold; return the labels of REQUIRED
   // fields that STILL won't hold their value (the portal silently dropped them).
+  /** #530 — a select that took none of its options for `value`: name what it DID offer, once per
+   *  label and value, so a blank required select reads as "the answer is not one of these" rather
+   *  than as a fill the portal took back. Native <select> only (a styled widget's list is not in
+   *  the DOM until opened). The wanted value of a sensitive field is never logged. Never throws. */
+  private selectNotOfferedSeen = new Set<string>();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async noteSelectNotOffered(loc: any, label: string, value: string, sensitive: boolean): Promise<void> {
+    try {
+      if (!loc || typeof loc.evaluate !== "function") return;
+      const offered = await loc.evaluate((el: Element) => {
+        if ((el.tagName || "").toLowerCase() !== "select") return null;
+        return Array.from((el as HTMLSelectElement).options)
+          .map((o) => (o.textContent || "").replace(/\s+/g, " ").trim())
+          .filter((t) => t && !/^(please\s+)?(select|choose)\b\.{0,3}|^--/i.test(t));
+      }).catch(() => null) as string[] | null;
+      if (!Array.isArray(offered)) return;
+      const key = sensitive ? label : `${label}\u0000${value}`;
+      if (this.selectNotOfferedSeen.has(key)) return;
+      this.selectNotOfferedSeen.add(key);
+      this.debug?.event({
+        type: "select_value_not_offered",
+        label: label.slice(0, 80),
+        ...(sensitive ? {} : { wanted: String(value ?? "").slice(0, 80) }),
+        offered: offered.slice(0, 12).map((o) => o.slice(0, 60)),
+        ...(offered.length > 12 ? { more: offered.length - 12 } : {}),
+      });
+    } catch { /* reporting only */ }
+  }
+
   private async verifyFillsLanded(applied: AppliedFill[], opts?: { budgetMs?: number; requiredOnly?: boolean }): Promise<string[]> {
     const misses: string[] = [];
     // A RE-ASSERT PASS IS A SAFETY NET, NOT A SECOND FILL PHASE. Unbounded, the exit pass
@@ -9742,7 +10936,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         } else if (a.sensitive || !a.expected) {
           // nothing to retype — fall through to the re-check
         } else if (a.fieldType === "select") {
-          await selectWithFallback(this.page!, loc, a.expected);
+          if (!(await selectWithFallback(this.page!, loc, a.expected))) await this.noteSelectNotOffered(loc, a.label, a.expected, a.sensitive);
         } else if (a.fieldType === "checkbox" || a.fieldType === "radio") {
           if (/^(true|yes|on|1)$/i.test(a.expected) && typeof loc.check === "function") await loc.check({ timeout: 5000 });
         } else if (typeof loc.fill === "function") {
@@ -11055,6 +12249,38 @@ export async function advanceSignatureOf(page: any): Promise<string> {
     });
   } catch {
     return "";
+  }
+}
+
+/** WHICH PAGE THIS IS, for "is the live page still the one the plan was made for?" (#410).
+ *  Structure only: the address's path, the page's own heading (or the wizard's active step) and
+ *  the names of the visible controls one can type into or choose. Typed values, prose length,
+ *  button counts and list rows are left out on purpose: they move while a page is being read or
+ *  answered (a dropdown read open and shut, a "Saving…" label) without the page being another.
+ *  `where` (path + heading) tells a DIFFERENT page from the same page that painted more controls
+ *  after it was read. Null when the page cannot be asked (a fake page, mid-navigation). */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function pageIdentityOf(page: any): Promise<{ where: string; controls: string } | null> {
+  if (!page || typeof page.evaluate !== "function") return null;
+  try {
+    const got = await page.evaluate(() => {
+      const vis = (el: Element): boolean => {
+        const r = (el as HTMLElement).getBoundingClientRect();
+        return r.width > 2 && r.height > 2;
+      };
+      const heading = (document.querySelector("h1, h2, legend, .wizard-step.active, [aria-current='step']")?.textContent || "")
+        .replace(/\s+/g, " ").trim().slice(0, 80);
+      const controls = (Array.from(document.querySelectorAll("input, select, textarea")) as HTMLInputElement[])
+        .filter((el) => vis(el) && !/^(hidden|submit|button|reset|image)$/i.test(el.type || ""))
+        .map((el) => (el.getAttribute("name") || el.getAttribute("id") || el.type || el.tagName).toLowerCase())
+        .sort()
+        .join(",")
+        .slice(0, 600);
+      return { where: `${location.pathname}|${heading}`, controls };
+    });
+    return got && typeof got.where === "string" ? got : null;
+  } catch {
+    return null;
   }
 }
 

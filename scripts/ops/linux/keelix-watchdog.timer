@@ -1,0 +1,12 @@
+# Every 5 minutes, starting 2 minutes after boot (so a box that came back reports it).
+# WATCHDOG_INTERVAL_SECONDS=300 in .env must match OnUnitActiveSec, or the watchdog reports gaps.
+[Unit]
+Description=Keelix watchdog every 5 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

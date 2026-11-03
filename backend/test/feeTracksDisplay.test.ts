@@ -46,11 +46,16 @@ const lift = (name: string): string => {
 const NAMES = [
   "esc", "humanize", "fmtDate", "statusBadge", "httpUrl", "portalHostname", "feeMoney",
   "FEE_SOURCE_TEXT", "FEE_CONFIDENCE", "feeConfidenceKey", "FEE_PAYMENT_METHOD", "renderFeeCharges", "feeFaceSourceHtml",
-  "feeComparisonHtml", "feePortalRecordsHtml", "renderFeeSheetLine",
+  "feeComparisonHtml", "printedFormCheckHtml", "feePortalRecordsHtml", "renderFeeSheetLine",
   "TRACK_STATUS_CLASS", "TRACK_CHANNEL_BASIS", "linkifyText", "trackChannelHtml", "OFF_TOOL_CHANNEL", "offToolChannelHtml", "trackPrerequisitesHtml", "ESS_STEP_BASIS", "trackEssStepHtml", "trackNextActionText",
   // The permit card's issuer line and its set/clear control (split issuer) — trackCardHtml calls both.
   "TRACK_ISSUER_KEY", "TRACK_ISSUER_SOURCE", "trackIssuerHtml", "trackIssuerEditHtml", "saveTrackIssuer",
-  "trackCardHtml", "utilityGroupTitle", "renderSubmittalTracks",
+  // What the recipe will fill that the job has no value for (#445) — trackCardHtml calls it.
+  "STAGE_GAP_LINK", "trackStageGapsHtml",
+  "trackCardHtml", "utilityGroupTitle",
+  // The closeout milestones group (#497) — renderSubmittalTracks draws and binds it.
+  "closeoutGroupHtml", "bindCloseoutMilestones", "saveProjectMilestone",
+  "renderSubmittalTracks",
 ];
 const preamble = "const screenshotMisses = new Set(); const screenshotKey = (a, b, c) => `${a}:${b}:${c}`;";
 const code = `${preamble}\n${NAMES.map(lift).join("\n\n")}`;

@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { backendDataDir } from "../../backend/src/statePaths";
 
 const ALGORITHM = "aes-256-gcm";
 
@@ -81,7 +82,7 @@ export function decryptStorageState(encryptedState: string): unknown {
 }
 
 export function saveEncryptedStorageState(profileId: string, storageState: unknown): string {
-  const dir = path.resolve(process.cwd(), "backend/data/storage-state");
+  const dir = path.join(backendDataDir(), "storage-state");
   fs.mkdirSync(dir, { recursive: true });
   const filePath = path.join(dir, `${profileId}.json.enc`);
   fs.writeFileSync(filePath, encryptStorageState(storageState), "utf8");

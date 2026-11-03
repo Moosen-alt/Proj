@@ -44,6 +44,37 @@ const projectsPage = (p: number) => shell(`<h1>Projects</h1>
   <a href="/new">New Project</a>`);
 const listPage = (p: number) => shell(`<h1>My Applications</h1><table><tbody>${p === 2 ? row("APP-777001", "Interconnection Complete") : row("APP-300001", "In Review")}</tbody></table>
   ${p === 1 ? `<a href="/list?page=2">Next</a>` : `<a class="disabled" aria-disabled="true">Next</a>`}`);
+// AN ACCELA-SHAPED "MY RECORDS" GRID (#418): a header row of <th>, nested in a layout table, the
+// filing between two neighbours whose statuses must not speak for it. Its status cell is the bare
+// word "Issued", which the text window read as a word in prose.
+const accelaRow = (date: string, id: string, type: string, status: string, action: string) =>
+  `<tr><td>${date}</td><td><a href="#">${id}</a></td><td>${type}</td><td>${status}</td><td>${action}</td></tr>`;
+const RECORDS = shell(`<table class="layout"><tr><td><h1>My Records</h1>
+  <table class="ACA_GridView"><tr><th>Date</th><th>Record Number</th><th>Record Type</th><th>Status</th><th>Action</th></tr>
+  ${accelaRow("10/14/2026", "194-26-001489-ELEC", "Residential Electrical", "Corrections Required", "Resubmit")}
+  ${accelaRow("10/15/2026", "187-26-000328-STR", "Residential Structural", "Issued", "Request Inspection")}
+  ${accelaRow("10/16/2026", "194-26-001491-ELEC", "Residential Electrical", "In Review", "")}
+  </table></td></tr></table>`);
+// A SUMMARY GRID WITH NO STATUS COLUMN, the status printed below it: the row says nothing about the
+// status, so the read keeps the window that reaches the paragraph.
+const SUMMARY = shell(`<h1>Record 187-26-000329-STR</h1>
+  <table><tr><th>Date</th><th>Record Number</th><th>Record Type</th><th>Action</th></tr>
+  ${`<tr><td>10/15/2026</td><td>187-26-000329-STR</td><td>Residential Structural</td><td>View</td></tr>`}</table>
+  <p>Status: In Review</p>`);
+// AN ACCELA "MY RECORDS" GRID WHOSE NUMBERS ARE LINKS (#413): the record number is the anchor to its
+// CapDetail page, carrying a session ticket the stored link must drop. A neighbour with a LONGER number
+// that starts with the filing's (…-STR-REV) and an APP-11168 beside a search for APP-1116 must never
+// answer for it. A PowerClerk-shaped row has the number as plain text and one "View" link.
+const capLink = (cap3: string) => `/TESTCOUNTY/Cap/CapDetail.aspx?Module=Building&TabName=Building&capID1=26TMP&capID2=00000&capID3=${cap3}&agencyCode=TESTCOUNTY&ticket=SESSION-${cap3}`;
+const linkedRow = (id: string, href: string, status: string) => `<tr><td>10/15/2026</td><td><a href="${href}">${id}</a></td><td>Residential Structural</td><td>${status}</td></tr>`;
+const MY_RECORDS = shell(`<h1>My Records</h1>
+  <table><tr><th>Date</th><th>Record Number</th><th>Record Type</th><th>Status</th></tr>
+  ${linkedRow("187-26-000328-STR-REV", capLink("00452"), "In Review")}
+  ${linkedRow("187-26-000328-STR", capLink("00451"), "Issued")}
+  ${linkedRow("APP-11168", "/rec/11168", "Approved")}
+  </table>
+  <table><tr><th>Project</th><th>Status</th><th></th></tr><tr><td>APP-220011</td><td>PP - Engineering Review</td><td><a href="/MvcProjects/EditProject?ProjectId=220011&amp;csrf=zzz">View</a></td></tr></table>`);
+const CAP_DETAIL = shell(`<h1>Record 187-26-000999-STR:</h1><p>Residential Structural</p><p>Record Status: Permit Issued</p><p>Expiration Date: 04/16/2027</p>`);
 const LOGIN = shell(`<h1>Login</h1><form><input name="username"><input type="password" name="password"><button>Sign in</button></form>`);
 
 // A PowerClerk-shaped list: 5 pages, the filing on page 4, and a search box with no "search" words of
@@ -90,6 +121,10 @@ const server = http.createServer((q, r) => {
     : u.pathname === "/apps" ? shell(`<h1>Home</h1><a href="/list?page=1">My Applications</a>`)
     : u.pathname === "/apps2" ? shell(`<h1>Home</h1><a href="/list2">Applications</a>`)
     : u.pathname === "/list2" ? shell(`<h1>Applications</h1><table><tbody>${row("APP-400001", "Draft")}</tbody></table><button onclick="location.href='/submit'">Next: Submit application</button>`)
+    : u.pathname === "/records" ? RECORDS
+    : u.pathname === "/myrecords" ? MY_RECORDS
+    : u.pathname === "/TESTCOUNTY/Cap/CapDetail.aspx" ? CAP_DETAIL
+    : u.pathname === "/summary" ? SUMMARY
     : u.pathname === "/login" ? LOGIN
     : shell(`<h1>${u.pathname}</h1>`);
   r.writeHead(200, { "Content-Type": "text/html" });
@@ -211,6 +246,58 @@ await check("MUST-EXCLUDE a sign-in page is named as such, nothing is read", asy
   assert.match(r.reason, /sign-in page/);
 });
 
+await check("MUST-PASS a list grid with a header row reads the filing's OWN row, status first (#418)", async () => {
+  await page.goto(`${base}/records`);
+  const r = await findFilingStatus(page, ["187-26-000328-STR"], { settleMs: 5000 });
+  assert.ok(r.text && /^Status: Issued \| /.test(r.text), `status text: ${r.text} (${r.reason})`);
+  assert.match(r.text, /Record Type: Residential Structural/);
+  assert.ok(!/Corrections Required|In Review|Resubmit/.test(r.text), `a neighbouring row spoke for the filing: ${r.text}`);
+});
+
+await check("MUST-EXCLUDE a grid with no status column keeps the window, which reaches the status beside it (#418)", async () => {
+  await page.goto(`${base}/summary`);
+  const r = await findFilingStatus(page, ["187-26-000329-STR"], { settleMs: 5000 });
+  assert.ok(r.text && /Status: In Review/.test(r.text), `status text: ${r.text} (${r.reason})`);
+  assert.ok(!/Record Number:/.test(r.text), `the status-less row was labelled instead: ${r.text}`);
+});
+
+await check("MUST-PASS the found filing's own record link, session ticket dropped (#413)", async () => {
+  await page.goto(`${base}/myrecords`);
+  const r = await findFilingStatus(page, ["187-26-000328-STR"], { settleMs: 5000 });
+  assert.ok(r.text && /^Status: Issued \| /.test(r.text), `status text: ${r.text} (${r.reason})`);
+  assert.equal(r.recordLink, `${base}/TESTCOUNTY/Cap/CapDetail.aspx?Module=Building&TabName=Building&capID1=26TMP&capID2=00000&capID3=00451&agencyCode=TESTCOUNTY`);
+});
+
+await check("MUST-EXCLUDE a longer number that starts with the filing's is not the filing: its own row and link only (#413)", async () => {
+  await page.goto(`${base}/myrecords`);
+  const rev = await findFilingStatus(page, ["187-26-000328-STR-REV"], { settleMs: 5000 });
+  assert.ok(rev.text && /^Status: In Review/.test(rev.text), `status text: ${rev.text}`);
+  assert.match(String(rev.recordLink), /capID3=00452/);
+  await page.goto(`${base}/myrecords`);
+  const short = await findFilingStatus(page, ["APP-1116"], { settleMs: 5000 });
+  assert.equal(short.text, null, `APP-11168's row answered for APP-1116: ${short.text}`);
+  assert.ok(!short.recordLink, `APP-11168's link was taken for APP-1116: ${short.recordLink}`);
+});
+
+await check("MUST-PASS a number in plain text beside one 'View' link takes that row's link; a record page found directly is its own link (#413)", async () => {
+  await page.goto(`${base}/myrecords`);
+  const pc = await findFilingStatus(page, ["APP-220011"], { settleMs: 5000 });
+  assert.ok(pc.text && /Engineering Review/.test(pc.text), `status text: ${pc.text}`);
+  assert.equal(pc.recordLink, `${base}/MvcProjects/EditProject?ProjectId=220011`, "the View link (minus its csrf token) was not taken");
+  await page.goto(`${base}${capLink("00999")}`);
+  const direct = await findFilingStatus(page, ["187-26-000999-STR"], { settleMs: 5000 });
+  assert.ok(direct.text && /Permit Issued/.test(direct.text), `status text: ${direct.text}`);
+  assert.match(String(direct.recordLink), /CapDetail\.aspx\?.*capID3=00999/);
+  assert.ok(!/ticket/.test(String(direct.recordLink)), `session ticket kept: ${direct.recordLink}`);
+});
+
+await check("MUST-EXCLUDE a status found with no link of its own reports no link", async () => {
+  await page.goto(`${base}/home`);
+  const r = await findFilingStatus(page, ["APP-123456"], { settleMs: 5000 });
+  assert.ok(r.text);
+  assert.equal(r.recordLink, "", `a link was invented: ${r.recordLink}`);
+});
+
 await check("MUST-PASS RecipeAdapter.checkStatus stays on the signed-in page: portalUrl = /login is never reloaded", async () => {
   hits.length = 0;
   await page.goto(`${base}/home`);
@@ -225,6 +312,10 @@ await check("MUST-PASS RecipeAdapter.checkStatus stays on the signed-in page: po
   assert.ok(text && /Application Approved/.test(text), `status text: ${text}; reason: ${adapter.lastStatusReason}`);
   assert.ok(!hits.includes("/login"), "the recipe's login page was loaded after sign-in");
   assert.ok(!hits.includes("/new"));
+  assert.equal(adapter.lastStatusRecordLink, "");
+  await page.goto(`${base}/myrecords`);
+  assert.ok(await adapter.checkStatus(["187-26-000328-STR"]));
+  assert.match(adapter.lastStatusRecordLink, /capID3=00451&agencyCode=TESTCOUNTY$/, "the adapter does not carry the found link (#413)");
 });
 
 await browser.close();

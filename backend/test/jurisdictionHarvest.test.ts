@@ -241,6 +241,8 @@ const server = http.createServer((req, res) => {
 });
 await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
 const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+// The stub stands in for a public jurisdiction site; the fetch guard (#391) refuses loopback otherwise.
+process.env.DOCUMENT_FETCH_ALLOW_ORIGINS = base;
 
 // A field mapper that actually maps, so "how many fields" is a real number.
 let mapCalls = 0;

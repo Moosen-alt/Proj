@@ -82,8 +82,13 @@ export interface AutopilotState {
   /** What the person taking the staged review page must know before submitting (dryrun-0928
    *  B3 / B14): answers the portal may not have saved; the portal's own calls held back. */
   reviewHandoffNotes: string[];
-  /** Why Approve & Submit is disabled, in words (null when canApprove). */
+  /** Why the rail's Approve is disabled, in words (null when canApprove). */
   approveDisabledReason: string | null;
+  /** The filing the rail's Approve & auto-submit acts on: the newest awaiting draft's track (#423).
+   *  The rail opens the track card's door for THIS track (the approver prompt, then
+   *  prepare-submission with autoSubmit), so both buttons are one action. Set only while a draft
+   *  awaits approval; absent (or null) otherwise, and the rail button is then off. */
+  approveTrack?: SubmittalTrackType | null;
   /** S8 — may "Stage portals · Autopilot" start a run? False with a reason when the project is
    *  operator-blocked, a run is in flight, it is past Submit, every required track is
    *  already staged or filed (re-staging opens a duplicate draft), or the submit gate holds
@@ -224,6 +229,13 @@ function blockersFromHttpError(err: HttpError): AutopilotBlocker[] {
   // behind-the-meter, disconnect distance) — named, so the operator knows what to answer (B2).
   for (const q of (Array.isArray(d.unansweredPortalQuestions) ? d.unansweredPortalQuestions : []) as Array<{ label?: string; key?: string }>) {
     out.push({ code: "portal_question", detail: `Answer the portal's question for this job: "${String(q.label ?? q.key ?? "a per-job question")}" (portal questions on the project, or the intake link).` });
+  }
+  // A box the recipe fills that this job has no value for (#445) — the portal's label and the
+  // project/client field (or document) to fill. Labels only, never a value (rule 2).
+  for (const g of (Array.isArray(d.missingRecipeInputs) ? d.missingRecipeInputs : []) as Array<{ kind?: string; label?: string; fieldName?: string; where?: string }>) {
+    out.push(g.kind === "document"
+      ? { code: "recipe_document_missing", detail: `Upload a ${String(g.fieldName ?? "required")} document: the portal asks for it at "${String(g.label ?? g.fieldName ?? "an upload")}".` }
+      : { code: "recipe_field_missing", detail: `Fill ${String(g.fieldName ?? "a field")} on the ${g.where === "client" ? "client record" : "project"}: the portal's "${String(g.label ?? g.fieldName ?? "box")}" would be filed blank.` });
   }
   if (out.length === 0) out.push({ code: "blocked", detail: err.message });
   return out;
@@ -442,11 +454,16 @@ export function getAutopilotState(db: AppDb, projectId: string): AutopilotState 
         ? `Approval recorded. Automation stops here — open the portal, click its submit yourself, then capture the confirmation number below.${canApprove ? "" : ` Not approvable again yet: ${approveRefusals.join("; ")}.`}`
         : !canApprove
           ? `Staged, but not approvable yet: ${approveRefusals.join("; ")}.`
-          : "Staged to portal review. Click Approve & Submit to file.";
+          : awaitingTrack === "nem"
+            // #423/#435: the one Approve action is held while a NEM draft is staged; this draft is
+            // finished by a person on the portal.
+            ? "Staged to portal review. Verify it, then click its submit on the portal yourself."
+            : "Staged to portal review. Verify it, then click its submit on the portal yourself, or press Approve & auto-submit to file it under your approval through the one gate.";
     return {
       projectId, phase: "awaiting_approval", stage: approvedAwaitingFiling ? "Approved — awaiting your filing" : "Awaiting approval",
       message: baseMsg + siblingNote + gapAdvisory + engineAdvisory,
       blockers, canApprove, approveDisabledReason: canApprove ? null : `Not approvable: ${approveRefusals.join("; ")}.`,
+      approveTrack: awaitingTrack,
       pauseReason: null, portalRunId: run ? String(run.id) : null, updatedAt: ts,
       ...reviewInfo, ...stageInfo,
     };
@@ -699,11 +716,15 @@ export async function runAutopilotSegmentA(
         // one filing, not a project-wide gate. requiredTracks lists NEM first, so returning here left
         // the building/electrical permits unstaged. Recorded like a failed stage (the stageOutcome path
         // below) and the run goes on to the next track. Only that gate sets unansweredPortalQuestions.
+        // So does a box THIS track's recipe fills that the job has no value for (#445): the same gate,
+        // the same one filing.
         const perJobQuestions = (err.details as { unansweredPortalQuestions?: unknown } | undefined)?.unansweredPortalQuestions;
-        if (Array.isArray(perJobQuestions) && perJobQuestions.length) {
+        const missingInputs = (err.details as { missingRecipeInputs?: unknown } | undefined)?.missingRecipeInputs;
+        if ((Array.isArray(perJobQuestions) && perJobQuestions.length) || (Array.isArray(missingInputs) && missingInputs.length)) {
           trackBlockers.push(...blockers);
-          logger.warn("autopilot", "Segment A: this track's portal asks a per-job question the job has not answered — holding this track, staging the rest", {
-            project: projectId, track: t, ms: `${Math.round(performance.now() - t0)}ms`, questions: perJobQuestions.length,
+          logger.warn("autopilot", "Segment A: this track's recipe needs per-job answers or fields the job does not have — holding this track, staging the rest", {
+            project: projectId, track: t, ms: `${Math.round(performance.now() - t0)}ms`,
+            questions: Array.isArray(perJobQuestions) ? perJobQuestions.length : 0, missing: Array.isArray(missingInputs) ? missingInputs.length : 0,
           });
           continue;
         }

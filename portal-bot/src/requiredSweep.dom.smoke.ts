@@ -29,6 +29,25 @@ const shell = (body: string): string =>
      .err{color:#c00;display:block} .form-group{margin:18px 0}
    </style></head><body>${body}</body></html>`;
 
+// Bootstrap 4 + select2 4 markup for the select2 pages (#327). Metrics as Bootstrap ships them.
+const bs4 = (body: string, width = 600): string =>
+  `<!doctype html><html><head><style>
+     html{font-size:16px} body{margin:0;padding:20px;font:16px/1.5 sans-serif} *,*::before,*::after{box-sizing:border-box}
+     form{width:${width}px} .form-group{margin-bottom:1rem} label{display:inline-block;margin-bottom:.5rem}
+     .form-control{display:block;width:100%;height:calc(1.5em + .75rem + 2px);padding:.375rem .75rem;font-size:1rem;line-height:1.5;border:1px solid #ced4da}
+     .invalid-feedback{display:none;width:100%;margin-top:.25rem;font-size:80%;color:#dc3545} .d-block{display:block!important}
+     small{font-size:80%} .form-text{display:block;margin-top:.25rem}
+     .select2-container{display:inline-block;margin:0;position:relative;vertical-align:middle}
+     .select2-selection--single{display:block;height:calc(1.5em + .75rem + 2px);border:1px solid #ced4da;padding:.375rem .75rem}
+     .select2-hidden-accessible{border:0!important;clip:rect(0 0 0 0)!important;clip-path:inset(50%)!important;height:1px!important;overflow:hidden!important;padding:0!important;position:absolute!important;width:1px!important;white-space:nowrap!important}
+   </style></head><body><form>${body}</form></body></html>`;
+const S2_SELECT = (cls = ""): string => `<select id="s2u" name="s2u" class="${cls}select2-hidden-accessible is-invalid" tabindex="-1" aria-hidden="true"><option value=""></option><option value="u1">Sample Light Co</option></select>`;
+const S2_FACE = (style = "width:100%"): string => `<span class="select2 select2-container select2-container--bootstrap4" dir="ltr" style="${style}"><span class="selection"><span class="select2-selection select2-selection--single" role="combobox" tabindex="0" aria-labelledby="select2-s2u-container"><span class="select2-selection__rendered" id="select2-s2u-container" role="textbox" aria-readonly="true"><span class="select2-selection__placeholder">Select a utility</span></span><span class="select2-selection__arrow" role="presentation"><b role="presentation"></b></span></span></span><span class="dropdown-wrapper" aria-hidden="true"></span></span>`;
+const S2_SELECT_FILLED = `<select id="s2u" name="s2u" class="form-control select2-hidden-accessible" tabindex="-1" aria-hidden="true"><option value=""></option><option value="u1" selected>Sample Light Co</option></select>`;
+const S2_FACE_FILLED = S2_FACE("width:300px").replace('<span class="select2-selection__placeholder">Select a utility</span>', "Sample Light Co");
+const S2_ADDRESS = `<div class="form-group"><label for="s2a">Service address</label><input id="s2a" name="s2a" class="form-control" value="5010 Fixture Ave"></div>`;
+const S2_HELP = `<small class="form-text text-muted">The utility that serves the meter.</small>`;
+
 const PAGES: Record<string, string> = {
   // ---- the live miss, shape 1: a complaint in a row that holds TWO controls ----------
   arrayRow: shell(`
@@ -126,11 +145,161 @@ const PAGES: Record<string, string> = {
     <div class="form-group"><label for="d">Description</label>
       <textarea id="d">Solar PV plan set</textarea></div>`),
 
+  // ---- A COMPLAINT BESIDE ITS FIELD BELONGS TO THAT FIELD (#327) ---------------------
+  // requiredBlank.dom.smoke's page as the container's fonts laid it out: the optional notes
+  // box wrapped onto the line just above, ending where the complaint's line starts, and the
+  // complaint sits right after the empty Manufacturer select. Pinned with absolute positions
+  // so the geometry no longer depends on which fonts a machine has.
+  besideOwnField: shell(`
+    <label for="bn" style="position:absolute;left:8px;top:40px">Additional notes</label>
+    <input id="bn" style="position:absolute;left:8px;top:80px;width:185px;height:21px;box-sizing:border-box" />
+    <label for="bm" style="position:absolute;left:8px;top:101px">Inverter Manufacturer</label>
+    <select id="bm" style="position:absolute;left:154px;top:101px;width:168px;height:19px"><option value="">Please select...</option></select>
+    <span class="err" style="position:absolute;left:325px;top:101px;display:inline">This field is required.</span>`),
+
+  // ...and its mirror: a complaint UNDER its field, sharing a line with another empty control
+  // further RIGHT, still belongs to the field above it.
+  underWithNeighbourRight: shell(`
+    <label for="ua" style="position:absolute;left:8px;top:20px">Meter number</label>
+    <input id="ua" style="position:absolute;left:8px;top:60px;width:185px;height:21px;box-sizing:border-box" />
+    <span class="err" style="position:absolute;left:8px;top:111px;display:inline">This field is required.</span>
+    <label for="uc" style="position:absolute;left:200px;top:90px">Fax</label>
+    <input id="uc" style="position:absolute;left:200px;top:111px;width:185px;height:21px;box-sizing:border-box" />`),
+
+  // ---- A FIELD THAT HOLDS THE COMPLAINT UNDER ITSELF OUTRANKS A NEIGHBOUR'S "BESIDE" (#327) --
+  // The beside rule above must not hand a complaint UNDER its own field to an empty control
+  // that ends just left of it on the complaint's line. On the PSE Part 1 page that control was
+  // an upload slot the run had filled, the held-upload read-back discharged it, and the draft
+  // was created with Customer phone blank. All absolute, so the geometry is the pin.
+  //
+  // mirrorLeft: the complaint 16 px under Customer phone, aligned; the slot ends at 292.
+  mirrorLeft: shell(`
+    <label for="mp" style="position:absolute;left:300px;top:20px">Customer phone</label>
+    <input id="mp" style="position:absolute;left:300px;top:40px;width:185px;height:21px;box-sizing:border-box" />
+    <label for="ms" style="position:absolute;left:200px;top:52px;font-size:11px">Plan set</label>
+    <input id="ms" type="file" style="position:absolute;left:200px;top:72px;width:92px;height:26px;box-sizing:border-box" />
+    <span class="err" style="position:absolute;left:300px;top:77px;display:inline">This field is required.</span>`),
+
+  // indent40: the complaint INDENTED 40 px under its field (a plain |dleft| <= 12 test misses
+  // it), with an empty box ending just left of it on its line.
+  indent40: shell(`
+    <label for="ip" style="position:absolute;left:300px;top:20px">Customer phone</label>
+    <input id="ip" style="position:absolute;left:300px;top:40px;width:185px;height:21px;box-sizing:border-box" />
+    <label for="ir" style="position:absolute;left:240px;top:58px;font-size:11px">Reference</label>
+    <input id="ir" style="position:absolute;left:240px;top:72px;width:96px;height:24px;box-sizing:border-box" />
+    <span class="err" style="position:absolute;left:340px;top:75px;display:inline">This field is required.</span>`),
+
+  // twoComplaints: two columns, both empty and both flagged. The left one is a tall textarea, so
+  // the RIGHT field's complaint sits beside it on its line; the beside rule handed that complaint
+  // to the textarea (already reported for its own) and lost Customer email.
+  twoComplaints: shell(`
+    <label for="ta" style="position:absolute;left:150px;top:0">Project description *</label>
+    <textarea id="ta" style="position:absolute;left:150px;top:20px;width:140px;height:80px;box-sizing:border-box"></textarea>
+    <span class="err" style="position:absolute;left:150px;top:104px;display:inline">This field is required.</span>
+    <label for="te" style="position:absolute;left:300px;top:0">Customer email</label>
+    <input id="te" style="position:absolute;left:300px;top:20px;width:140px;height:21px;box-sizing:border-box" />
+    <span class="err" style="position:absolute;left:300px;top:61px;display:inline">This field is required.</span>`),
+
+  // bootstrapSelect: a 300 px bootstrap-select "Utility" — the face is a button, the native
+  // select a 0.5 px opacity-0 sliver at left:50% — flagged under its left edge, with an empty
+  // box ending just left of the complaint on its line.
+  bootstrapSelect: shell(`
+    <label for="bu" style="position:absolute;left:300px;top:20px">Utility</label>
+    <div class="btn-group bootstrap-select" style="position:absolute;left:300px;top:40px;width:300px;height:34px">
+      <button type="button" class="btn dropdown-toggle" title="Nothing selected" style="width:300px;height:34px;text-align:left">Nothing selected</button>
+      <select id="bu" class="selectpicker" tabindex="-98" style="position:absolute;bottom:0;left:50%;display:block;width:0.5px;height:100%;padding:0;opacity:0;border:none">
+        <option value="">Nothing selected</option><option value="u1">Sample Light Co</option>
+      </select>
+    </div>
+    <label for="br" style="position:absolute;left:170px;top:54px;font-size:11px">Reference</label>
+    <input id="br" style="position:absolute;left:170px;top:74px;width:122px;height:26px;box-sizing:border-box" />
+    <span class="err" style="position:absolute;left:300px;top:78px;display:inline">This field is required.</span>`),
+
+  // fullWidthAbove: a FULL-WIDTH (960 px) empty notes box right above "Meter location [select]
+  // This field is required." The aligned-above bound is capped at 48 px so this box does not
+  // cancel the beside complaint; uncapped (width / 3) it would, and main's misattribution to the
+  // box above — by one pixel here — comes back.
+  fullWidthAbove: shell(`
+    <label for="fn" style="position:absolute;left:8px;top:0">Additional notes</label>
+    <textarea id="fn" style="position:absolute;left:8px;top:20px;width:960px;height:30px;box-sizing:border-box"></textarea>
+    <label for="fm" style="position:absolute;left:8px;top:54px">Meter location</label>
+    <select id="fm" style="position:absolute;left:120px;top:54px;width:190px;height:19px"><option value="">Please select...</option></select>
+    <span class="err" style="position:absolute;left:314px;top:54px;display:inline">This field is required.</span>`),
+
+  // handedRunnerUp: a complaint truly under an empty upload slot. The entry carries the
+  // runner-up empty control and the unattributed fallback, so a caller that discharges the slot
+  // as a held upload (recipeAdapter.sweepRequired) can keep the complaint.
+  handedRunnerUp: shell(`
+    <label for="hs" style="position:absolute;left:8px;top:20px">Plan set</label>
+    <input id="hs" type="file" style="position:absolute;left:8px;top:40px;width:200px;height:26px;box-sizing:border-box" />
+    <span class="err" style="position:absolute;left:8px;top:70px;display:inline">This field is required.</span>
+    <label for="hp" style="position:absolute;left:300px;top:20px">Customer phone</label>
+    <input id="hp" style="position:absolute;left:300px;top:40px;width:185px;height:21px;box-sizing:border-box" />`),
+
+  // ---- A SELECT2 SLIVER'S WIDGET BOX MAY ONLY BRING IT NEARER (#327) --------------------
+  // select2 keeps the native <select> as a 1 x 1 clipped sliver and draws its face as a SIBLING,
+  // so the sliver's nearest box is the whole form-group (or row, or fieldset): label above,
+  // complaint and help text below. Judged by that box alone (9807442c) the complaint fell out of
+  // reach and went to a filled neighbour, or nowhere. Bootstrap 4's own metrics, inlined (bs4).
+  //
+  // help2: two help lines under "This field is required.", a filled Service address above.
+  s2Help2: bs4(`${S2_ADDRESS}<div class="form-group"><label for="s2u">Utility</label>${S2_SELECT("form-control ")}${S2_FACE()}
+    <div class="invalid-feedback d-block">This field is required.</div>${S2_HELP}${S2_HELP}</div>`),
+  // captionIn / captionOut: a 450 px inline caption, so the row (the box) starts 450 px left of the
+  // face, past the 420 px column bound; the complaint inside the row, and just outside it.
+  s2CaptionIn: bs4(`${S2_ADDRESS}<div class="form-group"><label for="s2u" style="width:450px">Utility</label>${S2_SELECT()}${S2_FACE("width:300px")}
+    <div class="invalid-feedback d-block" style="margin-left:450px">This field is required.</div></div>`, 900),
+  s2CaptionOut: bs4(`${S2_ADDRESS}<div class="form-group" style="margin-bottom:0"><label for="s2u" style="width:450px">Utility</label>${S2_SELECT()}${S2_FACE("width:300px")}</div>
+    <div class="invalid-feedback d-block" style="margin-left:450px">This field is required.</div>`, 900),
+  // floatFieldset: the face floated in a wrapper that collapses to 0 px, so the box climbs to the
+  // radio fieldset round it (radios are not "controls" here); a filled field within 90 px above.
+  s2FloatFieldset: bs4(`${S2_ADDRESS}<fieldset style="border:1px solid #ccc;padding:0 8px 4px;margin:0">
+      <legend style="font-size:1rem;margin:0"><label for="s2u" style="margin:0">Utility</label></legend>
+      <div>${S2_SELECT("form-control ")}${S2_FACE("float:left;width:300px")}</div>
+      <div class="invalid-feedback d-block" style="clear:both">This field is required.</div>
+      <div>Battery storage? <label><input type="radio" name="bat" value="y" checked> Yes</label> <label><input type="radio" name="bat" value="n"> No</label></div>
+    </fieldset>`),
+
+  // FILLED: the same float markup with Utility FILLED, then a note and a blank this sweep cannot
+  // see (an unmarked Yes/No, or an unticked checkbox), and the complaint at the fieldset's foot,
+  // more than 90 px below Utility's own rect. The filled select2's widget box is the fieldset;
+  // judged by it, pass 1 handed the complaint to Utility, a filled claimant drops it, and the page
+  // read as clean (6eed71c9). Main reports it unattributed; so must this (review round 4).
+  s2FloatFilledRadio: bs4(`${S2_ADDRESS}<fieldset style="border:1px solid #ccc;padding:0 8px 4px;margin:0">
+      <legend style="font-size:1rem;margin:0"><label for="s2u" style="margin:0">Utility</label></legend>
+      <div>${S2_SELECT_FILLED}${S2_FACE_FILLED}</div>
+      <p style="height:60px;margin:8px 0">Battery details are asked on the next page.</p>
+      <div>Battery storage? <label><input type="radio" name="bat" value="y"> Yes</label> <label><input type="radio" name="bat" value="n"> No</label></div>
+      <div class="invalid-feedback d-block">This field is required.</div>
+    </fieldset>`),
+  s2FloatFilledCheckbox: bs4(`${S2_ADDRESS}<fieldset style="border:1px solid #ccc;padding:0 8px 4px;margin:0">
+      <legend style="font-size:1rem;margin:0"><label for="s2u" style="margin:0">Utility</label></legend>
+      <div>${S2_SELECT_FILLED}${S2_FACE_FILLED}</div>
+      <p style="height:60px;margin:8px 0">Battery details are asked on the next page.</p>
+      <div><label><input type="checkbox" name="agree"> I agree to the interconnection terms</label></div>
+      <div class="invalid-feedback d-block">This field is required.</div>
+    </fieldset>`),
+
   // ---- a complaint no control can own must still be reported -------------------------
   orphanComplaint: shell(`
     <div class="err">Please select at least one option before continuing.</div>
     <div style="height:600px"></div>
     <div class="form-group"><label for="z">Notes</label><input id="z" value="ok" /></div>`),
+
+  // ---- #362 SF3/SF5: required radio groups and checkboxes, both directions -------------
+  // A required group a person can answer is a blank; the same group hidden or disabled is not
+  // (it said nothing about THIS page, and stopped permit replays where main went ahead).
+  radioRequired: shell(`<div class="form-group"><div>Is the system grid-tied?</div>
+    <input type="radio" name="g" id="gY" required><label for="gY">Yes</label>
+    <input type="radio" name="g" id="gN" required><label for="gN">No</label></div>`),
+  radioHidden: shell(`<div class="form-group" style="display:none"><div>Is the system grid-tied?</div>
+    <input type="radio" name="g" id="gY" required><label for="gY">Yes</label>
+    <input type="radio" name="g" id="gN" required><label for="gN">No</label></div>`),
+  radioDisabled: shell(`<div class="form-group"><div>Is the system grid-tied?</div>
+    <input type="radio" name="g" id="gY" required disabled><label for="gY">Yes</label>
+    <input type="radio" name="g" id="gN" required disabled><label for="gN">No</label></div>`),
+  checkboxRequired: shell(`<div class="form-group"><input type="checkbox" id="rdy" required><label for="rdy">I am ready to submit</label></div>`),
+  checkboxOptional: shell(`<div class="form-group"><input type="checkbox" id="upd"><label for="upd">Email me updates</label></div>`),
 };
 
 const server = http.createServer((req, res) => {
@@ -185,6 +354,61 @@ check("one complaint claims ONE field, not the whole page",
   many.length === 1, `${many.length} reported: ${JSON.stringify(many)}`);
 check("...and it is the field the message sits under",
   many.some((r) => /meter/i.test(r.name)), JSON.stringify(many));
+
+const beside = await sweep("besideOwnField");
+check("a complaint BESIDE its empty select is that select's, not the empty box on the line above (#327)",
+  beside.some((r) => /inverter manufacturer/i.test(r.name)) && !beside.some((r) => /additional notes/i.test(r.name)),
+  JSON.stringify(beside));
+const under = await sweep("underWithNeighbourRight");
+check("...and a complaint UNDER its field is not handed to an empty control further right on its line",
+  under.some((r) => /meter number/i.test(r.name)) && !under.some((r) => /fax/i.test(r.name)),
+  JSON.stringify(under));
+
+const nameIs = (rows: Array<{ name: string }>, re: RegExp): boolean => rows.some((r) => re.test(r.name));
+const mirror = await sweep("mirrorLeft");
+check("a complaint UNDER Customer phone is Customer phone's, not the empty slot ending left of it on the complaint's line (#327)",
+  nameIs(mirror, /customer phone/i) && !nameIs(mirror, /plan set/i), JSON.stringify(mirror));
+const indent = await sweep("indent40");
+check("...and so is a complaint indented 40 px under its field",
+  nameIs(indent, /customer phone/i) && !nameIs(indent, /reference/i), JSON.stringify(indent));
+const two = await sweep("twoComplaints");
+check("two columns, two complaints: BOTH empty fields are named, the right one from its own complaint",
+  nameIs(two, /project description/i) && two.some((r) => /customer email/i.test(r.name) && r.why === "complaint") && two.length === 2,
+  JSON.stringify(two));
+const boot = await sweep("bootstrapSelect");
+check("a 300 px bootstrap-select (0.5 px opacity-0 native select at left:50%) flagged under its widget is named, not the box left of the complaint",
+  nameIs(boot, /^utility$/i) && !nameIs(boot, /reference/i), JSON.stringify(boot));
+const wide = await sweep("fullWidthAbove");
+check("a full-width empty box above does not cancel a complaint BESIDE its select (the 48 px cap)",
+  nameIs(wide, /meter location/i) && !nameIs(wide, /additional notes/i), JSON.stringify(wide));
+const runner = await sweep("handedRunnerUp");
+{
+  const slot = runner.find((r) => /plan set/i.test(r.name));
+  check("a complaint handed to a control carries the runner-up EMPTY control and the unattributed fallback",
+    slot?.why === "complaint" && slot.handed?.length === 1 && slot.handed[0].next === "Customer phone"
+      && /^portal reports "This field is required\." \(field could not/.test(slot.handed[0].unattributed),
+    JSON.stringify(runner));
+}
+
+for (const [key, what] of [
+  ["s2Help2", "two help lines under the complaint"],
+  ["s2CaptionIn", "a 450 px inline caption, the complaint inside the row"],
+  ["s2CaptionOut", "a 450 px inline caption, the complaint just outside the row"],
+  ["s2FloatFieldset", "a collapsed float wrapper inside a radio fieldset, a filled field within 90 px"],
+] as Array<[string, string]>) {
+  const got = await sweep(key);
+  check(`a blank select2 Utility (1 x 1 sliver, face a sibling) is named from its complaint: ${what} (#327)`,
+    got.some((r) => r.name === "Utility" && r.why === "complaint"), JSON.stringify(got));
+}
+
+for (const [key, what] of [
+  ["s2FloatFilledRadio", "an unmarked Yes/No"],
+  ["s2FloatFilledCheckbox", "an unticked checkbox"],
+] as Array<[string, string]>) {
+  const got = await sweep(key);
+  check(`a FILLED select2 Utility's widget box never absorbs a complaint at the fieldset's foot (${what} the sweep cannot see): reported unattributed, never Utility (#327)`,
+    got.some((r) => /^portal reports "This field is required\."/.test(r.name)) && !got.some((r) => r.name === "Utility"), JSON.stringify(got));
+}
 
 const instr = await sweep("instructions");
 check("INSTRUCTIONAL 'please select all that apply' is not treated as a complaint",
@@ -245,6 +469,14 @@ check("a satisfied page proves it LOOKED: two asterisked fields, zero blank",
   legendSeen.length === 2, `expected Email and Phone counted as required-and-satisfied, got ${JSON.stringify(legendSeen)}`);
 check("...and the LEGEND SENTENCE itself is not counted as a required field",
   !legendSeen.some((n) => /asterisk|all information|is required/i.test(n)), JSON.stringify(legendSeen));
+
+// #362 SF3/SF5 — both directions.
+check("a required radio group a person can answer is a blank", (await sweep("radioRequired")).length === 1);
+check("...the same group hidden is not", (await sweep("radioHidden")).length === 0);
+check("...nor disabled", (await sweep("radioDisabled")).length === 0);
+check("a required unticked 'I am ready to submit' checkbox is a blank",
+  (await sweep("checkboxRequired")).some((e) => /ready to submit/i.test(e.name)));
+check("...an optional unticked checkbox is not", (await sweep("checkboxOptional")).length === 0);
 
 await browser.close();
 server.close();

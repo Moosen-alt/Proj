@@ -31,6 +31,7 @@
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
+import { backupDir } from "../../backend/src/statePaths";
 import {
   AUTOMATIC_SNAPSHOT_RE, OFFBOX_STATUS_NAME, copyVerified, listAutomaticSnapshots, mirrorTree,
   pruneAutomaticSnapshots, readChecksumSidecar, sha256File, verifyChecksum,
@@ -48,7 +49,7 @@ const dryRun = args.includes("--dry-run");
 const withDocuments = !args.includes("--no-documents");
 
 // Same default and same resolution as backend/src/backup.ts, so "BACKUP_DIR" means one place.
-const fromDir = path.resolve(process.cwd(), flag("from") || process.env.BACKUP_DIR || "backend/data/backups");
+const fromDir = flag("from") ? path.resolve(process.cwd(), flag("from")) : backupDir();
 const toRaw = flag("to") || process.env.BACKUP_SECOND_DIR || "";
 const keep = Number(flag("keep") || process.env.BACKUP_SECOND_KEEP || process.env.BACKUP_KEEP || 14);
 

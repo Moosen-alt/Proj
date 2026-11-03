@@ -11,6 +11,7 @@
 //   npm run portal:audit -- <portal-url> [--client=<id>]
 import "dotenv/config";
 import path from "node:path";
+import { portalProfilesDir, screenshotsDir } from "../../backend/src/statePaths";
 import fs from "node:fs";
 
 process.env.AUTOPILOT_DB_PATH = process.env.AUTOPILOT_DB_PATH || "backend/data/autopilot.sqlite";
@@ -34,12 +35,12 @@ async function main(): Promise<void> {
 
   const db = await openDatabase();
   const cred = getDecryptedCredentialByUrl(db, clientId, url) ?? undefined;
-  const outDir = path.join(process.cwd(), "data", "screenshots");
+  const outDir = screenshotsDir();
   fs.mkdirSync(outDir, { recursive: true });
   const tag = (() => { try { return new URL(url).hostname.split(".")[0]; } catch { return "portal"; } })();
 
   const opened = await openPortal({
-    userDataDir: path.join(process.cwd(), "portal-profiles", clientId, `audit_${tag}`),
+    userDataDir: path.join(portalProfilesDir(), clientId, `audit_${tag}`),
     headless: true,
   });
   const page = opened.page;

@@ -3,6 +3,8 @@ import type { NextFunction, Request, Response } from "express";
 import type { AppDb, SqlParam } from "./db";
 import { DEFAULT_ORG_ID } from "./db";
 import { apiKeyAuthPrefixes, orgEntitlements, productsAllowPath } from "./entitlements";
+import { serverIsShared } from "./serverPosture";
+import { attachRecorderPrincipal, isRecorderRoute, presentedRecorderToken, recorderPrincipal, userFromRecorderToken } from "./recorderTokens";
 
 type Row = Record<string, SqlParam>;
 
@@ -45,14 +47,39 @@ function verifyPassword(password: string, stored: string): boolean {
 }
 
 /**
- * The ONE writer of users.password_hash outside the raw INSERT in seedAdminUser and
- * POST /api/orgs/:id/users. Exported so scripts (scripts/onboard-company.ts) do not
- * re-implement the hasher: the stored format is scrypt(password, 16-byte salt, 64) as
+ * The ONE writer of users.password_hash outside the raw INSERT in seedAdminUser. Used by
+ * POST /api/orgs/:id/users and the dashboard's staff-login routes (staffLogins.ts, #431), and
+ * exported so scripts (scripts/onboard-company.ts) do not re-implement the hasher: the stored format is scrypt(password, 16-byte salt, 64) as
  * "salthex:hashhex", and verifyPassword above is the only reader. A second, drifting
  * copy of that format is a login that cannot log in and nothing that says why.
  */
 export function setUserPassword(db: AppDb, userId: string, password: string): void {
-  db.run("UPDATE users SET password_hash = ? WHERE id = ?", [hashPassword(password), userId]);
+  // A new password ends every session signed in under the old one (#432), in the same write, so
+  // no caller can set a password and forget the revocation: a self-change, an admin reset, the
+  // first-admin seed and the org-users route all come through here. The self-change route then
+  // re-issues the CURRENT device's cookie (issueSessionCookie) so the person who changed it stays in.
+  db.run("UPDATE users SET password_hash = ?, session_version = session_version + 1 WHERE id = ?", [hashPassword(password), userId]);
+}
+
+/**
+ * End every session this user has open, on every device (#432). The cookie is still a signed,
+ * stateless token, but it names the users.session_version it was issued under and currentUser
+ * refuses it once the column has moved on, so the very next request from any older cookie 401s.
+ * Callers: setUserPassword (in its own UPDATE), a deactivation or reactivation
+ * (staffLogins.setStaffLoginActive, users.updateUser), and "Sign out everywhere"
+ * (POST /api/auth/logout-everywhere).
+ */
+export function bumpSessionVersion(db: AppDb, userId: string): void {
+  db.run("UPDATE users SET session_version = session_version + 1 WHERE id = ?", [userId]);
+}
+
+/**
+ * Whether `password` is this user's current password (self-service password change, #431). The
+ * only other reader of the stored format is login(); neither ever returns the hash.
+ */
+export function passwordMatchesForUser(db: AppDb, userId: string, password: string): boolean {
+  const row = db.get<Row>("SELECT password_hash FROM users WHERE id = ? AND active = 1", [userId]);
+  return Boolean(row?.password_hash) && verifyPassword(password, String(row?.password_hash));
 }
 
 // Create the first admin from env if no user has a password yet.
@@ -81,25 +108,37 @@ export function seedAdminUser(db: AppDb): void {
 }
 
 // ---------------------------------------------------------------------------
-// Stateless signed session cookie: base64url(userId|expiryMs).hmac
+// Signed session cookie: base64url(userId|expiryMs|sessionVersion).hmac
+//
+// Still stateless to verify, but revocable (#432): the third field is the users.session_version
+// the cookie was issued under, and currentUser accepts it only while the column still holds that
+// number. A cookie minted before #432 has two fields; it reads as version 0, which is where every
+// user's column starts, so the deploy logs nobody out and the user's first bump (password change,
+// reset, deactivation, Sign out everywhere) ends it exactly like any other old cookie.
 // ---------------------------------------------------------------------------
 
 function sign(value: string): string {
   return crypto.createHmac("sha256", secret()).update(value).digest("base64url");
 }
 
-function makeToken(userId: string): string {
-  const payload = Buffer.from(`${userId}|${Date.now() + SESSION_HOURS * 3600_000}`).toString("base64url");
+function makeToken(userId: string, sessionVersion: number): string {
+  const payload = Buffer.from(`${userId}|${Date.now() + SESSION_HOURS * 3600_000}|${sessionVersion}`).toString("base64url");
   return `${payload}.${sign(payload)}`;
 }
 
-function readToken(token: string): { userId: string } | null {
-  const [payload, sig] = token.split(".");
-  if (!payload || !sig) return null;
-  if (sign(payload) !== sig) return null;
-  const [userId, expiry] = Buffer.from(payload, "base64url").toString().split("|");
+function readToken(token: string): { userId: string; sessionVersion: number } | null {
+  const [payload, sig, extra] = token.split(".");
+  if (!payload || !sig || extra !== undefined) return null;
+  const expected = Buffer.from(sign(payload));
+  const given = Buffer.from(sig);
+  if (expected.length !== given.length || !crypto.timingSafeEqual(expected, given)) return null;
+  const fields = Buffer.from(payload, "base64url").toString().split("|");
+  if (fields.length !== 2 && fields.length !== 3) return null;
+  const [userId, expiry, version = "0"] = fields;
   if (!userId || !expiry || Date.now() > Number(expiry)) return null;
-  return { userId };
+  // Only a plain non-negative integer; anything else is not a cookie this server minted.
+  if (!/^\d{1,15}$/.test(version)) return null;
+  return { userId, sessionVersion: Number(version) };
 }
 
 function readCookie(req: Request, name: string): string | null {
@@ -118,8 +157,7 @@ export interface SessionUser {
   email: string;
   role: string;
   /** The user's org (tenant). Existing rows default to 'org-default' (full edition),
-   *  read from the users table on every request — the cookie format is unchanged, so
-   *  deploys never log anyone out. */
+   *  read from the users table on every request, never from the cookie. */
   orgId: string;
 }
 
@@ -148,14 +186,21 @@ export const ADMIN_ROLES = new Set([ROLE_ADMIN, ROLE_SUPERADMIN]);
 export const ALL_ROLES = [ROLE_SUPERADMIN, ROLE_ADMIN, ROLE_OPERATOR];
 
 export function currentUser(db: AppDb, req: Request): SessionUser | null {
+  // A recorder token (#433) authenticated THIS request as its person. Only requireAuth attaches
+  // it, and only on one of the recorder's four routes, so on every other route this is null and
+  // the answer comes from the session cookie alone.
+  const viaRecorder = recorderPrincipal(req);
+  if (viaRecorder) return viaRecorder;
   const token = readCookie(req, COOKIE);
   if (!token) return null;
   const parsed = readToken(token);
   if (!parsed) return null;
-  const row = db.get<Row>("SELECT id, name, email, role, org_id FROM users WHERE id = ? AND active = 1", [parsed.userId]);
-  return row
-    ? { id: String(row.id), name: String(row.name), email: String(row.email), role: String(row.role), orgId: String(row.org_id || DEFAULT_ORG_ID) }
-    : null;
+  const row = db.get<Row>("SELECT id, name, email, role, org_id, session_version FROM users WHERE id = ? AND active = 1", [parsed.userId]);
+  if (!row) return null;
+  // Revoked (#432): this cookie was issued before the user's last password change, reset,
+  // deactivation or Sign out everywhere.
+  if (Number(row.session_version ?? 0) !== parsed.sessionVersion) return null;
+  return { id: String(row.id), name: String(row.name), email: String(row.email), role: String(row.role), orgId: String(row.org_id || DEFAULT_ORG_ID) };
 }
 
 export function getOrg(db: AppDb, orgId: string): OrgInfo {
@@ -234,7 +279,19 @@ export function login(db: AppDb, req: Request, res: Response): void {
     return;
   }
   loginAttempts.delete(ip);
-  const token = makeToken(String(row.id));
+  issueSessionCookie(db, req, res, String(row.id));
+  res.json({ user: { id: String(row.id), name: String(row.name), email: String(row.email), role: String(row.role), orgId: String(row.org_id || DEFAULT_ORG_ID) } });
+}
+
+/**
+ * Set a fresh session cookie for `userId` at the user's CURRENT session_version. Used by login,
+ * and by the self-service password change (#432): that change bumps the version, which ends the
+ * cookie the person is using too, so the route hands this device a new one and only the OTHER
+ * devices are signed out.
+ */
+export function issueSessionCookie(db: AppDb, req: Request, res: Response, userId: string): void {
+  const row = db.get<Row>("SELECT session_version FROM users WHERE id = ?", [userId]);
+  const token = makeToken(userId, Number(row?.session_version ?? 0));
   // Secure DEFAULTS ON when the request itself arrived over HTTPS (the documented
   // Caddy deploy, with trust proxy set), so the session cookie is never replayable
   // over plaintext there. Localhost/dev over http keeps working because req.secure
@@ -246,7 +303,11 @@ export function login(db: AppDb, req: Request, res: Response): void {
     secure: secureEnv === "true" ? true : secureEnv === "false" ? false : req.secure,
     maxAge: SESSION_HOURS * 3600_000,
   });
-  res.json({ user: { id: String(row.id), name: String(row.name), email: String(row.email), role: String(row.role), orgId: String(row.org_id || DEFAULT_ORG_ID) } });
+}
+
+/** Clear this browser's session cookie. Ends nothing elsewhere; that is bumpSessionVersion. */
+export function clearSessionCookie(res: Response): void {
+  res.clearCookie(COOKIE);
 }
 
 export function logout(_req: Request, res: Response): void {
@@ -254,8 +315,11 @@ export function logout(_req: Request, res: Response): void {
   res.json({ ok: true });
 }
 
+// serverIsShared rides along (#439): the dashboard already reads this at boot, and it decides
+// whether the controls that read the SERVER'S disk are shown as if the server were the user's PC.
+// A boolean about the deployment, nothing about the caller, so it is safe before sign-in too.
 export function me(db: AppDb, req: Request, res: Response): void {
-  res.json({ enabled: AUTH_ENABLED, user: AUTH_ENABLED ? currentUser(db, req) : null });
+  res.json({ enabled: AUTH_ENABLED, user: AUTH_ENABLED ? currentUser(db, req) : null, serverIsShared: serverIsShared(process.env) });
 }
 
 /** Brand images and vendored fonts a logged-out page needs. A single file name, no leading dot. */
@@ -304,9 +368,28 @@ export function requireAuth(db: AppDb) {
     if (apiKeyAuthPrefixes().some((p) => req.path.startsWith(p)) && orgFromApiKey(db, req)) {
       return next();
     }
+    // Recorder token (#433): the portal recorder CLI on a person's own computer has no cookie. A
+    // token authenticates EXACTLY the recorder's four routes (method + whole path,
+    // recorderTokens.RECORDER_ROUTES), as the person who minted it. On any other route it is
+    // ignored — never a principal — so staging, approval, admin and minting all 401 below as if
+    // no token had been sent (rule 1: a recorder token never approves or stages a filing).
+    const recorderToken = presentedRecorderToken(req);
+    if (recorderToken && isRecorderRoute(req.method, req.path)) {
+      const user = userFromRecorderToken(db, recorderToken);
+      if (user) {
+        attachRecorderPrincipal(req, user);
+        return next();
+      }
+      res.status(401).json({ error: "This recorder token is not valid: it is unknown, revoked or expired, or its login is switched off. Make a new one in the dashboard (Team, Recorder tokens)." });
+      return;
+    }
     if (currentUser(db, req)) return next();
     if (req.path.startsWith("/api/")) {
-      res.status(401).json({ error: "Not authenticated." });
+      res.status(401).json({
+        error: recorderToken
+          ? "Not authenticated. A recorder token only reaches the portal recorder's own endpoints."
+          : "Not authenticated.",
+      });
       return;
     }
     res.redirect("/login");

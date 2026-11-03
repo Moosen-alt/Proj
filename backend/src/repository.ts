@@ -37,6 +37,7 @@ import type {
   ProjectCommunicationDraft,
   ProjectCommunicationDraftPacket,
   ProjectDetail,
+  PermitStatusCheckResult,
   ProjectHandoffPacket,
   ProjectHandoffPacketSection,
   ProjectListItem,
@@ -66,21 +67,28 @@ import type {
 import { correctionFilingStamp, correctionOverdueSql, touchProjectMetrics, type CorrectionFilingInput } from "./kpi";
 import fs from "node:fs";
 import path from "node:path";
+import { portalProfilesDir } from "./statePaths";
 import os from "node:os";
 import { checkStatusWithAdapter, runCorrectionReopen, stageWithAccela, stageWithMockPortal, stageWithPowerClerk, stageWithRecipe } from "../../portal-bot/src/index";
+import { readRecordLinkSignedIn } from "../../portal-bot/src/recordLinkRead";
 import { portalAutomationDisabled, resolveHeadless } from "../../portal-bot/src/browser";
 import { findCompleteRecipeForProject, findAnyRecipeForProject, resolveRecipeFieldValues, markPortalRecipeForRerecord, demoteOnReplayFailure, collectHealedSteps, persistHealedSteps, getPortalRecipe, portalEntityEvidence, recipeHostFit, findBorrowableRecipe, replayFailureBlamesRecipe, recipeStepsSignature, isNotServedRecipe, recordPortalNotServed, type BorrowedRecipeChoice } from "./portalRecipes";
 import { notServedInResult } from "../../shared/src/portalNotServed";
 import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier";
-// detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget.
-import { publicPermitStatusCheck } from "./publicPermitStatus";
+import { notifyClientOfFiling } from "./clientFilingUpdate";
+import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStageHeld, alertStaffOnStatusChange, alertStaffOnUnmatchedCorrectionEmail } from "./staffAlerts";
+import { installerHandoffNoteBody, sendInstallerHandoff } from "./installerHandoff";
+// detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget; the
+// card's Edit (updatePermitCheckTarget) re-detects with the same function when the URL changes.
+import { accelaModulesForNumber, detectPlatform, publicPermitStatusCheck, searchAccelaRecordByNumber } from "./publicPermitStatus";
 import { planSetTextForProject, projectDocsByType, DOCS_DIR, PLAN_TEXT_DOC_TYPES } from "./projectDocuments";
 import { activeStructuralLetterConfirmation, structuralLetterState } from "./structuralLetter";
 import type { DesignTextSource } from "./designCriteria";
 import { describeCited, lookedUpRecordType, issuingAgencyFor, permitAnswerForTrack, stateRulesFor, isStatewidePortalUrl, permitProcessKey, projectForTrack, refuseTrackIssuerValue, trackIssuer } from "./permitProcess";
 import { statewideDecisionFor, statewideUrlRefusal } from "./statewideEvidence";
 import { RESEARCH_UNCONFIRMED_REASON, researchNamedPlatform, researchSaysPortalUnconfirmed, researchWithFittedUrl } from "./researchedPortalUrl";
-import { bindRecipeForReplay, describeReplayBinding, openPerJobQuestions } from "./recipeReplayBinding";
+import { bindRecipeForReplay, describeReplayBinding } from "./recipeReplayBinding";
+import { recipeStageGaps, stageGapsRefusal, type RecipeStageGap } from "./recipeStageGaps";
 import { agencyListStatusResolver, documentInventory, missingFilledAtStaging, owedDocumentAction, owedMissingDocuments, requiredListCheck, type DocumentInventory, type DocPresence } from "./requiredDocuments";
 import { deadLinkSentence, formDeadLinks, startedAtLabel, type StageAcquiredForm } from "./formAcquisitionPlan";
 import { agencyListReplacesLine, issuingAgencyDocumentList } from "./applicationDocsAgency";
@@ -90,11 +98,13 @@ import { STAGE_COUNT, stageForStatus, isBlockedProject } from "./projectStage";
 import { compactNextStep, decideNextStep, loadNextStepFacts, withoutCodeResearch } from "./nextStep";
 import { correctionHoldScope, criticalFieldHoldScope, findingHoldScope, GATE_TRACKS, scopeHoldsTrack, tracksHeld, type GateHoldScope } from "./gateScope";
 import { addAuditLog } from "./audit";
-import { clientLicenceRow, clientStagingOverlay, contractorLicenceForState, getClient } from "./clients";
+import { clientLicenceRow, clientStagingOverlay, contractorLicenceForState, getClient, stagingIdentityDisagreement, stagingIdentityPortal } from "./clients";
 import { planSetLicenceWarning } from "./clientMatch";
 import { assertSubmissionPaid } from "./submissionFees";
+import { snapshotFilingQuote } from "./feeAccuracy";
 import { readAndRecordPortalFees } from "./portalFeeReadings";
-import { getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential } from "./portalCredentials";
+import { closeoutDocumentLines, fetchIssuedRecordDocuments, isFinishedOutcome, issuedDocumentsByTarget } from "./portalIssuedDocuments";
+import { clientHasLoginOnHost, getDecryptedCredential, getDecryptedCredentialByUrl, getDecryptedCredentialAny, listPortalCredentials, lockedOutCredential, recordLoginOutcome, storedCredentialFor } from "./portalCredentials";
 import { annotateDraft, buildDraftTouch, recordDraftTouch } from "./draftLedger";
 import { logger } from "./logger";
 import { disarmDraftCreatingSubmit, draftContinuationGaps, draftSubmitStampForReplay, openPortalDraftFor, recordPortalDraft, DRAFT_SUBMIT_UNEXPECTED_ACTION, type ObservedDraft } from "./portalDraft";
@@ -102,7 +112,8 @@ import { claimSignatureRequestApproval, runningJobSignatureRequestApprovalId } f
 import { deleteProjectInfoPages } from "./infoPages";
 import { nemSignatureState, nemStageIsResume } from "./signatureTrack";
 import { siteKey } from "../../portal-bot/src/draftCreated";
-import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, type HostFit, type PortalUrlSource } from "./portalChannel";
+import { safeRecordLink } from "../../portal-bot/src/adapters/submissionLedger";
+import { selectAdapterActor, selectStagingActor, learnEntryUrl, resolvePortalChannel, seedOutcomeToStageResult, isAutoSeedDisabled, recipeDisciplineFromSteps, disciplineConflictsWithTrack, recipeDisciplineForTrack, hostFitsTrackAndEntity, scopeForTrack, trackSafeUrl, portalHostOf, sameHost, samePortal, type HostFit, type PortalUrlSource } from "./portalChannel";
 import { isPortalPaused } from "./portalPause";
 // The ONE creator of permit_check_targets rows (extracted from markTrackSubmitted).
 // Direction matters: submittalTracks must never import repository — jobQueue statically
@@ -137,15 +148,18 @@ import {
   importMboxKnowledge,
   importMboxKnowledgeFromFile,
   classifyMboxMessages,
+  emailAsksForInformation,
+  redactEmailText,
   isVerifiedKnowledge,
   type ClassifiedMboxMessage,
 } from "./knowledgeBase";
 import { canonicalAliasForVerifiedField, canonicalizeSnapshot, compactAlnum, divergedAliases, existingSystemFromSnapshot, fieldAliases, mergeEditOverSnapshot, MICRO_SUPERSEDED_KEY, normalizeProject, recordMicroSupersession, normalizeTokens, TRACK_ISSUER_SNAPSHOT_KEYS, withTrackIssuers } from "./normalize";
 import {
   classificationDrift, classifyPermitStatusText, effectiveCheckDays, extractStatusDate, isAuthWallText, isNemApprovalOutcome, nextCheckIso, outcomeTrack, portalStatedStatus,
-  readingMayFinishTrack, shouldRecordStatusCheck, trackKind, UNCONFIRMED_READING_LABEL,
+  readingMayFinishTrack, shouldRecordStatusCheck, shouldSkipEmptyRead, trackKind, UNCONFIRMED_READING_LABEL,
   type PermitStatusClassification, type ReadingProvenance, type TrackKind,
 } from "./permitMonitor";
+import { linkLookupRanRecently, signedInOutcome, statusReadGap, type ReadGapFacts } from "./statusLinkGap";
 import { evidenceForTopic, evidenceLines, type EvidenceTopic } from "./projectEvidence";
 import { customerBillOnFile, runQcForProject, WAITING_ON_BILL_ISSUE_TYPE, type QcRunOptions } from "./qc";
 import { loadStoredTemplates, formAllowedForPath } from "./ahjForms";
@@ -175,7 +189,10 @@ export function setRecipeStageRunnerForTests(runner: RecipeStageRunner | null): 
 // THE STATUS MONITOR'S TWO DOORS TO THE OUTSIDE — the authenticated scrape (a browser) and the
 // public fetch (the network) — behind the same kind of seam, so the sweep's own resolution (which
 // recipe, which URL, the track/entity judgment) runs for real in a test with nothing opened.
-type StatusCheckSeams = { checkStatus?: typeof checkStatusWithAdapter | null; publicCheck?: typeof publicPermitStatusCheck | null };
+// The third, recordSearch, is the Accela module search by record number (#443) — also the network.
+// The fourth, signedInLink, signs in with the client's stored login and reads the card's own record
+// link (#512) — a browser.
+type StatusCheckSeams = { checkStatus?: typeof checkStatusWithAdapter | null; publicCheck?: typeof publicPermitStatusCheck | null; recordSearch?: typeof searchAccelaRecordByNumber | null; signedInLink?: typeof readRecordLinkSignedIn | null };
 let statusCheckSeams: StatusCheckSeams = {};
 export function setStatusCheckSeamsForTests(seams: StatusCheckSeams | null): void {
   if (process.env.AUTOPILOT_TEST_SEAMS !== "1") throw new Error("setStatusCheckSeamsForTests needs AUTOPILOT_TEST_SEAMS=1 — it is a test seam only.");
@@ -183,6 +200,8 @@ export function setStatusCheckSeamsForTests(seams: StatusCheckSeams | null): voi
 }
 const statusScrape: typeof checkStatusWithAdapter = (...args) => (statusCheckSeams.checkStatus ?? checkStatusWithAdapter)(...args);
 const publicStatusFetch: typeof publicPermitStatusCheck = (...args) => (statusCheckSeams.publicCheck ?? publicPermitStatusCheck)(...args);
+const accelaRecordSearch: typeof searchAccelaRecordByNumber = (...args) => (statusCheckSeams.recordSearch ?? searchAccelaRecordByNumber)(...args);
+const signedInLinkRead: typeof readRecordLinkSignedIn = (...args) => (statusCheckSeams.signedInLink ?? readRecordLinkSignedIn)(...args);
 
 // THE FAILURE TEXT LIVES ON THE FAILING STEP, NOT THE SUMMARY. stageWithRecipe's failure
 // result carries no top-level message - "Recipe step failed (fill - inverter quantity)" rides
@@ -406,6 +425,9 @@ function mapProject(row: ProjectRow): ProjectRecord {
     assignedUserId: row.assigned_user_id ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    // The edit version an editor saves against (#440, migration v51). Read via the cast, like
+    // stage_detail, so row literals elsewhere keep compiling.
+    editVersion: Number((row as Record<string, unknown>).edit_version ?? 0) || 0,
   };
 }
 
@@ -511,9 +533,26 @@ function mapPermitTarget(row: Row): PermitCheckTarget {
     permitType: text(row.permit_type),
     portalPlatform: text(row.portal_platform),
     trackingUrl: row.tracking_url ? text(row.tracking_url) : undefined,
+    readGap: text(row.read_gap) || undefined,
+    // Only while the filing is finished: a gap from an earlier issued reading that a later
+    // correction undid is not this filing's news any more.
+    issuedDocsGap: isFinishedOutcome(trackKind(text(row.target_type), text(row.permit_type)), text(row.latest_outcome))
+      ? text(row.issued_docs_gap) || undefined
+      : undefined,
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
   };
+}
+
+/** Each target's downloaded issued permit / approval letter (#492), with provenance — one query
+ *  for the project, not one per target. */
+function withIssuedDocuments(db: AppDb, projectId: string, targets: PermitCheckTarget[]): PermitCheckTarget[] {
+  const byTarget = issuedDocumentsByTarget(db, projectId);
+  if (!byTarget.size) return targets;
+  return targets.map((t) => {
+    const docs = byTarget.get(t.id);
+    return docs?.length ? { ...t, issuedDocuments: docs, issuedDocsGap: undefined } : t;
+  });
 }
 
 function mapPermitStatusCheck(row: Row): PermitStatusCheck {
@@ -836,8 +875,11 @@ export function updateProject(
   projectId: string,
   payload: ParserPayload,
   /** humanInverterEdit: ONLY a human-only caller (corrections-apply, a person's approval) may set it —
-   *  never PUT /api/projects/:id, which the parser and API keys use (#270). See recordMicroSupersession. */
-  options: { humanInverterEdit?: boolean } = {},
+   *  never PUT /api/projects/:id, which the parser and API keys use (#270). See recordMicroSupersession.
+   *  expectedVersion: the project's editVersion the editor LOADED (#440). Given, a project that has
+   *  moved on since — a teammate's save, or a background write of its data — is refused with a 409 and nothing
+   *  is written. Omitted (the parser, API keys, internal callers), the save is unconditional, as before. */
+  options: { humanInverterEdit?: boolean; expectedVersion?: number } = {},
 ): ProjectDetail {
   const existing = getProjectDetail(db, projectId).project;
   // Drop the non-persistent plan-set text overlay (re-derived from project_documents
@@ -898,6 +940,11 @@ export function updateProject(
   // Preserve the client link unless the payload explicitly changes it.
   const clientId = (payload.clientId ?? payload.client_id ?? existing.clientId) as string | null;
   db.transaction(() => {
+    // THE STALE-SAVE CHECK, INSIDE THE WRITE'S OWN TRANSACTION (#440). Read and refused here, not
+    // before the merge above, so nothing can move the row between the check and the UPDATE (a second
+    // connection's write in between makes this transaction's write fail rather than land). The throw
+    // rolls back; QC and learning below never run for a refused save.
+    if (options.expectedVersion !== undefined) assertProjectEditVersion(db, projectId, options.expectedVersion);
     db.run(
       `UPDATE projects SET
         client_id = ?, homeowner_name = ?, project_address = ?, city = ?, state = ?, zip = ?, ahj = ?, utility = ?,
@@ -937,6 +984,23 @@ export function updateProject(
   runQcForProject(db, projectId);
   learnFromProject(db, getProjectDetail(db, projectId).project, "project.updated");
   return getProjectDetail(db, projectId);
+}
+
+/** The message a stale save gets (#440). The dashboard reloads the project and says so itself. */
+export const PROJECT_EDIT_CONFLICT_MESSAGE =
+  "Not saved — this project was changed by someone else since you opened it. Reload it, check your changes against theirs, and save again.";
+
+/**
+ * Refuse a save made against an old edit version (#440): 409, `details.editConflict`, nothing
+ * written. Background writers never call this — a data write bumps the version (the v51 trigger) and goes on.
+ */
+export function assertProjectEditVersion(db: AppDb, projectId: string, expectedVersion: number): void {
+  const row = db.get<{ edit_version: number }>("SELECT edit_version FROM projects WHERE id = ?", [projectId]);
+  if (!row) throw new HttpError(404, "Project not found.");
+  const currentVersion = Number(row.edit_version) || 0;
+  if (currentVersion !== expectedVersion) {
+    throw new HttpError(409, PROJECT_EDIT_CONFLICT_MESSAGE, { editConflict: true, expectedVersion, currentVersion });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,9 +1389,9 @@ export function getProjectDetail(db: AppDb, projectId: string): ProjectDetail {
       .query<Row>("SELECT * FROM human_review_items WHERE project_id = ? ORDER BY status DESC, created_at DESC", [projectId])
       .map(mapReview),
     corrections,
-    permitCheckTargets: db
+    permitCheckTargets: withIssuedDocuments(db, projectId, db
       .query<Row>("SELECT * FROM permit_check_targets WHERE project_id = ? ORDER BY active DESC, created_at DESC", [projectId])
-      .map(mapPermitTarget),
+      .map(mapPermitTarget)),
     permitStatusChecks: db
       .query<Row>("SELECT c.*, t.target_type, t.permit_type FROM permit_status_checks c LEFT JOIN permit_check_targets t ON t.id = c.target_id WHERE c.project_id = ? ORDER BY c.created_at DESC LIMIT 50", [projectId])
       .map(mapPermitStatusCheck),
@@ -1396,6 +1460,8 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     db.run("DELETE FROM audit_logs WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM historical_failure_examples WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM permit_timeline_samples WHERE project_id = ?", [projectId]);
+    // Closeout milestones (migration v58, #497).
+    db.run("DELETE FROM project_milestones WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM historical_project_fingerprints WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM knowledge_events WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM project_notes WHERE project_id = ?", [projectId]);
@@ -1409,6 +1475,9 @@ export function deleteProject(db: AppDb, projectId: string): { deleted: true; pr
     db.run("DELETE FROM project_intake_requests WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM submission_payments WHERE project_id = ?", [projectId]);
     db.run("DELETE FROM portal_fee_readings WHERE project_id = ?", [projectId]);
+    db.run("DELETE FROM portal_record_documents WHERE project_id = ?", [projectId]);
+    // The filing-time quote (migration v56, #494) carries the same FK.
+    db.run("DELETE FROM fee_quote_snapshots WHERE project_id = ?", [projectId]);
     // Keep permit_fee_history (learned real fees) but unlink the deleted project.
     db.run("UPDATE permit_fee_history SET project_id = NULL WHERE project_id = ?", [projectId]);
     // Communications may belong to a customer too — unlink rather than destroy correspondence.
@@ -2178,6 +2247,8 @@ export function getProjectHandoffPacket(db: AppDb, projectId: string): ProjectHa
   const noteLines = runbook.recentNotes
     .slice(0, 8)
     .map((note) => `${note.noteType.replaceAll("_", " ")} | ${note.createdBy || "Operations"}: ${note.body}`);
+  // The issued permit(s) and the approval letter the installer needs (#492).
+  const closeout = closeoutDocumentLines(db, projectId);
 
   const sections: ProjectHandoffPacketSection[] = [
     handoffSection({
@@ -2224,6 +2295,12 @@ export function getProjectHandoffPacket(db: AppDb, projectId: string): ProjectHa
       lines: timelineLines.length ? timelineLines : ["No timeline activity recorded yet."],
     }),
     handoffSection({
+      title: "Issued Permit & Approval Letter",
+      severity: closeout.complete ? "pass" : closeout.finished ? "warning" : "info",
+      source: "portal_record_documents",
+      lines: closeout.lines.length ? closeout.lines : ["No filing reads issued or approved yet."],
+    }),
+    handoffSection({
       title: "PM Notes",
       severity: runbook.recentNotes.some((note) => note.noteType === "blocker") ? "blocker" : runbook.recentNotes.length ? "info" : "pass",
       source: "project_notes",
@@ -2245,6 +2322,7 @@ export function getProjectHandoffPacket(db: AppDb, projectId: string): ProjectHa
     timelineEventCount: timeline.totalEvents,
     ownerRoles: [...owners].sort((a, b) => a.localeCompare(b)),
     sections,
+    closeoutDocumentsComplete: closeout.complete,
   };
   return {
     ...basePacket,
@@ -4622,14 +4700,60 @@ function matchProjectForEmail(
   };
 }
 
+/**
+ * IS THIS EMAIL A CORRECTION NOTICE (#522)? A correction or deficiency bucket always is; an
+ * information-request bucket is when the email directly ASKS for something (emailAsksForInformation
+ * — the bucket's own words are loose enough to catch a receipt). The one answer for both the
+ * reading's text (emailStatusText) and the unmatched-email alert.
+ */
+function emailIsCorrectionNotice(message: ClassifiedMboxMessage): boolean {
+  const bucket = message.record.type;
+  if (bucket === "permit_correction" || bucket === "nem_correction") return true;
+  return bucket === "missing_info_request" && emailAsksForInformation(message.rawSearchText);
+}
+
+/** The subject line alone, through the same redaction as the body (numbers, addresses, emails). */
+function redactEmailSubject(message: ClassifiedMboxMessage): string {
+  return redactEmailText(message.subject).slice(0, 240);
+}
+
 function emailStatusText(message: ClassifiedMboxMessage): string {
+  const infoRequest = message.record.type === "missing_info_request";
+  const asksForInformation = infoRequest && emailIsCorrectionNotice(message);
+  const unaskedInformationRequest = infoRequest && !asksForInformation;
   return [
     `Email bucket: ${message.record.type}`,
     message.record.workflow ? `Workflow: ${message.record.workflow}` : "",
     message.record.statusLabel ? `Status: ${message.record.statusLabel}` : "",
+    // An information request that never says "correction" ("please upload the signed owner form")
+    // read as needs_human_review: no correction, no due date, no client update (#522). Said here in
+    // words classifyPermitStatusText's correctionPattern already reads, so the reading takes the
+    // ONE correction path every other correction takes.
+    asksForInformation ? "Agency request: additional information requested." : "",
     message.record.requiredAction ? `Required action: ${message.record.requiredAction}` : "",
-    message.redactedText,
+    // AND THE OTHER WAY ROUND: an information-request email that does NOT ask ("if additional
+    // information is needed, we will contact you") used to open a correction anyway, because
+    // correctionPattern reads "additional information" / "incomplete" anywhere in the body. Its
+    // reading is the subject alone, so it lands as needs_human_review — a person looks — and the
+    // client is never told of a correction nobody asked for. The match row keeps the subject.
+    unaskedInformationRequest ? `Subject: ${redactEmailSubject(message)}` : message.redactedText,
   ].filter(Boolean).join("\n").slice(0, 5000);
+}
+
+/** THE ONE PREDICATE for "rows the mbox tracker reads" (#514). `email_tracking_sources` holds
+ *  IMAP inboxes too (`source_type = 'imap'`, `file_path = 'imap:<id>'`, or `''` on a row saved
+ *  before #513). Their mail is fetched by `pollImap`, which hands it to this tracker as a temp
+ *  file; read here as an mbox path, `imap:<id>` (or `''`, resolved to the working directory)
+ *  failed every tick with "not found" / "must point to a local MBOX file" and wrote that onto
+ *  the IMAP row's `last_error`, flipping its status against the poll's success. `!= 'imap'`
+ *  rather than `= 'mbox_path'` so an older row with any other type keeps being read. */
+const MBOX_TRACKER_SOURCE_FILTER = "source_type != 'imap'";
+
+/** Ids of the active sources the scheduler runs through the mbox tracker, one by one. */
+export function mboxTrackerSourceIds(db: AppDb): string[] {
+  return db
+    .query<{ id: string }>(`SELECT id FROM email_tracking_sources WHERE active = 1 AND ${MBOX_TRACKER_SOURCE_FILTER} ORDER BY updated_at DESC`)
+    .map((row) => row.id);
 }
 
 export async function runEmailTracker(
@@ -4650,8 +4774,9 @@ export async function runEmailTracker(
         client_id: input.clientId ?? null,
       } as Row]
     : input.sourceId
-      ? db.query<Row>("SELECT * FROM email_tracking_sources WHERE id = ?", [input.sourceId])
-      : db.query<Row>("SELECT * FROM email_tracking_sources WHERE active = 1 ORDER BY updated_at DESC");
+      // An IMAP row's id names no mbox file: it is read by pollImap, so here it checks nothing.
+      ? db.query<Row>(`SELECT * FROM email_tracking_sources WHERE id = ? AND ${MBOX_TRACKER_SOURCE_FILTER}`, [input.sourceId])
+      : db.query<Row>(`SELECT * FROM email_tracking_sources WHERE active = 1 AND ${MBOX_TRACKER_SOURCE_FILTER} ORDER BY updated_at DESC`);
 
   const result: EmailTrackerRunResult = {
     sourcesChecked: 0,
@@ -4712,6 +4837,18 @@ export async function runEmailTracker(
         const match = matchProjectForEmail(db, message, { orgId: sourceOrgId, clientId: sourceClientId });
         if (!match) {
           result.unmatchedMessages += 1;
+          // A CORRECTION NOBODY CAN PLACE STILL REACHES THE TEAM (#522). It used to be a count and
+          // nothing else. One alert per message (deduped by its signature — the inbox is re-read
+          // every poll), to this source's org only, carrying no email text (rule 2).
+          if (emailIsCorrectionNotice(message)) {
+            void alertStaffOnUnmatchedCorrectionEmail(db, {
+              orgId: sourceOrgId,
+              signature: message.sourceSignature,
+              from: message.from,
+              receivedAt: message.record.occurredAt,
+              bucket: message.record.type,
+            });
+          }
           continue;
         }
 
@@ -6076,8 +6213,30 @@ export async function reopenCorrectionOnPortal(
   //    on a utility platform, and a NEM filing never on an AHJ permit platform. Stop before any
   //    browser opens.
   const reopenTrack = targetType === "nem" ? "nem" : "permit";
-  let recipe = findCompleteRecipeForProject(db, { scopeType, state: detail.project.state, ahj: detail.project.ahj, utility: detail.project.utility })
-    ?? findAnyRecipeForProject(db, { scopeType, state: detail.project.state, ahj: detail.project.ahj, utility: detail.project.utility });
+  // THE FILING'S OWN DISCIPLINE (#455, the reopen half of #426): a per-discipline AHJ (City of
+  // Coos Bay: a structural and an electrical recipe, no '' row) has no recipe for a discipline-less
+  // lookup, so the reopen ran on the target's URL with no steps, or stopped with "no portal URL is
+  // known". Same helper the monitor uses — staging's own track → discipline mapping.
+  const reopenFiling = trackForTarget(text(target.target_type), text(target.permit_type));
+  const reopenDiscipline = recipeDisciplineForTarget(text(target.target_type), text(target.permit_type));
+  const recipeInput = { scopeType, state: detail.project.state, ahj: detail.project.ahj, utility: detail.project.utility, discipline: reopenDiscipline };
+  let recipe = findCompleteRecipeForProject(db, recipeInput) ?? findAnyRecipeForProject(db, recipeInput);
+  // LEGACY-ROW DISCIPLINE CHECK — staging's (prepareSubmission): a '' row recorded before recipes
+  // were keyed per discipline is still accepted as the fallback, and if its steps were learned for
+  // the OTHER discipline they pick the other jurisdiction row and record type. A reopen replays
+  // those steps against THIS filing, so the row is dropped (the reopen then runs on the target's
+  // own URL with no steps, like a host misfit below) rather than replayed down the wrong path.
+  if (recipe && reopenDiscipline && !recipe.discipline) {
+    try {
+      const learnedFor = recipeDisciplineFromSteps(getPortalRecipe(db, recipe.id).steps);
+      if (disciplineConflictsWithTrack(learnedFor, reopenFiling)) {
+        addAuditLog(db, projectId, "system", "correction reopen", "portal.discipline_recipe_skipped", {
+          correctionId, targetId: text(target.id), track: reopenFiling, recipeId: recipe.id, learnedFor,
+        });
+        recipe = null;
+      }
+    } catch { /* unreadable steps — leave the recipe to the host-fit judge below */ }
+  }
   if (recipe) {
     const entityInput = { scope: scopeType, state: detail.project.state, name: scopeType === "utility" ? detail.project.utility : detail.project.ahj, excludeRecipeIds: [recipe.id] };
     const fit = recipeHostFit(reopenTrack, portalEntityEvidence(db, entityInput), recipe);
@@ -6112,13 +6271,12 @@ export async function reopenCorrectionOnPortal(
   //    gate re-reads the project's current path + selected file at the attach itself.
   //    Scoped to THIS target's filing (docs-audit PLAN D3): a reopened building permit is
   //    handed the building track's documents, never the utility bill or the electrical form.
-  const reopenFiling = trackForTarget(text(target.target_type), text(target.permit_type));
   const docsByType = submissionDocumentsByType(db, detail.project, reopenFiling);
   const beforeUpload = uploadDocumentGuard(db, projectId, { track: reopenFiling });
 
   // 4) Credential/session conventions shared with the learner/replay/monitor.
   const clientId = detail.project.clientId ?? "";
-  const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  const profileBase = portalProfilesDir();
   const portalType = scopeType === "utility" ? "utility" : "AHJ";
   const userDataDir = portalProfileDir(profileBase, clientId || null, portalType, portalUrl);
   const credential = clientId
@@ -6346,6 +6504,111 @@ export function createPermitCheckTarget(
   return getProjectDetail(db, projectId);
 }
 
+// EDIT ONE TRACKED FILING FROM ITS CARD (#411). Owner 2026-10-29, West / Lincoln County: the building
+// permit was issued but its card read ACTIVE, because the filing went in before the record link was
+// captured and the monitor had no URL to read. The only way to fix a target was the add-target form,
+// which upserts by number — undiscoverable from the card. This edits the row the card shows.
+//
+// Only the fields the caller NAMES are touched (`undefined` = leave it). The status itself is never
+// a field here: a status is a reading, recorded through recordPermitStatusCheck so its provenance
+// (readingMayFinishTrack) still decides what it may finish.
+//   · scope — the target must belong to THIS project (else 404, like recordPermitStatusCheck); the
+//     project's own org scope is the /api/projects/:id guard's. Never 403.
+//   · rule 5 — the same predicate and message as creation (refuseUtilityUrlOnPermitTarget), judged
+//     by the row's own kind (trackKind); and a non-empty URL that is not http(s) is refused.
+//   · links — every URL written goes through safeRecordLink first, so a pasted session query string
+//     is never stored (the ids that make the record readable are kept).
+//   · identity — an edit that writes the numbers must leave an application or a permit number, or
+//     it is refused (clearing one never orphans the row).
+//   · cadence — a frequency change recomputes next_check_at the way a reading does (effectiveCheckDays).
+//   · platform — a new portal URL is re-detected (detectPlatform), as at creation.
+//   · audit — permit_target.edited names the CHANGED FIELDS only. Never the values: a record URL can
+//     carry a session token, and an audit row is read by people the URL was never meant for.
+export function updatePermitCheckTarget(
+  db: AppDb,
+  projectId: string,
+  targetId: string,
+  input: {
+    portalUrl?: string;
+    trackingUrl?: string;
+    applicationNumber?: string;
+    permitNumber?: string;
+    portalName?: string;
+    checkFrequencyDays?: number;
+    active?: boolean;
+  },
+  actorName = "operator",
+): ProjectDetail {
+  getProjectDetail(db, projectId); // an unknown project 404s before anything is read
+  const row = db.get<Row>("SELECT * FROM permit_check_targets WHERE id = ? AND project_id = ?", [targetId, projectId]);
+  if (!row) throw new HttpError(404, "Permit check target not found.");
+
+  const str = (v: unknown): string | undefined => (v === undefined || v === null ? undefined : String(v).trim());
+  // A URL pasted on the card is stored the way a captured record link is (safeRecordLink: origin +
+  // path + the record's own ids, never a session token, only http(s)). "" clears it; a non-empty
+  // paste that comes back empty is not a web address and is refused.
+  const link = (v: unknown): string | undefined => {
+    const raw = str(v);
+    if (!raw) return raw;
+    const safe = safeRecordLink(raw);
+    if (!safe) throw new HttpError(400, "A portal or status URL must be a web address starting with http:// or https://.");
+    return safe;
+  };
+  const next = {
+    portal_url: link(input.portalUrl) ?? text(row.portal_url),
+    tracking_url: link(input.trackingUrl) ?? text(row.tracking_url),
+    application_number: str(input.applicationNumber) ?? text(row.application_number),
+    permit_number: str(input.permitNumber) ?? text(row.permit_number),
+    portal_name: str(input.portalName) ?? text(row.portal_name),
+  };
+  // Only the URLs this edit WRITES are judged: a legacy row already holding a refused URL must still
+  // be retired (active:false) or have that URL cleared, not be frozen by its own bad value.
+  const urlsWritten = [input.portalUrl === undefined ? "" : next.portal_url, input.trackingUrl === undefined ? "" : next.tracking_url];
+  refuseUtilityUrlOnPermitTarget(trackKind(text(row.target_type), text(row.permit_type)), ...urlsWritten);
+  const numbersWritten = input.applicationNumber !== undefined || input.permitNumber !== undefined;
+  if (numbersWritten && !next.application_number && !next.permit_number) {
+    throw new HttpError(400, "A tracked filing needs an application number or a permit number. Keep one of them, or stop tracking this filing instead.");
+  }
+  let frequency: number | undefined;
+  if (input.checkFrequencyDays !== undefined && input.checkFrequencyDays !== null) {
+    frequency = Number(input.checkFrequencyDays);
+    if (!Number.isInteger(frequency) || frequency < 1 || frequency > 365) {
+      throw new HttpError(400, "Check frequency must be a whole number of days from 1 to 365.");
+    }
+  }
+  if (input.active !== undefined && input.active !== null && typeof input.active !== "boolean") {
+    throw new HttpError(400, "active must be true or false.");
+  }
+  const active = typeof input.active === "boolean" ? input.active : undefined;
+
+  const changed: string[] = [];
+  const sets: string[] = [];
+  const args: Array<string | number> = [];
+  const set = (field: string, column: string, value: string | number): void => { changed.push(field); sets.push(`${column} = ?`); args.push(value); };
+  if (next.portal_url !== text(row.portal_url)) {
+    set("portalUrl", "portal_url", next.portal_url);
+    sets.push("portal_platform = ?");
+    args.push(next.portal_url ? detectPlatform(next.portal_url) : "unknown");
+  }
+  if (next.tracking_url !== text(row.tracking_url)) set("trackingUrl", "tracking_url", next.tracking_url);
+  if (next.application_number !== text(row.application_number)) set("applicationNumber", "application_number", next.application_number);
+  if (next.permit_number !== text(row.permit_number)) set("permitNumber", "permit_number", next.permit_number);
+  if (next.portal_name !== text(row.portal_name)) set("portalName", "portal_name", next.portal_name);
+  if (frequency !== undefined && frequency !== Number(row.check_frequency_days)) {
+    set("checkFrequencyDays", "check_frequency_days", frequency);
+    sets.push("next_check_at = ?");
+    args.push(nextCheckIso(effectiveCheckDays(frequency, row.latest_outcome == null ? null : text(row.latest_outcome))));
+  }
+  if (active !== undefined && active !== bool(row.active)) set("active", "active", active ? 1 : 0);
+  if (!changed.length) return getProjectDetail(db, projectId);
+
+  db.transaction(() => {
+    db.run(`UPDATE permit_check_targets SET ${sets.join(", ")}, updated_at = ? WHERE id = ?`, [...args, nowIso(), targetId]);
+    addAuditLog(db, projectId, "human", actorName, "permit_target.edited", { targetId, fields: changed });
+  });
+  return getProjectDetail(db, projectId);
+}
+
 export async function recordPermitStatusCheck(
   db: AppDb,
   projectId: string,
@@ -6371,7 +6634,7 @@ export async function recordPermitStatusCheck(
      *  (permitMonitor.extractStatusDate), if any. */
     noticedAt?: string | null;
   },
-): Promise<ProjectDetail> {
+): Promise<PermitStatusCheckResult> {
   const detail = getProjectDetail(db, projectId);
   const target = input.targetId
     ? db.get<Row>("SELECT * FROM permit_check_targets WHERE id = ? AND project_id = ?", [input.targetId, projectId])
@@ -6379,7 +6642,26 @@ export async function recordPermitStatusCheck(
   if (input.targetId && !target) throw new HttpError(404, "Permit check target not found.");
 
   const source = input.source || "manual";
-  const rawStatusText = await resolveStatusText(target, input.rawStatusText || "", source);
+  const resolved = await resolveStatusText(target, input.rawStatusText || "", source);
+  // A RE-CHECK THAT READ NOTHING IS NOT A STATUS — the sweep's own rule, asked through the same
+  // predicate (shouldSkipEmptyRead). #412, live 7ddfbe48: the stale panel's public re-check of an
+  // issued building permit got "no results" from Accela's global search, and the placeholder it
+  // fell back to was written as the target's latest_outcome (needs_human_review) and the
+  // project's current_stage. On a target whose status is known nothing is written — no check
+  // row, no review item, no outcome or stage — the target is only rescheduled, and the caller is
+  // told in a sentence. Only a check against a TARGET takes this branch (no target: nothing to
+  // keep or reschedule), and never an email: it is its own evidence, and its match row links the
+  // check it wrote.
+  if (target && source !== "email" && shouldSkipEmptyRead({ gatheredNothing: resolved.gatheredNothing, source, alreadyKnown: Boolean(text(target.latest_outcome)) })) {
+    const track = trackKind(text(target.target_type), text(target.permit_type));
+    db.transaction(() => rescheduleUnreadTarget(db, projectId, target, track, resolved.why, nowIso()));
+    const kept = text(target.latest_status_label) || text(target.latest_outcome);
+    return {
+      ...getProjectDetail(db, projectId),
+      unreadable: `The portal gave no readable status (${resolved.why}) — nothing recorded.${kept ? ` The filing keeps its last known status: ${kept}.` : ""}`,
+    };
+  }
+  const rawStatusText = resolved.text;
   // The notice's own date: the caller's (an email's Date header), else the date the page itself
   // prints for its status (#58: the portal monitor passes none). Neither: null, and the cure clock
   // of a correction this reading raises starts at ingestion.
@@ -6481,6 +6763,17 @@ export async function recordPermitStatusCheck(
   const doneBeforeReading = (classification.outcome === "issued" || classification.outcome === "nem_approved") && previousOutcome !== classification.outcome
     ? trackDoneSnapshot(db, detail.project)
     : null;
+  // Set on the transition to handoff_ready only (triggerHandoffIfReady) — the installer handoff
+  // packet goes out after the transaction commits, below.
+  let handedOff = false;
+
+  // THE SAME LETTER, SEEN TWICE (#523). The poll read the correction off the portal first; now the
+  // agency's email about it arrives. The email still records — its words are usually the fuller list
+  // of what was asked — but as an item of the notice already open, not a second notice, and the team
+  // is not alerted twice. Read before the transaction (the target row is about to be overwritten).
+  const sameNotice = recordCheck && classification.outcome === "correction_flagged" && source === "email" && target && previousOutcome === "correction_flagged"
+    ? sameNoticeAsPolledCorrection(db, text(target.id), noticedAt || ts)
+    : null;
 
   db.transaction(() => {
     // `recordCheck &&` on all three: see the note above. An unchanged poll falls straight through
@@ -6495,7 +6788,7 @@ export async function recordPermitStatusCheck(
         jurisdiction: text(target?.jurisdiction),
         recordNumber: input.permitNumber || text(target?.permit_number) || input.applicationNumber || text(target?.application_number),
         readingSource: source,
-      }, noticedAt);
+      }, noticedAt, sameNotice?.noticeId ?? null);
     } else if (recordCheck && refused) {
       // THE REFUSED READING'S OWN ROW — issue_type names it, parser_value carries what the text
       // said (outcome + label), notes carry why it was not trusted. This is the item an operator
@@ -6602,7 +6895,7 @@ export async function recordPermitStatusCheck(
         recordNumber: input.permitNumber || text(target.permit_number) || input.applicationNumber || text(target.application_number),
       });
     }
-    if (mayWriteStatus) triggerHandoffIfReady(db, projectId, ts);
+    if (mayWriteStatus) handedOff = triggerHandoffIfReady(db, projectId, ts);
     // ONE ROW PER CHECK, ALWAYS — this is the per-check evidence trail, and it is the thing the
     // status-check gate above is allowed to suppress *because* this is not. `checkId` is null when
     // no row was written: an audit entry pointing at a permit_status_checks id that does not exist
@@ -6660,6 +6953,25 @@ export async function recordPermitStatusCheck(
   // demoted row: a reading this function refused to write is refused here for the same reason,
   // by the same verdict, so the two doors cannot disagree. (Passing the persisted outcome instead
   // would make this gate dead code — it would only ever see needs_human_review.)
+  // STAFF ALERT (#487) — also after the commit, and on what was WRITTEN (`classification`): a
+  // refused reading reaches staff as the needs_human_review it was persisted as, which is exactly
+  // the item somebody has to go and confirm. A new correction is its own alert (the correction is
+  // the news); otherwise a change of the target's outcome is, gated on the same change pair the
+  // client update uses — and on recordCheck, so a re-read of a known state alerts nobody.
+  // (The cast: TypeScript does not see the assignment inside the transaction closure.)
+  const newCorrectionId = correctionId as string | null;
+  // A second report of a notice already alerted (#523) is not news for the team.
+  if (newCorrectionId && sameNotice) {
+    addAuditLog(db, projectId, "system", "email tracker", "correction.grouped_with_polled_notice", { correctionId: newCorrectionId, noticeId: sameNotice.noticeId, polledCorrectionId: sameNotice.correctionId });
+  } else if (newCorrectionId) {
+    void alertStaffOnCorrection(db, { projectId, correctionId: newCorrectionId, track: track ?? "permit" });
+  } else if (recordCheck) {
+    void alertStaffOnStatusChange(db, {
+      projectId, targetId: text(target?.id), track: track ?? "permit",
+      outcome: classification.outcome, previousOutcome,
+    });
+  }
+
   if (shouldNotifyClient(read.outcome, previousOutcome, provenance)) {
     void notifyClientOfStatusChange(db, detail.project, {
       outcome: read.outcome,
@@ -6679,12 +6991,65 @@ export async function recordPermitStatusCheck(
     });
   }
 
+  // THE INSTALLER HANDOFF PACKET (#491) — on the transition only, after the commit, fire-and-
+  // forget (it never throws). Its record (the communication, the client note) is written before
+  // its first await, so the detail returned below already shows it.
+  if (handedOff) void sendInstallerHandoff(db, getProjectDetail(db, projectId).project, { trigger: "automatic" });
+
   return getProjectDetail(db, projectId);
 }
 
-async function resolveStatusText(target: Row | null, rawStatusText: string, source: PermitCheckSource): Promise<string> {
+/** How recent a polled correction must be for an emailed one on the same filing to count as the
+ *  same letter (#523). Agencies email the letter the day they post it; a week is generous, and past
+ *  it an emailed correction is treated as a new round rather than risk hiding one. */
+export const SAME_NOTICE_WINDOW_DAYS = 7;
+
+/**
+ * Is an emailed correction on this target the letter the portal poll already recorded (#523)? Yes
+ * when the target's newest OPEN correction was raised by a PORTAL reading of this same target within
+ * SAME_NOTICE_WINDOW_DAYS before the email. A closed one (the agency's previous round, answered)
+ * never groups, and neither does an earlier EMAILED correction: that is a letter of its own.
+ */
+function sameNoticeAsPolledCorrection(db: AppDb, targetId: string, emailAt: string): { correctionId: string; noticeId: string } | null {
+  const row = db.get<Row>(
+    `SELECT c.id, c.notice_id, c.source, c.created_at FROM corrections c
+       JOIN permit_status_checks k ON k.correction_id = c.id
+      WHERE k.target_id = ? AND c.closed_at IS NULL
+      ORDER BY c.created_at DESC, c.rowid DESC LIMIT 1`,
+    [targetId],
+  );
+  if (!row || text(row.source) !== "portal") return null;
+  const raised = Date.parse(text(row.created_at));
+  const at = Date.parse(emailAt);
+  if (!Number.isFinite(raised) || !Number.isFinite(at)) return null;
+  if (Math.abs(at - raised) > SAME_NOTICE_WINDOW_DAYS * 86_400_000) return null;
+  return { correctionId: text(row.id), noticeId: text(row.notice_id) || text(row.id) };
+}
+
+/** WHAT A CHECK THAT READ NOTHING STILL DOES (shouldSkipEmptyRead), at both doors: it ALWAYS
+ *  reschedules — a skip that left next_check_at alone kept an unreadable target permanently due
+ *  and re-attempted on every sweep — and audits why. Nothing else on the target moves. */
+function rescheduleUnreadTarget(db: AppDb, projectId: string, target: Row, track: TrackKind | null, why: string, ts: string): void {
+  const days = effectiveCheckDays(target.check_frequency_days, text(target.latest_outcome));
+  db.run("UPDATE permit_check_targets SET last_checked_at = ?, next_check_at = ?, updated_at = ? WHERE id = ?", [
+    ts,
+    nextCheckIso(days, new Date(ts)),
+    ts,
+    text(target.id),
+  ]);
+  addAuditLog(db, projectId, "system", "permit monitor", "permit_status.unreadable", { targetId: text(target.id), track, reason: why });
+}
+
+/** The text a check classifies, and whether it GATHERED anything: `gatheredNothing` is true only
+ *  when the caller's text was blank and no fetch yielded a readable status (the placeholder, or a
+ *  login page — the sweep never counts a sign-in wall as a reading either). Never inferred from
+ *  the text: an operator who pastes the placeholder itself has pasted something. `why` words it. */
+type ResolvedStatusText = { text: string; gatheredNothing: boolean; why: string };
+
+async function resolveStatusText(target: Row | null, rawStatusText: string, source: PermitCheckSource): Promise<ResolvedStatusText> {
   const trimmed = rawStatusText.trim();
-  if (trimmed) return trimmed;
+  if (trimmed) return { text: trimmed, gatheredNothing: false, why: "" };
+  const nothing = (text: string, why: string): ResolvedStatusText => ({ text, gatheredNothing: true, why });
   // "mock" source = no portal URL and no recipe to check against. NEVER fabricate a
   // status here — a made-up "under review" classifies as a real outcome and can email
   // the client a fake update. Honest answer only, except in explicit offline/dev mode
@@ -6692,8 +7057,8 @@ async function resolveStatusText(target: Row | null, rawStatusText: string, sour
   if (source === "mock") {
     const offlineDev = isAutoSeedDisabled();
     return offlineDev
-      ? "Application is under review. Plans assigned to reviewer."
-      : "No status text available. Manual AHJ/utility portal check required.";
+      ? { text: "Application is under review. Plans assigned to reviewer.", gatheredNothing: false, why: "" }
+      : nothing("No status text available. Manual AHJ/utility portal check required.", "no portal URL or recipe to read");
   }
 
   // Rule 5 both ways at the fetch (resolution skeptic MF3): a permit target bound to a utility
@@ -6714,12 +7079,16 @@ async function resolveStatusText(target: Row | null, rawStatusText: string, sour
     // review" items, several are this. The same failure honest in one path and silent in
     // its sibling is the shape that keeps producing these.
     if (publicText && isAuthWallText(publicText)) {
-      return "The portal returned its LOGIN page, not a status — the stored session or credential for this portal is no longer valid. Refresh the credential, then re-check; nothing about the filing has been read.";
+      return nothing(
+        "The portal returned its LOGIN page, not a status — the stored session or credential for this portal is no longer valid. Refresh the credential, then re-check; nothing about the filing has been read.",
+        "the portal returned its login page — refresh the credential, then re-check",
+      );
     }
-    if (publicText && publicText.length > 40) return publicText;
+    if (publicText && publicText.length > 40) return { text: publicText, gatheredNothing: false, why: "" };
+    return nothing("No status text available. Manual AHJ/utility portal check required.", "the public page held no readable status");
   }
 
-  return "No status text available. Manual AHJ/utility portal check required.";
+  return nothing("No status text available. Manual AHJ/utility portal check required.", source === "public_url" || source === "portal" ? "no portal URL to read" : "no status text was given");
 }
 
 function insertMonitorCorrection(
@@ -6731,6 +7100,9 @@ function insertMonitorCorrection(
   source: CorrectionRecord["source"],
   origin: CorrectionReadingOrigin,
   noticedAt: string | null = null,
+  /** The notice this item belongs to, when it is a second report of a notice already recorded
+   *  (sameNoticeAsPolledCorrection); null = a notice of its own. */
+  noticeId: string | null = null,
 ): string {
   // A portal reading is the record PAGE; the correction is what that page asks for.
   const { correctionText, sourceText } = correctionFromReading(readText, source === "portal");
@@ -6738,7 +7110,7 @@ function insertMonitorCorrection(
   const correctionId = id();
   // The filing is the TARGET's (its target_type / permit_type), never the page's words.
   const filing: CorrectionFilingInput = origin.targetId ? { targetType: origin.targetType, permitType: origin.permitType, noticedAt } : { noticedAt };
-  const stamp = correctionFilingStamp(db, project, correctionId, ts, filing);
+  const stamp = correctionFilingStamp(db, project, correctionId, ts, { ...filing, noticeId });
   db.run(
     `INSERT INTO corrections (
       id, project_id, source, correction_text, source_text, correction_bucket, root_cause, required_action,
@@ -7033,22 +7405,6 @@ const MONITOR_WAITING_MAY_ADVANCE = new Set(["awaiting_human_submit", "submitted
   }
 }
 
-function buildInstallerHandoffChecklist(project: ProjectRecord): string[] {
-  const size = project.systemSizeDcKw ? `${project.systemSizeDcKw} kW DC` : "system";
-  return [
-    `PERMIT ISSUED — ${project.ahj || "AHJ"}: Download permit card and post at job site before work begins.`,
-    `NEM APPROVED — ${project.utility || "Utility"}: Save the approval confirmation email/letter.`,
-    `INSTALLATION: Install per the approved plans. Do not deviate from stamped set without re-permit.`,
-    `RAPID SHUTDOWN: Label all rapid shutdown devices per approved plans before inspection.`,
-    `FINAL INSPECTION: Schedule with ${project.ahj || "AHJ"}. Inspector will verify install matches approved plans.`,
-    `AFTER INSPECTION PASSES: Send a copy of the signed final inspection card to ${project.utility || "the utility"} to trigger Permission to Operate (PTO).`,
-    `PTO: Utility will issue PTO once inspection record is received. Timeline varies (typically 1–5 business days).`,
-    `SYSTEM SIZE: ${size} — verify AC output at inverter matches NEM application.`,
-    project.interconnectionMethod ? `INTERCONNECTION: ${project.interconnectionMethod}` : "",
-    `HOMEOWNER: Notify ${project.homeownerName || "homeowner"} that the system can be energized only after PTO is received.`,
-  ].filter(Boolean);
-}
-
 /**
  * IS THE SUBMISSION SCOPE COMPLETE? — the handoff predicate, per track, from the filings'
  * own tracking targets. Returns what still stands in the way (empty = hand off).
@@ -7082,25 +7438,21 @@ export function handoffBlockers(db: AppDb, project: ProjectRecord): string[] {
   return blockers;
 }
 
-function triggerHandoffIfReady(db: AppDb, projectId: string, ts: string): void {
+/** Moves the project to handoff_ready when the scope is complete. Returns true ON THE TRANSITION
+ *  only — the caller sends the installer handoff packet (installerHandoff.ts) after its
+ *  transaction commits, so a repeat reading on a handed-off project sends nothing. */
+function triggerHandoffIfReady(db: AppDb, projectId: string, ts: string): boolean {
   const project = db.get<ProjectRow>("SELECT * FROM projects WHERE id = ?", [projectId]);
-  if (!project) return;
+  if (!project) return false;
   // Already handed off: nothing to write, and the note/audit are written only on the transition.
   // (A correction arriving after handoff has already moved the status to correction_received
   // before this runs, so it is not caught here — and the predicate below refuses it.)
-  if (project.status === "handoff_ready") return;
-  if (handoffBlockers(db, mapProject(project)).length > 0) return;
+  if (project.status === "handoff_ready") return false;
+  if (handoffBlockers(db, mapProject(project)).length > 0) return false;
 
-  const mappedProject = mapProject(project);
-  const checklist = buildInstallerHandoffChecklist(mappedProject);
-  const noteBody = [
-    "✓ PERMIT ISSUED + NEM APPROVED — your submission scope is complete.",
-    "",
-    "Installer handoff checklist:",
-    ...checklist.map((line, i) => `${i + 1}. ${line}`),
-    "",
-    "No further action required from this platform unless a correction is received after final inspection.",
-  ].join("\n");
+  // The checklist is installerHandoff.ts's ONE copy: this note and the client's handoff email
+  // render the same lines.
+  const noteBody = installerHandoffNoteBody(mapProject(project));
 
   db.run("UPDATE projects SET status = 'handoff_ready', current_stage = ?, stage_detail = ?, updated_at = ? WHERE id = ?", [
     "Permit issued + NEM approved. Ready for installer handoff.",
@@ -7120,6 +7472,51 @@ function triggerHandoffIfReady(db: AppDb, projectId: string, ts: string): void {
     nemApproved: true,
     fromStatus: project.status,
   });
+  return true;
+}
+
+/**
+ * STORE THE RECORD LINK A SIGNED-IN READ FOUND (#413) as the target's tracking_url — so the next
+ * check reads the record's own page without signing in. Returns the stored link, or "".
+ *   · only a target with NO link: a captured (#400) or pasted link is never overwritten;
+ *   · through safeRecordLink: identifiers only, never session material, only http(s);
+ *   · rule 5 (trackSafeUrl): a permit target never takes a utility URL, nor a NEM target an AHJ one;
+ *   · on the portal the recipe that read it was judged fit for (recipeHostFit, the
+ *     hostFitsTrackAndEntity answer): its host, and on a permit track its tenant too (one Accela host
+ *     serves many agencies by path). A utility's record pages sit beside its login on the same host.
+ *     A link the AHJ portal's public record search found (#443) is held to the target's own portal
+ *     the same way (`from` says which read found it).
+ * Every refusal is audited with its reason; nothing else on the target moves.
+ */
+function storeFoundStatusLink(db: AppDb, projectId: string, target: Row, track: TrackKind, found: string, recipePortalUrl: string, ts: string,
+  from: "record_list" | "public_search" = "record_list"): string {
+  const link = safeRecordLink(found);
+  const refuse = (reason: string): string => {
+    addAuditLog(db, projectId, "system", "permit monitor", "permit_target.status_link_refused", { targetId: text(target.id), track, url: link || String(found).slice(0, 300), reason });
+    return "";
+  };
+  if (!link) return refuse("not an http(s) record link");
+  if (!trackSafeUrl(track, link)) return refuse(track === "nem" ? "the link is an AHJ permit portal, and this is a NEM filing" : "the link is a utility interconnection portal, and this is a permit filing");
+  if (!sameHost(link, recipePortalUrl) || (track === "permit" && !samePortal(link, recipePortalUrl))) return refuse(from === "public_search" ? "the link is not on this filing's AHJ portal" : "the link is not on the portal that was signed in to");
+  const current = db.get<{ tracking_url?: string }>("SELECT tracking_url FROM permit_check_targets WHERE id = ?", [text(target.id)]);
+  if (text(current?.tracking_url)) return "";
+  db.run("UPDATE permit_check_targets SET tracking_url = ?, updated_at = ? WHERE id = ? AND COALESCE(tracking_url, '') = ''", [link, ts, text(target.id)]);
+  addAuditLog(db, projectId, "system", "permit monitor", "permit_target.status_link_found", { targetId: text(target.id), track, url: link, from: from === "public_search" ? "the AHJ portal's public record search" : "the account's record list (signed-in read)" });
+  return link;
+}
+
+/**
+ * WHICH RECIPE DISCIPLINE A TRACKED FILING READS ITS STATUS WITH (#426) — staging's own answer
+ * (recipeDisciplineForTrack), never a second list. A target's permit_type is the track it was
+ * filed on (ensureCheckTarget writes the track), so a track name maps directly; anything else
+ * ("structural" from an older door) goes through trackForTarget, the ONE target → track answer
+ * (structural → building). A NEM filing reads the utility's recipe, which has no discipline.
+ */
+export function recipeDisciplineForTarget(targetType: string, permitType: string): string {
+  if (trackKind(targetType, permitType) === "nem") return "";
+  const permit = text(permitType).trim().toLowerCase();
+  const track = (SUBMITTAL_TRACK_TYPES as string[]).includes(permit) ? permit : trackForTarget(targetType, permit);
+  return recipeDisciplineForTrack(track);
 }
 
 export async function runDuePermitChecks(
@@ -7172,13 +7569,41 @@ export async function runDuePermitChecks(
     const applicationNumbers = [text(target.application_number), text(target.permit_number)].filter(Boolean);
     const projectDetail = getProjectDetail(db, projectId);
     const clientId = projectDetail.project.clientId ?? "";
-    const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+    const profileBase = portalProfilesDir();
+    // WHAT THIS SWEEP LEARNED ABOUT READING THE FILING ON ITS OWN (#413): the facts the card's one
+    // line is worded from (statusLinkGap.statusReadGap), and the record link a signed-in read found.
+    const gap: Omit<ReadGapFacts, "entityName" | "clientName" | "hasNumber" | "track"> = {
+      recipe: "none", profileUsed: false, portalHost: "", signedIn: "not_tried", hasCredential: false, publicLink: "none",
+    };
+    let signedInRan = false;
+    let foundLink = "";
+    let linkLookupStamp: string | null = null;
+    let publicReadUrl = "";
 
-    if (applicationNumbers.length > 0) {
+    // 0. A PERMIT FILING WITH A STATUS LINK IS READ ANONYMOUSLY FIRST (#413). The link is the record's
+    //    own public page (an Accela CapDetail, captured at filing by #400, pasted on the card, or found
+    //    in the account's record list below), so no sign-in is needed and none is spent. A NEM filing
+    //    keeps the signed-in read first: a utility's record page (PowerClerk) is behind a login.
+    if (track === "permit" && safeTrackingUrl && applicationNumbers.length > 0) {
+      publicReadUrl = safeTrackingUrl;
+      const publicText = await publicStatusFetch(safeTrackingUrl, applicationNumbers).catch(() => null);
+      if (publicText && publicText.length > 40 && !isAuthWallText(publicText)) {
+        rawStatusText = publicText;
+        source = "public_url";
+      } else {
+        gap.publicLink = publicText && isAuthWallText(publicText) ? "wall" : "no_status";
+      }
+    }
+
+    if (applicationNumbers.length > 0 && !rawStatusText) {
       const scopeType: "ahj" | "utility" = targetType === "nem" ? "utility" : "ahj";
-      let recipe =
-        findCompleteRecipeForProject(db, { scopeType, state: projectDetail.project.state, ahj: projectDetail.project.ahj, utility: projectDetail.project.utility })
-        ?? findAnyRecipeForProject(db, { scopeType, state: projectDetail.project.state, ahj: projectDetail.project.ahj, utility: projectDetail.project.utility });
+      // THE FILING'S OWN DISCIPLINE (#426): a per-discipline AHJ (City of Coos Bay: a structural and
+      // an electrical recipe, no '' row) has no recipe for a discipline-less lookup, so the monitor
+      // never signed in and fell back to a public page that read nothing.
+      const discipline = recipeDisciplineForTarget(text(target.target_type), text(target.permit_type));
+      const recipeInput = { scopeType, state: projectDetail.project.state, ahj: projectDetail.project.ahj, utility: projectDetail.project.utility, discipline };
+      let recipe = findCompleteRecipeForProject(db, recipeInput) ?? findAnyRecipeForProject(db, recipeInput);
+      if (recipe) gap.recipe = "used";
       if (recipe) {
         const entityInput = { scope: scopeType, state: projectDetail.project.state, name: scopeType === "utility" ? projectDetail.project.utility : projectDetail.project.ahj, excludeRecipeIds: [recipe.id] };
         const fit = recipeHostFit(track, portalEntityEvidence(db, entityInput), recipe);
@@ -7188,7 +7613,16 @@ export async function runDuePermitChecks(
           });
           noteReason(`the recorded portal was not used for this filing: ${fit.reason}`);
           recipe = null;
+          gap.recipe = "refused";
         }
+      }
+      // AT MOST ONE RECORD-LIST LOOKUP A DAY for a filing with no link (#413: go gently on live
+      // portals). A filing the account's list never shows is not walked again on every sweep.
+      if (recipe?.portalUrl && !safeTrackingUrl && linkLookupRanRecently(target.link_lookup_at == null ? null : text(target.link_lookup_at), new Date(now))) {
+        gap.signedIn = "throttled";
+        gap.portalHost = portalHostOf(recipe.portalUrl);
+        noteReason("the account's record list was already searched for this filing in the last day");
+        recipe = null;
       }
       if (recipe?.portalUrl) {
         // Same credential/profile conventions as the learner/replay: portalType key is
@@ -7202,6 +7636,12 @@ export async function runDuePermitChecks(
             ?? undefined
           : undefined;
         portalRead = true;
+        signedInRan = true;
+        gap.portalHost = portalHostOf(recipe.portalUrl);
+        gap.hasCredential = Boolean(credential);
+        if (!safeTrackingUrl) linkLookupStamp = now;
+        const recipeUrl = recipe.portalUrl;
+        let reportedLink = "";
         const scraped = await statusScrape("recipe", applicationNumbers, {
           recipe,
           fieldValues: {},
@@ -7210,23 +7650,32 @@ export async function runDuePermitChecks(
           credential,
           userDataDir,
           onReason: noteReason,
+          // THE FILING'S OWN RECORD LINK, read off the account's list where the status was found
+          // (#413). Kept only for a filing with no link yet, and only on the portal this recipe was
+          // judged fit for (storeFoundStatusLink).
+          onRecordLink: (link: string) => { reportedLink = link; },
         }).catch((err) => { noteReason(`the status read failed: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`); return null; });
         if (scraped && !isAuthWallText(scraped)) {
           rawStatusText = scraped;
           source = "portal";
+          // Only beside a status that was really read: a link from a sign-in wall is no record's.
+          if (reportedLink && !safeTrackingUrl) foundLink = storeFoundStatusLink(db, projectId, target, track, reportedLink, recipeUrl, now);
         } else if (scraped) {
           noteReason("the portal page read was a sign-in wall");
         }
       }
-    } else {
+    } else if (applicationNumbers.length === 0) {
       noteReason("the filing has no application or permit number to look up");
     }
 
     const portalType = targetType === "nem" ? "powerclerk_pge" : "accela_oregon";
     // The legacy platform adapter logs in at the target's own URL — only a track-safe one.
+    // RULE 6 (#413): only THIS project's client's profile, or a legacy profile no client owns —
+    // never another client's stored session. (It read the newest profile of the type, whoever's.)
     const portalProfile = rawStatusText || (text(target.portal_url) && !safeTargetPortalUrl) ? null : db.get<{ id: string; portal_type: string; encrypted_storage_state?: string }>(
-      "SELECT * FROM portal_profiles WHERE portal_type = ? ORDER BY created_at DESC LIMIT 1",
-      [portalType],
+      `SELECT * FROM portal_profiles WHERE portal_type = ? AND (client_id = ? OR client_id IS NULL OR client_id = '')
+       ORDER BY CASE WHEN client_id = ? THEN 0 ELSE 1 END, created_at DESC LIMIT 1`,
+      [portalType, clientId, clientId],
     );
     if (portalProfile?.encrypted_storage_state) {
       const userDataDir = portalProfileDir(profileBase, clientId ?? null, portalType, safeTargetPortalUrl);
@@ -7238,6 +7687,10 @@ export async function runDuePermitChecks(
         : undefined;
       const adapterType = portalType === "powerclerk_pge" ? "powerclerk" : "accela";
       portalRead = true;
+      signedInRan = true;
+      gap.profileUsed = true;
+      gap.portalHost ||= portalHostOf(safeTargetPortalUrl);
+      gap.hasCredential ||= Boolean(credential);
       const scraped = await statusScrape(adapterType, applicationNumbers, {
         encryptedStorageStatePath: portalProfile.encrypted_storage_state,
         headless: true,
@@ -7255,42 +7708,157 @@ export async function runDuePermitChecks(
         noteReason("the portal page read was a sign-in wall");
       }
     }
+    // A PERMIT FILING WITH A NUMBER AND NO LINK, ON AN ACCELA PORTAL: FIND ITS RECORD THROUGH THE
+    // MODULE'S OWN PUBLIC SEARCH (#443) — the filings with no recipe and no portal login, which no
+    // signed-in read can reach. A query, never a filing (rule 1: searchAccelaRecordByNumber); only the
+    // target's own track-safe AHJ portal and tenant, every hop asked (rule 5). Go gently: ONE search
+    // per check, in ONE module (the number's own by suffix first, then the next one on the next
+    // check), and none inside a day of any link lookup for this target (link_lookup_at, shared with
+    // the record-list lookup above). A record found is read now and its CapDetail kept as the
+    // tracking_url through storeFoundStatusLink, so every later check is a plain GET of that page.
+    const searchNumber = text(target.permit_number) || text(target.application_number);
+    if (!rawStatusText && track === "permit" && !text(target.tracking_url) && searchNumber && safeTargetPortalUrl
+      && detectPlatform(safeTargetPortalUrl) === "accela" && !linkLookupStamp
+      && !linkLookupRanRecently(target.link_lookup_at == null ? null : text(target.link_lookup_at), new Date(now))) {
+      const searchPortal = safeTargetPortalUrl;
+      const modules = accelaModulesForNumber(searchNumber, searchPortal);
+      const searchedBefore = Number(db.get<{ n: number }>(
+        "SELECT COUNT(*) AS n FROM audit_logs WHERE project_id = ? AND action = 'permit_target.status_link_search' AND json_extract(details, '$.targetId') = ?",
+        [projectId, text(target.id)],
+      )?.n ?? 0);
+      const module = modules[searchedBefore % modules.length]!;
+      linkLookupStamp = now;
+      const result = await accelaRecordSearch(searchPortal, searchNumber, {
+        module,
+        allowUrl: (u: string) => Boolean(trackSafeUrl("permit", u)) && samePortal(u, searchPortal),
+      }).catch((err) => ({ found: false as const, module, reason: `the search failed: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}` }));
+      addAuditLog(db, projectId, "system", "permit monitor", "permit_target.status_link_search", {
+        targetId: text(target.id), track, module, number: searchNumber, found: result.found, ...(result.found ? { url: result.link } : { reason: result.reason }),
+      });
+      if (result.found) {
+        rawStatusText = result.text;
+        source = "public_url";
+        foundLink = storeFoundStatusLink(db, projectId, target, track, result.link, searchPortal, now, "public_search");
+      } else if (!signedInRan) {
+        // (Not after a signed-in read: its own reason words the card's sign-in outcome.)
+        noteReason(`the portal's ${module} record search did not find it: ${result.reason}`);
+      }
+    }
     // No authenticated scrape — try the public tracking URL (exact CapDetail / record-detail
     // link that requires no login), then fall back to the generic portal_url.
     if (!rawStatusText) {
       const checkUrl = safeTrackingUrl || safeTargetPortalUrl;
       const appNums = [text(target.application_number), text(target.permit_number)].filter(Boolean);
-      if (checkUrl) {
+      // Not twice: the anonymous-first read above already fetched the status link.
+      if (checkUrl && checkUrl !== publicReadUrl) {
         const publicText = await publicStatusFetch(checkUrl, appNums).catch(() => null);
         if (publicText && publicText.length > 40 && !isAuthWallText(publicText)) {
           rawStatusText = publicText;
           source = "public_url";
+        } else {
+          gap.publicLink = publicText && isAuthWallText(publicText) ? "wall" : "no_status";
         }
       }
     }
-    // A CHECK THAT READ NOTHING IS NOT A STATUS. Two ways a sweep gathers no evidence: it
-    // had nothing to check at all (source stays "mock"), or it had a URL that could not be
-    // read — a PowerClerk project page is behind a login, so an anonymous fetch returns
-    // nothing usable. Recording either as a status classifies the honest "no status
-    // available" text as needs_human_review, which on a target we ALREADY know the status of
-    // is a downgrade: one sweep turned three verified "In review" NEM rows into "Needs human
-    // review" and stomped each project's current_stage with it.
+    // A LOGIN-WALLED RECORD LINK, READ WITH THE CLIENT'S OWN STORED LOGIN (#512). The card's link
+    // was read anonymously and gave nothing — a sign-in page (PowerClerk's record pages; any portal
+    // whose records need an account), or a page the plain fetch cannot see into — and neither the
+    // recipe nor a saved session read it. When the project's client has a login stored for THAT
+    // link's host — getDecryptedCredentialByUrl: the same host and tenant path, never another
+    // portal's login and never another client's (rules 5 and 6) — open the record through its own
+    // link in a real browser, signing in only when the page asks. One shape on every portal, nothing
+    // per platform. Read-only (readRecordLinkSignedIn: the filing backstop first; the only form it
+    // submits is the login). A profile of its own, so a staging window left open on the client's
+    // portal profile is never waited on or closed by a status read.
     //
-    // So: skip whenever no text was gathered — but ALWAYS reschedule. The old skip `continue`d
-    // without touching next_check_at, leaving an unreadable target permanently due and
-    // re-attempted on every single sweep (live: Ivy's NEM, still due from a poll an hour
-    // earlier). A never-checked target is the one exception: recording the honest "manual
-    // check required" is how the operator learns the link needs a login.
+    // NOT ONLY A WALL THE TEXT RECOGNIZES. Live 2026-11-02: PacifiCorp's record link redirects an
+    // anonymous visitor to /MvcAccount/Login, a page whose form is drawn by script — the plain fetch
+    // saw an empty shell (null), so the read was "no_status", never "wall", and a door keyed on the
+    // wall would never have opened. Whether the page asks for a sign-in is the browser's question.
+    if (!rawStatusText && gap.publicLink !== "none") {
+      const linkUrl = safeTrackingUrl || safeTargetPortalUrl;
+      const appNums = [text(target.application_number), text(target.permit_number)].filter(Boolean);
+      // A host-only question first (no secret read): is a browser worth opening at all? WHICH login is
+      // typed is chosen against the sign-in page the portal itself leads to (credentialFor below).
+      const hasLogin = Boolean(clientId && linkUrl && clientHasLoginOnHost(db, clientId, linkUrl));
+      gap.portalHost ||= portalHostOf(linkUrl);
+      gap.hasCredential ||= hasLogin;
+      if (linkUrl && hasLogin && appNums.length > 0) {
+        portalRead = true;
+        signedInRan = true;
+        const linkHost = portalHostOf(linkUrl);
+        let signInPage = "";
+        let withheld = "";
+        let held: "login_refused" | "login_sends_code" | null = null;
+        const read = await signedInLinkRead(linkUrl, appNums, {
+          // NO KNOCKING ON A DOOR THAT SAID NO. A login the portal refused the last time is not typed
+          // again (lockedOutCredential's rule, the stage gate's own: repeated attempts are what lock an
+          // account), and a login the client's record says sends a code at every sign-in is not typed
+          // by a scheduled read (each check would send the client a code). Nothing is typed; the card
+          // says which (the sweep sets that outcome itself — statusLinkGap words it).
+          credentialFor: (signInPageUrl: string) => {
+            signInPage = signInPageUrl;
+            const stored = storedCredentialFor(db, clientId, signInPageUrl);
+            if (stored?.stale && process.env.PORTAL_CREDENTIAL_LOCKOUT !== "0") {
+              held = "login_refused";
+              withheld = `${linkHost} refused the client's stored login the last time it was tried, so a status read does not try it again (repeated attempts are what lock an account)`;
+              return null;
+            }
+            if (stored?.mfaRequired) {
+              held = "login_sends_code";
+              withheld = `the client's login for ${linkHost} sends a code at every sign-in, so a scheduled status read never signs in with it`;
+              return null;
+            }
+            return getDecryptedCredentialByUrl(db, clientId, signInPageUrl);
+          },
+          headless: true,
+          userDataDir: portalProfileDir(profileBase, clientId, "status-read", linkUrl),
+        }).catch((err) => ({ text: null, reason: `the signed-in record read failed: ${err instanceof Error ? err.message.slice(0, 160) : String(err)}`, signedIn: false, loginRefused: false }));
+        // LOGIN HEALTH, the learn's own bookkeeping (recordLoginOutcome): a login the portal accepted
+        // clears a stale mark, one it refused sets it — so neither the next check nor the next stage
+        // knocks again. Diagnostic only: never allowed to change what this check reads.
+        try {
+          if (signInPage && read.signedIn) recordLoginOutcome(db, clientId, signInPage, { ok: true, note: "login accepted (status read)" });
+          else if (signInPage && read.loginRefused) recordLoginOutcome(db, clientId, signInPage, { ok: false, note: `status read: ${read.reason}` });
+        } catch { /* diagnostic only */ }
+        if (held) gap.signedIn = held;
+        if (read.text && !isAuthWallText(read.text)) {
+          rawStatusText = read.text;
+          source = "portal";
+        } else {
+          noteReason(withheld || read.reason || "the signed-in record read found no status");
+        }
+      } else if (linkUrl && !hasLogin && gap.publicLink === "wall") {
+        noteReason(`the record link needs a sign-in, and this client has no login stored for ${portalHostOf(linkUrl)}`);
+      }
+    }
+    // A CHECK THAT READ NOTHING IS NOT A STATUS — the rule and its history live on
+    // shouldSkipEmptyRead, which the manual/re-check door (recordPermitStatusCheck) asks too. A
+    // sweep gathers nothing when it had nothing to check at all (source stays "mock") or its URL
+    // could not be read (a PowerClerk project page behind a login). Skipped — but ALWAYS
+    // rescheduled (rescheduleUnreadTarget; live: Ivy's NEM stayed due from a poll an hour
+    // earlier). In offline dev a mock check fabricates its text downstream, so it is not
+    // "nothing" here.
     const gatheredNothing = !rawStatusText && !isAutoSeedDisabled();
     const alreadyKnown = Boolean(text(target.latest_outcome));
-    if (gatheredNothing && (source === "mock" || alreadyKnown)) {
-      const days = effectiveCheckDays(target.check_frequency_days, text(target.latest_outcome));
-      db.run("UPDATE permit_check_targets SET last_checked_at = ?, next_check_at = ?, updated_at = ? WHERE id = ?", [
-        now,
-        new Date(Date.now() + days * 24 * 60 * 60 * 1000).toISOString(),
-        now,
-        text(target.id),
-      ]);
+    // THE CARD SAYS WHY (#413): one actionable line while the filing cannot be read on its own,
+    // cleared by the first sweep that reads a status. Written on both branches below — a skipped
+    // read and a never-checked target's honest "manual check required" alike.
+    // Read off the first reason only when the sweep did not decide the outcome itself (throttled, or
+    // a stored login held back untyped).
+    if (gap.signedIn === "not_tried") gap.signedIn = signedInOutcome(signedInRan, unreadableReason);
+    const readGap = gatheredNothing
+      ? statusReadGap({
+          ...gap,
+          track,
+          entityName: track === "nem" ? projectDetail.project.utility : projectDetail.project.ahj,
+          clientName: clientId ? text(db.get<{ company_name?: string }>("SELECT company_name FROM clients WHERE id = ?", [clientId])?.company_name) : "",
+          hasNumber: applicationNumbers.length > 0,
+        })
+      : "";
+    db.run("UPDATE permit_check_targets SET read_gap = ?, link_lookup_at = COALESCE(?, link_lookup_at) WHERE id = ?", [readGap, linkLookupStamp, text(target.id)]);
+    if (foundLink) logger.info("monitor", `status link found for target ${text(target.id)}`, { projectId });
+    if (shouldSkipEmptyRead({ gatheredNothing, source, alreadyKnown })) {
       // Say WHY (issue #161). "No portal URL/recipe" only when nothing could be read at all; otherwise
       // the scraper's own reason (sign-in failed, MFA asked, where it looked and how far).
       const why = unreadableReason
@@ -7302,7 +7870,7 @@ export async function runDuePermitChecks(
           : `skipping status check for target ${text(target.id)}: ${why}`,
         { projectId },
       );
-      addAuditLog(db, projectId, "system", "permit monitor", "permit_status.unreadable", { targetId: text(target.id), track, reason: why });
+      rescheduleUnreadTarget(db, projectId, target, track, why, now);
       continue;
     }
     const detail = await recordPermitStatusCheck(db, projectId, {
@@ -7315,6 +7883,12 @@ export async function runDuePermitChecks(
     if (source !== "mock") {
       await readAndRecordPortalFees(db, detail.project, text(target.id)).catch((err) => {
         logger.warn("monitor", "portal fee read failed — status unaffected", { projectId, targetId: text(target.id), err: err instanceof Error ? err.message : String(err) });
+      });
+      // THE ISSUED PERMIT / APPROVAL LETTER, off the same record once it reads issued / approved
+      // (portalIssuedDocuments.ts, #492) — read-only GETs on the record's own portal and track,
+      // after the status is recorded and unable to change it.
+      await fetchIssuedRecordDocuments(db, detail.project, text(target.id)).catch((err) => {
+        logger.warn("monitor", "issued-document fetch failed — status unaffected", { projectId, targetId: text(target.id), err: err instanceof Error ? err.message : String(err) });
       });
     }
     touchProjectMetrics(db, projectId);
@@ -7520,6 +8094,28 @@ export function finalSubmitJobPayload(input: {
 }
 
 /**
+ * WHY THIS APPROVED RUN DID NOT CLICK THE SUBMIT (#422), for the operator's result line. Reads
+ * what the gate already wrote (`portal.auto_submit_declined`, below in prepareSubmission) for
+ * THIS run id; null when the gate did not decline this run. Reads only: it decides nothing, and
+ * an empty answer is never read as permission (the click is the adapter's gate, not this).
+ */
+export function autoSubmitDeclineReasons(db: AppDb, projectId: string, runId: string): string[] | null {
+  const wanted = String(runId || "").trim();
+  if (!wanted) return null;
+  const rows = db.query<{ details: string }>(
+    "SELECT details FROM audit_logs WHERE project_id = ? AND action = 'portal.auto_submit_declined' ORDER BY created_at DESC, rowid DESC LIMIT 20",
+    [projectId],
+  );
+  for (const row of rows) {
+    let details: { runId?: unknown; reasons?: unknown } = {};
+    try { details = JSON.parse(String(row.details || "{}")); } catch { continue; }
+    if (String(details.runId ?? "") !== wanted) continue;
+    return Array.isArray(details.reasons) ? details.reasons.map((r) => String(r)).filter(Boolean) : [];
+  }
+  return null;
+}
+
+/**
  * EVERY REASON automation may NOT click the final submit in this run. Empty only when all hold.
  * Reads the recipe FROM THE DATABASE (status and steps as they are now, not as the caller last
  * saw them) and the environment switch at call time. Never reads auto_submit_enabled.
@@ -7640,6 +8236,7 @@ export function recoverInterruptedPortalRuns(
     addAuditLog(db, text(r.project_id), "system", "portal run recovery", "portal.run_interrupted", {
       runId: text(r.id), track: text(r.permit_type), trackingUrl: url || null, runner: text(r.runner),
     });
+    void alertStaffOnRunOutcome(db, { projectId: text(r.project_id), runId: text(r.id), track: text(r.permit_type), runStatus: "interrupted", reason: "" });
     recovered.push({ runId: text(r.id), projectId: text(r.project_id), permitType: text(r.permit_type), trackingUrl: url });
   }
   return recovered;
@@ -8869,7 +9466,7 @@ export async function prepareSubmission(
     : undefined;
 
   // Per-client browser profile so sessions never bleed across clients.
-  const profileBase = process.env.PORTAL_PROFILES_DIR || path.join(process.cwd(), "portal-profiles");
+  const profileBase = portalProfilesDir();
   const userDataDir = clientId
     ? path.join(profileBase, clientId, portalType)
     : path.join(profileBase, portalType);
@@ -8917,7 +9514,38 @@ export async function prepareSubmission(
   // (CCB#, electrical license, installer company) instead of hardcoded names.
   // The licence keys are THIS track's in THIS state (clients.licenceOverlay) — never Oregon's CCB
   // on another state's filing.
-  const overlay = clientStagingOverlay(db, detail.project.clientId, portalType, { state: String(detail.project.state ?? ""), track: track ?? null });
+  //
+  // WHOSE PORTAL IDENTITY (#518): the client's identity row for the portal THIS run opens — keyed on
+  // every URL the run could launch (the recipe's, the learner's entry, the login's), never on
+  // `portalType`, which is "mock" for every real run (nothing writes portal_profiles) and would
+  // apply a "mock" row everywhere. `portalType` itself is untouched: it still keys the credential
+  // lookup and the browser profile directory. The value dictionary below is resolved with the same
+  // key, so the replay, the planner and the hand-coded adapters all read one identity.
+  const identityUrls = [
+    recipe ? (recipe as { portalUrl?: string }).portalUrl : "",
+    learnEntryUrl({
+      track,
+      learnedProfileUrl: permitSafeUrl(learnedProfile && (learnedProfile as { portalUrl?: string }).portalUrl),
+      recipeUrl: recipe ? (recipe as { portalUrl?: string }).portalUrl : "",
+      draftUrl: draftRecipe ? draftRecipe.portalUrl : "",
+      utilityUrl: utilityPortalUrl,
+      ahjUrl: ahjPortalUrl,
+      statewideUrl: statewidePortalUrl,
+    }),
+    credentialUrl,
+  ];
+  const identityPortal = stagingIdentityPortal({ urls: identityUrls, profilePortalType: portalType, isRealPortal });
+  // THE URLS DISAGREE, SO NO IDENTITY ROW APPLIED (Helm review of #527): said once per staging run,
+  // naming the hosts, so an operator who set the row can see why it did nothing.
+  {
+    const disagree = identityPortal ? null : stagingIdentityDisagreement(identityUrls);
+    if (disagree) {
+      logger.warn("client-identity", "the portal URLs this run could open name different portals, so no client portal identity row applied (the company is the client's legal name and no contact code is used)", {
+        project: detail.project.id, hosts: disagree.hosts, identityTypes: disagree.keys.map((k) => k || "(none)"),
+      });
+    }
+  }
+  const overlay = clientStagingOverlay(db, detail.project.clientId, identityPortal, { state: String(detail.project.state ?? ""), track: track ?? null });
   const stagedProject = Object.keys(overlay).length > 0
     ? { ...portalProject, parserSnapshot: { ...portalProject.parserSnapshot, ...overlay } }
     : portalProject;
@@ -8963,6 +9591,58 @@ export async function prepareSubmission(
     ? { street: portalProject.projectAddress, city: portalProject.city, zip: portalProject.zip, siblingAtSameStreet }
     : undefined;
 
+  // #333 — A PERSON CAN FILE FROM THE REVIEW WINDOW BEFORE THIS RUN IS RECORDED. The replay hands
+  // the review page over before its own read-only housekeeping, and the left-open window is watched
+  // from that moment, so the completion page can be read while this run's row still says 'running'
+  // and no awaiting_human_submit submission exists yet. captureConfirmation then would stamp an
+  // OLDER staging row and the outcome below would overwrite the run's 'submitted' (live 2026-10-14,
+  // Lincoln County: the filing went, the run read failed, the number was typed by hand). So a capture
+  // that arrives first waits here, and is recorded right after the outcome, through the same door.
+  type SubmitCapture = { recordNumber: string; confidence: string; source?: string; reason: string; recordLink: string; candidates?: Array<{ recordNumber: string; recordLink: string; source: string }>; draftCreated?: ObservedDraft };
+  let runOutcomeRecorded = false;
+  const capturesBeforeOutcome: SubmitCapture[] = [];
+  const recordSubmitCapture = (capture: SubmitCapture): void => {
+    try {
+      // THE CLICK ONLY MADE A DRAFT (#302: PSE's Part 1 Submit). Nothing was filed: no submission,
+      // no record number. The draft is written down for the next stage to continue, and the
+      // replayed recipe's final-submit flag comes off the step that made it (portalDraft.ts).
+      if (capture.draftCreated) {
+        const healed = recordPortalDraft(db, { projectId, track: track ?? "permit", draft: capture.draftCreated, runId, recipeId: recipe?.id ?? null, source: "replay" });
+        logger.info("submit-capture", "the submit created a draft, not a filing — recorded for the next stage", {
+          project: projectId, track, healed: healed.healed, why: healed.why,
+        });
+        return;
+      }
+      if (capture.confidence === "high" && capture.recordNumber) {
+        // runId is minted above, before staging, and its outcome is recorded before this runs
+        // (capturesBeforeOutcome). captureConfirmation is the SAME function the manual form calls,
+        // so the filing is recorded through one path whoever supplied the number.
+        // THE LINK GOES THROUGH THE SAME DOOR (#400): the run's and the track target's
+        // tracking_url, exactly the columns the automatic-submit path writes.
+        const fromList = capture.source === "account_list";
+        captureConfirmation(db, runId, {
+          applicationNumber: capture.recordNumber,
+          recordLink: capture.recordLink,
+          submittedBy: fromList ? "read from the portal's application list" : "read from the portal's completion page",
+          notes: capture.reason.slice(0, 300),
+        });
+        addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_read", {
+          track, runId, source: fromList ? "account_list" : "completion_page", reason: capture.reason.slice(0, 200),
+        });
+        logger.info("submit-capture", "record number read off the completion page — no typing needed", {
+          project: projectId, track,
+        });
+      } else {
+        // Not confident — say so where the operator will see it, and leave the form alone. What
+        // was seen goes on the next-step panel as candidates for a person to confirm (#400).
+        const held = recordSubmitCaptureCandidates(db, runId, capture.candidates ?? [], capture.reason);
+        addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_unread", {
+          track, reason: capture.reason.slice(0, 200), candidates: held,
+        });
+      }
+    } catch { /* capture is a convenience; it must never disturb the run */ }
+  };
+
   const stageOptions = {
     beforeUpload: uploadDocumentGuard(db, projectId, track !== "nem"),
     encryptedStorageStatePath: portalProfile?.encrypted_storage_state ?? undefined,
@@ -8998,41 +9678,10 @@ export async function prepareSubmission(
     // WRITTEN ONLY WHEN THE READ IS CONFIDENT. Every downstream check keys on this value,
     // so a low-confidence read is recorded as a NOTE for the operator to confirm rather
     // than written as fact — the manual capture form keeps working exactly as it does now.
-    onSubmitCaptured: (capture: { recordNumber: string; confidence: string; reason: string; recordLink: string; draftCreated?: ObservedDraft }) => {
-      try {
-        // THE CLICK ONLY MADE A DRAFT (#302: PSE's Part 1 Submit). Nothing was filed: no submission,
-        // no record number. The draft is written down for the next stage to continue, and the
-        // replayed recipe's final-submit flag comes off the step that made it (portalDraft.ts).
-        if (capture.draftCreated) {
-          const healed = recordPortalDraft(db, { projectId, track: track ?? "permit", draft: capture.draftCreated, runId, recipeId: recipe?.id ?? null, source: "replay" });
-          logger.info("submit-capture", "the submit created a draft, not a filing — recorded for the next stage", {
-            project: projectId, track, healed: healed.healed, why: healed.why,
-          });
-          return;
-        }
-        if (capture.confidence === "high" && capture.recordNumber) {
-          // runId is minted above, before staging, and the row exists by the time a human
-          // gets round to clicking submit — this fires from the left-open window, minutes
-          // later. captureConfirmation is the SAME function the manual form calls, so the
-          // filing is recorded through one path whoever supplied the number.
-          captureConfirmation(db, runId, {
-            applicationNumber: capture.recordNumber,
-            submittedBy: "read from the portal's completion page",
-            notes: capture.reason.slice(0, 300),
-          });
-          addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_read", {
-            track, runId, source: "completion_page", reason: capture.reason.slice(0, 200),
-          });
-          logger.info("submit-capture", "record number read off the completion page — no typing needed", {
-            project: projectId, track,
-          });
-        } else {
-          // Not confident — say so where the operator will see it, and leave the form alone.
-          addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_unread", {
-            track, reason: capture.reason.slice(0, 200),
-          });
-        }
-      } catch { /* capture is a convenience; it must never disturb the run */ }
+    onSubmitCaptured: (capture: SubmitCapture) => {
+      // Before this run's outcome is recorded: held, and recorded right after it (see above).
+      if (!runOutcomeRecorded) { capturesBeforeOutcome.push(capture); return; }
+      recordSubmitCapture(capture);
     },
     gapFillPlanner,
     gapFillFields,
@@ -9187,30 +9836,53 @@ export async function prepareSubmission(
   // (R10) now binds that control to the job's key, and an unanswered key would replay a blank — so
   // the question is asked first, named, the way the question bank lists it for intake. Same
   // predicate as the bank, the binders and the planner (shared/src/perJobQuestions).
+  //
+  // AND EVERY OTHER BOX THE RECIPE WILL FILL (#445, owner 2026-10-31: "automated fill is right every
+  // time"). validatePortalFields above is a fixed list; the recipe binds far more (a preparer phone,
+  // an inverter model, a contractor licence, an uploaded document), and a blank one only showed at
+  // the portal — after a full run. The same bound steps and the same value dictionary the replay
+  // below is handed are read once here (recipeStageGaps): every non-optional fill/select bound to a
+  // field this job has no value for, and every upload whose document is not on file, refuses the
+  // stage with each one named. Literal steps and steps the replay answers itself never count. It
+  // refuses earlier and never answers a field; it reads and writes no row but the audit line.
   if (recipe && runActorLabel === "RecipeAdapter" && !channelDecision.blocked
       && !recipeTrackConflict && !recipeEntityMisfit && !recipeDisciplineConflict) {
-    let open: Array<{ key: string; label: string }> = [];
+    let gaps: RecipeStageGap[] = [];
     try {
-      const gateValues = resolveRecipeFieldValues(db, stagedProject, portalType, track ?? null);
+      const gateValues = resolveRecipeFieldValues(db, stagedProject, identityPortal, track ?? null);
       const gateBinding = bindRecipeForReplay({
         steps: recipe.steps ?? [], portalUrl: recipe.portalUrl, project: portalProject, fieldValues: gateValues, track,
         borrowed: borrowed ? { learnedFor: borrowed.learnedFor, discipline: borrowed.discipline } : null,
         agency: issuingAgencyFor(portalProject, track),
       });
-      open = openPerJobQuestions(gateBinding.steps, { ...gateValues, ...gateBinding.fieldValues });
+      gaps = recipeStageGaps(gateBinding.steps, { ...gateValues, ...gateBinding.fieldValues }, docsByType, { clientKeys: Object.keys(overlay) });
     } catch (err) {
       // The replay path binds the same steps again inside the run below and records its own failure.
-      logger.warn("prepare-submission", `per-job question check could not read the recipe: ${err instanceof Error ? err.message : String(err)}`);
+      logger.warn("prepare-submission", `recipe input check could not read the recipe: ${err instanceof Error ? err.message : String(err)}`);
     }
-    if (open.length) {
-      addAuditLog(db, projectId, "system", "submit gate", "portal.per_job_question_open", {
-        track: track ?? "permit", recipeId: recipe.id, questions: open,
+    if (gaps.length) {
+      const open = gaps.filter((g) => g.kind === "question").map((g) => ({ key: g.key, label: g.label }));
+      // Labels and keys only — never a value (rule 2: a secret gap carries its fixed label).
+      const missingRecipeInputs = gaps.filter((g) => g.kind !== "question")
+        .map((g) => ({ kind: g.kind, key: g.key, label: g.label, fieldName: g.fieldName, where: g.where, secret: g.secret }));
+      if (open.length) {
+        addAuditLog(db, projectId, "system", "submit gate", "portal.per_job_question_open", {
+          track: track ?? "permit", recipeId: recipe.id, questions: open,
+        });
+      }
+      if (missingRecipeInputs.length) {
+        addAuditLog(db, projectId, "system", "submit gate", "portal.recipe_inputs_missing", {
+          track: track ?? "permit", recipeId: recipe.id, missing: missingRecipeInputs.map((g) => ({ kind: g.kind, key: g.key, label: g.label })),
+        });
+      }
+      // The team hears about it (#551): this refusal comes before any run row, so the run alert
+      // never fires, and a background Autopilot / approval run that stops here was silent.
+      void alertStaffOnStageHeld(db, { projectId, track: track ?? "permit", gaps });
+      throw new HttpError(409, stageGapsRefusal(gaps, portalLabel), {
+        ...(open.length ? { unansweredPortalQuestions: open } : {}),
+        ...(missingRecipeInputs.length ? { missingRecipeInputs } : {}),
+        track: track ?? "permit", recipeId: recipe.id,
       });
-      throw new HttpError(409,
-        `Staging paused before opening the portal: ${portalLabel} asks ${open.length === 1 ? "a question" : `${open.length} questions`} only a person can answer for this job — `
-        + `${open.map((q) => `"${q.label}"`).join("; ")}. The recorded answer belonged to another job, so it is never replayed; `
-        + "answer it under the project's portal questions (or send the intake link), then stage again. Nothing was opened.",
-        { unansweredPortalQuestions: open, track: track ?? "permit", recipeId: recipe.id });
     }
   }
   let result: Record<string, unknown>;
@@ -9322,7 +9994,7 @@ export async function prepareSubmission(
       // anything binds or runs them. A human step edit does not bump the version, so heals and the
       // demotion are measured against every field of these steps, selectors included.
       const replayStepsSig = recipeStepsSignature(recipe.steps ?? []);
-      const replayFieldValues = resolveRecipeFieldValues(db, stagedProject, portalType, track ?? null);
+      const replayFieldValues = resolveRecipeFieldValues(db, stagedProject, identityPortal, track ?? null);
       replayBinding = bindRecipeForReplay({
         steps: recipe.steps ?? [], portalUrl: recipe.portalUrl, project: portalProject, fieldValues: replayFieldValues, track,
         borrowed: borrowed ? { learnedFor: borrowed.learnedFor, discipline: borrowed.discipline } : null,
@@ -9916,7 +10588,52 @@ export async function prepareSubmission(
         });
     });
 
+    // THE CLIENT HEARS WE FILED (#490) — only on a filing the portal CONFIRMED (acceptedFiling). A
+    // click the portal did not confirm (submitted_unconfirmed) may not have filed, so it says nothing
+    // until a person confirms it through captureConfirmation, which then announces it. Once per
+    // track, fire-and-forget: it never throws and never touches the run's record.
+    if (acceptedFiling) {
+      void notifyClientOfFiling(db, detail.project, { track: permitTypeTag, permitNumber: capturedPermitNumber, via: "auto_submit" });
+      // The quote in force as it was filed (#494), once per billing track; never throws.
+      snapshotFilingQuote(db, detail.project, permitTypeTag, submissionId);
+    }
+
+    // STAFF ALERT (#487) — after the run's row committed, fire-and-forget, never into this path.
+    // Only the endings that need a person alert (paused, failed, submitted-unconfirmed); the
+    // reason is the run's own one line — the same text the row's error_message just took — and
+    // staffAlerts scrubs it before it leaves.
+    void alertStaffOnRunOutcome(db, {
+      projectId, runId, track: permitTypeTag, runStatus,
+      reason: failureMessage || (pauseReason ? pausedRunSentence(pauseReason, result) : ""),
+    });
+
+    // #333: a filing the person made from the review window while this run was finishing — recorded
+    // now, on top of the outcome (an awaiting_human_submit row, or the run's own failed row), never
+    // under it. Whatever the run reported, a filing that went is recorded as submitted.
+    runOutcomeRecorded = true;
+    for (const capture of capturesBeforeOutcome.splice(0)) recordSubmitCapture(capture);
   } catch (err) {
+    // A capture that arrived before the outcome cannot be recorded against a run that was not:
+    // say so where the operator looks, so the number is entered by hand (the manual form).
+    runOutcomeRecorded = true;
+    for (const capture of capturesBeforeOutcome.splice(0)) {
+      // A held DRAFT is not a filing and needs no recorded outcome: it is written down (audit +
+      // result_json; the status write below leaves result_json alone), and a failed-outcome run with
+      // a recorded draft is the next stage's to continue. WITHOUT a recipe (round 5, Helm item 3):
+      // healDraftCreatingFinalSubmit is click authority under the #330 carve-out, and it never runs
+      // off a run whose outcome could not be recorded. The happy path keeps the heal.
+      if (capture.draftCreated) {
+        try {
+          recordPortalDraft(db, { projectId, track: track ?? "permit", draft: capture.draftCreated, runId, recipeId: null, source: "replay" });
+        } catch { /* the original error is the one to surface */ }
+        continue;
+      }
+      try {
+        addAuditLog(db, projectId, "portal_bot", "submit capture", "submission.record_number_unread", {
+          track, runId, reason: `the run's outcome could not be recorded, so the completion page's read was not either: ${capture.reason.slice(0, 160)}`,
+        });
+      } catch { /* the original error is the one to surface */ }
+    }
     // Recording the outcome failed. The row must not stay 'running': this process is alive, so
     // the next stage of the track would read it as a run in flight and refuse forever.
     try {
@@ -10076,6 +10793,45 @@ export function suggestReviewValues(db: AppDb, projectId: string, suggestions: R
   return applied;
 }
 
+/** A record link fit to store and to render as an href: http(s) only, bounded. Anything else
+ *  (a `javascript:` URL from a request body, an unparseable string) is no link at all. */
+function storableRecordLink(raw: unknown): string {
+  const link = String(raw ?? "").trim();
+  return link.length <= 2000 && /^https?:\/\/[^\s"'<>]+$/i.test(link) ? link : "";
+}
+
+/**
+ * HOLD UNSURE RECORD NUMBERS FOR A PERSON (#400). After a person's submit in the left-open window,
+ * a low-confidence completion-page read or an ambiguous account-list diff is NOT a filing's number:
+ * it is written to the run's own submit_capture_candidates (never result_json, never a submission
+ * row) and the next-step panel offers each one to confirm in one click, through captureConfirmation.
+ * Only while the run is still awaiting the person's submit — a run already confirmed is answered.
+ * Returns how many were held.
+ */
+export function recordSubmitCaptureCandidates(
+  db: AppDb,
+  portalRunId: string,
+  candidates: Array<{ recordNumber: string; recordLink: string; source: string }>,
+  reason: string,
+): number {
+  const held = candidates
+    .map((c) => ({
+      recordNumber: String(c?.recordNumber ?? "").trim().slice(0, 80),
+      recordLink: storableRecordLink(c?.recordLink),
+      source: c?.source === "account_list" ? "account_list" : "completion_page",
+    }))
+    .filter((c) => c.recordNumber)
+    .slice(0, 5);
+  if (!held.length) return 0;
+  const run = db.get<Row>("SELECT status FROM portal_runs WHERE id = ?", [portalRunId]);
+  if (!run || text(run.status) !== "awaiting_human_submit") return 0;
+  db.run(
+    "UPDATE portal_runs SET submit_capture_candidates = ? WHERE id = ?",
+    [JSON.stringify({ at: nowIso(), reason: String(reason || "").slice(0, 300), candidates: held }), portalRunId],
+  );
+  return held.length;
+}
+
 export function captureConfirmation(
   db: AppDb,
   portalRunId: string,
@@ -10083,6 +10839,9 @@ export function captureConfirmation(
     applicationNumber?: string;
     permitNumber?: string;
     confirmationNumber?: string;
+    /** The link that opens the record on the portal (#400) — the run's and the track target's
+     *  tracking_url. Optional: the manual form sends none. Only an http(s) link is kept. */
+    recordLink?: string;
     submittedBy?: string;
     notes?: string;
   },
@@ -10124,8 +10883,14 @@ export function captureConfirmation(
   // The confirmation number is deliberately NOT accepted here — a portal's receipt number
   // is not a record the status page can be searched by.
   const filingNumber = (input.applicationNumber || "").trim() || (input.permitNumber || "").trim();
+  const recordLink = storableRecordLink(input.recordLink);
+  let recordLinkRefused = false;
   // Hoisted so the post-transaction correction close can read it — see below.
   let remainingTracks = 0;
+  // Hoisted so the client's "we filed it" update (#490) names the track this confirmation filed,
+  // and so the filing-time quote snapshot (#494) knows the track and the submission row.
+  let filedTrack = "";
+  let filedSubmissionId = "";
 
   db.transaction(() => {
     db.run("UPDATE portal_runs SET status = ?, finished_at = ? WHERE id = ?", ["submitted", ts, portalRunId]);
@@ -10204,6 +10969,21 @@ export function captureConfirmation(
     const trackKey = runPermitType
       || text(stamped?.permit_type)
       || (text(stamped?.submission_type) === "interconnection" ? "nem" : "");
+    filedTrack = trackKey;
+    filedSubmissionId = text(stamped?.id);
+    // THE RECORD'S LINK (#400). Rule 5 at the one creator: a utility-portal link never lands on a
+    // permit target (ensureCheckTarget would refuse it). Here it is dropped instead of refused —
+    // the number is the precious fact, and a link must never cost the filing its record.
+    let trackingUrl = recordLink;
+    if (trackingUrl) {
+      try { refuseUtilityUrlOnPermitTarget(trackKey === "nem" ? "nem" : "permit", trackingUrl); } catch { trackingUrl = ""; recordLinkRefused = true; }
+    }
+    // The run carries the link the way the automatic path's does; its unsure candidates are
+    // answered now, whoever supplied the number.
+    db.run(
+      "UPDATE portal_runs SET tracking_url = COALESCE(NULLIF(?, ''), tracking_url), submit_capture_candidates = '' WHERE id = ?",
+      [trackingUrl, portalRunId],
+    );
     const ensured = filingNumber
       ? ensureCheckTarget(db, projectForTarget, {
           track: SUBMITTAL_TRACK_TYPES.includes(trackKey as SubmittalTrackType) ? (trackKey as SubmittalTrackType) : undefined,
@@ -10211,6 +10991,7 @@ export function captureConfirmation(
           permitType: trackKey,
           applicationNumber: input.applicationNumber,
           permitNumber: input.permitNumber,
+          trackingUrl,
           notes: "Tracking a filing a human confirmed from the dashboard.",
           // Due on the very next sweep. A filing was just made; waiting out a full
           // check_frequency_days window before the first read is a week of silence.
@@ -10244,6 +11025,8 @@ export function captureConfirmation(
       applicationNumber: input.applicationNumber || "",
       permitNumber: input.permitNumber || "",
       confirmationNumber: input.confirmationNumber || "",
+      ...(recordLink ? { recordLinkSaved: !recordLinkRefused } : {}),
+      ...(recordLinkRefused ? { recordLinkRefused: "a utility-portal link is never a permit filing's tracking link (rule 5)" } : {}),
     });
     // A SECOND ROW, because the audit panel renders the ACTION NAME and nothing else. The
     // stage_detail chip is overwritten by the next thing that happens to this project; this
@@ -10295,7 +11078,21 @@ export function captureConfirmation(
     }
   }
 
+  // THE QUOTE IN FORCE AS IT WAS FILED (#494), kept once per billing track for the fee accuracy
+  // report. Outside the transaction and never throwing, for the same reason as the close above.
+  // A legacy run with no track and no stamped row bills as the permit track (billingTrack).
+  snapshotFilingQuote(db, projectForTarget, filedTrack, filedSubmissionId);
+
   const detail = getProjectDetail(db, projectId);
+  // A PERSON CONFIRMED THIS FILING (the dashboard's capture form, or the hand-over's confident read
+  // of the completion page) — the client hears we filed (#490). Once per track: a re-capture of the
+  // same run, or a later "mark submitted" of the same track, sends nothing more.
+  void notifyClientOfFiling(db, detail.project, {
+    track: filedTrack || "permit",
+    applicationNumber: input.applicationNumber,
+    permitNumber: input.permitNumber,
+    via: "capture",
+  });
   learnFromSubmissionConfirmation(db, detail.project, input);
   return getProjectDetail(db, projectId);
 }

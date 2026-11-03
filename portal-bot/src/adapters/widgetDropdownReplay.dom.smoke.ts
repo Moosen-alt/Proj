@@ -69,7 +69,18 @@ const PAGE = `<!doctype html><html><body style="font:14px sans-serif;padding:16p
   </script>
 </body></html>`;
 
-const server = http.createServer((_req, res) => { res.writeHead(200, { "Content-Type": "text/html" }); res.end(PAGE); });
+// MUST EXCLUDE (#327): the read-back trusts the widget's FACE when its backing input holds a key,
+// so a pick that writes the key while the face snaps back to the placeholder (a re-render that
+// wiped it) must still be a miss. Same page, with the face reverting right after the pick.
+const PAGE_REVERT = PAGE.replace(
+  'document.getElementById("done").textContent = "PICKED " + c[1];',
+  'document.getElementById("done").textContent = "PICKED " + c[1];'
+    + ' setTimeout(function () { document.querySelector("#dvjcCategoryleft .t-input").textContent = "Please select a Job Category..."; }, 50);',
+);
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/html" });
+  res.end(/^\/revert/.test(req.url || "") ? PAGE_REVERT : PAGE);
+});
 await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
 const port = (server.address() as { port: number }).port;
 const url = `http://127.0.0.1:${port}/`;
@@ -121,6 +132,18 @@ check("...and the step is not reported as skipped", () => {
 });
 check("MUST EXCLUDE: the invisible twin is not the control that got filled", () => {
   assert.equal(twin, "", `the twin holds ${JSON.stringify(twin)} — this is the PowerClerk regression the visible-preference exists to stop`);
+});
+
+const revertSteps = steps.map((st) => (st.action === "goto" ? { ...st, value: `${url}revert` } : st));
+const revertAdapter = new RecipeAdapter({ ...recipe, steps: revertSteps } as PortalRecipe, { street: "3500 Pan American Dr" }, {}, { autoSubmit: false });
+(revertAdapter as unknown as { page: unknown }).page = page;
+const revert = await revertAdapter.fillApplication({} as never);
+const revertData = (revert.data ?? {}) as { skipped?: string[] };
+const revertKey = await page.locator("#JobCategoryID").inputValue().catch(() => "");
+console.log(`   revert: value=${JSON.stringify(revertKey)} skipped=${JSON.stringify(revertData.skipped ?? [])}`);
+check("MUST EXCLUDE: a key in the backing input whose face reverted to the placeholder is still a miss", () => {
+  assert.ok(revertKey !== "", "fixture: the pick never wrote the key, so this proves nothing");
+  assert.ok((revertData.skipped ?? []).some((x) => /job category/i.test(x)), `skipped: ${JSON.stringify(revertData.skipped)}`);
 });
 
 await browser.close();

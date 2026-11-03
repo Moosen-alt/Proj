@@ -112,6 +112,7 @@ import { syncBuiltinESMExports } from "node:module";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
+import { backendDataDir } from "../backend/src/statePaths";
 import tls from "node:tls";
 // Side-effect free (a type-only playwright import), so it is safe ahead of the traps.
 import { installLoopbackOnlyRoute, isLoopbackHost } from "./demo-portal/network";
@@ -422,7 +423,7 @@ async function main(): Promise<number> {
   // with --db) — the guard above has already required a person present; these demo-only checks
   // are skipped, and the copy-then-open discipline below still holds.
   const kitRoot = path.resolve(process.cwd());
-  const srcDb = path.resolve(arg("db") || path.join("backend", "data", "autopilot.sqlite"));
+  const srcDb = path.resolve(arg("db") || path.join(backendDataDir(), "autopilot.sqlite"));
   if (!fs.existsSync(srcDb)) { console.error(`No database at ${srcDb}. ${realRun ? "Pass --db <a copy of the production database>." : "Run from a demo kit folder."}`); return 2; }
   if (!realRun) {
     if (path.dirname(srcDb).toLowerCase() !== path.join(kitRoot, "backend", "data").toLowerCase()) {

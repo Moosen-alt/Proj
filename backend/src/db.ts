@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
+import { dbPath as stateDbPath } from "./statePaths";
 import Database, { type Database as DB, type Statement } from "better-sqlite3";
 import { baselineRuleDefinitions } from "./baselineRules";
 import { knowledgeProfileKey, purgeCredentialNoteSegments, purgeForeignKnownTenantPortals, seedInitialKnowledgeBase } from "./knowledgeBase";
@@ -110,7 +111,7 @@ export class AppDb {
 }
 
 export async function openDatabase(): Promise<AppDb> {
-  const dbPath = path.resolve(process.cwd(), process.env.AUTOPILOT_DB_PATH || "backend/data/autopilot.sqlite");
+  const dbPath = stateDbPath();
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   const db = new Database(dbPath);
@@ -857,6 +858,17 @@ function migrate(db: AppDb): void {
   // for unauthenticated status checks (e.g. Accela ACA CapDetail.aspx links).
   addColumnIfMissing(db, "portal_runs", "tracking_url", "TEXT NOT NULL DEFAULT ''");
   addColumnIfMissing(db, "permit_check_targets", "tracking_url", "TEXT NOT NULL DEFAULT ''");
+  // A STATUS LINK THE MONITOR CAN READ ON ITS OWN (#413). read_gap: the last sweep's one actionable
+  // line on why it read nothing (statusLinkGap.statusReadGap), '' once a status is read. link_lookup_at:
+  // when the signed-in record list was last searched for a filing that has no link — at most once a
+  // day per target, so a filing the list never shows is not re-walked on every sweep.
+  addColumnIfMissing(db, "permit_check_targets", "read_gap", "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, "permit_check_targets", "link_lookup_at", "TEXT");
+  // UNSURE RECORD NUMBERS read after a person's submit in the left-open window (#400): JSON
+  // { at, reason, candidates: [{ recordNumber, recordLink, source }] }, or ''. Shown on the
+  // next-step panel for one-click confirmation; never written as the filing's number. Its own
+  // column, not result_json, so nothing that reads a run's result ever carries these numbers.
+  addColumnIfMissing(db, "portal_runs", "submit_capture_candidates", "TEXT NOT NULL DEFAULT ''");
 
   // Per-permit submittal tracks — a project can need NEM (utility), plus either a
   // combined building+electrical permit or SEPARATE building (BLD) and electrical
@@ -1064,6 +1076,33 @@ function migrate(db: AppDb): void {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_portal_fee_readings_key
       ON portal_fee_readings(project_id, target_id, source_kind);
   `);
+
+  // THE ISSUED PERMIT AND THE UTILITY'S APPROVAL LETTER, DOWNLOADED OFF THE FILED RECORD by the
+  // permit monitor once the record reads issued / approved (portalIssuedDocuments.ts, #492). One
+  // row per document attached: which record it came from, the URL, when, and the file's sha256 —
+  // the hash is what makes a re-read attach nothing new. The file itself is a project_documents
+  // row (document_id). Per-target "why nothing was attached" lives on permit_check_targets
+  // (issued_docs_gap), beside read_gap. The legacy idempotent idiom on purpose (see above).
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS portal_record_documents (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      target_id TEXT NOT NULL DEFAULT '',
+      track TEXT NOT NULL DEFAULT 'permit',
+      doc_type TEXT NOT NULL DEFAULT '',
+      document_id TEXT NOT NULL DEFAULT '',
+      record_number TEXT NOT NULL DEFAULT '',
+      source_url TEXT NOT NULL DEFAULT '',
+      link_text TEXT NOT NULL DEFAULT '',
+      sha256 TEXT NOT NULL DEFAULT '',
+      fetched_at TEXT NOT NULL,
+      FOREIGN KEY (project_id) REFERENCES projects(id)
+    );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_portal_record_documents_hash
+      ON portal_record_documents(project_id, sha256);
+  `);
+  addColumnIfMissing(db, "permit_check_targets", "issued_docs_gap", "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing(db, "permit_check_targets", "issued_docs_checked_at", "TEXT");
 
   runVersionedMigrations(db);
   healStructuralLetterColumns(db);
@@ -2595,6 +2634,74 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       addColumnIfMissing(db, "project_metrics", "package_complete_at", "TEXT");
     },
   },
+  // v51 sits here, beside the other project-row migration (v44), not at the end of the list, so
+  // parallel PRs appending there don't collide on the same lines (see v43 / v46 / v50).
+  {
+    version: 51,
+    name: "project_edit_version",
+    up: (db) => {
+      // TWO TEAMMATES, ONE PROJECT (#440, shared server #429). Project saves were last-write-wins:
+      // the second person's Save silently threw the first person's edit away. edit_version is the
+      // version a dashboard editor loaded; PUT /api/projects/:id with expectedVersion refuses a stale
+      // one with a 409 and writes nothing (updateProject).
+      //
+      // BUMPED BY TRIGGER, NOT BY CALL SITE. Every writer of the project's DATA moves it — a
+      // teammate's save, the parser, the bill / datasheet reads and intake (all through
+      // updateProject, with no expected version, so they bump and never 409), the review queue's
+      // verified field (applyVerifiedField writes parser_json directly) — and a new writer cannot
+      // forget to. The column list is exactly what updateProject writes, i.e. what an editor's save
+      // could overwrite. Lifecycle writes (status, current_stage, stage_detail, archive, share token,
+      // assignment, the v17 per-job answer columns) do NOT bump it: a save never writes those, so no
+      // edit can be lost to them, and the stage chain that runs after every save writes them for
+      // seconds afterwards — bumping on them would refuse the editor's next save for nothing.
+      // The trigger fires only when the statement did not move edit_version itself; its own UPDATE
+      // sets only edit_version (not in the OF list), so it never re-fires. A trigger's writes are not
+      // counted in changes(), so no caller's row count moves.
+      // projects is CREATEd in the base schema, so this addColumnIfMissing comes after it.
+      addColumnIfMissing(db, "projects", "edit_version", "INTEGER NOT NULL DEFAULT 0");
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS projects_bump_edit_version
+        AFTER UPDATE OF client_id, homeowner_name, project_address, city, state, zip, ahj, utility,
+          account_number, meter_number, system_size_dc_kw, system_size_ac_kw, total_export_kw,
+          interconnection_method, parser_confidence_summary, parser_json
+        ON projects
+        FOR EACH ROW WHEN NEW.edit_version = OLD.edit_version
+        BEGIN
+          UPDATE projects SET edit_version = OLD.edit_version + 1 WHERE id = NEW.id;
+        END;
+      `);
+    },
+  },
+  // v52 sits here, beside v51 (the other shared-server #429 migration), not at the end of the list,
+  // so parallel PRs appending there don't collide on the same lines.
+  {
+    version: 52,
+    name: "recorder_tokens",
+    up: (db) => {
+      // PER-USER RECORDER TOKENS (#433, shared server #429). The portal recorder CLI runs on a
+      // person's own computer and posts to the server; with sign-in on, it has no cookie. A signed-in
+      // person mints a token here (recorderTokens.ts): shown ONCE, stored as sha256 only, expiring
+      // (default 30 days), revocable. It authenticates ONLY the recorder's four endpoints
+      // (RECORDER_ROUTES), as that person, so the audit trail names who recorded. It reaches an org
+      // through its user (users.org_id), so no org_id column here (CLAUDE.md tenancy model).
+      // revoked_at / last_used_at are '' when unset; rows are never deleted, so the history stays.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS recorder_tokens (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          name TEXT NOT NULL DEFAULT '',
+          token_hash TEXT NOT NULL UNIQUE,
+          created_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL,
+          revoked_at TEXT NOT NULL DEFAULT '',
+          revoked_by TEXT NOT NULL DEFAULT '',
+          last_used_at TEXT NOT NULL DEFAULT '',
+          FOREIGN KEY (user_id) REFERENCES users(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_recorder_tokens_user ON recorder_tokens(user_id);
+      `);
+    },
+  },
   {
     version: 45,
     name: "jurisdiction_design_observations_precedents",
@@ -2700,6 +2807,206 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
           armed_at TEXT NOT NULL DEFAULT ''
         );
       `);
+    },
+  },
+  {
+    version: 53,
+    name: "users_session_version",
+    up: (db) => {
+      // REVOCABLE SIGN-IN SESSIONS (#432, shared server #429). Every session cookie carries the
+      // session_version it was issued under, and currentUser accepts it only while the user's row
+      // still holds that number. A password change or reset (setUserPassword, in the same UPDATE
+      // as the hash), a deactivation or reactivation, and "Sign out everywhere" bump it
+      // (auth.ts bumpSessionVersion), so every older cookie stops working on its next request.
+      // Default 0 is also what a cookie minted before this migration reads as (it has no version
+      // field), so the deploy signs nobody out; the user's first bump ends it like any other.
+      // users is CREATEd in the base schema, so this addColumnIfMissing comes after it.
+      addColumnIfMissing(db, "users", "session_version", "INTEGER NOT NULL DEFAULT 0");
+    },
+  },
+  {
+    version: 54,
+    name: "client_request_sends",
+    up: (db) => {
+      // THE INTAKE AND LOGIN LINKS, EMAILED BY THE SERVER (#488). When the automatic chain stops on
+      // something only the client can supply (the utility bill, a portal question, the utility
+      // portal login), clientRequestLinks.ts makes the request and emails the client's inbox the
+      // link. One row per ASK: it is what makes the send happen once per open request instead of
+      // once per chain run, carries the one reminder, and is what the Next step reads back as
+      // "Sent to <contact> on <date>". closed_at is stamped when the need goes away (answered,
+      // bill arrived, login stored, request spent or expired); a new need later is a new ask.
+      // Created here, never lazily: nextStep reads it, and reads write nothing (nextStep.test).
+      // The token is NOT stored here — the credential link's token lives only in its own
+      // credential_requests row, and the sent email's stored copy masks it.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS client_request_sends (
+          id TEXT PRIMARY KEY,
+          kind TEXT NOT NULL,
+          request_id TEXT NOT NULL DEFAULT '',
+          project_id TEXT NOT NULL,
+          client_id TEXT NOT NULL,
+          portal_url TEXT NOT NULL DEFAULT '',
+          recipient TEXT NOT NULL DEFAULT '',
+          needs_json TEXT NOT NULL DEFAULT '[]',
+          sent_at TEXT NOT NULL,
+          delivery_status TEXT NOT NULL DEFAULT '',
+          reminder_at TEXT NOT NULL DEFAULT '',
+          reminder_status TEXT NOT NULL DEFAULT '',
+          closed_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_client_request_sends_project ON client_request_sends(project_id, closed_at);
+        CREATE INDEX IF NOT EXISTS idx_client_request_sends_client ON client_request_sends(client_id, kind, closed_at);
+      `);
+      // Per-client opt-out: '' = the server emails the links (the default the owner asked for);
+      // 'off' = staff send them by hand, as before. clients is CREATEd in the base schema.
+      addColumnIfMissing(db, "clients", "request_links_auto_send", "TEXT NOT NULL DEFAULT ''");
+    },
+  },
+  {
+    version: 55,
+    name: "staff_notifications",
+    up: (db) => {
+      // STAFF ALERTS + MORNING DIGEST (#487). One row per alert or digest the team was (or was
+      // not) sent, so "what did we fail to send" is a query — the lesson of the client backlog that
+      // sat in communications for twelve days. NOT the communications table: that one is the
+      // CLIENT's timeline, and scripts/undelivered.ts re-resolves every stranded row's recipient to
+      // the project's CLIENT — a staff alert left there would be re-sent to the customer.
+      //
+      // org_id is the row's OWN column, stamped at write from the project row (alerts) or the org
+      // being digested — the historical_failure_examples precedent (CLAUDE.md, tenancy): a digest
+      // has no project to reach an org through. (kind, ref, state) is the dedupe key: the newest
+      // row for (org, kind, ref) carrying the same state means this transition was already handled.
+      // recipient lists email addresses and the word "webhook" — never the webhook URL itself.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS staff_notifications (
+          id TEXT PRIMARY KEY,
+          org_id TEXT NOT NULL,
+          project_id TEXT,
+          kind TEXT NOT NULL,
+          ref TEXT NOT NULL,
+          state TEXT NOT NULL DEFAULT '',
+          subject TEXT NOT NULL DEFAULT '',
+          body TEXT NOT NULL DEFAULT '',
+          recipient TEXT NOT NULL DEFAULT '',
+          delivery_status TEXT NOT NULL DEFAULT 'pending',
+          delivery_detail TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          sent_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_staff_notifications_ref ON staff_notifications(org_id, kind, ref, created_at);
+        CREATE INDEX IF NOT EXISTS idx_staff_notifications_delivery ON staff_notifications(delivery_status, created_at);
+      `);
+    },
+  },
+  {
+    version: 56,
+    name: "fee_quote_snapshots",
+    up: (db) => {
+      // WHAT THE CLIENT WAS TOLD, KEPT (#494). The fee accuracy report holds the quote up against
+      // what the jurisdiction actually billed, and the quote it needs is the one in force WHEN
+      // THE TRACK WAS FILED. Recomputing it later is not that number: the learned tier feeds on
+      // every real fee recorded since, so a quote rebuilt after the fact already contains part of
+      // the answer it is being graded against (Portland's own receipts would pull its median up
+      // and the low quote would vanish from the report that exists to find it).
+      //
+      // One row per project and BILLING track (permit | nem), written ONCE by the filing doors
+      // (markTrackSubmitted, captureConfirmation) through feeAccuracy.snapshotFilingQuote and
+      // never updated: a second building filing or a re-capture keeps the first snapshot. The
+      // amount is the RESEARCHED ladder's (learned history, published schedule, estimate,
+      // printed form), never the portal's own figure, which is the thing it is compared with.
+      // A child of projects: it reaches an org through its project and carries no org_id.
+      // A report reads it; nothing here writes a schedule or a "verified" (rule 3).
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS fee_quote_snapshots (
+          id TEXT PRIMARY KEY,
+          project_id TEXT NOT NULL,
+          track TEXT NOT NULL,
+          submission_id TEXT NOT NULL DEFAULT '',
+          state TEXT NOT NULL DEFAULT '',
+          jurisdiction TEXT NOT NULL DEFAULT '',
+          quoted_usd REAL,
+          source TEXT NOT NULL DEFAULT 'unknown',
+          confidence TEXT NOT NULL DEFAULT 'unknown',
+          basis TEXT NOT NULL DEFAULT '',
+          snapshotted_at TEXT NOT NULL,
+          FOREIGN KEY (project_id) REFERENCES projects(id)
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_fee_quote_snapshots_project_track
+          ON fee_quote_snapshots(project_id, track);
+      `);
+    },
+  },
+  {
+    version: 57,
+    name: "clients_handoff_auto_send",
+    up: (db) => {
+      // THE INSTALLER HANDOFF PACKET, EMAILED BY THE SERVER (#491). Per-client opt-out: '' = the
+      // server emails the packet when the job reaches handoff_ready (the default the owner asked
+      // for); 'off' = staff send it by hand from the project page. No table: the packet's record
+      // is its communications row (installerHandoff.ts). clients is CREATEd in the base schema.
+      addColumnIfMissing(db, "clients", "handoff_auto_send", "TEXT NOT NULL DEFAULT ''");
+    },
+  },
+  {
+    version: 58,
+    name: "project_milestones",
+    up: (db) => {
+      // THE CLOSEOUT MILESTONES (#497): installed, final inspection passed, PTO requested, PTO
+      // granted. No portal reading produces them today, so the client's timeline had nothing to
+      // show after "permit issued / interconnection approved". One row per (project, milestone),
+      // written only by clientTimeline.recordProjectMilestone — a person on the project page now,
+      // the finals and PTO automation (#495, #496) through the same door when it lands. reached_at
+      // is when it happened (what the client sees); recorded_at / recorded_by are who wrote it.
+      // Created here, never lazily: the client pages read it, and reads write nothing.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS project_milestones (
+          project_id TEXT NOT NULL,
+          milestone TEXT NOT NULL,
+          reached_at TEXT NOT NULL,
+          recorded_by TEXT NOT NULL DEFAULT '',
+          source TEXT NOT NULL DEFAULT 'operator',
+          recorded_at TEXT NOT NULL,
+          PRIMARY KEY (project_id, milestone)
+        );
+      `);
+    },
+  },
+  {
+    version: 59,
+    name: "email_intake",
+    up: (db) => {
+      // EMAIL-IN INTAKE (#489). An installer emails a new job (plan set, bill, meter photo) to the
+      // intake address with their tag (intake+acme@…); emailIntake.ts creates and parses the
+      // project. One row per message: message_key (Message-ID, else a hash of the raw message) is
+      // what keeps a poll that re-reads the same inbox from making the job twice. A message the
+      // server could not place is status 'unsorted' with its reason, and its attachments are kept
+      // under backend/data/email-intake/<id>/ for a person. org_id is the matched client's org, else
+      // the polling source's — never anything the message says (rule 6).
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS email_intake_messages (
+          id TEXT PRIMARY KEY,
+          message_key TEXT NOT NULL UNIQUE,
+          org_id TEXT NOT NULL,
+          client_id TEXT,
+          project_id TEXT,
+          status TEXT NOT NULL,
+          reason TEXT NOT NULL DEFAULT '',
+          sender TEXT NOT NULL DEFAULT '',
+          intake_tag TEXT NOT NULL DEFAULT '',
+          subject TEXT NOT NULL DEFAULT '',
+          files_json TEXT NOT NULL DEFAULT '[]',
+          reply_status TEXT NOT NULL DEFAULT '',
+          received_at TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          resolved_at TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_email_intake_org_status ON email_intake_messages(org_id, status, created_at);
+      `);
+      // Per client: the tag after the + in the intake address, and the extra sender addresses
+      // (or @domain entries) allowed to send it jobs beyond the client's own contact emails.
+      // clients is CREATEd in the base schema.
+      addColumnIfMissing(db, "clients", "intake_tag", "TEXT NOT NULL DEFAULT ''");
+      addColumnIfMissing(db, "clients", "intake_senders", "TEXT NOT NULL DEFAULT ''");
     },
   },
 ];

@@ -6,13 +6,52 @@ import type {OverlayField, SignaturePlacement} from "./ahjForms";
 // prevent a revised PDF from silently inheriting old coordinates. No customer
 // data or signatures belong in these maps, and no fee amount goes into a MAP.
 //
-// THE ONE FEE EXCEPTION IS A SEED'S OWN PRINTED LADDER (`printedFees`, Marion E-01 — operator finding
-// 2026-09-27: Michael's E-01 printed Qty 1 and a blank Total, Subtotal, surcharge and TOTAL because no
-// county schedule is on file). It is the fee table printed on THAT hash's blank, read off the form
-// itself; the fill falls back to it only where no saved jurisdiction fee line is on file, only up to
-// the size the form prices without per-kVA math or plan review, and says so on the fill result. It is
-// never written to the fee store and never "verified" (hard rule 3) — a saved line always wins. A seed
-// whose printed table is known to be stale (Coos County, 1.70x under the adopted schedule) carries none.
+// THE FEE TABLES PRINTED ON THESE BLANKS (`printedFees`) — read off each hash's own page, never typed
+// into a MAP. Two uses, and only two:
+//   1. THE FILL (Marion E-01 only, `fillsOwnForm` — operator finding 2026-09-27: Michael's E-01 printed
+//      Qty 1 and a blank Total, Subtotal, surcharge and TOTAL because no county schedule is on file).
+//      The fill falls back to that form's own ladder only where no saved jurisdiction fee line is on
+//      file, only up to the size the form prices without per-kVA math or plan review, and says so on
+//      the fill result (curatedPrintedFees).
+//   2. THE CROSS-CHECK (#454, printedFormFees.ts): the payment quote holds its permit amount up against
+//      what these printed lines compose for the job, and says when the two disagree. A DATED,
+//      LOWER-TRUST source: a printed table can be years stale (Coos County's 12/23/2022 revision
+//      printed $79/$94/$156 against an adopted $135/$160/$265 — 1.70x under), so it is a note beside
+//      the quote, never a replacement for a saved schedule, a recorded real fee or a verified row.
+// It is never written to the fee store and never "verified" (hard rule 3). Amounts are AS PRINTED;
+// a percentage surcharge is carried as its PERCENT and evaluated per line, never pre-multiplied. A
+// conditional line whose rate the form leaves blank (Marion B-01S "(c) Zoning Review ___ %", Tigard's
+// "Plan Review Required (25%)" which only the listed large jobs owe) is not carried. A blank that
+// prints no amounts carries none — the held Coos County blank ("Revised 2025") prints its fee column
+// EMPTY, so the cross-check reports "no printed table" there.
+export interface PrintedFeeLine {
+  /** The row's own printed wording. */
+  label: string;
+  /** As printed. */
+  amountUsd: number;
+  /** A size row's inclusive upper bound in kVA (the same bounds as ahjForms.feeBracket); absent on a flat line. */
+  maxKva?: number;
+}
+export interface PrintedFeeTable {
+  discipline: "electrical" | "structural";
+  /** What the blank prints about its own date, verbatim ("Rev 06/17/2015"); "" when it prints none —
+   *  never invented. */
+  printedDate: string;
+  /** When the held copy was fetched, for an undated blank ("" when not recorded). */
+  copyFetched?: string;
+  /** "prescriptive": the block prices only the prescriptive solar path (an engineered job files
+   *  something else and this table says nothing about it). */
+  path?: "prescriptive";
+  /** The permit lines: kVA rows (each with maxKva, ascending) or exactly one flat line. */
+  lines: ReadonlyArray<PrintedFeeLine>;
+  /** Above this the form's own figures need per-kVA math and plan review: never computed. */
+  autoMaxKva?: number;
+  /** Percentage surcharges on the permit line, as printed ("State surcharge (12% of permit fee)"). */
+  surcharges: ReadonlyArray<{ readonly label: string; readonly percent: number }>;
+  /** Marion E-01 only: the fill may price this form's own fee boxes from the ladder (use 1 above). */
+  fillsOwnForm?: { note: string };
+}
+/** The E-01 fill's view of its printed ladder (ahjForms reads this shape). */
 export interface PrintedFeeLadder {
   discipline: "electrical";
   /** The form's solar rows: inclusive upper bound in kVA (the same bounds as ahjForms.feeBracket), ascending. */
@@ -32,9 +71,21 @@ export interface PrintedFeeLadder {
  *  fill message when the form's printed ladder priced it (the two would contradict each other). */
 export const CURATED_SAVED_FEE_NOTE = "Fee entries use the current saved jurisdiction lookup; printed rates may be historical.";
 export const CURATED_AHJ_FORMS = [
-  {ahj:"tigard",state:"OR",formType:"building_application",formName:"City of Tigard Residential Building Permit Application",url:"https://www.tigard-or.gov/home/showpublisheddocument/42/639007759919470000",hash:"af2a97754e8300ce5341c316b4739a3e68df7da31688a4b993910f6894c784c7",documentDate:"01/25/2023 (printed footer)"},
-  {ahj:"tigard",state:"OR",formType:"electrical_application",formName:"City of Tigard Electrical Permit Application",url:"https://www.tigard-or.gov/home/showpublisheddocument/44/637615268530600000",hash:"631bc73563f644c600b363c0f5f058b7a3d4eb8684551ac1e4a57a1a50fcb1b6",documentDate:"Rev 06/17/2015"},
-  // The form only says "Revised 2025"; do not invent a month/day.
+  {ahj:"tigard",state:"OR",formType:"building_application",formName:"City of Tigard Residential Building Permit Application",url:"https://www.tigard-or.gov/home/showpublisheddocument/42/639007759919470000",hash:"af2a97754e8300ce5341c316b4739a3e68df7da31688a4b993910f6894c784c7",documentDate:"01/25/2023 (printed footer)",
+   // "PHOTOVOLTAIC SOLAR PANEL SYSTEM FEES* — Commercial and residential prescriptive installation of
+   // roof-top mounted PhotoVoltaic Solar Panel System": $180.00, 12% state surcharge $21.60, total $201.60.
+   printedFees:{discipline:"structural",printedDate:"01/25/2023 (printed footer)",path:"prescriptive",
+    lines:[{label:"Photovoltaic solar panel system permit fee (includes plan review and administrative fees)",amountUsd:180}],
+    surcharges:[{label:"State surcharge (12% of permit fee)",percent:12}]}},
+  {ahj:"tigard",state:"OR",formType:"electrical_application",formName:"City of Tigard Electrical Permit Application",url:"https://www.tigard-or.gov/home/showpublisheddocument/44/637615268530600000",hash:"631bc73563f644c600b363c0f5f058b7a3d4eb8684551ac1e4a57a1a50fcb1b6",documentDate:"Rev 06/17/2015",
+   // Page 2 "Renewable Energy Permit Fees": 5 kva or less 100.70; 5.01 to 15 kva 133.56; 15.01 to 25
+   // kva 200.34; solar over 25 kva each additional kva 7.42 (not computed); page 1 "State surcharge
+   // (12% of permit fee)". Cross-check only — this form's fill is untouched (no fillsOwnForm).
+   printedFees:{discipline:"electrical",printedDate:"Rev 06/17/2015",
+    lines:[{label:"Renewable electrical energy systems: 5 kva or less",amountUsd:100.70,maxKva:5},{label:"Renewable electrical energy systems: 5.01 to 15 kva",amountUsd:133.56,maxKva:15},{label:"Renewable electrical energy systems: 15.01 to 25 kva",amountUsd:200.34,maxKva:25}],
+    autoMaxKva:25,surcharges:[{label:"State surcharge (12% of permit fee)",percent:12}]}},
+  // The form only says "Revised 2025"; do not invent a month/day. It prints its fee column EMPTY (only
+  // the 12% / 25% / 5% percentages), so it carries no printedFees.
   {ahj:"coos bay",state:"OR",formType:"electrical_application",formName:"Coos County Electrical Permit Application",url:"https://co.coos.or.us/files/5bb0a81e5/electrical_permit.pdf",hash:"7ef28457e32b802f53e47ffd8a2494548cc11b60c839be780b2344217c6f2d0c",documentDate:"Revised 2025"},
   // MARION COUNTY'S OWN APPLICATIONS — keyed to the ISSUING AGENCY, never to a city it issues for
   // (applicationDocsAgency.formAuthorityFor). A City of Jefferson job reaches them because the
@@ -42,14 +93,20 @@ export const CURATED_AHJ_FORMS = [
   // 2026-09-27 from co.marion.or.us (recorded in .probe/agency-apps/live-fetch/fetch-log.json);
   // B-01S is the URL the lookup cited, E-01 was found on the county's forms listing. The B-01S
   // prints no revision date; the E-01 footer prints only "06/20" — do not invent a day.
-  {ahj:"marion county",state:"OR",formType:"building_application",applicationKind:"prescriptive",formName:"Marion County Prescriptive Solar Photovoltaic Installation Permit Application (B-01S)",url:"https://www.co.marion.or.us/PW/BuildingInspection/Documents/B-01S%20Solar%20Prescriptive%20Installation%20Application%20Filleable.pdf",hash:"8c8daff4239868c9a156bcabf6e6690eb3677541b24c34ca7eec59bb8bd0a732",documentDate:""},
+  {ahj:"marion county",state:"OR",formType:"building_application",applicationKind:"prescriptive",formName:"Marion County Prescriptive Solar Photovoltaic Installation Permit Application (B-01S)",url:"https://www.co.marion.or.us/PW/BuildingInspection/Documents/B-01S%20Solar%20Prescriptive%20Installation%20Application%20Filleable.pdf",hash:"8c8daff4239868c9a156bcabf6e6690eb3677541b24c34ca7eec59bb8bd0a732",documentDate:"",
+   // "PERMIT FEES (a) Permit Fee $ 67.25 (b) State Surcharge of 12% $ 8.07 (c) Zoning Review ___ % x
+   // 67.25 (if required)". (c)'s rate is blank on the form, so it is not carried.
+   printedFees:{discipline:"structural",printedDate:"",copyFetched:"2026-09-27",path:"prescriptive",
+    lines:[{label:"(a) Permit Fee",amountUsd:67.25}],surcharges:[{label:"(b) State Surcharge of 12%",percent:12}]}},
   // Its FEE SCHEDULE block, as printed on this revision (backend/test/fixtures/marion-e-01.pdf): SOLAR
   // 5 kva or less $79.00; 5.01 to 15 kva $94.00; 15.01 to 25 kva $156.00; in excess of 25 kva $156.00
   // plus $6.25 per additional kva up to 100; over 100 kva $624.75; plan review 25% when the system
   // exceeds 25 kva; state surcharge 12% of permit fee. Only the flat rows are carried (<= 25 kVA).
   {ahj:"marion county",state:"OR",formType:"electrical_application",formName:"Marion County Renewable Electrical Energy Permit Application (E-01)",url:"https://www.co.marion.or.us/PW/BuildingInspection/Documents/E-01%20Renewable%20Energy%20Permit%20Application.pdf",hash:"bd723dfa527a18990d40ce9871ae20a8a31e5d9e85a383db610d69ed027948a4",documentDate:"06/20 (printed footer)",
-   printedFees:{discipline:"electrical",tiers:[{maxKva:5,feeUsd:79},{maxKva:15,feeUsd:94},{maxKva:25,feeUsd:156}],autoMaxKva:25,stateSurchargePercent:12,
-    note:"Fees are the schedule printed on this form (Marion County E-01, footer 06/20) because no saved Marion County electrical fee schedule is on file, so confirm the county's current fees before filing."}},
+   printedFees:{discipline:"electrical",printedDate:"06/20 (printed footer)",
+    lines:[{label:"SOLAR 5 kva or less",amountUsd:79,maxKva:5},{label:"SOLAR 5.01 to 15 kva",amountUsd:94,maxKva:15},{label:"SOLAR 15.01 to 25 kva",amountUsd:156,maxKva:25}],
+    autoMaxKva:25,surcharges:[{label:"State surcharge 12% of permit fee",percent:12}],
+    fillsOwnForm:{note:"Fees are the schedule printed on this form (Marion County E-01, footer 06/20) because no saved Marion County electrical fee schedule is on file, so confirm the county's current fees before filing."}}},
 ] as const;
 type CuratedSource = (typeof CURATED_AHJ_FORMS)[number];
 const curatedKey = (ahj: string) => String(ahj ?? "").trim().toLowerCase().replace(/^city of\s+/,"");
@@ -67,14 +124,22 @@ export function curatedFormSourcesFor(authority: string, state: string): Curated
 export function curatedFormSource(project: Pick<ProjectRecord,"ahj"|"state">,formType:string,kind?:"prescriptive"|"structural"|null){
  return curatedFormSourcesFor(project.ahj, project.state).find(f=>f.formType===formType&&(!kind||!curatedApplicationKind(f)||curatedApplicationKind(f)===kind));
 }
-/** The fee ladder PRINTED on this exact blank (by its sha256), else null. Keyed by the bytes, not by a
- *  stored map, so a row stored before the ladder existed (Michael's E-01) reads it too. */
+/** The fee table printed on a seed, else null (#454's cross-check reads every one of them). */
+export function curatedPrintedFeeTable(source: CuratedSource): PrintedFeeTable | null {
+ return "printedFees" in source ? source.printedFees as PrintedFeeTable : null;
+}
+/** The fee ladder PRINTED on this exact blank (by its sha256) that the FILL may use, else null. Keyed by
+ *  the bytes, not by a stored map, so a row stored before the ladder existed (Michael's E-01) reads it
+ *  too. Only a table marked fillsOwnForm (Marion E-01): every other printed table is cross-check only. */
 export function curatedPrintedFees(bytes:Uint8Array):PrintedFeeLadder|null{
  const hash=createHash("sha256").update(bytes).digest("hex");
  const source=CURATED_AHJ_FORMS.find(f=>f.hash===hash);
+ const table=source?curatedPrintedFeeTable(source):null;
+ if(!source||!table?.fillsOwnForm||table.discipline!=="electrical")return null;
  // The ladder is the printed schedule of THIS seed's authority ("marion county"): ahjForms declines it
  // when that authority's own undifferentiated schedule is on file (skeptic stage-forms-fee-2).
- return source&&"printedFees" in source?{...(source.printedFees as PrintedFeeLadder),authority:source.ahj}:null;
+ return {discipline:"electrical",tiers:table.lines.map(l=>({maxKva:Number(l.maxKva),feeUsd:l.amountUsd})),autoMaxKva:Number(table.autoMaxKva),
+  stateSurchargePercent:table.surcharges[0]?.percent ?? 0,authority:source.ahj,note:table.fillsOwnForm.note};
 }
 export function curatedFormMap(bytes:Uint8Array,sourceUrl:string){
  return curatedFormMapForHash(createHash("sha256").update(bytes).digest("hex"),sourceUrl);

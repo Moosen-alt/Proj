@@ -1,5 +1,9 @@
 # Solar Submission Autopilot
 
+**Proprietary and confidential.** Copyright (c) 2026 Keelix. All rights reserved. This code is
+Keelix's property and trade secret; no licence is granted without a written agreement with Keelix.
+See [LICENSE](LICENSE).
+
 Automates residential solar **permit** (AHJ) and **NEM/interconnection**
 (utility) submissions end-to-end — parse plan set → QC → code-cited reviewer
 gate → build/fill official AHJ forms → stage the portal application via
