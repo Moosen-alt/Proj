@@ -9985,9 +9985,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // watchdog gives it the planner's budget (the LLM client retries a stalled attempt itself).
     this.noteActivity(`asking the planner (page ${this.walkPageCount})`);
     this.plannerCalls++;
-    let call: Promise<LearnPlanResponse>;
-    try { call = Promise.resolve(this.planner(this.scrubPlanRequest(req))); } catch (e) { call = Promise.reject(e); }
-    return call.finally(() => { this.plannerCalls--; this.noteActivity("planner replied"); });
+    const settled = (): void => { this.plannerCalls--; this.noteActivity("planner replied"); };
+    try {
+      return this.planner(this.scrubPlanRequest(req)).finally(settled);
+    } catch (e) {
+      settled();
+      throw e;
+    }
   }
 
   private scrubPlanRequest(req: LearnPlanRequest): LearnPlanRequest {
