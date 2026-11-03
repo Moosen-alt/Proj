@@ -7198,7 +7198,8 @@ function portalQuestionBodyHtml(item, ctx) {
  * One Human Review card. `ctx`: { project, snapshot, inverterLookup } — the selected project, its
  * parser snapshot, and the last inverter lookup this page made (or null).
  */
-function reviewCardHtml(item, ctx = {}) {
+function reviewCardHtml(item, ctxIn) {
+  const ctx = ctxIn || {};
   const pending = item.status === "pending";
   const isQuestion = !!(item.portalQuestion && item.portalQuestion.key);
   const isAdvisory = !isQuestion && ADVISORY_REVIEW_ISSUE_TYPES.includes(item.issueType || "");
