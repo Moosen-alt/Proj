@@ -1,4 +1,4 @@
-// #436 FIX ROUNDS 1-2 — THE STAGED PICTURE'S MASK IS VERIFIED, IN A REAL BROWSER (secretMask.ts).
+// #436 FIX ROUNDS 1-3 — THE STAGED PICTURE'S MASK IS VERIFIED, IN A REAL BROWSER (secretMask.ts).
 //
 // The adversarial check's probe, re-run: a scriptless page (Emulation.setScriptExecutionDisabled, as
 // the staged walk's page is) on 127.0.0.1, 800x600, synthetic ACCOUNT=8814402937 at fixed spots. Each
@@ -61,6 +61,40 @@
 //   no alt check → "imgAlt" and "inputImage" ok:true with a file; no generated-content check →
 //     "after", "quotes", "marker" ok:true with a file; no quotes term → "quotes"; no list-style-type
 //     term → "marker".
+//
+// #436 FIX ROUND 3 — AN <option>/<optgroup> OUTSIDE A <select> (the round-2 check's one rule-2
+// regression vs origin/main). The account is drawn in pure green; nothing else on those pages is.
+//   FACE 1, THE LEARNER (section 7, scripts on): main's inline withSecretMask tagger, copied verbatim
+//              into this file as the oracle, against the shared tagger, on the check's five pages
+//              (strayOption, listboxDivOptions, strayOptionInTable, strayOptgroupLabel,
+//              strayOptionLabel), three siblings (a bare option, an option in a stray optgroup, one in
+//              an open shadow root), a datalist and three controls (plain, select, input): every
+//              element main tags is tagged (or its <select> is), and under the learner's own mask
+//              ([data-al-secret]) the account leaves 0 green pixels (main's left 1210 / 650 / 1210 on
+//              the two label pages and the shadow root, and 1162 on the select).
+//   FACE 2, THE STAGED PICTURE (section 8, scriptless): those eight, plus a stray option whose own box
+//              does not hold its text (width:0, text-indent:350px, display:contents on an option and
+//              on an optgroup) and three split ones (two halves in two width:0 options in a 20px
+//              wrapper; an option's half and a <p>'s half; an optgroup label's half and a span's) →
+//              refused with no file, or kept with 0 green. All 15 are refused. MUST-PASS: a datalist's
+//              option (paints nothing) beside a plain account → ok:true, 0 green.
+//
+// Kill, round 3 (each run by hand against secretMask.ts, then restored; the failing checks as seen,
+// of 103):
+//   the tagger skipping OPTION/OPTGROUP by name everywhere again → 14 fail, all section 7 (the five,
+//     the bare option, the stray optgroup, the shadow root; datalist's "main tagged" check); section 8
+//     still refuses all 15 (the leftover walk counts the untagged option's text as painted);
+//   the tagger not reading stray labels (whole-root guard and element text) → 2: strayOptgroupLabel,
+//     strayOptionLabel in section 7;
+//   textRects' stray flag off → 5: strayWidth0 1210 px, strayIndent 981, strayContents 1210,
+//     strayOptgroupContents 1210, splitTwoOptions 489 kept in clear (the check's five stay at 0: the
+//     tagged option's own box happens to hold them there — which is why that box was NOT taken as
+//     the measure);
+//   the leftover walk without stray labels (SHOW_TEXT only) → 1: splitLabel 966 px;
+//   the leftover walk treating a stray option's text as unpainted → 1: splitStrayP 722 px;
+//   all three coverage changes off → 7 (the five above and both splits);
+//   the whole round-2 secretMask.ts (633cfbc3) → 29: the 14 of section 7 and all 15 of section 8 kept
+//     with the account in clear (the check's five at 1210 / 722 / 378 / 1210 / 650 px).
 //
 //   npx tsx portal-bot/src/secretMask.dom.smoke.ts
 import "./smokeArtifactDirs";

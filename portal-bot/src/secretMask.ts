@@ -315,7 +315,7 @@ export async function secretMaskCoverageInPage(frame: Pick<Frame, "evaluate">, p
         if (/^(INPUT|TEXTAREA|SELECT|IMG)$/.test(target.tagName)) rects = Array.from(target.getClientRects()).filter((r) => area(r) > 0);
         else {
           const tr = textRects(target);
-          if (tr.stray) { uncovered.push(`${name(el)} paints a known secret in an <option> or <optgroup> outside a <select>, whose text the mask cannot place`); continue; }
+          if (tr.stray) { uncovered.push(`${name(el)} carries a known secret painted by an <option> or <optgroup> outside a <select>, whose text the mask cannot place`); continue; }
           rects = tr.rects;
         }
         if (!rects.length) continue;
