@@ -4309,6 +4309,27 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     if (this.stallTimer) { clearInterval(this.stallTimer); this.stallTimer = null; }
   }
 
+  /** THE BACKSTOP'S TEARDOWN, BOUNDED (#556). On a page whose script never returns, page.unroute never
+   *  returns either (measured: unroute, evaluate, screenshot and even a locator.click with its own
+   *  timeout all stay pending; tracing.stop and page.close do not) — so learn() never returned after
+   *  the walk itself had ended, named. dispose() sets `disposed` before its first await, so the route
+   *  handler already lets every request through exactly as after the route comes off (the dispose
+   *  gap, C9): waiting no longer for the DevTools command changes nothing about what is let through. */
+  private async disposeBackstopWithin(backstop: FilingBackstop | null): Promise<void> {
+    // One teardown per run, given its bound once: the finally's call (there for a walk that threw
+    // before the hand-off) has nothing left to do after the hand-off's.
+    if (!backstop || this.backstopDisposeStarted) return;
+    this.backstopDisposeStarted = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const done = await Promise.race([
+      backstop.dispose().then(() => true, () => true),
+      new Promise<boolean>((resolve) => { timer = setTimeout(() => resolve(false), 15_000); (timer as { unref?: () => void }).unref?.(); }),
+    ]);
+    if (timer) clearTimeout(timer);
+    if (!done) this.debug?.event({ type: "backstop_dispose_unfinished", waitedMs: 15_000 });
+  }
+  private backstopDisposeStarted = false;
+
   /** The walk, raced against the watchdog. Once the watchdog has closed the page the walk gets a short
    *  grace to unwind through its own path (its stuck call rejects); a walk that does not — a promise
    *  that is not the browser's — is abandoned, inert: every click is retired and its page is gone.
@@ -4512,7 +4533,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       if (this.infoPageIncidents.length) result = { ...result, infoPageIncidents: this.infoPageIncidents.map((i) => ({ ...i, why: i.why.map((w) => this.scrubSecrets(w)) })) };
       if (this.infoPageHeldVerified.length) result = { ...result, infoPageHeldVerified: this.infoPageHeldVerified.map((h) => ({ ...h, why: h.why.map((w) => this.scrubSecrets(w)) })) };
       // Hand-off first (the route comes off), then every abort up to that moment is counted.
-      await backstop?.dispose().catch(() => null);
+      await this.disposeBackstopWithin(backstop);
       // WHAT THE PERSON TAKING THE REVIEW PAGE MUST KNOW (dryrun-0928 B3 + B14), in the hand-off itself:
       // answers the portal may not have saved, and the portal's own background calls the lockdown
       // held back (a section may render incomplete). The learner cannot tell how the page was
@@ -4561,7 +4582,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       throw err;
     } finally {
       this.stopStallWatchdog();
-      await backstop?.dispose().catch(() => null);
+      await this.disposeBackstopWithin(backstop);
       this.stopHeartbeat();
       // A run that TYPED a secret has it in the trace raw (the fill's value, every DOM snapshot
       // after it) — hard rule 2: that trace is discarded, not saved; the rest of the bundle stays.
@@ -7602,6 +7623,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
 
       // c3) DASHBOARD NAVIGATION — click a link/button to get from the portal home to the
       //     actual application form. Recorded as a click step (phase:"open") then loop again.
+      /** The planner's navigate target was refused as DISABLED while its plan also fills this page:
+       *  the page is planned again after the fills (#556). */
+      let navDisabledRefused = false;
       if (typeof plan.navigateSelectorIndex === "number") {
         let navField = fields[plan.navigateSelectorIndex];
         // A LIST WHERE EVERY CONTROL SAYS THE SAME WORD — see rowChooser.ts. The planner has
@@ -7683,12 +7707,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // click's every retry and does nothing. Not clicked, not recorded, and not registered as
           // clicked (the loop guard must not refuse it once it is enabled); the planner is told what
           // the page is waiting for, and the page is planned again. Bounded by the stuck guard's
-          // recovery cap and the page budget like any other re-plan.
+          // recovery cap and the page budget like any other re-plan. A plan that also FILLS this page
+          // keeps its fills — they may be the very choice that enables the button — and the page is
+          // planned again after them (the tail below), never left as if it had no way forward.
           const lbl = (navField.label || "").replace(/\s+/g, " ").trim().slice(0, 60);
           this.debug?.event({ type: "navigate_disabled_refused", page: pageCount, label: lbl });
           pendingHint = `"${lbl}" is DISABLED on this page: it becomes clickable only after a choice here (the option, type or category this application needs). ` +
             `Make that choice first — click or select it — and use "${lbl}" once it is enabled. Never choose a disabled control.`;
-          continue;
+          if (!(plan.fills ?? []).length) continue;
+          navDisabledRefused = true;
         } else if (navField) {
           // WHAT IT DECIDED TO CLICK, not only what it refused.
           //
@@ -7761,7 +7788,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             await this.waitAfterClick(navBeforeUrl, navBeforeFp, navTabsBefore);
           });
           if (res.timedOut) {
-            this.debug?.event({ type: "navigate_timed_out", page: pageCount, label: (navField.label || "").slice(0, 60), ms: Date.now() - navStarted });
+            this.debug?.event({ type: "navigate_timed_out", page: pageCount, label: (navField.label || "").slice(0, 60), tookMs: Date.now() - navStarted });
             return fail(steps, this.portalName, `Failed to click navigation link "${navField.label}" on page ${pageCount}: the click did not finish within ${Math.round(clickStepBudgetMs() / 1000)} s (the control never responded); the walk stopped rather than keep retrying it.`, null, pageCount, portalNotices);
           }
           if (!res.ok) {
@@ -8941,6 +8968,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         continue;
       }
 
+      // The page's way forward was refused as DISABLED and this page's fills have now run: plan it
+      // again — the button they may have enabled is the way forward, not the fallbacks below (#556).
+      if (navDisabledRefused) continue;
+
       // No advance + not at review → nothing more we can do, UNLESS a create dialog is
       // waiting on its own Submit (see clickCreateDialogAdvance).
       if (await this.clickCreateDialogAdvance(steps)) continue;
@@ -9921,7 +9952,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    *  length and order, so the planner's indices still mean the caller's list. The screenshot is
    *  not text — it is masked where it is taken (capturePlanScreenshot). */
   private askPlanner(req: LearnPlanRequest): Promise<LearnPlanResponse> {
-    // A planner reply, or its failure, is progress (#556 stall watchdog).
+    // A planner reply, or its failure, is progress (#556 stall watchdog); and should the reply never
+    // come, the watchdog's message says that is where the walk was.
+    this.noteActivity(`asking the planner (page ${this.walkPageCount})`);
     return this.planner(this.scrubPlanRequest(req)).finally(() => this.noteActivity("planner replied"));
   }
 
