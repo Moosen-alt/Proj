@@ -7499,10 +7499,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // names a document we hold, nothing clicked, no substitute, no attachment Save — and the
       // run stops at review afterwards exactly as before, naming any required slot left empty.
       // ACA's unlabeled attachment rows name no document, so they are still left alone.
+      // Page-scoped, not block-scoped: the pass after this page's answers (d3e) reads both —
+      // the same attach-only rule, and the slot labels this pass already offered.
+      const reviewUpload = isReviewPage || plan.atReview === true;
+      const seenSlotLabels = new Set<string>();
       {
-        const reviewUpload = isReviewPage || plan.atReview === true;
         this.debug?.event({ type: "upload_phase_start", page: pageCount, ...(reviewUpload ? { attachOnly: true } : {}) });
-        const seenSlotLabels = new Set<string>(await this.uploadSlotLabels());
+        for (const l of await this.uploadSlotLabels()) seenSlotLabels.add(l);
         const up = await this.withPhaseTimeout(
           "uploads",
           150_000,
@@ -8038,6 +8041,55 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             if (!missesDidNotHold.includes(m)) missesDidNotHold.push(m);
           }
         } catch { /* best-effort: row 1 stands as the learn filled it */ }
+      }
+
+      // d3e) AN UPLOAD SLOT THIS PAGE'S OWN ANSWERS REVEALED GETS THE SAME PASS (#529).
+      //
+      // Live on PacifiCorp's PowerClerk NEM (2026-11-02): "Description of Service" shows its
+      // required "Upload a photo of meter where system will be interconnected" only after an
+      // answer on the same page. The upload pass (d0) runs at page entry, BEFORE the fills, and
+      // its late look (two 1.5 s waits) only catches slots a cascade reveals on its own. The
+      // re-scan (d3) saw the slot appear (revealed_controls) but deliberately fills no file
+      // control. So nothing offered the slot to performUploads: the meter photo we held was
+      // never attached, and nothing reported the required slot as empty.
+      //
+      // After every pass that answers questions on this page (planner, re-scan, policy
+      // defaults, array rows), look again; any slot label d0 never offered gets one more
+      // performUploads — attach-only on a review page, exactly as d0 — and a required one with
+      // no document joins missingRequiredDocs. Before the persist settle (d1), so the upload's
+      // own save lands with the page's answers. A page that answered nothing reveals nothing.
+      if (pageFillCount > 0 && this.page) {
+        await this.waitForDynamicFieldsSettle().catch(() => null);
+        const fresh = (await this.uploadSlotLabels()).filter((l) => !seenSlotLabels.has(l));
+        if (fresh.length > 0) {
+          for (const l of fresh) seenSlotLabels.add(l);
+          this.debug?.event({ type: "upload_revealed_slots", page: pageCount, labels: fresh.slice(0, 6).join(" | ").slice(0, 200) });
+          const rev = await this.withPhaseTimeout(
+            "uploads_revealed",
+            90_000,
+            () => this.performUploads(steps, alreadyFilledLabels, { reviewPage: reviewUpload }),
+            { filled: [] as string[], missingRequired: [] as string[], attached: 0 },
+          );
+          this.debug?.event({ type: "upload_phase_done", page: pageCount, pass: "revealed", attached: rev.attached, missing: rev.missingRequired.length, ...(reviewUpload ? { attachOnly: true } : {}) });
+          for (const m of rev.missingRequired) if (!missingRequiredDocs.includes(m)) missingRequiredDocs.push(m);
+          // ACA commits an attachment only on its section's Save (see d0). The answers on this
+          // page are already in, so commit in place rather than re-entering the page — and say
+          // so when the Save did not take, never leave the file silently pending.
+          if (rev.attached > 0 && !reviewUpload && this.isAcaPage(url, fields) && acaAttachmentSaves < 3) {
+            acaAttachmentSaves++;
+            const saved = await this.withPhaseTimeout(
+              "attachment_save",
+              90_000,
+              () => this.accelaAttachmentSavePass(_project, steps),
+              false,
+            );
+            this.debug?.event({ type: "aca_attachment_save_pass", page: pageCount, saved, pass: "revealed" });
+            if (!saved) {
+              const warn = "Attachments were uploaded but the portal's Save did not confirm them — re-attach and click Save by hand before submitting.";
+              if (!missingRequiredDocs.includes(warn)) missingRequiredDocs.push(warn);
+            }
+          }
+        }
       }
 
       // d1) PERSIST SETTLE (ADAPTIVE). Portals like PowerClerk autosave each page's fields via
