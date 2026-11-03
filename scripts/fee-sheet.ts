@@ -258,7 +258,9 @@ export function renderFeeLine(
   const out: string[] = [];
   const track = line.track as FeeTrack;
   out.push(`  ${TRACK_LABEL[track]}   ${line.jurisdiction || "(no jurisdiction on the project)"}`);
-  out.push(row("Fee", money(line.feeUsd)));
+  // A FLOOR (#421) is printed as one: the schedule priced part of this filing, and the number is
+  // that part — never a bare figure that reads like the whole fee.
+  out.push(row("Fee", line.feeIsFloor && line.feeUsd != null ? `AT LEAST ${money(line.feeUsd)} (not every charge is priced — see below)` : money(line.feeUsd)));
   out.push(row("From", wrap(`${SOURCE_NOTE[line.source] || line.source} — ${line.basis}`, 64, cont)));
   out.push(row(
     "Bracket",
@@ -314,7 +316,9 @@ export function renderFeeLine(
     // estimate is the sum of this list would be the reassurance this whole round
     // exists to remove.
     out.push(row("Charges", feeIsTheSchedule
-      ? `${charges.length} charges on this filing${allPriced ? " — the fee above is their total" : " — the fee above is NOT their sum; one of them is unpriced"}`
+      ? `${charges.length} charges on this filing${allPriced ? " — the fee above is their total"
+        : line.feeIsFloor ? " — the fee above is the sum of the PRICED ones only, a floor: the unpriced one is not in it"
+          : " — the fee above is NOT their sum; one of them is unpriced"}`
       : wrap(`${charges.length} charges on this filing, as the PUBLISHED SCHEDULE holds them — NOT a breakdown of the fee above, which came from somewhere else (see "From").`, 62, cont)));
     for (const charge of charges) {
       // "UNRESOLVED" means somebody has to go and find out. An overage fee needs nobody to find
@@ -421,10 +425,16 @@ export function renderFeeSheet(view: FeeSheetPresentation): string {
   const totalEstimated = sheet.totalUsd != null && sheet.totalConfidence === "estimated";
   out.push(`  JURISDICTION FEES   ${money(sheet.jurisdictionFeesUsd)}   (permit + NEM, owed to the AHJ and the utility)`);
   out.push(`  SERVICE FEES        ${money(sheet.serviceFeesUsd)}   (ours, ${sheet.billingRequired ? "per submission — two tracks, two fees" : `not collected: billing mode "${sheet.billingMode || "monthly/none"}"`})`);
-  out.push(`  PROJECT TOTAL       ${totalEstimated ? `≈ ${money(sheet.totalUsd)}   (ESTIMATE)` : money(sheet.totalUsd)}`);
+  // A FLOOR (#421) makes the total a lower bound too — said as one, never as "≈".
+  const hasFloor = sheet.lines.some((l) => l.feeIsFloor === true && l.feeUsd != null);
+  out.push(`  PROJECT TOTAL       ${totalEstimated ? `${hasFloor ? "AT LEAST " : "≈ "}${money(sheet.totalUsd)}   (ESTIMATE)` : money(sheet.totalUsd)}`);
   if (sheet.totalUsd == null) {
     out.push("  The total is UNKNOWN because at least one fee is. It is not a zero and it is not");
     out.push("  a partial sum — do not put a number in front of this customer yet.");
+  } else if (totalEstimated && hasFloor) {
+    out.push("  This total is a FLOOR: at least one fee is marked AT LEAST — its published schedule priced");
+    out.push("  part of that filing and the rest is not priced yet, so the real total is HIGHER. Price what");
+    out.push("  is missing (STILL UNKNOWN, below) or enter the portal's own fee before quoting a customer.");
   } else if (totalEstimated) {
     // Named for what the estimate actually IS — see the two-kinds note further down. Both roads
     // end at the same instruction, so the instruction is shared and only the cause differs.

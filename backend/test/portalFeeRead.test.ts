@@ -162,8 +162,10 @@ const strTid = mkTarget(ann.id, STR, "City of Readbay", "building", strUrl);
 const elecTid = mkTarget(ann.id, ELEC, "Read County", "electrical", elecUrl);
 const permitQuote = () => buildPaymentQuote(db, R.getProjectDetail(db, ann.id).project, "permit");
 const before = permitQuote();
-check("2a. before any read: the researched $360.00 from the published schedule, no portal records",
-  before.permitFeeSource === "published_schedule" && before.permitFeeUsd === 360 && before.portalFeeRecords === null, `${before.permitFeeSource} ${before.permitFeeUsd}`);
+// #421: the researched figure is the schedule's $360.00 PLUS the 12% Oregon state surcharge the
+// stored rows do not hold, which the quote now adds ($200 + $160, each x 1.12 = $403.20).
+check("2a. before any read: the researched $403.20 ($360.00 + the modeled 12% state surcharge) from the published schedule, no portal records",
+  before.permitFeeSource === "published_schedule" && before.permitFeeUsd === 403.2 && before.portalFeeRecords === null, `${before.permitFeeSource} ${before.permitFeeUsd}`);
 const schedulesBefore = snapshotSchedules();
 
 // Sweep 1: only the city's STR record is due; its plain fetch shows the Loading placeholder.
@@ -176,8 +178,8 @@ await R.runDuePermitChecks(db, "permit");
 const q1 = permitQuote();
 check("2b. the plain fetch's 'Loading...' fell back to the browser reader, once, for the record's own URL",
   browserCalls.length === 1 && browserCalls[0] === strUrl, JSON.stringify(browserCalls));
-check("2c. ONE of two records read: the amount stays the researched $360.00 (published schedule)",
-  q1.permitFeeSource === "published_schedule" && q1.permitFeeUsd === 360, `${q1.permitFeeSource} ${q1.permitFeeUsd}`);
+check("2c. ONE of two records read: the amount stays the researched $403.20 (published schedule)",
+  q1.permitFeeSource === "published_schedule" && q1.permitFeeUsd === 403.2, `${q1.permitFeeSource} ${q1.permitFeeUsd}`);
 check("2d. …and the partial read is shown BESIDE it: $236.00 read so far, the county record named as not yet read",
   q1.portalFeeRecords?.complete === false && q1.portalFeeRecords?.totalUsd === 236 && q1.permitFeeComparison?.shown === "researched"
     && q1.permitFeeComparison?.portalUsd === 236 && /not yet read: 194-26-001482-ELEC/.test(q1.permitFeeComparison?.note ?? ""),
@@ -195,13 +197,13 @@ const today = new Date().toISOString().slice(0, 10);
 check("2f. provenance: 'read from the portal records 187-26-000309-STR on <date> and 194-26-001482-ELEC on <date>'",
   q2.permitFeeBasis.includes(`read from the portal records ${STR} on ${today} and ${ELEC} on ${today}`) && /no person has checked it/.test(q2.permitFeeBasis), q2.permitFeeBasis);
 check("2g. …the STR record is still in review, so it says the fees may grow", /invoiced so far/.test(q2.permitFeeBasis), q2.permitFeeBasis);
-check("2h. both numbers and the difference: researched $360.00 (published schedule), portal $415.20, +$55.20",
-  q2.permitFeeComparison?.researchedUsd === 360 && q2.permitFeeComparison?.researchedSource === "published_schedule"
-    && q2.permitFeeComparison?.portalUsd === 415.2 && q2.permitFeeComparison?.differenceUsd === 55.2 && q2.permitFeeComparison?.shown === "portal",
+check("2h. both numbers and the difference: researched $403.20 (published schedule), portal $415.20, +$12.00",
+  q2.permitFeeComparison?.researchedUsd === 403.2 && q2.permitFeeComparison?.researchedSource === "published_schedule"
+    && q2.permitFeeComparison?.portalUsd === 415.2 && q2.permitFeeComparison?.differenceUsd === 12 && q2.permitFeeComparison?.shown === "portal",
   JSON.stringify(q2.permitFeeComparison));
 const pay = db.get<{ permit_fee_actual_usd: number | null; permit_fee_estimate_usd: number | null }>("SELECT permit_fee_actual_usd, permit_fee_estimate_usd FROM submission_payments WHERE project_id = ? AND track = 'permit'", [ann.id]);
 check("2i. the person's column (permit_fee_actual_usd) is never written by a machine read; the estimate column keeps research",
-  pay?.permit_fee_actual_usd == null && pay?.permit_fee_estimate_usd === 360, JSON.stringify(pay));
+  pay?.permit_fee_actual_usd == null && pay?.permit_fee_estimate_usd === 403.2, JSON.stringify(pay));
 check("2j. fee_schedules untouched by the reads", snapshotSchedules() === schedulesBefore);
 check("2k. not every record is issued: nothing fed to learned history yet",
   db.query("SELECT 1 FROM permit_fee_history WHERE project_id = ?", [ann.id]).length === 0);
@@ -238,10 +240,10 @@ plainPages.set(lowUrl, page(lowRecord, "In Review", ["Print/View Summary Fees", 
 due(lowTid);
 await R.runDuePermitChecks(db, "permit");
 const ql = buildPaymentQuote(db, R.getProjectDetail(db, low.id).project, "permit");
-check("3a. a record in review with $99.00 invoiced (< researched $300.00) does not become the amount",
-  ql.permitFeeSource === "published_schedule" && ql.permitFeeUsd === 300, `${ql.permitFeeSource} ${ql.permitFeeUsd}`);
+check("3a. a record in review with $99.00 invoiced (< researched $336.00 = $300.00 + 12% state surcharge) does not become the amount",
+  ql.permitFeeSource === "published_schedule" && ql.permitFeeUsd === 336, `${ql.permitFeeSource} ${ql.permitFeeUsd}`);
 check("3b. …it is shown beside it with the gap, marked not the amount",
-  ql.permitFeeComparison?.shown === "researched" && ql.permitFeeComparison?.portalUsd === 99 && ql.permitFeeComparison?.differenceUsd === -201 && /more may be invoiced/.test(ql.permitFeeComparison?.note ?? ""),
+  ql.permitFeeComparison?.shown === "researched" && ql.permitFeeComparison?.portalUsd === 99 && ql.permitFeeComparison?.differenceUsd === -237 && /more may be invoiced/.test(ql.permitFeeComparison?.note ?? ""),
   JSON.stringify(ql.permitFeeComparison));
 
 // ═══ 4. A PERSON'S ENTRY STANDS ══════════════════════════════════════════════════════════════
@@ -311,7 +313,7 @@ const badge = (html: string): string => /<span class="badge [^"]*">([^<]*)<\/spa
   check("7a. a portal-read amount is labelled 'actual — read from the portal', never 'verified'",
     badge(html) === "actual — read from the portal" && !/(?<!not )\bverified\b/i.test(badge(html)), badge(html));
   check("7b. its provenance is on the face", words(face(html)).includes(`The portal's own fee, read from the portal records ${STR} on ${today} and ${ELEC} on ${today}.`), words(face(html)).slice(0, 500));
-  check("7c. both numbers and the gap are on the face", /Portal record, read automatically: \$415\.20 — \$55\.20 more than researched/.test(words(face(html))) && /Researched: \$360\.00/.test(words(face(html))), words(face(html)).slice(0, 600));
+  check("7c. both numbers and the gap are on the face", /Portal record, read automatically: \$415\.20 — \$12\.00 more than researched/.test(words(face(html))) && /Researched: \$403\.20/.test(words(face(html))), words(face(html)).slice(0, 600));
   check("7d. the records read are one click away, invoices masked", /Read from the portal: 2 of 2 filed records/.test(html) && !/1234401|2204118/.test(html));
   const evil = lib.renderFeeSheetLine({ ...annLine, portalRecords: { ...annLine.portalRecords, provenance: `read from the portal record <script>x</script>` }, comparison: { ...annLine.comparison, note: `<img src=x onerror=1>` } });
   check("7e. provenance and notes are escaped", !/<script>x/.test(evil) && !/<img src=x/.test(evil) && /&lt;script&gt;/.test(evil));
@@ -365,7 +367,7 @@ const badge = (html: string): string => /<span class="badge [^"]*">([^<]*)<\/spa
   const flipQuote = () => buildPaymentQuote(db, R.getProjectDetail(db, flip.id).project, "permit");
   const readingRow = () => db.get<Record<string, unknown>>("SELECT status, total_usd, record_outcome, read_at FROM portal_fee_readings WHERE target_id = ?", [flipTid]);
   const inReview = readingRow();
-  check("9a. setup: in review, $99 read < researched $300 — the researched figure leads", flipQuote().permitFeeSource === "published_schedule" && flipQuote().permitFeeUsd === 300);
+  check("9a. setup: in review, $99 read < researched $336 ($300 + 12% state surcharge) — the researched figure leads", flipQuote().permitFeeSource === "published_schedule" && flipQuote().permitFeeUsd === 336);
 
   // Issued now; the re-read refuses: plain "Loading...", and the browser returns nothing.
   statusText.set(flipUrl, `Record ${flipRecord}: Record Status: Issued`);
@@ -379,11 +381,11 @@ const badge = (html: string): string => /<span class="badge [^"]*">([^<]*)<\/spa
     afterRefusal?.total_usd === 99 && afterRefusal?.record_outcome === inReview?.record_outcome && afterRefusal?.record_outcome !== "issued" && afterRefusal?.read_at === inReview?.read_at,
     JSON.stringify({ inReview, afterRefusal }));
   check("9c. MUST-EXCLUDE: the in-review $99 is not 'final'", q9.portalFeeRecords?.final !== true, JSON.stringify(q9.portalFeeRecords?.records?.map((r) => [r.totalUsd, r.recordOutcome, r.final])));
-  check("9d. MUST-EXCLUDE: …and does not lead the line as the actual fee", !(q9.permitFeeSource === "portal_record" && q9.permitFeeUsd === 99) && q9.permitFeeUsd === 300, `${q9.permitFeeSource} ${q9.permitFeeUsd}`);
+  check("9d. MUST-EXCLUDE: …and does not lead the line as the actual fee", !(q9.permitFeeSource === "portal_record" && q9.permitFeeUsd === 99) && q9.permitFeeUsd === 336, `${q9.permitFeeSource} ${q9.permitFeeUsd}`);
   check("9e. MUST-EXCLUDE: …and feeds no learned history", db.query("SELECT 1 FROM permit_fee_history WHERE project_id = ?", [flip.id]).length === 0);
   const flipNeighbour = mkProject("City of Flipbay");
   const qfn = buildPaymentQuote(db, flipNeighbour, "permit");
-  check("9f. MUST-EXCLUDE: …so a neighbour's quote is not dragged to $99", qfn.permitFeeUsd === 300 && qfn.permitFeeSource === "published_schedule", `${qfn.permitFeeSource} ${qfn.permitFeeUsd}`);
+  check("9f. MUST-EXCLUDE: …so a neighbour's quote is not dragged to $99", qfn.permitFeeUsd === 336 && qfn.permitFeeSource === "published_schedule", `${qfn.permitFeeSource} ${qfn.permitFeeUsd}`);
 
   // A REFUSAL OF ANOTHER KIND (the page names a different record) changes nothing either.
   plainPages.set(flipUrl, page("187-26-000445-STR", "Issued", fees99.replace("$99.00", "$500.00").replace("$99.00", "$500.00")));

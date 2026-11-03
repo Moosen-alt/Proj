@@ -108,11 +108,14 @@ const permitLine = (projectId: string) => buildProjectFeeSheet(db, R.getProjectD
 const seenOf = (line: { feeUsd: number | null; confirmRows?: Array<{ id: string; updatedAt: string }> }) => ({ feeUsd: line.feeUsd as number, scheduleRows: line.confirmRows ?? [] });
 
 // ── 1. CONFIRM A SPLIT FEE ─────────────────────────────────────────────────────────────────
+// #421: every amount on the CARD (permitLine(...).feeUsd) now carries Oregon's 12% state surcharge,
+// which these fixture rows do not hold and the quote adds ($360 -> $403.20). What a Confirm RECORDS
+// is unchanged: each bracket at the SCHEDULE's own amount (fee_cents 24000 below is $240, not $268.80).
 seedSplit("City of Confirmbay", "Confirm County");
 const ann = mk("City of Confirmbay");
 const before = permitLine(ann.id);
 check("1a. the researched split fee is seeded, from the schedule, $360, and confirmable",
-  before.source === "published_schedule" && before.confidence === "seeded" && before.feeUsd === 360 && before.confirmable === true,
+  before.source === "published_schedule" && before.confidence === "seeded" && before.feeUsd === 403.2 && before.confirmable === true,
   JSON.stringify({ s: before.source, c: before.confidence, f: before.feeUsd, k: before.confirmable }));
 
 // 2 (first half): the refusals write nothing.
@@ -156,7 +159,7 @@ check("1d. the line now reads verified, names the person, and is no longer confi
 const small = mk("City of Confirmbay", "4.0");
 const smallLine = permitLine(small.id);
 check("1e. MUST-EXCLUDE (V1): a 4 kW job's '5 KVA or less' $135 — the bracket nobody saw — stays seeded, names nobody, and is confirmable",
-  smallLine.feeUsd === 335 && smallLine.confidence === "seeded" && smallLine.verifiedBy === "" && smallLine.confirmable === true
+  smallLine.feeUsd === 375.2 && smallLine.confidence === "seeded" && smallLine.verifiedBy === "" && smallLine.confirmable === true
     && /not yet human-verified/.test(smallLine.basis) && !/\(human-verified|Jane/.test(smallLine.basis),
   JSON.stringify({ f: smallLine.feeUsd, c: smallLine.confidence, v: smallLine.verifiedBy, k: smallLine.confirmable, b: smallLine.basis.slice(0, 160) }));
 check("1f. …and what it would confirm is that bracket, beside the two items Jane already vouched for",
@@ -164,7 +167,7 @@ check("1f. …and what it would confirm is that bracket, beside the two items Ja
   JSON.stringify(smallLine.confirmRows));
 const sameBracket = permitLine(mk("City of Confirmbay", "12.0").id);
 check("1g. MUST-PASS: another job in the SAME bracket Jane saw ('5.01 KVA to 15 KVA' $160, 12 kW) reads verified",
-  sameBracket.feeUsd === 360 && sameBracket.confidence === "verified" && sameBracket.verifiedBy === "Jane Operator", JSON.stringify({ f: sameBracket.feeUsd, c: sameBracket.confidence }));
+  sameBracket.feeUsd === 403.2 && sameBracket.confidence === "verified" && sameBracket.verifiedBy === "Jane Operator", JSON.stringify({ f: sameBracket.feeUsd, c: sameBracket.confidence }));
 
 // 2 (second half): nothing-to-confirm refusals.
 const refused409 = (fn: () => unknown): number => { try { fn(); return 200; } catch (err) { return (err as { status?: number }).status ?? -1; } };
@@ -202,7 +205,7 @@ F.markFeeScheduleVerified(db, F.feeScheduleProfileKey({ state: "OR", ahj: "Whole
 const wholeSmall = permitLine(mk("Whole County", "4.0").id);
 const wholeBig = permitLine(mk("Whole County").id);
 check("3d. a row verified WHOLE by the script door reads verified on every bracket (4 kW $135 and 7.68 kW $160), and records no bracket",
-  wholeSmall.confidence === "verified" && wholeSmall.feeUsd === 135 && wholeBig.confidence === "verified" && wholeBig.feeUsd === 160 && verifs("Whole County").length === 0,
+  wholeSmall.confidence === "verified" && wholeSmall.feeUsd === 151.2 && wholeBig.confidence === "verified" && wholeBig.feeUsd === 179.2 && verifs("Whole County").length === 0,
   JSON.stringify([wholeSmall.confidence, wholeSmall.feeUsd, wholeBig.confidence, wholeBig.feeUsd]));
 check("3c. isConfirmingPerson: a name passes, placeholders do not",
   isConfirmingPerson("Jane Operator") && isConfirmingPerson("jo@solar.example") && !isConfirmingPerson("Admin") && !isConfirmingPerson("x"));
@@ -281,7 +284,7 @@ const tick = () => new Promise((r) => setTimeout(r, 5));
   const p = mk("City of Toctou");
   const seen = permitLine(p.id);
   check("6a. a confirmable line carries the rows behind its amount, with their versions (city structural, the pointer, the county electrical)",
-    seen.feeUsd === 360 && Array.isArray(seen.confirmRows) && seen.confirmRows.length === 3 && seen.confirmRows.every((r) => r.id && r.updatedAt),
+    seen.feeUsd === 403.2 && Array.isArray(seen.confirmRows) && seen.confirmRows.length === 3 && seen.confirmRows.every((r) => r.id && r.updatedAt),
     JSON.stringify(seen.confirmRows));
   const silent = statusOf(() => confirmPublishedFee(db, p, "permit", "Jane Operator", DEFAULT_ORG_ID, undefined as never));
   check("6b. a confirmation that does not say what was seen is refused (400) and writes nothing",
@@ -309,7 +312,7 @@ const tick = () => new Promise((r) => setTimeout(r, 5));
   }));
   const unseen = statusOf(() => confirmPublishedFee(db, p, "permit", "Jane Operator", DEFAULT_ORG_ID, seenOf(seen440)));
   check("6e. MUST-EXCLUDE: the same $440 but a row re-saved since the person looked (an unseen bracket moved) -> 409",
-    seen440.feeUsd === 440 && unseen.status === 409 && [...rows("Toctou County")].every((r) => r.confidence === "seeded") && verifs("Toctou County").length === 0, JSON.stringify({ f: seen440.feeUsd, unseen }));
+    seen440.feeUsd === 492.8 && unseen.status === 409 && [...rows("Toctou County")].every((r) => r.confidence === "seeded") && verifs("Toctou County").length === 0, JSON.stringify({ f: seen440.feeUsd, unseen }));
 
   // THE BRACKET IS PART OF WHAT WAS SEEN: the same amount and row versions, but the card said
   // another bracket (a doctored body, or a bracket that moved while the rows did not) -> 409.
@@ -324,12 +327,12 @@ const tick = () => new Promise((r) => setTimeout(r, 5));
   check("6f. MUST-PASS: the amount and row versions the person saw are the ones standing -> the three items they saw are recorded",
     ok.verified.length === 3 && verifs("City of Toctou", "Toctou County").length === 3 && verifs("City of Toctou", "Toctou County").every((v) => v.verified_by === "Jane Operator")
       && verifs("Toctou County")[0].bracket_label === "5.01 KVA to 15 KVA" && verifs("Toctou County")[0].fee_cents === 24000
-      && permitLine(p.id).feeUsd === 440 && permitLine(p.id).confidence === "verified",
+      && permitLine(p.id).feeUsd === 492.8 && permitLine(p.id).confidence === "verified",
     JSON.stringify(ok.verified));
   check("6g. a line that is not confirmable carries no rows to confirm", permitLine(p.id).confirmRows.length === 0);
   const toctouSmall = permitLine(mk("City of Toctou", "4.0").id);
   check("6i. MUST-EXCLUDE: the county's '5 KVA or less' $170 — on the same row, never on the card — stays seeded",
-    toctouSmall.feeUsd === 370 && toctouSmall.confidence === "seeded" && toctouSmall.confirmable === true, JSON.stringify({ f: toctouSmall.feeUsd, c: toctouSmall.confidence }));
+    toctouSmall.feeUsd === 414.4 && toctouSmall.confidence === "seeded" && toctouSmall.confirmable === true, JSON.stringify({ f: toctouSmall.feeUsd, c: toctouSmall.confidence }));
   const whitelisted = feeConfirmSeenFrom({ feeUsd: "440", scheduleRows: fresh.confirmRows.map((r) => ({ ...r, extra: "x" })) });
   check("6j. the body whitelist keeps each item's kind, bracket and amount (what the comparison reads), and drops the rest",
     !!whitelisted && whitelisted.scheduleRows.length === fresh.confirmRows.length

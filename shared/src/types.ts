@@ -581,6 +581,10 @@ export interface SubmissionPaymentQuote {
   permitFeeUsd: number | null;
   permitFeeSource: PermitFeeSource;
   permitFeeBasis: string;
+  /** permitFeeUsd is a FLOOR, not a total (#421): the published schedule priced some of this
+   *  filing's lines and not all of them, and the amount is their sum — "at least". Graded
+   *  "estimated"; the basis names what is left out. Absent/false on every other amount. */
+  permitFeeIsFloor?: boolean;
   /** The jurisdiction's own fee page, when a published schedule supplied or
    *  corroborated the number — so the operator can click through and check. */
   permitFeeSourceUrl: string | null;
@@ -693,6 +697,13 @@ export interface PublishedFeeResult {
   /** THE BILL, ITEMISED. See FeeChargeBreakdown. Absent/empty on a jurisdiction
    *  that publishes one permit line and nothing else, which is most of them. */
   charges?: FeeChargeBreakdown[];
+  /** THE FLOOR (#421): when feeUsd is null, the sum of the lines and charges the schedule DID
+   *  price for this filing — a lower bound, never a total. null/absent when nothing priced. The
+   *  quote shows it as "at least $X" instead of falling to the valuation heuristic, which is
+   *  allowed to read LOWER than lines the schedule had already priced. */
+  pricedSubtotalUsd?: number | null;
+  /** What that floor leaves out, by name (the unresolved permits and the unpriced charges). */
+  unpricedItems?: string[];
 }
 
 /** ONE CHARGE ON THIS FILING, PRICED — the presentation grain, not the storage one.
@@ -760,6 +771,8 @@ export interface ProjectFeeSheetLine {
    *  line, the AHJ's review on the local_review line. Absent otherwise. */
   issuerLabel?: string;
   feeUsd: number | null;
+  /** feeUsd is a lower bound ("at least"), not the fee — see SubmissionPaymentQuote.permitFeeIsFloor. */
+  feeIsFloor?: boolean;
   source: PermitFeeSource;
   basis: string;
   bracketLabel: string | null;

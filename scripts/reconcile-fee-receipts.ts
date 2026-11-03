@@ -3,8 +3,9 @@
 //   npx tsx scripts/reconcile-fee-receipts.ts [--db <path>] [--apply]
 //
 // Dry run (default) opens the database READ-ONLY — no migration, no write — and prints, per fee
-// schedule that has receipts at its jurisdiction, whether those receipts corroborate it, need the
-// 12% Oregon state surcharge the schedule does not hold, or contradict it outright.
+// schedule that has receipts at its jurisdiction, whether those receipts corroborate the total the
+// QUOTE produces from it (including the state surcharge the quote models where the schedule holds
+// none — #421; counted separately as "only with the modeled state surcharge"), or contradict it.
 //
 // --apply OPENS THE DATABASE THROUGH openDatabase(), WHICH RUNS PENDING MIGRATIONS (v33 llm_calls
 // included) before anything else — pointed at production, it moves the schema ahead of the server.
@@ -36,7 +37,11 @@ for (const r of report.results) {
 }
 const count = (v: string) => report.results.filter((r) => r.verdict === v).length;
 console.log(`\nschedules considered ${report.schedulesConsidered} (skipped: ${report.schedulesSkipped} conflicted/delegation/empty)`);
-console.log(`  with receipts ${report.results.length}: corroborated ${count("corroborated")}, missing surcharge ${count("corroborated_missing_surcharge")}, contradicted ${count("contradicted")}`);
+// "with modeled surcharge" = corroborated only by a total that includes the state surcharge the
+// QUOTE adds from the state rule because the schedule holds none (#421) — the old
+// "missing surcharge" verdict, now that the quote charges it.
+const withModeled = report.results.filter((r) => r.verdict === "corroborated" && !r.receipts.some((x) => x.explainedBy && !x.neededSurcharge)).length;
+console.log(`  with receipts ${report.results.length}: corroborated ${count("corroborated")} (of which ${withModeled} only with the modeled state surcharge), contradicted ${count("contradicted")}`);
 console.log(`  without receipts ${report.schedulesWithoutReceipts}`);
 console.log(`receipts read ${report.receiptsRead}; at a jurisdiction with no schedule ${report.receiptsWithoutSchedule}`);
 

@@ -331,7 +331,8 @@ async function main(): Promise<void> {
 
     const qLive = buildPaymentQuote(db, coos, "permit");
     check("INTEGRATION: a stored schedule reaches the ladder through the real module",
-      qLive.permitFeeSource === "published_schedule" && qLive.permitFeeUsd === 525,
+      // #421: $525.00 bracket + the 12% Oregon state surcharge the quote adds = $588.00.
+      qLive.permitFeeSource === "published_schedule" && qLive.permitFeeUsd === 588,
       `${qLive.permitFeeSource} ${qLive.permitFeeUsd}`);
     check("INTEGRATION: the 20 kW job bills the 15.01-25 kVA line, not the frozen 5.01-15",
       qLive.permitFeeBracketLabel === "Renewable energy for electrical systems- 15.01kva through 25kva",
@@ -340,7 +341,7 @@ async function main(): Promise<void> {
       qLive.permitFeeSourceUrl === "https://coosbay.example/fee-schedule" && qLive.permitFeeConfidence === "seeded");
     const liveSheet = buildProjectFeeSheet(db, coos);
     check("INTEGRATION: the sheet reports the permit line and chases the NEM one",
-      liveSheet.lines[0].feeUsd === 525 && liveSheet.totalUsd === null && liveSheet.unknowns.length === 1,
+      liveSheet.lines[0].feeUsd === 588 && liveSheet.totalUsd === null && liveSheet.unknowns.length === 1,
       `${liveSheet.lines[0].feeUsd} ${liveSheet.totalUsd}`);
   }
 
