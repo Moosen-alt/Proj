@@ -13,9 +13,11 @@
 //       writes blocked during the walk, two reads that disagree, no key, no draft id, a walk the
 //       navigator refuses before it opens anything (f6), fewer step pages opened than the recipe
 //       walks (f7, the page-count floor).
-//   (g) RULING 7, pinned: the cue and token patterns are exactly these; "Last saved 2:41 PM" and
-//       "Last saved 3:05 PM" read the same, but the name beside it, a control's value, and a time on
-//       a line with no cue all still count.
+//   (g) RULING 7, pinned (narrowly): the stamp / as-of / label patterns are exactly these; "Last
+//       saved 2:41 PM" and "Last saved 3:05 PM" read the same, "Autosaved" too; but the name beside
+//       it, a control's value, a time on a line with no cue, and a real date a cue does not introduce
+//       (skeptic round 3: "an updated diagram by 12/15/2026", "effective as of 01/01/2027", a row
+//       "Original system modified on | 03/01/2020") all still count.
 //   (h) MULTI-PAGE: one section per step, review first, steps in tab order; a change on step 2 alone
 //       changes the row's digest and that section's, and no other section's.
 //   (i) the key: same key + nonce → the same digest; another key → another keyId and digest; another
@@ -24,6 +26,13 @@
 //   (k) the recipe's page count (recipeAdapter.stagedReviewExpectedPages) reads the engine's one
 //       advancing-click predicate: a hand-patched "Next" with no "advance:" note is a page, so a
 //       review page with no step links is refused for it; the final submit and "Add New" are not pages.
+//   (l) skeptic round 3, blocker 2: a step link the ONE filing predicate (isSubmitOrPayRequestUrl)
+//       reads as a filing or payment is named and never opened; a filing-shaped review link is never
+//       reopened; a filing load the navigator blocked (a redirect hop, a refresh) is named.
+//   (m) skeptic round 3, blocker 4: the floor counts DISTINCT pages of THIS draft's form — two tabs
+//       landing on one page (m1), a tab landing on another draft or a login page (m2), another draft's
+//       link and the draft's own non-step tabs at another address (m3) never make up the count.
+//   (n) the scriptless reading against the person's window: a value only scripts show is named.
 //
 // KILL TESTS (run by hand, each turns this file red):
 //   K1 normalizedValue: return the raw value (no ruling-7 drop) → (g) fails.
@@ -35,13 +44,18 @@
 //   K10 walkStagedDraft: ignore nav.refusal() → (f6) fails (the refused walk opens the review page).
 //   K11 walkStagedDraft: drop the page-count floor → (f7) fails (1 of 3 step pages read, approvable).
 //   K9 stagedReviewExpectedPages: count only /^advance\b/ notes (the pre-fix heuristic) → (k) fails.
+//   K12 dropSelfChangingTimestamps: back to "any cue on the line drops every date" → (g) KEPT fails.
+//   K13 draftStepLinks: skip the isSubmitOrPayRequestUrl check → (l) fails (the walk opens Finish).
+//   K14 walkStagedDraft: count every opened link (no distinct / same-form check) → (m1), (m3) fail.
+//   K15 walkStagedDraft: skip the landed-on-this-draft check → (m2) fails.
+//   K16 walkStagedDraft: ignore the review link's filing shape → (l) fails (visited is not empty).
 //
 //   npx tsx portal-bot/src/reviewDigest.test.ts
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import {
-  buildStagedReviewCapture, DIGEST_MAX_BYTES, DIGEST_MAX_ROWS, dropSelfChangingTimestamps, finishDigestReading,
-  SELF_CHANGING_CUE, SELF_CHANGING_TOKEN, walkStagedDraft,
+  buildStagedReviewCapture, DIGEST_MAX_BYTES, DIGEST_MAX_ROWS, draftStepLinks, dropSelfChangingPairStamp, dropSelfChangingTimestamps, FILING_LINK_WHY, finishDigestReading,
+  SELF_CHANGING_AS_OF, SELF_CHANGING_LABEL, SELF_CHANGING_STAMP, SELF_CHANGING_WHOLE_STAMP, shownOnlyWithScripts, walkStagedDraft,
   type DigestKey, type DigestNavigator, type DigestPageItem, type DigestStepLink, type DigestWalk, type RawDigestReading,
 } from "./reviewDigest";
 
@@ -124,12 +138,14 @@ await check("(f1) over the cap, nothing read: refused by name (finishDigestReadi
 });
 
 /** A stub navigator over a fixed set of pages (by href). */
-const stubNav = (pages: Record<string, RawDigestReading | RawDigestReading[]>, links: DigestStepLink[], opts: { writes?: number; openFail?: Record<string, string> } = {}) => {
+const stubNav = (pages: Record<string, RawDigestReading | RawDigestReading[]>, links: DigestStepLink[], opts: { writes?: number; openFail?: Record<string, string>; landsOn?: Record<string, string>; filingLoads?: string[] } = {}) => {
   const reads: Record<string, number> = {};
   let at = REVIEW_URL;
+  /** Where a link lands (a redirect): the link itself unless `landsOn` says otherwise. */
+  const land = (href: string): string => opts.landsOn?.[href] ?? href;
   const nav: DigestNavigator & { visited: string[] } = {
     visited: [],
-    openReview: async () => { at = REVIEW_URL; nav.visited.push(at); return opts.openFail?.[REVIEW_URL] ?? ""; },
+    openReview: async () => { nav.visited.push(REVIEW_URL); at = land(REVIEW_URL); return opts.openFail?.[REVIEW_URL] ?? ""; },
     read: async () => {
       const p = pages[at];
       const n = reads[at] = (reads[at] ?? 0) + 1;
@@ -137,8 +153,10 @@ const stubNav = (pages: Record<string, RawDigestReading | RawDigestReading[]>, l
       return p ?? { title: "", url: at, items: [], unreadable: "the page reads nothing" };
     },
     stepLinks: async () => links,
-    openStep: async (l) => { at = l.href; nav.visited.push(at); return opts.openFail?.[l.href] ?? ""; },
+    openStep: async (l) => { nav.visited.push(l.href); at = land(l.href); return opts.openFail?.[l.href] ?? ""; },
+    landedUrl: () => at,
     writesBlocked: () => opts.writes ?? 0,
+    filingLoadsBlocked: () => opts.filingLoads ?? [],
     sleep: async () => undefined,
     close: async () => undefined,
   };
@@ -219,7 +237,7 @@ await check("(f7) the page-count floor: a recipe of 4 pages whose review page op
   const c = buildStagedReviewCapture({ walk: one, secrets: [], key: KEY, nonce: NONCE });
   assert.equal(c.approvable, false, "MUST-EXCLUDE: 1 of 3 step pages read and the row is approvable");
   assert.equal(c.digest, "");
-  assert.ok(c.why.some((w) => /the recipe walks 4 page\(s\) but only 1 step page\(s\) besides the review page could be opened by navigation alone/.test(w)), c.why.join(" | "));
+  assert.ok(c.why.some((w) => /the recipe walks 4 page\(s\) but only 1 distinct step page\(s\) of this draft's form \(the review page's own address, this draft's id\) besides the review page could be opened by navigation alone/.test(w)), c.why.join(" | "));
   // MUST PASS: as many step pages as the recipe walks (or more) is the floor met.
   const met = await walkStagedDraft(stubNav(pagesOf(), [link("Customer", S1), link("Equipment", S2)]), { reviewUrl: REVIEW_URL, gapMs: 0, expectedPages: 3 });
   assert.equal(buildStagedReviewCapture({ walk: met, secrets: [], key: KEY, nonce: NONCE }).approvable, true, "3 pages walked, 2 step pages + review read: refused");
@@ -230,7 +248,95 @@ await check("(f7) the page-count floor: a recipe of 4 pages whose review page op
   const cn = buildStagedReviewCapture({ walk: named, secrets: [], key: KEY, nonce: NONCE });
   assert.equal(cn.approvable, false);
   assert.ok(cn.why.some((w) => /step "Interconnection Request" cannot be opened by navigation alone \(its name or its link reads as an action/.test(w)), cn.why.join(" | "));
-  assert.ok(cn.why.some((w) => /the recipe walks 3 page\(s\) but only 1 step page/.test(w)), cn.why.join(" | "));
+  assert.ok(cn.why.some((w) => /the recipe walks 3 page\(s\) but only 1 distinct step page/.test(w)), cn.why.join(" | "));
+});
+
+// ── skeptic round 3, blocker 4: the floor counts DISTINCT pages of THIS draft's form ──────────────
+const S3 = "https://utility.powerclerk.example/MvcProjects/EditForm?ProjectId=4417&FormId=3";
+const OTHER = "https://utility.powerclerk.example/MvcProjects/EditForm?ProjectId=99999&FormId=1";
+const MESSAGES = "https://utility.powerclerk.example/MvcProjects/Messages?ProjectId=4417";
+const DOCUMENTS = "https://utility.powerclerk.example/MvcProjects/Documents?ProjectId=4417";
+
+await check("(m1) two step tabs that land on ONE page (a redirect) are one page: the floor is not met by them", async () => {
+  const nav = stubNav(pagesOf(), [link("Customer", S1), link("Equipment", S2)], { landsOn: { [S2]: S1 } });
+  const walk = await walkStagedDraft(nav, { reviewUrl: REVIEW_URL, gapMs: 0, expectedPages: 3 });
+  const c = buildStagedReviewCapture({ walk, secrets: [], key: KEY, nonce: NONCE });
+  assert.equal(walk.stepsRead, 1, "two links that landed on one page counted as two pages");
+  assert.equal(c.approvable, false, "MUST-EXCLUDE: the floor was met by one page read twice");
+  assert.ok(c.why.some((w) => /the recipe walks 3 page\(s\) but only 1 distinct step page/.test(w)), c.why.join(" | "));
+  // Every tab that redirects back to the review page: no step page at all.
+  const back = await walkStagedDraft(stubNav(pagesOf(), [link("Customer", S1), link("Equipment", S2)], { landsOn: { [S1]: REVIEW_URL, [S2]: REVIEW_URL } }), { reviewUrl: REVIEW_URL, gapMs: 0, expectedPages: 3 });
+  assert.equal(back.stepsRead, 0);
+  assert.equal(buildStagedReviewCapture({ walk: back, secrets: [], key: KEY, nonce: NONCE }).approvable, false);
+  // Two addresses that read exactly the same page are one page too.
+  const same = await walkStagedDraft(stubNav({ ...pagesOf(), [S2]: reading(STEP1, S2) }, [link("Customer", S1), link("Equipment", S2)]), { reviewUrl: REVIEW_URL, gapMs: 0, expectedPages: 3 });
+  assert.equal(same.stepsRead, 1, "two addresses with the same reading counted as two pages");
+});
+
+await check("(m2) a step tab that lands on another draft's page (or one with no id) is named, never counted", async () => {
+  const walk = await walkStagedDraft(stubNav({ ...pagesOf(), [OTHER]: reading(STEP2, OTHER) }, [link("Customer", S1), link("Equipment", S2)], { landsOn: { [S2]: OTHER } }), { reviewUrl: REVIEW_URL, gapMs: 0, expectedPages: 2 });
+  const c = buildStagedReviewCapture({ walk, secrets: [], key: KEY, nonce: NONCE });
+  assert.equal(c.approvable, false);
+  assert.ok(c.why.some((w) => /step "Equipment" did not open on this draft's page \(it landed on a page that does not carry this draft's id\)/.test(w)), c.why.join(" | "));
+  // The review link itself landing elsewhere (a login page) is refused before anything is read.
+  const login = "https://utility.powerclerk.example/MvcAccount/Login";
+  const r = await walkStagedDraft(stubNav(pagesOf(), [link("Customer", S1)], { landsOn: { [REVIEW_URL]: login } }), { reviewUrl: REVIEW_URL, gapMs: 0 });
+  const cr = buildStagedReviewCapture({ walk: r, secrets: [], key: KEY, nonce: NONCE });
+  assert.equal(cr.approvable, false);
+  assert.ok(cr.why.some((w) => /the review page did not open on this draft's page/.test(w)), cr.why.join(" | "));
+});
+
+await check("(m3) this draft's step links only: another draft's link is not a step; a page of the draft at another address is read but never counted", async () => {
+  const links = draftStepLinks([link("Customer", S1), link("Equipment", OTHER), { label: "Equipment", href: "", navigable: false, why: "it opens by a script" }, link("Messages", MESSAGES)], REVIEW_URL);
+  assert.deepEqual(links.map((l) => l.href), [S1, "", MESSAGES], "another draft's link was kept, or a scripted one dropped");
+  // The skeptic's navtabs: the real steps open by a script outside any step list, and the draft's
+  // Messages / Documents tabs (same draft id, another address) sit in a tabs bar. Before: approvable.
+  const nav = stubNav({ ...pagesOf(), [MESSAGES]: reading([f("Messages", "none")], MESSAGES), [DOCUMENTS]: reading([f("Documents", "none")], DOCUMENTS) }, [link("Messages", MESSAGES), link("Documents", DOCUMENTS)]);
+  const walk = await walkStagedDraft(nav, { reviewUrl: REVIEW_URL, gapMs: 0, expectedPages: 3 });
+  const c = buildStagedReviewCapture({ walk, secrets: [], key: KEY, nonce: NONCE });
+  assert.equal(walk.stepsRead, 0, "a page of the draft at another address counted as one of its form's steps");
+  assert.equal(c.approvable, false, "MUST-EXCLUDE: two non-step tabs of the draft met the floor");
+  assert.deepEqual(c.sections.map((s) => s.step), ["review", "Messages", "Documents"], "the other-address pages were not read (they are still compared)");
+});
+
+// ── skeptic round 3, blocker 2: one filing predicate on every link the walk opens ──────────────────
+await check("(l) a step link the filing predicate reads as a filing is named and never opened; a filing-shaped review link is never reopened; a blocked filing load is named", async () => {
+  const SUBMIT = "https://utility.powerclerk.example/P/SubmitProject?ProjectId=4417";
+  const nav = stubNav(pagesOf(), [link("Customer", S1), link("Finish", SUBMIT)]);
+  const walk = await walkStagedDraft(nav, { reviewUrl: REVIEW_URL, gapMs: 0 });
+  const c = buildStagedReviewCapture({ walk, secrets: [], key: KEY, nonce: NONCE });
+  assert.ok(!nav.visited.includes(SUBMIT), "the walk opened a filing-shaped link");
+  assert.equal(c.approvable, false);
+  assert.ok(c.why.some((w) => w.includes(`step "Finish" cannot be opened by navigation alone (${FILING_LINK_WHY})`)), c.why.join(" | "));
+  // The ONE predicate: a payment path too, and a percent-encoded one.
+  for (const href of ["https://utility.powerclerk.example/Payment/PayFees?ProjectId=4417", "https://utility.powerclerk.example/P/S%75bmitApplication?ProjectId=4417", "https://utility.powerclerk.example/P/CompleteApplication?ProjectId=4417"]) {
+    assert.equal(draftStepLinks([link("Next step", href)], REVIEW_URL)[0]?.navigable, false, href);
+  }
+  // A review link that itself reads as a filing is never opened at all.
+  const SUBMIT_REVIEW = "https://utility.powerclerk.example/P/ReviewAndSubmit?ProjectId=4417";
+  const nr = stubNav({ [SUBMIT_REVIEW]: reading(BASE, SUBMIT_REVIEW) }, []);
+  const wr = await walkStagedDraft(nr, { reviewUrl: SUBMIT_REVIEW, gapMs: 0 });
+  assert.deepEqual(nr.visited, [], "a filing-shaped review link was opened");
+  assert.ok(wr.reasons.some((w) => /the review page's own link reads as a filing or a payment/.test(w)), wr.reasons.join(" | "));
+  // The navigator's own block of a filing-shaped load (a redirect hop, a <meta refresh>) is named.
+  const wf = await walkStagedDraft(stubNav(pagesOf(), [link("Customer", S1)], { filingLoads: ["https://utility.powerclerk.example/P/SubmitProject"] }), { reviewUrl: REVIEW_URL, gapMs: 0 });
+  const cf = buildStagedReviewCapture({ walk: wf, secrets: [], key: KEY, nonce: NONCE });
+  assert.equal(cf.approvable, false);
+  assert.ok(cf.why.some((w) => /the walk blocked 1 page load\(s\) whose link reads as a filing or a payment/.test(w)), cf.why.join(" | "));
+});
+
+// ── the scriptless reading against the person's window (the review page) ─────────────────────────
+await check("(n) shownOnlyWithScripts: a value only the scripts show is named; text lines are not compared; the same reading names nothing", () => {
+  const off = reading([f("System Size (kW DC)", ""), { kind: "pair", label: "Customer", value: "Avery Fenwick" }, { kind: "line", label: "", value: "Review" }]);
+  const on = reading([f("System Size (kW DC)", "7.2"), { kind: "pair", label: "Customer", value: "Avery Fenwick" }, { kind: "line", label: "", value: "Chat with us" }]);
+  assert.deepEqual(shownOnlyWithScripts(on, off), ["System Size (kW DC)"]);
+  assert.deepEqual(shownOnlyWithScripts(off, off), []);
+  // A self-changing stamp is ignored on both sides (ruling 7).
+  const a = reading([{ kind: "pair", label: "Last Updated", value: "11/03/2026 2:41 PM" }]);
+  const b = reading([{ kind: "pair", label: "Last Updated", value: "11/03/2026 2:44 PM" }]);
+  assert.deepEqual(shownOnlyWithScripts(a, b), []);
+  // Counted: two same-labelled rows on the window, one in the scriptless reading.
+  assert.deepEqual(shownOnlyWithScripts(reading([f("Name", "Pat"), f("Name", "Pat")]), reading([f("Name", "Pat")])), ["Name"]);
 });
 
 await check("(f5) ruling 3: an uploaded file the draft's pages list is 'listed'; one they do not list is named and the row is not approvable", () => {
@@ -253,40 +359,88 @@ await check("(f4) refused by name: no key (nothing hashed), and no draft id in t
   assert.ok(c2.why.some((w) => /carries no draft id/.test(w)));
 });
 
-await check("(g) ruling 7, pinned: the exact cue and token patterns", () => {
-  assert.equal(SELF_CHANGING_CUE.source, "\\b(?:saved|updated|modified|edited)\\b|\\bas\\s+of\\b");
-  assert.equal(SELF_CHANGING_CUE.flags, "i");
-  assert.equal(SELF_CHANGING_TOKEN.flags, "gi");
-  assert.equal(SELF_CHANGING_TOKEN.source,
-    "\\b(?:\\d{4}-\\d{2}-\\d{2}(?:[T ]\\d{1,2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:?\\d{2})?)?"
-    + "|\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{2,4}"
-    + "|(?:(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun),?\\s+)?(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,?\\s+\\d{4})?"
-    + "|(?:(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun),?\\s+)?\\d{1,2}(?:st|nd|rd|th)?\\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\\.?(?:,?\\s+\\d{4})?"
-    + "|\\d{1,2}:\\d{2}(?::\\d{2})?(?:\\s*[ap]\\.?\\s?m\\.?)?"
-    + "|\\d{1,2}\\s*[ap]\\.?\\s?m\\.?)(?![\\w/:])");
-  // The token forms it drops on a cue line.
+await check("(g) ruling 7, pinned: the exact stamp, as-of, label and whole-stamp patterns (narrowly: only the stamp a cue introduces)", () => {
+  // The pieces, written out here so any change to the module's patterns turns this red.
+  const W = "(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun)";
+  const M = "(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)";
+  const ISO = "\\d{4}-\\d{2}-\\d{2}(?:[T ]\\d{1,2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:?\\d{2})?)?";
+  const ISO_T = "\\d{4}-\\d{2}-\\d{2}[T ]\\d{1,2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:?\\d{2})?";
+  const NUM = "\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{2,4}";
+  const MD = `(?:${W},?\\s+)?${M}\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,?\\s+\\d{4})?`;
+  const DM = `(?:${W},?\\s+)?\\d{1,2}(?:st|nd|rd|th)?\\s+${M}\\.?(?:,?\\s+\\d{4})?`;
+  const CLK = "\\d{1,2}:\\d{2}(?::\\d{2})?(?:\\s*[ap]\\.?\\s?m\\.?)?";
+  const HR = "\\d{1,2}\\s*[ap]\\.?\\s?m\\.?";
+  const PART = `(?:${ISO}|${NUM}|${MD}|${DM}|${CLK}|${HR})`;
+  const JOIN = "(?:\\s*(?:,|\\bat\\b|@)\\s*|\\s+)";
+  const STAMP = `${PART}(?:${JOIN}${PART})*`;
+  const CUE = "(?:saved|updated|modified|edited)";
+  assert.equal(SELF_CHANGING_STAMP.flags, "gi");
+  assert.equal(SELF_CHANGING_STAMP.source,
+    `((?:\\bauto-?saved|(?:^|\\blast\\s+|\\b(?:draft|changes?)\\s+(?:(?:was|were)\\s+)?)${CUE})\\b(?:\\s+(?:on|at)\\b)?\\s*[:\\-\\u2013]?\\s*)(${STAMP})(?![\\w/:])`);
+  assert.equal(SELF_CHANGING_AS_OF.flags, "gi");
+  assert.equal(SELF_CHANGING_AS_OF.source, `(\\bas\\s+of\\s*:?\\s*)((?:${ISO_T}|(?:(?:${NUM}|${MD}|${DM})${JOIN})?(?:${CLK}|${HR})))(?![\\w/:])`);
+  assert.equal(SELF_CHANGING_LABEL.flags, "i");
+  assert.equal(SELF_CHANGING_LABEL.source, `^(?:(?:date|time)\\s+)?(?:last\\s+)?(?:auto-?)?${CUE}(?:\\s+(?:on|at|date|time|date\\s*\\/\\s*time))?\\s*:?$|^as\\s+of\\s*:?$`);
+  assert.equal(SELF_CHANGING_WHOLE_STAMP.source, `^${STAMP}$`);
+  // DROPPED: the stamp a cue introduces, and only it.
   for (const [line, want] of [
     ["Last saved 2:41 PM", "Last saved ⟨time⟩"],
-    ["Updated 11/03/2026 at 14:41:05", "Updated ⟨time⟩ at ⟨time⟩"],
+    ["Updated 11/03/2026 at 14:41:05", "Updated ⟨time⟩"],
     ["Modified 2026-11-03T14:41:05Z", "Modified ⟨time⟩"],
-    ["As of Monday, November 3, 2026 2:41 p.m.", "As of ⟨time⟩ ⟨time⟩"],
+    ["As of Monday, November 3, 2026 2:41 p.m.", "As of ⟨time⟩"],
     ["Last edited 3 Nov 2026", "Last edited ⟨time⟩"],
     ["Draft saved at 9am", "Draft saved at ⟨time⟩"],
+    ["Autosaved 2:41 PM", "Autosaved ⟨time⟩"],
+    ["Changes saved at 2:41:05 PM", "Changes saved at ⟨time⟩"],
+    ["Last updated: Nov 3, 2026 at 2:41 PM", "Last updated: ⟨time⟩"],
+    ["Data as of 2:41 PM", "Data as of ⟨time⟩"],
+    ["Last saved 2:41 PM by Alice", "Last saved ⟨time⟩ by Alice"],
+    // The skeptic's line: the in-service date beside the stamp still counts.
+    ["Estimated in-service date: 12/01/2026 (last saved 2:41 PM)", "Estimated in-service date: 12/01/2026 (last saved ⟨time⟩)"],
   ] as const) assert.equal(dropSelfChangingTimestamps(line), want, line);
-  // NOT dropped: no cue on the line; a number that is no time or date.
-  assert.equal(dropSelfChangingTimestamps("Total 2:41"), "Total 2:41");
-  assert.equal(dropSelfChangingTimestamps("Install date 11/03/2026"), "Install date 11/03/2026");
-  assert.equal(dropSelfChangingTimestamps("System size updated to 7.2 kW"), "System size updated to 7.2 kW");
+  // KEPT (skeptic round 3: each lost a real date before): a cue that does not introduce the date, an
+  // effective date "as of" with no clock, no cue at all, a number that is no time or date.
+  for (const line of [
+    "Please upload an updated single-line diagram by 12/15/2026",
+    "Interconnection effective as of 01/01/2027",
+    "Edited by installer on Nov 3, 2026",
+    "Original system modified on 03/01/2020",
+    "Main panel 200 A, updated 40 Amps",
+    "Total 2:41",
+    "Install date 11/03/2026",
+    "System size updated to 7.2 kW",
+  ]) assert.equal(dropSelfChangingTimestamps(line), line, line);
+  // A pair / row: only when the LABEL is the stamp's name and the value wholly a stamp.
+  for (const [label, value, want] of [
+    ["Last Updated", "11/03/2026", "⟨time⟩"], ["Date Modified", "Nov 3, 2026 2:41 PM", "⟨time⟩"], ["Updated:", "2:41 PM", "⟨time⟩"], ["As of", "11/03/2026 2:41 PM", "⟨time⟩"],
+    ["As of", "01/01/2027", "01/01/2027"], ["Date existing system was modified", "03/01/2020", "03/01/2020"], ["Original system modified on", "03/01/2020", "03/01/2020"], ["Last Updated", "11/03/2026 by Pat", "11/03/2026 by Pat"],
+  ] as const) assert.equal(dropSelfChangingPairStamp(label, value), want, `${label} | ${value}`);
 });
 
-await check("(g) ruling 7 in the digest: the ignored token reads the same; the real change beside it still counts", () => {
+await check("(g) ruling 7 in the digest: the ignored stamp reads the same; the real date or change beside it still counts", () => {
   const at = (line: string, extra: DigestPageItem[] = []) => digestOf([...BASE, { kind: "line", label: "", value: line }, ...extra]);
   assert.equal(at("Last saved 2:41 PM"), at("Last saved 3:05 PM"), "MUST PASS: a self-changing 'last saved' time refused the page");
+  assert.equal(at("Autosaved 2:41 PM"), at("Autosaved 3:05 PM"), "MUST PASS: an 'Autosaved' time refused the page");
   assert.notEqual(at("Last saved 2:41 PM by Alice"), at("Last saved 3:05 PM by Bob"), "the name beside the dropped time went unseen");
   assert.notEqual(at("Total 2:41"), at("Total 3:05"), "a time on a line with no cue was dropped");
-  // A <dl> pair whose LABEL carries the cue drops the date in its value...
-  const pair = (v: string) => digestOf([...BASE, { kind: "pair", label: "Last Updated", value: v }]);
-  assert.equal(pair("11/03/2026"), pair("11/04/2026"));
+  // The skeptic's lines: a real date next to a cue word is a change.
+  assert.notEqual(at("Please upload an updated single-line diagram by 12/15/2026"), at("Please upload an updated single-line diagram by 01/15/2027"), "a deadline beside 'updated' was dropped");
+  assert.notEqual(at("Interconnection effective as of 01/01/2027"), at("Interconnection effective as of 02/01/2027"), "an effective date 'as of' was dropped");
+  assert.notEqual(at("Estimated in-service date: 12/01/2026 (last saved 2:41 PM)"), at("Estimated in-service date: 12/09/2026 (last saved 2:41 PM)"), "the in-service date beside the stamp was dropped");
+  // A <dl> pair / table row whose LABEL is the stamp's name drops it...
+  const pair = (kind: "pair" | "row", label: string, v: string) => digestOf([...BASE, { kind, label, value: v }]);
+  assert.equal(pair("pair", "Last Updated", "11/03/2026"), pair("pair", "Last Updated", "11/04/2026"));
+  assert.equal(pair("row", "Last Modified", "11/03/2026 2:41 PM"), pair("row", "Last Modified", "11/04/2026 9:02 AM"));
+  // ...but a label that only MENTIONS a change keeps its date (the skeptic's row and pair).
+  assert.notEqual(pair("row", "Original system modified on", "03/01/2020"), pair("row", "Original system modified on", "04/02/2021"), "a row's real date was dropped");
+  assert.notEqual(pair("pair", "Date existing system was modified", "03/01/2020"), pair("pair", "Date existing system was modified", "04/02/2021"), "a pair's real date was dropped");
+  // The row's own text line ("Original system modified on 03/01/2020") counts too.
+  const rowAndLine = (v: string) => digestOf([...BASE, { kind: "row", label: "Original system modified on", value: v }, { kind: "line", label: "", value: `Original system modified on ${v}` }]);
+  assert.notEqual(rowAndLine("03/01/2020"), rowAndLine("04/02/2021"));
+  // A <dl>'s two lines: "Last Updated" then its stamp → dropped; any other line before it → kept.
+  const twoLines = (first: string, v: string) => digestOf([...BASE, { kind: "line", label: "", value: first }, { kind: "line", label: "", value: v }]);
+  assert.equal(twoLines("Last Updated", "11/03/2026"), twoLines("Last Updated", "11/04/2026"));
+  assert.notEqual(twoLines("Install date", "11/03/2026"), twoLines("Install date", "11/04/2026"));
   // ...a control's value never: "Date updated" on a box is an answer the person files.
   const box = (v: string) => digestOf([...BASE, f("Date panel updated", v)]);
   assert.notEqual(box("11/03/2026"), box("11/04/2026"), "a control's date value was dropped by ruling 7");
@@ -305,10 +459,11 @@ await check("(h) multi-page: one section per step (review first, then tab order)
   assert.equal(c2.sections[0].digest, c.sections[0].digest, "the review section changed");
   assert.equal(c2.sections[1].digest, c.sections[1].digest, "step 1 changed");
   assert.notEqual(c2.sections[2].digest, c.sections[2].digest, "step 2's section did not change");
-  // Each page is read twice, and nothing but the step links is opened.
+  // Each page is LOADED twice (two loads, not two looks: the walk page runs no script), and nothing
+  // but the review link and the step links is opened.
   const nav = stubNav(pagesOf(), [link("Customer", S1), link("Equipment", S2)]);
   await walkStagedDraft(nav, { reviewUrl: REVIEW_URL, gapMs: 0 });
-  assert.deepEqual(nav.visited, [REVIEW_URL, S1, S2]);
+  assert.deepEqual(nav.visited, [REVIEW_URL, REVIEW_URL, S1, S1, S2, S2]);
 });
 
 await check("(i) the key: same key and nonce give the same digest; another key or nonce share nothing", () => {

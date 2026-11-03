@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep, StagedReviewCapture } from "../../../shared/src/types";
-import { buildStagedReviewCapture, countRecordedControl, openPlaywrightDigestNavigator, unapprovableStagedReview, walkStagedDraft } from "../reviewDigest";
+import { buildStagedReviewCapture, countRecordedControl, openPlaywrightDigestNavigator, readDigestPage, shownOnlyWithScripts, unapprovableStagedReview, walkStagedDraft } from "../reviewDigest";
 import { maskedFullPageScreenshot } from "../secretMask";
 import { stagedReviewShotsDir } from "../../../backend/src/statePaths";
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, ok, fail, type PortalContext, type PortalStepResult } from "../adapter";
@@ -3738,8 +3738,15 @@ export class RecipeAdapter extends BasePortalAdapter {
     // a separate page of this context (reviewDigest.ts): this window — the one a person submits in —
     // is never navigated, and nothing here writes. Any failure is an unapprovable capture, never a
     // failed or paused Stage.
+    // UNDER THE READ-ONLY LOCK (skeptic round 3): the run locks the review page HERE, before the walk,
+    // not after it — the backstop's sticky review lockdown aborts every state-changing request from
+    // every page of the context (the walk page's among them) for the whole walk. It is the lock
+    // lockReview below sets anyway (sticky: the later call keeps this reason); nothing the run writes
+    // comes after this point; and a person's own input after the hand-over still lifts it exactly as
+    // before (#333).
     if (this.options.stagedReview && !this.options.autoSubmit && !pastReview && !this.finalSubmitClicked && !this.stoppedAtPayment) {
       await this.drainBeforeReviewLock();
+      this.backstop?.lockReview(`replay stopped at review, reading the staged draft (${this.recipe.id})`);
       const cfg = this.options.stagedReview;
       this.stagedReviewCapture = await this.captureStagedReview(cfg).catch((e) =>
         unapprovableStagedReview(`the staged review could not be read (${String((e as { message?: string })?.message ?? e).replace(/\s+/g, " ").slice(0, 80)})`, this.pageUrlNoHash()));
@@ -3907,13 +3914,17 @@ export class RecipeAdapter extends BasePortalAdapter {
   }
 
   /** #436 PR1 — READ THE STAGED DRAFT FOR ITS REVIEW DIGEST (reviewDigest.ts is the one reader). A walk
-   *  page of this context reopens the review page by its link (a GET), reads it twice, checks it reads
-   *  as review with exactly one recorded final submit (not inside a frame), takes the MASKED picture
-   *  of it, then opens every step tab by its link and reads each twice. `this.page` is never touched. */
+   *  page of this context — scriptless, its every request judged — loads the review page by its link
+   *  (a GET) twice and reads each load, checks it reads as review with exactly one recorded final
+   *  submit (not inside a frame) and that the run's own window (scripts on) shows nothing the
+   *  scriptless reading lacks, takes the MASKED picture of it, then loads every step tab of this draft
+   *  by its link twice and reads each. `this.page` is never navigated, clicked or written: it is only
+   *  read. Runs only under the run's review lock (the caller sets it). */
   private async captureStagedReview(cfg: { secrets: string[]; gapMs?: number }): Promise<StagedReviewCapture> {
     const page = this.page;
     if (!page || typeof page.context !== "function" || typeof page.url !== "function") return unapprovableStagedReview("no browser page to read the staged draft from");
     const reviewUrl = String(page.url() ?? "");
+    if (!this.backstop) return unapprovableStagedReview("the run has no network backstop, so the staged draft's pages were not read (the walk runs only under the review lock)", reviewUrl);
     const secrets = Array.from(new Set([...(cfg.secrets ?? []), String(this.fieldValues.accountNumber ?? ""), String(this.fieldValues.meterNumber ?? "")]
       .map((s) => String(s ?? "").trim()).filter((s) => s.length >= 4)));
     const terminal = (this.recipe.steps ?? []).filter((s) => isFinalSubmitStep(s));
@@ -3926,9 +3937,19 @@ export class RecipeAdapter extends BasePortalAdapter {
     const nav = await openPlaywrightDigestNavigator(page, reviewUrl);
     const walk = await walkStagedDraft(nav, {
       reviewUrl, gapMs: cfg.gapMs, expectedPages,
-      atReview: async () => {
+      atReview: async (scriptless) => {
         const reasons: string[] = [];
         const wp = nav.page;
+        // THE WALK RUNS NO SCRIPT, SO A VALUE ONLY A SCRIPT FILLS READS EMPTY THERE (on both loads, and
+        // an edit to it would never be seen): the review page in this run's own window — scripts on,
+        // only read — must show no control, pair or row the scriptless reading lacks. A window that
+        // cannot be read is a refusal too: the check could not be made.
+        const withScripts = await readDigestPage(page);
+        if (withScripts.unreadable) reasons.push(`the review page in the run's window could not be read to check the walk's scriptless reading (${withScripts.unreadable})`);
+        else {
+          const only = shownOnlyWithScripts(withScripts, scriptless);
+          if (only.length) reasons.push(`the review page shows ${only.length} value(s) only while the portal's scripts run (${only.slice(0, 3).join(", ")}${only.length > 3 ? ", ..." : ""}), so the draft's pages cannot be read with its scripts off`);
+        }
         await wp.evaluate(PORTAL_SAFETY_IN_PAGE_SOURCE).catch(() => null);
         const t = await wp.evaluate((g: string) => {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any

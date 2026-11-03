@@ -18,24 +18,37 @@
 //   excluded by id or class name: only <header>, <nav> and <footer> are skipped, by tag, and only
 //   when they hold no control and no label/value row.
 // NORMALIZATION: whitespace collapsed; case kept; no NFKC. Repeated labels are counted by ordinal and
-//   order is part of the digest. RULING 7 (owner 2026-11-03, "ignore it, don't refuse"): in a text
-//   line, <dl> pair or table row that ALSO carries a saved / updated / modified / edited / as-of cue
-//   (SELF_CHANGING_CUE), clock-time and date tokens (SELF_CHANGING_TOKEN) are dropped; every other
-//   character of that line still counts. A control's value is never touched by it.
+//   order is part of the digest. RULING 7 (owner 2026-11-03, "ignore it, don't refuse"), NARROWLY: in
+//   a text line, <dl> pair or table row, only the date / clock-time stamp a saved / updated / modified
+//   / edited / as-of cue INTRODUCES is dropped ("Last saved 2:41 PM", "Autosaved 2:41 PM", "Data as of
+//   2:41 PM", a "Last Modified" row) — SELF_CHANGING_STAMP / _AS_OF / _LABEL, pinned in the test; a
+//   date the cue does not introduce ("an updated diagram by 12/15/2026", "effective as of
+//   01/01/2027", "system modified on 03/01/2020") and every other character still count. A control's
+//   value is never touched by it.
 // UNREADABLE, BY NAME, NEVER HASHED: the read throws or reads nothing; more than 400 rows or 64 KB;
-//   a dialog is open; a visible cross-origin frame; a CLOSED shadow root on the page (found through
-//   DevTools — a page script cannot see into one), or no way to check for one; the two reads
-//   (DIGEST_READ_GAP_MS apart) disagree.
+//   a dialog is open; a visible cross-origin frame (or one the walk blocked); a CLOSED shadow root on
+//   the page (found through DevTools — a page script cannot see into one), or no way to check for
+//   one; the two loads (DIGEST_READ_GAP_MS apart) disagree.
 //   The adapter adds the page-level ones: the page does not read as review, the terminal control is
-//   not exactly one or sits in a frame, no draft id.
+//   not exactly one or sits in a frame, no draft id, a value the review page shows only with its
+//   scripts on.
 // MULTI-PAGE (owner ruling 2): the draft's step pages are walked READ-ONLY in a separate page of the
 //   run's context — never the window a person submits in — by their step tabs/links only (a GET),
-//   never Next / Save / Submit or anything that autosaves. The walk page aborts and counts every
-//   request that is not a GET (its own read-only lock; the context's network backstop still judges
-//   each GET). A step that cannot be opened by a plain link is named, and the row is unapprovable:
-//   a step link the walk will not open (its name or path reads as an action, it opens by a script,
-//   it has no name) is NAMED, never dropped; and a walk that opened fewer step pages than the recipe
-//   walks (stepsRead + 1 < expectedPages) is refused by that count (the page-count floor).
+//   never Next / Save / Submit or anything that autosaves, while the run is under its review lock
+//   (the adapter locks the backstop first). THE WALK PAGE RUNS NO SCRIPT (openPlaywrightDigestNavigator):
+//   nothing on it can send a beacon, a keepalive fetch, an autosave or a WebSocket frame; no service
+//   worker answers it; and every request it makes — each redirect hop and refresh — is judged before
+//   it is sent (not a GET, a filing- or payment-shaped link, another site's document: aborted). Each
+//   page is LOADED twice (two loads, not two looks at one static document), and each load must land
+//   on a page carrying this draft's id. A step that cannot be opened by a plain link is named, and
+//   the row is unapprovable: a step link the walk will not open (its name or path reads as an
+//   action, the one filing predicate reads its link as a filing, it opens by a script, it has no
+//   name) is NAMED, never dropped; and a walk that read fewer DISTINCT pages of this draft than the
+//   recipe walks (stepsRead + 1 < expectedPages) is refused by that count (the page-count floor).
+//   Because the walk runs no script, the adapter also reads the review page in the run's own window
+//   (scripts on) and refuses a reading that misses a value only scripts show (shownOnlyWithScripts).
+//   RESIDUAL, stated: a STEP page cannot be checked that way without running its scripts; the review
+//   page is the portal-level signal (the pre-PR2 live capture is where a real portal answers it).
 //   walkStagedDraft takes a DigestNavigator, so a test stubs the whole walk.
 // RULE 2: raw values reach Node only to be HMACed here (stagedReviewDigestKey: a scrypt subkey of
 //   SESSION_ENCRYPTION_KEY, and the row's own nonce), then dropped. Labels and display values pass
@@ -46,7 +59,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
 import type { CDPSession, Locator, Page } from "playwright";
-import { redactSecretValues } from "../../shared/src/portalSafety";
+import { isSubmitOrPayRequestUrl, redactSecretValues } from "../../shared/src/portalSafety";
 import type {
   RecipeSelector, StagedReviewAttachment, StagedReviewCapture, StagedReviewFieldReportRow, StagedReviewItem, StagedReviewItemKind, StagedReviewSection,
 } from "../../shared/src/types";
@@ -72,26 +85,65 @@ const LABEL_MAX = 80;
 // RULING 7 — self-changing timestamps. PINNED in reviewDigest.test.ts; the PR lists this pattern.
 // ---------------------------------------------------------------------------------------------
 
-/** The cue: a line that says when the page was last saved / updated / modified / edited, or "as of". */
-export const SELF_CHANGING_CUE = /\b(?:saved|updated|modified|edited)\b|\bas\s+of\b/i;
+// NARROWLY (skeptic round 3): a cue word anywhere on the line once dropped EVERY date on it, so "Please
+// upload an updated single-line diagram by 12/15/2026", "Interconnection effective as of 01/01/2027"
+// and a row "Original system modified on | 03/01/2020" lost a real date, and "Autosaved 2:41 PM" was
+// not normalized at all. Now only the stamp the cue INTRODUCES is dropped:
+//   - SELF_CHANGING_STAMP: "Last saved / updated / modified / edited", "Draft saved", "Changes saved",
+//     "Autosaved" anywhere, or the cue word opening the line ("Saved 2:41 PM", "Updated: 11/03/2026");
+//     then an optional "on" / "at" / ":" / "-"; then the stamp (dates and clock times, joined by
+//     ",", "at" or "@"). "Edited by installer on Nov 3, 2026" keeps its date (a name comes between).
+//   - SELF_CHANGING_AS_OF: "as of" only with a stamp that carries a CLOCK time ("Data as of 2:41 PM");
+//     "as of 01/01/2027" is an effective date and still counts.
+//   - SELF_CHANGING_LABEL: a <dl> pair or table row whose LABEL is the stamp's name ("Last Modified",
+//     "Date Modified", "Updated:") and whose value is wholly a stamp; and a text line that is wholly a
+//     stamp right after a line that is such a name (a <dl> renders its dt and dd on two lines).
+// Every other character of the line counts. A control's value is never touched.
 const MONTH = "(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)";
 const WEEKDAY = "(?:monday|tuesday|wednesday|thursday|friday|saturday|sunday|mon|tues?|wed|thu(?:rs?)?|fri|sat|sun)";
 const ISO_DATE = "\\d{4}-\\d{2}-\\d{2}(?:[T ]\\d{1,2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:?\\d{2})?)?";
+const ISO_DATE_TIME = "\\d{4}-\\d{2}-\\d{2}[T ]\\d{1,2}:\\d{2}(?::\\d{2}(?:\\.\\d+)?)?(?:Z|[+-]\\d{2}:?\\d{2})?";
 const NUMERIC_DATE = "\\d{1,2}[/.-]\\d{1,2}[/.-]\\d{2,4}";
 const MONTH_DATE = `(?:${WEEKDAY},?\\s+)?${MONTH}\\.?\\s+\\d{1,2}(?:st|nd|rd|th)?(?:,?\\s+\\d{4})?`;
 const DAY_MONTH = `(?:${WEEKDAY},?\\s+)?\\d{1,2}(?:st|nd|rd|th)?\\s+${MONTH}\\.?(?:,?\\s+\\d{4})?`;
 const CLOCK = "\\d{1,2}:\\d{2}(?::\\d{2})?(?:\\s*[ap]\\.?\\s?m\\.?)?";
 const HOUR_AMPM = "\\d{1,2}\\s*[ap]\\.?\\s?m\\.?";
-/** The tokens dropped from a cue line: clock times and dates, nothing else. */
-export const SELF_CHANGING_TOKEN = new RegExp(`\\b(?:${ISO_DATE}|${NUMERIC_DATE}|${MONTH_DATE}|${DAY_MONTH}|${CLOCK}|${HOUR_AMPM})(?![\\w/:])`, "gi");
-/** What a dropped token becomes (so "saved ⟨time⟩" still differs from "saved"). */
+const STAMP_PART = `(?:${ISO_DATE}|${NUMERIC_DATE}|${MONTH_DATE}|${DAY_MONTH}|${CLOCK}|${HOUR_AMPM})`;
+const STAMP_JOIN = "(?:\\s*(?:,|\\bat\\b|@)\\s*|\\s+)";
+/** One stamp: dates and clock times, nothing else ("11/03/2026 2:41 PM", "Nov 3, 2026 at 2:41 PM"). */
+const STAMP = `${STAMP_PART}(?:${STAMP_JOIN}${STAMP_PART})*`;
+/** A stamp that carries a clock time (what "as of" needs to be self-changing). */
+const CLOCK_STAMP = `(?:${ISO_DATE_TIME}|(?:(?:${NUMERIC_DATE}|${MONTH_DATE}|${DAY_MONTH})${STAMP_JOIN})?(?:${CLOCK}|${HOUR_AMPM}))`;
+const CUE_WORD = "(?:saved|updated|modified|edited)";
+const STAMP_END = "(?![\\w/:])";
+/** The cue that INTRODUCES a stamp, then the separator; the stamp itself is the last group. */
+export const SELF_CHANGING_STAMP = new RegExp(
+  `((?:\\bauto-?saved|(?:^|\\blast\\s+|\\b(?:draft|changes?)\\s+(?:(?:was|were)\\s+)?)${CUE_WORD})\\b(?:\\s+(?:on|at)\\b)?\\s*[:\\-\\u2013]?\\s*)(${STAMP})${STAMP_END}`, "gi");
+/** "as of" + a stamp carrying a clock time. */
+export const SELF_CHANGING_AS_OF = new RegExp(`(\\bas\\s+of\\s*:?\\s*)(${CLOCK_STAMP})${STAMP_END}`, "gi");
+/** A label that is a stamp's name ("Last Modified", "Date Modified", "Updated:", "Last Saved Date"). */
+export const SELF_CHANGING_LABEL = new RegExp(
+  `^(?:(?:date|time)\\s+)?(?:last\\s+)?(?:auto-?)?${CUE_WORD}(?:\\s+(?:on|at|date|time|date\\s*/\\s*time))?\\s*:?$|^as\\s+of\\s*:?$`, "i");
+/** A value that is wholly one stamp. */
+export const SELF_CHANGING_WHOLE_STAMP = new RegExp(`^${STAMP}$`, "i");
+/** What a dropped stamp becomes (so "saved ⟨time⟩" still differs from "saved"). */
 export const SELF_CHANGING_PLACEHOLDER = "\u27e8time\u27e9";
 
-/** Ruling 7, applied to one line: unchanged unless the line carries the cue. */
+/** Ruling 7, applied to one line: only the stamp a saved / updated / modified / edited / as-of cue
+ *  introduces is dropped; the line is otherwise unchanged. */
 export function dropSelfChangingTimestamps(line: string): string {
-  const s = String(line ?? "");
-  if (!SELF_CHANGING_CUE.test(s)) return s;
-  return s.replace(SELF_CHANGING_TOKEN, SELF_CHANGING_PLACEHOLDER);
+  return String(line ?? "")
+    .replace(SELF_CHANGING_STAMP, (_m, cue: string) => `${cue}${SELF_CHANGING_PLACEHOLDER}`)
+    .replace(SELF_CHANGING_AS_OF, (_m, cue: string) => `${cue}${SELF_CHANGING_PLACEHOLDER}`);
+}
+
+/** Ruling 7 for a label / value pair (a <dl> pair, a table row): the label is a stamp's name and the
+ *  value is wholly a stamp → the placeholder; otherwise the value as one line. */
+export function dropSelfChangingPairStamp(label: string, value: string): string {
+  const l = normalizeDigestText(label);
+  const v = normalizeDigestText(value);
+  if (SELF_CHANGING_LABEL.test(l) && SELF_CHANGING_WHOLE_STAMP.test(v) && (!/^as\s+of/i.test(l) || new RegExp(`^${CLOCK_STAMP}$`, "i").test(v))) return SELF_CHANGING_PLACEHOLDER;
+  return dropSelfChangingTimestamps(v);
 }
 
 /** Whitespace collapsed and trimmed; case kept; no NFKC. */
@@ -408,7 +460,7 @@ export async function closedShadowRootCount(page: Page): Promise<number | null> 
  *  a failure is an unreadable reading, by name. `dialogSeen` reports a native dialog the walk page
  *  dismissed since its last navigation. A page holding a CLOSED shadow root (or one that cannot be
  *  checked for them) is unreadable: its controls are out of a page script's reach. */
-export async function readDigestPage(page: Page, opts: { dialogSeen?: () => boolean } = {}): Promise<RawDigestReading> {
+export async function readDigestPage(page: Page, opts: { dialogSeen?: () => boolean; blockedFrameHosts?: () => string[] } = {}): Promise<RawDigestReading> {
   let url = "";
   try { url = String(page.url() ?? ""); } catch { url = ""; }
   try {
@@ -434,6 +486,12 @@ export async function readDigestPage(page: Page, opts: { dialogSeen?: () => bool
       const box = fe ? await fe.boundingBox().catch(() => null) : null;
       if (!box || box.width < 2 || box.height < 2) continue;
       const fu = String(frame.url() ?? "");
+      if (/^chrome-error:/i.test(fu)) {
+        // The walk page never loads another site's document (openPlaywrightDigestNavigator): a visible
+        // frame it blocked reads as an error page — named by the host it would have loaded.
+        const hosts = opts.blockedFrameHosts?.() ?? [];
+        return unreadableReading(url, hosts.length ? `a cross-origin frame (${hosts[0]}) is on the page` : "a frame on the page did not load");
+      }
       if (fu && !/^about:/i.test(fu) && originOf(fu) !== mainOrigin) {
         let host = "";
         try { host = new URL(fu).host; } catch { host = "another site"; }
@@ -474,12 +532,48 @@ export interface DigestNavigator {
   stepLinks(): Promise<DigestStepLink[]>;
   /** Open one step by its link (a GET). "" = opened; else why not. */
   openStep(link: DigestStepLink): Promise<string>;
+  /** Where the walk page is now, after any redirect (the page it LANDED on, not the link it opened). */
+  landedUrl(): string;
   /** Requests the walk page tried to send that were not a GET (each aborted). */
   writesBlocked(): number;
+  /** Page loads (origin + path) the walk page blocked because their link reads as a filing or a
+   *  payment (isSubmitOrPayRequestUrl) — a redirect hop or a <meta refresh> included. */
+  filingLoadsBlocked?(): string[];
   sleep(ms: number): Promise<void>;
   close(): Promise<void>;
   /** Why the walk must not start at all ("" or absent = it may). Named in the row. */
   refusal?(): string;
+}
+
+/** Why the walk never opens a link the one filing predicate reads as a filing or a payment. */
+export const FILING_LINK_WHY = "its link reads as a filing or a payment (isSubmitOrPayRequestUrl), so the walk never opens it";
+
+/** The draft's own id, from a link (draftReferenceFromUrl — the id the row keeps). "" = none. */
+const draftIdOf = (url: string): string => draftReferenceFromUrl(String(url ?? "")).id;
+const withoutHash = (url: string): string => { try { const u = new URL(url); u.hash = ""; return u.toString(); } catch { return ""; } };
+
+/**
+ * THIS DRAFT'S STEP LINKS (pure; the walk asks it in Node, so a stub navigator meets it too). Of the
+ * links the page's step lists offer:
+ *   - a link that carries no id, or another draft's id, is NOT a step of this draft (a "My Projects"
+ *     tab, another application in the same directory) and is left out — a definition of what a step
+ *     page is, not a silent drop: the page-count floor (walkStagedDraft) counts only DISTINCT pages
+ *     that carry this draft's id, so a draft whose steps cannot all be reached is still refused;
+ *   - a step that opens by a script, or whose link does not parse, carries no id to tell: it stays
+ *     in, named, and the row is unapprovable;
+ *   - a link the ONE filing predicate (isSubmitOrPayRequestUrl — the backstop's, the recorder's)
+ *     reads as a filing or a payment is never opened, by its name or its link: named.
+ */
+export function draftStepLinks(links: readonly DigestStepLink[], reviewUrl: string): DigestStepLink[] {
+  const id = draftIdOf(reviewUrl);
+  const out: DigestStepLink[] = [];
+  for (const l of links) {
+    const href = String(l.href ?? "");
+    if (href && (!id || draftIdOf(href) !== id)) continue;
+    if (href && isSubmitOrPayRequestUrl(href)) { out.push({ ...l, navigable: false, why: FILING_LINK_WHY }); continue; }
+    out.push({ ...l });
+  }
+  return out;
 }
 
 export interface DigestWalkSection {
@@ -503,12 +597,26 @@ export interface DigestWalk {
 }
 
 /**
- * WALK THE STAGED DRAFT READ-ONLY. Opens the review page by its link, reads it twice, runs
- * `atReview` there (the adapter's page-level checks and the masked picture), then opens each step
- * by its link and reads it twice. A step link the walk will not open is named (never skipped).
- * `expectedPages` is how many pages the recipe walks: a recipe of more than one page whose review
- * page offers no step link cannot be compared beyond the review page, and says so; nor can one
- * whose review page opened fewer step pages than the recipe walked (the page-count floor). Never throws.
+ * WALK THE STAGED DRAFT READ-ONLY. Opens the review page by its link, reads it, opens it AGAIN (a
+ * fresh GET of the same link) and reads it again, runs `atReview` there (the adapter's page-level
+ * checks and the masked picture), then does the same for each of THIS DRAFT's step links
+ * (draftStepLinks). A step link the walk will not open is named (never skipped).
+ *   - TWO LOADS, NOT TWO LOOKS: the walk page runs no script (openPlaywrightDigestNavigator), so one
+ *     document cannot change by itself; what PR2 compares is one load against a later one, so the two
+ *     reads are two loads (DIGEST_READ_GAP_MS apart), and a page the portal renders differently on
+ *     each request is refused by name ("changed between two reads").
+ *   - WHERE IT LANDED: every load must land on a page that carries this draft's id (after any
+ *     redirect) — a step tab that lands on another project, a login page or an error page is named.
+ *   - THE PAGE-COUNT FLOOR counts DISTINCT pages of this draft's FORM — at the review page's own
+ *     address (origin + path), carrying this draft's id: a step that lands on a page already read
+ *     (the same address, or the same reading), or a page of the draft elsewhere (a "Messages" tab), is
+ *     read but not counted (skeptic round 3: two tabs redirecting to one page, or two non-step tabs of
+ *     the draft, met the floor while no step page was read). A recipe of
+ *     `expectedPages` pages needs that many distinct pages (the review page among them), else the row
+ *     says how many it could open.
+ *   - Neither the review link nor a step link the one filing predicate reads as a filing or payment
+ *     is ever opened (FILING_LINK_WHY); the navigator blocks a redirect hop or refresh to one too.
+ * Never throws.
  */
 export async function walkStagedDraft(nav: DigestNavigator, opts: {
   reviewUrl: string;
@@ -522,59 +630,84 @@ export async function walkStagedDraft(nav: DigestNavigator, opts: {
   const sections: DigestWalkSection[] = [];
   let stepsFound = 0;
   let stepsRead = 0;
-  const readTwice = async (step: string, where: string): Promise<DigestWalkSection> => {
+  const draftId = draftIdOf(opts.reviewUrl);
+  const landed = (): string => { try { return withoutHash(String(nav.landedUrl() ?? "")); } catch { return ""; } };
+  /** Pages of this draft read so far: where each landed, and what it read. */
+  const read: Array<{ at: string; sig: string }> = [];
+  const sigOf = (r: RawDigestReading): string => JSON.stringify(r.items.map((i) => [i.kind, normalizeDigestText(i.label), normalizeDigestText(i.value)]));
+  /** Open by `open` (a GET), check where it landed, read; wait; open again (a fresh GET), check, read. */
+  const loadTwice = async (step: string, link: string, what: string, open: () => Promise<string>): Promise<{ section: DigestWalkSection; at: string; opened: boolean }> => {
+    const where = whereOf(link);
+    const fail = (why: string, opened: boolean): { section: DigestWalkSection; at: string; opened: boolean } =>
+      ({ section: { step, where, first: unreadableReading(link, why), second: null, unreadable: why }, at: "", opened });
+    const went = await open();
+    if (went) return fail(`${what} did not open by its link (${went})`, false);
+    const at = landed();
+    if (!draftId || draftIdOf(at) !== draftId) return fail(`${what} did not open on this draft's page (it landed on a page that does not carry this draft's id)`, false);
     const first = await nav.read();
-    if (first.unreadable) return { step, where, first, second: null, unreadable: first.unreadable };
+    if (first.unreadable) return { section: { step, where, first, second: null, unreadable: first.unreadable }, at, opened: true };
     await nav.sleep(gap);
+    const again = await open();
+    if (again) return { section: { step, where, first, second: null, unreadable: `${what} did not reopen by its link for the second read (${again})` }, at, opened: true };
+    if (landed() !== at) return { section: { step, where, first, second: null, unreadable: `${what} reopened on another page for the second read` }, at, opened: true };
     const second = await nav.read();
-    return { step, where, first, second, unreadable: second.unreadable };
+    return { section: { step, where, first, second, unreadable: second.unreadable }, at, opened: true };
   };
   try {
     const refused = nav.refusal?.() ?? "";
-    const opened = refused ? "" : await nav.openReview();
-    if (refused) {
-      reasons.push(refused);
-      sections.push({ step: "review", where: whereOf(opts.reviewUrl), first: unreadableReading(opts.reviewUrl, refused), second: null, unreadable: refused });
-    } else if (opened) {
-      reasons.push(`the review page does not reopen by its link (${opened})`);
-      sections.push({ step: "review", where: whereOf(opts.reviewUrl), first: unreadableReading(opts.reviewUrl, opened), second: null, unreadable: opened });
+    const filingReview = !refused && isSubmitOrPayRequestUrl(opts.reviewUrl) ? `the review page's own link reads as a filing or a payment (isSubmitOrPayRequestUrl), so the walk never reopens it` : "";
+    const stop = refused || filingReview;
+    if (stop) {
+      reasons.push(stop);
+      sections.push({ step: "review", where: whereOf(opts.reviewUrl), first: unreadableReading(opts.reviewUrl, stop), second: null, unreadable: stop });
     } else {
-      const review = await readTwice("review", whereOf(opts.reviewUrl));
-      sections.push(review);
-      if (opts.atReview) {
-        try { reasons.push(...await opts.atReview(review.first)); } catch (e) { reasons.push(`the review page's checks could not run (${String((e as { message?: string })?.message ?? e).slice(0, 60)})`); }
-      }
-      const links = await nav.stepLinks().catch(() => [] as DigestStepLink[]);
-      stepsFound = links.length;
-      if (links.length > (opts.maxSteps ?? DIGEST_MAX_STEPS)) {
-        reasons.push(`the review page offers ${links.length} step links, more than a draft's tabs (${opts.maxSteps ?? DIGEST_MAX_STEPS})`);
+      const review = await loadTwice("review", opts.reviewUrl, "the review page", () => nav.openReview());
+      if (!review.opened) {
+        const why = review.section.unreadable.replace(/^the review page did not open by its link \((.*)\)$/, "the review page does not reopen by its link ($1)");
+        reasons.push(why);
+        sections.push({ ...review.section, unreadable: why, first: unreadableReading(opts.reviewUrl, why) });
       } else {
-        if (!links.length && (opts.expectedPages ?? 1) > 1) {
-          reasons.push(`the draft's other ${(opts.expectedPages ?? 1) - 1} step page(s) cannot be opened by navigation alone (the review page offers no step links)`);
+        sections.push(review.section);
+        if (!review.section.unreadable) read.push({ at: review.at, sig: sigOf(review.section.first) });
+        if (opts.atReview) {
+          try { reasons.push(...await opts.atReview(review.section.first)); } catch (e) { reasons.push(`the review page's checks could not run (${String((e as { message?: string })?.message ?? e).slice(0, 60)})`); }
         }
-        for (const link of links) {
-          const step = normalizeDigestText(link.label) || "(unnamed step)";
-          if (!link.navigable) {
-            const why = `step "${step.slice(0, 40)}" cannot be opened by navigation alone (${link.why || "no link"})`;
-            reasons.push(why);
-            sections.push({ step, where: "", first: unreadableReading("", why), second: null, unreadable: why });
-            continue;
+        const links = draftStepLinks(await nav.stepLinks().catch(() => [] as DigestStepLink[]), opts.reviewUrl);
+        stepsFound = links.length;
+        if (links.length > (opts.maxSteps ?? DIGEST_MAX_STEPS)) {
+          reasons.push(`the review page offers ${links.length} step links, more than a draft's tabs (${opts.maxSteps ?? DIGEST_MAX_STEPS})`);
+        } else {
+          if (!links.length && (opts.expectedPages ?? 1) > 1) {
+            reasons.push(`the draft's other ${(opts.expectedPages ?? 1) - 1} step page(s) cannot be opened by navigation alone (the review page offers no step links)`);
           }
-          const went = await nav.openStep(link);
-          if (went) {
-            const why = `step "${step.slice(0, 40)}" did not open by its link (${went})`;
-            reasons.push(why);
-            sections.push({ step, where: whereOf(link.href), first: unreadableReading(link.href, went), second: null, unreadable: why });
-            continue;
+          for (const link of links) {
+            const step = normalizeDigestText(link.label) || "(unnamed step)";
+            const named = `step "${step.slice(0, 40)}"`;
+            if (!link.navigable) {
+              const why = `${named} cannot be opened by navigation alone (${link.why || "no link"})`;
+              reasons.push(why);
+              sections.push({ step, where: "", first: unreadableReading("", why), second: null, unreadable: why });
+              continue;
+            }
+            const got = await loadTwice(step, link.href, named, () => nav.openStep(link));
+            if (!got.opened) reasons.push(got.section.unreadable);
+            sections.push(got.section);
+            if (!got.opened || got.section.unreadable) continue;
+            // A DISTINCT page of THIS DRAFT'S FORM counts: at the review page's own address (origin +
+            // path) with this draft's id, not one already read (same address or same reading). A page
+            // of the draft elsewhere (a "Messages" or "Documents" tab beside the wizard) is read and
+            // compared, but it is not one of the form's steps and never makes up the count.
+            const sig = sigOf(got.section.first);
+            if (read.some((p) => p.at === got.at || p.sig === sig)) continue;
+            read.push({ at: got.at, sig });
+            if (whereOf(got.at) === whereOf(review.at)) stepsRead++;
           }
-          stepsRead++;
-          sections.push(await readTwice(step, whereOf(link.href)));
-        }
-        // THE PAGE-COUNT FLOOR: the recipe walked `expectedPages` pages (the review page among them);
-        // fewer step pages opened than that is a draft not read in full, whatever the links said.
-        const expected = opts.expectedPages ?? 1;
-        if (links.length && stepsRead + 1 < expected) {
-          reasons.push(`the recipe walks ${expected} page(s) but only ${stepsRead} step page(s) besides the review page could be opened by navigation alone`);
+          // THE PAGE-COUNT FLOOR: the recipe walked `expectedPages` pages (the review page among them);
+          // fewer distinct pages of this draft's form read than that is a draft not read in full.
+          const expected = opts.expectedPages ?? 1;
+          if (links.length && stepsRead + 1 < expected) {
+            reasons.push(`the recipe walks ${expected} page(s) but only ${stepsRead} distinct step page(s) of this draft's form (the review page's own address, this draft's id) besides the review page could be opened by navigation alone`);
+          }
         }
       }
     }
@@ -583,8 +716,33 @@ export async function walkStagedDraft(nav: DigestNavigator, opts: {
   }
   const writes = nav.writesBlocked();
   if (writes > 0) reasons.push(`the draft's pages tried to send ${writes} request(s) while being read (each was blocked)`);
+  const filing = nav.filingLoadsBlocked?.() ?? [];
+  if (filing.length) reasons.push(`the walk blocked ${filing.length} page load(s) whose link reads as a filing or a payment (${Array.from(new Set(filing)).slice(0, 3).join(", ")})`);
   await nav.close().catch(() => null);
   return { sections, reasons, stepsFound, stepsRead, writesBlocked: writes, reviewUrl: opts.reviewUrl };
+}
+
+/** THE SCRIPTLESS READING AGAINST THE PERSON'S WINDOW (the review page). The walk page runs no script,
+ *  so a value a portal's script fills in reads EMPTY there, on both loads — and an edit to it would
+ *  never be seen ("unknown must not read as reassurance"). The run's own window shows the review page
+ *  with its scripts on: every control, pair and row it shows must be in the scriptless reading, value
+ *  for value (ruling 7 applied to both; text lines are not compared — a widget's or a clock's). The
+ *  labels of those that are not. Pure. */
+export function shownOnlyWithScripts(withScripts: RawDigestReading, withoutScripts: RawDigestReading): string[] {
+  const keyed = (r: RawDigestReading): string[] => {
+    const values = normalizedDigestValues(r.items);
+    return r.items.map((it, i) => (it.kind === "line" ? "" : [it.kind, normalizeDigestText(it.label), values[i]].join(SEP)));
+  };
+  const have = new Map<string, number>();
+  for (const k of keyed(withoutScripts)) if (k) have.set(k, (have.get(k) ?? 0) + 1);
+  const missing: string[] = [];
+  keyed(withScripts).forEach((k, i) => {
+    if (!k) return;
+    const n = have.get(k) ?? 0;
+    if (n > 0) { have.set(k, n - 1); return; }
+    missing.push(normalizeDigestText(withScripts.items[i].label) || "(unlabelled)");
+  });
+  return missing;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -615,15 +773,22 @@ export function redactDigestText(s: string, secrets: readonly string[], max = LA
   return redactCaptureText(t, 4000).replace(/\s+/g, " ").trim().slice(0, max);
 }
 
-const normalizedValue = (it: DigestPageItem): string => {
-  const v = normalizeDigestText(it.value);
-  if (it.kind === "line" || it.kind === "pair" || it.kind === "row") {
-    // Ruling 7: the cue may sit in the label ("Last Updated") and the token in the value.
-    const label = normalizeDigestText(it.label);
-    return SELF_CHANGING_CUE.test(label) ? v.replace(SELF_CHANGING_TOKEN, SELF_CHANGING_PLACEHOLDER) : dropSelfChangingTimestamps(v);
-  }
-  return v;
-};
+/** Ruling 7 over one page's items, IN ORDER: a pair or row loses only the stamp its label names or
+ *  its cue introduces; a line likewise, or wholly when it is a stamp right after a line that is a
+ *  stamp's name (a <dl>'s dt and dd read as two lines). A control's value is never touched. */
+export function normalizedDigestValues(items: readonly DigestPageItem[]): string[] {
+  let prevLine = "";
+  return items.map((it) => {
+    const v = normalizeDigestText(it.value);
+    if (it.kind === "pair" || it.kind === "row") return dropSelfChangingPairStamp(it.label, v);
+    if (it.kind === "line") {
+      const out = dropSelfChangingPairStamp(prevLine, v);
+      prevLine = v;
+      return out;
+    }
+    return v;
+  });
+}
 
 const sameValue = (a: string, b: string): boolean => normalizeDigestText(a).toLowerCase() === normalizeDigestText(b).toLowerCase();
 
@@ -651,14 +816,15 @@ export function buildStagedReviewCapture(input: BuildDigestInput): StagedReviewC
   const itemMacs = (reading: RawDigestReading): StagedReviewItem[] => {
     const seen = new Map<string, number>();
     const out: StagedReviewItem[] = [];
-    for (const it of reading.items) {
+    const values = normalizedDigestValues(reading.items);
+    reading.items.forEach((it, i) => {
       const rawLabel = normalizeDigestText(it.label);
       const k = `${it.kind}${SEP}${rawLabel}`;
       const ordinal = (seen.get(k) ?? 0) + 1;
       seen.set(k, ordinal);
       const label = it.kind === "line" ? `${rawLabel ? `${rawLabel} ` : ""}line near "${red(normalizeDigestText(it.value), 30)}"` : rawLabel;
-      out.push({ kind: it.kind, label: red(label), ordinal, mac: mac ? mac([nonce, it.kind, rawLabel, String(ordinal), normalizedValue(it)].join(SEP)) : "" });
-    }
+      out.push({ kind: it.kind, label: red(label), ordinal, mac: mac ? mac([nonce, it.kind, rawLabel, String(ordinal), values[i]].join(SEP)) : "" });
+    });
     return out;
   };
   for (const s of input.walk.sections) {
@@ -742,25 +908,23 @@ export function unapprovableStagedReview(why: string, reviewUrl = ""): StagedRev
 // ---------------------------------------------------------------------------------------------
 
 /** Runs IN THE PAGE: the step tabs / links of a wizard. Only links inside a step-shaped container (a
- *  tablist, or a container whose class or id names steps / a wizard / progress / tabs) that point at
- *  this draft (same origin, and the same path, or a shared query parameter such as PowerClerk's
- *  ProjectId) are candidates; the link to the page being read is that page, already read.
- *  EVERY OTHER CANDIDATE IS RETURNED — none is dropped. One the walk will not open is returned
- *  `navigable: false` with its reason, so the row names it and is not approvable (ruling 2: every step
- *  page is read, or the row says which one was not): a name that reads as an action on a GET (sign
- *  out, delete, withdraw, cancel, new, copy, print, request... and any Next / Save / Submit — even
- *  "Interconnection Request" or "Battery Back-up", which may well be steps: the walk never guesses),
- *  a link whose path names an action, a step that opens by a script or has no link or no name.
- *  What the walk OPENS is unchanged by this: only a named, plain, same-draft link that reads as no
- *  action. Open shadow roots are searched too. */
+ *  tablist, or a container whose class or id names steps / a wizard / progress / tabs) on this
+ *  page's origin are candidates; the link to the page being read is that page, already read. Which
+ *  of them are THIS DRAFT's steps (they carry its id) and which read as a filing is decided in Node
+ *  (draftStepLinks), where a stub navigator meets the same rule. Every candidate keeps its link.
+ *  One the walk will not open is returned `navigable: false` with its reason, so the row names it and
+ *  is not approvable (ruling 2: every step page is read, or the row says which one was not): a name
+ *  that reads as an action on a GET (sign out, delete, withdraw, cancel, new, copy, print, request...
+ *  and any Next / Save / Submit — even "Interconnection Request" or "Battery Back-up", which may well
+ *  be steps: the walk never guesses), a link whose path names an action (a save, a finish, a
+ *  completion among them), a step that opens by a script or has no link or no name. Open shadow
+ *  roots are searched too. */
 export function stepLinksInPage(): Array<{ label: string; href: string; navigable: boolean; why: string }> {
   const clean = (s: unknown): string => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
   const here = new URL(location.href);
-  const hereParams = new Set<string>();
-  here.searchParams.forEach((v, k) => { if (v) hereParams.add(`${k.toLowerCase()}=${v}`); });
-  const hereDir = here.pathname.replace(/\/[^/]*$/, "/");
   const ACTS = /\b(log\s*-?\s*(out|off)|sign\s*-?\s*out|delete|remove|withdraw|cancel|discard|submit|save|next|continue|back|previous|pay|new|create|copy|clone|duplicate|print|download|export|request|send|e-?sign)\b/i;
-  const ACT_PATH = /logout|logoff|signout|sign-out|delete|remove|withdraw|cancel|discard|copy|clone/i;
+  // A filing or payment link is the ONE filing predicate's question (draftStepLinks, isSubmitOrPayRequestUrl), not this list's.
+  const ACT_PATH = /logout|logoff|signout|sign-out|delete|remove|withdraw|cancel|discard|copy|clone|save|finish|complete/i;
   const STEPPY = /(^|[\s_-])(steps|stepper|step-?nav|step-?list|wizard|progress|tabs|tablist|form-?nav|form-?steps)([\s_-]|$)/i;
   // Every element in tree order, open shadow roots included (a step list inside a web component).
   const all: Element[] = [];
@@ -794,11 +958,9 @@ export function stepLinksInPage(): Array<{ label: string; href: string; navigabl
       if (!scripted) {
         let u: URL;
         try { u = new URL(String(raw), location.href); } catch { out.push({ label: label || "(unnamed step)", href: "", navigable: false, why: "its link does not parse" }); continue; }
-        // Not this draft's page: another site, another scheme, a path and query that share nothing.
+        // Not this portal's page: another site or another scheme. (Whether it is THIS DRAFT's — it
+        // carries the draft's id — is draftStepLinks' question, in Node.)
         if (!/^https?:$/.test(u.protocol) || u.origin !== here.origin) continue;
-        let shares = u.pathname === here.pathname || u.pathname.replace(/\/[^/]*$/, "/") === hereDir;
-        u.searchParams.forEach((v, k) => { if (v && hereParams.has(`${k.toLowerCase()}=${v}`)) shares = true; });
-        if (!shares) continue;
         u.hash = "";
         href = u.toString();
         // The page being read IS this page (the review page's own "Review and Submit" tab): read already.
@@ -806,8 +968,8 @@ export function stepLinksInPage(): Array<{ label: string; href: string; navigabl
         hrefs.add(href);
         actPath = ACT_PATH.test(u.pathname);
       }
-      if (ACTS.test(label) || actPath) { out.push({ label: label || "(unnamed step)", href: "", navigable: false, why: ACTION_WHY }); continue; }
-      if (!label) { out.push({ label: "(unnamed step)", href: "", navigable: false, why: "it has no name, so the walk never opens it" }); continue; }
+      if (ACTS.test(label) || actPath) { out.push({ label: label || "(unnamed step)", href, navigable: false, why: ACTION_WHY }); continue; }
+      if (!label) { out.push({ label: "(unnamed step)", href, navigable: false, why: "it has no name, so the walk never opens it" }); continue; }
       if (scripted) { out.push({ label, href: "", navigable: false, why: raw && /javascript:/i.test(raw) ? "it opens by a script" : "it has no link" }); continue; }
       out.push({ label, href, navigable: true, why: "" });
     }
@@ -845,21 +1007,58 @@ export interface PlaywrightDigestNavigator extends DigestNavigator {
   page: Page;
 }
 
-/** The walk page: a NEW page of `runPage`'s context (never the window a person submits in). Every
- *  request that is not a GET / HEAD is aborted and counted; a GET falls back to the context's own
- *  routes (the network backstop still judges it).
- *  A NATIVE DIALOG IS NOTED, NEVER ANSWERED HERE (#381; personDialogs.test pins that product code
- *  answers a dialog only in the approved click's slot, and registers no other `dialog` listener). The
- *  walk page registers none, so Playwright's own default answers a dialog exactly as it does on every
- *  page before a hand-over on main; a CDP session only OBSERVES Page.javascriptDialogOpening (never
- *  Page.handleJavaScriptDialog), and the page it opened on reads as unreadable, by name. A walk whose
- *  dialogs cannot be watched, or whose window already leaves dialogs to a person (one would stall
- *  every read), is refused before it opens anything. */
+/** Runs IN THE PAGE: are scripts OFF in this document? With scripting disabled the HTML parser
+ *  builds a <noscript>'s content as elements; with it enabled, as raw text. Nothing runs to tell —
+ *  so a Content-Security-Policy that blocks inline scripts cannot make scripts-on read as off. */
+export function scriptsOffInPage(): boolean {
+  const d = document.createElement("div");
+  d.innerHTML = "<noscript><b>x</b></noscript>";
+  return d.querySelector("noscript b") !== null;
+}
+
+/** One request the walk page's own DevTools session paused (Fetch.requestPaused, request stage). */
+interface WalkPausedRequest { requestId: string; resourceType?: string; request?: { url?: string; method?: string } }
+
+/**
+ * THE WALK PAGE AND ITS READ-ONLY LOCK: a NEW page of `runPage`'s context (never the window a person
+ * submits in), made scriptless BEFORE it opens anything, through its own DevTools session:
+ *   1. NO PAGE SCRIPT EVER RUNS ON IT (Emulation.setScriptExecutionDisabled), checked on the blank
+ *      page before the first load and again after every load (scriptsOffInPage — a parse, nothing
+ *      runs). So none of the ways a page writes by itself exists here: no beacon or keepalive fetch on
+ *      pagehide or visibilitychange, no autosave on load, no WebSocket, no service-worker
+ *      registration, no form a script submits. (Skeptic round 3: the walk page's own route could not
+ *      see a sendBeacon, a keepalive fetch sent as the page closed, a pass-through service worker's
+ *      fetch, or a WebSocket — the server got the posts while the row read approvable, 0 blocked.)
+ *      The run's own context-level backstop is ALSO in review-lock mode while the walk runs (the
+ *      adapter locks the run before the walk) — the lock the spec names; scripts-off is what makes
+ *      the walk page itself unable to send anything that lock cannot see.
+ *   2. NO SERVICE WORKER answers it (Network.setBypassServiceWorker): one the portal registered on an
+ *      earlier page never sees the walk page's loads.
+ *   3. EVERY REQUEST IT MAKES IS JUDGED BEFORE IT IS SENT — redirect hops and a <meta refresh>
+ *      included (Fetch at the request stage reports each hop as its own request; Playwright's route
+ *      never sees a hop): not a GET / HEAD → aborted and counted (writesBlocked); a link the ONE filing
+ *      predicate (isSubmitOrPayRequestUrl) reads as a filing or a payment → aborted, and a page load
+ *      of one is named (filingLoadsBlocked; an image or stylesheet whose name merely says "submit" is
+ *      aborted and not held against the draft); another site's document (a frame, or a redirect away)
+ *      → aborted, so no other site's script runs either (a visible frame it blocked is named by
+ *      readDigestPage). A paused request is always answered — a dropped one would hang the page.
+ * A setting that does not take, or a session that cannot be opened, refuses the walk before it opens
+ * anything — never a best effort. Playwright's route aborts and counts a non-GET too (a second line).
+ * A NATIVE DIALOG IS NOTED, NEVER ANSWERED HERE (#381; personDialogs.test pins that product code
+ * answers a dialog only in the approved click's slot, and registers no other `dialog` listener). With
+ * no script there is nothing to open one; the CDP watch stays as a defence: it only OBSERVES
+ * Page.javascriptDialogOpening (never Page.handleJavaScriptDialog), and the page it opened on reads as
+ * unreadable, by name. A walk whose window already leaves dialogs to a person is refused before it
+ * opens anything.
+ */
 export async function openPlaywrightDigestNavigator(runPage: Page, reviewUrl: string, opts: { navTimeoutMs?: number } = {}): Promise<PlaywrightDigestNavigator> {
   const ctx = runPage.context();
   const walk = await ctx.newPage();
+  const portalOrigin = originOf(reviewUrl);
   let blocked = 0;
   let dialog = false;
+  const filingLoads: string[] = [];
+  let foreignHosts: string[] = [];
   let refusal = dialogsLeftToPerson(runPage)
     ? "the run's window already leaves its dialogs to a person, so a dialog on the draft's pages would stall the walk"
     : "";
@@ -869,23 +1068,50 @@ export async function openPlaywrightDigestNavigator(runPage: Page, reviewUrl: st
     blocked++;
     return route.abort("blockedbyclient");
   });
-  let cdp: { detach(): Promise<void> } | null = null;
+  let cdp: CDPSession | null = null;
   if (!refusal) {
     try {
       const session = await ctx.newCDPSession(walk);
+      cdp = session;
+      await session.send("Emulation.setScriptExecutionDisabled", { value: true });
+      await session.send("Network.enable");
+      await session.send("Network.setBypassServiceWorker", { bypass: true });
+      session.on("Fetch.requestPaused", (e: WalkPausedRequest) => {
+        void (async () => {
+          let fail = true;
+          try {
+            const method = String(e.request?.method ?? "").toUpperCase();
+            const url = String(e.request?.url ?? "");
+            const isDocument = /^document$/i.test(String(e.resourceType ?? ""));
+            if (method !== "GET" && method !== "HEAD") blocked++;
+            else if (isSubmitOrPayRequestUrl(url)) { if (isDocument) filingLoads.push(whereOf(url) || "a link"); }
+            else if (isDocument && originOf(url) !== portalOrigin) { try { foreignHosts.push(new URL(url).host || "another site"); } catch { foreignHosts.push("another site"); } }
+            else fail = false;
+          } catch { fail = true; }
+          if (fail) await session.send("Fetch.failRequest", { requestId: e.requestId, errorReason: "BlockedByClient" }).catch(() => null);
+          else await session.send("Fetch.continueRequest", { requestId: e.requestId }).catch(() => null);
+        })();
+      });
+      await session.send("Fetch.enable", { patterns: [{ urlPattern: "*", requestStage: "Request" }] });
       await session.send("Page.enable");
       session.on("Page.javascriptDialogOpening", () => { dialog = true; });
-      cdp = session;
+      if (await walk.evaluate(scriptsOffInPage).catch(() => false) !== true) {
+        refusal = "the walk page's scripts could not be turned off, so the walk did not start";
+      }
     } catch {
-      refusal = "native dialogs on the draft's pages could not be watched (no DevTools session), so the walk did not start";
+      refusal = "the walk page could not be made read-only (no DevTools session to turn its scripts off and judge its requests), so the walk did not start";
     }
   }
   const timeout = opts.navTimeoutMs ?? 20_000;
   const go = async (url: string): Promise<string> => {
+    if (refusal) return refusal;
+    if (isSubmitOrPayRequestUrl(url)) return FILING_LINK_WHY;
     dialog = false;
+    foreignHosts = [];
     try {
       const res = await walk.goto(url, { waitUntil: "load", timeout });
       await walk.waitForLoadState("networkidle", { timeout: 4000 }).catch(() => null);
+      if (await walk.evaluate(scriptsOffInPage).catch(() => false) !== true) return "the page loaded with its scripts on";
       if (res && res.status() >= 400) return `the portal answered ${res.status()}`;
       return "";
     } catch (e) {
@@ -894,17 +1120,20 @@ export async function openPlaywrightDigestNavigator(runPage: Page, reviewUrl: st
   };
   return {
     openReview: () => go(reviewUrl),
-    read: () => readDigestPage(walk, { dialogSeen: () => dialog }),
+    read: () => readDigestPage(walk, { dialogSeen: () => dialog, blockedFrameHosts: () => foreignHosts }),
     stepLinks: async () => {
       await walk.mainFrame().evaluate(SHIM).catch(() => null);
       return (await walk.evaluate(stepLinksInPage).catch(() => [])) as DigestStepLink[];
     },
     openStep: (link) => go(link.href),
+    landedUrl: () => { try { return String(walk.url() ?? ""); } catch { return ""; } },
     writesBlocked: () => blocked,
+    filingLoadsBlocked: () => [...filingLoads],
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     close: async () => {
-      await cdp?.detach().catch(() => null);
+      // The page first (it runs no script, so closing it sends nothing), then its session.
       await walk.close().catch(() => null);
+      await cdp?.detach().catch(() => null);
       await runPage.bringToFront().catch(() => null);
     },
     refusal: () => refusal,
