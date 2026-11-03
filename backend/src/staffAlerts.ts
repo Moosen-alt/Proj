@@ -15,6 +15,11 @@
 //              status   a permit/NEM tracking target's outcome changed (ref = target id)
 //              unmatched_email  a correction email matched no job (ref = the message's signature;
 //                       no project, so the org is the inbox source's) (#522)
+//              stage_held  the stage gate refused a filing before any browser opened: boxes its
+//                       recipe types that the job has no value for, or a per-job question nobody
+//                       answered (#445). No run row exists, so the run alert never fired (#551).
+//                       ref = project + track, state = the gap keys, so a retry of the same
+//                       refusal sends nothing and a changed set of gaps sends once more.
 //            The dedupe is the newest staff_notifications row for (org, kind, ref): the same
 //            state there means this transition was already handled, so a re-entered writer or a
 //            re-poll sends nothing — the same idea as shouldNotifyClient, kept in the table so it
@@ -49,7 +54,7 @@ import { projectSecretValuesById } from "./projectSecrets";
 import { redactSecretValues } from "../../shared/src/portalSafety";
 import { configuredStaffOrgs, staffAlertChannels, staffDigestHour, type StaffAlertChannels } from "./staffAlertConfig";
 
-export type StaffAlertKind = "run" | "correction" | "status" | "digest" | "unmatched_email";
+export type StaffAlertKind = "run" | "correction" | "status" | "digest" | "unmatched_email" | "stage_held";
 
 /** Stage-run endings that need a person. awaiting_human_submit (staged cleanly, waiting for
  *  review) is deliberately absent: it is the expected end of a run and the digest carries it. */
@@ -337,6 +342,45 @@ export function alertStaffOnUnmatchedCorrectionEmail(
     return recordAndSend(db, { orgId: input.orgId || DEFAULT_ORG_ID, projectId: null, kind: "unmatched_email", ref: input.signature, state: "unmatched", subject, body });
   } catch (err) {
     logger.warn("staff-alert", `unmatched email alert skipped: ${err instanceof Error ? err.message : String(err)}`);
+    return Promise.resolve();
+  }
+}
+
+/** One gap the stage gate named — the shape of RecipeStageGap this needs: our own words for the
+ *  field (fieldName), never the portal's recorded label, and never a value (there is none). */
+export interface StageHeldGap { kind: string; key: string; fieldName: string; where?: string }
+
+const STAGE_GAP_WHERE: Record<string, string> = {
+  project: "project", client: "client record", documents: "documents", portal_questions: "portal questions",
+};
+
+/**
+ * The stage gate refused a filing (#445) — before any browser opened, so no run row and no run
+ * alert. RULE 2: each gap is named by its fieldName (our words: "Homeowner email", "CCB / contractor
+ * licence number", a secret's fixed label), never by the step's recorded portal text, and carries no
+ * value. Deduped per project + track on the sorted gap keys. Callers `void` it.
+ */
+export function alertStaffOnStageHeld(
+  db: AppDb,
+  input: { projectId: string; track: string; gaps: StageHeldGap[] },
+): Promise<void> {
+  try {
+    const gaps = (input.gaps ?? []).filter((g) => g && g.key);
+    if (!gaps.length) return Promise.resolve();
+    const facts = projectFacts(db, input.projectId);
+    if (!facts || facts.archived) return Promise.resolve();
+    const state = [...new Set(gaps.map((g) => `${g.kind}:${g.key}`))].sort().join(",");
+    const secrets = projectSecretValuesById(db, input.projectId) ?? [];
+    const names = [...new Set(gaps.map((g) => {
+      const where = STAGE_GAP_WHERE[String(g.where ?? "")];
+      return `${String(g.fieldName || g.key)}${where ? ` (${where})` : ""}`;
+    }))];
+    const why = scrubStaffText(`nothing was opened. Missing: ${names.join("; ")}. Fill ${names.length === 1 ? "it" : "them"}, or send the intake link, then stage again.`, secrets);
+    const { subject, body } = alertMessage(facts, input.projectId, input.track, "staging held, details missing", why);
+    const track = String(input.track || "permit");
+    return recordAndSend(db, { orgId: facts.orgId, projectId: input.projectId, kind: "stage_held", ref: `${input.projectId}:${track}`, state, subject, body });
+  } catch (err) {
+    logger.warn("staff-alert", `stage-held alert skipped: ${err instanceof Error ? err.message : String(err)}`);
     return Promise.resolve();
   }
 }

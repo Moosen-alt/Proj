@@ -131,6 +131,9 @@ export abstract class BasePortalAdapter implements PortalAdapter {
   /** The controls the LAST runGapFill tried to write (landed or not), by label, id and name — what
    *  that pass put on the page that no recorded step did (#362). Reset at the start of every pass. */
   protected lastGapFillWrites: Array<{ label: string; id: string; name: string; kind: import("./llmGapFill").GapFillWriteKind; question?: string; option?: string; questions?: string[] }> = [];
+  /** #524 — the company / contact-code selects the LAST runGapFill refused (no option exactly this
+   *  client's), as the stop's sentences. Also reported as missing; replay stops the run on one. */
+  protected lastGapFillFilerRefused: string[] = [];
   /** Accumulated across pages; surfaced in the run result so the operator can see what the
    *  LLM filled and which required fields had no backing data (left blank, not guessed). */
   public gapFillReport: { filled: string[]; skippedUngrounded: string[]; reportedMissing: string[] } = {
@@ -152,6 +155,7 @@ export abstract class BasePortalAdapter implements PortalAdapter {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   protected async runGapFill(page: any): Promise<void> {
     this.lastGapFillWrites = [];
+    this.lastGapFillFilerRefused = [];
     if (!this.gapPlanner) return;
     try {
       const { gapFillCurrentPage } = await import("./llmGapFill");
@@ -161,6 +165,8 @@ export abstract class BasePortalAdapter implements PortalAdapter {
       this.gapFillReport.filled.push(...r.filled);
       this.gapFillReport.skippedUngrounded.push(...r.skippedUngrounded);
       this.gapFillReport.reportedMissing.push(...r.reportedMissing);
+      this.lastGapFillFilerRefused = [...(r.filerIdentityRefused ?? [])];
+      for (const m of this.lastGapFillFilerRefused) if (!this.gapFillReport.reportedMissing.includes(m)) this.gapFillReport.reportedMissing.push(m);
     } catch {
       // gap-fill is best-effort; never let it break a staging run.
     }

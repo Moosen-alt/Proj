@@ -95,6 +95,7 @@ import { reviewComparison, scrapeReviewScreen as scrapeReviewScreenShared, utili
 import { controlReadsUnanswered, pinEmptyRequiredControl, PINNED_CONTROL_ATTR, SWEPT_BLANK_ATTR, sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
 import { openPortal } from "../browser";
 import { selectWithFallback, comboboxFaceInPage, type ComboboxPick } from "../comboboxFill";
+import { assertFilerIdentityHeld, FilerIdentityStop, filerIdentityFieldForSelect, filerIdentityStopMessage, isFilerIdentityField, isUnansweredOption, readNativeSelect, selectFilerIdentity } from "../filerIdentitySelect";
 import {
   classifySubmissionText, finalSubmitEnvAllows, finalSubmitRefusals, isFinalSubmitControl, isPayFee, isPayNowDialogText, mayClickFinalSubmit,
   isPayRequestUrl, isRecipeShapeValid, isSignatureNameLabel, isSignatureRequestControl, isSubmitIntent, isSubmitOrPayRequestUrl, PORTAL_SAFETY_GLOBAL, PORTAL_SAFETY_IN_PAGE_SOURCE, splitSignerName,
@@ -1408,6 +1409,13 @@ export class RecipeAdapter extends BasePortalAdapter {
       return await super.runGapFill(page);
     } finally {
       for (const w of this.lastGapFillWrites) await this.noteUnrecordedWrite(w.kind === "data" ? "data" : "pick", `gap-fill: ${w.label}`, w);
+      // #524: a company / contact-code list the gap-fill could not make this client's stops the run
+      // (sticky: the next step, click or key press refuses), exactly like a recorded step's miss.
+      const filer = this.lastGapFillFilerRefused[0];
+      if (filer && !this.filerIdentityStop) {
+        this.filerIdentityStop = filer;
+        this.driftWarnings.push(`STOPPED: ${filer}`);
+      }
     }
   }
 
@@ -1441,7 +1449,15 @@ export class RecipeAdapter extends BasePortalAdapter {
     this.backstop = await installFilingBackstop(this.page, "replay run").catch(() => null);
     if (this.backstop?.redirectGuardNote) this.driftWarnings.push(this.backstop.redirectGuardNote);
     try {
-      const ran = await this.runAll(project);
+      // A FilerIdentityStop that escaped the step loop (a click between steps) is the run's answer too.
+      const ranRaw = await this.runAll(project).catch((err: unknown) => {
+        if (err instanceof FilerIdentityStop) return fail(err.message, { driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals });
+        throw err;
+      });
+      // ...and a stop recorded on a path that swallowed it never ends as "reached review".
+      const ran = this.filerIdentityStop && ranRaw.ok
+        ? fail(this.filerIdentityStop, { ...(ranRaw.data ?? {}), driftWarnings: this.driftWarnings, guardRefusals: this.guardRefusals })
+        : ranRaw;
       // A dismissed dialog cancelled the approved click: the result says so in data too.
       const r = this.finalSubmitNothingSent ? { ...ran, data: { ...(ran.data ?? {}), finalSubmitClicked: false, finalSubmitRequestSent: false } } : ran;
       // Hand-off: the route comes off FIRST, then every abort up to that moment is counted (an
@@ -1534,6 +1550,11 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  guarded clicks, presses and steps refuse, so a trusted input the watch sees can only be a
    *  person's. Never cleared on a run. */
   private inputsClosed = "";
+  /** #524 — WHO IS FILING could not be made this client's (a company / contact-code select missed,
+   *  matched twice, or did not hold). Sticky for the run: every later step, click and key press
+   *  refuses, so a caller that swallows the stop (a gap-fill write, an array re-run) cannot carry the
+   *  run on to Next under the portal's default company. */
+  private filerIdentityStop = "";
   /** #333: after the hand-over, a person's own main-frame form request went (their submit, or a
    *  postback they made) — the run's end page is theirs now, not where the run "stopped". */
   private personMovedOn = false;
@@ -2772,6 +2793,11 @@ export class RecipeAdapter extends BasePortalAdapter {
         const bsStop = this.backstopStop();
         if (bsStop) return fail(bsStop, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: Math.max(0, stepIdx - 1), trace });
       }
+      // WHO IS FILING STOPPED THE RUN (#524) on a path that swallowed the throw (a gap-fill write, an
+      // array re-run): stop here, named, before the next step.
+      if (this.filerIdentityStop) {
+        return fail(this.filerIdentityStop, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: Math.max(0, stepIdx - 1), trace, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified });
+      }
       // THE PORTAL SAYS THIS ADDRESS IS NOT SERVED HERE (portal-truth D5): after every step that
       // moved the page (a click, a goto), ask the one predicate of the page's visible text. A replay
       // that lands on "No Building services were returned for this address" stops here, named, with
@@ -3241,6 +3267,14 @@ export class RecipeAdapter extends BasePortalAdapter {
             const base = fail(err.pauseReason ? err.message : `Recipe step failed (${step.action}${step.note ? ` — ${step.note}` : ""}): ${err.message}`,
               { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: stepIdx, trace, slowSteps, finalSubmitClicked: this.finalSubmitClicked, ...(err.pauseReason ? { needsHuman: true } : {}), pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath });
             return err.pauseReason ? { ...base, pauseReason: err.pauseReason } : base;
+          }
+          // WHO IS FILING (#524): never retried, healed or skipped as optional — a retry or a heal
+          // re-asks the same list the same question, and an optional skip leaves the portal's default
+          // company standing.
+          if (err instanceof FilerIdentityStop) {
+            closePrevStepTiming();
+            trace.push({ i: stepIdx, action: step.action, note: String(step.note ?? "").slice(0, 52), outcome: "FAILED", page: await currentPageLabel() });
+            return fail(err.message, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: stepIdx, trace, slowSteps, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath });
           }
           if (!failureContext) failureContext = await this.timed("failure-context", () => this.captureFailureContext(step, stepIdx).catch(() => ""));
           const isTimeout = err instanceof Error && /timeout|TimeoutError/i.test(err.message);
@@ -4688,6 +4722,55 @@ export class RecipeAdapter extends BasePortalAdapter {
     }).catch(() => []) as Array<Array<{ label: string; tag: string; value: string; placeholder: boolean }>>;
   }
 
+  /** #524 — the submitting company's name, for a stop's message. */
+  private filerCompanyName(): string {
+    return String(this.fieldValues.installerCompanyName ?? "").replace(/\s+/g, " ").trim();
+  }
+
+  /** #524 — record WHO IS FILING's stop (sticky for the run) and throw it. */
+  private stopOnFilerIdentity(step: RecipeStep, why: string, err?: unknown): never {
+    const field = String(step.field ?? "");
+    const msg = err instanceof FilerIdentityStop ? err.message : filerIdentityStopMessage({
+      field, control: this.stepLabel(step) || String(step.note ?? ""), company: this.filerCompanyName(),
+      code: field === "installerCompanyName" ? undefined : String(this.fieldValues[field] ?? ""), why,
+    });
+    this.filerIdentityStop = msg;
+    if (!this.driftWarnings.includes(`STOPPED: ${msg}`)) this.driftWarnings.push(`STOPPED: ${msg}`);
+    const name = String(step.note ?? step.field ?? step.action).slice(0, 60);
+    if (!this.fieldsUnverified.includes(name)) this.fieldsUnverified.push(name);
+    throw err instanceof FilerIdentityStop ? err : new FilerIdentityStop(msg, field);
+  }
+
+  /** #524 — A SELECT THAT NAMES WHO IS FILING: this client's option (exact, else the one folded-equal
+   *  name; a contact code exactly), committed the way every replayed select is, then read back after
+   *  the autosave settled. Any miss stops the run (stopOnFilerIdentity). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async selectFilerIdentityStep(step: RecipeStep, scoped: any, v: string): Promise<boolean> {
+    const field = String(step.field ?? "");
+    const input = { field, value: v, control: this.stepLabel(step) || String(step.note ?? ""), company: this.filerCompanyName() };
+    let hit;
+    try {
+      hit = await selectFilerIdentity(scoped, input);
+    } catch (err) {
+      return this.stopOnFilerIdentity(step, `the list could not be read or set (${err instanceof Error ? err.message.slice(0, 120) : String(err)})`, err);
+    }
+    // COMMIT (native: focus, then blur + settle — see the generic select's commit) and wait out the
+    // autosave, then read it back: a re-render that put another company back is a stop, not a retry.
+    if (typeof scoped?.focus === "function") await scoped.focus({ timeout: 2000 }).catch(() => null);
+    await this.commitAndSettle(scoped);
+    await this.waitForAutosaveCommitted();
+    try {
+      await assertFilerIdentityHeld(scoped, hit, input);
+    } catch (err) {
+      return this.stopOnFilerIdentity(step, "the list did not keep the client's option", err);
+    }
+    if (hit.label !== v) this.agingNotes.push(`${input.control || field}: "${v}" matched the list's "${hit.label}" (same name, case/punctuation folded)`);
+    const name = String(step.note ?? step.field ?? step.action).slice(0, 60);
+    if (!this.fieldsVerified.includes(name)) this.fieldsVerified.push(name);
+    this.writtenTarget = scoped;
+    return true;
+  }
+
   /** The label a recorded step would resolve by — its selector's, or the first fallback's. */
   private stepLabel(step: RecipeStep): string {
     const sel = step.selector;
@@ -5246,7 +5329,10 @@ export class RecipeAdapter extends BasePortalAdapter {
     // which it was, between the declaration commit and this one: isBatteryDeclaration said
     // "declaration" for every check step and skipForNoBattery then executed it.
     if (kind === "declaration") return step.action === "check";
-    return true; // a spec of a battery that does not exist
+    // A spec of a battery that does not exist — and an ATTESTATION about one (#536: "The battery
+    // system will not backfeed into the grid" is never ticked for a battery that is not there; on
+    // such a job the portal does not render it, so a recorded tick skips rather than fails).
+    return true;
   }
 
   // A SLOT THAT ONLY EXISTS AT REPLAY CAN ONLY BE FILLED AT REPLAY.
@@ -5585,6 +5671,7 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  review lock (set at stopForReview) are untouched. Clicks, presses and gotos get no window. */
   private async executeStep(step: RecipeStep, pastReview: boolean): Promise<boolean> {
     if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (step ${String(step.note || step.action)})`);
+    if (this.filerIdentityStop) throw new FilerIdentityStop(this.filerIdentityStop, String(step.field ?? ""));
     // Which view each recorded write ran in (#362: a re-assert from another page is a pick).
     if (RecipeAdapter.WRITE_ACTIONS.has(step.action) && !this.inPolicyRetry) {
       const idx = this.recipe.steps.indexOf(step);
@@ -5987,7 +6074,26 @@ export class RecipeAdapter extends BasePortalAdapter {
         return true;
       }
       case "select": {
+        // WHO IS FILING (#524): a select bound to the submitting company or its contact code — or a
+        // step on the INSTALLER'S company list that recorded a literal: the company the recipe was
+        // learned on, which on a shared account is another client. That one takes THIS client's name.
+        const companyList = !isFilerIdentityField(step.field) && filerIdentityFieldForSelect(this.stepLabel(step) || step.note, "") === "installerCompanyName";
+        const literalCompany = companyList && !step.field;
+        if (literalCompany && String(step.value ?? "").trim()) {
+          this.agingNotes.push(`"${this.stepLabel(step) || "Installer Company"}": the recorded company "${String(step.value).slice(0, 40)}" is the learn's — this client's own name is used instead`);
+        }
+        if (companyList) step = { ...step, field: "installerCompanyName", ...(literalCompany ? { value: undefined } : {}) };
         const v = this.resolveValue(step);
+        const filerIdentity = isFilerIdentityField(step.field);
+        if (!v && filerIdentity) {
+          // No company is never "skip": the list would keep whatever the portal shows. No contact
+          // code is a skip only while the list shows nothing chosen.
+          const shown = String(step.field) === "installerCompanyName" ? null : await readNativeSelect(scoped).catch(() => null);
+          if (String(step.field) !== "installerCompanyName" && (!shown || isUnansweredOption(shown.selected))) { this.noteUnresolved(step); return false; }
+          return this.stopOnFilerIdentity(step, String(step.field) === "installerCompanyName"
+            ? "no submitting company on the project"
+            : `no contact code on file for this client, and the list shows "${shown?.selected?.label ?? ""}"`);
+        }
         if (!v) { this.noteUnresolved(step); return false; }
         // TWO "Manufacturer" SELECTS, ONE LABEL — THE FIELD NAME CARRIES THE SIDE.
         //
@@ -6028,6 +6134,9 @@ export class RecipeAdapter extends BasePortalAdapter {
           }
         }
         await waitForElement(scoped);
+        // WHO IS FILING (#524): never the contains match, the model rules, a certified alias or a
+        // label re-resolve — this client's option exactly once, read back after the commit, or stop.
+        if (filerIdentity) return this.selectFilerIdentityStep(step, scoped, v);
         // Native <select> first; fall back to the custom-combobox interaction for styled
         // div dropdowns (PowerClerk "Please select...", select2, ExtJS) selectOption can't drive.
         // MODEL FIRST — before the generic select. selectWithFallback matches "exact, then
@@ -7099,6 +7208,7 @@ export class RecipeAdapter extends BasePortalAdapter {
   /** Every click in replay. Refused → throws ReplayGuardRefusal (named), nothing clicked. */
   private async guardedClick(target: unknown, why: string, opts?: { timeout?: number; force?: boolean }, flags: { passThrough?: boolean; finalSubmitApproved?: boolean; draftCreatingApproved?: boolean } = {}): Promise<void> {
     if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (${why})`);
+    if (this.filerIdentityStop) throw new FilerIdentityStop(this.filerIdentityStop, "");
     const reason = await this.guardAction({ kind: "click", target, why, ...flags });
     if (reason) throw new ReplayGuardRefusal(reason);
     // THE APPROVED FINAL SUBMIT (and its confirm dialog) is the one click whose FILING request
@@ -7125,6 +7235,7 @@ export class RecipeAdapter extends BasePortalAdapter {
   /** Every key press in replay. Enter/Space are clicks on the focused control. */
   private async guardedPress(target: unknown, key: string, why: string): Promise<void> {
     if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (${why})`);
+    if (this.filerIdentityStop) throw new FilerIdentityStop(this.filerIdentityStop, "");
     const focused = /^(enter|numpadenter|space| )$/i.test(key) && this.page && typeof this.page.locator === "function"
       ? (target && typeof (target as { evaluate?: unknown }).evaluate === "function" ? target : this.page.locator(":focus"))
       : target;

@@ -204,6 +204,49 @@ await check("an INTERRUPTED run (its process went away) alerts once", async () =
   assert.match(mine[0].subject, /NEM \/ interconnection run interrupted/);
 });
 
+await check("a stage HELD on a missing box alerts once, in our words, before any run; same gaps again send nothing; new gaps send once (#551)", async () => {
+  hooks.length = 0;
+  // A recipe that types the homeowner email (the fixture has none) under a portal label of its own.
+  const PORTAL_LABEL = "Owner Electronic Mail - Quillfeather";
+  fx.completeRecipe([...fx.fills(2), { action: "fill", selector: { label: PORTAL_LABEL }, field: "homeownerEmail", note: PORTAL_LABEL } as never, fx.REVIEW, fx.FINAL]);
+  const pid = newProject();
+  let launched = 0;
+  fx.stubRunner(async () => { launched++; return fx.failingStep("must not run"); });
+  const refused = await repo.prepareSubmission(db, pid, "building").catch((e) => e) as { status?: number };
+  assert.equal(refused?.status, 409, "the stage gate must refuse");
+  assert.equal(launched, 0, "a browser opened");
+  await settle();
+  const mine = rows("project_id = ? AND kind = 'stage_held'", [pid]);
+  assert.equal(mine.length, 1, JSON.stringify(rows("project_id = ?", [pid])));
+  assert.equal(mine[0].ref, `${pid}:building`);
+  assert.equal(mine[0].state, "field:homeownerEmail");
+  assert.equal(mine[0].delivery_status, "sent", mine[0].delivery_detail);
+  assert.equal(rows("project_id = ? AND kind = 'run'", [pid]).length, 0, "no run row, so no run alert");
+  const h = hooks.filter((x) => x.path === "/staff");
+  assert.equal(h.length, 1);
+  assert.match(h[0].title, /needs you: Building permit staging held, details missing/);
+  assert.match(h[0].body, /Homeowner email \(project\)/, h[0].body);
+  assert.match(h[0].body, /intake link/);
+  assert.ok(!h[0].body.includes("Quillfeather") && !h[0].body.includes("Electronic Mail"), `the portal's recorded label leaked: ${h[0].body}`);
+  // The same refusal again (a retry, the next Autopilot pass): nothing new.
+  await repo.prepareSubmission(db, pid, "building").catch((e) => e);
+  await settle();
+  assert.equal(rows("project_id = ? AND kind = 'stage_held'", [pid]).length, 1, "a retry of the same refusal alerted again");
+  // A different set of gaps is news.
+  await sa.alertStaffOnStageHeld(db, { projectId: pid, track: "building", gaps: [
+    { kind: "field", key: "homeownerEmail", fieldName: "Homeowner email", where: "project" },
+    { kind: "field", key: "ccbLicenseNumber", fieldName: "CCB / contractor licence number", where: "client" },
+  ] });
+  const after = rows("project_id = ? AND kind = 'stage_held'", [pid]);
+  assert.equal(after.length, 2);
+  assert.equal(after[1].state, "field:ccbLicenseNumber,field:homeownerEmail");
+  assert.match(after[1].body, /CCB \/ contractor licence number \(client record\)/);
+  // No gaps: nothing.
+  await sa.alertStaffOnStageHeld(db, { projectId: pid, track: "building", gaps: [] });
+  assert.equal(rows("project_id = ? AND kind = 'stage_held'", [pid]).length, 2);
+  fx.completeRecipe(); // back to the suite's every-box-filled recipe
+});
+
 let statusProject = "";
 await check("a status CHANGE alerts once in our own words; a re-poll of it sends nothing", async () => {
   statusProject = newProject();

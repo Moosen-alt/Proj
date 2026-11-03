@@ -76,7 +76,7 @@ import { findCompleteRecipeForProject, findAnyRecipeForProject, resolveRecipeFie
 import { notServedInResult } from "../../shared/src/portalNotServed";
 import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier";
 import { notifyClientOfFiling } from "./clientFilingUpdate";
-import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStatusChange, alertStaffOnUnmatchedCorrectionEmail } from "./staffAlerts";
+import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStageHeld, alertStaffOnStatusChange, alertStaffOnUnmatchedCorrectionEmail } from "./staffAlerts";
 import { installerHandoffNoteBody, sendInstallerHandoff } from "./installerHandoff";
 // detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget; the
 // card's Edit (updatePermitCheckTarget) re-detects with the same function when the URL changes.
@@ -98,7 +98,7 @@ import { STAGE_COUNT, stageForStatus, isBlockedProject } from "./projectStage";
 import { compactNextStep, decideNextStep, loadNextStepFacts, withoutCodeResearch } from "./nextStep";
 import { correctionHoldScope, criticalFieldHoldScope, findingHoldScope, GATE_TRACKS, scopeHoldsTrack, tracksHeld, type GateHoldScope } from "./gateScope";
 import { addAuditLog } from "./audit";
-import { clientLicenceRow, clientStagingOverlay, contractorLicenceForState, getClient, stagingIdentityPortal } from "./clients";
+import { clientLicenceRow, clientStagingOverlay, contractorLicenceForState, getClient, stagingIdentityDisagreement, stagingIdentityPortal } from "./clients";
 import { planSetLicenceWarning } from "./clientMatch";
 import { assertSubmissionPaid } from "./submissionFees";
 import { snapshotFilingQuote } from "./feeAccuracy";
@@ -9521,23 +9521,30 @@ export async function prepareSubmission(
   // apply a "mock" row everywhere. `portalType` itself is untouched: it still keys the credential
   // lookup and the browser profile directory. The value dictionary below is resolved with the same
   // key, so the replay, the planner and the hand-coded adapters all read one identity.
-  const identityPortal = stagingIdentityPortal({
-    urls: [
-      recipe ? (recipe as { portalUrl?: string }).portalUrl : "",
-      learnEntryUrl({
-        track,
-        learnedProfileUrl: permitSafeUrl(learnedProfile && (learnedProfile as { portalUrl?: string }).portalUrl),
-        recipeUrl: recipe ? (recipe as { portalUrl?: string }).portalUrl : "",
-        draftUrl: draftRecipe ? draftRecipe.portalUrl : "",
-        utilityUrl: utilityPortalUrl,
-        ahjUrl: ahjPortalUrl,
-        statewideUrl: statewidePortalUrl,
-      }),
-      credentialUrl,
-    ],
-    profilePortalType: portalType,
-    isRealPortal,
-  });
+  const identityUrls = [
+    recipe ? (recipe as { portalUrl?: string }).portalUrl : "",
+    learnEntryUrl({
+      track,
+      learnedProfileUrl: permitSafeUrl(learnedProfile && (learnedProfile as { portalUrl?: string }).portalUrl),
+      recipeUrl: recipe ? (recipe as { portalUrl?: string }).portalUrl : "",
+      draftUrl: draftRecipe ? draftRecipe.portalUrl : "",
+      utilityUrl: utilityPortalUrl,
+      ahjUrl: ahjPortalUrl,
+      statewideUrl: statewidePortalUrl,
+    }),
+    credentialUrl,
+  ];
+  const identityPortal = stagingIdentityPortal({ urls: identityUrls, profilePortalType: portalType, isRealPortal });
+  // THE URLS DISAGREE, SO NO IDENTITY ROW APPLIED (Helm review of #527): said once per staging run,
+  // naming the hosts, so an operator who set the row can see why it did nothing.
+  {
+    const disagree = identityPortal ? null : stagingIdentityDisagreement(identityUrls);
+    if (disagree) {
+      logger.warn("client-identity", "the portal URLs this run could open name different portals, so no client portal identity row applied (the company is the client's legal name and no contact code is used)", {
+        project: detail.project.id, hosts: disagree.hosts, identityTypes: disagree.keys.map((k) => k || "(none)"),
+      });
+    }
+  }
   const overlay = clientStagingOverlay(db, detail.project.clientId, identityPortal, { state: String(detail.project.state ?? ""), track: track ?? null });
   const stagedProject = Object.keys(overlay).length > 0
     ? { ...portalProject, parserSnapshot: { ...portalProject.parserSnapshot, ...overlay } }
@@ -9868,6 +9875,9 @@ export async function prepareSubmission(
           track: track ?? "permit", recipeId: recipe.id, missing: missingRecipeInputs.map((g) => ({ kind: g.kind, key: g.key, label: g.label })),
         });
       }
+      // The team hears about it (#551): this refusal comes before any run row, so the run alert
+      // never fires, and a background Autopilot / approval run that stops here was silent.
+      void alertStaffOnStageHeld(db, { projectId, track: track ?? "permit", gaps });
       throw new HttpError(409, stageGapsRefusal(gaps, portalLabel), {
         ...(open.length ? { unansweredPortalQuestions: open } : {}),
         ...(missingRecipeInputs.length ? { missingRecipeInputs } : {}),
