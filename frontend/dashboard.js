@@ -7272,10 +7272,12 @@ function renderReview() {
 
   const project = state.detail.project || {};
   const lookup = state.inverterLookup && state.inverterLookup.projectId === project.id ? state.inverterLookup : null;
-  // Open portal questions a pending run note names (the backend's label match), by note id.
+  // Open portal questions a pending run note names (the backend's label match), by note id. A question
+  // a pending item already asks is asked there once; a note naming it stays a note.
+  const askedKeys = new Set(pending.filter((x) => x.portalQuestion && x.portalQuestion.key).map((x) => x.portalQuestion.key));
   const noteQuestions = {};
   for (const q of (state.portalQuestions && state.portalQuestions.questions) || []) {
-    if (!q || !q.key || !Array.isArray(q.noteItemIds) || !Array.isArray(q.options) || q.options.length < 2) continue;
+    if (!q || !q.key || askedKeys.has(q.key) || !Array.isArray(q.noteItemIds) || !Array.isArray(q.options) || q.options.length < 2) continue;
     for (const noteId of q.noteItemIds) noteQuestions[String(noteId)] = { key: q.key, label: q.label, options: q.options, control: "choice" };
   }
   const ctx = { project, snapshot: project.parserSnapshot || {}, inverterLookup: lookup, noteQuestions };

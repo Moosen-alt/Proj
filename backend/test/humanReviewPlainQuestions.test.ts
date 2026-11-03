@@ -186,6 +186,9 @@ check("N none of the agent's engineering text", !/systemOwnership|planner|\bbind
 check("N a note the backend did not name stays a note", !/type="radio"/.test(otherNote) && /data-review-action="reject"/.test(otherNote) && /third-party inspector/.test(otherNote), otherNote);
 const [resolvedNote = ""] = render([{ ...legacy, status: "rejected" }], {}, null, PQ);
 check("N a dismissed note is not re-asked", !/type="radio"/.test(resolvedNote), resolvedNote);
+const both = render([question, legacy], {}, null, PQ);
+check("N a question a pending item already asks is asked once (the note naming it stays a note)",
+  both.length === 2 && /type="radio"/.test(both[0]) && !/type="radio"/.test(both[1]) && /data-review-action="reject"/.test(both[1]), both.join("\n----\n"));
 
 console.log("\n[I] the inverter item is one card");
 const inputValue = (html: string, idPrefix: string): string | null => {
