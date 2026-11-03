@@ -9,6 +9,7 @@ import { openPortal } from "../browser";
 import { selectWithFallback, readClosedComboboxOptions } from "../comboboxFill";
 import { assertFilerIdentityHeld, FilerIdentityStop, filerIdentityFieldForSelect, filerIdentityStopMessage, selectFilerIdentity } from "../filerIdentitySelect";
 import { detectChallengeFrame, frameSelectorFor, maskId, readbackMatches, redactCaptureText, redactStatusText, safeAction, sleep, smartWait, waitForElement, waitForInteractiveControls } from "../safeAction";
+import { secretMaskPatterns, tagSecretsInPage } from "../secretMask";
 import { applyFormatHint } from "../formatHint";
 import { scrapeReviewScreen as scrapeReviewScreenShared } from "../reviewScreenScraper";
 import { performLogin, lastRevealTrail, loginFormPresent, holdForPerson } from "./loginFlow";
@@ -9882,66 +9883,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   private async withSecretMask<T>(why: string, take: (mask: Locator[] | undefined) => Promise<T>): Promise<T | undefined> {
     const secrets = this.knownSecrets();
     if (!secrets.length || !this.page || typeof this.page.evaluate !== "function") return take(undefined);
-    const pats = secrets.map((s) => {
-      const digits = s.replace(/\D/g, "");
-      return digits.length >= 5 ? { digits, literal: "" } : { digits: "", literal: s.toLowerCase() };
-    }).filter((p) => p.digits || p.literal.length >= 4);
+    // THE ONE TAGGER (secretMask.ts), shared with the staged review picture (#436): moved there unchanged.
+    const pats = secretMaskPatterns(secrets);
     let tagged = 0;
     let tagOk = true;
     try {
-      // Plain loops only: a function DECLARED inside an evaluated body needs the __name shim.
-      tagged = Number(await this.page.evaluate((ps: Array<{ digits: string; literal: string }>) => {
-        let n = 0;
-        // A box holding one (typed here, or pre-filled by the portal).
-        for (const el of Array.from(document.querySelectorAll("input, textarea"))) {
-          const v = String((el as HTMLInputElement).value || "");
-          if (!v) continue;
-          const vd = v.replace(/\D/g, "");
-          const vl = v.toLowerCase();
-          for (const p of ps) {
-            if ((p.digits && vd.indexOf(p.digits) >= 0) || (p.literal && vl.indexOf(p.literal) >= 0)) { el.setAttribute("data-al-secret", "1"); n++; break; }
-          }
-        }
-        // Text rendering one (a review page's "Account: 7734009155"). Most pages carry none, so
-        // the whole-body check keeps the element walk off the common path.
-        const bt = String(document.body ? document.body.textContent || "" : "");
-        const btd = bt.replace(/\D/g, "");
-        const btl = bt.toLowerCase();
-        let textHas = false;
-        for (const p of ps) {
-          if ((p.digits && btd.indexOf(p.digits) >= 0) || (p.literal && btl.indexOf(p.literal) >= 0)) { textHas = true; break; }
-        }
-        if (!textHas) return n;
-        for (const el of Array.from(document.querySelectorAll("body *"))) {
-          const tag = el.tagName;
-          if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT" || tag === "INPUT" || tag === "TEXTAREA") continue;
-          const text = String(el.textContent || "");
-          if (!text) continue;
-          const td = text.replace(/\D/g, "");
-          const tl = text.toLowerCase();
-          let hit = false;
-          for (const p of ps) {
-            if ((p.digits && td.indexOf(p.digits) >= 0) || (p.literal && tl.indexOf(p.literal) >= 0)) { hit = true; break; }
-          }
-          if (!hit) continue;
-          // The SMALLEST element carrying the whole secret: skip an ancestor when a child element
-          // carries it too (masking <body> would blank the whole picture).
-          let childCarries = false;
-          for (const c of Array.from(el.children)) {
-            const ct = String(c.textContent || "");
-            const cd = ct.replace(/\D/g, "");
-            const cl = ct.toLowerCase();
-            for (const p of ps) {
-              if ((p.digits && cd.indexOf(p.digits) >= 0) || (p.literal && cl.indexOf(p.literal) >= 0)) { childCarries = true; break; }
-            }
-            if (childCarries) break;
-          }
-          if (childCarries) continue;
-          el.setAttribute("data-al-secret", "1");
-          n++;
-        }
-        return n;
-      }, pats));
+      tagged = await tagSecretsInPage(this.page, pats);
     } catch {
       tagOk = false;
     }

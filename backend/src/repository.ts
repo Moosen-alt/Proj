@@ -118,7 +118,9 @@ import { isPortalPaused } from "./portalPause";
 // The ONE creator of permit_check_targets rows (extracted from markTrackSubmitted).
 // Direction matters: submittalTracks must never import repository — jobQueue statically
 // imports repository, and the circular-import guard in CLAUDE.md is about that edge.
-import { ensureCheckTarget, refuseUtilityUrlOnPermitTarget, getSubmittalTracks, isTrackDone, requiredTracks, SUBMITTAL_TRACK_TYPES, trackHasFiling, trackPermitTypes, unfinishedTracks, unfinishedUnattributedTargets } from "./submittalTracks";
+import { ensureCheckTarget, refuseUtilityUrlOnPermitTarget, getSubmittalTracks, isTrackDone, requiredTracks, SUBMITTAL_TRACK_TYPES, trackHasFiling, trackPermitTypes, trackSubmittedAndTracked, trackSubmittedSentence, unfinishedTracks, unfinishedUnattributedTargets } from "./submittalTracks";
+import { recordStagedReview, supersedeStagedReviews, takeStagedReviewCapture } from "./stagedReviews";
+import { projectSecretValues } from "./projectSecrets";
 import { recordTimelineSample, trackForTarget } from "./timelineSamples";
 import { buildApplicationDocumentPackage, findApplicationProfile } from "./applicationDocs";
 import { ensurePlanSetSplit } from "./docSplitter";
@@ -8987,29 +8989,13 @@ export async function prepareSubmission(
   // run row ended up saying: a submissions row 'submitted_unconfirmed', a run whose result reports
   // the click (08909df6 / 5864e8ef clicked and were recorded 'failed', and the second filing went
   // through), or a portal.auto_submitted audit row for the track.
+  // #436 RULING 5: those three readings now live in submittalTracks.trackFilingOnRecord, and the ONE
+  // predicate — trackSubmittedAndTracked — adds the track's tracking card holding the filing's
+  // number. The Stage route asks it before an approval is minted, and the track card shows it beside
+  // a held Stage; here it is asked again before anything opens. A staged draft is never it.
   const filedOn = (t: string): Row | null => {
-    const family = trackFamily(t);
-    const ph = family.map(() => "?").join(", ");
-    return db.get<Row>(
-      `SELECT permit_number, application_number, submitted_at, status AS via FROM submissions
-        WHERE project_id = ? AND permit_type IN (${ph}) AND status IN ('submitted', 'submitted_unconfirmed')
-        ORDER BY submitted_at DESC LIMIT 1`,
-      [projectId, ...family],
-    ) ?? db.get<Row>(
-      `SELECT '' AS permit_number, '' AS application_number, started_at AS submitted_at, 'automation_click' AS via FROM portal_runs
-        WHERE project_id = ? AND permit_type IN (${ph})
-          AND (status IN ('submitted', 'submitted_unconfirmed')
-            OR json_extract(result_json, '$.finalSubmitClicked') = 1
-            OR json_extract(result_json, '$.finalSubmitClickedByAutomation') = 1)
-        ORDER BY started_at DESC LIMIT 1`,
-      [projectId, ...family],
-    ) ?? db.get<Row>(
-      `SELECT '' AS permit_number, '' AS application_number, created_at AS submitted_at, 'automation_click' AS via FROM audit_logs
-        WHERE project_id = ? AND action = 'portal.auto_submitted'
-          AND COALESCE(json_extract(details, '$.track'), 'permit') IN (${ph})
-        ORDER BY created_at DESC LIMIT 1`,
-      [projectId, ...family],
-    );
+    const e = trackSubmittedAndTracked(db, projectId, t as SubmittalTrackType, required as SubmittalTrackType[]);
+    return e ? { permit_number: e.number, application_number: "", submitted_at: e.at, via: e.via } : null;
   };
   // A STAGED DRAFT THAT A CORRECTION CAME AFTER IS SUPERSEDED, NOT A CONFLICT. A project staged
   // (never filed) and then corrected — a reviewer or designer caught something before the human
@@ -9057,14 +9043,11 @@ export async function prepareSubmission(
       { track: track ?? "permit", runInFlight: text(inFlightAtEntry.id) });
   }
   if (track) {
-    const filed = filedOn(track);
-    if (filed) {
-      const num = filedNumber(filed);
-      throw new HttpError(409,
-        `The ${track} track is already filed as ${num}${filedWhen(filed)}. `
-        + "Staging it again would open a duplicate application with the jurisdiction. "
-        + "Withdraw the existing filing first if it needs to be replaced.",
-        { track, permitNumber: num, submittedAt: filed.submitted_at ?? null });
+    const filedEvidence = trackSubmittedAndTracked(db, projectId, track, required as SubmittalTrackType[]);
+    if (filedEvidence) {
+      const num = filedNumber({ permit_number: filedEvidence.number, application_number: "", via: filedEvidence.via });
+      throw new HttpError(409, trackSubmittedSentence(filedEvidence),
+        { track, permitNumber: num, submittedAt: filedEvidence.at, submittedAndTracked: filedEvidence.via });
     }
   } else {
     const found = footprint.map((t) => {
@@ -9889,6 +9872,9 @@ export async function prepareSubmission(
   // What the replay-failure classifier decided about the recipe, for the run's own message.
   let replayVerdictNote = "";
   let replayBinding: ReturnType<typeof bindRecipeForReplay> | null = null;
+  // #436 PR1 — which recipe (and which exact steps) a plain NEM replay read its staged draft with. Set
+  // only on that branch; the reading itself is taken off the in-memory result below, never result_json.
+  let stagedReviewFor: { recipeId: string; stepsSignature: string } | null = null;
   // THE RUN ROW EXISTS BEFORE THE BROWSER OPENS (A3). Until now it was written only after the
   // adapter returned: 4 of 7 interrupted production jobs left no record of an application the
   // portal may already have created, and a re-stage opened a duplicate draft. 'running' names
@@ -9903,6 +9889,9 @@ export async function prepareSubmission(
     runId, projectId, portalProfileId: safePortalProfileId, startedAt: ts, permitType: track ?? "permit",
     actor: runActorLabel, recipeId: recipe?.id ?? null, recipeVersion: recipe?.version ?? null,
   });
+  // #436 PR1 — A NEW RUN ON THE TRACK SUPERSEDES ITS STAGED REVIEWS NOW, whatever this run ends as: the
+  // draft may change under it, so no earlier reading of it still describes the portal.
+  supersedeStagedReviews(db, projectId, track ?? "permit", runId);
   // EVERY STAGING BROWSER LAUNCH IS A POSSIBLE DRAFT ON A REAL ACCOUNT, WRITTEN DOWN BEFORE IT OPENS
   // (dryrun-0928 B11). Only the learn and the benchmark wrote the draft ledger, so a clean project's
   // building and electrical replays left two drafts on Oregon ePermitting that the list a company is
@@ -10021,7 +10010,12 @@ export async function prepareSubmission(
       const draftSubmitStamp = ownStamp && boundStampIdx >= 0 && boundStampIdx === replayBinding.steps.length - 1
         ? { ...ownStamp, stepIndex: boundStampIdx }
         : null;
-      const replayOptions = { ...stageOptions, draftSubmitStamp };
+      // #436 PR1 — A PLAIN NEM STAGE READS ITS STAGED DRAFT FOR THE REVIEW DIGEST (portal-bot
+      // reviewDigest.ts), never an approved run (that run files on its own gate). The project's secrets
+      // go along so the masked picture and every label blank them. Nothing clicks on the reading.
+      const stagedReview = track === "nem" && !resolvedAutoSubmit ? { secrets: projectSecretValues(stagedProject) } : null;
+      if (stagedReview) stagedReviewFor = { recipeId: recipe.id, stepsSignature: replayStepsSig };
+      const replayOptions = { ...stageOptions, draftSubmitStamp, stagedReview };
       ledgerStagingLaunch(`staging replay (${track ?? "permit"} track, run ${runId})`, String(recipe.portalUrl || credentialUrl || ""));
       result = await recipeStageRunner(boundRecipe, stagedProject, boundValues, docsByType, files, replayOptions);
 
@@ -10380,6 +10374,10 @@ export async function prepareSubmission(
   // transaction — never 'failed': production runs 08909df6 and 5864e8ef clicked the submit and
   // were recorded failed with no submission, so the duplicate guard let a second filing through.
   try {
+    // #436 PR1 — THE STAGED DRAFT'S REVIEW DIGEST LEAVES THE RESULT HERE, before anything persists it:
+    // taken off the in-memory result (and every step's data), so result_json never carries it. The
+    // one writer below records it from this object only.
+    const stagedCapture = takeStagedReviewCapture(result);
     const outcome = derivePortalRunOutcome(result);
     const pauseReason = outcome.pauseReason;
     const clicked = outcome.finalSubmitClicked;
@@ -10484,6 +10482,16 @@ export async function prepareSubmission(
           asJson({ ...result, actor: runActorLabel, harnessAbort: outcome.harnessAbort || undefined, submissionVerdict: outcome.submissionVerdict ?? undefined, borrowedRecipe: borrowedRecord, packagedDocTypes: Object.keys(docsByType) }),
           pauseReason, runId],
       );
+
+      // #436 PR1 — THE STAGED REVIEW ROW, from the in-memory reading only (the one writer): a plain NEM
+      // replay that ended staged at review, nothing clicked. Nothing reads it to click (Approve on a
+      // staged draft stays held); the card shows the picture and what the pages say.
+      if (stagedCapture && stagedReviewFor && track === "nem" && runStatus === "awaiting_human_submit" && !clicked) {
+        recordStagedReview(db, {
+          runId, projectId, track: "nem", recipeId: stagedReviewFor.recipeId, stepsSignature: stagedReviewFor.stepsSignature,
+          capture: stagedCapture, secrets: projectSecretValues(stagedProject),
+        });
+      }
 
       db.run(
         `INSERT INTO submissions

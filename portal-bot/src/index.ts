@@ -313,6 +313,10 @@ interface StageOptions {
    *  passed for the NEM track's own recipe only and only when the replayed steps are exactly the
    *  ones it was signed over. Never an approval to file, and never read by the final-submit gate. */
   draftSubmitStamp?: import("./draftSubmitGate").DraftCreatingStamp | null;
+  /** #436 PR1 — read the staged draft for its review digest at the review stop (RecipeAdapter
+   *  stagedReview; reviewDigest.ts). The backend passes it on a plain NEM recipe stage only. The
+   *  capture comes back as the result's top-level `stagedReview`, in memory, for the one writer. */
+  stagedReview?: { secrets: string[]; gapMs?: number } | null;
 }
 
 // Headed, guided-manual staging leaves the browser OPEN at the review screen so the human
@@ -607,6 +611,9 @@ async function runAdapter(
     // records and never reads as a filing.
     const draftCreatedByReplay = steps.map((s) => s?.data?.draftCreatedByReplay).find((d) => d && typeof d === "object") ?? null;
     const draftSubmitUnexpected = steps.map((s) => s?.data?.draftSubmitUnexpected).find((d) => d && typeof d === "object") ?? null;
+    // #436 PR1 — THE STAGED DRAFT'S REVIEW DIGEST, off the adapter itself (never a step's data): the
+    // backend's one writer records it from this in-memory result and keeps it out of result_json.
+    const stagedReview = (adapter as { stagedReviewCapture?: unknown }).stagedReviewCapture;
 
     // Leave the browser OPEN for the human ONLY when: this is a guided-manual run (no
     // autosubmit), it's headed (the human is watching), it staged cleanly to review, and we
@@ -665,6 +672,7 @@ async function runAdapter(
       ...(existingDraft ? { existingDraft } : {}),
       ...(draftCreatedByReplay ? { draftCreatedByReplay } : {}),
       ...(draftSubmitUnexpected ? { draftSubmitUnexpected } : {}),
+      ...(stagedReview && typeof stagedReview === "object" ? { stagedReview } : {}),
       evidenceDir,
       outcomeShotPath,
       pauseReason: stepPause,
@@ -733,6 +741,7 @@ export async function stageWithRecipe(
     draftSubmitStamp: options.draftSubmitStamp ?? null,
     // The review page is handed to a person only when this caller watches for their submit (#333).
     handOverReview: typeof options.onSubmitCaptured === "function",
+    stagedReview: options.stagedReview ?? null,
   }), project, files, options));
 }
 

@@ -19,10 +19,12 @@ import type {
   PermitCheckOutcome,
   ProjectRecord,
   StageDetail,
+  StagedReviewView,
   SubmittalTrack,
   SubmittalTrackStatus,
   SubmittalTrackType,
 } from "../../shared/src/types";
+import { latestStagedReview, stagedReviewView } from "./stagedReviews";
 import { findApplicationProfile, describePermitType, permitStructureAnswer, permitStructureIsCitedOrVerified, type PermitPrerequisiteStep, type PermitStructureAnswer } from "./applicationDocs";
 import { findAhjProcessProfile, jurisdictionKind, jurisdictionKindsCompatible } from "./processProfiles";
 import { findAnyRecipeForProject, findCompleteRecipeForProject } from "./portalRecipes";
@@ -89,6 +91,13 @@ export interface SubmittalTrackView extends SubmittalTrack {
   channelBasis?: string;
   /** Battery jobs only (#246): the fire review / separate ESS permit as the records on file say it. */
   essStep?: EssPermitStep;
+  /** #436 PR1 — NEM only, while the track is staged: the newest staged review the server holds (the
+   *  masked picture of the review page, and what the draft's pages show). Shown beside Approve,
+   *  which stays held exactly as #449 holds it. null = none recorded. */
+  stagedReview?: StagedReviewView | null;
+  /** #436 ruling 5 — why Stage (and Approve & auto-submit) is refused on this track: it is already
+   *  submitted and tracked (trackSubmittedAndTracked). Absent when Stage may run. */
+  stageBlocked?: string;
 }
 
 /** Every submittal track, derived from the label Record so it cannot go stale: adding a
@@ -486,6 +495,99 @@ export function isTrackDone(db: AppDb, projectId: string, track: SubmittalTrackT
   return pool.every((r) => targetFinishedTrack(db, track, r));
 }
 
+/**
+ * A FILING ON RECORD FOR THIS TRACK — the duplicate guard's three readings (A3), moved here from
+ * prepareSubmission so the route, the job and the card ask one question: a person captured it
+ * (submissions 'submitted'), automation clicked the final submit whatever the run row ended up
+ * saying (a 'submitted_unconfirmed' submission, a run whose result reports the click), or a
+ * portal.auto_submitted audit row for the track. By track family (trackPermitTypes). A read.
+ */
+export function trackFilingOnRecord(db: AppDb, projectId: string, track: SubmittalTrackType | string): Record<string, unknown> | null {
+  const family = trackPermitTypes(track as SubmittalTrackType);
+  const ph = family.map(() => "?").join(", ");
+  return db.get<Row>(
+    `SELECT permit_number, application_number, submitted_at, status AS via FROM submissions
+      WHERE project_id = ? AND permit_type IN (${ph}) AND status IN ('submitted', 'submitted_unconfirmed')
+      ORDER BY submitted_at DESC LIMIT 1`,
+    [projectId, ...family],
+  ) ?? db.get<Row>(
+    `SELECT '' AS permit_number, '' AS application_number, started_at AS submitted_at, 'automation_click' AS via FROM portal_runs
+      WHERE project_id = ? AND permit_type IN (${ph})
+        AND (status IN ('submitted', 'submitted_unconfirmed')
+          OR json_extract(result_json, '$.finalSubmitClicked') = 1
+          OR json_extract(result_json, '$.finalSubmitClickedByAutomation') = 1)
+      ORDER BY started_at DESC LIMIT 1`,
+    [projectId, ...family],
+  ) ?? db.get<Row>(
+    `SELECT '' AS permit_number, '' AS application_number, created_at AS submitted_at, 'automation_click' AS via FROM audit_logs
+      WHERE project_id = ? AND action = 'portal.auto_submitted'
+        AND COALESCE(json_extract(details, '$.track'), 'permit') IN (${ph})
+      ORDER BY created_at DESC LIMIT 1`,
+    [projectId, ...family],
+  );
+}
+
+/** #436 ruling 5 — what makes a track SUBMITTED AND TRACKED, by name. */
+export interface TrackSubmittedEvidence {
+  track: SubmittalTrackType;
+  /** 'submitted' / 'submitted_unconfirmed' / 'automation_click': a filing on record (trackFilingOnRecord);
+   *  'tracking_card': the track's tracking card holds the filing's number. */
+  via: "submitted" | "submitted_unconfirmed" | "automation_click" | "tracking_card";
+  /** The filing's number ("" when automation clicked and nothing was captured). */
+  number: string;
+  at: string | null;
+}
+
+/**
+ * #436 RULING 5 (owner 2026-11-03, "b, let it run" — except once submitted and tracked): IS THIS
+ * TRACK ALREADY SUBMITTED AND TRACKED? The ONE predicate the Stage route (a 409 before an approval is
+ * minted), prepareSubmission (the job, before anything opens) and the track card (the reason beside a
+ * held Stage) all read. Either a filing is on record for the track (trackFilingOnRecord), or its
+ * tracking card holds the filing's number: the tracking target that speaks for the track — its own
+ * tagged target, or an untagged one ONLY when this is the one track drawing on that pool (on a
+ * multi-permit project one unattributed number cannot be pinned on building rather than
+ * electrical, isTrackDone's rule) — carries an application or permit number.
+ *
+ * NOT a reason to refuse: a staged draft awaiting approval (an awaiting_human_submit submission —
+ * whose row can hold the draft's own number: it is never read here). A plain Stage over it runs.
+ * A read: writes nothing.
+ */
+export function trackSubmittedAndTracked(db: AppDb, projectId: string, track: SubmittalTrackType, required: readonly SubmittalTrackType[] = [track]): TrackSubmittedEvidence | null {
+  const filed = trackFilingOnRecord(db, projectId, track);
+  if (filed) {
+    const via = s(filed.via);
+    return {
+      track,
+      via: via === "submitted" || via === "submitted_unconfirmed" ? via : "automation_click",
+      number: s(filed.permit_number) || s(filed.application_number),
+      at: s(filed.submitted_at) || null,
+    };
+  }
+  const judged = Array.from(new Set([...required, track]));
+  const { own, pool, poolDemand } = trackTargets(db, projectId, track, judged);
+  const numberOf = (r: Row | null): string => (r ? s(r.application_number).trim() || s(r.permit_number).trim() : "");
+  const card = own ? (numberOf(own) ? own : null) : (poolDemand <= 1 ? pool.find((r) => numberOf(r)) ?? null : null);
+  if (!card) return null;
+  return { track, via: "tracking_card", number: numberOf(card), at: s(card.created_at) || null };
+}
+
+/** The refusal a Stage of a submitted-and-tracked track reads (the route's 409, the job's, the card). */
+export function trackSubmittedSentence(e: TrackSubmittedEvidence): string {
+  const when = e.at ? ` on ${e.at.slice(0, 10)}` : "";
+  if (e.via === "tracking_card") {
+    return `The ${e.track} track is already submitted and tracked: its tracking card holds ${e.number}${when}. `
+      + "Staging it again would open a duplicate application with the jurisdiction. "
+      + "Withdraw the existing filing first if it needs to be replaced.";
+  }
+  const num = e.number
+    || (e.via !== "submitted"
+      ? "(no number captured — automation clicked the final submit and the portal did not confirm it; verify on the portal)"
+      : "(no number captured)");
+  return `The ${e.track} track is already filed as ${num}${when}. `
+    + "Staging it again would open a duplicate application with the jurisdiction. "
+    + "Withdraw the existing filing first if it needs to be replaced.";
+}
+
 /** Does this track have a TRACKED filing — its own tagged target, or pool targets it draws on?
  *  (A required track with none is unknown, not "in review": nobody has told us it was filed.) */
 export function trackHasFiling(db: AppDb, projectId: string, track: SubmittalTrackType, required: readonly SubmittalTrackType[]): boolean {
@@ -801,6 +903,9 @@ export function getSubmittalTracks(db: AppDb, project: ProjectRecord): Submittal
     const state = readTrackState(db, project.id, type, required);
     const status = deriveStatus(state);
     const category = categoryFor(type);
+    // #436 RULING 5: the reason the card holds Stage — the same predicate the route and the job refuse on.
+    const submittedEvidence = trackSubmittedAndTracked(db, project.id, type, required);
+    const stageBlocked = submittedEvidence ? trackSubmittedSentence(submittedEvidence) : "";
     // A PERMIT CARD IS ITS ISSUER'S (split issuer): channel, recipe and portal on file are the agency
     // that issues THIS track's permit — the same view staging stages with (projectForTrack; the
     // project itself when that is the project AHJ). The utility card: the project.
@@ -945,8 +1050,17 @@ export function getSubmittalTracks(db: AppDb, project: ProjectRecord): Submittal
       ...(stageGaps.length ? { stageGaps } : {}),
       ...(type === "nem" ? { signatureRequest } : {}),
       ...(issuer ? { issuer } : {}),
+      // #436 PR1: the staged draft's review (NEM, while staged), and ruling 5's Stage block.
+      ...(type === "nem" && status === "staged" ? { stagedReview: stagedReviewViewFor(db, project.id) } : {}),
+      ...(stageBlocked ? { stageBlocked } : {}),
     };
   });
+}
+
+/** The card's staged review (a read: writes nothing). */
+function stagedReviewViewFor(db: AppDb, projectId: string): StagedReviewView | null {
+  const row = latestStagedReview(db, projectId, "nem");
+  return row ? stagedReviewView(row) : null;
 }
 
 /**

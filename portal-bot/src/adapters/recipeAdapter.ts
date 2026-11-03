@@ -1,6 +1,9 @@
 import fs from "fs";
 import path from "path";
-import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep } from "../../../shared/src/types";
+import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep, StagedReviewCapture } from "../../../shared/src/types";
+import { buildStagedReviewCapture, countRecordedControl, openPlaywrightDigestNavigator, unapprovableStagedReview, walkStagedDraft } from "../reviewDigest";
+import { maskedFullPageScreenshot } from "../secretMask";
+import { stagedReviewShotsDir } from "../../../backend/src/statePaths";
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, ok, fail, type PortalContext, type PortalStepResult } from "../adapter";
 import { applyFormatHint } from "../formatHint";
 import { extractRecordNumber, pageConfirmsSubmission, recordNumberCandidates, RECORD_NUMBER_TIERS } from "../recordNumber";
@@ -1234,6 +1237,10 @@ export class RecipeAdapter extends BasePortalAdapter {
   private ledgerBefore: LedgerEntry[] | null = null;
   /** The recipe step index the loop is on — the final-submit gate's "is this the terminal step". */
   private currentStepIdx = -1;
+  /** #436 PR1 — the staged draft's review digest, read at the review stop (options.stagedReview).
+   *  IN MEMORY ONLY: runAdapter hands it to the backend's one writer; it is never part of a step's
+   *  data (result_json is not where it lives). null = not asked for, or the run did not stop at review. */
+  stagedReviewCapture: StagedReviewCapture | null = null;
   /** The step whose selector resolveLocator is resolving right now (for disambiguation). */
   private resolvingStep: RecipeStep | null = null;
   /** Every click/press/goto the chokepoint refused this run, in order. */
@@ -1277,6 +1284,13 @@ export class RecipeAdapter extends BasePortalAdapter {
        *  function; the learn self-test, the cross-project replay, the benchmark and the correction /
        *  status constructions never hand over, so a click in their tail is held as on main. */
       handOverReview?: boolean;
+      /** #436 PR1 — READ THE STAGED DRAFT FOR ITS REVIEW DIGEST at the review stop (reviewDigest.ts):
+       *  every step page, read-only, in a separate page of this context, before the page is handed
+       *  to anyone. The backend passes it only on a plain NEM recipe stage (never an approved run).
+       *  `secrets`: the project's account / meter numbers (and parser aliases) the masked picture and
+       *  every label blank. Nothing is clicked on it; any failure is an unapprovable capture, never a
+       *  failed Stage. */
+      stagedReview?: { secrets: string[]; gapMs?: number } | null;
     } = {},
   ) {
     super();
@@ -3699,6 +3713,18 @@ export class RecipeAdapter extends BasePortalAdapter {
     this.dischargeCoveredWarning();
     // D4: every owed document has an outcome — an owed one no attachment row carried is named.
     this.settleOwedLedger();
+    // #436 PR1 — THE STAGED DRAFT'S REVIEW DIGEST, read BEFORE the page is handed to anyone: a plain
+    // NEM stage (the backend asks), that stopped at review (not at payment, nothing clicked). The
+    // run's own last answers drain first, so the walk's GETs read what the portal saved. The walk is
+    // a separate page of this context (reviewDigest.ts): this window — the one a person submits in —
+    // is never navigated, and nothing here writes. Any failure is an unapprovable capture, never a
+    // failed or paused Stage.
+    if (this.options.stagedReview && !this.options.autoSubmit && !pastReview && !this.finalSubmitClicked && !this.stoppedAtPayment) {
+      await this.drainBeforeReviewLock();
+      const cfg = this.options.stagedReview;
+      this.stagedReviewCapture = await this.captureStagedReview(cfg).catch((e) =>
+        unapprovableStagedReview(`the staged review could not be read (${String((e as { message?: string })?.message ?? e).replace(/\s+/g, " ").slice(0, 80)})`, this.pageUrlNoHash()));
+    }
     // THE REVIEW-PAGE LOCKDOWN (filingBackstop.ts): the run's last write to the page (the final
     // re-assert and gap-fill above, which a portal autosaves on blur) is done. From here until
     // fillApplication hands the page to a person (dispose), every state-changing request is
@@ -3859,6 +3885,58 @@ export class RecipeAdapter extends BasePortalAdapter {
       + (personRequestWent
         ? ` A request from the page went through after you touched it while the stage was finishing (it may also have been the portal saving the stage's answers) — check the portal before anything else.`
         : ` Next: in the portal, finish that page (check every attachment is listed and nothing is flagged required), continue to the review page, verify every field there, then submit. Nothing was filed.`);
+  }
+
+  /** #436 PR1 — READ THE STAGED DRAFT FOR ITS REVIEW DIGEST (reviewDigest.ts is the one reader). A walk
+   *  page of this context reopens the review page by its link (a GET), reads it twice, checks it reads
+   *  as review with exactly one recorded final submit (not inside a frame), takes the MASKED picture
+   *  of it, then opens every step tab by its link and reads each twice. `this.page` is never touched. */
+  private async captureStagedReview(cfg: { secrets: string[]; gapMs?: number }): Promise<StagedReviewCapture> {
+    const page = this.page;
+    if (!page || typeof page.context !== "function" || typeof page.url !== "function") return unapprovableStagedReview("no browser page to read the staged draft from");
+    const reviewUrl = String(page.url() ?? "");
+    const secrets = Array.from(new Set([...(cfg.secrets ?? []), String(this.fieldValues.accountNumber ?? ""), String(this.fieldValues.meterNumber ?? "")]
+      .map((s) => String(s ?? "").trim()).filter((s) => s.length >= 4)));
+    const terminal = (this.recipe.steps ?? []).filter((s) => isFinalSubmitStep(s));
+    // How many pages the recipe walks: a recipe of more than one page must offer step links to compare them.
+    const expectedPages = (this.recipe.steps ?? []).filter((s) => s.action === "click" && /^advance\b/i.test(String(s.note ?? ""))).length + 1;
+    const runKey = String(this.options.runId || `run-${Date.now()}`).replace(/[^A-Za-z0-9-]/g, "").slice(0, 64) || `run-${Date.now()}`;
+    const shotPath = path.join(stagedReviewShotsDir(), `staged-review-${runKey}.png`);
+    let shot = "";
+    this.progress("wait", "Reading the staged draft's pages for the review digest (read-only)", 0);
+    const nav = await openPlaywrightDigestNavigator(page, reviewUrl);
+    const walk = await walkStagedDraft(nav, {
+      reviewUrl, gapMs: cfg.gapMs, expectedPages,
+      atReview: async () => {
+        const reasons: string[] = [];
+        const wp = nav.page;
+        await wp.evaluate(PORTAL_SAFETY_IN_PAGE_SOURCE).catch(() => null);
+        const t = await wp.evaluate((g: string) => {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const ps = (globalThis as any)[g];
+          return ps && typeof ps.terminalPageInPage === "function" ? { reviewPage: ps.terminalPageInPage().reviewPage } : {};
+        }, PORTAL_SAFETY_GLOBAL).catch(() => ({})) as { reviewPage?: boolean };
+        if (t.reviewPage === false) reasons.push("the page the Stage stopped on does not read as the portal's review step");
+        if (terminal.length !== 1) reasons.push(terminal.length ? `the recipe has ${terminal.length} recorded final submits` : "the recipe has no recorded final submit");
+        else if ((terminal[0].selector as RecipeSelector | undefined)?.frame) reasons.push("the recorded final submit sits inside a frame");
+        else {
+          const n = await countRecordedControl(wp, terminal[0].selector as RecipeSelector);
+          if (n !== 1) reasons.push(`the recorded final submit matches ${n} controls on the review page, not exactly one`);
+        }
+        await fs.promises.mkdir(path.dirname(shotPath), { recursive: true }).catch(() => null);
+        const m = await maskedFullPageScreenshot(wp, secrets, shotPath);
+        if (m.ok) shot = shotPath;
+        else reasons.push(m.why);
+        return reasons;
+      },
+    });
+    const boundValues = Array.from(new Map((this.recipe.steps ?? [])
+      .filter((s) => typeof s.field === "string" && s.field)
+      .map((s) => [String(s.field), { key: String(s.field), value: String(this.fieldValues[String(s.field)] ?? "") }] as const)).values());
+    const uploads = this.uploadsPerformed.map((u) => ({
+      fileName: u.fileName, docType: u.docType, filePath: u.docType ? this.docsByType[u.docType] : undefined,
+    }));
+    return buildStagedReviewCapture({ walk, secrets, boundValues, uploads, screenshotPath: shot });
   }
 
   /** Binding keys the planner invented that the dictionary does not define — reported once

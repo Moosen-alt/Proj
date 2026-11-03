@@ -168,7 +168,8 @@ import {
 } from "./repository";
 import { createSignatureRequestApproval } from "./signatureRequestApproval";
 import { confirmSignatureRequestSent } from "./signatureTrack";
-import { getSubmittalTracks, markTrackSubmitted } from "./submittalTracks";
+import { getSubmittalTracks, markTrackSubmitted, requiredTracks, trackSubmittedAndTracked, trackSubmittedSentence } from "./submittalTracks";
+import { stagedReviewScreenshotFile } from "./stagedReviews";
 import { buildApprovalSheet } from "./approvalSheet";
 import { projectForTrack } from "./permitProcess";
 import { ahjProcessKnowledgeStatus, AHJ_PROCESS_REFERENCE_ENV } from "./processProfiles";
@@ -3441,6 +3442,15 @@ app.post("/api/projects/:id/prepare-submission", (req, res) => {
   // Recorded in the audit trail BEFORE the run, with the approver's identity, exactly as
   // autopilot/approve does: a filing must always be attributable to a person.
   const allowFinalSubmit = req.body?.allowFinalSubmit === true || String(req.body?.allowFinalSubmit) === "true";
+  // #436 RULING 5 (owner 2026-11-03): A TRACK ALREADY SUBMITTED AND TRACKED IS NEVER STAGED AGAIN — a
+  // filing is on record for it, or its tracking card holds the filing's number. Refused HERE, before
+  // an approval is minted or a job enqueued (the card holds Stage with the same reason, and the job
+  // asks the same predicate again). A plain Stage while a staged draft awaits approval is not this:
+  // it runs. The trackless legacy stage keeps its own refusals in the job.
+  if (track) {
+    const filed = trackSubmittedAndTracked(db, projectId, track, requiredTracks(getProjectDetail(db, projectId).project));
+    if (filed) throw new HttpError(409, trackSubmittedSentence(filed), { track, submittedAndTracked: filed.via, number: filed.number });
+  }
   // APPROVE & SUBMIT: A NAMED PERSON APPROVES THIS RUN. The approval row is the only thing that
   // lets the run click the portal's final submit (repository.maySubmitAutomatically also needs
   // PORTAL_ALLOW_FINAL_SUBMIT=1, a complete recipe and its one flagged terminal submit). The
@@ -3686,6 +3696,19 @@ app.post("/api/portal-runs/:id/mark-resubmitted", (req, res) => {
 // Save a public AHJ portal tracking URL (no login required) for a portal run or
 // permit check target. Operators paste the CapDetail / record-detail URL after
 // submission so the system can surface it for unauthenticated status checks.
+// #436 PR1 — THE STAGED REVIEW'S MASKED PICTURE. Serves ONLY the file the staged-review row names (the
+// review page with every known secret masked, inside statePaths.stagedReviewShotsDir), for a row of
+// THIS project — never portal_runs.screenshots_path (the unmasked outcome shot) and never the recipe
+// notes' fallback below (which can serve another project's picture). Under /api/projects/:id, so the
+// scope guard covers it (rule 6); another project's run, or no row, is a 404.
+app.get("/api/projects/:id/staged-reviews/:runId/screenshot", (req, res) => {
+  const file = stagedReviewScreenshotFile(db, String(req.params.id), String(req.params.runId));
+  if (!file) throw new HttpError(404, "No staged review picture for this project's run.");
+  res.setHeader("Content-Type", "image/png");
+  res.setHeader("Cache-Control", "no-store");
+  res.sendFile(file);
+});
+
 // Serve the auto-captured review-page screenshot for a portal run (or auto-learn recipe).
 app.get("/api/projects/:id/portal-runs/:runId/review-screenshot", (req, res) => {
   const projectId = String(req.params.id);
