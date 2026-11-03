@@ -43,7 +43,7 @@ import { isInformationalPageUrl, isPermitPortalUrl, isUtilityPlatformUrl, namedI
 import { utilityFilingKey } from "./utilityFilingLookup";
 import { KNOWN_POWERCLERK_PORTALS, knownPowerClerkUtility, sameUtilityEntity } from "./utilityIdentity";
 import { isVerifiedKnowledge } from "./knowledgeBase";
-import { sameEntity } from "./portalRecipes";
+import { isNotServedRecipe, sameEntity } from "./portalRecipes";
 import { addAuditLog } from "./audit";
 import { HttpError } from "./httpError";
 import { id as newId } from "./ids";
@@ -287,47 +287,99 @@ const KNOWN_PERMIT_TRACKS = new Set(["building", "electrical", "combo", "permit"
  *  own site at /s/interconnection-application). As evidence that a filing was made ELSEWHERE, either
  *  would fail open: a Salesforce site is never one here. */
 function isPositiveInterconnectionPlatform(u: string): boolean {
-  return isUtilityPlatformUrl(u) && salesforceTenantKind(u) === null;
+  // Helm's 10-18 re-check (should-fix 3): a PARSED host only. isUtilityPlatformUrl reads
+  // a scheme-less value as one raw string, so "status.cedarvale.gov/track?src=x.powerclerk.com" (a
+  // NEM tracking URL saved verbatim) "ended with" a platform host. Read as asPortalUrl reads it.
+  const url = asPortalUrl(u);
+  return url !== "" && isUtilityPlatformUrl(url) && salesforceTenantKind(url) === null;
 }
 
-/** EVERY PORTAL URL A UTILITY KB ROW'S portal_url HOLDS (Helm's review, S4; round 4, the S4 residue):
- *  the value split on whitespace, commas, semicolons and pipes; a piece with a scheme read as is; a
- *  scheme-less host[/path] — on ANY top-level domain ("permits.x.online/apply", "epermits.x.co/apply",
- *  which the KB route stores verbatim) — read as https; a piece that is no host at all ("N/A") names
- *  no portal. Plus the links portalUrlsInText finds in it and in the free-text portal_name. */
-function kbRowPortalUrls(portalUrl: string, portalName: string): string[] {
-  const urls: string[] = [];
-  for (const raw of portalUrl.split(/[\s,;|]+/)) {
-    const p = raw.trim().replace(/^[<("'[]+/, "").replace(/[>)"'\].]+$/, "");
-    if (!p) continue;
-    const u = /^https?:\/\//i.test(p) ? p : /^(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]+(?::\d+)?(?:[/?#]|$)/i.test(p) ? `https://${p}` : "";
-    if (portalHostOf(u)) urls.push(u);
-  }
-  return [...urls, ...portalUrlsInText(portalUrl), ...portalUrlsInText(portalName)];
+/** ONE STORED PIECE AS A PORTAL URL, or "" (round 4, the S4 residue; the 10-18 re-check, should-fix 3 and the
+ *  nit): wrappers stripped (brackets, straight and smart quotes, a trailing comma or period); a piece
+ *  with a scheme read as is; a scheme-less host[/path] — on ANY top-level domain ("permits.x.online/
+ *  apply", "epermits.x.co/apply", which the KB route stores verbatim), or a dotted-quad IPv4
+ *  ("10.20.30.40/apply") — read as https; a trailing-dot host ("permits.x.gov./apply") read without
+ *  its dot. A piece that is no host at all ("N/A", "nem@x.gov") names no portal here. */
+function asPortalUrl(raw: string): string {
+  const p = s(raw).trim().replace(/^[<("'[“”‘’«]+/, "").replace(/[>)"'\].,“”‘’»]+$/, "");
+  if (!p) return "";
+  const u = /^https?:\/\//i.test(p) ? p
+    : /^(?:(?:[a-z0-9-]+\.)+[a-z][a-z0-9-]+\.?|(?:\d{1,3}\.){3}\d{1,3})(?::\d+)?(?:[/?#]|$)/i.test(p) ? `https://${p}` : "";
+  const out = u.replace(/^(https?:\/\/[^/?#:]+)\.(?=[:/?#]|$)/i, "$1");
+  return portalHostOf(out) ? out : "";
 }
+
+/** The portal URLs a utility KB row's portal_url VALUE yields: the value split on whitespace, commas,
+ *  semicolons and pipes, each piece read by asPortalUrl (Helm's review, S4: every URL in it). */
+function kbPortalUrlField(portalUrl: string): string[] {
+  return portalUrl.split(/[\s,;|]+/).map(asPortalUrl).filter(Boolean);
+}
+
+/** EVERY PORTAL URL A UTILITY KB ROW NAMES: its portal_url (kbPortalUrlField), plus the links
+ *  portalUrlsInText finds in it ("[City portal](https://…)", "nem@cedarvale.gov") and in the
+ *  free-text portal_name. */
+function kbRowPortalUrls(portalUrl: string, portalName: string): string[] {
+  return [...kbPortalUrlField(portalUrl), ...portalUrlsInText(portalUrl), ...portalUrlsInText(portalName)];
+}
+
+/** WHAT A KB ROW'S NOTES SAY ABOUT WHERE IT IS SUBMITTED (the 10-18 re-check, should-fix 2): every "Submit
+ *  instructions:" segment (the reference import writes it as its own " | " segment) to the END of that
+ *  segment — its value may hold labels of its own ("Two paths. Inside Mallow city limits: apply
+ *  through …", "Step 1: … Step 2: …") — and every "Submission: …" sentence (research and a verify
+ *  write it) up to the label research or a verify writes NEXT, or the segment's end. */
+const SUBMISSION_NEXT_LABEL = /\b(?:Smart inverter settings|Meter aggregation|AC disconnect|Export limit|Steps|Tips):/;
+function submissionSentence(segment: string): string | null {
+  const at = /\bSubmission:\s*/.exec(segment);
+  if (!at) return null;
+  const rest = segment.slice(at.index + at[0].length);
+  const stop = rest.search(SUBMISSION_NEXT_LABEL);
+  return (stop >= 0 ? rest.slice(0, stop) : rest).trim().replace(/[.\s]+$/, "");
+}
+const noteSegmentsOf = (notes: unknown): string[] => s(notes).split(" | ").map((x) => x.trim()).filter(Boolean);
+function submissionWordsInNotes(notes: unknown): string[] {
+  const out: string[] = [];
+  for (const seg of noteSegmentsOf(notes)) {
+    const si = /\bSubmit instructions:\s*/i.exec(seg);
+    if (si) out.push(seg.slice(si.index + si[0].length));
+    const sub = submissionSentence(seg);
+    if (sub) out.push(sub);
+  }
+  return out;
+}
+/** A person's verify writes ONE segment that begins so (knowledgeBase.saveVerifiedUtilityProfile). */
+const VERIFY_SEGMENT = /^Human-verified utility NEM profile\./i;
+/** Words that name only a CHANNEL, never whose portal ("Online", "Online portal", "Email", "In
+ *  person"): no evidence against a platform (the 10-18 re-check, should-fix 1). */
+const CHANNEL_WORDS = new Set(["online", "on", "line", "web", "website", "site", "internet", "electronic", "electronically", "email", "e", "mail", "mailed", "postal",
+  "fax", "in", "person", "portal", "application", "applications", "form", "forms", "submit", "submitted", "submission", "upload", "via", "by", "through", "the", "an", "a",
+  "or", "and", "to", "at", "of", "its", "our", "their", "own", "utility", "utilities", "s", "customer", "customers"]);
 
 /** POSITIVE EVIDENCE THAT THIS UTILITY'S NEM IS FILED ON ITS OWN PLATFORM (#365): its own records —
- *  utility-keyed KB rows of ANY confidence and its utility recipes — name at least one portal, and
- *  every portal they name is a utility interconnection platform (information pages ignored). A
- *  utility that names a city's portal anywhere (a carve-out utility, verified or only seeded: the
- *  operator may have filed it there by hand), any other portal, or nothing at all: false.
+ *  utility-keyed KB rows of ANY confidence and its COMPLETE utility recipes — name at least one
+ *  portal, and every portal they name is a utility interconnection platform (information pages
+ *  ignored). A utility that names a city's portal anywhere (a carve-out utility, verified or only
+ *  seeded: the operator may have filed it there by hand), any other portal, or nothing at all: false.
  *  WHOSE records: only a STRONG match (a known identity, or the same name) is evidence FOR the
  *  platform; a row that matches only by the fuzzy entity score (portalRecipes.sameEntity) can add
  *  caution — a non-platform portal there counts the number — but never vouches for a platform.
+ *  WHICH RECIPES VOUCH (Helm's 10-18 re-check, blocker 2): only a COMPLETE one that its portal
+ *  never refused. A failed learn's stub (needs_rerecord), a paused one (recording) and a "not served
+ *  here" refusal (recordPortalNotServed, which means the opposite) record only that a learn STARTED
+ *  there; every recipe's URL still feeds the own-host guard and the every-portal-a-platform test.
  *  THE UTILITY FILING LOOKUP (round 3, items 2 and 4) can make the number count — a filing that
  *  names no platform, a URL its source page names off the platform, a source page on a host in
  *  question or on a permit vendor's — but is never the only record that vouches: a web-researched,
- *  shared lookup alone, with no KB row or utility recipe of this utility naming a platform, counts.
+ *  shared lookup alone, with no KB row or complete utility recipe of this utility naming a platform,
+ *  counts.
  *  WORDS (round 4): a record's words that name a permit vendor or a city's permit portal
  *  (portalChannel.namedPermitPlatforms — a lookup's filing name or quote, found or not; a KB row's
- *  portal name, platform or submission method, any confidence, strong or fuzzy) count the number,
- *  whatever else is on file. Words that merely name NO platform count it only from the lookup's
- *  filing and from a person's VERIFIED row (a portal named with no URL, or a platform) — never from a
- *  seeded or learned row's free text (research writes labels this code cannot read: "Unknown (…)",
- *  "Custom") — and never when they are this utility's own platform portal's name (a strong KB row on a
- *  platform names it so: Pacific Power's seed calls its PowerClerk tenant "Pacific Power Customer
- *  Generation Portal"), or the utility is one whose tenant this codebase knows by heart
- *  (utilityIdentity: PacifiCorp, Portland General — each files on exactly one tenant). */
+ *  portal name, platform, submission method or (the 10-18 re-check) submission notes, any confidence, strong or
+ *  fuzzy) count the number, whatever else is on file. Words that merely name NO platform count it
+ *  only from the lookup's filing NAME and from a person's VERIFIED row (its name, platform, or the
+ *  method its own verify typed) — never from a seeded or learned row's free text (research writes
+ *  labels this code cannot read: "Unknown (…)", "Custom"), never from a bare channel word ("Online",
+ *  "email"), and never for a utility whose tenant this codebase knows by heart (utilityIdentity:
+ *  PacifiCorp, Portland General — each files on exactly one tenant). */
 function utilityFilesOnlyOnInterconnectionPlatform(db: AppDb, state: string, utility: string, hostsInQuestion: ReadonlySet<string>): boolean {
   if (!utility.trim()) return false;
   const st = state.trim().toUpperCase();
@@ -337,36 +389,74 @@ function utilityFilesOnlyOnInterconnectionPlatform(db: AppDb, state: string, uti
   const sameState = (r: Row) => s(r.state).trim().toUpperCase() === st && st !== "";
   const strong = (r: Row) => sameState(r) && (sameUtilityEntity(state, s(r.utility), utility) || norm(s(r.utility)) === norm(utility));
   const weak = (r: Row) => !strong(r) && sameEntity(state, utility, s(r.state).trim() || state, s(r.utility));
-  type Rec = { r: Row; urls: string[]; words: string[]; verified: boolean; kb: boolean };
+  const identity = knownPowerClerkUtility({ state, utility });
+  /** urls: every portal the record names. vouches: the record may stand as evidence FOR a platform
+   *  (every KB row; a recipe only when complete and never refused). urlUnread: a KB portal_url that
+   *  holds a value but yields no URL. */
+  type Rec = { r: Row; urls: string[]; words: string[]; verified: boolean; kb: boolean; vouches: boolean; urlUnread: boolean };
+  // THIS UTILITY'S ROWS ONLY are read for URLs and words (the 10-18 re-check, a nit: portalUrlsInText grows
+  // with the square of a value's length — one huge value on ANOTHER utility's row slowed every
+  // hand-out and admission).
+  const ours = (r: Row) => strong(r) || weak(r);
   const rows: Rec[] = [
     // portal_url read for every URL in it (kbRowPortalUrls); portal_name is free text, read for the
-    // links in it — and, with the platform and the submission method, for its words.
-    ...db.query<Row>("SELECT state, utility, portal_url, portal_name, portal_platform, submission_method, verified_at FROM permit_utility_knowledge WHERE (ahj IS NULL OR ahj = '') AND utility != ''")
-      .map((r) => ({ r, urls: kbRowPortalUrls(s(r.portal_url), s(r.portal_name)), words: [s(r.portal_name), s(r.portal_platform), s(r.submission_method)], verified: isVerifiedKnowledge(r), kb: true })),
-    ...db.query<Row>("SELECT state, utility, portal_url FROM portal_recipes WHERE scope_type = 'utility' AND portal_url IS NOT NULL AND portal_url != ''")
-      .map((r) => ({ r, urls: [s(r.portal_url)], words: [], verified: false, kb: false })),
+    // links in it — and, with the platform, the submission method and (the 10-18 re-check) the notes' own
+    // submission words (not for a tenant known by heart: its prose may name the permit office as a
+    // prerequisite), for its words.
+    ...db.query<Row>("SELECT state, utility, portal_url, portal_name, portal_platform, submission_method, notes, verified_at FROM permit_utility_knowledge WHERE (ahj IS NULL OR ahj = '') AND utility != ''")
+      .filter(ours)
+      .map((r) => ({
+        r, urls: kbRowPortalUrls(s(r.portal_url), s(r.portal_name)),
+        words: [s(r.portal_name), s(r.portal_platform), s(r.submission_method), ...(identity ? [] : submissionWordsInNotes(r.notes))],
+        verified: isVerifiedKnowledge(r), kb: true, vouches: true,
+        urlUnread: s(r.portal_url).trim() !== "" && kbPortalUrlField(s(r.portal_url)).length === 0 && portalUrlsInText(s(r.portal_url)).length === 0,
+      })),
+    ...db.query<Row>("SELECT state, utility, portal_url, status, flag_reason FROM portal_recipes WHERE scope_type = 'utility' AND portal_url IS NOT NULL AND portal_url != ''")
+      .filter(ours)
+      .map((r) => ({ r, urls: [s(r.portal_url)], words: [], verified: false, kb: false, vouches: s(r.status) === "complete" && !isNotServedRecipe(r), urlUnread: false })),
   ];
   const mine = rows.filter((x) => strong(x.r));
   const kin = rows.filter((x) => weak(x.r));
   // (1) A RECORD OF THIS UTILITY (strong or fuzzy, any confidence) WHOSE WORDS NAME A PERMIT VENDOR OR
   //     A CITY'S PERMIT PORTAL: a verified "City of Cedarvale Accela Citizen Access" / platform
   //     "Accela" / method "City permit portal" merged onto a row that still holds a stale seeded
-  //     PowerClerk URL (a verify keeps a field it leaves blank) — it counts.
+  //     PowerClerk URL (a verify keeps a field it leaves blank), or the reference import's "Submit
+  //     instructions: Submit through the City of Larkspur Accela Citizen Access portal" — it counts.
   if ([...mine, ...kin].some((x) => namedPermitPlatforms(x.words).length)) return false;
+  // A PERSON'S VERIFIED portal_url THAT YIELDS NO URL (the 10-18 re-check, a nit: a value this code cannot read
+  // as a host — smart quotes, an odd spelling): no evidence for a platform, so it counts.
+  if ([...mine, ...kin].some((x) => x.kb && x.verified && x.urlUnread)) return false;
   // THIS UTILITY'S OWN PLATFORM PORTAL, BY NAME: what a strong KB row whose every URL is a platform
-  // calls it, and the known tenant's name.
-  const identity = knownPowerClerkUtility({ state, utility });
+  // calls it — a person's verified row only when that name itself names a platform (the 10-18 re-check,
+  // should-fix 1: a verify that typed the city's portal name kept the stale tenant URL) — and the
+  // known tenant's name.
   const platformNames = new Set([
-    ...mine.filter((x) => x.kb && x.urls.length > 0 && x.urls.every(positive)).map((x) => norm(s(x.r.portal_name))),
+    ...mine.filter((x) => x.kb && x.urls.length > 0 && x.urls.every(positive) && (!x.verified || namedInterconnectionPlatforms(s(x.r.portal_name)).length > 0))
+      .map((x) => norm(s(x.r.portal_name))),
     identity ? norm(KNOWN_POWERCLERK_PORTALS[identity].portalName) : "",
   ].filter(Boolean));
-  /** Words that name a portal but no interconnection platform, and are not this utility's own
-   *  platform portal's name — for a utility whose tenant is not known by heart. */
-  const namesNoPlatform = (w: string): boolean => !identity && norm(w) !== "" && !namedInterconnectionPlatforms(w).length && !platformNames.has(norm(w));
-  // (2) A PERSON'S VERIFIED ROW OF THIS UTILITY that names a portal with no URL, or a platform, that is
-  //     no interconnection platform (a verify that names the city's portal and leaves the URL blank):
-  //     it counts.
-  if (mine.some((x) => x.verified && ((!x.urls.length && namesNoPlatform(s(x.r.portal_name))) || namesNoPlatform(s(x.r.portal_platform))))) return false;
+  /** Words that name a portal but no interconnection platform — not a bare channel word, not this
+   *  utility's own platform portal's name — for a utility whose tenant is not known by heart. */
+  const namesNoPlatform = (w: string): boolean => !identity && norm(w) !== ""
+    && !norm(w).split(" ").every((t) => CHANNEL_WORDS.has(t))
+    && !namedInterconnectionPlatforms(w).length && !platformNames.has(norm(w));
+  // (2) A PERSON'S VERIFIED ROW OF THIS UTILITY whose name, platform or method names no
+  //     interconnection platform — WHATEVER URL it holds (the 10-18 re-check, should-fix 1: a verify that leaves
+  //     the URL blank keeps the stale seeded tenant URL, upsertKnowledge's scalar()) — counts. The
+  //     method is the one the verify ITSELF typed (its "Submission: …" sentence), or the column only
+  //     when no other segment wrote a "Submission:" (research's "online portal" is not the person's).
+  //     It stands down when that verify itself names a platform ("Portal platform: PowerClerk").
+  for (const x of mine) {
+    if (!x.kb || !x.verified) continue;
+    const segs = noteSegmentsOf(x.r.notes);
+    const verifies = segs.filter((seg) => VERIFY_SEGMENT.test(seg));
+    const latest = verifies.length ? verifies[verifies.length - 1] : "";
+    if (latest && namedInterconnectionPlatforms(latest).length) continue;
+    const typed = latest ? submissionSentence(latest) : null;
+    const othersWroteIt = segs.some((seg) => !VERIFY_SEGMENT.test(seg) && submissionSentence(seg) !== null);
+    const method = typed !== null ? typed : othersWroteIt ? "" : s(x.r.submission_method);
+    if ([s(x.r.portal_name), s(x.r.portal_platform), method].some(namesNoPlatform)) return false;
+  }
   // WHERE THE PRODUCT SAYS THIS UTILITY TAKES ITS APPLICATION (Helm's review, blocker 2): the utility
   // filing lookup (migration v37) — the NEM track card shows its URL ahead of a seeded KB row, so it is
   // the utility's own record, keyed by its exact name. A lookup that cannot be read: no evidence for a
@@ -375,58 +465,75 @@ function utilityFilesOnlyOnInterconnectionPlatform(db: AppDb, state: string, uti
   let lookupNamed: string[] = [];
   try {
     const row = db.get<Row>("SELECT payload_json FROM utility_filing_lookups WHERE profile_key = ?", [utilityFilingKey(state, utility)]);
-    // A row that cannot be parsed throws: unknown, so no evidence for a platform (counts).
-    const filing = row ? ((JSON.parse(s(row.payload_json) || "{}") as Row).filing as Row | undefined) : undefined;
-    const fact = filing && typeof filing === "object" ? filing : undefined;
-    const raw = fact ? fact.value : undefined;
-    // A filing value, or a dropped-URL list, of a shape this code does not know: unknown, so it counts.
-    if (raw !== undefined && raw !== null && typeof raw !== "object") return false;
-    if (fact && fact.droppedUrls !== undefined && !Array.isArray(fact.droppedUrls)) return false;
-    const value = raw && typeof raw === "object" ? (raw as Row) : null;
-    const name = s(value?.name);
-    const quote = s(fact?.quote);
-    // THE URLS THE DOOR DROPPED (round 4): the filing URL the answer named that acceptFilingUrl did
-    // not keep — a permit vendor's portal, a host the search never returned, a page off the platform
-    // the answer names. Evidence of where the lookup says the utility files, read by host.
-    const dropped = (Array.isArray(fact?.droppedUrls) ? (fact!.droppedUrls as unknown[]) : []).map((u) => s(u).trim()).filter((u) => portalHostOf(u) !== "");
-    // (3a) ITS WORDS NAME A PERMIT VENDOR OR A CITY'S PERMIT PORTAL — the filing's name or the quote,
-    //      found or not ("inside city limits submit through the City of Cedarvale Accela Citizen
-    //      Access portal; all other customers use PowerClerk"): it counts.
-    if (fact && namedPermitPlatforms([name, quote]).length) return false;
-    // (3b) A FILING THAT NAMES NO PLATFORM IS EVIDENCE AGAINST ONE (round 3, B2; round 4: the name AND
-    //      the quote, as the lookup's own parse and utilityKbChannel judge it). The door drops every
-    //      permit-vendor URL and keeps only the name ("City of Cedarvale Accela Citizen Access", url
-    //      null). Not evidence against it: a filing URL — kept or dropped — on a platform, a platform
-    //      named in the name or the quote, this utility's own platform portal's name, or a utility
-    //      whose tenant is known by heart (round 4: the Portland pass — Pacific Power's lookup may name
-    //      its "Customer Generation Portal" with no tenant URL kept).
-    if (value && !positive(s(value.url)) && !dropped.some(positive) && !namedInterconnectionPlatforms([name, quote]).length
-      && !platformNames.has(norm(name)) && !identity) return false;
-    // (3c) Its URL, every URL its source page's own words name (the quote), and a dropped URL off the
-    //      platform are portals the utility's lookup names: strong evidence.
-    lookupUrls = [s(value?.url), ...portalUrlsInText(quote), ...dropped.filter((u) => !positive(u))].filter(Boolean);
-    // The source page is where the answer was READ, not where it is filed (usually the utility's own
-    //     interconnection page): it reaches the own-host guard below, so a lookup read off the city's
-    //     own site counts the number there — and, on a permit vendor's host or a self-hosted permit
-    //     install (the city's Accela tenant), the strong set too. Every dropped URL reaches the guard.
-    const source = s(fact?.sourceUrl).trim();
-    if (isPermitPortalUrl(source)) lookupUrls.push(source);
-    lookupNamed = [source, ...dropped];
+    if (row) {
+      // A row that cannot be parsed throws: unknown, so no evidence for a platform (counts).
+      const payload = JSON.parse(s(row.payload_json) || "{}") as unknown;
+      // THE SHAPES THE WRITER STORES (saveUtilityFilingLookup; the 10-18 re-check, a nit): a payload object whose
+      // filing is an object — its value null (not found) or an object whose name and url are strings
+      // (url null when none), its quote and sourceUrl strings, its droppedUrls absent or a list of
+      // strings. ANY OTHER SHAPE (a string or list filing, no filing at all, a list value, a number
+      // where a string goes): unknown, so it counts.
+      const plain = (v: unknown): v is Row => !!v && typeof v === "object" && !Array.isArray(v);
+      const text = (v: unknown, nullable = true) => v === undefined || (nullable && v === null) || typeof v === "string";
+      if (!plain(payload) || !plain(payload.filing)) return false;
+      const fact = payload.filing;
+      const raw = fact.value;
+      if (raw !== undefined && raw !== null && !plain(raw)) return false;
+      if (plain(raw) && (!text(raw.name) || !text(raw.url))) return false;
+      if (!text(fact.quote) || !text(fact.sourceUrl)) return false;
+      if (fact.droppedUrls !== undefined && !(Array.isArray(fact.droppedUrls) && fact.droppedUrls.every((u) => typeof u === "string"))) return false;
+      const value = plain(raw) ? raw : null;
+      const name = s(value?.name);
+      const quote = s(fact.quote);
+      // THE URLS THE DOOR DROPPED (round 4): the filing URL the answer named that acceptFilingUrl did
+      // not keep — a permit vendor's portal, a host the search never returned, a page off the platform
+      // the answer names. Evidence of where the lookup says the utility files, read by host.
+      const dropped = (Array.isArray(fact.droppedUrls) ? (fact.droppedUrls as string[]) : []).map((u) => u.trim()).filter((u) => portalHostOf(u) !== "");
+      // (3a) ITS WORDS NAME A PERMIT VENDOR OR A CITY'S PERMIT PORTAL — the filing's name or the quote,
+      //      found or not ("inside city limits submit through the City of Cedarvale Accela Citizen
+      //      Access portal; all other customers use PowerClerk"): it counts.
+      if (namedPermitPlatforms([name, quote]).length) return false;
+      // (3b) A FILING THAT NAMES NO PLATFORM IS EVIDENCE AGAINST ONE (round 3, B2). The door drops every
+      //      permit-vendor URL and keeps only the name ("City of Cedarvale Accela Citizen Access", url
+      //      null). Helm's 10-18 re-check (blocker 1): NOT evidence against it only when the
+      //      KEPT filing URL is a platform, the filing's NAME names one, or the utility is one whose
+      //      tenant is known by heart (the Portland pass — Pacific Power's lookup may name its
+      //      "Customer Generation Portal" with no tenant URL kept). The quote is not read here ("no
+      //      longer accepts applications on PowerClerk", "Rebates are applied for on PowerClerk"), a
+      //      DROPPED URL only adds caution (the door dropped it: the search never attested it, or it is
+      //      no application portal — model memory never relaxes the guard), and a name equal to a KB
+      //      row's portal name is no exemption (a stale seeded row keeps the old portal's name).
+      if (value && !positive(s(value.url)) && !namedInterconnectionPlatforms(name).length && !identity) return false;
+      // (3c) Its URL, every URL its source page's own words name (the quote), and a dropped URL off the
+      //      platform are portals the utility's lookup names: strong evidence.
+      lookupUrls = [s(value?.url), ...portalUrlsInText(quote), ...dropped.filter((u) => !positive(u))].filter(Boolean);
+      // The source page is where the answer was READ, not where it is filed (usually the utility's own
+      //     interconnection page): it reaches the own-host guard below, so a lookup read off the city's
+      //     own site counts the number there — and, on a permit vendor's host or a self-hosted permit
+      //     install (the city's Accela tenant), the strong set too. Every dropped URL reaches the guard.
+      const source = s(fact.sourceUrl).trim();
+      if (isPermitPortalUrl(source)) lookupUrls.push(source);
+      lookupNamed = [source, ...dropped];
+    }
   } catch {
     return false;
   }
   const keep = (u: string) => portalHostOf(u) !== "" && !isInformationalPageUrl(u);
-  const records = mine.flatMap((x) => x.urls).filter(keep);
-  const own = [...records, ...lookupUrls.filter(keep)];
+  // THE RECORDS THAT VOUCH: this utility's KB rows and its complete, never-refused recipes.
+  const records = mine.filter((x) => x.vouches).flatMap((x) => x.urls).filter(keep);
+  // EVERY PORTAL THIS UTILITY'S OWN RECORDS NAME — a failed, paused or refused recipe's too — must be a
+  // platform.
+  const own = [...mine.flatMap((x) => x.urls).filter(keep), ...lookupUrls.filter(keep)];
   const fuzzy = kin.flatMap((x) => x.urls).filter(keep);
-  // THE OWN-HOST GUARD: a page this utility names (strong or fuzzy, platform or not, an information
-  // page too — round 4: "a utility's page on a portal in question: it may have filed here" holds for a
-  // KB row's net-metering guide as it does for the lookup's source page), or the page its lookup was
-  // read off or named, ON a portal in question: never skipped.
+  // THE OWN-HOST GUARD: a page this utility names (strong or fuzzy, platform or not, vouching or not,
+  // an information page too — round 4: "a utility's page on a portal in question: it may have filed
+  // here" holds for a KB row's net-metering guide as it does for the lookup's source page), or the page
+  // its lookup was read off or named, ON a portal in question: never skipped.
   const named = [...mine.flatMap((x) => x.urls), ...kin.flatMap((x) => x.urls), ...lookupUrls, ...lookupNamed];
   if (named.some((u) => { const h = portalHostOf(u); return h !== "" && hostsInQuestion.has(h); })) return false;
-  // THE LOOKUP NEVER VOUCHES ALONE (round 3, item 4): one of this utility's own KB rows or recipes
-  // must name a portal — and, with everything else it names, a platform.
+  // THE LOOKUP NEVER VOUCHES ALONE (round 3, item 4), NOR DOES A LEARN THAT NEVER COMPLETED (the 10-18 re-check):
+  // one of this utility's own KB rows or complete recipes must name a portal — and, with everything
+  // else it names, a platform.
   if (!records.length || !own.every(positive)) return false;
   return fuzzy.every(positive);
 }
@@ -498,7 +605,7 @@ interface PriorProgressReasons {
  *   - a tracked application or permit number of this project (trackedNumberHardReason, #365). A
  *     number of the OTHER side is skipped only on POSITIVE, HOST-LEVEL evidence that it was filed
  *     elsewhere: a NEM number when this utility's own records (KB rows of any confidence, its
- *     recipes) name a portal and every one is a utility interconnection platform host (PowerClerk
+ *     complete recipes) name a portal and every one is a utility interconnection platform host (PowerClerk
  *     and kin, a utility's own domain — never a city's permit portal, never a Salesforce site,
  *     whatever its label or path), and its filing lookup names no other (the lookup never vouches
  *     alone); a permit number when every portal in question is such a platform host (permits are
