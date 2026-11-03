@@ -7075,52 +7075,240 @@ function reviewNotesDisplay(item) {
   return notes || "Review required.";
 }
 
+// The body of a correction review item: the agent's proposals, the actions, and the one apply
+// button. Its own function so the review card stays liftable on its own (#544).
+function correctionReviewBodyHtml(item) {
+  let triage = null;
+  try { if (String(item.notes).startsWith("agent-triage:")) triage = JSON.parse(item.notes.slice(13)); } catch {}
+  const proposals = Array.isArray(triage?.proposals) ? triage.proposals : [];
+  const jurisdictionProposals = jurisdictionProposalList(triage);
+  const reviewRuleProposals = reviewRuleProposalList(triage);
+  return `
+      ${proposals.length ? `<table><thead><tr><th>Field</th><th>Current</th><th>Proposed</th><th>Evidence</th></tr></thead><tbody>${proposals.map(p => `<tr><td>${esc(p.field)}</td><td>${esc(p.currentValue || "Missing")}</td><td>${esc(p.proposedValue)}</td><td>${esc(p.basis)}</td></tr>`).join("")}</tbody></table>` : ""}
+      ${jurisdictionProposalsHtml(jurisdictionProposals)}
+      ${reviewRuleProposalsHtml(reviewRuleProposals)}
+      ${Array.isArray(triage?.actions) && triage.actions.length ? `<ol>${triage.actions.map(a => `<li>${esc(a)}</li>`).join("")}</ol>` : ""}
+      ${item.status === "pending" && triage?.correctionId && (proposals.length || jurisdictionProposals.some((p) => p.status === "proposed") || reviewRuleProposals.some((p) => p.status === "proposed")) ? `<button class="primary" data-apply-correction="${esc(triage.correctionId)}">Apply these data updates</button>${reviewTabApplyCaption(jurisdictionProposals, reviewRuleProposals)}` : `<p class="muted">Use Corrections in the Submit stage to review the response and record resolution.</p>`}`;
+}
+
+// ONE PLAIN QUESTION PER HUMAN REVIEW ITEM (#544). Operator, 2026-11-02: "can we clean these up
+// too? They're a bit confusing". A run's blank portal question arrived as the triage agent's
+// engineering note with its suggestion in an editable box (Save Edit wrote that sentence into the
+// project), and the inverter's output current took two boxes — an "Auto-fill (AI)" panel with an
+// empty model box above a separate amps box. Every card now asks one thing the person can answer
+// in place, and says in one line who acts and what happens after saving:
+const REVIEW_NEXT_LINE = {
+  typed: "You enter it. Saving updates the project and re-runs QC.",
+  question: "You answer it for this job. The next portal run fills in your answer. Dismissing it only clears this card: the portal still asks it on the next run.",
+  // A question the job answered since the run asked it (a project save): nothing to choose.
+  questionAnswered: "Nothing to choose: the job already holds this answer. Dismiss it to clear the card.",
+  inverter: "You confirm it, or enter it from the datasheet. Saving re-runs QC, and the PV breaker check uses this current.",
+  advisory: "For your information: nothing to enter. Dismiss it once you've read it.",
+  // A run's note is about the filing itself: it must not read as settled (an older one can name a
+  // required question the run left blank), so it says what to do before the filing goes in.
+  runNote: "Check this on the portal before you submit. Dismissing it only clears this note.",
+};
+const REVIEW_ADVISORY_TITLES = { "Run triage": "Note from the last portal run" };
+
+// The inverter (or microinverter) model and count on file, read from the same keys, in the same
+// order, as the lookup route (server.ts autofill-specs) — so the model shown is the model looked up.
+function inverterSpecsFromSnapshot(snap) {
+  const s = snap || {};
+  const pick = (...keys) => {
+    for (const k of keys) { const v = String(s[k] ?? "").trim(); if (v) return v; }
+    return "";
+  };
+  const qty = Number.parseInt(pick("invQty", "inverterQty", "inverterQuantity", "inverterCount", "pvMicroQty"), 10);
+  return { model: pick("invModel", "inverterModel", "pvMicroModel"), qty: Number.isFinite(qty) && qty > 0 ? qty : null };
+}
+
+// Where a looked-up current came from, in words (the lookup's own source string otherwise).
+function inverterLookupBasis(source) {
+  const s = String(source || "");
+  if (/nameplate/i.test(s)) return "worked out from the system's AC size";
+  if (/built-in/i.test(s)) return "from the equipment table";
+  if (/cec/i.test(s)) return "from the CEC equipment list";
+  return s ? `from ${s}` : "";
+}
+
+// THE INVERTER OUTPUT ITEM — one card, three states: look the model up (prefilled from the plan
+// set), confirm what the lookup found ("IQ8M-72-2-US × 10 → 13.5 A total"), or — only when the
+// lookup could not find the model — type the amps from the datasheet.
+function inverterOutputBodyHtml(item, ctx) {
+  const id = String(item.id);
+  const specs = inverterSpecsFromSnapshot(ctx.snapshot);
+  const lookup = ctx.inverterLookup && ctx.inverterLookup.itemId === id ? ctx.inverterLookup : null;
+  const model = (lookup && lookup.model) || specs.model;
+  const qty = (lookup && lookup.qty) || specs.qty;
+  const amps = Number.parseFloat(String(item.llmSuggestedValue || ""));
+  const purpose = `<p style="margin:0 0 4px">The inverters' rated output current, all units together. It is used to size the PV breaker (at least 1.25 × this current).</p>`;
+  const manual = (why) => `
+      ${purpose}
+      <p style="margin:0 0 4px">${esc(why)}</p>
+      <div class="review-actions">
+        <input id="review-${esc(id)}" data-inverter-manual="${esc(id)}" type="number" min="0" step="0.01" inputmode="decimal" placeholder="Total output current in amps, from the datasheet" />
+        <div class="actions"><button class="primary" data-review-action="edit" data-review-id="${esc(id)}"><i data-lucide="check"></i><span>Save</span></button></div>
+      </div>`;
+  if (lookup && lookup.status === "notFound") {
+    return manual(`The lookup couldn't find the rated output for ${model || "this model"}. Enter it from the inverter datasheet${qty > 1 ? `, for all ${qty} units together` : ""}.`);
+  }
+  if (lookup && lookup.status === "manual") return manual("Enter the rated output current from the inverter datasheet, for all units together.");
+  if (Number.isFinite(amps) && amps > 0) {
+    const sum = `${model ? `${model}${qty ? ` × ${qty}` : ""} → ` : ""}${amps} A total`;
+    const each = lookup && lookup.perUnitA != null && qty > 1 ? `${lookup.perUnitA} A each` : "";
+    const basis = [each, lookup ? inverterLookupBasis(lookup.source) : ""].filter(Boolean).join(", ");
+    return `
+      ${purpose}
+      <p class="review-derived" style="margin:0 0 4px"><strong>${esc(sum)}</strong>${basis ? ` <span class="muted">(${esc(basis)})</span>` : ""}</p>
+      <div class="actions">
+        <button class="primary" data-inverter-confirm="${esc(id)}" data-value="${esc(String(amps))}"><i data-lucide="check"></i><span>Confirm ${esc(String(amps))} A</span></button>
+        <button class="secondary" data-inverter-manual-open="${esc(id)}"><span>Enter a different value</span></button>
+      </div>`;
+  }
+  return `
+      ${purpose}
+      <div class="review-actions inverter-lookup">
+        <input id="inverterModel-${esc(id)}" value="${esc(model)}" placeholder="Inverter / microinverter model, as on the plan set" aria-label="Inverter or microinverter model" />
+        <input id="inverterQty-${esc(id)}" type="number" min="1" value="${esc(qty ? String(qty) : "")}" placeholder="Qty" aria-label="Quantity" style="max-width:90px" />
+        <div class="actions"><button class="primary" data-inverter-lookup="${esc(id)}"><i data-lucide="search"></i><span>Look up output current</span></button></div>
+      </div>
+      ${model ? "" : `<p class="muted" style="margin:4px 0 0">No model on file yet: type it as printed on the plan set.</p>`}`;
+}
+
+// A PORTAL QUESTION A RUN LEFT BLANK — asked as the portal asked it, with its own options. Nothing is
+// pre-selected: the answer is the person's, for this job. Saved through /portal-questions; Dismiss
+// clears the card, like a note.
+//
+// ANSWERED SINCE IT WAS ASKED (#544): a project save can write the key after the run asked it. The
+// question is then no longer open (the answer route takes only open ones), so the card shows the
+// job's answer (GET /portal-questions' answeredItems) instead of options, and offers Dismiss only.
+function portalQuestionBodyHtml(item, ctx) {
+  const q = item.portalQuestion;
+  const id = String(item.id);
+  const head = `<p style="margin:0 0 6px"><strong>${esc(q.label)}</strong></p>`;
+  const dismiss = `<button class="secondary" data-review-action="reject" data-review-id="${esc(id)}"><i data-lucide="x"></i><span>Dismiss</span></button>`;
+  if (item.status !== "pending") {
+    const project = ctx.project || {};
+    const answer = String(project[q.key] || (ctx.snapshot || {})[q.key] || "").trim();
+    // A dismissed question was never answered here: it must not read as "Answered."
+    const closed = item.status === "rejected" ? "Dismissed. No answer was saved here." : "Answered.";
+    return `${head}<p class="muted" style="margin:0">${answer ? `Answered for this job: ${esc(answer)}` : closed}</p>`;
+  }
+  const onFile = ctx.answeredQuestions ? ctx.answeredQuestions[id] : null;
+  if (onFile) {
+    return `
+      ${head}
+      <p style="margin:0 0 6px">Already answered for this job: <strong>${esc(onFile)}</strong></p>
+      <div class="actions">${dismiss}</div>`;
+  }
+  const options = Array.isArray(q.options) ? q.options : [];
+  const control = options.length <= 4
+    ? `<div class="portal-question-options" role="radiogroup" aria-label="${esc(q.label)}" style="display:flex;flex-wrap:wrap;gap:6px 18px;margin:0 0 6px">${options.map((o) => `
+        <label style="display:inline-flex;gap:6px;align-items:center"><input type="radio" name="pq-${esc(id)}" value="${esc(o)}" data-portal-question-option="${esc(id)}" /> ${esc(o)}</label>`).join("")}
+      </div>`
+    : `<select data-portal-question-select="${esc(id)}" aria-label="${esc(q.label)}" style="margin:0 0 6px"><option value="">Choose an answer…</option>${options.map((o) => `<option value="${esc(o)}">${esc(o)}</option>`).join("")}</select>`;
+  return `
+      <p style="margin:0 0 4px">The portal asks this and the job's documents don't say.</p>
+      ${head}
+      ${control}
+      <div class="actions"><button class="primary" data-portal-answer="${esc(id)}" data-portal-key="${esc(q.key)}"><i data-lucide="check"></i><span>Save answer</span></button>${dismiss}</div>`;
+}
+
+/**
+ * One Human Review card. `ctx`: { project, snapshot, inverterLookup, noteQuestions, answeredQuestions }
+ * — the selected project, its parser snapshot, the last inverter lookup this page made (or null), the
+ * open portal questions that pending run notes name, by note id (from GET /portal-questions'
+ * noteItemIds), and the job's answer to each pending question item it has answered since, by item id
+ * (from GET /portal-questions' answeredItems).
+ */
+function reviewCardHtml(itemIn, ctxIn) {
+  const ctx = ctxIn || {};
+  const pending = itemIn.status === "pending";
+  // A RUN NOTE THAT NAMES AN OPEN PORTAL QUESTION IS ASKED AS THAT QUESTION. A note written before
+  // #544 ("Required question '…' left blank") carries no question of its own; the backend matched it
+  // to the open question by its label. Answering it closes the note.
+  const noteQuestion = pending && !itemIn.portalQuestion && ctx.noteQuestions ? ctx.noteQuestions[String(itemIn.id)] : null;
+  const item = noteQuestion ? { ...itemIn, portalQuestion: noteQuestion } : itemIn;
+  const isQuestion = !!(item.portalQuestion && item.portalQuestion.key);
+  const answeredOnFile = isQuestion && pending && !!(ctx.answeredQuestions && ctx.answeredQuestions[String(item.id)]);
+  const isAdvisory = !isQuestion && ADVISORY_REVIEW_ISSUE_TYPES.includes(item.issueType || "");
+  const isInverter = !isQuestion && !isAdvisory && item.fieldName === "inverterOutput";
+  const isCorrection = item.fieldName === "correction";
+  const isWarning = REVIEW_WARNING_FIELDS.has(item.fieldName);
+  const label = isQuestion ? "Portal question for this job"
+    : isAdvisory ? (REVIEW_ADVISORY_TITLES[item.issueType] || reviewLabel(item))
+      : isInverter ? "Inverter output current (A)" : reviewLabel(item);
+  const tone = !pending ? "pass" : (isAdvisory || isWarning || answeredOnFile) ? "info" : "warning";
+  const next = (kind) => (pending ? `<p class="muted review-next" style="margin:6px 0 0;font-size:12px">${esc(REVIEW_NEXT_LINE[kind])}</p>` : "");
+  let body = "";
+  if (isQuestion) {
+    body = portalQuestionBodyHtml(item, ctx) + next(answeredOnFile ? "questionAnswered" : "question");
+  } else if (isAdvisory) {
+    // THE FINDING, NOT THE ENGINEERING NOTE: a run triage item shows its one-line title; its root
+    // cause and suggested fix live in the run's triage note (project notes), never in a box here.
+    const text = item.issueType === "Run triage" ? (item.sourceExcerpt || "The last portal run flagged something for the team.") : reviewNotesDisplay(item);
+    body = `<p style="margin:0 0 4px">${esc(text)}</p>
+      ${item.issueType !== "Run triage" && item.sourceExcerpt ? `<p style="margin:0 0 4px"><strong>Source:</strong> ${esc(item.sourceExcerpt)}</p>` : ""}
+      ${pending ? `<div class="actions"><button class="secondary" data-review-action="reject" data-review-id="${esc(item.id)}"><i data-lucide="check"></i><span>Dismiss</span></button></div>` : ""}
+      ${next(item.issueType === "Run triage" ? "runNote" : "advisory")}`;
+  } else if (isInverter && pending) {
+    body = inverterOutputBodyHtml(item, ctx) + next("inverter");
+  } else {
+    const hint = reviewHint(item);
+    const known = item.llmSuggestedValue || item.parserValue || "";
+    const context = [];
+    if (item.llmSuggestedValue) context.push(`<strong>Suggested:</strong> ${esc(item.llmSuggestedValue)}`);
+    if (item.parserValue && item.parserValue !== item.llmSuggestedValue) context.push(`<strong>Parser read:</strong> ${esc(item.parserValue)}`);
+    // The hint is often already the tail of the notes sentence; printing it again read as a stutter.
+    const squash = (t) => String(t || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+    if (hint && !squash(reviewNotesDisplay(item)).includes(squash(hint).slice(0, 24))) context.push(`<span class="muted">${esc(hint)}</span>`);
+    body = `
+      <p style="margin:0 0 4px">${esc(reviewNotesDisplay(item))}</p>
+      ${context.length ? `<p style="margin:0 0 4px">${context.join("<br>")}</p>` : ""}
+      ${item.sourceExcerpt ? `<p style="margin:0 0 4px"><strong>Source:</strong> ${esc(item.sourceExcerpt)}</p>` : ""}
+      ${isCorrection ? correctionReviewBodyHtml(item) : ""}
+      ${pending && !isCorrection ? `
+        <div class="review-actions">
+          <input id="review-${esc(item.id)}" value="${esc(known)}" placeholder="${esc(hint ? `Enter ${hint}, then Save Edit` : `Enter the ${label} (read it off the plan set / bill), then Save Edit`)}" />
+          <div class="actions">
+            ${isWarning ? `<button class="secondary" data-review-action="reject" data-review-id="${esc(item.id)}"><i data-lucide="x"></i><span>Skip (N/A)</span></button>` : ""}
+            <button class="primary" data-review-action="edit" data-review-id="${esc(item.id)}"><i data-lucide="pencil"></i><span>Save Edit</span></button>
+          </div>
+        </div>
+        ${next("typed")}` : ""}`;
+  }
+  return `
+    <article class="item ${tone}" data-review-item="${esc(item.id)}">
+      <div class="item-title"><strong>${esc(label)}</strong>${statusBadge(item.status)}</div>
+      ${body}
+    </article>`;
+}
+
 function renderReview() {
   const items = state.detail.humanReviewItems || [];
   const pending = items.filter((x) => x.status === "pending");
   const resolved = items.filter((x) => x.status !== "pending");
   $("reviewCounts").textContent = `${pending.length} pending`;
 
-  function reviewCard(item) {
-    const label = reviewLabel(item);
-    const hint = reviewHint(item);
-    const isWarning = REVIEW_WARNING_FIELDS.has(item.fieldName);
-    const known = item.llmSuggestedValue || item.parserValue || "";
-    let triage = null;
-    try { if (String(item.notes).startsWith("agent-triage:")) triage = JSON.parse(item.notes.slice(13)); } catch {}
-    const proposals = Array.isArray(triage?.proposals) ? triage.proposals : [];
-    const jurisdictionProposals = jurisdictionProposalList(triage);
-    const reviewRuleProposals = reviewRuleProposalList(triage);
-    const correctionBody = item.fieldName === "correction" ? `
-      ${proposals.length ? `<table><thead><tr><th>Field</th><th>Current</th><th>Proposed</th><th>Evidence</th></tr></thead><tbody>${proposals.map(p => `<tr><td>${esc(p.field)}</td><td>${esc(p.currentValue || "Missing")}</td><td>${esc(p.proposedValue)}</td><td>${esc(p.basis)}</td></tr>`).join("")}</tbody></table>` : ""}
-      ${jurisdictionProposalsHtml(jurisdictionProposals)}
-      ${reviewRuleProposalsHtml(reviewRuleProposals)}
-      ${Array.isArray(triage?.actions) && triage.actions.length ? `<ol>${triage.actions.map(a => `<li>${esc(a)}</li>`).join("")}</ol>` : ""}
-      ${item.status === "pending" && triage?.correctionId && (proposals.length || jurisdictionProposals.some((p) => p.status === "proposed") || reviewRuleProposals.some((p) => p.status === "proposed")) ? `<button class="primary" data-apply-correction="${esc(triage.correctionId)}">Apply these data updates</button>${reviewTabApplyCaption(jurisdictionProposals, reviewRuleProposals)}` : `<p class="muted">Use Corrections in the Submit stage to review the response and record resolution.</p>`}` : "";
-    const context = [];
-    if (item.llmSuggestedValue) context.push(`<strong>AI suggestion:</strong> ${esc(item.llmSuggestedValue)}`);
-    if (item.parserValue && item.parserValue !== item.llmSuggestedValue) context.push(`<strong>Parser read:</strong> ${esc(item.parserValue)}`);
-    // The hint is often already the tail of the notes sentence; printing it again read as a stutter.
-    const squash = (t) => String(t || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
-    if (hint && !squash(reviewNotesDisplay(item)).includes(squash(hint).slice(0, 24))) context.push(`<span class="muted">${esc(hint)}</span>`);
-    return `
-    <article class="item ${item.status === "pending" ? (isWarning ? "info" : "warning") : "pass"}">
-      <div class="item-title"><strong>${esc(label)}</strong>${statusBadge(item.status)}</div>
-      <p style="margin:0 0 4px">${esc(reviewNotesDisplay(item))}</p>
-      ${context.length ? `<p style="margin:0 0 4px">${context.join("<br>")}</p>` : ""}
-      ${item.sourceExcerpt ? `<p style="margin:0 0 4px"><strong>Source:</strong> ${esc(item.sourceExcerpt)}</p>` : ""}
-      ${correctionBody}
-      ${item.status === "pending" && item.fieldName !== "correction" ? `
-        <div class="review-actions">
-          <input id="review-${item.id}" value="${esc(known)}" placeholder="${esc(hint ? `Enter ${hint}, then Save Edit` : `Enter the ${label} (read it off the plan set / bill), then Save Edit`)}" />
-          <div class="actions">
-            ${isWarning ? `<button class="secondary" data-review-action="reject" data-review-id="${item.id}"><i data-lucide="x"></i><span>Skip (N/A)</span></button>` : ""}
-            <button class="primary" data-review-action="edit" data-review-id="${item.id}"><i data-lucide="pencil"></i><span>Save Edit</span></button>
-          </div>
-        </div>
-      ` : ""}
-    </article>`;
+  const project = state.detail.project || {};
+  const lookup = state.inverterLookup && state.inverterLookup.projectId === project.id ? state.inverterLookup : null;
+  // Open portal questions a pending run note names (the backend's label match), by note id. A question
+  // a pending item already asks is asked there once; a note naming it stays a note.
+  const askedKeys = new Set(pending.filter((x) => x.portalQuestion && x.portalQuestion.key).map((x) => x.portalQuestion.key));
+  const noteQuestions = {};
+  for (const q of (state.portalQuestions && state.portalQuestions.questions) || []) {
+    if (!q || !q.key || askedKeys.has(q.key) || !Array.isArray(q.noteItemIds) || !Array.isArray(q.options) || q.options.length < 2) continue;
+    for (const noteId of q.noteItemIds) noteQuestions[String(noteId)] = { key: q.key, label: q.label, options: q.options, control: "choice" };
   }
+  // Pending question items the job has answered since they were asked (the backend's answeredItems:
+  // the same "answered on file" the answer route reads), by item id → the job's answer. Named
+  // explicitly, never inferred from a key missing from the open list (that list is capped and filtered).
+  const answeredQuestions = {};
+  for (const a of (state.portalQuestions && state.portalQuestions.answeredItems) || []) {
+    if (a && a.itemId && String(a.answer || "").trim()) answeredQuestions[String(a.itemId)] = String(a.answer).trim();
+  }
+  const ctx = { project, snapshot: project.parserSnapshot || {}, inverterLookup: lookup, noteQuestions, answeredQuestions };
+  const reviewCard = (item) => reviewCardHtml(item, ctx);
 
   const pendingHtml = pending.map(reviewCard).join("");
   const resolvedHtml = resolved.length
@@ -7134,6 +7322,24 @@ function renderReview() {
   $("reviewItems").querySelectorAll("button[data-review-action]").forEach((button) => {
     button.addEventListener("click", () => updateReview(button.dataset.reviewId, button.dataset.reviewAction));
   });
+  $("reviewItems").querySelectorAll("button[data-inverter-confirm]").forEach((button) => {
+    button.addEventListener("click", () => updateReview(button.dataset.inverterConfirm, "approve", button.dataset.value));
+  });
+  $("reviewItems").querySelectorAll("button[data-inverter-lookup]").forEach((button) => {
+    button.addEventListener("click", () => lookupInverterOutput(button.dataset.inverterLookup, button));
+  });
+  $("reviewItems").querySelectorAll("button[data-inverter-manual-open]").forEach((button) => {
+    button.addEventListener("click", () => {
+      const prior = state.inverterLookup && state.inverterLookup.itemId === button.dataset.inverterManualOpen ? state.inverterLookup : {};
+      state.inverterLookup = { ...prior, projectId: project.id, itemId: button.dataset.inverterManualOpen, status: "manual" };
+      renderReview();
+      const input = document.querySelector(`[data-inverter-manual="${CSS.escape(button.dataset.inverterManualOpen)}"]`);
+      if (input) input.focus();
+    });
+  });
+  $("reviewItems").querySelectorAll("button[data-portal-answer]").forEach((button) => {
+    button.addEventListener("click", () => savePortalQuestionAnswer(button.dataset.portalAnswer, button.dataset.portalKey, button));
+  });
   $("reviewItems").querySelectorAll("button[data-apply-correction]").forEach(button => {
     button.addEventListener("click", async () => {
       button.disabled = true;
@@ -7144,15 +7350,76 @@ function renderReview() {
       } catch (err) { showMessage(err.message, "error"); button.disabled = false; }
     });
   });
+}
 
-  // The auto-fill helper only fills inverter-output / PV-breaker fields, so show it
-  // exclusively when one of those is pending. Otherwise it's an orphaned input box.
-  const autofillRelevant = pending.some((x) => x.fieldName === "inverterOutput" || x.fieldName === "pvBreaker");
-  const autofillPanel = $("autofillSpecsPanel");
-  if (autofillPanel) autofillPanel.style.display = autofillRelevant ? "" : "none";
-  if (!autofillRelevant) {
-    const status = $("autofillSpecsStatus");
-    if (status) status.textContent = "";
+// The answer a portal-question card holds right now: its checked radio, or its select's value.
+function portalQuestionChoice(itemId) {
+  const radio = Array.from(document.querySelectorAll("input[data-portal-question-option]"))
+    .find((el) => el.dataset.portalQuestionOption === itemId && el.checked);
+  if (radio) return radio.value;
+  const select = Array.from(document.querySelectorAll("select[data-portal-question-select]"))
+    .find((el) => el.dataset.portalQuestionSelect === itemId);
+  return select ? select.value : "";
+}
+
+// Save a portal question's answer as THIS JOB's answer — the same door the parser page and the
+// intake link use (POST /portal-questions validates it against the portal's own options and closes
+// the review item). Never through human-verify: that would write the answer under the item's field.
+async function savePortalQuestionAnswer(itemId, key, button) {
+  const value = portalQuestionChoice(itemId);
+  if (!value) {
+    showMessage("Choose one of the portal's answers first, then Save answer.", "warning");
+    return;
+  }
+  if (button) button.disabled = true;
+  try {
+    const out = await api(`/api/projects/${state.selectedProjectId}/portal-questions`, {
+      method: "POST",
+      body: JSON.stringify({ answers: { [key]: value } }),
+    });
+    await selectProject(state.selectedProjectId);
+    // Answered since the run asked it (a project save): the job's answer stands and the card closed.
+    const already = ((out && out.alreadyAnswered) || []).find((a) => a && a.key === key);
+    showMessage(already
+      ? `This job already had an answer to that question: ${String(already.answer || "").trim() || "on file"}. Nothing was changed, and the card is closed.`
+      : "Answer saved for this job. The next portal run fills it in.");
+  } catch (err) {
+    // A person reads this: the server's sentence when it is plain, never one naming the internal key.
+    const said = String((err && err.message) || "").trim();
+    showMessage(said && !said.includes(key) ? said : "Could not save the answer. Reload the page to see the questions still open.", "error");
+    if (button) button.disabled = false;
+  }
+}
+
+// Look the inverter's rated output up from the model + quantity on the card (prefilled from the
+// plan set). Found: the item carries the total current to confirm. Not found: the card offers the
+// manual box. The lookup also suggests the PV breaker on that item, as before.
+async function lookupInverterOutput(itemId, button) {
+  if (!state.selectedProjectId) return;
+  const projectId = state.selectedProjectId;
+  const model = String($(`inverterModel-${itemId}`)?.value || "").trim();
+  const qty = Number.parseInt($(`inverterQty-${itemId}`)?.value || "0", 10) || 0;
+  if (!model) {
+    showMessage("Type the inverter or microinverter model first, as printed on the plan set.", "warning");
+    $(`inverterModel-${itemId}`)?.focus();
+    return;
+  }
+  if (button) button.disabled = true;
+  try {
+    const result = await api(`/api/projects/${projectId}/autofill-specs`, {
+      method: "POST",
+      body: JSON.stringify({ modelOverride: model, qtyOverride: qty || undefined }),
+    });
+    if (result.detail) state.detail = result.detail;
+    const s = result.spec || {};
+    const totalA = s.totalContinuousCurrentA ?? s.outputCurrentA;
+    state.inverterLookup = totalA != null && result.applied > 0
+      ? { projectId, itemId, status: "found", model, qty: s.inverterQty || qty || null, perUnitA: s.outputCurrentA ?? null, totalA, source: s.source || "" }
+      : { projectId, itemId, status: "notFound", model, qty: qty || null };
+    renderDetail();
+  } catch (err) {
+    showMessage(err.message || "The inverter lookup failed.", "error");
+    if (button) button.disabled = false;
   }
 }
 
@@ -8922,42 +9189,11 @@ function renderAudit() {
       : "") : `<p class="muted">No audit entries yet.</p>`;
 }
 
-async function autofillSpecs() {
-  if (!state.selectedProjectId) return;
-  const btn = $("autofillSpecsBtn");
-  const status = $("autofillSpecsStatus");
-  if (btn) btn.disabled = true;
-  if (status) status.textContent = "Looking up the inverter datasheet (knowledge first, web if needed)…";
-  try {
-    const modelOverride = ($("autofillModelInput")?.value || "").trim();
-    const qtyOverride = parseInt($("autofillQtyInput")?.value || "0", 10) || 0;
-    const body = JSON.stringify({ modelOverride: modelOverride || undefined, qtyOverride: qtyOverride || undefined });
-    const result = await api(`/api/projects/${state.selectedProjectId}/autofill-specs`, { method: "POST", body });
-    if (result.detail) state.detail = result.detail;
-    const s = result.spec || {};
-    // System total is what gets filled into "Inverter output (A)" (per-unit × qty for
-    // microinverters); show that, noting the per-unit basis for clarity.
-    const totalA = s.totalContinuousCurrentA ?? s.outputCurrentA;
-    const perUnitNote = (s.inverterQty > 1 && s.outputCurrentA != null) ? ` (${s.outputCurrentA} A × ${s.inverterQty})` : "";
-    if (result.applied > 0) {
-      if (status) status.textContent = `Filled ${result.applied} field(s) from ${esc(s.source || "lookup")} (${esc(s.confidence || "?")} confidence): inverter output ${totalA ?? "?"} A${perUnitNote}, suggested PV breaker ${s.derivedPvBreakerA ?? "?"} A. Review and Save Edit each. ${esc(s.notes || "")}`;
-      renderDetail();
-    } else if (totalA != null) {
-      if (status) status.textContent = `Found inverter output ${totalA} A${perUnitNote} / suggested breaker ${s.derivedPvBreakerA ?? "?"} A, but there were no pending inverter-output/PV-breaker items to fill (run QC first if needed).`;
-    } else {
-      if (status) status.textContent = s.notes || "Could not determine the inverter spec — enter it manually from the datasheet/SLD.";
-    }
-  } catch (err) {
-    if (status) status.textContent = "";
-    showMessage(err.message || "Auto-fill specs failed.", "error");
-  } finally {
-    if (btn) btn.disabled = false;
-  }
-}
-
-async function updateReview(reviewItemId, action) {
+// `explicitValue`: a value the card itself holds rather than a typed box — the inverter item's
+// "Confirm 10 A" posts the looked-up current it shows (#544).
+async function updateReview(reviewItemId, action, explicitValue) {
   const input = $(`review-${reviewItemId}`);
-  const value = (input?.value || "").trim();
+  const value = String(explicitValue != null ? explicitValue : (input?.value || "")).trim();
   // Guard the trap: approving/saving a BLANK value writes nothing, so the QC
   // blocker never clears and the project looks stuck. Require a real value.
   if (action !== "reject" && !value) {
@@ -10505,7 +10741,6 @@ if ($("launchRecordBtn")) $("launchRecordBtn").addEventListener("click", launchR
 if ($("autoLearnBtn")) $("autoLearnBtn").addEventListener("click", autoLearnPortalUI);
 if ($("copyDescriptionBtn")) $("copyDescriptionBtn").addEventListener("click", copyDescriptionOfWork);
 if ($("buildSplitBtn")) $("buildSplitBtn").addEventListener("click", buildDocumentSplit);
-if ($("autofillSpecsBtn")) $("autofillSpecsBtn").addEventListener("click", autofillSpecs);
 if ($("genIntakeLinkBtn")) $("genIntakeLinkBtn").addEventListener("click", generateIntakeLink);
 if ($("saveManualEntryBtn")) $("saveManualEntryBtn").addEventListener("click", saveManualEntry);
 // Typing in the manual-entry form starts an edit against the version on screen (#440).

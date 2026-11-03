@@ -1139,6 +1139,22 @@ export interface HumanReviewItem {
   notes: string;
   createdAt: string;
   updatedAt: string;
+  /** #544: set when the item IS a portal question a run left blank for this job (the per-job key
+   *  only a person answers, the portal's own wording and options as the run saw them). The person
+   *  answers it in place through /api/projects/:id/portal-questions; absent on every other item. */
+  portalQuestion?: HumanReviewPortalQuestion;
+}
+
+/** A portal question carried on a review item (human_review_items.portal_question_json, #544). */
+export interface HumanReviewPortalQuestion {
+  /** One of PER_JOB_ANSWER_KEYS (shared/src/perJobQuestions.ts). */
+  key: string;
+  /** The portal's own wording of the question. */
+  label: string;
+  /** The portal's own options, placeholders removed (at least two). */
+  options: string[];
+  /** A dropdown on the portal, or a radio / choice group. */
+  control: "select" | "choice";
 }
 
 /** How a correction's text relates to the text it was read from (corrections.source_text).
