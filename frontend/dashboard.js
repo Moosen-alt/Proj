@@ -7102,6 +7102,9 @@ const REVIEW_NEXT_LINE = {
   question: "You answer it for this job. The next portal run fills in your answer.",
   inverter: "You confirm it, or enter it from the datasheet. Saving re-runs QC, and the PV breaker check uses this current.",
   advisory: "For your information: nothing to enter. Dismiss it once you've read it.",
+  // A run's note is about the filing itself: it must not read as settled (an older one can name a
+  // required question the run left blank), so it says what to do before the filing goes in.
+  runNote: "Check this on the portal before you submit. Dismissing it only clears this note.",
 };
 const REVIEW_ADVISORY_TITLES = { "Run triage": "Note from the last portal run" };
 
@@ -7127,7 +7130,7 @@ function inverterLookupBasis(source) {
 }
 
 // THE INVERTER OUTPUT ITEM — one card, three states: look the model up (prefilled from the plan
-// set), confirm what the lookup found ("IQ8M-72-2-US × 10 → 10 A total"), or — only when the
+// set), confirm what the lookup found ("IQ8M-72-2-US × 10 → 13.5 A total"), or — only when the
 // lookup could not find the model — type the amps from the datasheet.
 function inverterOutputBodyHtml(item, ctx) {
   const id = String(item.id);
@@ -7195,12 +7198,18 @@ function portalQuestionBodyHtml(item, ctx) {
 }
 
 /**
- * One Human Review card. `ctx`: { project, snapshot, inverterLookup } — the selected project, its
- * parser snapshot, and the last inverter lookup this page made (or null).
+ * One Human Review card. `ctx`: { project, snapshot, inverterLookup, noteQuestions } — the selected
+ * project, its parser snapshot, the last inverter lookup this page made (or null), and the open portal
+ * questions that pending run notes name, by note id (from GET /portal-questions' noteItemIds).
  */
-function reviewCardHtml(item, ctxIn) {
+function reviewCardHtml(itemIn, ctxIn) {
   const ctx = ctxIn || {};
-  const pending = item.status === "pending";
+  const pending = itemIn.status === "pending";
+  // A RUN NOTE THAT NAMES AN OPEN PORTAL QUESTION IS ASKED AS THAT QUESTION. A note written before
+  // #544 ("Required question '…' left blank") carries no question of its own; the backend matched it
+  // to the open question by its label. Answering it closes the note.
+  const noteQuestion = pending && !itemIn.portalQuestion && ctx.noteQuestions ? ctx.noteQuestions[String(itemIn.id)] : null;
+  const item = noteQuestion ? { ...itemIn, portalQuestion: noteQuestion } : itemIn;
   const isQuestion = !!(item.portalQuestion && item.portalQuestion.key);
   const isAdvisory = !isQuestion && ADVISORY_REVIEW_ISSUE_TYPES.includes(item.issueType || "");
   const isInverter = !isQuestion && !isAdvisory && item.fieldName === "inverterOutput";
@@ -7221,7 +7230,7 @@ function reviewCardHtml(item, ctxIn) {
     body = `<p style="margin:0 0 4px">${esc(text)}</p>
       ${item.issueType !== "Run triage" && item.sourceExcerpt ? `<p style="margin:0 0 4px"><strong>Source:</strong> ${esc(item.sourceExcerpt)}</p>` : ""}
       ${pending ? `<div class="actions"><button class="secondary" data-review-action="reject" data-review-id="${esc(item.id)}"><i data-lucide="check"></i><span>Dismiss</span></button></div>` : ""}
-      ${next("advisory")}`;
+      ${next(item.issueType === "Run triage" ? "runNote" : "advisory")}`;
   } else if (isInverter && pending) {
     body = inverterOutputBodyHtml(item, ctx) + next("inverter");
   } else {
@@ -7263,7 +7272,13 @@ function renderReview() {
 
   const project = state.detail.project || {};
   const lookup = state.inverterLookup && state.inverterLookup.projectId === project.id ? state.inverterLookup : null;
-  const ctx = { project, snapshot: project.parserSnapshot || {}, inverterLookup: lookup };
+  // Open portal questions a pending run note names (the backend's label match), by note id.
+  const noteQuestions = {};
+  for (const q of (state.portalQuestions && state.portalQuestions.questions) || []) {
+    if (!q || !q.key || !Array.isArray(q.noteItemIds) || !Array.isArray(q.options) || q.options.length < 2) continue;
+    for (const noteId of q.noteItemIds) noteQuestions[String(noteId)] = { key: q.key, label: q.label, options: q.options, control: "choice" };
+  }
+  const ctx = { project, snapshot: project.parserSnapshot || {}, inverterLookup: lookup, noteQuestions };
   const reviewCard = (item) => reviewCardHtml(item, ctx);
 
   const pendingHtml = pending.map(reviewCard).join("");

@@ -123,9 +123,10 @@ const inverter = item({ id: "inv1", issueType: "Inverter output", fieldName: "in
 const bus = item({ id: "bus1", issueType: "MSP bus rating", fieldName: "busRating", notes: "Enter the main service panel busbar rating in amps (e.g. 200)." });
 
 /** Render a set of pending items through renderReview; returns each card's HTML, in item order. */
-function render(items: unknown[], snapshot: Record<string, unknown> = {}, lookup: unknown = null): string[] {
+function render(items: unknown[], snapshot: Record<string, unknown> = {}, lookup: unknown = null, portalQuestions: unknown = null): string[] {
   env.state.detail = { project: { id: "p-1", parserSnapshot: snapshot }, humanReviewItems: items };
   env.state.inverterLookup = lookup;
+  env.state.portalQuestions = portalQuestions;
   els.reviewItems.innerHTML = "";
   try { lib.renderReview?.(); } catch (err) { return [`RENDER THREW: ${String((err as Error).message)}`]; }
   return String(els.reviewItems.innerHTML).split("<article").slice(1);
@@ -169,6 +170,22 @@ check("A no input box on an advisory run-triage item", !/<input/.test(lgCard), l
 check("A none of the agent's engineering text (suggestion, root cause, internal field name)",
   !/systemOwnership|planner|\bbind\b|nothing to map/i.test(text(lgCard)), text(lgCard));
 check("A a Dismiss button", /data-review-action="reject"/.test(lgCard) && /Dismiss/.test(lgCard), lgCard);
+check("A a run's note never reads as settled: no 'nothing to enter', it says to check the portal before submitting",
+  !/nothing to enter/i.test(text(lgCard)) && /before you submit/i.test(text(lgCard)), text(lgCard));
+
+console.log("\n[N] a run note that names an open portal question is asked as that question");
+const PQ = { questions: [
+  { key: "ownershipModel", label: Q, options: ["Customer-Owned", "Third-Party Owned"], unsure: false, noteItemIds: ["lg1"] },
+], unansweredCount: 1, unsureCount: 0 };
+const [noteAsQ = "", otherNote = ""] = render([legacy, item({ id: "lg2", issueType: "Run triage", fieldName: "portal_field", sourceExcerpt: "The city asks whether a third-party inspector will be used." })], {}, null, PQ);
+const noteRadios = noteAsQ.match(/<input[^>]*type="radio"[^>]*>/g) ?? [];
+check("N the note is the portal's question with its options, nothing pre-selected", noteAsQ.includes(Q) && noteRadios.length === 2 && !/\bchecked\b/.test(noteAsQ), noteAsQ);
+check("N it saves through the portal-questions door (Save answer with the per-job key), not Dismiss",
+  /data-portal-answer="lg1"/.test(noteAsQ) && /data-portal-key="ownershipModel"/.test(noteAsQ) && !/data-review-action="reject"/.test(noteAsQ), noteAsQ);
+check("N none of the agent's engineering text", !/systemOwnership|planner|\bbind\b|nothing to map|left blank/i.test(text(noteAsQ)), text(noteAsQ));
+check("N a note the backend did not name stays a note", !/type="radio"/.test(otherNote) && /data-review-action="reject"/.test(otherNote) && /third-party inspector/.test(otherNote), otherNote);
+const [resolvedNote = ""] = render([{ ...legacy, status: "rejected" }], {}, null, PQ);
+check("N a dismissed note is not re-asked", !/type="radio"/.test(resolvedNote), resolvedNote);
 
 console.log("\n[I] the inverter item is one card");
 const inputValue = (html: string, idPrefix: string): string | null => {
@@ -209,7 +226,7 @@ check("T a QC value (bus rating) keeps its input and Save Edit", /id="review-bus
 
 console.log("\n[W] who acts, and what happens after saving");
 for (const [name, card] of [["question", qCard], ["advisory", lgCard], ["inverter", invCard], ["typed", busCard]] as Array<[string, string]>) {
-  check(`W the ${name} card says who acts and what saving does`, /class="muted review-next"/.test(card) && /\b(You|nothing to enter)\b/.test(text(card)), text(card));
+  check(`W the ${name} card says who acts and what saving does`, /class="muted review-next"/.test(card) && /\b(you|nothing to enter)\b/i.test(text(card)), text(card));
 }
 
 console.log("\n[E] esc() everything");
