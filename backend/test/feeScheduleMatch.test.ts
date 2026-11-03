@@ -253,7 +253,8 @@ registerFeeScheduleLookup(null);
   save("City of Genericbay", "Permit fee", 160);
   const generic = lineFor("mf4-generic", "City of Genericbay");
   check("5a. MUST-EXCLUDE: 'Permit fee' $160 paired with 'Plumbing permit fee | $160.00' does NOT read 'matches the published schedule'",
-    generic.feeUsd === 160 && generic.corroborated === false && generic.confidence === "seeded" && badge(lib.renderFeeSheetLine(generic)) === "provisional — not verified",
+    // #421: the card's amount carries the 12% Oregon state surcharge the quote adds ($160 -> $179.20).
+    generic.feeUsd === 179.2 && generic.corroborated === false && generic.confidence === "seeded" && badge(lib.renderFeeSheetLine(generic)) === "provisional — not verified",
     JSON.stringify({ f: generic.feeUsd, c: generic.corroborated, conf: generic.confidence, e: generic.evidenceQuote }));
   check("5a'. …the stored bracket's own pairing is left as it was (evidence only; the gate is the badge's)", stored("City of Genericbay"));
   save("City of Solarbay", "Solar photovoltaic permit", 250);
@@ -268,7 +269,7 @@ registerFeeScheduleLookup(null);
   check("5c. MUST-EXCLUDE: the exact-label row 'Residential permit | $180.00' names no solar permit — no badge", exact.corroborated === false, JSON.stringify({ c: exact.corroborated, e: exact.evidenceQuote }));
   save("Kva County", "5 KVA or less", 135, "electrical");
   const kva = lineFor("mf4-kva", "Kva County");
-  check("5d. MUST-EXCLUDE: a bare kVA row with no heading naming solar ('5 KVA or less | $135.00') — no badge", kva.corroborated === false && kva.feeUsd === 135, JSON.stringify({ f: kva.feeUsd, c: kva.corroborated, e: kva.evidenceQuote }));
+  check("5d. MUST-EXCLUDE: a bare kVA row with no heading naming solar ('5 KVA or less | $135.00') — no badge", kva.corroborated === false && kva.feeUsd === 151.2, JSON.stringify({ f: kva.feeUsd, c: kva.corroborated, e: kva.evidenceQuote }));
   save("City of Mechbay", "Mechanical permit", 90);
   const mech = lineFor("mf4-mech", "City of Mechbay");
   check("5e. MUST-EXCLUDE: a line naming another trade never earns it, even as the exact label", mech.corroborated === false, JSON.stringify({ c: mech.corroborated, e: mech.evidenceQuote }));
@@ -327,11 +328,11 @@ registerFeeScheduleLookup(null);
   saveOn(TIGARD_PROD, { ahj: "Windy Prodbay" }, "5.01 to 15 kva", 210, "electrical");
   const wind = lineOf("m1p-wind", "Windy Prodbay");
   check("6a. MUST-EXCLUDE (M1p): the production-shaped WIND row '5.01 to 15 kva | $210.00 | 7/1/2012' under 'Wind generation systems' does not badge",
-    wind.feeUsd === 210 && wind.corroborated === false, show(wind));
+    wind.feeUsd === 235.2 && wind.corroborated === false, show(wind));
   saveOn(TIGARD_PROD, { ahj: "Renew Prodbay" }, "5.01 to 15 kva", 133.56, "electrical");
   const renew = lineOf("m1p-renew", "Renew Prodbay");
   check("6b. MUST-PASS: the same production shape under 'Renewable electrical energy systems' badges (the heading names the permit)",
-    renew.feeUsd === 133.56 && renew.corroborated === true, show(renew));
+    renew.feeUsd === 149.59 && renew.corroborated === true, show(renew));
   check("6c. …the heading is stored with the bracket's corroboration and survives the DB read",
     storedCorr("Renew Prodbay").heading === "Renewable electrical energy systems" && storedCorr("Windy Prodbay").heading === "Wind generation systems",
     JSON.stringify([storedCorr("Renew Prodbay"), storedCorr("Windy Prodbay")]));

@@ -581,6 +581,10 @@ export interface SubmissionPaymentQuote {
   permitFeeUsd: number | null;
   permitFeeSource: PermitFeeSource;
   permitFeeBasis: string;
+  /** permitFeeUsd is a FLOOR, not a total (#421): the published schedule priced some of this
+   *  filing's lines and not all of them, and the amount is their sum — "at least". Graded
+   *  "estimated"; the basis names what is left out. Absent/false on every other amount. */
+  permitFeeIsFloor?: boolean;
   /** The jurisdiction's own fee page, when a published schedule supplied or
    *  corroborated the number — so the operator can click through and check. */
   permitFeeSourceUrl: string | null;
@@ -693,6 +697,13 @@ export interface PublishedFeeResult {
   /** THE BILL, ITEMISED. See FeeChargeBreakdown. Absent/empty on a jurisdiction
    *  that publishes one permit line and nothing else, which is most of them. */
   charges?: FeeChargeBreakdown[];
+  /** THE FLOOR (#421): when feeUsd is null, the sum of the lines and charges the schedule DID
+   *  price for this filing — a lower bound, never a total. null/absent when nothing priced. The
+   *  quote shows it as "at least $X" instead of falling to the valuation heuristic, which is
+   *  allowed to read LOWER than lines the schedule had already priced. */
+  pricedSubtotalUsd?: number | null;
+  /** What that floor leaves out, by name (the unresolved permits and the unpriced charges). */
+  unpricedItems?: string[];
 }
 
 /** ONE CHARGE ON THIS FILING, PRICED — the presentation grain, not the storage one.
@@ -760,6 +771,8 @@ export interface ProjectFeeSheetLine {
    *  line, the AHJ's review on the local_review line. Absent otherwise. */
   issuerLabel?: string;
   feeUsd: number | null;
+  /** feeUsd is a lower bound ("at least"), not the fee — see SubmissionPaymentQuote.permitFeeIsFloor. */
+  feeIsFloor?: boolean;
   source: PermitFeeSource;
   basis: string;
   bracketLabel: string | null;
@@ -1139,6 +1152,22 @@ export interface HumanReviewItem {
   notes: string;
   createdAt: string;
   updatedAt: string;
+  /** #544: set when the item IS a portal question a run left blank for this job (the per-job key
+   *  only a person answers, the portal's own wording and options as the run saw them). The person
+   *  answers it in place through /api/projects/:id/portal-questions; absent on every other item. */
+  portalQuestion?: HumanReviewPortalQuestion;
+}
+
+/** A portal question carried on a review item (human_review_items.portal_question_json, #544). */
+export interface HumanReviewPortalQuestion {
+  /** One of PER_JOB_ANSWER_KEYS (shared/src/perJobQuestions.ts). */
+  key: string;
+  /** The portal's own wording of the question. */
+  label: string;
+  /** The portal's own options, placeholders removed (at least two). */
+  options: string[];
+  /** A dropdown on the portal, or a radio / choice group. */
+  control: "select" | "choice";
 }
 
 /** How a correction's text relates to the text it was read from (corrections.source_text).
@@ -2383,6 +2412,13 @@ export interface AiReviewFinding {
 
 export interface AiPlanReviewResult {
   provider: "claude" | "stub";
+  /** Whether the model's review came back WHOLE. "complete": the answer ended on its own and
+   *  parsed, so an empty `findings` list means the model found nothing. "incomplete": the answer
+   *  was cut off at the output ceiling (stop_reason max_tokens), could not be read as the requested
+   *  JSON, or the call failed. Its findings are partial, and an empty list means nothing was read,
+   *  never "nothing found" (`notes` says why). REQUIRED so no producer can leave it out, and every
+   *  reader treats anything but "complete" as incomplete (issue #531). */
+  completeness: "complete" | "incomplete";
   findings: AiReviewFinding[];
   summary: string;
   confidence: "low" | "medium" | "high";
@@ -4356,6 +4392,9 @@ export interface InfoPageCandidateCapture {
   evidence: unknown;
   /** The masked full-page screenshot, base64 PNG; absent when it could not be taken safely. */
   screenshotBase64?: string;
+  /** #366: captured on a project that already made progress on this portal — its session may have
+   *  sat at a later position of the interview, so the card warns the person verifying it. */
+  capturedWithHistory?: boolean;
 }
 
 /** A candidate row as the dashboard reads it (project-scoped evidence; never screenshot bytes). */

@@ -176,6 +176,7 @@ import { applyCachedVisionVerdicts, visionRelaxedBlockers } from "./reviewerVisi
 import { nowIso } from "./time";
 import { isHarnessAbort, looksBotBlocked } from "./runAbort";
 import { finalSubmitEnvAllows, recipeShapeProblems } from "../../shared/src/portalSafety";
+import { parsePerJobPortalQuestion } from "../../shared/src/perJobQuestions";
 
 // THE ONE SEAM A TEST MAY STUB: the recipe-replay launcher prepareSubmission calls. Everything
 // around it — the gates, the run row, the outcome, the demotion, the heal write, the approval —
@@ -447,6 +448,9 @@ function mapQc(row: Row): QcResult {
 }
 
 function mapReview(row: Row): HumanReviewItem {
+  // #544: a portal question the person answers in place — only one that parses as a per-job key
+  // with at least two of the portal's own options; anything else is no question at all.
+  const portalQuestion = parsePerJobPortalQuestion(row.portal_question_json);
   return {
     id: text(row.id),
     projectId: text(row.project_id),
@@ -459,6 +463,7 @@ function mapReview(row: Row): HumanReviewItem {
     notes: text(row.notes),
     createdAt: text(row.created_at),
     updatedAt: text(row.updated_at),
+    ...(portalQuestion ? { portalQuestion } : {}),
   };
 }
 

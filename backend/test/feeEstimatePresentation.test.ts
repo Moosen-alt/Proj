@@ -141,8 +141,9 @@ async function main(): Promise<void> {
     traskQuote.permitFeeUsd === 180 && traskQuote.permitFeeSource === "valuation_estimate" && traskQuote.permitFeeConfidence === "estimated",
     `${traskQuote.permitFeeUsd} / ${traskQuote.permitFeeSource} / ${traskQuote.permitFeeConfidence}`);
   const ivyQuote = buildPaymentQuote(db, IVY, "permit");
-  check("premise: Ivy quotes $335.00 from the published schedule",
-    ivyQuote.permitFeeUsd === 335 && ivyQuote.permitFeeSource === "published_schedule" && ivyQuote.permitFeeConfidence === "seeded",
+  // #421: $335.00 of schedule + the 12% Oregon state surcharge the rows do not hold = $375.20.
+  check("premise: Ivy quotes $375.20 from the published schedule ($335.00 + the modeled 12% state surcharge)",
+    ivyQuote.permitFeeUsd === 375.2 && ivyQuote.permitFeeSource === "published_schedule" && ivyQuote.permitFeeConfidence === "seeded",
     `${ivyQuote.permitFeeUsd} / ${ivyQuote.permitFeeSource} / ${ivyQuote.permitFeeConfidence}`);
   check("premise: nothing here wrote confidence 'verified' (hard rule 3)",
     db.query<{ n: number }>("SELECT COUNT(*) AS n FROM fee_schedules WHERE confidence = 'verified'")[0]?.n === 0);
@@ -189,15 +190,15 @@ async function main(): Promise<void> {
   //    A published number presenting as a guess is the mirror-image defect.
   // -------------------------------------------------------------------------
   const ivy = buildProjectFeeSheet(db, IVY);
-  check("4a. Ivy's published line keeps known:true at $335.00",
-    ivy.lines[0].known === true && ivy.lines[0].feeUsd === 335, `known=${ivy.lines[0].known} fee=${ivy.lines[0].feeUsd}`);
+  check("4a. Ivy's published line keeps known:true at $375.20",
+    ivy.lines[0].known === true && ivy.lines[0].feeUsd === 375.2, `known=${ivy.lines[0].known} fee=${ivy.lines[0].feeUsd}`);
   check("4b. Ivy's sheet has NO unknowns and a graded, non-estimated total",
-    ivy.unknowns.length === 0 && ivy.totalUsd === 535 && ivy.totalConfidence === "seeded",
+    ivy.unknowns.length === 0 && ivy.totalUsd === 575.2 && ivy.totalConfidence === "seeded",
     `${JSON.stringify(ivy.unknowns)} / ${ivy.totalUsd} / ${ivy.totalConfidence}`);
   const ivyText = renderFeeSheet(buildFeeSheetPresentation(db, IVY));
   check("4c. Ivy's render carries no estimate caveat anywhere",
     !ivyText.includes("INCLUDES AN ESTIMATE") && !ivyText.includes("≈") && !/are ESTIMATES/.test(ivyText)
-    && /PROJECT TOTAL\s+\$535\.00/.test(ivyText),
+    && /PROJECT TOTAL\s+\$575\.20/.test(ivyText),
     ivyText.split("\n").filter((l) => /PROJECT TOTAL|ESTIMATE/.test(l)).join(" | "));
 
   // -------------------------------------------------------------------------

@@ -433,7 +433,7 @@ const walk = async (mode: string, entries: VerifiedInfoPage[], permitType = "str
   const reported: Array<{ passId: string; where: string }> = [];
   const reserved: Walk["reserved"] = [];
   const a = new AutoLearnAdapter("Incident Walk", plan, {
-    maxPages: 6, budgetMs: 180_000, infoPagePasses: entries, infoPagePriorProgress: priorProgress, onInfoPagePassed: (p) => { reported.push(p); }, infoPageProofValues: JOB_VALUES,
+    maxPages: 6, budgetMs: 180_000, infoPagePasses: entries, infoPagePriorProgress: priorProgress, infoPagePassUnavailable: false, onInfoPagePassed: (p) => { reported.push(p); }, infoPageProofValues: JOB_VALUES,
     // Round 5: the backend's reservation at the admission — always reserved here (its refusals are
     // pinned in infoPagePass.dom.smoke [R] and backend infoPages.test).
     reserveInfoPagePass: (p) => { reserved.push({ ...p, reportedBefore: reported.length }); return []; },

@@ -157,6 +157,7 @@ const stubLearn = () => ({
 type LearnInput = {
   infoPagePasses?: Array<{ id: string }>; infoPagePriorProgress?: boolean; onInfoPagePassed?: (p: { passId: string; where: string }) => void; infoPageProofValues?: Record<string, string>;
   reserveInfoPagePass?: (p: { passId: string; where: string }) => ReadonlyArray<string> | Promise<ReadonlyArray<string>>;
+  infoPagePassUnavailable?: boolean;
 };
 let handedAll: LearnInput[] = [];
 let scripted: Array<(input: LearnInput) => unknown> = [];
@@ -496,9 +497,237 @@ await check("prior progress (round 2, P5): a tracking number of this project ref
     db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)", [`t-${P}`, P, portalUrl, "26-104455-RS", "2026-10-15", "2026-10-15"]);
     assert.equal(IP.infoPagePriorProgress(db, P, url, "ahj"), true, what);
     assert.equal(IP.infoPagePriorProgress(db, P, url, "utility"), true, `${what}: the table has no side, so both`);
-    assert.ok(!JSON.stringify(IP.infoPagePriorProgressReasons(db, P, "ahj")).includes("104455"), "the number is masked in the reasons");
+    assert.ok(!JSON.stringify(IP.infoPagePriorProgressReasons(db, P, "ahj", [url])).includes("104455"), "the number is masked in the reasons");
   }
   assert.equal(IP.infoPagePriorProgress(db, fx.newProject(), "not a url", "ahj"), true);
+});
+await check("#365: a tracked number of the OTHER side is skipped only on POSITIVE evidence it was filed elsewhere — a NEM number when the utility's own records name only its interconnection platform (PowerClerk, or no URL kept), a permit number on an interconnection platform; a carve-out or unknown utility, contradictory/default rows, this-host rows and no portal still count; asked again at the admission on the real page", async () => {
+  const { getProjectDetail } = await import("../src/repository");
+  const { ensureCheckTarget } = await import("../src/submittalTracks");
+  const permitUrl = "https://aca-oregon.accela.com/oregon/Default.aspx";
+  const nemUrl = "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login"; // a utility interconnection platform
+  const nemTarget = (P: string, portalUrl: string, number = "APP-900417") => ensureCheckTarget(db, getProjectDetail(db, P).project, {
+    targetType: "nem", permitType: "nem", applicationNumber: number, portalName: "Utility NEM portal", portalUrl,
+  });
+  const kbUtilityRow = (id: string, utility: string, url: string, verified: boolean) => {
+    const at = new Date().toISOString();
+    db.run(
+      `INSERT INTO permit_utility_knowledge (id, profile_key, state, ahj, utility, portal_url, confidence, first_seen_at, last_learned_at, updated_at, verified_at, verified_by)
+       VALUES (?, ?, 'OR', '', ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, `or||${utility.toLowerCase()}|${id}`, utility, url, verified ? "verified" : "seeded", at, at, at, verified ? at : null, verified ? "synthetic.reviewer@example.com" : ""]);
+  };
+  // The fixture's utility (PGE): its own records name only its PowerClerk tenant.
+  kbUtilityRow("kb-365-pge", "PGE", "https://pgenm.powerclerk.com/MvcAccount/Login", false);
+
+  // The NEM application of a platform-only utility: not progress on the permit side, on ANY permit
+  // host (the learn's entry URL or the page it reaches) — and still progress on the utility side.
+  const N = fx.newProject();
+  nemTarget(N, nemUrl);
+  assert.deepEqual(IP.infoPagePriorProgressReasons(db, N, "ahj", [permitUrl]).hard, [], "the NEM filing is NOT progress on the permit side");
+  assert.equal(IP.infoPagePriorProgress(db, N, permitUrl, "ahj"), false);
+  assert.equal(IP.infoPagePriorProgress(db, N, "https://www.examplecity.gov/permits/apply-online", "ahj"), false, "…on whichever permit host the learn enters by");
+  assert.equal(IP.infoPagePriorProgress(db, N, nemUrl, "utility"), true, "…and must stay progress on the utility side");
+  // THE LIVE SHAPE: the confirmation was captured with no URL kept (captureConfirmation writes blanks).
+  const Nb = fx.newProject();
+  nemTarget(Nb, "");
+  assert.equal(IP.infoPagePriorProgress(db, Nb, permitUrl, "ahj"), false, "a platform-only utility's NEM number with no URL kept is not progress on a permit portal");
+  assert.equal(IP.infoPagePriorProgress(db, Nb, nemUrl, "utility"), true);
+  // A permit number: progress on the permit side; on the utility side only on an interconnection platform.
+  const B = fx.newProject();
+  ensureCheckTarget(db, getProjectDetail(db, B).project, {
+    targetType: "permit", permitType: "building", applicationNumber: "26-104455-RS", portalName: "Oregon ePermitting", portalUrl: permitUrl,
+  });
+  assert.equal(IP.infoPagePriorProgress(db, B, permitUrl, "ahj"), true, "a permit number is progress on the permit side");
+  assert.equal(IP.infoPagePriorProgress(db, B, nemUrl, "utility"), false, "…and not on an interconnection platform, where permits are never filed");
+  assert.equal(IP.infoPagePriorProgress(db, B, "https://www.examplecity.gov/utilities/interconnection", "utility"), true, "…but it counts on any other utility-side portal (a carve-out city portal)");
+  // The legacy split shape (target_type on the column default, permit_type 'nem') reads as the utility's.
+  const L = fx.newProject();
+  db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, target_type, permit_type, created_at, updated_at) VALUES (?, ?, '', 'APP-1', 'permit', 'nem', '2026-10-15', '2026-10-15')", [`tl-${L}`, L]);
+  assert.equal(IP.infoPagePriorProgress(db, L, permitUrl, "ahj"), false);
+  assert.equal(IP.infoPagePriorProgress(db, L, nemUrl, "utility"), true);
+  // Contradictory columns ('nem' + a permit discipline, which a body field can write): both sides.
+  const X = fx.newProject();
+  db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, target_type, permit_type, created_at, updated_at) VALUES (?, ?, '', 'BLD-1', 'nem', 'building', '2026-10-15', '2026-10-15')", [`tx-${X}`, X]);
+  assert.equal(IP.infoPagePriorProgress(db, X, permitUrl, "ahj"), true, "contradictory row: counts on the permit side");
+  assert.equal(IP.infoPagePriorProgress(db, X, nemUrl, "utility"), true, "…and on the utility side");
+  // A NEM number recorded on THIS very host counts (www-insensitive), whatever the utility's records say.
+  const H = fx.newProject();
+  nemTarget(H, "https://www.aca-oregon.accela.com/oregon/status");
+  assert.equal(IP.infoPagePriorProgress(db, H, permitUrl, "ahj"), true, "a NEM number recorded on this very host is progress here");
+  // RULE 5'S CARVE-OUT: a utility whose own records name a city's permit portal — verified OR only
+  // seeded (the operator may have filed it there by hand) — has its NEM number counted on the permit
+  // side, on every host (the learn may enter by a city landing page on another host).
+  const MUNI = "Example Muni Power";
+  kbUtilityRow("kb-365-muni", MUNI, "https://aca-prod.accela.com/EXAMPLEOR/Default.aspx", true);
+  const M = fx.newProject({ utility: MUNI });
+  nemTarget(M, "");
+  assert.equal(IP.infoPagePriorProgress(db, M, "https://aca-prod.accela.com/EXAMPLEOR/Default.aspx", "ahj"), true, "verified carve-out: counts on the portal it names");
+  assert.equal(IP.infoPagePriorProgress(db, M, "https://www.examplemuni-city.gov/permits/apply-online", "ahj"), true, "…and on a landing host the learn enters by");
+  const SEEDED = "Example Seeded Muni";
+  kbUtilityRow("kb-365-seeded", SEEDED, "https://aca-prod.accela.com/SEEDEDOR/Default.aspx", false);
+  const S = fx.newProject({ utility: SEEDED });
+  nemTarget(S, "");
+  assert.equal(IP.infoPagePriorProgress(db, S, permitUrl, "ahj"), true, "seeded carve-out: a hand-filed NEM in the city's portal still counts");
+  const BOTH = "Example Platform And City Power";
+  kbUtilityRow("kb-365-both-a", BOTH, "https://bothpower.powerclerk.com/MvcAccount/Login", false);
+  kbUtilityRow("kb-365-both-b", BOTH, "https://permits.bothcity.gov/apply", false);
+  const PB = fx.newProject({ utility: BOTH });
+  nemTarget(PB, "");
+  assert.equal(IP.infoPagePriorProgress(db, PB, permitUrl, "ahj"), true, "a utility naming its platform AND another portal: counts");
+  // A synthetic platform-only utility (the same name on its rows): positive evidence, skipped.
+  const PLAT = "Example Platform Power";
+  kbUtilityRow("kb-365-plat", PLAT, "https://exampleplatform.powerclerk.com/MvcAccount/Login", false);
+  const PP = fx.newProject({ utility: PLAT });
+  nemTarget(PP, "");
+  assert.equal(IP.infoPagePriorProgress(db, PP, permitUrl, "ahj"), false, "a utility whose own rows name only its platform: its NEM number is not progress on a permit portal");
+  // A row that matches only by the fuzzy entity score adds caution (its city portal counts the
+  // number) but never vouches for a platform.
+  const { sameEntity } = await import("../src/portalRecipes");
+  const FUZ = "Example Fuzzy Power";
+  kbUtilityRow("kb-365-fuz-a", FUZ, "https://examplefuzzy.powerclerk.com/MvcAccount/Login", false);
+  kbUtilityRow("kb-365-fuz-b", `${FUZ} Cooperative`, "https://permits.fuzzycity.gov/apply", false);
+  assert.ok(sameEntity("OR", FUZ, "OR", `${FUZ} Cooperative`), "precondition: the fuzzy entity score matches the two spellings");
+  const PF = fx.newProject({ utility: FUZ });
+  nemTarget(PF, "");
+  assert.equal(IP.infoPagePriorProgress(db, PF, permitUrl, "ahj"), true, "a fuzzily matched row naming a city portal adds caution: counts");
+  const FUZP = "Example Fuzzy Platform Power";
+  kbUtilityRow("kb-365-fuzp-b", `${FUZP} Cooperative`, "https://examplefuzzyp.powerclerk.com/MvcAccount/Login", false);
+  const PFP = fx.newProject({ utility: FUZP });
+  nemTarget(PFP, "");
+  assert.equal(IP.infoPagePriorProgress(db, PFP, permitUrl, "ahj"), true, "a platform named only by a fuzzily matched row never vouches: counts");
+  // A utility with no records at all: no evidence where it files, so the number counts.
+  const U = fx.newProject({ utility: "Example Unknown Power" });
+  nemTarget(U, "");
+  assert.equal(IP.infoPagePriorProgress(db, U, permitUrl, "ahj"), true, "an unknown utility never hides the number");
+  // No portal given at all: every number counts.
+  assert.ok(IP.infoPagePriorProgressReasons(db, N, "ahj", []).hard.length > 0, "no portal: the number counts");
+  assert.ok(IP.infoPagePriorProgressReasons(db, N, "ahj", ["not a url", ""]).hard.length > 0, "unreadable portals: the number counts");
+  // THE CARD reads every portal it knows (each verified page held/passed here, each learn's own portal
+  // URL): with a permit number on the utility side, one non-platform portal among them counts it.
+  const K = fx.newProject();
+  ensureCheckTarget(db, getProjectDetail(db, K).project, { targetType: "permit", permitType: "electrical", applicationNumber: "26-104466-EL", portalName: "Oregon ePermitting", portalUrl: permitUrl });
+  IP.recordInfoPageHeldVerified(db, K, "utility", "run-k", [{ passId: "pass-k", where: nemUrl }]);
+  IP.recordInfoPageLearnStart(db, K, "utility", 1, nemUrl);
+  assert.deepEqual(IP.listInfoPageProjectState(db, K)[0].hard, [], "every portal it knows is an interconnection platform: no hard reason on the card");
+  IP.recordInfoPageLearnStart(db, K, "utility", 1, "https://www.examplecity.gov/utilities/interconnection");
+  assert.ok(IP.listInfoPageProjectState(db, K)[0].hard.length > 0, "a learn's own portal that is not a platform: the card counts the number too");
+});
+await check("#365, HELM'S REVIEW OF #369: a city's own Salesforce tenant is never a platform (both sides); the utility filing lookup and a utility's portal on a host in question count; the project's own NEM row URL counts; KB portal_url read raw; free-text permit types, default-columns rows, a city URL in portal_name, a utility recipe on a city portal, stateless and out-of-state rows all count", async () => {
+  const { getProjectDetail, createPermitCheckTarget } = await import("../src/repository");
+  const { ensureCheckTarget } = await import("../src/submittalTracks");
+  const { saveUtilityFilingLookup } = await import("../src/utilityFilingLookup");
+  const { isUtilityPlatformUrl } = await import("../src/portalChannel");
+  const permitUrl = "https://aca-oregon.accela.com/oregon/Default.aspx";
+  const nemUrl = "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login";
+  const at = new Date().toISOString();
+  const kbRow = (id: string, utility: string, url: string, name = "", state = "OR", verified = false) => db.run(
+    `INSERT INTO permit_utility_knowledge (id, profile_key, state, ahj, utility, portal_url, portal_name, confidence, first_seen_at, last_learned_at, updated_at, verified_at, verified_by)
+     VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, `${state.toLowerCase()}||${utility.toLowerCase()}|${id}`, state, utility, url, name, verified ? "verified" : "seeded", at, at, at, verified ? at : null, verified ? "synthetic.reviewer@example.com" : ""]);
+  const nemTarget = (P: string, portalUrl: string) => ensureCheckTarget(db, getProjectDetail(db, P).project, {
+    targetType: "nem", permitType: "nem", applicationNumber: "APP-900418", portalName: "Utility NEM portal", portalUrl,
+  });
+  const cityForce = "https://cedarvale.my.site.com/s/permits";
+  assert.equal(isUtilityPlatformUrl(cityForce), true, "precondition: the launch predicate reads a city's unknown Salesforce tenant as a utility's");
+
+  // BLOCKER 1, utility side: a permit number with the NEM learn on the city's own Salesforce site.
+  const S1 = fx.newProject();
+  ensureCheckTarget(db, getProjectDetail(db, S1).project, { targetType: "permit", permitType: "building", applicationNumber: "BLD-2026-501", portalName: "City permits", portalUrl: "" });
+  assert.equal(IP.infoPagePriorProgress(db, S1, cityForce, "utility"), true, "a permit number counts on a city's Salesforce tenant (never a platform)");
+  assert.equal(IP.infoPagePriorProgress(db, S1, nemUrl, "utility"), false, "…and is still skipped on a real interconnection platform");
+  // BLOCKER 1, permit side: a carve-out muni whose verified row names the city's Salesforce site.
+  const SFM = "Example Salesforce Muni";
+  kbRow("kb-369-sfm-a", SFM, "https://sfmuni.powerclerk.com/MvcAccount/Login");
+  kbRow("kb-369-sfm-b", SFM, "https://cedarvale.my.site.com/s/apply", "", "OR", true);
+  const S2 = fx.newProject({ utility: SFM });
+  nemTarget(S2, "");
+  assert.equal(IP.infoPagePriorProgress(db, S2, cityForce, "ahj"), true, "a utility naming the city's Salesforce site: its NEM number counts there");
+  assert.equal(IP.infoPagePriorProgress(db, S2, permitUrl, "ahj"), true, "…and on any permit host (its own records name a non-platform portal)");
+
+  // BLOCKER 2: the utility filing lookup names a city host; a seeded PowerClerk KB row beside it.
+  const LK = "Example Lookup Power";
+  kbRow("kb-369-lk", LK, "https://lookuppower.powerclerk.com/MvcAccount/Login");
+  const cited = <T,>(value: T, quote = "Apply through the city portal.") => ({ value, sourceUrl: "https://lookuppower.example.test/interconnection", quote, origin: "lookup" as const });
+  saveUtilityFilingLookup(db, { state: "OR", utility: LK, filing: cited({ name: "City permit portal", url: "https://permits.lookupcity.gov/apply" }), program: cited("net_metering" as const), lookedUpAt: at });
+  const L1 = fx.newProject({ utility: LK });
+  nemTarget(L1, "");
+  assert.equal(IP.infoPagePriorProgress(db, L1, permitUrl, "ahj"), true, "a lookup naming a city portal makes the NEM number count");
+  assert.equal(IP.infoPagePriorProgress(db, L1, "https://permits.lookupcity.gov/apply", "ahj"), true, "…and on the very host the lookup names");
+  const LP = "Example Lookup Platform Power";
+  kbRow("kb-369-lp", LP, "https://lookupplatform.powerclerk.com/MvcAccount/Login");
+  // The round-2 fixture as it was (the 10-18 re-check, a nit: it was edited in place in round 4): the lookup
+  // names the utility's own platform, but its quote ("Apply through the city portal.") names a city's
+  // portal — words that count the number on their own since round 4.
+  saveUtilityFilingLookup(db, { state: "OR", utility: LP, filing: cited({ name: "PowerClerk", url: "https://lookupplatform.powerclerk.com/MvcAccount/Login" }), program: cited("net_metering" as const), lookedUpAt: at });
+  const L2 = fx.newProject({ utility: LP });
+  nemTarget(L2, "");
+  assert.equal(IP.infoPagePriorProgress(db, L2, permitUrl, "ahj"), true, "a lookup naming the platform, quoting the city's portal: counts");
+  // …and the quote that states its own platform, as its own case: skipped.
+  const LS = "Example Stated Platform Power";
+  kbRow("kb-369-ls", LS, "https://statedplatform.powerclerk.com/MvcAccount/Login");
+  saveUtilityFilingLookup(db, { state: "OR", utility: LS, filing: cited({ name: "PowerClerk", url: "https://statedplatform.powerclerk.com/MvcAccount/Login" }, "Apply through PowerClerk."), program: cited("net_metering" as const), lookedUpAt: at });
+  const L3 = fx.newProject({ utility: LS });
+  nemTarget(L3, "");
+  assert.equal(IP.infoPagePriorProgress(db, L3, permitUrl, "ahj"), false, "a lookup naming the utility's own platform agrees: skipped");
+
+  // A portal the utility names ON a portal in question (any kind, any match strength): counts.
+  const HQ = "Example Here Power";
+  kbRow("kb-369-hq-a", HQ, "https://herepower.powerclerk.com/MvcAccount/Login");
+  kbRow("kb-369-hq-b", HQ, "https://aca-oregon.accela.com/oregon/HerePower");
+  const H1 = fx.newProject({ utility: HQ });
+  nemTarget(H1, "");
+  assert.equal(IP.infoPagePriorProgress(db, H1, permitUrl, "ahj"), true, "a utility naming a portal on the host in question: counts");
+
+  // S3: the project's own NEM row kept a city status URL on a sibling host — its own evidence.
+  const O1 = fx.newProject();
+  nemTarget(O1, "https://status.examplecity.gov/interconnection/123");
+  assert.equal(IP.infoPagePriorProgress(db, O1, permitUrl, "ahj"), true, "the project's own NEM row URL off any platform: counts");
+  const O2 = fx.newProject();
+  nemTarget(O2, nemUrl);
+  assert.equal(IP.infoPagePriorProgress(db, O2, permitUrl, "ahj"), false, "…while a NEM row kept on the platform is still skipped");
+
+  // S4: a verified carve-out row on a TLD portalUrlsInText does not know (.online).
+  const ON = "Example Online Muni";
+  kbRow("kb-369-on-a", ON, "https://onlinemuni.powerclerk.com/MvcAccount/Login");
+  kbRow("kb-369-on-b", ON, "https://permits.examplemuni.online/apply", "", "OR", true);
+  const N1 = fx.newProject({ utility: ON });
+  nemTarget(N1, "");
+  assert.equal(IP.infoPagePriorProgress(db, N1, permitUrl, "ahj"), true, "a carve-out row on a .online host is read: counts");
+
+  // S5: a free-text permit_type a body field stored ('interconnection') cannot say its side.
+  const F1 = fx.newProject();
+  createPermitCheckTarget(db, F1, { targetType: "permit", permitType: "interconnection", applicationNumber: "INT-2026-7", portalName: "Utility portal" });
+  assert.equal(IP.infoPagePriorProgress(db, F1, nemUrl, "utility"), true, "a free-text permit type counts on the utility side");
+  // S7a: the dashboard's add-target form writes the defaults shape (only a number).
+  const D1 = fx.newProject();
+  createPermitCheckTarget(db, D1, { applicationNumber: "26-104477-RS", portalName: "City permits" });
+  assert.equal(IP.infoPagePriorProgress(db, D1, nemUrl, "utility"), true, "a default-columns row counts on the utility side");
+  assert.equal(IP.infoPagePriorProgress(db, D1, permitUrl, "ahj"), true, "…and on the permit side");
+  // S7b: a city URL only in a KB row's portal_name, beside a PowerClerk portal_url.
+  const PN = "Example Name Power";
+  kbRow("kb-369-pn", PN, "https://namepower.powerclerk.com/MvcAccount/Login", "Online application; municipal customers apply at https://permits.namecity.gov/apply");
+  const P1n = fx.newProject({ utility: PN });
+  nemTarget(P1n, "");
+  assert.equal(IP.infoPagePriorProgress(db, P1n, permitUrl, "ahj"), true, "a city URL in portal_name counts");
+  // S7c: a utility recipe on a city portal beside a PowerClerk-only KB row.
+  const RC = "Example Recipe Power";
+  kbRow("kb-369-rc", RC, "https://recipepower.powerclerk.com/MvcAccount/Login");
+  db.run("INSERT INTO portal_recipes (id, scope_type, profile_key, state, ahj, utility, portal_url, status, version, steps_json, created_at, updated_at) VALUES (?, 'utility', ?, 'OR', '', ?, 'https://permits.recipecity.gov/interconnection', 'complete', 1, '[]', ?, ?)",
+    ["rc-369", `or||${RC.toLowerCase()}`, RC, at, at]);
+  const R1 = fx.newProject({ utility: RC });
+  nemTarget(R1, "");
+  assert.equal(IP.infoPagePriorProgress(db, R1, permitUrl, "ahj"), true, "a utility recipe on a city portal counts");
+  // Optional: a row with no state, or another state's row, never vouches for the platform.
+  const NS = "Example Stateless Power";
+  kbRow("kb-369-ns", NS, "https://statelesspower.powerclerk.com/MvcAccount/Login", "", "");
+  const T1 = fx.newProject({ utility: NS });
+  nemTarget(T1, "");
+  assert.equal(IP.infoPagePriorProgress(db, T1, permitUrl, "ahj"), true, "a stateless row never vouches");
+  const XS = "Example Elsewhere Power";
+  kbRow("kb-369-xs", XS, "https://elsewherepower.powerclerk.com/MvcAccount/Login", "", "WA");
+  const T2 = fx.newProject({ utility: XS });
+  nemTarget(T2, "");
+  assert.equal(IP.infoPagePriorProgress(db, T2, permitUrl, "ahj"), true, "another state's row never vouches");
 });
 
 // ── PRIOR PROGRESS, ROUND 2: through the real autoLearnPortal (the learner stubbed) ──────────────
@@ -526,7 +755,7 @@ await check("B1a / P1 / 'twice': a learn PASSED the verified page, filled fields
   assert.equal(JSON.parse(fx.audits("portal.info_page_passed").filter((a) => a.project_id === P)[0].details).scope, "ahj");
   await runLearn(P);
   assert.equal(handedOf(handed as LearnInput).priorProgress, true, "the SAME project's next learn is refused");
-  const why = IP.infoPagePriorProgressReasons(db, P, "ahj");
+  const why = IP.infoPagePriorProgressReasons(db, P, "ahj", [sfjsp]);
   assert.ok(why.learn.some((w) => /passed a verified information page/.test(w)), JSON.stringify(why));
   assert.ok(why.learn.some((w) => /may have entered data/.test(w)), JSON.stringify(why));
   assert.equal(IP.infoPagePriorProgress(db, P, sfjsp, "utility"), false, "the other side is untouched");
@@ -639,7 +868,7 @@ await check("ALLOW ONCE MORE: after a use the card shows it (canAllow); a named 
   assert.equal(st[0].passed.length, 1);
   assert.equal(st[0].canAllow, true, JSON.stringify(st[0]));
   IP.allowInfoPagePassOnceMore(db, P, "ahj", { by: "Pat Allower", userId: "" });
-  assert.deepEqual(IP.infoPagePriorProgressReasons(db, P, "ahj"), { hard: [], learn: [] });
+  assert.deepEqual(IP.infoPagePriorProgressReasons(db, P, "ahj", [sfjsp]), { hard: [], learn: [] });
   assert.equal(IP.listInfoPageProjectState(db, P).length, 0, "nothing since the allowance");
   use();
   await runLearn(P);
@@ -674,6 +903,948 @@ await check("HELD AT A VERIFIED PAGE by prior progress: the learn reports it, th
   assert.equal(st[0].held.length, 1);
   assert.equal(st[0].passed.length, 0);
   assert.equal(st[0].canAllow, true);
+});
+await check("#365 + #366, THE LIVE PORTLAND SHAPE end to end: NEM filed first + an earlier learn → the card is still recorded → verified → the next learn is held at the verified page → nothing HARD stands in the way → allowed once more → the learn after passes once", async () => {
+  const { getProjectDetail } = await import("../src/repository");
+  const { ensureCheckTarget } = await import("../src/submittalTracks");
+  const P = fx.newProject();
+  ensureCheckTarget(db, getProjectDetail(db, P).project, {
+    targetType: "nem", permitType: "nem", applicationNumber: "APP-900417",
+    portalName: "Pacific Power NEM portal (PowerClerk)", portalUrl: "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login",
+  });
+  scripted = [() => passedResult()];
+  await runLearn(P); // an earlier learn that filled a field and failed: learn history on this side
+  const before = IP.infoPagePriorProgressReasons(db, P, "ahj", [sfjsp]);
+  assert.deepEqual(before.hard, [], JSON.stringify(before));
+  assert.ok(before.learn.length > 0, "the earlier learn is history");
+  // The capture learn. The learner is STUBBED here, so the backstop's half of #366 (opening the watch
+  // despite the history) is simulated; it is pinned in real Chromium by infoPagePass.dom.smoke [A2] /
+  // [A2b]. What this pins is the backend half: the card is recorded, verified, held, allowed, passed.
+  const c = capture(material((m) => { m.title = "Live Portland Shape Page"; }));
+  await runLearn(P, c);
+  assert.equal(handedOf(handed as LearnInput).priorProgress, true, "the capture learn was handed the history");
+  const open = cand(P).filter((r) => r.status === "open" && r.identity_sha256 === c.identitySha256);
+  assert.equal(open.length, 1, "the card was recorded on a project with history");
+  const passId = verifyFn(P, String(open[0].id), c.identitySha256).passId;
+  scripted = [() => passedResult({ stopReason: "backstop_abort", message: "HELD AT A VERIFIED INFORMATION PAGE: …", infoPageHeldVerified: [{ passId, where: sfjsp, why: ["this project already made progress on this portal"] }] })];
+  await runLearn(P);
+  const st = IP.listInfoPageProjectState(db, P);
+  assert.equal(st.length, 1);
+  assert.equal(st[0].held.length, 1);
+  assert.deepEqual(st[0].hard, [], "the NEM filing must not make the allowance impossible");
+  assert.equal(st[0].canAllow, true, JSON.stringify(st[0]));
+  IP.allowInfoPagePassOnceMore(db, P, "ahj", { by: "Pat Allower", userId: "" });
+  scripted = [(input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); return passedResult({ infoPagePassed: [{ passId, where: sfjsp }] }); }];
+  await runLearn(P);
+  assert.equal(handedOf(handedAll[0]).priorProgress, false, "allowed once more: the next learn may pass");
+  assert.ok((handedAll[0] as LearnInput).infoPagePasses!.some((e) => e.id === passId), "…and is handed the verified page");
+  await runLearn(P);
+  assert.equal(handedOf(handed as LearnInput).priorProgress, true, "…once");
+});
+await check("#365, ASKED AGAIN AT THE ADMISSION: the use is judged on the page the verified request leaves from — a carve-out utility's NEM number refuses the reservation there; a platform-only utility's does not", async () => {
+  const { getProjectDetail } = await import("../src/repository");
+  const { ensureCheckTarget } = await import("../src/submittalTracks");
+  const { P, passId } = await verifiedPage("Admission Recheck Page");
+  // The same project's utility switched to a carve-out utility (its records name a city portal).
+  const MUNI2 = "Example Admission Muni";
+  const at = new Date().toISOString();
+  db.run(
+    `INSERT INTO permit_utility_knowledge (id, profile_key, state, ahj, utility, portal_url, confidence, first_seen_at, last_learned_at, updated_at, verified_at, verified_by)
+     VALUES ('kb-365-adm', ?, 'OR', '', ?, 'https://permits.admissioncity.gov/apply', 'seeded', ?, ?, ?, NULL, '')`,
+    [`or||${MUNI2.toLowerCase()}|kb-365-adm`, MUNI2, at, at, at]);
+  db.run("UPDATE projects SET utility = ? WHERE id = ?", [MUNI2, P]);
+  ensureCheckTarget(db, getProjectDetail(db, P).project, { targetType: "nem", permitType: "nem", applicationNumber: "IC-2026-88", portalName: "City portal", portalUrl: "" });
+  const refused = IP.reserveInfoPagePassUse(db, P, "", "ahj", { passId, where: sfjsp });
+  assert.ok(refused.some((r) => /tracked by number/.test(r)), JSON.stringify(refused));
+  assert.equal(fx.audits("portal.info_page_passed").filter((a) => a.project_id === P).length, 0, "nothing was reserved");
+  // Back to the fixture's platform-only utility: the same NEM number no longer refuses the use.
+  db.run("UPDATE projects SET utility = 'PGE' WHERE id = ?", [P]);
+  assert.deepEqual(IP.reserveInfoPagePassUse(db, P, "", "ahj", { passId, where: sfjsp }), [], "a platform-only utility's NEM number does not refuse the use");
+});
+await check("#366: a card captured on a project with history WARNS the person verifying it (it may be that project's resumed application); a clean capture does not; a later history capture stamps an open card", () => {
+  const P = fx.newProject();
+  const c = capture(material((m) => { m.title = "History Stamp Page"; }), { capturedWithHistory: true });
+  IP.recordInfoPageCandidate(db, P, "run-h", c);
+  const card = IP.listInfoPageCandidates(db, P).find((x) => x.identitySha256 === c.identitySha256);
+  assert.ok(card && card.warnings.includes(IP.INFO_PAGE_HISTORY_CAPTURE_WARNING), JSON.stringify(card?.warnings));
+  const Q = fx.newProject();
+  const c2 = capture(material((m) => { m.title = "Clean Stamp Page"; }));
+  IP.recordInfoPageCandidate(db, Q, "run-c", c2);
+  const clean = () => IP.listInfoPageCandidates(db, Q).find((x) => x.identitySha256 === c2.identitySha256);
+  assert.ok(clean() && !clean()!.warnings.includes(IP.INFO_PAGE_HISTORY_CAPTURE_WARNING), "a clean capture carries no history warning");
+  IP.recordInfoPageCandidate(db, Q, "run-c2", { ...c2, capturedWithHistory: true });
+  assert.ok(clean()!.warnings.includes(IP.INFO_PAGE_HISTORY_CAPTURE_WARNING), "a later capture of the same page on a history run stamps the open card");
+});
+await check("#366 S6 (Helm): the stand-in reaches the learner as passUnavailable — true on the retry after an admission, a failed learn-start record and a passes read that throws; false on a real reading; a tracked-filings read error throws instead of reading as history", async () => {
+  const P0 = fx.newProject();
+  scripted = [() => passedResult()];
+  await runLearn(P0);
+  assert.equal(handedAll[0]?.infoPagePassUnavailable, false, "a real reading is handed passUnavailable false");
+  // The retry after an admission (the headed bot-wall retry).
+  const { P, passId } = await verifiedPage("S6 Retry Page");
+  const wall = "403 Forbidden. Attention Required — checking your browser.";
+  scripted = [
+    (input) => { input.onInfoPagePassed?.({ passId, where: sfjsp }); return passedResult({ message: wall, pageCount: 1, infoPagePassed: [{ passId, where: sfjsp }] }); },
+    () => passedResult({ message: "headed: still nothing", pageCount: 0 }),
+  ];
+  await runLearn(P);
+  assert.equal(handedAll.length, 2, "the bot wall triggered the headed retry");
+  assert.equal(handedAll[0]?.infoPagePassUnavailable, false);
+  assert.equal(handedAll[1]?.infoPagePassUnavailable, true, "the retry after an admission is handed the stand-in");
+  // A learn-start record that cannot be written.
+  db.run("CREATE TEMP TRIGGER s6_no_learn_start BEFORE INSERT ON audit_logs WHEN NEW.action = 'portal.info_page_learn_started' BEGIN SELECT RAISE(ABORT, 's6 no learn start'); END");
+  try {
+    scripted = [() => passedResult()];
+    await runLearn(fx.newProject()).catch(() => null);
+    assert.equal(handedAll[0]?.infoPagePassUnavailable, true, "a failed learn-start record hands the stand-in");
+  } finally { db.run("DROP TRIGGER IF EXISTS s6_no_learn_start"); }
+  // A passes read that throws.
+  db.run("ALTER TABLE portal_info_page_passes RENAME TO s6_passes_away");
+  try {
+    scripted = [() => passedResult()];
+    await runLearn(fx.newProject()).catch(() => null);
+    assert.equal(handedAll[0]?.infoPagePassUnavailable, true, "a passes read that throws hands the stand-in");
+  } finally { db.run("ALTER TABLE s6_passes_away RENAME TO portal_info_page_passes"); }
+  // A tracked-filings read error is not a reading: it throws, so the caller hands the stand-in.
+  const T = fx.newProject();
+  db.run("ALTER TABLE permit_check_targets RENAME TO s6_targets_away");
+  try {
+    assert.throws(() => IP.infoPagePriorProgress(db, T, sfjsp, "ahj"), /could not be read/);
+  } finally { db.run("ALTER TABLE s6_targets_away RENAME TO permit_check_targets"); }
+});
+await check("#365, HELM'S RE-CHECK OF #369 (round 3): no Salesforce site is ever a positive platform, whatever its label or path (both sides); a lookup naming a permit vendor's portal counts, and its quote and source page are read; a lookup never vouches alone; a scheme-less or two-URL KB portal_url is read; the own-host guard, the progress read-error throw and the NEM row's own URL each decide alone — at the hand-out AND at the admission", async () => {
+  const { getProjectDetail } = await import("../src/repository");
+  const { ensureCheckTarget } = await import("../src/submittalTracks");
+  const ufl = await import("../src/utilityFilingLookup");
+  const { saveVerifiedUtilityProfile } = await import("../src/knowledgeBase");
+  const { salesforceTenantKind } = await import("../src/portalChannel");
+  const permitUrl = "https://aca-oregon.accela.com/oregon/Default.aspx";
+  const nemUrl = "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login";
+  const cityLanding = "https://www.cedarvale.gov/permits/apply-online";
+  const at = new Date().toISOString();
+  const kbRow = (id: string, utility: string, url: string, verified = false) => db.run(
+    `INSERT INTO permit_utility_knowledge (id, profile_key, state, ahj, utility, portal_url, confidence, first_seen_at, last_learned_at, updated_at, verified_at, verified_by)
+     VALUES (?, ?, 'OR', '', ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, `or||${utility.toLowerCase()}|${id}`, utility, url, verified ? "verified" : "seeded", at, at, at, verified ? at : null, verified ? "synthetic.reviewer@example.com" : ""]);
+  const nemTarget = (P: string, portalUrl = "") => ensureCheckTarget(db, getProjectDetail(db, P).project, {
+    targetType: "nem", permitType: "nem", applicationNumber: "APP-900419", portalName: "Utility NEM portal", portalUrl,
+  });
+  // A fresh verified page: every admission below reserves against it (a refusal writes nothing; each
+  // positive control writes one use — well under the 10-project cap).
+  const { passId } = await verifiedPage("Round 3 Admission Page");
+  const handOut = (P: string, url: string, side: "ahj" | "utility") => IP.infoPagePriorProgress(db, P, url, side);
+  const admit = (P: string, url: string, side: "ahj" | "utility") => IP.reserveInfoPagePassUse(db, P, "", side, { passId, where: url });
+  /** The number counts at the hand-out AND at the admission (nothing reserved). */
+  const counts = (P: string, url: string, side: "ahj" | "utility", what: string) => {
+    assert.equal(handOut(P, url, side), true, `${what}: the hand-out counts the number`);
+    const r = admit(P, url, side);
+    assert.ok(r.some((x) => /tracked by number/.test(x)), `${what}: the admission counts it too — ${JSON.stringify(r)}`);
+  };
+  /** The positive control: skipped at both (the admission then RESERVES a use — call it last for a
+   *  project and side). */
+  const skipped = (P: string, url: string, side: "ahj" | "utility", what: string) => {
+    assert.equal(handOut(P, url, side), false, `${what}: the hand-out skips the number`);
+    assert.deepEqual(admit(P, url, side), [], `${what}: the admission skips it too`);
+  };
+  const stub = (filing: unknown, resultUrls: string[]) => ({
+    webLookup: async () => ({ text: JSON.stringify({ filing, program: { value: null, notFound: "n/a" } }), groundedSearches: 2, stopReason: "end_turn", resultUrls, pagesRead: 0, fetchedUrls: [] }),
+  }) as never;
+  const lookupThrough = (utility: string, filing: unknown, seen: string[]) => ufl.runUtilityFilingLookup(db, stub(filing, seen), { state: "OR", utility });
+
+  // ── B1, UTILITY SIDE: a permit number with the NEM learn (or the request) on a city's Salesforce
+  // site the classifier calls "utility" — by an interconnection PATH, by a utility WORD in the label,
+  // or an allowlisted tenant at an interconnection path. Never a platform: it counts.
+  const sfCity = [
+    "https://cedarvale.my.site.com/s/interconnection-application",   // a city tenant at an interconnection path
+    "https://cedarvale.force.com/apex/InterconnectionApplication",
+    "https://cedarvale.my.salesforce-sites.com/nem/apply",
+    "https://cedarvaleutilities.my.site.com/s/permits/new",          // a city label holding a utility word
+    "https://cityofelectriccity.my.site.com/s/permits",
+    "https://coopercity.my.site.com/s/permits",
+    "https://edisonnj.my.site.com/s/permits",
+    "https://cedarvalepermits.my.site.com/s/net-metering",           // an allowlisted tenant at an interconnection path
+  ];
+  for (const u of sfCity) assert.equal(salesforceTenantKind(u), "utility", `precondition: the classifier calls ${u} a utility's`);
+  assert.equal(salesforceTenantKind("https://cedarvalepermits.my.site.com/s/permits"), "agency", "precondition: the same tenant off the interconnection path is allowlisted");
+  const S = fx.newProject();
+  ensureCheckTarget(db, getProjectDetail(db, S).project, { targetType: "permit", permitType: "building", applicationNumber: "BLD-2026-777", portalName: "City permits", portalUrl: "" });
+  for (const u of sfCity) counts(S, u, "utility", `B1 utility side, ${u}`);
+  skipped(S, nemUrl, "utility", "B1 utility side, the positive control: a real interconnection platform");
+
+  // ── B1, PERMIT SIDE: a carve-out utility whose ONLY record names a city Salesforce site the
+  // classifier calls "utility"; the AHJ learn on another host (so only the predicate decides).
+  const sfMunis: Array<[string, string]> = [
+    ["Halvorsen Municipal Light", "https://cedarvale.my.site.com/s/interconnection-application"],
+    ["Ostrander Town Board", "https://cityofelectriccity.my.site.com/s/permits"],
+    ["Pemberton Board Of Works", "https://cedarvalepermits.my.site.com/s/net-metering"],
+  ];
+  for (const [i, [utility, url]] of sfMunis.entries()) {
+    kbRow(`kb-r3-sfm-${i}`, utility, url);
+    const P = fx.newProject({ utility });
+    nemTarget(P);
+    counts(P, permitUrl, "ahj", `B1 permit side, ${utility} names ${url}`);
+    counts(P, cityLanding, "ahj", `B1 permit side, ${utility}, on a city landing host`);
+  }
+
+  // ── B2 (a): a lookup, written through runUtilityFilingLookup, naming the city's PERMIT-VENDOR portal —
+  // the door drops the URL as an AHJ permit portal and keeps the name; a seeded PowerClerk KB row
+  // vouches beside it. It counts, on the vendor portal and on any other permit host (the quote names
+  // no URL and the source page is the utility's own, so only the filing's name decides off the vendor).
+  const vendors: Array<[string, string, string, RegExp]> = [
+    ["Quillby Electric", "City of Cedarvale Accela Citizen Access", "https://aca-prod.accela.com/CEDARVALE/Default.aspx", /accela/],
+    ["Rookwood Power", "Cedarvale EnerGov Citizen Self Service", "https://cedarvaleor-energovweb.tylerhost.net/apps/selfservice", /tylerhost/],
+    ["Saltmarsh Electric", "Cedarvale Citizenserve Portal", "https://www.citizenserve.com/Portal/PortalController?Action=showHomePage&ctzPagePrefix=Portal_&installationID=999", /citizenserve/],
+  ];
+  for (const [i, [utility, name, url, re]] of vendors.entries()) {
+    const slug = utility.toLowerCase().replace(/[^a-z]+/g, "");
+    kbRow(`kb-r3-vendor-${i}`, utility, `https://${slug}.powerclerk.com/MvcAccount/Login`);
+    const src = `https://www.${slug}.example.com/solar/interconnection`;
+    const run = await lookupThrough(utility, { value: { name, url }, sourceUrl: src, quote: `Submit your interconnection application through the ${name}.` }, [src, url]);
+    assert.equal(run.saved, true, run.reason);
+    assert.equal(run.lookup?.filing.value?.name, name, `precondition: the lookup kept the name (${JSON.stringify(run.lookup?.filing)})`);
+    assert.equal(run.lookup?.filing.value?.url ?? null, null, "precondition: the door dropped the vendor URL");
+    assert.ok(run.dropped.some((d) => re.test(d)), run.dropped.join("; "));
+    const P = fx.newProject({ utility });
+    nemTarget(P);
+    counts(P, url, "ahj", `B2 ${name}: on the vendor portal the lookup names`);
+    counts(P, cityLanding, "ahj", `B2 ${name}: on a city landing host`);
+  }
+
+  // ── B2 (b): the lookup's QUOTE names a vendor URL beside "PowerClerk" (the filing names a platform,
+  // so (a) does not decide): its URL is in the strong set — counts on any permit host.
+  const TQ = "Thistledown Electric";
+  kbRow("kb-r3-tq", TQ, "https://thistledown.powerclerk.com/MvcAccount/Login");
+  const tqSrc = "https://www.thistledown-electric.example.com/solar";
+  const tq = await lookupThrough(TQ, { value: { name: "PowerClerk", url: null }, sourceUrl: tqSrc,
+    quote: "Customers inside city limits apply at aca-prod.accela.com/THISTLE; everyone else uses PowerClerk." }, [tqSrc]);
+  assert.equal(tq.lookup?.filing.value?.name, "PowerClerk", JSON.stringify(tq.lookup?.filing));
+  const PTQ = fx.newProject({ utility: TQ });
+  nemTarget(PTQ);
+  counts(PTQ, cityLanding, "ahj", "B2 a vendor URL in the lookup's quote");
+  // …its SOURCE PAGE on the city's own host (where the answer was read, not where it is filed): the
+  // own-host guard counts the number there; on another permit host it is not a portal claim.
+  const UF = "Umberfield Light";
+  kbRow("kb-r3-uf", UF, "https://umberfield.powerclerk.com/MvcAccount/Login");
+  const ufSrc = "https://www.umberfield.gov/utilities/solar-interconnection";
+  await lookupThrough(UF, { value: { name: "PowerClerk", url: null }, sourceUrl: ufSrc, quote: "Umberfield Light interconnection applications are submitted on PowerClerk." }, [ufSrc]);
+  const PUF = fx.newProject({ utility: UF });
+  nemTarget(PUF);
+  counts(PUF, "https://www.umberfield.gov/permits/apply-online", "ahj", "B2 the lookup's source page on the host in question");
+  skipped(PUF, permitUrl, "ahj", "B2 the lookup's source page (the utility's own interconnection page) is no portal claim elsewhere");
+  // …its SOURCE PAGE on a permit vendor's host (the city's Accela tenant): in the strong set — counts
+  // on any permit host.
+  const VB = "Verbena Electric";
+  kbRow("kb-r3-vb", VB, "https://verbena.powerclerk.com/MvcAccount/Login");
+  const vbSrc = "https://aca-prod.accela.com/VERBENA/Welcome.aspx";
+  await lookupThrough(VB, { value: { name: "PowerClerk", url: null }, sourceUrl: vbSrc, quote: "Verbena Electric interconnection applications are submitted on PowerClerk." }, [vbSrc]);
+  const PVB = fx.newProject({ utility: VB });
+  nemTarget(PVB);
+  counts(PVB, cityLanding, "ahj", "B2 the lookup read off a permit vendor's host");
+
+  // ── ITEM 4: a seeded lookup naming a PowerClerk tenant, with NO KB row or recipe of the utility,
+  // never vouches alone; once a KB row names the same platform, it is skipped.
+  const WX = "Wexcombe Electric";
+  const wxPc = "https://wexcombe.powerclerk.com/MvcAccount/Login";
+  const wxSrc = "https://www.wexcombe-electric.example.com/solar/contractors";
+  const wx = await lookupThrough(WX, { value: { name: "Wexcombe PowerClerk", url: wxPc }, sourceUrl: wxSrc, quote: "Contractors submit the interconnection application through Wexcombe PowerClerk." }, [wxSrc, wxPc]);
+  assert.equal(wx.lookup?.filing.value?.url, wxPc, `precondition: the lookup kept the tenant URL (${JSON.stringify(wx.lookup?.filing)})`);
+  const PWX = fx.newProject({ utility: WX });
+  nemTarget(PWX);
+  counts(PWX, permitUrl, "ahj", "item 4: the lookup alone");
+  kbRow("kb-r3-wx", WX, wxPc);
+  skipped(PWX, permitUrl, "ahj", "item 4: a KB row naming the same platform beside the lookup");
+
+  // ── S4: a VERIFIED row stored scheme-less through the real write path (the KB route's
+  // saveVerifiedUtilityProfile), beside a seeded PowerClerk row; and one portal_url holding two URLs,
+  // the platform first.
+  const YB = "Yarrowby Electric";
+  saveVerifiedUtilityProfile(db, { state: "OR", utility: YB, portalUrl: "permits.yarrowby.gov/apply", verifiedBy: "synthetic.reviewer@example.com" });
+  assert.ok(db.query<{ portal_url: string }>("SELECT portal_url FROM permit_utility_knowledge WHERE utility = ? AND verified_at IS NOT NULL", [YB]).some((r) => r.portal_url === "permits.yarrowby.gov/apply"),
+    "precondition: the verified row stores the scheme-less value verbatim");
+  kbRow("kb-r3-yb", YB, "https://yarrowby.powerclerk.com/MvcAccount/Login");
+  const PYB = fx.newProject({ utility: YB });
+  nemTarget(PYB);
+  counts(PYB, permitUrl, "ahj", "S4 a scheme-less verified portal_url");
+  counts(PYB, "https://permits.yarrowby.gov/start", "ahj", "S4 …and on its own host");
+  const ZF = "Zinnford Electric";
+  kbRow("kb-r3-zf", ZF, "https://zinnford.powerclerk.com/MvcAccount/Login https://permits.zinnford.gov/apply");
+  const PZF = fx.newProject({ utility: ZF });
+  nemTarget(PZF);
+  counts(PZF, permitUrl, "ahj", "S4 a portal_url holding a platform URL then a city URL");
+
+  // ── S5a, THE OWN-HOST GUARD ALONE: a muni whose verified row names a POSITIVE platform host (a
+  // utility domain on the list) that is also the permit learn's host. Off that host it is skipped.
+  const AM = "Aldermoor Water And Light";
+  kbRow("kb-r3-am", AM, "https://apply.eweb.org/interconnection", true);
+  const PAM = fx.newProject({ utility: AM });
+  nemTarget(PAM);
+  assert.equal(handOut(PAM, permitUrl, "ahj"), false, "precondition: the row names only a positive platform (off its host, skipped)");
+  counts(PAM, "https://apply.eweb.org/permits/new", "ahj", "S5a the utility's platform host is the permit learn's host");
+  skipped(PAM, permitUrl, "ahj", "S5a the positive control off that host");
+
+  // ── S5c: the project's own NEM row kept a city Salesforce status page (the fixture's PGE names only
+  // its PowerClerk tenant): its own evidence the filing was not on the platform — counts.
+  const PSC = fx.newProject();
+  nemTarget(PSC, "https://cedarvale.my.site.com/s/status/IC-7");
+  counts(PSC, permitUrl, "ahj", "S5c a NEM row kept on a city Salesforce site");
+  // …and on a tenant the classifier calls a UTILITY's (the 10-18 re-check, a nit: the fixture above is
+  // "unknown", which round 2's predicate also counted — this one only the host-only rule counts).
+  const sfUtilStatus = "https://cedarvaleutilities.my.site.com/s/status";
+  assert.equal(salesforceTenantKind(sfUtilStatus), "utility", "precondition: the classifier calls this tenant a utility's");
+  const PSC2 = fx.newProject();
+  nemTarget(PSC2, sfUtilStatus);
+  counts(PSC2, permitUrl, "ahj", "S5c a NEM row kept on a Salesforce site the classifier calls a utility's");
+
+  // ── N2: a lookup that cannot be parsed counts; so does a filing value of a shape this code does not
+  // know (written raw: no real write path produces either).
+  const BX = "Bexleigh Electric";
+  kbRow("kb-r3-bx", BX, "https://bexleigh.powerclerk.com/MvcAccount/Login");
+  const PBX = fx.newProject({ utility: BX });
+  nemTarget(PBX);
+  assert.equal(handOut(PBX, permitUrl, "ahj"), false, "precondition: the KB row alone is skipped");
+  db.run("INSERT INTO utility_filing_lookups (profile_key, state, utility, confidence, payload_json, looked_up_at, updated_at) VALUES (?, 'OR', ?, 'seeded', '{not json', ?, ?)",
+    [ufl.utilityFilingKey("OR", BX), BX, at, at]);
+  counts(PBX, permitUrl, "ahj", "N2 a malformed lookup payload");
+  const CD = "Caddington Electric";
+  kbRow("kb-r3-cd", CD, "https://caddington.powerclerk.com/MvcAccount/Login");
+  db.run("INSERT INTO utility_filing_lookups (profile_key, state, utility, confidence, payload_json, looked_up_at, updated_at) VALUES (?, 'OR', ?, 'seeded', ?, ?, ?)",
+    [ufl.utilityFilingKey("OR", CD), CD, JSON.stringify({ filing: { value: "City permit portal", sourceUrl: "", quote: "" } }), at, at]);
+  const PCD = fx.newProject({ utility: CD });
+  nemTarget(PCD);
+  counts(PCD, permitUrl, "ahj", "N2 a filing value of an unknown shape");
+
+  // ── S5b, THE PROGRESS HALF OF THE READ-ERROR THROW: a submissions read that fails throws (never a
+  // history reading); end to end, a job_queue read that fails reaches the learner as the stand-in.
+  const T = fx.newProject();
+  db.run("ALTER TABLE submissions RENAME TO r3_submissions_away");
+  try {
+    assert.throws(() => IP.infoPagePriorProgress(db, T, sfjsp, "ahj"), /could not be read/);
+  } finally { db.run("ALTER TABLE r3_submissions_away RENAME TO submissions"); }
+  db.run("ALTER TABLE job_queue RENAME TO r3_job_queue_away");
+  try {
+    scripted = [() => passedResult()];
+    await runLearn(fx.newProject()).catch(() => null);
+    assert.ok(handedAll.length >= 1, "the learner was reached with job_queue unreadable");
+    assert.equal(handedAll[0]?.infoPagePassUnavailable, true, "a progress read that throws hands the stand-in");
+  } finally { db.run("ALTER TABLE r3_job_queue_away RENAME TO job_queue"); }
+});
+await check("#365, THE ROUND-3 SKEPTICS ON #369 (round 4): Portland's pass survives a Pacific Power lookup that names its portal its own way with no tenant URL kept (the known tenant keeps it alone; the 10-18 re-check: a KB row's own portal name, a quote naming the platform and a dropped platform URL no longer do — each counts); a URL the door dropped is stored and read by host; a KB row's words (portal name / platform / submission method) naming a permit vendor, or a verified row naming another portal, count; every URL in a portal_url is read; a lookup naming a permit vendor beside a platform counts; the own-host guard sees a utility's information page — at the hand-out AND at the admission", async () => {
+  const { getProjectDetail } = await import("../src/repository");
+  const { ensureCheckTarget } = await import("../src/submittalTracks");
+  const ufl = await import("../src/utilityFilingLookup");
+  const { saveVerifiedUtilityProfile, knowledgeProfileKey } = await import("../src/knowledgeBase");
+  const { namedPermitPlatforms, isInformationalPageUrl } = await import("../src/portalChannel");
+  const permitUrl = "https://aca-oregon.accela.com/oregon/Default.aspx";
+  const devhub = "https://devhub.portlandoregon.gov/permits/sfjsp";
+  const acaCedar = "https://aca-prod.accela.com/CEDARVALE/Default.aspx";
+  const cityLanding = "https://www.cedarvale.gov/permits/apply-online";
+  const pacificTenant = "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login";
+  const pacificSrc = "https://www.pacificpower.net/savings-energy-choices/customer-generation.html";
+  const at = new Date().toISOString();
+  const kbRow = (id: string, utility: string, url: string, o: { name?: string; platform?: string; method?: string; verified?: boolean; key?: string } = {}) => db.run(
+    `INSERT INTO permit_utility_knowledge (id, profile_key, state, ahj, utility, portal_url, portal_name, portal_platform, submission_method, confidence, first_seen_at, last_learned_at, updated_at, verified_at, verified_by)
+     VALUES (?, ?, 'OR', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, o.key ?? `or||${utility.toLowerCase()}|${id}`, utility, url, o.name ?? "", o.platform ?? "", o.method ?? "", o.verified ? "verified" : "seeded", at, at, at, o.verified ? at : null, o.verified ? "synthetic.reviewer@example.com" : ""]);
+  const nemTarget = (P: string, portalUrl = "") => ensureCheckTarget(db, getProjectDetail(db, P).project, {
+    targetType: "nem", permitType: "nem", applicationNumber: "APP-112418", portalName: "Utility NEM portal", portalUrl,
+  });
+  // THE ADMISSION'S PAGES: a positive control reserves one use (refusals write nothing); a fresh
+  // verified page after eight, well under the 10-project cap (an expiry refusal would read as a bug).
+  let page: { passId: string; uses: number } | null = null;
+  let pages = 0;
+  const currentPage = async () => {
+    if (!page || page.uses >= 8) page = { passId: (await verifiedPage(`Round 4 Admission Page ${++pages}`)).passId, uses: 0 };
+    return page;
+  };
+  const handOut = (P: string, url: string) => IP.infoPagePriorProgress(db, P, url, "ahj");
+  /** The number counts at the hand-out AND at the admission (nothing reserved). */
+  const counts = async (P: string, url: string, what: string) => {
+    assert.equal(handOut(P, url), true, `${what}: the hand-out counts the number`);
+    const r = IP.reserveInfoPagePassUse(db, P, "", "ahj", { passId: (await currentPage()).passId, where: url });
+    assert.ok(r.some((x) => /tracked by number/.test(x)), `${what}: the admission counts it too — ${JSON.stringify(r)}`);
+  };
+  /** Skipped at both (the admission then RESERVES a use — one call per project). */
+  const skipped = async (P: string, url: string, what: string) => {
+    assert.equal(handOut(P, url), false, `${what}: the hand-out skips the number`);
+    const pg = await currentPage();
+    assert.deepEqual(IP.reserveInfoPagePassUse(db, P, "", "ahj", { passId: pg.passId, where: url }), [], `${what}: the admission skips it too`);
+    pg.uses++;
+  };
+  const stub = (filing: unknown, resultUrls: string[]) => ({
+    webLookup: async () => ({ text: JSON.stringify({ filing, program: { value: null, notFound: "n/a" } }), groundedSearches: 2, stopReason: "end_turn", resultUrls, pagesRead: 0, fetchedUrls: [] }),
+  }) as never;
+  const lookupThrough = (utility: string, filing: unknown, seen: string[]) => ufl.runUtilityFilingLookup(db, stub(filing, seen), { state: "OR", utility, force: true });
+  const project = (utility: string, nemUrl = "") => { const P = fx.newProject({ utility }); nemTarget(P, nemUrl); return P; };
+
+  // ── THE WORDS PREDICATE FAILS BOTH WAYS: what it must name, and what it must never name (each
+  // false positive loses Portland's pass).
+  for (const w of ["City of Cedarvale Accela Citizen Access", "Cedarvale EnerGov Citizen Self Service", "Cedarvale Citizenserve Portal", "SolarAPP+", "City permit portal",
+    "Apply on the City's portal.", "Customers inside Cedarvale city limits submit through the City of Cedarvale Accela Citizen Access portal; all other customers use PowerClerk.",
+    "Accela", "Cedarvale ePermits", "eTRAKiT",
+    "Apply through the city portal.",
+    // a permit OFFICE in plain words (round 4)
+    "City of Portland Development Services", "Customers inside Portland city limits apply through City of Portland Development Services online.",
+    "the Bureau of Development Services", "Apply through the Building Division.", "the city's Building and Safety Department", "the county permit office"])
+    assert.ok(namedPermitPlatforms(w).length, `names a permit platform: ${w}`); // ("Apply through the city portal." is the round-2 lookup fixture's shared quote)
+  for (const w of ["Pacific Power Customer Generation Portal", "PowerClerk (utility interconnection)", "Customer Generation Online Application",
+    "Submit your solar application through PowerClerk", "Attach the approved city building permit", "City of Portland customers use the PowerClerk portal",
+    "Apply through the Pacific Power Customer Generation Portal.", "Apply online through PowerClerk, the Pacific Power Customer Generation Portal.",
+    "Applications are submitted through the Customer Generation Portal on PowerClerk.", "Obtain an electrical permit from your city before you apply.", "Net metering applies."])
+    assert.deepEqual(namedPermitPlatforms(w), [], `names no permit platform: ${w}`);
+
+  // ── PORTLAND (blockers 1 and 2): the fixture's real seeded Pacific Power row — its PowerClerk tenant,
+  // named "Pacific Power Customer Generation Portal", no platform label. Each lookup written through
+  // runUtilityFilingLookup; the NEM number checked on DevHub.
+  const seed = db.query<Record<string, unknown>>("SELECT portal_url, portal_name, portal_platform FROM permit_utility_knowledge WHERE state = 'OR' AND utility = 'Pacific Power' AND (ahj IS NULL OR ahj = '')");
+  assert.deepEqual(seed.map((r) => [r.portal_url, r.portal_name, r.portal_platform]), [[pacificTenant, "Pacific Power Customer Generation Portal", ""]], "precondition: the seeded Pacific Power row, with no platform label");
+  const PP = "Pacific Power";
+  const portland: Array<[string, unknown, string[], string]> = [
+    // A1: the tenant URL is not among the search results — dropped; the quote names the portal, not PowerClerk.
+    ["A1", { value: { name: "Pacific Power Customer Generation Portal", url: pacificTenant }, sourceUrl: pacificSrc, quote: "Apply through the Pacific Power Customer Generation Portal." }, [pacificSrc], ""],
+    // A2: a utility-worded name; the quote names PowerClerk; the tenant URL dropped.
+    ["A2", { value: { name: "Customer Generation Online Application", url: pacificTenant }, sourceUrl: pacificSrc, quote: "Submit the Customer Generation Online Application on PowerClerk." }, [pacificSrc], ""],
+    // A4: the URL is the marketing page, dropped BECAUSE the quote names PowerClerk.
+    ["A4", { value: { name: "Pacific Power Customer Generation Portal", url: pacificSrc }, sourceUrl: pacificSrc, quote: "Apply online through PowerClerk, the Pacific Power Customer Generation Portal." }, [pacificSrc], ""],
+    // PDX1: no URL at all; the NEM row kept on the tenant (the other live shape).
+    ["PDX1", { value: { name: "Pacific Power Customer Generation Portal", url: null }, sourceUrl: pacificSrc, quote: "Applications are submitted through the Customer Generation Portal on PowerClerk." }, [pacificSrc], pacificTenant],
+    // A3, the control: the tenant URL attested and kept.
+    ["A3", { value: { name: "Pacific Power Customer Generation Portal", url: pacificTenant }, sourceUrl: pacificSrc, quote: "Apply through the Pacific Power Customer Generation Portal." }, [pacificSrc, pacificTenant], ""],
+  ];
+  for (const [label, filing, seen, nemUrl] of portland) {
+    const run = await lookupThrough(PP, filing, seen);
+    assert.equal(run.saved, true, `${label}: ${run.reason}`);
+    assert.equal(run.lookup?.filing.value?.url ?? null, label === "A3" ? pacificTenant : null, `${label} precondition: ${JSON.stringify(run.lookup?.filing)}`);
+    await skipped(project(PP, nemUrl), devhub, `Portland ${label}`);
+  }
+
+  // ── EACH PROTECTION ALONE (the Portland shapes rest on several at once). THE 10-18 RE-CHECK (Helm's
+  // re-check, blocker 1): only the known tenant (ii), a kept platform URL and a platform in the
+  // filing's NAME keep it. The three shapes below were exemptions in round 4 and COUNT now, as main
+  // counts them.
+  // (i) is gone — THE UTILITY'S OWN PLATFORM PORTAL NAME: a strong KB row on PowerClerk names it so;
+  // the lookup names it with no URL and a quote that names no platform. A stale seeded row keeps the
+  // old portal's name ("Larkspur Solar Portal" after the muni moved to the city's portal), so the
+  // name equality is no evidence for the platform.
+  kbRow("kb-r4-dun", "Dunmore Electric", "https://dunmore.powerclerk.com/MvcAccount/Login", { name: "Dunmore Customer Generation Portal" });
+  const dunSrc = "https://www.dunmore-electric.example.com/solar";
+  const dun = await lookupThrough("Dunmore Electric", { value: { name: "Dunmore Customer Generation Portal", url: null }, sourceUrl: dunSrc, quote: "Apply through the Dunmore Customer Generation Portal." }, [dunSrc]);
+  assert.equal(dun.lookup?.filing.value?.name, "Dunmore Customer Generation Portal", `precondition: ${JSON.stringify(dun.lookup?.filing)}`);
+  await counts(project("Dunmore Electric"), permitUrl, "10-18 re-check: a lookup naming a KB row's own portal name, with no URL kept, counts");
+  // THE QUOTE is no exemption: the name is the utility's own words, the quote says PowerClerk.
+  kbRow("kb-r4-esk", "Eskdale Electric", "https://eskdale.powerclerk.com/MvcAccount/Login");
+  const eskSrc = "https://www.eskdale-electric.example.com/solar";
+  const esk = await lookupThrough("Eskdale Electric", { value: { name: "Eskdale Customer Generation Portal", url: null }, sourceUrl: eskSrc, quote: "Applications go through the Eskdale Customer Generation Portal on PowerClerk." }, [eskSrc]);
+  assert.equal(esk.lookup?.filing.value?.name, "Eskdale Customer Generation Portal", `precondition: ${JSON.stringify(esk.lookup?.filing)}`);
+  await counts(project("Eskdale Electric"), permitUrl, "10-18 re-check: a lookup whose QUOTE (not its name) names the platform counts");
+  // A DROPPED PLATFORM URL only adds caution: the tenant URL the answer named, not among the search
+  // results (model memory never relaxes the guard).
+  kbRow("kb-r4-fer", "Fernhill Electric", "https://fernhill.powerclerk.com/MvcAccount/Login");
+  const ferSrc = "https://www.fernhill-electric.example.com/solar";
+  const fer = await lookupThrough("Fernhill Electric", { value: { name: "Fernhill Interconnection Portal", url: "https://fernhill.powerclerk.com/MvcAccount/Login" }, sourceUrl: ferSrc, quote: "Apply through the Fernhill Interconnection Portal." }, [ferSrc]);
+  assert.deepEqual([fer.lookup?.filing.value?.url ?? null, fer.lookup?.filing.droppedUrls], [null, ["https://fernhill.powerclerk.com/MvcAccount/Login"]], `precondition: the door dropped the tenant URL and the lookup stored it (${JSON.stringify(fer.lookup?.filing)})`);
+  await counts(project("Fernhill Electric"), permitUrl, "10-18 re-check: a DROPPED URL on the platform is no exemption: counts");
+  // (ii) THE KNOWN TENANT: Pacific Power, a name that matches nothing on file, a quote naming no platform.
+  await lookupThrough(PP, { value: { name: "Customer Generation Online Application", url: null }, sourceUrl: pacificSrc, quote: "Apply through the Customer Generation Online Application." }, [pacificSrc]);
+  await skipped(project(PP), devhub, "(ii) the utility whose tenant is known by heart");
+  // …but words naming a permit vendor beat it: counts.
+  await lookupThrough(PP, { value: { name: "PowerClerk", url: null }, sourceUrl: pacificSrc, quote: "Customers inside Cedarvale city limits apply on the City of Cedarvale Accela Citizen Access; all others use PowerClerk." }, [pacificSrc]);
+  await counts(project(PP), devhub, "the known tenant's lookup naming a permit vendor");
+  // …and so do plain words naming the city's permit OFFICE (round 4, the round-3 re-check's X1): the
+  // lookup says Portland customers file with the city, not on the tenant — counts on DevHub and on
+  // another permit host. Main counts here.
+  await lookupThrough(PP, { value: { name: "City of Portland Development Services", url: null }, sourceUrl: pacificSrc, quote: "Customers inside Portland city limits apply through City of Portland Development Services online." }, [pacificSrc]);
+  await counts(project(PP), devhub, "X1 the known tenant's lookup naming the city's permit office in plain words, on DevHub");
+  await counts(project(PP), permitUrl, "X1 …and on another permit host");
+  db.run("DELETE FROM utility_filing_lookups WHERE profile_key = ?", [ufl.utilityFilingKey("OR", PP)]);
+
+  // ── A URL THE DOOR DROPPED IS STORED AND READ BY HOST (MAJOR 3).
+  // B1: the lookup names the city's Accela tenant beside "PowerClerk": dropped as an AHJ permit portal.
+  kbRow("kb-r4-quo", "Quorn Electric", "https://quorn.powerclerk.com/MvcAccount/Login");
+  const quoSrc = "https://www.quorn-electric.example.com/solar/interconnection";
+  const quo = await lookupThrough("Quorn Electric", { value: { name: "PowerClerk", url: acaCedar }, sourceUrl: quoSrc, quote: "Quorn Electric interconnection applications are submitted on PowerClerk." }, [quoSrc, acaCedar]);
+  assert.deepEqual([quo.lookup?.filing.value?.url ?? null, quo.lookup?.filing.droppedUrls], [null, [acaCedar]], `precondition: ${JSON.stringify(quo.lookup?.filing)}`);
+  const PQ = project("Quorn Electric");
+  await counts(PQ, acaCedar, "B1 on the vendor portal the lookup named");
+  await counts(PQ, permitUrl, "B1 on another permit host");
+  // B2: a URL on the city's own site, dropped by the PowerClerk-name refusal.
+  kbRow("kb-r4-ras", "Rasmussen Light", "https://rasmussen.powerclerk.com/MvcAccount/Login");
+  const rasSrc = "https://www.rasmussen-light.example.com/solar";
+  const rasUrl = "https://www.cedarvale.gov/utilities/net-metering/apply";
+  const ras = await lookupThrough("Rasmussen Light", { value: { name: "PowerClerk", url: rasUrl }, sourceUrl: rasSrc, quote: "Rasmussen Light applications are submitted on PowerClerk." }, [rasSrc, rasUrl]);
+  assert.deepEqual(ras.lookup?.filing.droppedUrls, [rasUrl], `precondition: ${JSON.stringify(ras.lookup?.filing)}`);
+  await counts(project("Rasmussen Light"), cityLanding, "B2 on the city's own site");
+
+  // ── A LOOKUP NAMING A PERMIT VENDOR BESIDE A PLATFORM (MAJOR 7): the name, the quote, or a not-found's quote.
+  const P2s: Array<[string, unknown]> = [
+    ["Pellow Electric", { value: { name: "PowerClerk", url: null }, sourceUrl: "https://www.pellow.example.com/solar", quote: "Customers inside Cedarvale city limits submit through the City of Cedarvale Accela Citizen Access portal; all other customers use PowerClerk." }],
+    ["Pinkney Electric", { value: { name: "PowerClerk or the City of Cedarvale Accela Citizen Access", url: null }, sourceUrl: "https://www.pinkney.example.com/solar", quote: "Apply through PowerClerk or the City of Cedarvale Accela Citizen Access." }],
+    ["Pargeter Electric", { value: null, sourceUrl: "https://www.pargeter.example.com/solar", quote: "Solar customers in Cedarvale apply on the City's Accela Citizen Access.", notFound: "no page named the utility's own portal" }],
+  ];
+  for (const [i, [utility, filing]] of P2s.entries()) {
+    kbRow(`kb-r4-p2-${i}`, utility, `https://${utility.split(" ")[0].toLowerCase()}.powerclerk.com/MvcAccount/Login`);
+    const run = await lookupThrough(utility, filing, [String((filing as { sourceUrl: string }).sourceUrl)]);
+    assert.equal(run.saved, true, `${utility}: ${run.reason}`);
+    const P = project(utility);
+    await counts(P, acaCedar, `${utility}: on the vendor portal its lookup names`);
+    await counts(P, permitUrl, `${utility}: on another permit host`);
+  }
+
+  // ── KB ROWS' WORDS (MAJOR 4). C1, THE REAL MERGE: a seeded PowerClerk row, then a person's verify
+  // naming the city's Accela with the URL left blank — the stale URL stays on the verified row.
+  const TM = "Tamsin Municipal Power";
+  kbRow("kb-r4-tm", TM, "https://tamsin.powerclerk.com/MvcAccount/Login", { key: knowledgeProfileKey({ state: "OR", utility: TM }) });
+  saveVerifiedUtilityProfile(db, { state: "OR", utility: TM, portalName: "City of Cedarvale Accela Citizen Access", portalPlatform: "Accela", portalUrl: "", submissionMethod: "City permit portal", verifiedBy: "synthetic.reviewer@example.com" });
+  const tm = db.query<Record<string, unknown>>("SELECT portal_url, portal_platform, verified_at FROM permit_utility_knowledge WHERE utility = ?", [TM]);
+  assert.equal(tm.length, 1, "precondition: the verify merged onto the seeded row");
+  assert.deepEqual([tm[0].portal_url, tm[0].portal_platform, !!tm[0].verified_at], ["https://tamsin.powerclerk.com/MvcAccount/Login", "Accela", true], "precondition: verified, platform Accela, the stale PowerClerk URL kept");
+  const PTM = project(TM);
+  await counts(PTM, acaCedar, "C1 on the Accela portal the verify names");
+  await counts(PTM, permitUrl, "C1 on another permit host");
+  // A PERMIT VENDOR IN ANY ONE FIELD, on a SEEDED row (no verify involved): the name, the platform, the method.
+  kbRow("kb-r4-ws-n", "Wickham Electric", "https://wickham.powerclerk.com/MvcAccount/Login", { name: "PowerClerk; customers in Cedarvale use the City's Accela Citizen Access" });
+  await counts(project("Wickham Electric"), permitUrl, "a seeded row's portal name names a permit vendor");
+  kbRow("kb-r4-ws-a", "Wexford Electric", "https://wexford.powerclerk.com/MvcAccount/Login", { platform: "Accela Citizen Access" });
+  await counts(project("Wexford Electric"), permitUrl, "a seeded row's platform names a permit vendor");
+  kbRow("kb-r4-ws-b", "Wolverton Electric", "https://wolverton.powerclerk.com/MvcAccount/Login", { method: "Through the city's permit portal" });
+  await counts(project("Wolverton Electric"), permitUrl, "a seeded row's submission method names a city permit portal");
+  // A PERSON'S VERIFIED PLATFORM THAT IS NO INTERCONNECTION PLATFORM, merged onto a stale PowerClerk URL.
+  const VP = "Vaughan Municipal Power";
+  kbRow("kb-r4-vp", VP, "https://vaughan.powerclerk.com/MvcAccount/Login", { key: knowledgeProfileKey({ state: "OR", utility: VP }) });
+  saveVerifiedUtilityProfile(db, { state: "OR", utility: VP, portalPlatform: "Cedarvale Online Services", portalUrl: "", verifiedBy: "synthetic.reviewer@example.com" });
+  await counts(project(VP), permitUrl, "a verified platform that is no interconnection platform");
+  // C2: a verified row naming a portal with NO URL, beside a seeded PowerClerk row — a vendor name, and plain words.
+  for (const [utility, name] of [["Carrow Electric", "City of Cedarvale Accela Citizen Access"], ["Corbin Electric", "Cedarvale Online Services"]] as const) {
+    kbRow(`kb-r4-c2-${utility}`, utility, `https://${utility.split(" ")[0].toLowerCase()}.powerclerk.com/MvcAccount/Login`);
+    saveVerifiedUtilityProfile(db, { state: "OR", utility, portalName: name, portalUrl: "", verifiedBy: "synthetic.reviewer@example.com" });
+    assert.ok(db.query<Record<string, unknown>>("SELECT portal_url, verified_at FROM permit_utility_knowledge WHERE utility = ?", [utility]).some((r) => r.portal_url === "" && r.verified_at), "precondition: a verified row with no URL");
+    await counts(project(utility), permitUrl, `C2 a verified row naming "${name}" with no URL`);
+  }
+  // …C2's TWIN ON THE PRODUCTION KEY (the 10-18 re-check, should-fix 1): the seeded row under knowledgeProfileKey,
+  // so the verify MERGES onto it and the stale PowerClerk URL stays (upsertKnowledge's scalar()). The
+  // round-4 C2 above passed only because its seeded row sat under another key.
+  for (const [utility, name] of [["Carlow Electric", "City of Cedarvale Accela Citizen Access"], ["Corley Electric", "Cedarvale Online Services"]] as const) {
+    const tenant = `https://${utility.split(" ")[0].toLowerCase()}.powerclerk.com/MvcAccount/Login`;
+    kbRow(`kb-r5-c2-${utility}`, utility, tenant, { key: knowledgeProfileKey({ state: "OR", utility }) });
+    saveVerifiedUtilityProfile(db, { state: "OR", utility, portalName: name, portalUrl: "", verifiedBy: "synthetic.reviewer@example.com" });
+    const merged = db.query<Record<string, unknown>>("SELECT portal_url, portal_name, verified_at FROM permit_utility_knowledge WHERE utility = ?", [utility]);
+    assert.deepEqual(merged.map((r) => [r.portal_url, r.portal_name, !!r.verified_at]), [[tenant, name, true]], "precondition: ONE verified row, the stale tenant URL kept");
+    await counts(project(utility), permitUrl, `C2 on the production key: a verified row naming "${name}" with the stale tenant URL kept`);
+  }
+  // THE NARROWING, pinned: a SEEDED row's free-text platform that names no platform (research writes
+  // labels this code cannot read) is not evidence against it — hand-out only (no reservation).
+  kbRow("kb-r4-nar", "Norbury Electric", "https://norbury.powerclerk.com/MvcAccount/Login", { platform: "Custom" });
+  assert.equal(handOut(project("Norbury Electric"), permitUrl), false, "a seeded row's unreadable platform label does not count the number");
+
+  // ── EVERY URL IN A portal_url (MAJOR 5): scheme-less on a TLD portalUrlsInText does not list, through
+  // the KB route's verify (stored verbatim), beside a seeded PowerClerk row; and two URLs, the platform first.
+  for (const [utility, url] of [["Selsey Electric", "permits.cedarvale.online/apply"], ["Sutton Electric", "permits.cedarvale.city/apply"], ["Sowerby Electric", "epermits.cedarvale.co/apply"]] as const) {
+    kbRow(`kb-r4-s4-${utility}`, utility, `https://${utility.split(" ")[0].toLowerCase()}.powerclerk.com/MvcAccount/Login`);
+    saveVerifiedUtilityProfile(db, { state: "OR", utility, portalUrl: url, verifiedBy: "synthetic.reviewer@example.com" });
+    assert.ok(db.query<{ portal_url: string }>("SELECT portal_url FROM permit_utility_knowledge WHERE utility = ?", [utility]).some((r) => r.portal_url === url), `precondition: stored verbatim (${url})`);
+    await counts(project(utility), permitUrl, `S4 a scheme-less verified portal_url ${url}`);
+  }
+  kbRow("kb-r4-wol", "Wolsey Electric", "https://wolsey.powerclerk.com/MvcAccount/Login https://permits.wolsey.online/apply");
+  await counts(project("Wolsey Electric"), permitUrl, "S4 two URLs in one portal_url, the platform first, the second on .online");
+
+  // ── THE OWN-HOST GUARD SEES A UTILITY'S INFORMATION PAGE (MAJOR 8): a KB row's net-metering guide on
+  // the city's own host; off that host the guide is no portal claim.
+  const guide = "https://www.cedarvale.gov/utilities/net-metering-resources";
+  assert.equal(isInformationalPageUrl(guide), true, "precondition: the guide is an information page");
+  kbRow("kb-r4-clp", "Cedarvale Light And Power", "https://cedarvalelp.powerclerk.com/MvcAccount/Login", { name: "Net metering guide: www.cedarvale.gov/utilities/net-metering-resources" });
+  await counts(project("Cedarvale Light And Power"), cityLanding, "the utility's information page on the host in question");
+  await skipped(project("Cedarvale Light And Power"), permitUrl, "the information page is no portal claim elsewhere");
+});
+await check("#365, HELM'S 10-18 RE-CHECK OF #369: a lookup that names no platform in its NAME counts, whatever a KB row calls its portal, the quote says or the door dropped (B1); failed, paused and refused learns never vouch (B2); a person's verify counts on the real merge (S1); a row's submission notes are read (S2); a scheme-less NEM URL is read by its parsed host (S3); the four unpinned lines, the odd URL spellings, the lookup's unknown shapes and the non-platform URLs a lookup names — at the hand-out AND at the admission", async () => {
+  const { getProjectDetail } = await import("../src/repository");
+  const { ensureCheckTarget, markTrackSubmitted } = await import("../src/submittalTracks");
+  const ufl = await import("../src/utilityFilingLookup");
+  const kb = await import("../src/knowledgeBase");
+  const { recordPortalNotServed, isNotServedRecipe, sameEntity } = await import("../src/portalRecipes");
+  const { isUtilityPlatformUrl, namedPermitPlatforms, isInformationalPageUrl } = await import("../src/portalChannel");
+  const permitUrl = "https://aca-oregon.accela.com/oregon/Default.aspx";
+  const devhub = "https://devhub.portlandoregon.gov/permits/sfjsp";
+  const acaCedar = "https://aca-prod.accela.com/CEDARVALE/Default.aspx";
+  const cityLanding = "https://www.cedarvale.gov/permits/apply-online";
+  const at = new Date().toISOString();
+  const tenantOf = (utility: string) => `https://${utility.split(" ")[0].toLowerCase()}.powerclerk.com/MvcAccount/Login`;
+  const kbRow = (id: string, utility: string, url: string, o: { name?: string; platform?: string; method?: string; notes?: string; verified?: boolean; key?: string } = {}) => db.run(
+    `INSERT INTO permit_utility_knowledge (id, profile_key, state, ahj, utility, portal_url, portal_name, portal_platform, submission_method, notes, confidence, first_seen_at, last_learned_at, updated_at, verified_at, verified_by)
+     VALUES (?, ?, 'OR', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id, o.key ?? `or||${utility.toLowerCase()}|${id}`, utility, url, o.name ?? "", o.platform ?? "", o.method ?? "", o.notes ?? "", o.verified ? "verified" : "seeded", at, at, at, o.verified ? at : null, o.verified ? "synthetic.reviewer@example.com" : ""]);
+  const nemTarget = (P: string, portalUrl = "") => ensureCheckTarget(db, getProjectDetail(db, P).project, {
+    targetType: "nem", permitType: "nem", applicationNumber: "APP-552041", portalName: "Utility NEM portal", portalUrl,
+  });
+  let page: { passId: string; uses: number } | null = null;
+  let pages = 0;
+  const currentPage = async () => {
+    if (!page || page.uses >= 8) page = { passId: (await verifiedPage(`10-18 Re-check Admission Page ${++pages}`)).passId, uses: 0 };
+    return page;
+  };
+  const handOut = (P: string, url: string) => IP.infoPagePriorProgress(db, P, url, "ahj");
+  /** The number counts at the hand-out AND at the admission (nothing reserved). */
+  const counts = async (P: string, url: string, what: string) => {
+    assert.equal(handOut(P, url), true, `${what}: the hand-out counts the number`);
+    const r = IP.reserveInfoPagePassUse(db, P, "", "ahj", { passId: (await currentPage()).passId, where: url });
+    assert.ok(r.some((x) => /tracked by number/.test(x)), `${what}: the admission counts it too — ${JSON.stringify(r)}`);
+  };
+  /** Skipped at both (the admission then RESERVES a use — one call per project). */
+  const skipped = async (P: string, url: string, what: string) => {
+    assert.equal(handOut(P, url), false, `${what}: the hand-out skips the number`);
+    const pg = await currentPage();
+    assert.deepEqual(IP.reserveInfoPagePassUse(db, P, "", "ahj", { passId: pg.passId, where: url }), [], `${what}: the admission skips it too`);
+    pg.uses++;
+  };
+  const stub = (filing: unknown, resultUrls: string[]) => ({
+    webLookup: async () => ({ text: JSON.stringify({ filing, program: { value: null, notFound: "n/a" } }), groundedSearches: 2, stopReason: "end_turn", resultUrls, pagesRead: 0, fetchedUrls: [] }),
+  }) as never;
+  const lookupThrough = (utility: string, filing: unknown, seen: string[]) => ufl.runUtilityFilingLookup(db, stub(filing, seen), { state: "OR", utility, force: true });
+  /** A lookup written through the real door, its stored filing checked (a quote that does not name the
+   *  filing is silently "not found" — every case below would then count for the wrong reason). */
+  const lookupNaming = async (utility: string, filing: { value: { name: string; url: string | null }; sourceUrl: string; quote: string }, seen: string[], expect: { url?: string | null; droppedUrls?: string[] } = {}) => {
+    const run = await lookupThrough(utility, filing, seen);
+    assert.equal(run.saved, true, `${utility}: ${run.reason}`);
+    assert.equal(run.lookup?.filing.value?.name, filing.value.name, `precondition (${utility}): the lookup kept the name — ${JSON.stringify(run.lookup?.filing)}`);
+    assert.equal(run.lookup?.filing.value?.url ?? null, expect.url ?? null, `precondition (${utility}): the kept URL — ${JSON.stringify(run.lookup?.filing)}`);
+    assert.deepEqual(run.lookup?.filing.droppedUrls, expect.droppedUrls, `precondition (${utility}): the dropped URLs — ${JSON.stringify(run.lookup?.filing)}`);
+    return run;
+  };
+  const project = (utility: string, nemUrl = "") => { const P = fx.newProject({ utility }); nemTarget(P, nemUrl); return P; };
+  const research = (o: { portalName?: string; portalPlatform?: string; portalUrl?: string; submissionMethod?: string }) => ({
+    provider: "stub" as const, portalName: o.portalName ?? "", portalPlatform: o.portalPlatform ?? "", portalUrl: o.portalUrl ?? "", submissionMethod: o.submissionMethod ?? "",
+    requiredDocuments: [], smartInverterSettings: "", meterAggregation: "", acDisconnectRule: "", exportLimitNote: "",
+    commonCorrections: [], tips: [], submissionSteps: [], confidence: "medium" as const, needsHumanVerification: true, notes: "", webGrounded: true,
+  });
+  const rowOf = (utility: string) => {
+    const rows = db.query<Record<string, unknown>>("SELECT portal_url, portal_name, portal_platform, submission_method, notes, verified_at FROM permit_utility_knowledge WHERE utility = ? AND (ahj IS NULL OR ahj = '')", [utility]);
+    assert.equal(rows.length, 1, `precondition (${utility}): one KB row — ${JSON.stringify(rows)}`);
+    return rows[0];
+  };
+  const verifiedBy = "synthetic.reviewer@example.com";
+
+  // ══ BLOCKER 1: (3b) READS THE FILING'S NAME ONLY; NO EXEMPTION FOR A KB ROW'S PORTAL NAME, THE QUOTE
+  // OR A DROPPED URL. Each lookup through runUtilityFilingLookup, beside a KB row on PowerClerk.
+  // (3b) ITSELF: a plain-name lookup, url null.
+  kbRow("kb-r5-cv", "Cuthbert Electric", tenantOf("Cuthbert Electric"));
+  const cvSrc = "https://www.cuthbert-electric.example.com/solar";
+  await lookupNaming("Cuthbert Electric", { value: { name: "Cedarvale Online Services", url: null }, sourceUrl: cvSrc, quote: "Apply through Cedarvale Online Services." }, [cvSrc]);
+  await counts(project("Cuthbert Electric"), permitUrl, "B1 (3b) a plain-name lookup with no URL");
+  // THE MOVED-PORTAL MUNI: a stale row still calls the old tenant "Larkspur Solar Portal"; the lookup
+  // names it, url null, quoting that it is now part of the city's online services. Seeded, from AI
+  // research, and a name equal only after normalising.
+  const larkCity = "https://onlineservices.larkspur.gov/portal";
+  const larkLanding = "https://www.larkspur.gov/permits/apply-online";
+  kbRow("kb-r5-lark", "Larkspur Municipal Utilities", tenantOf("Larkspur Municipal Utilities"), { name: "Larkspur Solar Portal" });
+  const larkSrc = "https://www.larkspur-utilities.example.com/solar"; // off the city hosts: only (3b) decides there
+  await lookupNaming("Larkspur Municipal Utilities", { value: { name: "Larkspur Solar Portal", url: null }, sourceUrl: larkSrc, quote: "The Larkspur Solar Portal is now part of the City of Larkspur Online Services." }, [larkSrc]);
+  await counts(project("Larkspur Municipal Utilities"), larkCity, "B1 the moved-portal muni (seeded row), on the city portal");
+  await counts(project("Larkspur Municipal Utilities"), larkLanding, "B1 the moved-portal muni (seeded row), on its landing host");
+  kb.saveResearchedUtilityProfile(db, { state: "OR", utility: "Lindley Municipal Utilities" }, research({ portalName: "Lindley Solar Portal", portalPlatform: "PowerClerk", portalUrl: tenantOf("Lindley Municipal Utilities"), submissionMethod: "Online portal" }));
+  assert.equal(rowOf("Lindley Municipal Utilities").portal_url, tenantOf("Lindley Municipal Utilities"), "precondition: the researched row kept its tenant URL");
+  const lindSrc = "https://www.lindley-utilities.example.com/solar";
+  await lookupNaming("Lindley Municipal Utilities", { value: { name: "Lindley Solar Portal", url: null }, sourceUrl: lindSrc, quote: "The Lindley Solar Portal is now part of the City of Lindley Online Services." }, [lindSrc]);
+  await counts(project("Lindley Municipal Utilities"), permitUrl, "B1 the moved-portal muni (a researched row)");
+  kbRow("kb-r5-lock", "Lockwood Municipal Utilities", tenantOf("Lockwood Municipal Utilities"), { name: "Lockwood Solar Portal" });
+  const lockSrc = "https://www.lockwood-utilities.example.com/solar";
+  await lookupNaming("Lockwood Municipal Utilities", { value: { name: "LOCKWOOD SOLAR-PORTAL", url: null }, sourceUrl: lockSrc, quote: "The Lockwood Solar-Portal moved to the City of Lockwood Online Services." }, [lockSrc]);
+  await counts(project("Lockwood Municipal Utilities"), permitUrl, "B1 the moved-portal muni (a name equal only after normalising)");
+  // THE QUOTE IS NOT READ FOR THE EXEMPTION: a migration quote, and a quote naming PowerClerk for
+  // something else — the pass OFF the lookup's source host.
+  kbRow("kb-r5-mar", "Marrow Electric", tenantOf("Marrow Electric"));
+  const marSrc = "https://www.marrow-electric.example.com/solar";
+  await lookupNaming("Marrow Electric", { value: { name: "Marrow Build + Connect", url: null }, sourceUrl: marSrc, quote: "Apply through Marrow Build + Connect; Marrow no longer accepts applications on PowerClerk." }, [marSrc]);
+  await counts(project("Marrow Electric"), permitUrl, "B1 a migration quote naming PowerClerk");
+  kbRow("kb-r5-kes", "Kestrel Electric", tenantOf("Kestrel Electric"));
+  const kesSrc = "https://www.kestrel-electric.example.com/solar";
+  await lookupNaming("Kestrel Electric", { value: { name: "City of Kestrel Online Services", url: null }, sourceUrl: kesSrc, quote: "Apply through the City of Kestrel Online Services. Rebates are applied for on PowerClerk." }, [kesSrc]);
+  await counts(project("Kestrel Electric"), permitUrl, "B1 a quote naming PowerClerk for rebates");
+  // A DROPPED URL ONLY ADDS CAUTION: another tenant's PowerClerk URL the search never returned, and an
+  // attested PDF on a utility domain (eweb.org) the door dropped as an information page.
+  kbRow("kb-r5-ot", "Ottery Electric", tenantOf("Ottery Electric"));
+  const otSrc = "https://www.ottery-electric.example.com/solar";
+  const otherTenant = "https://otherborough.powerclerk.com/MvcAccount/Login";
+  await lookupNaming("Ottery Electric", { value: { name: "Cedarvale Online Services", url: otherTenant }, sourceUrl: otSrc, quote: "Apply through Cedarvale Online Services." }, [otSrc], { droppedUrls: [otherTenant] });
+  await counts(project("Ottery Electric"), permitUrl, "B1 a dropped other-tenant PowerClerk URL");
+  kbRow("kb-r5-ew", "Ewell Water And Electric", tenantOf("Ewell Water And Electric"));
+  const ewSrc = "https://www.ewell-water.example.com/solar";
+  const ewPdf = "https://www.eweb.org/documents/interconnection-application.pdf";
+  assert.ok(isUtilityPlatformUrl(ewPdf) && isInformationalPageUrl(ewPdf), "precondition: the PDF is on a utility domain and is an information page");
+  await lookupNaming("Ewell Water And Electric", { value: { name: "Ewell Customer Generation Application", url: ewPdf }, sourceUrl: ewSrc, quote: "Download the Ewell Customer Generation Application." }, [ewSrc, ewPdf], { droppedUrls: [ewPdf] });
+  await counts(project("Ewell Water And Electric"), permitUrl, "B1 a dropped attested eweb.org PDF");
+  // STAY SKIPPED: the tenant attested and kept; a filing name that says PowerClerk.
+  kbRow("kb-r5-tk", "Tamworth Electric", tenantOf("Tamworth Electric"));
+  const tkSrc = "https://www.tamworth-electric.example.com/solar";
+  await lookupNaming("Tamworth Electric", { value: { name: "Tamworth Customer Generation Portal", url: tenantOf("Tamworth Electric") }, sourceUrl: tkSrc, quote: "Apply through the Tamworth Customer Generation Portal." }, [tkSrc, tenantOf("Tamworth Electric")], { url: tenantOf("Tamworth Electric") });
+  await skipped(project("Tamworth Electric"), permitUrl, "B1 the tenant attested and kept");
+  kbRow("kb-r5-np", "Nettleton Electric", tenantOf("Nettleton Electric"));
+  const npSrc = "https://www.nettleton-electric.example.com/solar";
+  await lookupNaming("Nettleton Electric", { value: { name: "Nettleton PowerClerk Portal", url: null }, sourceUrl: npSrc, quote: "Apply through the Nettleton PowerClerk Portal." }, [npSrc]);
+  await skipped(project("Nettleton Electric"), permitUrl, "B1 a filing name that says PowerClerk");
+  // A NON-PLATFORM URL THE LOOKUP NAMES COUNTS OFF ITS HOST (the nit): one in the quote beside
+  // PowerClerk (the pass on another host), and one the door dropped (the pass on the city's Accela).
+  const cityApply = "https://www.cedarvale.gov/utilities/interconnection/apply";
+  assert.equal(isInformationalPageUrl(cityApply), false, "precondition: the city page is no information page");
+  kbRow("kb-r5-qc", "Quenby Electric", tenantOf("Quenby Electric"));
+  const qcSrc = "https://www.quenby-electric.example.com/solar";
+  await lookupNaming("Quenby Electric", { value: { name: "PowerClerk", url: null }, sourceUrl: qcSrc, quote: "Apply on PowerClerk; customers inside city limits start at www.cedarvale.gov/utilities/interconnection/apply." }, [qcSrc]);
+  await counts(project("Quenby Electric"), permitUrl, "a city page in the lookup's quote, the pass on another host");
+  kbRow("kb-r5-dc", "Dorrington Electric", tenantOf("Dorrington Electric"));
+  const dcSrc = "https://www.dorrington-electric.example.com/solar";
+  await lookupNaming("Dorrington Electric", { value: { name: "PowerClerk", url: cityApply }, sourceUrl: dcSrc, quote: "Dorrington Electric applications are submitted on PowerClerk." }, [dcSrc, cityApply], { droppedUrls: [cityApply] });
+  await counts(project("Dorrington Electric"), acaCedar, "a dropped city URL, the pass on the city's Accela tenant");
+
+  // ══ BLOCKER 2: FAILED, PAUSED AND REFUSED LEARNS NEVER VOUCH. Each learn through the real
+  // autoLearnPortal (the learner stubbed) on project A; the NEM number judged on project B.
+  const learnOn = async (utility: string, portalUrl: string, result: Record<string, unknown>) => {
+    const A = fx.newProject({ utility });
+    scripted = [() => ({ ok: false, portalName: "stub", steps: [], reviewScreen: { fields: [], bodyTextSnippet: "" }, finalSubmitRecorded: false, pageCount: 2, pauseReason: null, message: "stub learn", ...result })];
+    await autoLearn.autoLearnPortal(db, A, { scope: "utility", portalUrl, createdBy: "operator" }).catch(() => null);
+    const rows = db.query<Record<string, unknown>>("SELECT id, status, flag_reason, portal_url FROM portal_recipes WHERE scope_type = 'utility' AND utility = ?", [utility]);
+    assert.equal(rows.length, 1, `precondition (${utility}): the learn wrote one utility recipe — ${JSON.stringify(rows)}`);
+    assert.equal(rows[0].portal_url, portalUrl, `precondition (${utility}): on the tenant`);
+    return rows[0];
+  };
+  const cityEnergov = "https://cedarvaleor-energovweb.tylerhost.net/apps/selfservice";
+  const refused = await learnOn("Dixon Municipal Power", tenantOf("Dixon Municipal Power"), { notServed: "This address is not in our service territory." });
+  assert.ok(isNotServedRecipe(refused) && refused.status === "needs_rerecord", `precondition: a refused stub — ${JSON.stringify(refused)}`);
+  await counts(project("Dixon Municipal Power"), acaCedar, "B2 a refused stub (not served) on the city's Accela");
+  await counts(project("Dixon Municipal Power"), cityLanding, "B2 a refused stub, on the city landing page");
+  const failed = await learnOn("Garfield Municipal Light", tenantOf("Garfield Municipal Light"), { message: "The portal did not load." });
+  assert.equal(failed.status, "needs_rerecord", `precondition: a failed stub — ${JSON.stringify(failed)}`);
+  await counts(project("Garfield Municipal Light"), cityEnergov, "B2 a failed stub, on the city's EnerGov");
+  const paused = await learnOn("Pickering Municipal Power", tenantOf("Pickering Municipal Power"), { pauseReason: "mfa_captcha", message: "A challenge appeared.", steps: [{ action: "goto", value: tenantOf("Pickering Municipal Power") }] });
+  assert.equal(paused.status, "recording", `precondition: a paused stub — ${JSON.stringify(paused)}`);
+  await counts(project("Pickering Municipal Power"), acaCedar, "B2 a paused stub");
+  // THE LOOKUP PLUS A FAILED STUB (it undid round 3's item 4): a PowerClerk-only lookup counts alone,
+  // and still counts once a learn on that tenant failed.
+  const hdSrc = "https://www.halden-electric.example.com/solar/contractors";
+  await lookupNaming("Halden Electric", { value: { name: "Halden PowerClerk", url: tenantOf("Halden Electric") }, sourceUrl: hdSrc, quote: "Contractors submit the interconnection application through Halden PowerClerk." }, [hdSrc, tenantOf("Halden Electric")], { url: tenantOf("Halden Electric") });
+  await counts(project("Halden Electric"), permitUrl, "B2 the lookup alone");
+  await learnOn("Halden Electric", tenantOf("Halden Electric"), { message: "The portal did not load." });
+  await counts(project("Halden Electric"), permitUrl, "B2 the lookup plus a failed stub on its tenant");
+  // A VERIFIED ROW NAMING THE CITY'S INTERCONNECTION PDF, plus a refused stub.
+  const ivPdf = "https://www.ivybridge.gov/files/interconnection-application.pdf";
+  assert.equal(isInformationalPageUrl(ivPdf), true, "precondition: the PDF is an information page");
+  kbRow("kb-r5-iv", "Ivybridge Light", ivPdf, { verified: true });
+  await learnOn("Ivybridge Light", tenantOf("Ivybridge Light"), { notServed: "No service at this address." });
+  await counts(project("Ivybridge Light"), acaCedar, "B2 a verified row naming the city's PDF plus a refused stub");
+  // A COMPLETE RECIPE vouches (skipped), with a NEM row kept on the tenant too; refused, it no longer
+  // does — and a refused row re-promoted WITH ITS FLAG (savePortalRecipeSteps keeps flag_reason) still
+  // does not (both checks are kept).
+  const JS = "Jessop Electric";
+  const jsRec = fx.recipes.startPortalRecording(db, { scopeType: "utility", state: "OR", utility: JS, portalUrl: tenantOf(JS), portalPlatform: "powerclerk", createdBy: "test" });
+  fx.recipes.savePortalRecipeSteps(db, jsRec.id, [...fx.fills(3), fx.REVIEW], { status: "complete", notes: "Auto-learned and verified (high confidence)." });
+  await skipped(project(JS), acaCedar, "B2 a complete recipe vouches");
+  await skipped(project(JS, tenantOf(JS)), acaCedar, "B2 a complete recipe, the NEM row kept on the tenant");
+  recordPortalNotServed(db, { scopeType: "utility", state: "OR", utility: JS, portalUrl: tenantOf(JS), quote: "This address is not served.", recipeId: jsRec.id });
+  assert.equal(fx.recipeRow(jsRec.id).status, "needs_rerecord", "precondition: the refusal demoted it");
+  await counts(project(JS), acaCedar, "B2 a refused (demoted) recipe");
+  fx.recipes.savePortalRecipeSteps(db, jsRec.id, [...fx.fills(3), fx.REVIEW], { status: "complete" });
+  assert.ok(fx.recipeRow(jsRec.id).status === "complete" && isNotServedRecipe(fx.recipeRow(jsRec.id)), "precondition: complete again, the refusal flag kept");
+  await counts(project(JS), acaCedar, "B2 a recipe re-promoted with its refusal flag");
+  // …and a recipe that does NOT vouch still adds caution: a failed stub on the city's own portal
+  // beside a PowerClerk-only KB row counts, off that host (every portal the utility names must be a
+  // platform, vouching or not).
+  const KS = "Kingston Electric";
+  kbRow("kb-r5-ks", KS, tenantOf(KS));
+  const ksRec = fx.recipes.startPortalRecording(db, { scopeType: "utility", state: "OR", utility: KS, portalUrl: "https://permits.kingstoncity.gov/interconnection", portalPlatform: "", createdBy: "test" });
+  fx.recipes.savePortalRecipeSteps(db, ksRec.id, [], { status: "needs_rerecord", notes: "Auto-learn could not complete: synthetic." });
+  assert.equal(fx.recipeRow(ksRec.id).status, "needs_rerecord", "precondition: a failed stub on the city portal");
+  await counts(project(KS), acaCedar, "B2 a failed stub on a city portal still counts the number");
+
+  // ══ SHOULD-FIX 1: A PERSON'S VERIFY ON THE REAL MERGE. Each row seeded under knowledgeProfileKey by
+  // research (or the reference import), then saveVerifiedUtilityProfile with the URL left blank: the
+  // stale tenant URL, research's platform and method stay on the row.
+  const seedResearched = (utility: string, o: { portalName?: string; portalPlatform?: string; submissionMethod?: string } = {}) => {
+    kb.saveResearchedUtilityProfile(db, { state: "OR", utility }, research({ portalName: "Garnet Interconnection Portal", portalPlatform: "PowerClerk", submissionMethod: "online portal", ...o, portalUrl: tenantOf(utility) }));
+    return rowOf(utility);
+  };
+  // THE NAME ONLY.
+  seedResearched("Abbotsley Electric");
+  kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Abbotsley Electric", portalName: "Cedarvale Build + Connect", portalUrl: "", verifiedBy });
+  const ab = rowOf("Abbotsley Electric");
+  assert.deepEqual([ab.portal_url, ab.portal_name, ab.portal_platform, ab.submission_method, !!ab.verified_at], [tenantOf("Abbotsley Electric"), "Cedarvale Build + Connect", "PowerClerk", "online portal", true], "precondition: the real merge");
+  await counts(project("Abbotsley Electric"), permitUrl, "S1 a verify naming the city's portal, the URL left blank");
+  await counts(project("Abbotsley Electric"), cityLanding, "S1 …on a city landing host");
+  // …the same over a REFERENCE-IMPORT seed.
+  kb.importSeededUtilityKnowledge(db, { state: "OR", utility: "Ashwell Electric", portalName: "Ashwell PowerClerk", portalUrl: tenantOf("Ashwell Electric"), notes: "Contact: interconnection desk", sourceLabel: "synthetic reference list" });
+  kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Ashwell Electric", portalName: "Cedarvale Build + Connect", portalUrl: "", verifiedBy });
+  assert.equal(rowOf("Ashwell Electric").portal_url, tenantOf("Ashwell Electric"), "precondition: the imported tenant URL kept");
+  await counts(project("Ashwell Electric"), permitUrl, "S1 a verify naming the city's portal over an imported row");
+  // A METHOD ONLY, IN PLAIN WORDS.
+  seedResearched("Barnack Electric", { portalName: "PowerClerk" });
+  kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Barnack Electric", submissionMethod: "Through Cedarvale Build + Connect", portalUrl: "", verifiedBy });
+  assert.equal(rowOf("Barnack Electric").portal_name, "PowerClerk", "precondition: research's name (a platform) stays");
+  await counts(project("Barnack Electric"), permitUrl, "S1 a verify typing only a method in plain words");
+  // THE NAME PLUS A LOOKUP NAMING THE SAME PORTAL, url null — the lookup first (it counts alone: the
+  // no-verify control), then the verify; and the verify first.
+  seedResearched("Cottenham Electric");
+  const ctSrc = "https://www.cottenham-electric.example.com/solar";
+  await lookupNaming("Cottenham Electric", { value: { name: "Cedarvale Build + Connect", url: null }, sourceUrl: ctSrc, quote: "Apply through Cedarvale Build + Connect." }, [ctSrc]);
+  await counts(project("Cottenham Electric"), permitUrl, "S1 control: the lookup alone, no verify");
+  kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Cottenham Electric", portalName: "Cedarvale Build + Connect", portalUrl: "", verifiedBy });
+  await counts(project("Cottenham Electric"), permitUrl, "S1 the lookup, then a verify naming the same portal");
+  seedResearched("Dullingham Electric");
+  kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Dullingham Electric", portalName: "Cedarvale Build + Connect", portalUrl: "", verifiedBy });
+  const dlSrc = "https://www.dullingham-electric.example.com/solar";
+  await lookupNaming("Dullingham Electric", { value: { name: "Cedarvale Build + Connect", url: null }, sourceUrl: dlSrc, quote: "Apply through Cedarvale Build + Connect." }, [dlSrc]);
+  await counts(project("Dullingham Electric"), permitUrl, "S1 a verify naming the portal, then the lookup");
+  // STAY SKIPPED: a verify that names the platform itself (it stands rule 2 down — research's
+  // "Garnet Interconnection Portal" name stays on the row); a genuine verify of a non-registry
+  // PowerClerk utility; a verify that leaves research's method on the row (only the verify's own
+  // method is the person's), in research's plain "online portal" and in words that would count.
+  seedResearched("Elsworth Electric", { portalPlatform: "" });
+  kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Elsworth Electric", portalPlatform: "PowerClerk", portalUrl: "", verifiedBy });
+  assert.deepEqual([rowOf("Elsworth Electric").portal_name, rowOf("Elsworth Electric").portal_platform], ["Garnet Interconnection Portal", "PowerClerk"], "precondition");
+  await skipped(project("Elsworth Electric"), permitUrl, "S1 a verify naming PowerClerk stands rule 2 down");
+  seedResearched("Fulbourn Electric");
+  kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Fulbourn Electric", portalName: "Fulbourn PowerClerk", submissionMethod: "Online portal", portalUrl: "", verifiedBy });
+  await skipped(project("Fulbourn Electric"), permitUrl, "S1 a genuine verify of a non-registry PowerClerk utility");
+  seedResearched("Grantchester Electric", { portalName: "PowerClerk" });
+  kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Grantchester Electric", smartInverterSettings: "Yes for UL 1741-SB inverters", portalUrl: "", verifiedBy });
+  assert.equal(rowOf("Grantchester Electric").submission_method, "online portal", "precondition: research's method stays on the row");
+  await skipped(project("Grantchester Electric"), permitUrl, "S1 a verify that leaves research's \"online portal\" method");
+  seedResearched("Haslingfield Electric", { portalName: "PowerClerk", submissionMethod: "Online application on the utility's interconnection portal" });
+  kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Haslingfield Electric", smartInverterSettings: "Yes for UL 1741-SB inverters", portalUrl: "", verifiedBy });
+  assert.equal(rowOf("Haslingfield Electric").submission_method, "Online application on the utility's interconnection portal", "precondition: research's method stays on the row");
+  await skipped(project("Haslingfield Electric"), permitUrl, "S1 a verify that leaves research's method in words that name no platform");
+  // A BARE CHANNEL WORD the verify typed is no evidence against the platform.
+  seedResearched("Histon Electric", { portalName: "PowerClerk" });
+  kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Histon Electric", submissionMethod: "Email", portalUrl: "", verifiedBy });
+  await skipped(project("Histon Electric"), permitUrl, "S1 a verify typing a bare channel word");
+
+  // ══ SHOULD-FIX 2: RULE (1) READS THE ROW'S SUBMISSION NOTES. A researched PowerClerk row, then the
+  // reference import adds its "Submit instructions:" (to the end of its segment, whatever labels its
+  // value holds); research's own "Submission:" sentence read up to the label research writes next.
+  const instructions: Array<[string, string]> = [
+    ["Impington Light", "Submit through the City of Impington Accela Citizen Access portal"],
+    ["Mallow Light", "Two paths. Inside Mallow city limits: apply through the City of Mallow Accela Citizen Access; elsewhere use PowerClerk."],
+    ["Melbourn Light", "Step 1: obtain the electrical permit. Step 2: submit the interconnection application on the city's Accela portal."],
+  ];
+  for (const [utility, text] of instructions) {
+    seedResearched(utility, { portalName: "PowerClerk" });
+    kb.importSeededUtilityKnowledge(db, { state: "OR", utility, notes: `Submit instructions: ${text} | Contact: interconnection desk`, sourceLabel: "synthetic reference list" });
+    assert.ok(String(rowOf(utility).notes).includes(`Submit instructions: ${text}`), `precondition: the import merged its segment (${utility})`);
+    await counts(project(utility), permitUrl, `S2 submit instructions: ${text.slice(0, 40)}`);
+  }
+  seedResearched("Orwell Light", { portalName: "PowerClerk", submissionMethod: "Inside Orwell city limits: apply through the City of Orwell Accela Citizen Access" });
+  kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Orwell Light", submissionMethod: "Online portal", portalUrl: "", verifiedBy });
+  assert.equal(rowOf("Orwell Light").submission_method, "Online portal", "precondition: the verify replaced the method column; research's sentence is only in the notes");
+  await counts(project("Orwell Light"), permitUrl, "S2 research's Submission sentence, read past a label inside it");
+  // NOT FOR A TENANT KNOWN BY HEART: Pacific Power's instructions name the permit office as a
+  // prerequisite — Portland's pass stays (and stays for every later check in this file).
+  const ppText = "Once the local permit office issues the electrical permit, submit the application on the Pacific Power Customer Generation Portal.";
+  assert.ok(namedPermitPlatforms(ppText).length, "precondition: the prerequisite wording names a permit office");
+  kb.importSeededUtilityKnowledge(db, { state: "OR", utility: "Pacific Power", notes: `Submit instructions: ${ppText}`, sourceLabel: "synthetic reference list" });
+  assert.ok(String(rowOf("Pacific Power").notes).includes(ppText), "precondition: the instructions are on Pacific Power's row");
+  await skipped(project("Pacific Power"), devhub, "S2 Pacific Power's instructions are not read (known tenant)");
+
+  // ══ SHOULD-FIX 3: A SCHEME-LESS NEM URL IS READ BY ITS PARSED HOST (markTrackSubmitted stores the
+  // tracking URL verbatim). The fixture's PGE names only its PowerClerk tenant.
+  const rawTrack = "status.cedarvale.gov/track?src=exampleplatformm.powerclerk.com";
+  assert.equal(isUtilityPlatformUrl(rawTrack), true, "precondition: the launch predicate reads the raw string as a platform");
+  const PT = fx.newProject();
+  markTrackSubmitted(db, getProjectDetail(db, PT).project, "nem", { applicationNumber: "APP-552090", trackingUrl: rawTrack });
+  assert.ok(db.query<Record<string, unknown>>("SELECT tracking_url FROM permit_check_targets WHERE project_id = ?", [PT]).some((r) => r.tracking_url === rawTrack), "precondition: stored verbatim");
+  await counts(PT, permitUrl, "S3 a scheme-less city tracking URL that mentions a PowerClerk host");
+  const PT2 = fx.newProject();
+  markTrackSubmitted(db, getProjectDetail(db, PT2).project, "nem", { applicationNumber: "APP-552091", trackingUrl: "pgenm.powerclerk.com/MvcAccount/Login" });
+  await skipped(PT2, permitUrl, "S3 a scheme-less bare tenant, skipped like its https form");
+
+  // ══ SHOULD-FIX 4: THE FOUR UNPINNED LINES. A verified portal_url through the KB route's verify (on
+  // its own key) beside a seeded PowerClerk row; and a SEEDED twin (the verified-row fallback below
+  // would hide a revert on a verified row).
+  const beside = (utility: string) => kbRow(`kb-r5-pc-${utility}`, utility, tenantOf(utility));
+  for (const [utility, url] of [
+    ["Kelshall Electric", "[City portal](https://permits.cedarvale.gov/apply)"], // portalUrlsInText of the URL itself
+    ["Kneesworth Electric", "nem@cedarvale.gov"],
+    ["Litlington Electric", "(permits.cedarvale.online/apply),"],                // the wrapper strip
+    ["Longstowe Electric", "<permits.cedarvale.online>"],
+  ] as const) {
+    beside(utility);
+    kb.saveVerifiedUtilityProfile(db, { state: "OR", utility, portalUrl: url, verifiedBy });
+    await counts(project(utility), permitUrl, `S4 a verified portal_url ${url}`);
+    const twin = `${utility.split(" ")[0]}by Power`;
+    beside(twin);
+    kbRow(`kb-r5-twin-${twin}`, twin, url);
+    await counts(project(twin), permitUrl, `S4 a seeded portal_url ${url}`);
+  }
+  // A FUZZY ROW'S INFORMATION PAGE on the host in question (the guard reads every URL, unfiltered).
+  const FW = "Fenstanton Electric";
+  beside(FW);
+  kbRow("kb-r5-fw-kin", `${FW} Cooperative`, "https://www.cedarvale.gov/utilities/net-metering-resources");
+  assert.ok(sameEntity("OR", FW, "OR", `${FW} Cooperative`), "precondition: a fuzzy match");
+  await counts(project(FW), cityLanding, "S4 a fuzzy row's information page on the host in question");
+  await skipped(project(FW), permitUrl, "S4 …off that host it is no portal claim");
+  // A RAW PAYLOAD WHOSE droppedUrls IS A STRING — and the lookup's other unknown shapes (the nit): a
+  // string or list filing, no filing at all, a list value, a number where a string goes, a list payload.
+  // The writer's own not-found shape stays what it was (no evidence either way: skipped).
+  const shapes: Array<[string, unknown]> = [
+    ["droppedUrls a string", { filing: { value: { name: "PowerClerk", url: null }, sourceUrl: "", quote: "", droppedUrls: "https://permits.cedarvale.gov/apply" } }],
+    ["droppedUrls holding a number", { filing: { value: { name: "PowerClerk", url: null }, sourceUrl: "", quote: "", droppedUrls: [42] } }],
+    ["a string filing", { filing: "PowerClerk" }],
+    ["a list filing", { filing: [{ value: { name: "PowerClerk", url: null } }] }],
+    ["no filing at all", {}],
+    ["a list value", { filing: { value: [{ name: "PowerClerk" }], sourceUrl: "", quote: "" } }],
+    ["a number for the url", { filing: { value: { name: "PowerClerk", url: 7 }, sourceUrl: "", quote: "" } }],
+    ["a list payload", [{ filing: { value: null } }]],
+  ];
+  for (const [i, [what, payload]] of shapes.entries()) {
+    const utility = `Shape ${String.fromCharCode(65 + i)} Electric`;
+    beside(utility);
+    db.run("INSERT INTO utility_filing_lookups (profile_key, state, utility, confidence, payload_json, looked_up_at, updated_at) VALUES (?, 'OR', ?, 'seeded', ?, ?, ?)",
+      [ufl.utilityFilingKey("OR", utility), utility, JSON.stringify(payload), at, at]);
+    await counts(project(utility), permitUrl, `nit: a lookup of an unknown shape — ${what}`);
+  }
+  const nf = "Shape Notfound Electric";
+  beside(nf);
+  db.run("INSERT INTO utility_filing_lookups (profile_key, state, utility, confidence, payload_json, looked_up_at, updated_at) VALUES (?, 'OR', ?, 'seeded', ?, ?, ?)",
+    [ufl.utilityFilingKey("OR", nf), nf, JSON.stringify({ filing: { value: null, sourceUrl: "", quote: "", origin: "lookup", notFound: "no source stated the filing location" } }), at, at]);
+  await skipped(project(nf), permitUrl, "nit: the writer's own not-found shape is no evidence either way");
+
+  // ══ THE NIT: ODD URL SPELLINGS ARE READ (seeded, so only the parse decides) — a scheme-less IPv4,
+  // smart quotes, a trailing-dot host; and a person's verified portal_url that yields no URL counts.
+  // Each on a host portalUrlsInText cannot find (it reads only its listed top-level domains), so the
+  // parse alone decides: a smart-quoted .gov value was found by it anyway, and its pin stayed green
+  // with the smart-quote strip gone (kill N-smart).
+  for (const [utility, url] of [
+    ["Quy Electric", "10.20.30.40/apply"],
+    ["Rampton Electric", "“https://permits.cedarvale.online/apply”"],
+    ["Sawston Electric", "permits.cedarvale.online./apply"],
+  ] as const) {
+    beside(utility);
+    kbRow(`kb-r5-odd-${utility}`, utility, url);
+    await counts(project(utility), permitUrl, `nit: a seeded portal_url ${url}`);
+  }
+  beside("Toft Electric");
+  kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Toft Electric", portalUrl: "see the city's own site", verifiedBy });
+  await counts(project("Toft Electric"), permitUrl, "nit: a verified portal_url that yields no URL");
+
+  // ══ ROUND 1'S THIS-HOST EXCEPTION, ALONE. Its kill (K-c) went green once round 2's S3 let a NEM
+  // row's own off-platform URL decide, so every earlier pin of it was decided twice. Here only the
+  // exception decides: a permit number on a LEGACY row recorded on the very platform host the
+  // utility-side pass is on (the door refuses that URL today, refuseUtilityUrlOnPermitTarget; an
+  // older row or a raw write holds it). Every portal in question is a platform.
+  const pgeHost = "https://pgenm.powerclerk.com/MvcAccount/Login";
+  const LH = fx.newProject();
+  db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, target_type, permit_type, created_at, updated_at) VALUES (?, ?, ?, 'BLD-2026-881', 'permit', 'building', ?, ?)",
+    [`r5-lh-${LH}`, LH, "https://pgenm.powerclerk.com/Projects/881", at, at]);
+  assert.equal(IP.infoPagePriorProgress(db, LH, pgeHost, "utility"), true, "K-c: a permit number recorded on this very platform host counts there (the hand-out)");
+  const lhAdmit = IP.reserveInfoPagePassUse(db, LH, "", "utility", { passId: (await currentPage()).passId, where: pgeHost });
+  assert.ok(lhAdmit.some((x) => /tracked by number/.test(x)), `K-c: …and at the admission — ${JSON.stringify(lhAdmit)}`);
+  assert.equal(IP.infoPagePriorProgress(db, LH, "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login", "utility"), false, "K-c: …and is skipped on another platform host");
+
+  // ══ THE NIT: ONE HUGE VALUE ON ANOTHER UTILITY'S ROW no longer slows every hand-out and admission
+  // (round 4 read every row's URLs; 35 s for one hand-out plus one admission on a 120k-character value).
+  // (A bare run of letters is the slow shape: portalUrlsInText retries its host pattern at every
+  // position. A value that starts with a URL is consumed in one match.)
+  kbRow("kb-r5-huge", "Zzyzx Unrelated Power", "a".repeat(120_000));
+  const PH = project("Wendy Electric");
+  beside("Wendy Electric");
+  const t0 = Date.now();
+  await skipped(PH, permitUrl, "nit: the hand-out and admission beside a huge unrelated row");
+  const ms = Date.now() - t0;
+  assert.ok(ms < 5000, `a hand-out plus an admission took ${ms} ms beside a 120k-character value on another utility's row`);
+  db.run("DELETE FROM permit_utility_knowledge WHERE id = 'kb-r5-huge'");
 });
 await check("prior progress: a staged submission on the same side refuses; one on the other side does not", () => {
   const P = fx.newProject();

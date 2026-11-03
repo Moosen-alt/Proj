@@ -72,7 +72,7 @@ import {
   SERVICE_FEEDER_COMMUNITY_SURCHARGE_KIND, SERVICE_FEEDER_STATE_SURCHARGE_KIND,
   SERVICE_FEEDER_400A_LABEL, SERVICE_FEEDER_400A_CHARGE_KIND,
   SERVICE_FEEDER_400A_COMMUNITY_SURCHARGE_KIND, SERVICE_FEEDER_400A_STATE_SURCHARGE_KIND,
-  SERVICE_FEEDER_UPGRADE_UNBILLED_KIND, type ServiceLineCounts,
+  SERVICE_FEEDER_UPGRADE_UNBILLED_KIND, isServiceLineBaseKind, type ServiceLineCounts,
 } from "./batteryServiceFeeder";
 // recordLlmCall, NOT a new accounting log. The fee researcher is the single most
 // expensive model operation in this system — up to twelve Opus turns with web
@@ -83,7 +83,7 @@ import {
 // files, under a label that names the jurisdiction.
 import { placeHistoryCacheBreakpoint, recordLlmCall, sanitizeApiKey, webSearchRequestsOf } from "./llm";
 import { routeFor } from "./modelRouting";
-import { getPermitProcessLookup } from "./permitProcess";
+import { getPermitProcessLookup, stateRulesFor } from "./permitProcess";
 import { localPermitReview, permitFeeProject, trackForFeeDiscipline } from "./feeIssuer";
 import { logger } from "./logger";
 import { agencyKind } from "./recipeReplayBinding";
@@ -482,6 +482,13 @@ export interface ProjectFeeResolution {
   scheduleId: string;
   /** Populated when feeUsd is null: why the schedule did not evaluate. */
   reason: string;
+  /** THE FLOOR (#421). When feeUsd is null, the sum of every line and charge on this filing that
+   *  DID price — never a total, always a lower bound: the filing owes at least this, plus each item
+   *  in `unpricedItems`. null when feeUsd is a total, or when nothing priced at all. Overage
+   *  (futureContingent) charges are in neither: they are not part of this filing's bill. */
+  pricedSubtotalUsd?: number | null;
+  /** What the floor leaves out, by name — the unresolved permits and the unpriced charges. */
+  unpricedItems?: string[];
   /** EVERY permit this project owes, itemised. One entry for an ordinary
    *  jurisdiction; two where the city takes the structural permit and the county
    *  takes the electrical one. feeUsd above is their TOTAL, which is what the
@@ -501,6 +508,9 @@ export interface FeeScheduleLine {
   baseFeeUsd?: number;
   stateSurchargeUsd?: number;
   communitySurchargeUsd?: number;
+  /** The state surcharge this permit owes that its schedule does not hold — reported, NOT inside
+   *  feeUsd or charges; the quote adds it (#421). See ModeledStateSurcharge. */
+  modeledStateSurcharge?: ModeledStateSurcharge;
   discipline: FeeDiscipline;
   /** Who publishes and collects THIS line — the county on a hopped electrical
    *  row, even though the project's AHJ is the city. */
@@ -3376,6 +3386,7 @@ export function feeLinesForProject(
       baseFeeUsd: evaluated.baseFeeUsd,
       stateSurchargeUsd: evaluated.stateSurchargeUsd,
       communitySurchargeUsd: evaluated.communitySurchargeUsd,
+      ...(evaluated.modeledStateSurcharge ? { modeledStateSurcharge: evaluated.modeledStateSurcharge } : {}),
       bracketLabel: evaluated.bracketLabel,
       basis: schedule.basis,
       paymentMethod: schedule.paymentMethod,
@@ -3999,6 +4010,75 @@ function conditionalChargeApplies(
   return null;
 }
 
+/** THE STATE'S SURCHARGE ON ONE PERMIT LINE, AND WHO HOLDS IT (#421).
+ *
+ *  Oregon levies a 12% surcharge on every permit fee (STATE_PERMIT_RULES.OR.surcharge, ORS
+ *  455.210/455.220). A stored schedule holds it one of three ways or not at all, and the quote
+ *  used to price it only in the first:
+ *    · "bracket"   — `b.stateSurcharge`, derived from a sentence in the retrieved document and
+ *                    folded INTO the line's own fee (Coos County, Tigard);
+ *    · "ancillary" — an unconditional percent "surcharge" charge riding this filing (the City of
+ *                    Portland electrical row: "State surcharge (12% of permit fee)"), priced by
+ *                    ancillaryCharges() on the permit line;
+ *    · "modeled"   — the schedule holds none and its label does not say it includes one. The state
+ *                    rule is then the citation; the line reports it (modeledStateSurcharge) and the
+ *                    QUOTE adds it as its own itemised line, rather than printing "PLUS the state
+ *                    surcharge … NOT included" beside a total that is short by 12%. Measured: every
+ *                    Portland permit bill carries "St. Sur." on BOTH permits (12% of each), and the
+ *                    stored structural row held none.
+ *  null off the permit track, in a state with no cited rule and nothing held, or where the
+ *  printed line says its fee already includes surcharges.
+ *
+ *  The SURCHARGE IS ON THE PERMIT, NEVER ON THE ANCILLARIES (rule 1 below) — and a services or
+ *  feeders line IS a permit fee, so serviceFeederCharges reads this too. One answer for both, so
+ *  the permit line and its services line can never be surcharged two different ways. */
+export interface LineStateSurcharge {
+  percent: number;
+  quote: string;
+  sourceUrl: string;
+  held: "bracket" | "ancillary" | "modeled";
+}
+
+export function stateSurchargeFor(
+  schedule: Pick<FeeScheduleRecord, "state" | "discipline">,
+  b: FeeBracket,
+  track: FeeTrack,
+  bracketQuote: string,
+): LineStateSurcharge | null {
+  if (track !== "permit") return null;
+  if (b.stateSurcharge) {
+    return { percent: b.stateSurcharge.percent, quote: clean(b.stateSurcharge.quote), sourceUrl: clean(b.stateSurcharge.sourceUrl), held: "bracket" };
+  }
+  const rule = stateRulesFor(schedule.state).surcharge;
+  const rulePercent = rule && typeof rule.value === "number" && rule.value > 0 ? round2(rule.value * 100) : null;
+  // HELD AS A CHARGE: the same equality attachAncillaryCharges uses to refuse a double charge — a
+  // surcharge at the state's percent IS the state's — and, in a state with no cited rule, a charge
+  // whose own printed label names the state.
+  for (const c of b.ancillaryCharges ?? []) {
+    if (c.kind !== "surcharge" || c.percent == null || c.conditional) continue;
+    if (c.appliesTo && c.appliesTo !== schedule.discipline) continue;
+    if (rulePercent != null ? Math.abs(c.percent - rulePercent) > 0.001 : !/\bstate\b/i.test(c.label)) continue;
+    return { percent: c.percent, quote: clean(c.matchedLine) || clean(c.quote), sourceUrl: clean(c.sourceUrl), held: "ancillary" };
+  }
+  if (rulePercent == null || !rule) return null;
+  // A printed amount that says it already includes surcharges is not short of one.
+  if (feeIncludesSurcharges(`${b.label ?? ""} ${bracketQuote}`)) return null;
+  return { percent: rulePercent, quote: rule.quote, sourceUrl: rule.sourceUrl, held: "modeled" };
+}
+
+/** THE STATE SURCHARGE A LINE OWES THAT ITS SCHEDULE DOES NOT HOLD (stateSurchargeFor "modeled").
+ *  Reported on the line, never inside its amount or its charges: the line is what the SCHEDULE
+ *  charges. The quote (submissionFees) adds `percent` of `ofUsd` as its own itemised charge. */
+export interface ModeledStateSurcharge {
+  percent: number;
+  /** The state rule's citation (STATE_PERMIT_RULES — ORS 455.210/455.220 for Oregon). */
+  quote: string;
+  sourceUrl: string;
+  /** The permit fees it is a percentage OF: the permit line's own fee plus each priced
+   *  services/feeders line on it. */
+  ofUsd: number;
+}
+
 /** The charge the PERMIT itself is, plus its surcharges — the parts already inside
  *  the line's own `feeUsd`. Itemised so the screens can show the arithmetic the
  *  receipt shows, never so anybody re-adds them. */
@@ -4067,8 +4147,14 @@ function ancillaryCharges(
     // its tier) are emitted ONCE, by serviceFeederCharges below, which knows the answer to
     // the condition this stored charge may carry ("when the job includes a service").
     // Listing it here too would bill it twice, or hold it open as a question already answered.
-    if (inputs.serviceFeeder?.le200 && isServiceFeeder200Label(c.label)) continue;
-    if (inputs.serviceFeeder?.t201to400 && isServiceFeeder400Label(c.label)) continue;
+    //
+    // AND ON A JOB WITH NO SERVICE LINE IT IS NOT THIS FILING'S CHARGE AT ALL (#421). A stored
+    // services/feeders row is a PRICE LIST ENTRY — "200 amps or less: $212" — owed once per service
+    // line the job actually has, and serviceLineCounts is the one answer to how many that is. This
+    // skip used to fire only when the job HAD such a line, so on every job WITHOUT one the stored
+    // row fell through to the generic path below: unconditional, it would add $212 to every
+    // rooftop-only Portland filing; conditional, it would null every one of their totals.
+    if (isServiceFeeder200Label(c.label) || isServiceFeeder400Label(c.label)) continue;
     // Rule 2 above: a percentage is a function of the BASE permit fee, evaluated
     // here and rounded here, never a product somebody stored.
     const amount = c.percent != null ? round2(b.feeUsd * c.percent / 100) : round2(c.amountUsd ?? 0);
@@ -4187,6 +4273,8 @@ function serviceFeederCharges(
   schedule: FeeScheduleRecord,
   b: FeeBracket,
   inputs: { serviceFeeder?: ServiceLineCounts | null },
+  /** The permit line's own state surcharge (stateSurchargeFor) — a services line is a permit fee. */
+  surcharge: LineStateSurcharge | null,
 ): FeeChargeBreakdown[] {
   const lines = inputs.serviceFeeder;
   if (!lines) return [];
@@ -4251,16 +4339,21 @@ function serviceFeederCharges(
       quote: tier.count > 1 ? `${stored.quote} — ${tier.count} lines` : stored.quote,
       sourceUrl: stored.sourceUrl,
     });
-    if (b.stateSurcharge) {
+    // THE SAME STATE SURCHARGE THE PERMIT LINE CARRIES, WHEREVER THE SCHEDULE HOLDS IT
+    // (stateSurchargeFor). This read `b.stateSurcharge` only, so a schedule holding the 12% as a
+    // charge (City of Portland's electrical row) priced the services line with no surcharge on it —
+    // 12% short on a line that is a permit fee. (One the schedule does not hold at all is modeled:
+    // the line's modeledStateSurcharge covers this services amount too, and the quote adds it.)
+    if (surcharge) {
       out.push({
-        label: `State surcharge (${b.stateSurcharge.percent}% of the services/feeders fee)`,
+        label: `State surcharge (${surcharge.percent}% of the services/feeders fee${surcharge.held === "modeled" ? " — state rule; not printed on this schedule" : ""})`,
         kind: tier.stateKind,
-        amountUsd: round2(amount * b.stateSurcharge.percent / 100),
+        amountUsd: round2(amount * surcharge.percent / 100),
         partOfLineFee: false,
         conditional: false,
         reason: "",
-        quote: clean(b.stateSurcharge.quote),
-        sourceUrl: clean(b.stateSurcharge.sourceUrl),
+        quote: surcharge.quote,
+        sourceUrl: surcharge.sourceUrl,
       });
     }
     if (b.communitySurcharge) {
@@ -4302,7 +4395,7 @@ function serviceFeederCharges(
 function evaluateSchedule(
   schedule: FeeScheduleRecord,
   inputs: { kw: number | null; kwSource: string; valuationUsd: number | null; valuationIsEstimate?: boolean; track?: FeeTrack; permitPath?: FeePathInput; electricalReviewRequired?: boolean; serviceFeeder?: ServiceLineCounts | null },
-): { feeUsd: number | null; baseFeeUsd?: number; stateSurchargeUsd?: number; communitySurchargeUsd?: number; bracketLabel: string; bracketQuote: string; corroboration?: FeeBracketCorroboration; reason: string; charges?: FeeChargeBreakdown[]; fromEstimatedValuation?: boolean } {
+): { feeUsd: number | null; baseFeeUsd?: number; stateSurchargeUsd?: number; communitySurchargeUsd?: number; bracketLabel: string; bracketQuote: string; corroboration?: FeeBracketCorroboration; reason: string; charges?: FeeChargeBreakdown[]; fromEstimatedValuation?: boolean; modeledStateSurcharge?: ModeledStateSurcharge } {
   const miss = (reason: string) => ({ feeUsd: null, bracketLabel: "", bracketQuote: "", reason });
   const hit = (b: FeeBracket) => {
     const bracketQuote = bracketEvidence(schedule, b);
@@ -4421,12 +4514,34 @@ function evaluateSchedule(
     // keep getting the electrical permit fee. They are added at resolutionFrom,
     // where the filing's total is made, and they travel on `charges` so the
     // screens can itemise both halves without either of them moving.
+    // THE STATE SURCHARGE, WHEREVER THE SCHEDULE HOLDS IT (stateSurchargeFor, #421). A HELD one
+    // rides the services line too (serviceFeederCharges). One the schedule does NOT hold is not
+    // priced here at all: this function answers what the SCHEDULE charges, and every reader of a
+    // line's amount — a Confirm, the printed-form cross-check, the electrical PDF's fee boxes —
+    // means exactly that. It is reported on the line as `modeledStateSurcharge` (the percent, the
+    // rule's citation, and the permit fees it is OF), and the QUOTE adds it (submissionFees).
+    const lineSurcharge = stateSurchargeFor(schedule, eb, inputs.track ?? "permit", bracketQuote);
+    const heldSurcharge = lineSurcharge && lineSurcharge.held !== "modeled" ? lineSurcharge : null;
+    const serviceCharges = serviceFeederCharges(schedule, eb, inputs, heldSurcharge);
     const charges = [
       ...permitCharges(schedule, eb, bracketLabel, bracketQuote, stateSurchargeUsd, communitySurchargeUsd),
       ...ancillaryCharges(schedule, eb, inputs),
-      ...serviceFeederCharges(schedule, eb, inputs),
+      ...serviceCharges,
     ];
+    const modeledStateSurcharge: ModeledStateSurcharge | undefined = lineSurcharge?.held === "modeled"
+      ? {
+        percent: lineSurcharge.percent,
+        quote: lineSurcharge.quote,
+        sourceUrl: lineSurcharge.sourceUrl,
+        // OF THE PERMIT FEES ON THIS LINE: the permit itself and each PRICED services/feeders line
+        // (a services line is a permit fee). Never a review or any other ancillary — rule 1 below.
+        ofUsd: round2(eb.feeUsd + serviceCharges
+          .filter((c) => isServiceLineBaseKind(c.kind) && c.amountUsd != null)
+          .reduce((sum, c) => sum + (c.amountUsd ?? 0), 0)),
+      }
+      : undefined;
     return { feeUsd: round2(eb.feeUsd + (stateSurchargeUsd ?? 0) + (communitySurchargeUsd ?? 0)), baseFeeUsd: feeIncludesSurcharges(`${b.label ?? ''} ${bracketQuote}`) ? undefined : eb.feeUsd, stateSurchargeUsd, communitySurchargeUsd, charges,
+      ...(modeledStateSurcharge ? { modeledStateSurcharge } : {}),
       fromEstimatedValuation: ladderFeeUsd != null && !kwFormula && inputs.valuationIsEstimate === true,
       bracketLabel: kwFormula ? `${bracketLabel} (computed on ${inputs.kw} ${kwFormula.unit}${inputs.kwSource ? ` ${inputs.kwSource}` : ""}: $${eb.feeUsd.toFixed(2)})` : bracketLabel,
       bracketQuote: stateSurchargeUsd == null ? bracketQuote
@@ -4609,6 +4724,7 @@ function lineFor(
     baseFeeUsd: evaluated.baseFeeUsd,
     stateSurchargeUsd: evaluated.stateSurchargeUsd,
     communitySurchargeUsd: evaluated.communitySurchargeUsd,
+    ...(evaluated.modeledStateSurcharge ? { modeledStateSurcharge: evaluated.modeledStateSurcharge } : {}),
     bracketLabel: evaluated.bracketLabel,
     basis: schedule.basis,
     paymentMethod: schedule.paymentMethod,
@@ -4692,6 +4808,23 @@ function resolutionFrom(lines: FeeScheduleLine[], track: FeeTrack): Omit<Project
   const total = unresolved.length || unpricedCharges.length
     ? null
     : round2(lines.reduce((sum, l) => sum + (l.feeUsd ?? 0), 0) + extra.reduce((sum, c) => sum + (c.amountUsd ?? 0), 0));
+  // THE FLOOR, WHEN THERE IS NO TOTAL (#421). An unpriced line or charge rightly nulls the TOTAL —
+  // but the lines that did price are still owed, and before this nothing carried them past here:
+  // the quote fell to the clamped 1.5%-of-valuation guess, which on both live City of Portland
+  // jobs printed $150 beside $739.55 / $881.77 of lines this same evaluation had priced. An unknown
+  // read as reassurance. The sum of what priced is a LOWER BOUND, and it is reported as one, with
+  // the items it leaves out named; it never stands in for `feeUsd`.
+  const pricedLines = lines.filter((l) => l.feeUsd != null);
+  const pricedExtras = extra.filter((c) => c.amountUsd != null);
+  const pricedSubtotalUsd = total == null && (pricedLines.length || pricedExtras.length)
+    ? round2(pricedLines.reduce((sum, l) => sum + (l.feeUsd ?? 0), 0) + pricedExtras.reduce((sum, c) => sum + (c.amountUsd ?? 0), 0))
+    : null;
+  const unpricedItems = total == null
+    ? [
+      ...unresolved.map((l) => `the ${l.authority || "jurisdiction"}${l.discipline ? ` ${l.discipline}` : ""} permit`),
+      ...unpricedCharges.map((c) => `"${c.label}"`),
+    ]
+    : [];
   const label = lines.length === 1 && !extra.length
     ? primary.bracketLabel
     : [
@@ -4700,6 +4833,8 @@ function resolutionFrom(lines: FeeScheduleLine[], track: FeeTrack): Omit<Project
     ].join(" + ");
   return {
     feeUsd: total,
+    pricedSubtotalUsd,
+    unpricedItems,
     charges,
     bracketLabel: label,
     // A mixed-basis total is not any one basis. "other" is the existing value
@@ -4844,6 +4979,9 @@ export interface PublishedFeeLookupResult {
    *  this seam too so the compatibility shim and feeForProject cannot answer the
    *  same question two different ways. */
   charges: FeeChargeBreakdown[];
+  /** The floor and what it leaves out, when feeUsd is null — see ProjectFeeResolution. */
+  pricedSubtotalUsd: number | null;
+  unpricedItems: string[];
 }
 
 /** Look up the published schedule for a project and evaluate it. Returns null
@@ -4909,6 +5047,8 @@ export function lookupPublishedFee(db: AppDb, input: PublishedFeeLookupArgs): Pu
         : `Published fee schedule${lines.length > 1 ? "s" : ""}${jurisdictionName ? ` (${jurisdictionName})` : ""}${rolled.bracketLabel ? `: ${rolled.bracketLabel}` : ""}`,
       jurisdictionName,
       charges: rolled.charges,
+      pricedSubtotalUsd: rolled.pricedSubtotalUsd ?? null,
+      unpricedItems: rolled.unpricedItems ?? [],
     };
   } catch (err) {
     logger.warn("fees", "lookupPublishedFee failed — falling through the quote ladder", { err: err instanceof Error ? err.message : String(err) });
@@ -4933,18 +5073,21 @@ export function lookupPublishedFee(db: AppDb, input: PublishedFeeLookupArgs): Pu
 // not an instruction to rewrite a row.
 
 /** How a schedule stands against the receipts paid at its jurisdiction.
- *   · corroborated — a receipt equals (within $0.02) a total this schedule, as held,
- *     can produce: one discipline, or electrical + structural combined, each with or
- *     without the schedule's own flat processing fee.
- *   · corroborated_missing_surcharge — a receipt matches ONLY once the 12% Oregon
- *     state surcharge is added to permit lines that do not carry it. The schedule's
- *     brackets are right and its quote is short: the margin finding this exists for.
- *   · contradicted — no total the schedule can produce matches any receipt. */
-export type ReceiptReconciliationVerdict = "corroborated" | "corroborated_missing_surcharge" | "contradicted";
+ *   · corroborated — a receipt equals (within $0.02) a total the QUOTE produces from this
+ *     schedule: one discipline, or electrical + structural combined, each with or without the
+ *     schedule's own flat processing fee, and each permit line carrying the state surcharge the
+ *     quote puts on it — the one the schedule holds, or the one stateSurchargeFor models from the
+ *     state rule where it holds none (#421).
+ *   · contradicted — no total the quote can produce from it matches any receipt.
+ *
+ *  There used to be a third verdict, corroborated_missing_surcharge: a receipt that matched only
+ *  once Oregon's 12% was added to lines that did not carry it — "the brackets are right and the
+ *  quote is short". The quote now adds exactly that 12% (stateSurchargeFor, the one predicate both
+ *  read), so such a schedule is corroborated; `neededSurcharge` on the receipt still says the
+ *  surcharge in the explanation is modeled, not held. */
+export type ReceiptReconciliationVerdict = "corroborated" | "contradicted";
 
-export const MISSING_OR_SURCHARGE_CAUSE = "missing 12% OR state surcharge";
 const RECEIPT_MATCH_TOLERANCE_USD = 0.02;
-const OREGON_STATE_SURCHARGE_PERCENT = 12;
 
 export interface ReconciledReceipt {
   jurisdiction: string;
@@ -4954,7 +5097,8 @@ export interface ReconciledReceipt {
   projectId: string | null;
   /** The candidate total that explained this receipt for this schedule; "" = none. */
   explainedBy: string;
-  /** True when that explanation needed the 12% surcharge the schedule does not hold. */
+  /** True when that explanation includes a state surcharge the schedule does not hold — the one the
+   *  quote models from the state rule (stateSurchargeFor). */
   neededSurcharge: boolean;
 }
 
@@ -5017,6 +5161,9 @@ interface ReceiptPart {
   /** Unconditional flat processing fees: filing-wide ('' appliesTo) vs this discipline's. */
   filingFlatUsd: number;
   ownFlatUsd: number;
+  /** The state surcharge the QUOTE models on this line because the schedule holds none
+   *  (stateSurchargeFor "modeled") — 0 where it holds one or no state rule applies. */
+  modeledPercent: number;
 }
 
 function receiptParts(schedule: FeeScheduleRecord): ReceiptPart[] {
@@ -5037,34 +5184,39 @@ function receiptParts(schedule: FeeScheduleRecord): ReceiptPart[] {
         if (rides === "filing") filingFlatUsd += c.amountUsd; else ownFlatUsd += c.amountUsd;
       }
     }
-    parts.push({ schedule, baseUsd, label: clean(b.label).slice(0, 60), heldPercents: [...held], filingFlatUsd, ownFlatUsd });
+    // THE QUOTE'S OWN ANSWER (stateSurchargeFor), not a second reading of "does this line carry
+    // Oregon's 12%": the reconcile judges what the quote would charge, so it adds a surcharge
+    // exactly where the quote does — and nowhere the quote would not.
+    const s = stateSurchargeFor(schedule, b, schedule.track, "");
+    const modeledPercent = s?.held === "modeled" ? s.percent : 0;
+    parts.push({ schedule, baseUsd, label: clean(b.label).slice(0, 60), heldPercents: [...held], filingFlatUsd, ownFlatUsd, modeledPercent });
   }
   return parts;
 }
 
 interface ReceiptCandidate { totalUsd: number; neededSurcharge: boolean; description: string; schedules: FeeScheduleRecord[] }
 
-/** Every total a combination of permit lines can reach: the held surcharges always,
- *  the Oregon 12% added where a line lacks it (flagged), flat processing on or off.
- *  The surcharge is taken on the PERMIT LINE only, then flat fees are added — Salem:
- *  $94 × 1.12 + $5 = $110.28, while ($94 + $5) × 1.12 = $110.88 is not a real bill. */
-function receiptCandidates(parts: ReceiptPart[], oregon: boolean): ReceiptCandidate[] {
+/** The totals a combination of permit lines reaches AS THE QUOTE PRICES THEM: the held
+ *  surcharges, the state surcharge the quote models where a line holds none (flagged), flat
+ *  processing on or off. The surcharge is taken on the PERMIT LINE only, then flat fees are added —
+ *  Salem: $94 × 1.12 + $5 = $110.28, while ($94 + $5) × 1.12 = $110.88 is not a real bill. */
+function receiptCandidates(parts: ReceiptPart[]): ReceiptCandidate[] {
   const out: ReceiptCandidate[] = [];
-  const lacks12 = parts.some((p) => !p.heldPercents.includes(OREGON_STATE_SURCHARGE_PERCENT));
-  for (const add12 of oregon && lacks12 ? [false, true] : [false]) {
-    let permitTotal = 0;
-    for (const p of parts) {
-      permitTotal += p.baseUsd;
-      for (const pct of p.heldPercents) permitTotal += round2(p.baseUsd * pct / 100);
-      if (add12 && !p.heldPercents.includes(OREGON_STATE_SURCHARGE_PERCENT)) permitTotal += round2(p.baseUsd * OREGON_STATE_SURCHARGE_PERCENT / 100);
-    }
-    // A filing-wide fee is charged once per filing, however many permit lines ride it.
-    const flat = Math.max(0, ...parts.map((p) => p.filingFlatUsd)) + parts.reduce((s, p) => s + p.ownFlatUsd, 0);
-    const lines = parts.map((p) => `${p.schedule.discipline || "permit"} "${p.label}" $${p.baseUsd.toFixed(2)}`).join(" + ");
-    const surcharge = add12 ? ` + ${OREGON_STATE_SURCHARGE_PERCENT}% OR state surcharge (not held by the schedule)` : "";
-    out.push({ totalUsd: round2(permitTotal), neededSurcharge: add12, description: `${lines}${surcharge}`, schedules: parts.map((p) => p.schedule) });
-    if (flat > 0) out.push({ totalUsd: round2(permitTotal + flat), neededSurcharge: add12, description: `${lines}${surcharge} + $${flat.toFixed(2)} processing`, schedules: parts.map((p) => p.schedule) });
+  let permitTotal = 0;
+  for (const p of parts) {
+    permitTotal += p.baseUsd;
+    for (const pct of p.heldPercents) permitTotal += round2(p.baseUsd * pct / 100);
+    if (p.modeledPercent > 0) permitTotal += round2(p.baseUsd * p.modeledPercent / 100);
   }
+  const modeled = parts.find((p) => p.modeledPercent > 0);
+  // A filing-wide fee is charged once per filing, however many permit lines ride it.
+  const flat = Math.max(0, ...parts.map((p) => p.filingFlatUsd)) + parts.reduce((s, p) => s + p.ownFlatUsd, 0);
+  const lines = parts.map((p) => `${p.schedule.discipline || "permit"} "${p.label}" $${p.baseUsd.toFixed(2)}`).join(" + ");
+  const surcharge = modeled
+    ? ` + ${modeled.modeledPercent}% ${modeled.schedule.state.toUpperCase()} state surcharge (not held by the schedule; the quote adds it from the state rule)`
+    : "";
+  out.push({ totalUsd: round2(permitTotal), neededSurcharge: !!modeled, description: `${lines}${surcharge}`, schedules: parts.map((p) => p.schedule) });
+  if (flat > 0) out.push({ totalUsd: round2(permitTotal + flat), neededSurcharge: !!modeled, description: `${lines}${surcharge} + $${flat.toFixed(2)} processing`, schedules: parts.map((p) => p.schedule) });
   return out;
 }
 
@@ -5105,10 +5257,9 @@ export function reconcileReceiptsWithSchedules(db: AppDb): ReceiptReconciliation
   for (const [key, rows] of groups) {
     const groupReceipts = byGroup.get(key) ?? [];
     if (!groupReceipts.length) { schedulesWithoutReceipts += rows.length; continue; }
-    const oregon = rows[0].state.trim().toUpperCase() === "OR";
     const partsBySchedule = new Map(rows.map((s) => [s, receiptParts(s)] as const));
     const candidates: ReceiptCandidate[] = [];
-    for (const [, parts] of partsBySchedule) for (const p of parts) candidates.push(...receiptCandidates([p], oregon));
+    for (const [, parts] of partsBySchedule) for (const p of parts) candidates.push(...receiptCandidates([p]));
     // Combined filings: one electrical line + one structural line from distinct rows.
     // Never a combo or undifferentiated row with anything — Douglas County holds both
     // with identical brackets, and adding them would double-count one permit.
@@ -5116,7 +5267,7 @@ export function reconcileReceiptsWithSchedules(db: AppDb): ReceiptReconciliation
     const struct = rows.find((s) => s.discipline === "structural");
     if (elec && struct) {
       for (const e of partsBySchedule.get(elec) ?? []) for (const st of partsBySchedule.get(struct) ?? []) {
-        candidates.push(...receiptCandidates([e, st], oregon));
+        candidates.push(...receiptCandidates([e, st]));
       }
     }
     for (const schedule of rows) {
@@ -5132,13 +5283,11 @@ export function reconcileReceiptsWithSchedules(db: AppDb): ReceiptReconciliation
           neededSurcharge: !!hit?.neededSurcharge,
         };
       });
-      const verdict: ReceiptReconciliationVerdict = reconciled.some((r) => r.explainedBy && !r.neededSurcharge)
-        ? "corroborated"
-        : reconciled.some((r) => r.explainedBy) ? "corroborated_missing_surcharge" : "contradicted";
+      const verdict: ReceiptReconciliationVerdict = reconciled.some((r) => r.explainedBy) ? "corroborated" : "contradicted";
       results.push({
         profileKey: schedule.profileKey, track: schedule.track, discipline: schedule.discipline,
         state: schedule.state, ahj: schedule.ahj, confidence: schedule.confidence, verdict,
-        likelyCause: verdict === "corroborated_missing_surcharge" ? MISSING_OR_SURCHARGE_CAUSE : "",
+        likelyCause: "",
         receipts: reconciled,
       });
     }

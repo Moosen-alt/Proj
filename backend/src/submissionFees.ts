@@ -310,6 +310,17 @@ interface ScheduleFee {
   /** The amount split by permit, read off the producer's per-line split — what the printed-form
    *  cross-check (#454) holds each printed form up against. */
   disciplineLines: Array<{ discipline: string; feeUsd: number | null }>;
+  /** THE FLOOR (#421): with feeUsd null, the sum of what the schedule DID price — a lower bound.
+   *  null whenever feeUsd is a number, or nothing priced. */
+  pricedSubtotalUsd: number | null;
+  /** What the floor leaves out, by name. */
+  unpricedItems: string[];
+  /** THE STATE SURCHARGE THE SCHEDULE DOES NOT HOLD (#421), one itemised charge per priced permit
+   *  line that owes it (feeSchedules.stateSurchargeFor "modeled" → line.modeledStateSurcharge).
+   *  NOT inside feeUsd / pricedSubtotalUsd, which are the schedule's own; the quote adds
+   *  modeledSurchargeUsd to whichever of them it shows. */
+  modeledSurcharges: FeeChargeBreakdown[];
+  modeledSurchargeUsd: number;
 }
 
 const PAYMENT_METHODS: FeePaymentMethod[] = ["portal", "mailed_check", "none", "unknown"];
@@ -437,7 +448,57 @@ function normalizeScheduleResult(raw: unknown): ScheduleFee | null {
     charges: normalizeCharges(r.charges),
     surchargeGaps: surchargeGapsOf(r),
     disciplineLines: disciplineLinesOf(r),
+    // Read only beside a null amount: a floor next to a total would be a second number for the same
+    // filing. Positive only — a "floor" of $0 says nothing a blank does not.
+    pricedSubtotalUsd: !usable && Number.isFinite(Number(r.pricedSubtotalUsd)) && r.pricedSubtotalUsd != null
+      && r.pricedSubtotalUsd !== "" && Number(r.pricedSubtotalUsd) > 0 ? round2(Number(r.pricedSubtotalUsd)) : null,
+    unpricedItems: !usable && Array.isArray(r.unpricedItems)
+      ? (r.unpricedItems as unknown[]).map((s) => text(s).trim().slice(0, 160)).filter(Boolean).slice(0, 8)
+      : [],
+    ...modeledSurchargesOf(r),
   };
+}
+
+/** THE STATE SURCHARGE THE QUOTE ADDS (#421), read off the producer's per-line
+ *  `modeledStateSurcharge` through the same whitelist discipline as every field here: a percent in
+ *  (0, 100], a positive base, a priced line. One charge per line, labelled with the permit it is on
+ *  (two permits' surcharges are two charges), rounded per line like every surcharge on a receipt. */
+function modeledSurchargesOf(r: Record<string, unknown>): { modeledSurcharges: FeeChargeBreakdown[]; modeledSurchargeUsd: number } {
+  const lines = Array.isArray(r.lines) ? (r.lines as Array<Record<string, unknown>>) : [];
+  const out: FeeChargeBreakdown[] = [];
+  for (const l of lines.slice(0, 6)) {
+    if (!l || typeof l !== "object") continue;
+    const fee = l.feeUsd == null || l.feeUsd === "" ? NaN : Number(l.feeUsd);
+    if (!Number.isFinite(fee)) continue;
+    const m = l.modeledStateSurcharge as Record<string, unknown> | undefined;
+    if (!m || typeof m !== "object") continue;
+    const percent = Number(m.percent);
+    const ofUsd = Number(m.ofUsd);
+    if (!Number.isFinite(percent) || percent <= 0 || percent > 100 || !Number.isFinite(ofUsd) || ofUsd <= 0) continue;
+    const discipline = text(l.discipline).trim();
+    const permit = [text(l.authority).trim(), discipline === "structural" ? "building/structural" : discipline].filter(Boolean).join(" ");
+    const url = text(m.sourceUrl).trim();
+    out.push({
+      label: `State surcharge (${round2(percent)}% of the ${permit ? `${permit} ` : ""}permit fee — state rule; the schedule does not print it)`.slice(0, 200),
+      kind: "state_surcharge",
+      amountUsd: round2(ofUsd * percent / 100),
+      partOfLineFee: false,
+      conditional: false,
+      reason: "",
+      quote: `${text(m.quote).trim()} — ${round2(percent)}% of $${round2(ofUsd).toFixed(2)}`.slice(0, 400),
+      sourceUrl: /^https?:\/\//i.test(url) ? url.slice(0, 500) : "",
+    });
+  }
+  return { modeledSurcharges: out, modeledSurchargeUsd: round2(out.reduce((s, c) => s + (c.amountUsd ?? 0), 0)) };
+}
+
+/** The basis clause for the state surcharge the quote added — "" when it added none. */
+function modeledSurchargeClause(schedule: ScheduleFee): string {
+  if (!schedule.modeledSurcharges.length) return "";
+  const rule = schedule.modeledSurcharges[0].quote.split(" — ")[0];
+  return ` INCLUDES $${schedule.modeledSurchargeUsd.toFixed(2)} of state surcharge the schedule does not print — `
+    + schedule.modeledSurcharges.map((c) => `${c.quote.split(" — ").slice(1).join(" — ")} = $${(c.amountUsd ?? 0).toFixed(2)}`).join("; ")
+    + ` (${rule}).`;
 }
 
 /** The producer's per-permit amounts ({discipline, feeUsd}), read defensively like every field here. */
@@ -501,6 +562,8 @@ function surchargeGapsOf(r: Record<string, unknown>): string[] {
     const fee = Number(l.feeUsd);
     if (l.feeUsd == null || !Number.isFinite(fee) || fee <= 0) continue;
     if (l.stateSurchargeUsd != null) continue;
+    // The quote ADDS this line's surcharge (#421, modeledSurchargesOf) — not a gap any more.
+    if (l.modeledStateSurcharge && typeof l.modeledStateSurcharge === "object") continue;
     const lineCharges = Array.isArray(l.charges) ? (l.charges as Array<Record<string, unknown>>) : [];
     if (lineCharges.some((c) => /surcharge/i.test(`${text(c?.kind)} ${text(c?.label)}`))) continue;
     if (/\binclud(?:es?|ing)\b[^.;]{0,50}\bsurcharges?\b|\bsurcharges?\b[^.;]{0,20}\bincluded\b/i.test(text(l.bracketLabel))) continue;
@@ -701,6 +764,8 @@ function computePaymentQuote(
   let permitFeeSource: PermitFeeSource = "unknown";
   let permitFeeBasis = "";
   let permitFeeConfidence: FeeConfidence = "unknown";
+  // Set only by the floor rung (#421): the amount is a lower bound, not the fee.
+  let permitFeeIsFloor = false;
   // Set on the published_schedule tier only — see the note where it is assigned.
   let permitFeeCorroborated = false;
   let permitFeeEvidenceQuote = "";
@@ -716,6 +781,25 @@ function computePaymentQuote(
   // applied on top of this, below.
   {
     const learned = learnedFee(db, project, track);
+    // THE FLOOR AND THE GUESS, SIDE BY SIDE (#421). A schedule that priced part of the filing gives
+    // a lower bound — what it priced plus the state surcharge on those lines (modeledSurchargesOf
+    // reads priced lines only), owed whatever the unpriced item turns out to be. The floor rung
+    // below takes the amount only when that bound is not BELOW the valuation estimate the old
+    // ladder would have quoted: a floor is never a reason to quote less than the guess, any more
+    // than the guess is a reason to quote less than the floor. The quote is the larger of the two.
+    // A CONFLICTED schedule has no floor: which document a floor would be built from is the
+    // question the conflict is asking a person.
+    const floorUsd = schedule && schedule.feeUsd == null && !scheduleConflicted
+      && schedule.pricedSubtotalUsd != null && schedule.pricedSubtotalUsd > 0
+      ? round2(schedule.pricedSubtotalUsd + schedule.modeledSurchargeUsd)
+      : null;
+    let estimateMemo: { fee: number | null; basis: string } | null = null;
+    const estimate = (): { fee: number | null; basis: string } => (estimateMemo ??= estimatedFee(db, project, track));
+    const floorWins = (): boolean => {
+      if (floorUsd == null) return false;
+      const guess = estimate().fee;
+      return guess == null || floorUsd >= guess;
+    };
     if (learned) {
       permitFeeUsd = learned.fee;
       permitFeeSource = "learned_history";
@@ -728,7 +812,10 @@ function computePaymentQuote(
           ? ` (${learned.machineSamples === learned.samples ? "all" : `${learned.machineSamples} of them`} read automatically from portal records or billing summaries — no person has checked ${learned.machineSamples === 1 ? "it" : "them"}).`
           : ".");
     } else if (schedule && schedule.feeUsd != null) {
-      permitFeeUsd = schedule.feeUsd;
+      // THE SCHEDULE'S TOTAL, PLUS THE STATE SURCHARGE IT DOES NOT PRINT (#421, modeledSurchargesOf):
+      // the schedule's own figure stays the schedule's (a Confirm, a printed form, the PDF read it);
+      // what the customer pays is that plus the surcharge the state levies on it.
+      permitFeeUsd = round2(schedule.feeUsd + schedule.modeledSurchargeUsd);
       permitFeeSource = "published_schedule";
       // A PUBLISHED TABLE PLUS A GUESSED INPUT IS STILL A GUESS.
       //
@@ -801,9 +888,40 @@ function computePaymentQuote(
         + `${vouching}.`
         + evidenceClause
         + `${schedule.sourceUrl ? ` ${schedule.sourceUrl}` : ""}`
+        + modeledSurchargeClause(schedule)
+        + (track === "permit" ? stateSurchargeNotice(project.state, schedule.surchargeGaps) : "");
+    } else if (schedule && floorUsd != null && floorWins()) {
+      // A SCHEDULE THAT PRICED PART OF THE FILING IS A FLOOR, NEVER A REASON TO GUESS LOWER (#421).
+      //
+      // Measured on both live City of Portland jobs: the schedule priced every line but one (the
+      // services/feeders line a 200 A service upgrade adds), so its total was rightly null — and
+      // the quote then fell to the rung below, the clamped 1.5%-of-valuation guess, and printed
+      // $150 beside $739.55 and $881.77 of lines this same evaluation had already priced (before
+      // the structural permit's state surcharge, which the quote now adds on top). The
+      // UNRESOLVED sentence was there; the number beside it read as an answer and was the
+      // smallest one on the screen. So the priced lines are quoted as what they are — AT LEAST
+      // this much, plus the named items not yet priced — graded "estimated" so the sheet marks it,
+      // the client total carries it, and nobody can Confirm it as a schedule figure. The schedule's
+      // own reason is kept word for word: it is the repair.
+      //
+      // A CONFLICTED schedule keeps the path below: two documents disagree about a line, and which
+      // of them a floor would be built from is the question the conflict is asking a person. So does
+      // a floor BELOW the valuation estimate (floorWins): that path quotes the guess and names the
+      // floor beside it.
+      const who = schedule.matchedName || (track === "nem" ? project.utility : feeProject.ahj) || "this jurisdiction";
+      const floor = floorUsd;
+      const missing = schedule.unpricedItems.length ? schedule.unpricedItems.join(", ") : "a line that is not priced";
+      permitFeeUsd = floor;
+      permitFeeSource = "published_schedule";
+      permitFeeConfidence = "estimated";
+      permitFeeIsFloor = true;
+      permitFeeBasis = `AT LEAST $${floor.toFixed(2)} — the sum of every line ${who}'s published fee schedule prices for this filing, `
+        + `PLUS ${missing}, not yet priced: the real fee is higher by ${schedule.unpricedItems.length > 1 ? "those" : "that"}. `
+        + `A published schedule for ${who} was found but did not resolve: ${schedule.reason}${schedule.sourceUrl ? ` (${schedule.sourceUrl})` : ""}`
+        + modeledSurchargeClause(schedule)
         + (track === "permit" ? stateSurchargeNotice(project.state, schedule.surchargeGaps) : "");
     } else {
-      const est = estimatedFee(db, project, track);
+      const est = estimate();
       // THE PRINTED FORM IS THE LAST RUNG (#454), below the valuation estimate: it answers only
       // where NO saved schedule row exists at all (a held-but-unresolved one keeps its reason), no
       // history, and not even a valuation to estimate from. It never stands in front of anything
@@ -819,6 +937,14 @@ function computePaymentQuote(
       permitFeeBasis = schedule?.reason && !scheduleConflicted
         ? `${estBasis} A published schedule for ${schedule.matchedName || "this jurisdiction"} was found but did not resolve: ${schedule.reason}${schedule.sourceUrl ? ` (${schedule.sourceUrl})` : ""}`
         : estBasis;
+      // A FLOOR BELOW THE GUESS (#421, floorWins): the guess is the amount, as it was before the
+      // floor existed, and the floor is said beside it — the schedule's priced lines are a fact the
+      // operator should see even when they are not the number quoted.
+      if (schedule && floorUsd != null && est.fee != null) {
+        permitFeeBasis += ` The schedule DID price part of this filing: AT LEAST $${floorUsd.toFixed(2)}, PLUS `
+          + `${schedule.unpricedItems.length ? schedule.unpricedItems.join(", ") : "a line that is not priced"}, not yet priced — `
+          + `below this estimate, so the estimate is the amount shown.`;
+      }
       // A bracket label describes a schedule line we did not use — do not let it
       // ride along on a guess and read as though the guess were bracketed.
       permitFeeBracketLabel = null;
@@ -846,6 +972,8 @@ function computePaymentQuote(
   const portalCovers = !!portalFeeRecords && portalFeeRecords.complete && portalRead != null
     && (portalFeeRecords.final || researched.usd == null || portalRead >= researched.usd - 0.005);
   const resetScheduleQualifiers = (): void => {
+    // The portal's figure is the filing's whole fee, not a lower bound.
+    permitFeeIsFloor = false;
     permitFeeCorroborated = false;
     permitFeeEvidenceQuote = "";
     permitFeeVerifiedBy = "";
@@ -947,6 +1075,7 @@ function computePaymentQuote(
     // stops being true. The stored sentence stays the reason for the AMOUNT,
     // which is what a re-read of that column is for.
     permitFeeBasis: archivedNotice(project) + permitFeeBasis,
+    ...(permitFeeIsFloor ? { permitFeeIsFloor: true } : {}),
     permitFeeSourceUrl,
     permitFeeBracketLabel,
     // Named only when the payee is not the AHJ. "cited" is about the SCHEDULE: said only when the
@@ -977,7 +1106,8 @@ function computePaymentQuote(
     // nobody has answered nulls the schedule's total, the ladder drops to the
     // valuation heuristic, and the operator would then be shown a rough $450 with
     // no sign that the real bill has seven charges on it and which one is missing.
-    permitFeeCharges: schedule?.charges ?? [],
+    // …and the state surcharge the quote adds to it (#421), itemised beside the schedule's own.
+    permitFeeCharges: schedule ? [...schedule.charges, ...schedule.modeledSurcharges].slice(0, CHARGE_CAP + 6) : [],
   };
   return { quote, researched };
 }
@@ -1145,6 +1275,7 @@ export function buildProjectFeeSheet(db: AppDb, project: ProjectRecord): Project
     jurisdiction: (track === "nem" ? project.utility : permitFeeProject(project).ahj) || "",
     ...(quote.permitFeeIssuerLabel ? { issuerLabel: quote.permitFeeIssuerLabel } : {}),
     feeUsd: quote.permitFeeUsd,
+    ...(quote.permitFeeIsFloor ? { feeIsFloor: true } : {}),
     source: quote.permitFeeSource,
     basis: quote.permitFeeBasis,
     bracketLabel: quote.permitFeeBracketLabel,
@@ -1216,7 +1347,13 @@ export function buildProjectFeeSheet(db: AppDb, project: ProjectRecord): Project
         (c) => c.amountUsd == null && !c.partOfLineFee && !c.futureContingent,
       );
       unknowns.push(
-        line.source === "valuation_estimate" && unpricedCharges.length
+        // A FLOOR (#421): the schedule priced part of this filing and the amount is that part.
+        line.feeIsFloor
+          ? `${label} for ${who} is AT LEAST $${line.feeUsd.toFixed(2)}, not a known fee — ${who}'s published fee schedule WAS read `
+            + `and prices this filing's other lines at that sum, but ${unpricedCharges.length === 1 ? "one charge on it is" : unpricedCharges.length ? `${unpricedCharges.length} charges on it are` : "part of it is"} `
+            + `not priced (named below), so the real fee is higher. Price ${unpricedCharges.length === 1 ? "that charge" : "what is missing"} (or enter the portal's own fee) `
+            + `and this becomes the schedule's figure. ${line.basis}`
+          : line.source === "valuation_estimate" && unpricedCharges.length
           ? `${label} for ${who} is an ESTIMATE, not a known fee — ${who}'s published fee schedule WAS read and prices `
             + `this filing's lines, but ${unpricedCharges.length === 1 ? "one charge on it is" : `${unpricedCharges.length} charges on it are`} `
             + `not priced (named below), so the schedule gives no total and the $${line.feeUsd.toFixed(2)} shown is a valuation `

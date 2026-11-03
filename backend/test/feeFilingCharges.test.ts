@@ -314,7 +314,8 @@ async function main(): Promise<void> {
   // a different (pre-existing, correct) gap. What this guards is that no unknown was
   // INVENTED on the permit side by this round's work.
   check("3c. Ivy's permit fee stays KNOWN and no new unknown appears on that track",
-    ivyPermitLine?.known === true && ivyPermitLine?.feeUsd === 335
+    // #421: $335.00 of schedule + the 12% Oregon state surcharge the quote adds = $375.20.
+    ivyPermitLine?.known === true && ivyPermitLine?.feeUsd === 375.2
     && !ivySheet.unknowns.some((u) => /Permit fee|charge/i.test(u)),
     JSON.stringify(ivySheet.unknowns));
 
@@ -383,15 +384,20 @@ async function main(): Promise<void> {
   check("5b. the unpriced charge prints UNRESOLVED and the block says INCOMPLETE",
     /UNRESOLVED\s+Fire - Plan Review/.test(rendered) && /INCOMPLETE/.test(rendered),
     rendered.slice(0, 600));
-  check("5c. it never prints a sum that omits a charge",
-    !/\$712\.93/.test(rendered), rendered.slice(0, 600));
+  // #421: the priced lines ARE shown now — but only as a FLOOR, never as the fee.
+  check("5c. it never prints a sum that omits a charge AS THE FEE — only as 'AT LEAST'",
+    !/Fee\s+\$712\.93/.test(rendered) && /Fee\s+AT LEAST \$712\.93/.test(rendered), rendered.slice(0, 600));
   const ivyView = buildFeeSheetPresentation(db, IVY);
   const ivyRendered = renderFeeLine(
     ivyView.sheet.lines.find((l) => l.track === "permit")!,
     ivyView.schedules.permit, ivyView.agreements.permit, ivyView.sheet.billingRequired,
   );
-  check("5d. OVER-CORRECTION GUARD: Ivy's complete filing grows no itemisation block",
-    !/charges on this filing/i.test(ivyRendered) && /\$335\.00/.test(ivyRendered), ivyRendered.slice(0, 400));
+  // #421: Ivy's filing now carries one charge beyond its permits per permit — the state surcharge
+  // the quote adds — so it is itemised, and the block's claim is that the fee is their total.
+  check("5d. OVER-CORRECTION GUARD: Ivy's complete filing itemises nothing but its permits and the state surcharge the quote adds",
+    /charges on this filing — the fee above is their total/i.test(ivyRendered) && /\$375\.20/.test(ivyRendered)
+      && (ivyView.sheet.lines.find((l) => l.track === "permit")!.charges ?? []).filter((c) => !c.partOfLineFee).every((c) => c.kind === "state_surcharge"),
+    ivyRendered.slice(0, 400));
 
   // =========================================================================
   // 6. PRESENTATION — the dashboard fee card, driven from its own source.
@@ -438,8 +444,8 @@ async function main(): Promise<void> {
   check("6g. markup in a charge label or reason cannot reach innerHTML",
     !/<img/.test(injected) && !/<script/.test(injected), injected.slice(0, 300));
   check("6h. OVER-CORRECTION GUARD: a filing with no charge beyond its permits draws nothing",
-    renderFeeCharges({ charges: ivyPermitLine!.charges }) === "",
-    renderFeeCharges({ charges: ivyPermitLine!.charges }).slice(0, 200));
+    renderFeeCharges({ charges: ivyPermitLine!.charges.filter((c) => c.kind !== "state_surcharge") }) === "",
+    renderFeeCharges({ charges: ivyPermitLine!.charges.filter((c) => c.kind !== "state_surcharge") }).slice(0, 200));
 
   // =========================================================================
   // 7. THE TRUST RULE — an untrusted save loses the charges entirely.

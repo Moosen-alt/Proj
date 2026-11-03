@@ -431,6 +431,8 @@ export class StubLLMProvider implements LLMProvider {
     // shows a single advisory saying so instead of silently omitting the pass.
     return {
       provider: "stub",
+      // Nothing was read. The report says so with its own "unavailable" finding (reviewPacks).
+      completeness: "incomplete",
       findings: [],
       summary: "",
       confidence: "low",
@@ -569,7 +571,11 @@ const KNOWN_INVERTERS: KnownInverter[] = [
   // Tesla Powerwall 3 — integrated PV+battery inverter, 11.5 kVA continuous on-grid.
   { label: "Tesla Powerwall 3", matches: ["powerwall3", "pw3", "1850000", "1707000ess"], outputCurrentA: 48, outputVa: 11500, note: "Powerwall 3 integrated inverter, 11.5 kVA / 48 A continuous @ 240 V. Verify the backfed PV portion against the SLD." },
   // Enphase microinverters (per-unit).
-  { label: "Enphase IQ8+", matches: ["iq8plus", "iq8", "iq8a", "iq8h", "iq8m", "iq8mc", "iq8x"], outputCurrentA: 1.0, outputVa: 240, note: "Enphase IQ8-series microinverter (per unit ~ 240 VA / 1.0 A; multiply by qty)." },
+  // IQ8M BEFORE the IQ8-series row (#544): the series row's "iq8" also matches IQ8M-72-2-US, and gave
+  // it 1.0 A — 10 units read 10 A (a 15 A breaker) where the IQ8M's 1.35 A gives 13.5 A (20 A). The
+  // Human Review card offers that total as a one-click Confirm, so the row has to be right.
+  { label: "Enphase IQ8M", matches: ["iq8m"], outputCurrentA: 1.35, outputVa: 325, note: "Enphase IQ8M microinverter (per unit 325 VA / 1.35 A @ 240 V; multiply by qty)." },
+  { label: "Enphase IQ8+", matches: ["iq8plus", "iq8", "iq8a", "iq8h", "iq8mc", "iq8x"], outputCurrentA: 1.0, outputVa: 240, note: "Enphase IQ8-series microinverter (per unit ~ 240 VA / 1.0 A; multiply by qty)." },
   { label: "Enphase IQ7", matches: ["iq7plus", "iq7", "iq7a", "iq7x", "iq7pd"], outputCurrentA: 0.96, outputVa: 230, note: "Enphase IQ7-series microinverter (per unit; multiply by qty)." },
   // SolarEdge HD-Wave string inverters (240 V).
   { label: "SolarEdge SE7600H", matches: ["se7600h", "se7600"], outputCurrentA: 32, outputVa: 7600 },
@@ -716,13 +722,15 @@ function heuristicVerifyFill(input: PortalFillVerifyInput): PortalFillVerificati
   };
 }
 
+/** A row whose match the model CONTAINS wins over one whose match merely contains the model (a bare
+ *  "IQ8" typed is the IQ8-series row, not the first row that has "iq8" in a longer match), each in
+ *  table order. */
 function lookupKnownInverter(model: string): KnownInverter | null {
   const n = normModel(model);
   if (!n) return null;
-  for (const k of KNOWN_INVERTERS) {
-    if (k.matches.some((m) => n.includes(m) || m.includes(n))) return k;
-  }
-  return null;
+  return KNOWN_INVERTERS.find((k) => k.matches.some((m) => n.includes(m)))
+    ?? KNOWN_INVERTERS.find((k) => k.matches.some((m) => m.includes(n)))
+    ?? null;
 }
 
 // Build the final lookup result from a per-unit current, with PV breaker derivation.
@@ -882,6 +890,15 @@ export const WEB_RESEARCH_MAX_TOKENS = 6000;
 /** Output ceiling for the flat-form vision pass (thinking included). 4096 truncated a two-page
  *  application (City of Waltham, 2026-09-28) before any JSON; a ceiling is not spend. */
 export const FLAT_FORM_OVERLAY_MAX_TOKENS = 16000;
+
+/** Output ceiling for the AI plan review (reviewPlanSetGeneral), thinking included. At 4096 it
+ *  ran out on all seven real residential plan sets of the owner's gate test (2026-11-02): about
+ *  19.6k tokens in, 4096 out, about 60 s, stop_reason max_tokens. Every report came back with an
+ *  empty AI summary. Adaptive thinking at effort "high" over six sheets spends from the same
+ *  budget as the JSON answer. A ceiling is not spend: output is billed as used. The call streams,
+ *  because 16k tokens at the measured ~68 tokens/s is about 4 minutes, as long as the client's
+ *  whole 240 s timeout. */
+export const PLAN_REVIEW_MAX_TOKENS = 16000;
 
 // DESIGN-CRITERIA LOOKUP (one AHJ: ground snow, ultimate wind speed, exposure). Measured on 10
 // AHJs in 8 states (2026-09-24): it never returned a wrong value, but it returned ONE value in
@@ -2448,6 +2465,7 @@ Review the attached plan-sheet images (and extracted text, when provided) the wa
 - CODE CONFORMANCE SIGNALS: obvious conflicts with the adopted codes/design criteria above (spans, load paths, egress, clearances, setbacks, fire access — whatever this work type implicates). Cite the code FAMILY and SECTION you are relying on.
 - MISSING INFORMATION a correction letter would ask for.
 Ground every finding in what is actually visible; never invent sheet contents. If the images are unreadable or insufficient, say so in notes rather than guessing.
+Keep the answer compact: at most 20 findings, the most significant first; each message one or two sentences.
 
 Return ONLY JSON:
 {"findings":[{"title":"<short>","message":"<what a correction letter would say>","severity":"warning|callout","codeFamily":"IRC|IBC|NEC|IFC|IPC|IMC|<state code>","codeSection":"<section>","sheetRef":"<sheet/page if identifiable>"}],
@@ -2469,17 +2487,34 @@ ${input.codeSummary || "No adopted-code data available — cite current model co
 
 Applicant facts:\n${factLines || "(none provided)"}\n\nExtracted plan text (may be partial):\n${(input.extractedText || "").slice(0, 6000) || "(none)"}\n\nPerform the pre-review now.`,
     });
-    const msg = await this.instrument("reviewPlanSetGeneral", this.routeOf("reviewPlanSetGeneral"), { image: input.pageImagesBase64.length > 0, pages: input.pageImagesBase64.length }, (t) =>
-      this.client.messages.create({
+    // ONE CALL, ONE GENEROUS CEILING, NO RETRY. A 2x retry (askLong's) would re-send every page
+    // image; splitting the sheets across calls would re-send the code summary and plan text per
+    // chunk and lose the cross-sheet completeness check. A truncated answer is reported as
+    // incomplete instead (see `completeness` below).
+    const msg = await this.instrument("reviewPlanSetGeneral", this.routeOf("reviewPlanSetGeneral"), { image: input.pageImagesBase64.length > 0, pages: input.pageImagesBase64.length, maxTokens: PLAN_REVIEW_MAX_TOKENS }, (t) =>
+      this.streamFinal(t, {
         model: t.model,
-        max_tokens: 4096,
+        max_tokens: PLAN_REVIEW_MAX_TOKENS,
         thinking: { type: "adaptive" },
         ...(outputConfigFor(t) ? { output_config: outputConfigFor(t) } : {}),
         system: this.cachedSystem(system),
         messages: [{ role: "user", content: userParts }],
       }),
     );
-    const parsed = this.parseJson<Partial<AiPlanReviewResult>>(this.textOf(msg), {});
+    const NOTHING = Symbol("no-json");
+    const read = this.parseJson<Partial<AiPlanReviewResult> | typeof NOTHING>(this.textOf(msg), NOTHING);
+    // READ, OR NOT: an answer counts only when it ended on its own (not at the ceiling) and parsed
+    // to an object carrying a findings array. Anything else is an incomplete review, never an
+    // empty one, so a cut-off answer cannot read as "the AI found nothing".
+    const truncated = msg.stop_reason === "max_tokens";
+    const readable = read !== NOTHING && read !== null && typeof read === "object" && !Array.isArray(read) && Array.isArray((read as Partial<AiPlanReviewResult>).findings);
+    const parsed: Partial<AiPlanReviewResult> = readable ? (read as Partial<AiPlanReviewResult>) : {};
+    const incompleteReason = truncated
+      ? `the model's answer was cut off at its ${PLAN_REVIEW_MAX_TOKENS}-token output ceiling`
+      : !readable
+        ? "the model's answer could not be read as the requested JSON"
+        : "";
+    if (incompleteReason) logger.warn("llm", `reviewPlanSetGeneral incomplete: ${incompleteReason}`, { stop: msg.stop_reason, chars: this.textOf(msg).length });
     const findings = (Array.isArray(parsed.findings) ? parsed.findings : [])
       .filter((f) => f && typeof f.title === "string" && typeof f.message === "string")
       .slice(0, 20)
@@ -2492,12 +2527,17 @@ Applicant facts:\n${factLines || "(none provided)"}\n\nExtracted plan text (may 
         codeSection: f.codeSection ? String(f.codeSection).slice(0, 40) : undefined,
         sheetRef: f.sheetRef ? String(f.sheetRef).slice(0, 60) : undefined,
       }));
+    const modelNotes = String(parsed.notes || "");
     return {
       provider: "claude",
+      completeness: incompleteReason ? "incomplete" : "complete",
       findings,
       summary: String(parsed.summary || "").slice(0, 1500),
-      confidence: (["low", "medium", "high"].includes(String(parsed.confidence)) ? parsed.confidence : "low") as "low" | "medium" | "high",
-      notes: String(parsed.notes || ""),
+      confidence: incompleteReason
+        ? "low"
+        : (["low", "medium", "high"].includes(String(parsed.confidence)) ? parsed.confidence : "low") as "low" | "medium" | "high",
+      // The reason leads, so the report's "incomplete" finding can quote it.
+      notes: incompleteReason ? `AI review incomplete: ${incompleteReason}.${modelNotes ? ` ${modelNotes}` : ""}` : modelNotes,
     };
   }
 

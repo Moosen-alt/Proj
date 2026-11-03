@@ -237,3 +237,110 @@ export function perJobAnswerKeyFor(text: string, evidence: PerJobEvidence): PerJ
   if (options.length && !options.some((o) => vocab.test(vocabNorm(o)))) return null;
   return key;
 }
+
+// ---------------------------------------------------------------------------
+// A PORTAL QUESTION A PERSON ANSWERS IN PLACE (#544).
+//
+// When a learn leaves a per-job question blank for a person (the planner above files the job's own
+// answer or nothing), the person used to meet it as the triage agent's engineering note ("Add a
+// systemOwnership field … and bind it to this question") in an editable box, and Save Edit wrote that
+// sentence into the project. The question itself — the portal's wording and its options — is what
+// they need, answered through the same per-job door the intake link and the parser page use.
+// ---------------------------------------------------------------------------
+
+/** The options a person can answer with: the portal's own, placeholders ("-- Select --") and blanks
+ *  removed, duplicates dropped, in the portal's order. */
+export function answerableOptions(options: unknown): string[] {
+  if (!Array.isArray(options)) return [];
+  const out: string[] = [];
+  for (const o of options) {
+    const s = String(o ?? "").replace(/\s+/g, " ").trim();
+    if (!s || PLACEHOLDER_OPTION.test(s) || out.includes(s)) continue;
+    out.push(s);
+  }
+  return out;
+}
+
+/** A per-job question in the portal's own words and options (shape of HumanReviewPortalQuestion). */
+export interface PerJobPortalQuestion {
+  key: PerJobAnswerKey;
+  label: string;
+  options: string[];
+  control: "select" | "choice";
+}
+
+/**
+ * A per-job key a run's blank may be ASKED of a person as a question: one only a person answers
+ * (PER_JOB_ANSWER_KEYS) AND one the operator has no standing answer for (OPERATOR_POLICY_ANSWERS).
+ *
+ * THE STANDING ANSWER SETTLES IT HERE TOO. "Is your disconnect within 10 feet of the PGE utility
+ * meter?" is per-job in principle, but the operator's standing "Yes" answers it on every job; it was
+ * reaching the homeowner's intake form on every PGE job until that table was read. A run that left it
+ * blank (a select that did not hold) is a run bug, not a question for the person: asked as a review
+ * item, it fed the intake ("the run's question wins" over the bank's) and the client was emailed it
+ * again. The bank's own disconnect question is untouched by this — it keeps its kind, so a recipe step
+ * bound to the key with no value ("bound-empty") is still asked there, exactly as before.
+ */
+export function asksAPersonForThisJob(key: unknown): key is PerJobAnswerKey {
+  return isPerJobAnswerKey(key) && !operatorPolicyAnswer(key);
+}
+
+/**
+ * A learn page's control as a question ONLY A PERSON answers for this job, or null. The one predicate
+ * (perJobAnswerKeyFor) names the key from the control's own words and options; the control must offer
+ * at least two real options — a text box, or a dropdown whose options were not captured, cannot be
+ * answered by choosing — and the key must be one the operator's standing answers leave open
+ * (asksAPersonForThisJob).
+ */
+export function perJobPortalQuestionOfField(field: { label?: string | null; fieldType?: string | null; options?: unknown[] | null }): PerJobPortalQuestion | null {
+  const label = String(field.label ?? "").replace(/\s+/g, " ").trim();
+  const options = answerableOptions(field.options);
+  const control = perJobControlOfField({ fieldType: field.fieldType, options });
+  if (!label || (control !== "select" && control !== "choice") || options.length < 2) return null;
+  const key = perJobAnswerKeyFor(label, { control, options });
+  return key && asksAPersonForThisJob(key) ? { key, label: label.slice(0, 300), options: options.slice(0, 25), control } : null;
+}
+
+/** A stored question (human_review_items.portal_question_json) read back, or null when it is not one a
+ *  person can answer: unparseable, a key outside PER_JOB_ANSWER_KEYS or settled by the operator's
+ *  standing answer (asksAPersonForThisJob — so a stored row can never feed the intake or displace the
+ *  bank's question for that key), no wording, under two options. */
+export function parsePerJobPortalQuestion(raw: unknown): PerJobPortalQuestion | null {
+  let v: unknown = raw;
+  if (typeof raw === "string") {
+    if (!raw.trim()) return null;
+    try { v = JSON.parse(raw); } catch { return null; }
+  }
+  if (!v || typeof v !== "object") return null;
+  const o = v as Record<string, unknown>;
+  const key = String(o.key ?? "");
+  const label = String(o.label ?? "").replace(/\s+/g, " ").trim();
+  const options = answerableOptions(o.options);
+  if (!asksAPersonForThisJob(key) || !label || options.length < 2) return null;
+  return { key, label: label.slice(0, 300), options: options.slice(0, 25), control: o.control === "choice" ? "choice" : "select" };
+}
+
+const labelWords = (s: unknown): string => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+/**
+ * DOES THIS TEXT NAME THAT PORTAL QUESTION? A triage note's title or field (the agent's words) against
+ * one question's own label (the portal's words): the label must appear in the text as whole words,
+ * with case, punctuation and quotes ignored. A question is ONE question.
+ *
+ * NEVER THE KEY'S RULE (skeptic, round 2). perJobRuleFor classifies a portal CONTROL'S label; a note's
+ * free text that merely mentions a lease, a third party, financing or ownership is not the ownership
+ * question. Matching notes by that rule closed "The city asks whether a third-party inspector will be
+ * used", "The utility asks for the signed lease agreement" and "proof of property ownership" the moment
+ * the ownership question was asked. A short label ("Ownership") is a word such notes use, so under
+ * three words only the whole text counts. A long label may end mid-word (a learn's fieldsSeen keeps 80
+ * characters of it), so from 40 characters on only its start must begin a word.
+ */
+export function textNamesPortalQuestion(text: unknown, label: unknown): boolean {
+  const t = labelWords(text);
+  const l = labelWords(label);
+  if (!t || !l) return false;
+  if (t === l) return true;
+  if (l.split(" ").length < 3) return false;
+  const padded = ` ${t} `;
+  return l.length >= 40 ? padded.includes(` ${l}`) : padded.includes(` ${l} `);
+}

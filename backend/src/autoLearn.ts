@@ -34,7 +34,7 @@ import { parseHasBattery } from "../../shared/src/batteryControls";
 import { learnPortal, browserLimiter } from "../../portal-bot/src/index";
 import { resolveHeadless } from "../../portal-bot/src/browser";
 import { compareReviewFields, utilityIdentifiersEnteredBySteps } from "../../portal-bot/src/reviewScreenScraper";
-import type { LearnPlanRequest, LearnPlanResponse } from "../../portal-bot/src/adapters/autoLearnAdapter";
+import type { LearnPlanRequest, LearnPlanResponse, PageExitReads, PageTrustEvidence } from "../../portal-bot/src/adapters/autoLearnAdapter";
 import { policyProfileFor } from "../../portal-bot/src/adapters/autoLearnAdapter";
 import { loginWasRefused } from "../../portal-bot/src/adapters/loginFlow";
 import { createLLMProvider, getRecentLlmCalls } from "./llm";
@@ -428,6 +428,23 @@ export interface TrustGateSignals {
   missingRequiredDocs: string[];
   /** The portal's own validation refused an advance. */
   validationBlocks: string[];
+  // #534 — WHAT EACH PAGE STILL SHOWED AS THE WALK LEFT IT, every page, not the last: the adapter's
+  // per-page trust evidence (#536) flattened by pageExitTrustSignals to "page N: …" lines.
+  /** A computed total the portal still called stale ("page 9: "Needs to be recalculated""). */
+  exitComputePending: string[];
+  /** A field-level validation error still showing ("page 9: Inverter Model: This field is
+   *  required."). A draft-saving portal lets the walk advance past one, so these are not
+   *  validationBlocks (which only ever means an advance was refused). */
+  exitValidationErrors: string[];
+  /** A REQUIRED checkbox left unchecked — not one the walk leaves for a person by design (an
+   *  acknowledgment, by the required sweep's own wording). */
+  exitRequiredUnchecked: string[];
+  /** An equipment write that reached a control it was not aimed at (put back and not recorded, or
+   *  refused before it was typed) — either way the control it WAS aimed at was not filled. */
+  exitStrayWrites: string[];
+  /** Which pages the exit reading read, and which it was due on and could not read. null = the
+   *  learn reported no reading at all — an unknown, never a clean bill. */
+  exitPagesRead: { read: number[]; unread: number[] } | null;
   /** Recorded literals that match this project's data under MORE THAN ONE field, so they
    *  cannot be safely auto-bound and would replay verbatim onto the next customer. */
   ambiguousLiteralCount: number;
@@ -475,6 +492,18 @@ export interface TrustGateSignals {
  *                             wizard, not a page.
  *  10. !formPurposeMismatch — and it must have been the RIGHT form. (Gilbert AZ scored 6 of 6
  *                             filling a Permit Extension Request perfectly.)
+ *  11. EVERY PAGE AS THE WALK LEFT IT, not the final one — no page left with a computed total
+ *                             still to be recalculated, a field validation error showing, a required
+ *                             checkbox unchecked (other than an acknowledgment left for a person by
+ *                             design) or an equipment write that reached another control; and every
+ *                             page the exit reading was due on was READ (an unread page, or a learn
+ *                             that reports no reading, is an unknown, never a clean page).
+ *                             (PacifiCorp NEM, 2026-11-02: trusted on "3 field(s) checked on the
+ *                             final page" while page 9 had been left with the inverter Model blank,
+ *                             "This field is required." under it and System Rating reading "Needs to
+ *                             be recalculated". The model reaches item 6 too: the adapter now counts
+ *                             an equipment value the portal did not keep as a required field left
+ *                             blank, on whatever page it happened.)
  *
  * Signal 3 is the one condition here that the pre-2026-09-10 gate computed and then ignored;
  * it is included deliberately, and it is the only change to the bar itself.
@@ -493,11 +522,40 @@ export function evaluateTrustGate(sig: TrustGateSignals): { trusted: boolean; bl
   if (sig.requiredFieldMisses.length) blockers.push(`required field(s) left blank: ${sig.requiredFieldMisses.slice(0, 12).join(", ")}`);
   if (sig.missingRequiredDocs.length) blockers.push(`required document(s) not attached: ${sig.missingRequiredDocs.slice(0, 8).join(", ")}`);
   if (sig.validationBlocks.length) blockers.push(`portal validation blocked an advance: ${sig.validationBlocks.slice(0, 8).join("; ")}`);
+  if (sig.exitComputePending.length) blockers.push(`page(s) left with a computed total still to be recalculated: ${sig.exitComputePending.slice(0, 6).join("; ")}`);
+  if (sig.exitValidationErrors.length) blockers.push(`page(s) left showing a field validation error: ${sig.exitValidationErrors.slice(0, 8).join("; ")}`);
+  if (sig.exitRequiredUnchecked.length) blockers.push(`required checkbox(es) left unchecked: ${sig.exitRequiredUnchecked.slice(0, 8).join("; ")}`);
+  if (sig.exitStrayWrites.length) blockers.push(`equipment write(s) reached another control: ${sig.exitStrayWrites.slice(0, 6).join("; ")}`);
+  if (!sig.exitPagesRead) blockers.push("the learn did not report reading its pages as it left them");
+  else if (sig.exitPagesRead.unread.length) blockers.push(`page(s) that could not be read as the walk left them: ${sig.exitPagesRead.unread.slice(0, 12).join(", ")}`);
+  else if (!sig.exitPagesRead.read.length) blockers.push("no page was read as the walk left it");
   if (sig.ambiguousLiteralCount > 0) blockers.push(`${sig.ambiguousLiteralCount} recorded literal(s) could not be uniquely bound to a project field`);
   if (sig.deadBindings.length) blockers.push(`step(s) bound to a field the resolver cannot produce: ${sig.deadBindings.slice(0, 8).join(", ")}`);
   if (sig.pageCount < 3 || sig.substantiveFills < 5) blockers.push(`too thin to auto-trust (${sig.pageCount} page(s), ${sig.substantiveFills} recorded fill(s))`);
   if (sig.formPurposeMismatch) blockers.push("the form this run filled is not the form this track files");
   return { trusted: blockers.length === 0, blockers };
+}
+
+/**
+ * THE PAGES AS THE WALK LEFT THEM, AS THE GATE READS THEM (#534). The adapter records one
+ * PageTrustEvidence per page that ended with something (#536) and which pages it read at all
+ * (pageExitReads); this flattens them into evaluateTrustGate's item 11 signals, every line naming
+ * its page. A requiredUnchecked box counts unless it is marked `acknowledgment` — an unmarked one is
+ * a required box left blank. A learn that reports no pageExitReads gives `exitPagesRead: null`, an
+ * unknown the gate refuses. Pure, exported for the unit test.
+ */
+export function pageExitTrustSignals(learn: { trustEvidence?: PageTrustEvidence[]; pageExitReads?: PageExitReads }): Pick<TrustGateSignals,
+  "exitComputePending" | "exitValidationErrors" | "exitRequiredUnchecked" | "exitStrayWrites" | "exitPagesRead"> {
+  const ev = Array.isArray(learn.trustEvidence) ? learn.trustEvidence : [];
+  const at = (e: PageTrustEvidence, line: string): string => `page ${e.page}: ${line}`;
+  const reads = learn.pageExitReads;
+  return {
+    exitComputePending: ev.filter((e) => String(e.computePending ?? "").trim()).map((e) => at(e, String(e.computePending))),
+    exitValidationErrors: ev.flatMap((e) => (e.validationErrors ?? []).map((v) => at(e, v))),
+    exitRequiredUnchecked: ev.flatMap((e) => (e.requiredUnchecked ?? []).filter((u) => u.acknowledgment !== true).map((u) => at(e, u.label))),
+    exitStrayWrites: ev.flatMap((e) => (e.strayWrites ?? []).map((w) => at(e, w))),
+    exitPagesRead: reads && Array.isArray(reads.read) && Array.isArray(reads.unread) ? { read: [...reads.read], unread: [...reads.unread] } : null,
+  };
 }
 
 /**
@@ -520,7 +578,13 @@ export function evaluateTrustGate(sig: TrustGateSignals): { trusted: boolean; bl
  *     10 pages. The words now say how many fields were checked, of how many, on how many pages.
  * The note keeps its leading "Auto-learned and verified (<confidence> confidence) on N page(s)."
  * EXACTLY — it is a matching key (scripts/rekey-recipe.ts notesSayVerified and its tests).
- * Pure, exported for the unit test.
+ *
+ * NEVER "TRUSTED" BESIDE "THE EARLIER PAGES WERE NOT RE-READ" (#534). The message used to say both
+ * in one breath, and the PacifiCorp learn that said it had left page 9 incomplete. Trust now
+ * requires that every page the exit reading was due on was READ and clean (evaluateTrustGate items 6
+ * and 11), so the words say what was read — WITH ITS DENOMINATOR, how many pages of how many walked
+ * (a page with no form field, or one the walk ended on at a signature hand-off, is not read) — and
+ * what the verifier compared on the last one. Pure, exported for the unit test.
  */
 export function trustedLearnWording(input: {
   confidence: string;
@@ -530,14 +594,19 @@ export function trustedLearnWording(input: {
   /** Recorded fill / select / check steps across the whole walk. */
   recordedFills: number;
   pageCount: number;
+  /** Pages the exit reading read (pageExitReads.read.length). */
+  pagesRead: number;
   scopeType: "ahj" | "utility";
   bindingNote: string;
 }): { note: string; message: string; done: string } {
   const checked = `${input.fieldsChecked} field(s) checked on the final page (${input.fieldsMatched} matched) of ${input.recordedFills} recorded fill(s) across ${input.pageCount} page(s)`;
+  // What the readings FOUND, not a promise about the portal: secret boxes left blank for a person
+  // are excluded by design (they bind by name) and are listed in the run's own message.
+  const read = `the walk read ${input.pagesRead} of the ${input.pageCount} page(s) as it left them and found none with a computed total still to be recalculated, a field validation error, a required box unchecked or an equipment value not kept, and its required-field sweep found no required field left blank`;
   return {
-    note: `Auto-learned and verified (${input.confidence} confidence) on ${input.pageCount} page(s).${input.bindingNote} The verifier read the final page only: ${checked}. ${FINAL_SUBMIT_GATE_SENTENCE}`,
-    message: `Portal learned: ${checked} (verifier confidence: ${input.confidence}) — the earlier pages were not re-read, so review them before submitting. The recipe is trusted and will replay on future ${input.scopeType === "utility" ? "utility" : "AHJ"} projects. ${FINAL_SUBMIT_GATE_SENTENCE}`,
-    done: `Learning complete — recipe trusted (${input.fieldsChecked} field(s) checked on the final page of ${input.pageCount}).`,
+    note: `Auto-learned and verified (${input.confidence} confidence) on ${input.pageCount} page(s).${input.bindingNote} ${read.charAt(0).toUpperCase()}${read.slice(1)}; the verifier compared values on the final page: ${checked}. ${FINAL_SUBMIT_GATE_SENTENCE}`,
+    message: `Portal learned: ${read}; the verifier compared values on the final page: ${checked} (verifier confidence: ${input.confidence}). The recipe is trusted and will replay on future ${input.scopeType === "utility" ? "utility" : "AHJ"} projects. ${FINAL_SUBMIT_GATE_SENTENCE}`,
+    done: `Learning complete — recipe trusted (${input.pagesRead} of ${input.pageCount} page(s) read on exit; ${input.fieldsChecked} field(s) compared on the final page).`,
   };
 }
 
@@ -1223,8 +1292,10 @@ async function autoLearnPortalInner(
     /** Round 5: why a reservation held the request (the run message names an expired verification). */
     reserveRefused: [] as string[],
   };
-  type InfoPageAttemptInput = { passes: ReturnType<typeof liveInfoPagePasses>; priorProgress: boolean };
-  const noInfoPagePass: InfoPageAttemptInput = { passes: [], priorProgress: true };
+  type InfoPageAttemptInput = { passes: ReturnType<typeof liveInfoPagePasses>; priorProgress: boolean; unavailable: boolean };
+  // The fail-closed stand-in (no project row, a read that threw, a retry after an admission): no pass
+  // AND no card (#366: "unavailable" is not a reading of this project's history).
+  const noInfoPagePass: InfoPageAttemptInput = { passes: [], priorProgress: true, unavailable: true };
   const armInfoPageAttempt = (attempt: number): InfoPageAttemptInput => {
     infoPageCall.attempt = [];
     infoPageCall.attemptStartId = "";
@@ -1233,9 +1304,9 @@ async function autoLearnPortalInner(
     try {
       input = infoPageCall.admitted.length
         ? noInfoPagePass
-        : { passes: liveInfoPagePasses(db), priorProgress: infoPagePriorProgress(db, projectId, portalUrl, scopeType) };
+        : { passes: liveInfoPagePasses(db), priorProgress: infoPagePriorProgress(db, projectId, portalUrl, scopeType), unavailable: false };
     } catch { input = noInfoPagePass; }
-    try { infoPageCall.attemptStartId = recordInfoPageLearnStart(db, projectId, scopeType, attempt); }
+    try { infoPageCall.attemptStartId = recordInfoPageLearnStart(db, projectId, scopeType, attempt, portalUrl); }
     catch { return noInfoPagePass; }
     return input;
   };
@@ -1547,6 +1618,7 @@ async function autoLearnPortalInner(
       // every admission reported at once.
       infoPagePasses: infoPageInput.passes,
       infoPagePriorProgress: infoPageInput.priorProgress,
+      infoPagePassUnavailable: infoPageInput.unavailable,
       // Round 5: the backstop reserves each use at the admission itself (limits checked there).
       reserveInfoPagePass,
       onInfoPagePassed,
@@ -2122,11 +2194,21 @@ async function autoLearnPortalInner(
   const requiredMisses = learn.requiredFieldMisses ?? [];
   // SELF-TEACHING: record the words of every required question this run couldn't answer.
   // Terms that recur across runs become active digest topics, so future runs surface the
-  // matching plan-set/notes lines to the planner and can answer the question.
-  try { learnNoteTopicsFromMisses(db, requiredMisses); } catch { /* best-effort */ }
+  // matching plan-set/notes lines to the planner and can answer the question. An equipment value
+  // the portal did not keep (#534) is a required miss but not a QUESTION — its value is the
+  // project's own equipment, filled deterministically — so its words ("inverter", "model") never
+  // become digest topics.
+  const equipmentNotHeld = learn.equipmentNotHeld ?? [];
+  try { learnNoteTopicsFromMisses(db, requiredMisses.filter((m) => !equipmentNotHeld.includes(m))); } catch { /* best-effort */ }
   const docMisses = learn.missingRequiredDocs ?? [];
   const validationBlocks = learn.validationBlocks ?? [];
-  const hasHardBlockers = requiredMisses.length > 0 || docMisses.length > 0 || validationBlocks.length > 0;
+  // #534 — what each page still showed as the walk LEFT it, on any page, and which pages were read.
+  const exit = pageExitTrustSignals(learn);
+  const exitUnread = !exit.exitPagesRead ? null : exit.exitPagesRead.unread;
+  const hasHardBlockers = requiredMisses.length > 0 || docMisses.length > 0 || validationBlocks.length > 0
+    || exit.exitComputePending.length > 0 || exit.exitValidationErrors.length > 0
+    || exit.exitRequiredUnchecked.length > 0 || exit.exitStrayWrites.length > 0
+    || exitUnread === null || exitUnread.length > 0 || !exit.exitPagesRead?.read.length;
 
   // POST-LEARN BINDING PASS. The auto-learned recipe is the ONLY home for portal specifics, so a
   // fill recorded as a frozen LITERAL that equals THIS project's data would replay verbatim onto
@@ -2226,6 +2308,7 @@ async function autoLearnPortalInner(
     requiredFieldMisses: requiredMisses,
     missingRequiredDocs: docMisses,
     validationBlocks,
+    ...exit,
     ambiguousLiteralCount: ambiguousLiterals.length,
     deadBindings,
     pageCount: learn.pageCount ?? 0,
@@ -2237,6 +2320,13 @@ async function autoLearnPortalInner(
     if (requiredMisses.length) verification.issues.push(`Required field(s) left blank/unselected — fill before trusting: ${requiredMisses.slice(0, 12).join(", ")}${requiredMisses.length > 12 ? ", …" : ""}.`);
     if (docMisses.length) verification.issues.push(`Required document(s) not attached: ${docMisses.slice(0, 8).join(", ")}.`);
     if (validationBlocks.length) verification.issues.push(`Portal validation blocked an advance: ${validationBlocks.slice(0, 8).join("; ")}.`);
+    if (exit.exitComputePending.length) verification.issues.push(`Page(s) left with a computed total still to be recalculated — open each, recalculate and save before trusting: ${exit.exitComputePending.slice(0, 6).join("; ")}.`);
+    if (exit.exitValidationErrors.length) verification.issues.push(`Page(s) left showing a field validation error — fix before trusting: ${exit.exitValidationErrors.slice(0, 8).join("; ")}.`);
+    if (exit.exitRequiredUnchecked.length) verification.issues.push(`Required checkbox(es) left unchecked — check before trusting: ${exit.exitRequiredUnchecked.slice(0, 8).join("; ")}.`);
+    if (exit.exitStrayWrites.length) verification.issues.push(`Equipment write(s) reached another control — check both controls before trusting: ${exit.exitStrayWrites.slice(0, 6).join("; ")}.`);
+    if (exitUnread === null) verification.issues.push("The learn did not report reading its pages as it left them, so no page can be called complete — review every page before trusting.");
+    else if (exitUnread.length) verification.issues.push(`Page(s) ${exitUnread.slice(0, 12).join(", ")} could not be read as the walk left them — review each before trusting.`);
+    else if (!exit.exitPagesRead?.read.length) verification.issues.push("No page was read as the walk left it — review every page before trusting.");
   }
 
   // While a verified-complete recipe is being protected, the stub (which RESETS that row) is
@@ -2355,6 +2445,7 @@ async function autoLearnPortalInner(
     fieldsMatched: verification.matches.filter((m) => m.ok).length,
     recordedFills: substantiveSteps,
     pageCount: learn.pageCount ?? 0,
+    pagesRead: exit.exitPagesRead?.read.length ?? 0,
     scopeType,
     bindingNote,
   });

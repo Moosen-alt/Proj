@@ -14,7 +14,7 @@
 //   K1 applyLookupFees: never pass citedStateSurcharge                  → (s1), (q1) fail.
 //   K2 citedStateSurcharge: accept a percentage from the basis/lines    → (s2) fails.
 //   K3 citedStateSurcharge: drop the state-maximum / consistency checks → (s3) fails.
-//   K4 buildPaymentQuote: no stateSurchargeNotice                       → (q1) fails.
+//   K4 buildPaymentQuote: do not add the modeled surcharge (#421)       → (q1) fails.
 //   K5 feeBracketFields.evaluatorAgrees: compare the surcharged line total → (b1) fails.
 //
 // Run: npx tsx backend/test/lookupStateSurcharge.test.ts
@@ -100,10 +100,20 @@ await check("(b1) MUST-PASS: a surcharged tier still computes this project's fee
 
 const quote = quotes.buildPaymentQuote(db, projectRow, "permit");
 
-await check("(q1) MUST-PASS: the quote prices the stated surcharge and SAYS which permit's surcharge is not included", () => {
-  assert.equal(quote.permitFeeUsd, 172.53, `permit fee ${quote.permitFeeUsd} — ${quote.permitFeeBasis}`);
-  assert.match(quote.permitFeeBasis, /PLUS the state surcharge on the Brightwater County structural permit \(up to 12% of the permit fee/i, quote.permitFeeBasis);
-  assert.match(quote.permitFeeBasis, /NOT included in this amount/);
+// #421: the structural line's surcharge — the one nobody's source prints — used to be a notice
+// ("PLUS the state surcharge … NOT included", $172.53). The quote now ADDS it from the state rule
+// (feeSchedules.stateSurchargeFor "modeled"), itemised: $172.53 + 12% of $67.25 ($8.07) = $180.60,
+// which is the Jefferson job's real total in this file's header.
+await check("(q1) MUST-PASS: the quote prices the stated surcharge AND adds the one no source prints, itemised, from the state rule ($180.60)", () => {
+  assert.equal(quote.permitFeeUsd, 180.6, `permit fee ${quote.permitFeeUsd} — ${quote.permitFeeBasis}`);
+  assert.match(quote.permitFeeBasis, /INCLUDES \$8\.07 of state surcharge the schedule does not print — 12% of \$67\.25 = \$8\.07 \(ORS 455\.210/, quote.permitFeeBasis);
+  assert.doesNotMatch(quote.permitFeeBasis, /NOT included in this amount/, "the surcharge it adds is not also announced as missing");
+  const added = quote.permitFeeCharges.filter((c) => c.kind === "state_surcharge" && !c.partOfLineFee);
+  assert.deepEqual(added.map((c) => [c.amountUsd, /Brightwater County building\/structural permit fee/.test(c.label)]), [[8.07, true]], JSON.stringify(added));
+  // The schedule's own line is untouched: what a Confirm and the PDF read stays the schedule's.
+  const structural = fees.feeForProject(db, projectRow, "permit")!.lines.find((l) => l.discipline === "structural")!;
+  assert.equal(structural.feeUsd, 67.25);
+  assert.equal(structural.modeledStateSurcharge?.percent, 12);
 });
 await check("(q2) MUST-EXCLUDE: a permit whose surcharge IS priced is not named as missing; outside a surcharge state nothing is added", () => {
   assert.ok(!/surcharge on the [^.]*electrical/i.test(quote.permitFeeBasis), quote.permitFeeBasis);
