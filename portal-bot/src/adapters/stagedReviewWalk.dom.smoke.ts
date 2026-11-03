@@ -23,14 +23,15 @@
 //              alert() on a step page (noted by the CDP watch, never answered by product code).
 //   MUST-EXCL  actionTabs: a step list of real step names that carry an action word ("Interconnection
 //              Request", "Battery Back-up", "New Construction Details", "Print Copy of Agreement") and
-//              a GET "Delete Draft" link inside it: each NAMED as a step the walk will not open, none
-//              requested, the row unapprovable. (The review page's own "Review and Submit" tab, in
+//              a GET "Delete Draft" link inside it, a nameless icon tab and a link that does not
+//              parse: each NAMED as a step the walk will not open, none requested, the row unapprovable. (The review page's own "Review and Submit" tab, in
 //              every list, is the page being read: never named, and the clean draft stays approvable.)
 //
 // Kill: openPlaywrightDigestNavigator's route → route.fallback() for every method → "onLoadPost" sees
 // a POST at the server. stepLinksInPage: drop the ACTS / ACT_PATH exclusion → Delete Draft is requested.
 // stepLinksInPage: `continue` past an action-named link again (the pre-fix drop) → "actionTabs" reads
-// approvable with none of the four named. The CDP dialog watch: never note
+// approvable with none of the four named. stepLinksInPage: `continue` past a nameless link and an
+// unparseable one again → the two "named" checks for them fail. The CDP dialog watch: never note
 // Page.javascriptDialogOpening → "nativeDialog" reads approvable.
 //
 //   npx tsx portal-bot/src/adapters/stagedReviewWalk.dom.smoke.ts
@@ -69,6 +70,8 @@ const ACTION_TABS: Array<[string, string]> = [
 const nav = (pid: number, mode: string): string => {
   const tabs = mode === "actionTabs"
     ? `<li><a href="/MvcProjects/EditForm?ProjectId=${pid}&FormId=1">Customer Information</a></li>${ACTION_TABS.map(([label, q]) => `<li><a href="/MvcProjects/EditForm?ProjectId=${pid}&${q}">${label}</a></li>`).join("")}<li><a href="/MvcProjects/DeleteProject?ProjectId=${pid}">Delete Draft</a></li>`
+      // A nameless step link (an icon tab) and one whose link does not parse: named, never opened.
+      + `<li><a href="/MvcProjects/EditForm?ProjectId=${pid}&FormId=6" style="display:inline-block;width:14px;height:14px;background:#888"></a></li><li><a href="http://[bad">Utility Review</a></li>`
     : STEPS.map(([n, label]) => {
       const href = mode === "scriptTab" && n === 2 ? "javascript:__doPostBack('step2','')" : `/MvcProjects/EditForm?ProjectId=${pid}&FormId=${n}`;
       return `<li><a href="${href}">${label}</a></li>`;
@@ -235,9 +238,13 @@ try {
         check(`actionTabs: "${label}" is named as a step the walk will not open`,
           c.why.some((w) => w.includes(`step "${label}" cannot be opened by navigation alone (its name or its link reads as an action`)), JSON.stringify(c.why));
       }
+      check("actionTabs: a nameless step link is named, never opened",
+        c.why.some((w) => w.includes('step "(unnamed step)" cannot be opened by navigation alone (it has no name, so the walk never opens it)')), JSON.stringify(c.why));
+      check("actionTabs: a step link that does not parse is named",
+        c.why.some((w) => w.includes('step "Utility Review" cannot be opened by navigation alone (its link does not parse)')), JSON.stringify(c.why));
       check("actionTabs: the one plain step is still read (review, Customer Information)",
         JSON.stringify(c.sections.filter((s) => !s.unreadable).map((s) => s.step)) === JSON.stringify(["review", "Customer Information"]), JSON.stringify(c.sections.map((s) => [s.step, s.unreadable])));
-      check("actionTabs: none of them was requested (FormId=2..5, DeleteProject)", hit(from, /ProjectId=4424&FormId=[2-5]|DeleteProject/).length === 0, JSON.stringify(hit(from, /ProjectId=4424&FormId=[2-5]|DeleteProject/)));
+      check("actionTabs: none of them was requested (FormId=2..6, DeleteProject)", hit(from, /ProjectId=4424&FormId=[2-6]|DeleteProject/).length === 0, JSON.stringify(hit(from, /ProjectId=4424&FormId=[2-6]|DeleteProject/)));
       check("actionTabs: 0 non-GET at the server", nonGet(from).length === 0, JSON.stringify(nonGet(from)));
       check("actionTabs: the review page's own tab is the page read, not a step to name", !c.why.some((w) => /Review and Submit/.test(w)), JSON.stringify(c.why));
     }
