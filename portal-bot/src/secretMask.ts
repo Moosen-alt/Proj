@@ -20,6 +20,13 @@
 // fix round 3: an <option> or <optgroup> OUTSIDE a <select> is content again — main's learner tagged
 // it, round 1's skip-by-name left it in clear — and the staged picture refuses one that paints a
 // secret, since neither its text node nor its own box says where Chromium draws its text.
+//
+// #436 ROUND 4 — A SUPERSET BY CONSTRUCTION, NOT BY CASES. Three rounds in a row found a page the
+// rewritten tagger left in clear where origin/main's learner masked it. So origin/main's tagger body
+// runs FIRST, verbatim (mainLearnerTagger below; secretMaskMainTagger.test.ts pins it by hash), and
+// the rewritten tagger runs after it: both write SECRET_MASK_ATTR, the mask selects both, and
+// clearSecretTags clears both (tagSecretsForMask — the one entry for the learner's withSecretMask and
+// the staged picture alike). And a <select> whose FULL text carries a secret is tagged whole.
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import type { CDPSession, ElementHandle, Frame, Locator, Page } from "playwright";
@@ -45,6 +52,97 @@ export function secretMaskPatterns(secrets: readonly string[]): SecretMaskPatter
   }).filter((p) => p.digits || p.literal.length >= 4);
 }
 
+/** ORIGIN/MAIN'S LEARNER TAGGER, VERBATIM (#436 round 4). The 50 body lines between this declaration
+ *  and its closing `};` are origin/main's withSecretMask inline tagger (autoLearnAdapter.ts, the
+ *  arrow passed to page.evaluate; origin/main ffee9493 lines 9935-9984, the same bytes at the branch
+ *  point d07388da), indentation and all. Only the declaration line differs. DO NOT EDIT THE BODY:
+ *  secretMaskMainTagger.test.ts hashes it, and a change fails that test. A fix goes in
+ *  tagSecretsInPage, which runs after this one; this one exists so that whatever the rewritten tagger
+ *  misses, the learner masks at least what main masked. Recompute the pinned hash with
+ *    git show ffee9493:portal-bot/src/adapters/autoLearnAdapter.ts | sed -n 9935,9984p | sha256sum */
+const mainLearnerTagger = (ps: Array<{ digits: string; literal: string }>): number => {
+        let n = 0;
+        // A box holding one (typed here, or pre-filled by the portal).
+        for (const el of Array.from(document.querySelectorAll("input, textarea"))) {
+          const v = String((el as HTMLInputElement).value || "");
+          if (!v) continue;
+          const vd = v.replace(/\D/g, "");
+          const vl = v.toLowerCase();
+          for (const p of ps) {
+            if ((p.digits && vd.indexOf(p.digits) >= 0) || (p.literal && vl.indexOf(p.literal) >= 0)) { el.setAttribute("data-al-secret", "1"); n++; break; }
+          }
+        }
+        // Text rendering one (a review page's "Account: 7734009155"). Most pages carry none, so
+        // the whole-body check keeps the element walk off the common path.
+        const bt = String(document.body ? document.body.textContent || "" : "");
+        const btd = bt.replace(/\D/g, "");
+        const btl = bt.toLowerCase();
+        let textHas = false;
+        for (const p of ps) {
+          if ((p.digits && btd.indexOf(p.digits) >= 0) || (p.literal && btl.indexOf(p.literal) >= 0)) { textHas = true; break; }
+        }
+        if (!textHas) return n;
+        for (const el of Array.from(document.querySelectorAll("body *"))) {
+          const tag = el.tagName;
+          if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT" || tag === "INPUT" || tag === "TEXTAREA") continue;
+          const text = String(el.textContent || "");
+          if (!text) continue;
+          const td = text.replace(/\D/g, "");
+          const tl = text.toLowerCase();
+          let hit = false;
+          for (const p of ps) {
+            if ((p.digits && td.indexOf(p.digits) >= 0) || (p.literal && tl.indexOf(p.literal) >= 0)) { hit = true; break; }
+          }
+          if (!hit) continue;
+          // The SMALLEST element carrying the whole secret: skip an ancestor when a child element
+          // carries it too (masking <body> would blank the whole picture).
+          let childCarries = false;
+          for (const c of Array.from(el.children)) {
+            const ct = String(c.textContent || "");
+            const cd = ct.replace(/\D/g, "");
+            const cl = ct.toLowerCase();
+            for (const p of ps) {
+              if ((p.digits && cd.indexOf(p.digits) >= 0) || (p.literal && cl.indexOf(p.literal) >= 0)) { childCarries = true; break; }
+            }
+            if (childCarries) break;
+          }
+          if (childCarries) continue;
+          el.setAttribute("data-al-secret", "1");
+          n++;
+        }
+        return n;
+};
+
+/** Run origin/main's learner tagger (mainLearnerTagger) on `page` (one frame). Returns how many it
+ *  tagged; throws when the page cannot be evaluated. */
+export async function tagSecretsLikeMain(page: Pick<Page, "evaluate">, pats: SecretMaskPattern[]): Promise<number> {
+  return Number(await page.evaluate(mainLearnerTagger, pats));
+}
+
+/** THE ONE ENTRY TO TAG A PAGE FOR THE MASK (#436 round 4), used by the learner's withSecretMask and by
+ *  maskedFullPageScreenshot: origin/main's learner tagger FIRST, then tagSecretsInPage. Both write
+ *  SECRET_MASK_ATTR, so the mask (`[data-al-secret]`) covers the UNION — a superset of main's by
+ *  construction — and clearSecretTags clears both. Each pass is caught on its own: one that throws
+ *  keeps the other's tags, and `ok` is false (the caller decides whether that fails closed).
+ *  `tagged`: the mask's locator is needed — a pass tagged something, or one threw (it may have tagged
+ *  before it threw; a locator that matches nothing masks nothing). Never throws. */
+export async function tagSecretsForMask(page: Pick<Page, "evaluate">, pats: SecretMaskPattern[]): Promise<{ main: number; shared: number; ok: boolean; tagged: boolean }> {
+  let main = 0;
+  let shared = 0;
+  let ok = true;
+  try {
+    main = await tagSecretsLikeMain(page, pats);
+  } catch {
+    ok = false;
+  }
+  try {
+    shared = await tagSecretsInPage(page, pats);
+  } catch {
+    ok = false;
+  }
+  return { main, shared, ok, tagged: !ok || main > 0 || shared > 0 };
+}
+
 /** Tag every element of `page` (ONE frame: a Page reads its main frame, a Frame itself) that renders
  *  one of `pats` — inside every OPEN shadow root too (#436 skeptic: a secret in a web component's
  *  shadow tree went unmasked; a declarative one exists even with scripts off, and Playwright's CSS
@@ -55,8 +153,10 @@ export function secretMaskPatterns(secrets: readonly string[]): SecretMaskPatter
  *  tagged by its placeholder too, an image (or image button) by its alt, and a <noscript> is content.
  *  #436 fix round 3: an <option> or <optgroup> is skipped only INSIDE a <select>; outside one it is
  *  content, read by its text and its label attribute (main's learner tagged a stray <option>; the
- *  name skip everywhere tagged nothing, ancestors included).
- *  Every change here tags MORE, never less: the learner's withSecretMask shares this tagger. Returns
+ *  name skip everywhere tagged nothing, ancestors included). #436 round 4: a <select> is tagged by its
+ *  FULL text (its textContent, an optgroup's own text, its options run together), not option by option.
+ *  Every change here tags MORE, never less: the learner's withSecretMask shares this tagger — and runs
+ *  origin/main's own tagger before it (tagSecretsForMask), so a miss here is not a miss there. Returns
  *  how many were tagged. Throws when the page cannot be evaluated (the caller decides whether that
  *  fails closed). */
 export async function tagSecretsInPage(page: Pick<Page, "evaluate">, pats: SecretMaskPattern[]): Promise<number> {
@@ -90,10 +190,31 @@ export async function tagSecretsInPage(page: Pick<Page, "evaluate">, pats: Secre
       }
       if (hit) { el.setAttribute("data-al-secret", "1"); n++; }
     }
-    // A <select> one of whose options (or option groups) carries one: the SELECT is what is painted.
+    // A <select> whose FULL text carries one is tagged WHOLE: the SELECT is what is painted, and its
+    // own box is what the mask draws — a collapsed one's chosen option, a listbox's every row. #436
+    // round 4: a secret split across two options, or written straight into an <optgroup> (its own
+    // text node), was carried by no single option, so the per-option rule tagged nothing (main's
+    // learner tagged the <optgroup>). Read, each on its own: the select's textContent; its text nodes
+    // and every option/optgroup label attribute in tree order; every option's text and label, one by
+    // one and run together; every optgroup's label. (The texts below are the coverage check's
+    // selectTexts — keep the two the same.)
     for (const sel of Array.from(root.querySelectorAll("select"))) {
-      const texts: string[] = [];
-      for (const o of Array.from((sel as HTMLSelectElement).options)) { texts.push(String(o.text || "")); texts.push(String(o.label || "")); }
+      const texts: string[] = [String(sel.textContent || "")];
+      let ordered = "";
+      const tw = document.createTreeWalker(sel, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+      for (let x = tw.nextNode(); x; x = tw.nextNode()) {
+        if (x.nodeType === 3) ordered += String(x.textContent || "");
+        else if ((x as Element).tagName === "OPTION" || (x as Element).tagName === "OPTGROUP") ordered += String((x as Element).getAttribute("label") || "");
+      }
+      texts.push(ordered);
+      let optTexts = "";
+      let optLabels = "";
+      for (const o of Array.from((sel as HTMLSelectElement).options)) {
+        texts.push(String(o.text || ""), String(o.label || ""));
+        optTexts += String(o.text || "");
+        optLabels += String(o.label || "");
+      }
+      texts.push(optTexts, optLabels);
       for (const g of Array.from(sel.querySelectorAll("optgroup"))) texts.push(String(g.getAttribute("label") || ""));
       let hit = false;
       for (const t of texts) {
@@ -279,6 +400,31 @@ export async function secretMaskCoverageInPage(frame: Pick<Frame, "evaluate">, p
       for (let e: Element | null = el; e; e = up(e)) if (getComputedStyle(e).display === "none") return false;
       return getComputedStyle(el).display === "contents" || el.getClientRects().length > 0;
     };
+    /** Everything a <select> may paint, read as the tagger reads it (#436 round 4; tagSecretsInPage's
+     *  select pass — keep the two the same): its textContent, its text nodes and option/optgroup labels
+     *  in tree order, every option's text and label one by one and run together, every optgroup label. */
+    const selectTexts = (sel: Element): string[] => {
+      const texts: string[] = [String(sel.textContent || "")];
+      let ordered = "";
+      const tw = document.createTreeWalker(sel, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
+      for (let x = tw.nextNode(); x; x = tw.nextNode()) {
+        if (x.nodeType === 3) ordered += String(x.textContent || "");
+        else if ((x as Element).tagName === "OPTION" || (x as Element).tagName === "OPTGROUP") ordered += String((x as Element).getAttribute("label") || "");
+      }
+      texts.push(ordered);
+      let optTexts = "";
+      let optLabels = "";
+      for (const o of Array.from((sel as HTMLSelectElement).options || [])) {
+        texts.push(String(o.text || ""), String(o.label || ""));
+        optTexts += String(o.text || "");
+        optLabels += String(o.label || "");
+      }
+      texts.push(optTexts, optLabels);
+      for (const g of Array.from(sel.querySelectorAll("optgroup"))) texts.push(String(g.getAttribute("label") || ""));
+      return texts;
+    };
+    /** Whether an element has a box with area (a select that paints). */
+    const boxed = (el: Element): boolean => Array.from(el.getClientRects()).some((r) => area(r) > 0);
     /** The stray <option>/<optgroup> an element sits in (itself included), or null. */
     const strayOf = (el: Element | null): Element | null => {
       const o = el ? el.closest("option, optgroup") : null;
@@ -302,6 +448,9 @@ export async function secretMaskCoverageInPage(frame: Pick<Frame, "evaluate">, p
           continue;
         }
         if (n.nodeType === 1 && !stray && strayPaints(n as Element) && `${String(n.textContent || "")}${String((n as Element).getAttribute("label") || "")}`.trim()) stray = true;
+        // A <select> or <textarea> inside paints its options / value in its own box, with no text
+        // rects to read (#436 round 4): that box is part of what the element paints.
+        if (n !== el && n.nodeType === 1 && /^(SELECT|TEXTAREA)$/.test((n as Element).tagName)) for (const r of Array.from((n as Element).getClientRects())) if (area(r) > 0) out.push(r);
         const sr = n.nodeType === 1 ? (n as HTMLElement).shadowRoot : null;
         if (sr) for (const c of Array.from(sr.childNodes)) stack.push(c);
         for (const c of Array.from(n.childNodes)) stack.push(c);
@@ -338,7 +487,9 @@ export async function secretMaskCoverageInPage(frame: Pick<Frame, "evaluate">, p
       for (const el of Array.from(root.querySelectorAll("input, textarea, select, img"))) {
         if (el.hasAttribute(a.attr) || !Array.from(el.getClientRects()).some((r) => area(r) > 0)) continue;
         const texts = el.tagName === "IMG" ? [String(el.getAttribute("alt") || "")] : [String((el as HTMLInputElement).value || ""), String(el.getAttribute("placeholder") || ""), String(el.getAttribute("alt") || "")];
-        if (el.tagName === "SELECT") for (const o of Array.from((el as HTMLSelectElement).options)) texts.push(String(o.text || ""), String(o.label || ""));
+        // A select is read WHOLE, as the tagger reads it (#436 round 4: options run together, an
+        // optgroup's own text).
+        if (el.tagName === "SELECT") texts.push(...selectTexts(el));
         if (texts.some((t) => t && carries(t))) uncovered.push(`${name(el)} shows a known secret and is not tagged for the mask`);
       }
     }
@@ -374,7 +525,11 @@ export async function secretMaskCoverageInPage(frame: Pick<Frame, "evaluate">, p
     // that paints nothing is left out of the run, not a break in it: the picture shows its neighbours
     // side by side). A stray <option>/<optgroup> that paints (strayPaints) paints its text with no
     // rects on the text node, and its label with no text node at all: both join the run (#436 fix
-    // round 3 — `<p><option>8814</option></p><p>402937</p>` was kept with the number in clear).
+    // round 3 — `<p><option>8814</option></p><p>402937</p>` was kept with the number in clear). A
+    // <select> is read WHOLE where the walk meets it (#436 round 4 — its text was dropped here
+    // whether or not it was tagged): tagged (or under a tagged element), it is a covered break; not
+    // tagged and painting, everything it may paint (selectTexts) joins the run — the control check
+    // above has already refused it if that alone carries one; painting nothing, it adds nothing.
     for (const root of roots) {
       const start: Node | null = root === document ? document.documentElement : root;
       if (!start) continue;
@@ -385,12 +540,19 @@ export async function secretMaskCoverageInPage(frame: Pick<Frame, "evaluate">, p
         let from: Element | null;
         if (n.nodeType === 1) {
           const el = n as Element;
-          if (!el.hasAttribute("label") || !strayPaints(el)) continue;
-          t = String(el.getAttribute("label") || "");
-          from = el;
+          if (el.tagName === "SELECT") {
+            if (!boxed(el)) continue;
+            t = selectTexts(el)[1]; // its tree-order reading: text nodes and labels as they stand
+            from = el;
+          } else {
+            if (!el.hasAttribute("label") || !strayPaints(el)) continue;
+            t = String(el.getAttribute("label") || "");
+            from = el;
+          }
         } else {
           const pe = (n as Text).parentElement;
-          // What a text area or select paints is its value / options, asked by the control check above.
+          // What a text area paints is its value, asked by the control check above; a select's text
+          // was read where the walk met the select.
           if (pe && pe.closest("textarea, select")) continue;
           t = String(n.textContent || "");
           const so = strayOf(pe);
@@ -517,7 +679,7 @@ export async function maskedFullPageScreenshot(page: Page, secrets: readonly str
       // A frame the picture does not show cannot leak; one it shows must be masked, or no picture.
       const clip = main ? undefined : await frameClip(frame);
       const shown = main || clip !== null;
-      let tagged = 0;
+      let tagged = false;
       let docMarked = false;
       let cov: { painted: number; uncovered: string[] };
       try {
@@ -529,7 +691,11 @@ export async function maskedFullPageScreenshot(page: Page, secrets: readonly str
           de.setAttribute(x.attr, x.nonce);
           return de.getAttribute(x.attr) === x.nonce;
         }, { attr: SECRET_MASK_DOC_ATTR, nonce });
-        tagged = await tagSecretsInPage(frame, pats);
+        // THE UNION (#436 round 4): origin/main's learner tagger, then the shared one. Either failing
+        // fails the frame as the tagger failing always did.
+        const t = await tagSecretsForMask(frame, pats);
+        if (!t.ok) throw new Error("the secret tagger could not run");
+        tagged = t.tagged;
         cov = await secretMaskCoverageInPage(frame, pats, nonce);
       } catch {
         if (main) return await refuse("the secret mask could not be built on the page, so no picture was taken");
@@ -540,7 +706,7 @@ export async function maskedFullPageScreenshot(page: Page, secrets: readonly str
       if (shown && !docMarked) return await refuse("a document the picture shows could not be marked for the mask check, so no picture was taken");
       if (shown && cov.uncovered.length) return await refuse(`the secret mask cannot cover the page (${cov.uncovered[0]}), so no picture was taken`);
       records.set(frame, { shown, painted: cov.painted });
-      if (tagged > 0 || cov.painted > 0) mask.push(frame.locator(`[${SECRET_MASK_ATTR}]`));
+      if (tagged || cov.painted > 0) mask.push(frame.locator(`[${SECRET_MASK_ATTR}]`));
     }
     if (opts.beforeShot) await opts.beforeShot();
     wrote = true;

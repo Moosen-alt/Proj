@@ -9,7 +9,7 @@ import { openPortal } from "../browser";
 import { selectWithFallback, readClosedComboboxOptions } from "../comboboxFill";
 import { assertFilerIdentityHeld, FilerIdentityStop, filerIdentityFieldForSelect, filerIdentityStopMessage, selectFilerIdentity } from "../filerIdentitySelect";
 import { detectChallengeFrame, frameSelectorFor, maskId, readbackMatches, redactCaptureText, redactStatusText, safeAction, sleep, smartWait, waitForElement, waitForInteractiveControls } from "../safeAction";
-import { clearSecretTags, secretMaskPatterns, tagSecretsInPage } from "../secretMask";
+import { clearSecretTags, secretMaskPatterns, tagSecretsForMask } from "../secretMask";
 import { applyFormatHint } from "../formatHint";
 import { scrapeReviewScreen as scrapeReviewScreenShared } from "../reviewScreenScraper";
 import { performLogin, lastRevealTrail, loginFormPresent, holdForPerson } from "./loginFlow";
@@ -9905,15 +9905,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   private async withSecretMask<T>(why: string, take: (mask: Locator[] | undefined) => Promise<T>): Promise<T | undefined> {
     const secrets = this.knownSecrets();
     if (!secrets.length || !this.page || typeof this.page.evaluate !== "function") return take(undefined);
-    // THE ONE TAGGER (secretMask.ts), shared with the staged review picture (#436): moved there unchanged.
+    // THE UNION (secretMask.ts tagSecretsForMask, #436 round 4), shared with the staged review picture:
+    // origin/main's own inline tagger, verbatim, FIRST, then the shared tagger — both mark
+    // [data-al-secret], so this mask covers at least what main's did, by construction. Either pass
+    // failing is the tagger failing (fail closed after a typed secret); the other's tags still mask.
     const pats = secretMaskPatterns(secrets);
-    let tagged = 0;
-    let tagOk = true;
-    try {
-      tagged = await tagSecretsInPage(this.page, pats);
-    } catch {
-      tagOk = false;
-    }
+    const tag = await tagSecretsForMask(this.page, pats);
+    const tagged = tag.tagged;
+    const tagOk = tag.ok;
     const controls: Locator[] = [];
     for (const sel of this.secretControls) {
       const loc = await this.locator(sel).catch(() => null);
@@ -9923,12 +9922,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       this.debug?.event({ type: "secret_mask_unavailable", why: why.slice(0, 60), controls: controls.length });
       return undefined;
     }
-    const mask = [...(tagged > 0 ? [this.page.locator("[data-al-secret]")] : []), ...controls];
+    const mask = [...(tagged ? [this.page.locator("[data-al-secret]")] : []), ...controls];
     try {
       return await take(mask.length ? mask : undefined);
     } finally {
-      // The tagger reaches open shadow roots now (#436), so its own clear does too.
-      if (tagged > 0) await clearSecretTags(this.page);
+      // One clear for both passes' tags (the shared tagger reaches open shadow roots, so its clear does
+      // too); `tagged` is true whenever a pass tagged, or threw part-way.
+      if (tagged) await clearSecretTags(this.page);
     }
   }
 
