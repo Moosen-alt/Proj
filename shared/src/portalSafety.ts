@@ -2348,20 +2348,34 @@ export function capturedFieldIsSecret(p: { sensitive?: boolean; identity?: Field
  *  every planner call) and the learner's page text, once it has typed the project's own account or
  *  meter number into the portal (a review page echoes it back as text).
  *  Identifier-shaped secrets (5+ digits) are matched digit-for-digit with separators ignored
- *  (whitespace — line breaks and CRLF included, so a wrapped number is still one number — any
- *  dash: ASCII, U+2010-2015 and the U+2212 minus, dots, '#', '/'), never inside a longer digit
- *  run; the class wordingNamesProject reads too ('/' aside). Other secrets only when
- *  they carry a digit and are 6+ chars (a meter-keyed word like "exterior" is not an identifier
- *  and must not erase that word from the notes). `replace` decides what a hit becomes — default
- *  "[redacted]"; a caller whose downstream check reads a last-4 may keep one (maskId). */
+ *  (SECRET_SEPARATOR_CLASS: whitespace — line breaks and CRLF included, so a wrapped number is still
+ *  one number — any dash: ASCII, U+2010-2015 and the U+2212 minus, dots, '#', '/', and — #436
+ *  skeptic — the comma of "8,814,402,937", the underscore and the parentheses of "(8814) 402-937"),
+ *  never inside a longer digit run; the class wordingNamesProject reads too ('/' aside). A secret
+ *  that carries LETTERS as well (an alphanumeric meter number, "1ND4421") is ALSO matched by its
+ *  whole letter-and-digit sequence, case-insensitive, the same separators ignored between them: its
+ *  digits alone ("14421") are never written together in "1ND4421" or "1-ND-4421", so the digit
+ *  match alone let it through. Other secrets only when they carry a digit and are 6+ chars (a
+ *  meter-keyed word like "exterior" is not an identifier and must not erase that word from the
+ *  notes). `replace` decides what a hit becomes — default "[redacted]"; a caller whose downstream
+ *  check reads a last-4 may keep one (maskId). Widening this only ever redacts more. */
+export const SECRET_SEPARATOR_CLASS = "[\\s\\-\\u2010-\\u2015\\u2212.#/,_()]";
 export function redactSecretValues(text: string, secrets: Iterable<string>, replace: (hit: string) => string = () => "[redacted]"): string {
   let out = text;
+  const sep = `${SECRET_SEPARATOR_CLASS}*`;
   for (const secret of secrets) {
-    const digits = String(secret ?? "").replace(/\D/g, "");
+    const raw = String(secret ?? "");
+    const digits = raw.replace(/\D/g, "");
+    const alnum = raw.replace(/[^0-9A-Za-z]/g, "");
+    const lettered = /[A-Za-z]/.test(alnum) && /\d/.test(alnum);
     if (digits.length >= 5) {
-      const pattern = digits.split("").join("[\\s\\-\\u2010-\\u2015\\u2212.#/]*");
+      const pattern = digits.split("").join(sep);
       out = out.replace(new RegExp(`(?<!\\d)${pattern}(?!\\d)`, "g"), (m) => replace(m));
-    } else if (String(secret ?? "").trim().length >= 6 && /\d/.test(String(secret))) {
+    }
+    if (lettered && (digits.length >= 5 || raw.trim().length >= 6)) {
+      const pattern = alnum.split("").join(sep);
+      out = out.replace(new RegExp(`${/^\d/.test(alnum) ? "(?<!\\d)" : ""}${pattern}${/\d$/.test(alnum) ? "(?!\\d)" : ""}`, "gi"), (m) => replace(m));
+    } else if (digits.length < 5 && raw.trim().length >= 6 && /\d/.test(raw)) {
       // Whitespace inside the secret matches any whitespace run: text read off a page wraps "AB 1234"
       // at its space as easily as it prints it on one line (#260 review). Trimmed before the length
       // gate, so padding never lets a short value through to over-redact.

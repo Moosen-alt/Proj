@@ -179,4 +179,47 @@ await check("(d) a review link that carries the account (plain, with separators,
   }
 });
 
+// (e) SKEPTIC ROUND 3: an ALPHANUMERIC meter number ("1ND4421": its digits "14421" never stand together,
+// so the digit match alone let it through), and the account written with a COMMA, an UNDERSCORE or in
+// PARENTHESES ("8,814,402,937", "8814_402_937", "(8814) 402-937") — none of those separators was one.
+// Fixed in the ONE shared scrub (redactSecretValues), which the digest's labels and display values,
+// the reference check and the writer all go through.
+const ALNUM_METER = "1ND4421";
+/** The secret by its letters and digits, any of the wide separators between them, any case. */
+const leakWide = (secret: string) => {
+  const chars = secret.replace(/[^0-9A-Za-z]/g, "").split("");
+  return new RegExp(`(?<![0-9A-Za-z])${chars.join("[\\s\\-\\u2010-\\u2015\\u2212.#/,_()]*")}(?![0-9A-Za-z])`, "i");
+};
+const wideLeaks = (hay: string): string[] => [ACCOUNT, ALNUM_METER].filter((sec) => leakWide(sec).test(hay));
+await check("(e) an alphanumeric meter and an account with commas, underscores or parentheses never reach the reading, the field report or the row", () => {
+  const forms = [`${ACCOUNT.slice(0, 1)},${ACCOUNT.slice(1, 4)},${ACCOUNT.slice(4, 7)},${ACCOUNT.slice(7)}`, `${ACCOUNT.slice(0, 4)}_${ACCOUNT.slice(4, 7)}_${ACCOUNT.slice(7)}`, `(${ACCOUNT.slice(0, 4)}) ${ACCOUNT.slice(4, 7)}-${ACCOUNT.slice(7)}`];
+  const meterForms = [ALNUM_METER, "1-ND-4421", "1nd 4421"];
+  const items: Item[] = [
+    { kind: "line", label: "", value: "Review and Submit" },
+    ...forms.map((v, i) => ({ kind: "field" as const, label: `Account form ${i + 1}`, value: v })),
+    ...forms.map((v) => ({ kind: "line" as const, label: "", value: `The bill shows account ${v} for this service.` })),
+    ...meterForms.map((v, i) => ({ kind: "pair" as const, label: `Meter ${i + 1}`, value: v })),
+    { kind: "field", label: `Meter ${ALNUM_METER} location`, value: "North wall" },
+    { kind: "row", label: "Meter", value: `${ALNUM_METER} | North wall` },
+  ];
+  // Fixture: the scan sees every planted form (else the check below proves nothing).
+  assert.deepEqual(wideLeaks(JSON.stringify(items)), [ACCOUNT, ALNUM_METER], "fixture: the scan misses a planted form");
+  const w = { ...walkOf(), sections: [{ step: "review", where: "https://pgenm.powerclerk.example/MvcProjects/EditForm", first: reading(items), second: reading(items), unreadable: "" }] };
+  const c = digest.buildStagedReviewCapture({ walk: w, secrets: [ACCOUNT, ALNUM_METER], boundValues: [{ key: "meterNumber", value: ALNUM_METER }], nonce: "00112233445566778899aabbccddeeff" });
+  assert.ok(c.approvable, c.why.join(" | "));
+  assert.ok(c.fieldReport.length >= 8, `fixture: the field report holds ${c.fieldReport.length} rows (the scan would prove little)`);
+  assert.deepEqual(wideLeaks(JSON.stringify(c)), [], "MUST-EXCLUDE: the reading (labels, field report, why) carries a secret");
+  // The writer, from that capture: nothing in the row either.
+  const pid4 = fx.newProject({ account: ACCOUNT, meter: ALNUM_METER });
+  recordStagedReview(db, { runId: `wide-${pid4}`, projectId: pid4, track: "nem", recipeId: "r", stepsSignature: "s", capture: c, secrets: [ACCOUNT, ALNUM_METER] });
+  const kept = db.get<Record<string, unknown>>("SELECT * FROM portal_staged_reviews WHERE project_id = ?", [pid4]);
+  assert.ok(kept, "no row");
+  assert.deepEqual(wideLeaks(JSON.stringify(kept)), [], "MUST-EXCLUDE: the row carries a secret");
+  // A review link carrying the alphanumeric meter as its id is refused (the same scrub).
+  const url = `https://pgenm.powerclerk.example/MvcProjects/EditForm?ProjectId=${ALNUM_METER}&FormId=9`;
+  const cr = digest.buildStagedReviewCapture({ walk: { ...walkOf(), reviewUrl: url }, secrets: [ACCOUNT, ALNUM_METER], nonce: "00112233445566778899aabbccddeeff" });
+  assert.equal(cr.draftId, "", "the reader kept the meter number as the draft id");
+  assert.ok(cr.why.some((x) => /carries one of the project's own account or meter numbers/.test(x)), cr.why.join(" | "));
+});
+
 finish("review-digest-rule2");
