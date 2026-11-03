@@ -223,9 +223,19 @@ check("LISTINGS MUST-EXCLUDE: a negated listing and parser commentary do not sat
   assert.ok(get(run(project({ planSetExtractedText: "MODULES UL 61730.", structuralCalcText: "No UL 2703 listing provided for the rail." })), LISTINGS), "negated");
   assert.ok(get(run(project({ planSetExtractedText: "MODULES UL 61730.", reviewFlags: "UL 2703 listing looks fine" })), LISTINGS), "reviewFlags");
 });
-check("LISTINGS: no jurisdiction context (legacy golden path) and ground mount -> no finding", () => {
+check("LISTINGS: no jurisdiction context (legacy golden path) -> no finding", () => {
   assert.ok(!get(run(project({}), null), LISTINGS));
-  assert.ok(!get(run(project({ mounting: "Ground mount" })), LISTINGS));
+  assert.ok(!get(run(project({ mounting: "Ground mount" }), null), LISTINGS));
+});
+// #533: a ground or carport array needs UL 61730 / 1703 modules and UL 2703 racking too — this used
+// to pin "ground mount -> no finding". The mount only changes the racking's words.
+check("LISTINGS: a ground mount and a carport ARE checked, in their own racking words", () => {
+  const ground = get(run(project({ mounting: "Ground mount", planSetExtractedText: INVERTER_LISTINGS_ONLY })), LISTINGS);
+  assert.equal(ground?.severity, "callout");
+  assert.match(ground!.message, /ground-mount racking listing \(UL 2703\)/);
+  const carport = get(run(project({ mounting: "Carport", planSetExtractedText: INVERTER_LISTINGS_ONLY }), ctxFor(ASKED)), LISTINGS);
+  assert.equal(carport?.severity, "warning", "listingEvidenceRequired still decides the severity");
+  assert.match(carport!.message, /carport racking\/mounting listing \(UL 2703\)/);
 });
 
 // ---------------------------------------------------------------------------------------

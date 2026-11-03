@@ -1231,7 +1231,23 @@ export function evaluateDesignCodeFindings(
   // asked for exactly these listings on a package that carried one. Its text is read (it is in
   // the plan-set text), its presence is not. Gated on a jurisdiction context like the criteria
   // rules above — the legacy no-context path is pinned by the Oregon golden.
-  if (ctx && roofMounted) {
+  // ANY MOUNT (#533). A ground or carport array carries UL 61730 / 1703 modules on UL 2703 racking
+  // exactly as a roof array does; the gate used to be `ctx && roofMounted`, so a job read as ground
+  // or carport never had the listings checked at all. Only the racking's words follow the mount —
+  // the roof wording is unchanged, and so is the severity (listingEvidenceRequired).
+  if (ctx) {
+    const listingMount = roofMounted ? "roof" : mountKind(project, all);
+    const racking = listingMount === "ground" ? "ground-mount racking" : listingMount === "carport" ? "carport racking/mounting" : "racking/mounting";
+    const mountNote = listingMount === "ground"
+      ? " A ground-mounted array needs listed modules and UL 2703 racking as much as a roof array does."
+      : listingMount === "carport"
+        ? " A carport array needs listed modules and UL 2703 racking as much as a roof array does."
+        : "";
+    const cityFeedback = listingMount === "ground"
+      ? "Provide UL listing for the panels and the ground-mount racking and mounting hardware."
+      : listingMount === "carport"
+        ? "Provide UL listing for the panels and the carport's racking and mounting hardware."
+        : "Provide UL listing for the panels, mounting and racking hardware.";
     // The module datasheet's listing, when its page was an IMAGE, is read once by vision
     // (moduleListing.ensureModuleListingAgency) and kept with the printed words — those words are
     // package evidence too ("UL listing not shown" was FALSE on City of Jefferson: the marks were on
@@ -1241,7 +1257,7 @@ export function evaluateDesignCodeFindings(
       ?? (datasheetWords ? affirmedIn([{ label: "Module datasheet (read from the page image)", text: datasheetWords }], MODULE_LISTING_PATTERNS) : null);
     const rackingListing = affirmedIn(packageTexts, RACKING_LISTING_PATTERNS);
     if (!moduleListing || !rackingListing) {
-      const missing = [!moduleListing ? "module listing (UL 61730 or UL 1703)" : "", !rackingListing ? "racking/mounting listing (UL 2703)" : ""].filter(Boolean);
+      const missing = [!moduleListing ? "module listing (UL 61730 or UL 1703)" : "", !rackingListing ? `${racking} listing (UL 2703)` : ""].filter(Boolean);
       const found = [moduleListing, rackingListing].filter((x): x is Affirmed => x != null);
       // A CALLOUT BY DEFAULT, A WARNING WHERE THE JURISDICTION HAS ASKED. It fired as a warning on
       // every roof job on production (19 of 19): most plan sets name the listings only on the
@@ -1257,9 +1273,10 @@ export function evaluateDesignCodeFindings(
           category: "plan_set",
           title: "UL listing for modules / racking not shown",
           message: `No ${missing.join(" or ")} was found in the package text that could be read (cut sheets whose pages are images are not read). UL 1741 (inverters) and UL 1699B (arc-fault) are different listings and do not answer this.`
+            + mountNote
             + (listingAsked ? ` ${ctx.ahj || "This jurisdiction"} has asked for this listing evidence before.` : ""),
-          cityFeedback: "Provide UL listing for the panels, mounting and racking hardware.",
-          designTeamAction: "Add the module UL 61730 (or UL 1703) listing and the racking/mounting UL 2703 listing to the plan set — equipment notes or the attached cut sheets/certificates.",
+          cityFeedback,
+          designTeamAction: `Add the module UL 61730 (or UL 1703) listing and the ${racking} UL 2703 listing to the plan set — equipment notes or the attached cut sheets/certificates.`,
           evidenceNeeded: missing.map((m) => `${m[0].toUpperCase()}${m.slice(1)} on the plan set or an attached cut sheet/certificate`),
           codeReferences: [residentialCodeRef(ctx, equipmentListings.section, equipmentListings.title, equipmentListings.note)],
         }),
