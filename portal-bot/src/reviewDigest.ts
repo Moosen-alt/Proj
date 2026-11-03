@@ -247,6 +247,16 @@ export function readDigestPageInPage(): InPageReading {
   return { title: clean(document.title), items, lines, dialogOpen };
 }
 
+/** A page's items as one reading — or refused by name: it reads nothing, or it is over the cap
+ *  (more than DIGEST_MAX_ROWS rows, or DIGEST_MAX_BYTES of text). Never hashed then. Pure. */
+export function finishDigestReading(url: string, title: string, items: DigestPageItem[]): RawDigestReading {
+  if (!items.length) return unreadableReading(url, "the page reads nothing");
+  if (items.length > DIGEST_MAX_ROWS) return unreadableReading(url, `the page holds more than ${DIGEST_MAX_ROWS} rows (${items.length})`);
+  const bytes = items.reduce((n, it) => n + it.label.length + it.value.length, 0);
+  if (bytes > DIGEST_MAX_BYTES) return unreadableReading(url, `the page holds more than ${DIGEST_MAX_BYTES / 1024} KB of text`);
+  return { title, url, items, unreadable: "" };
+}
+
 const SHIM = "globalThis.__name = globalThis.__name || function (fn) { return fn; };";
 const originOf = (u: string): string => { try { return new URL(u).origin; } catch { return ""; } };
 const whereOf = (u: string): string => { try { const x = new URL(u); return `${x.origin}${x.pathname}`; } catch { return ""; } };
@@ -288,11 +298,7 @@ export async function readDigestPage(page: Page, opts: { dialogSeen?: () => bool
       if (fr.dialogOpen) return unreadableReading(url, "a dialog is open in a frame on the page");
       take(fr, `frame ${k}: `);
     }
-    if (!items.length) return unreadableReading(url, "the page reads nothing");
-    if (items.length > DIGEST_MAX_ROWS) return unreadableReading(url, `the page holds more than ${DIGEST_MAX_ROWS} rows (${items.length})`);
-    const bytes = items.reduce((n, it) => n + it.label.length + it.value.length, 0);
-    if (bytes > DIGEST_MAX_BYTES) return unreadableReading(url, `the page holds more than ${DIGEST_MAX_BYTES / 1024} KB of text`);
-    return { title: r.title, url, items, unreadable: "" };
+    return finishDigestReading(url, r.title, items);
   } catch (e) {
     return unreadableReading(url, `the page could not be read (${String((e as { message?: string })?.message ?? e).replace(/\s+/g, " ").slice(0, 80)})`);
   }
