@@ -18,8 +18,8 @@
 import { HttpError } from "./httpError";
 import type { AppDb, SqlParam } from "./db";
 import { addAuditLog } from "./audit";
-import { ROLE_ADMIN, ROLE_OPERATOR, ROLE_SUPERADMIN, bumpSessionVersion, passwordMatchesForUser, setUserPassword, type SessionUser } from "./auth";
-import { createUser } from "./users";
+import { ROLE_ADMIN, ROLE_OPERATOR, bumpSessionVersion, passwordMatchesForUser, setUserPassword, type SessionUser } from "./auth";
+import { assertMayManageLogin, createUser } from "./users";
 
 type Row = Record<string, SqlParam>;
 
@@ -84,11 +84,10 @@ function loginInOrg(db: AppDb, actor: SessionUser, userId: string): StaffLogin {
   return mapLogin(row);
 }
 
-/** An org admin cannot reset or switch off a superadmin (the owner's own login). */
+/** An org admin cannot reset or switch off a superadmin (the owner's own login). The rule lives
+ *  in users.ts so the Team panel's PUT /api/users/:id door gives the same answer (#474). */
 function assertMayManage(actor: SessionUser, target: StaffLogin): void {
-  if (target.role === ROLE_SUPERADMIN && actor.role !== ROLE_SUPERADMIN) {
-    throw new HttpError(403, "Only a superadmin can manage a superadmin's login.");
-  }
+  assertMayManageLogin(actor, target);
 }
 
 export function createStaffLogin(
