@@ -211,13 +211,20 @@ export function choosePagesByContent(index: PlanPageIndex, candidates: number[],
 /** Letters/digits on each page that are NOT the boilerplate every page repeats (the title block):
  *  a token present on at least half the pages (and on 2+) is boilerplate. */
 export function bodyCharsPerPage(pageTexts: string[]): number[] {
+  return bodyTokensPerPage(pageTexts).map((toks) => toks.reduce((s, w) => s + w.length, 0));
+}
+
+/** The words on each page that are NOT the title block every page repeats (upper-cased, letters
+ *  and digits only) — on an image-only page, little more than the sheet's own name ("RACKING DATA",
+ *  "ATTACHMENT UL CERTIFICATE"). The same boilerplate test as bodyCharsPerPage. */
+export function bodyTokensPerPage(pageTexts: string[]): string[][] {
   const n = pageTexts.length;
   const tokensOf = (t: string) => String(t ?? "").toUpperCase().split(/\s+/).map((w) => w.replace(/[^A-Z0-9]/g, "")).filter(Boolean);
   const perPage = pageTexts.map(tokensOf);
   const docFreq = new Map<string, number>();
   for (const toks of perPage) for (const w of new Set(toks)) docFreq.set(w, (docFreq.get(w) ?? 0) + 1);
   const common = (w: string) => n >= 3 && (docFreq.get(w) ?? 0) >= Math.max(2, Math.ceil(n / 2));
-  return perPage.map((toks) => toks.filter((w) => !common(w)).reduce((s, w) => s + w.length, 0));
+  return perPage.map((toks) => toks.filter((w) => !common(w)));
 }
 
 /** The image-only pages of a set that HAS a text layer: little body text and a large raster. */

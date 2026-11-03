@@ -353,7 +353,7 @@ const CELL_DENIAL_AFTER = new RegExp(
   "i",
 );
 
-interface Affirmed {
+export interface Affirmed {
   source: string;
   excerpt: string;
 }
@@ -531,7 +531,85 @@ export const MODULE_LISTING_PATTERNS: RegExp[] = [
   /\bUL\s*-?\s*1703\b/i,
 ];
 export const RACKING_LISTING_PATTERNS: RegExp[] = [/\bUL\s*-?\s*2703\b/i];
+// THE ROOF ATTACHMENT'S LISTING (#532): UL Subject 2703A, the Outline of Investigation for flashing
+// devices ("UL 2703A", "UL SUBJECT 2703A:2022"). It lists the attachment/flashing, NOT the racking,
+// so it is shown as evidence and never clears the UL 2703 half (the racking pattern's \b already
+// refuses "2703A").
+export const ATTACHMENT_LISTING_PATTERNS: RegExp[] = [/\bUL\s*(?:subject\s*)?-?\s*2703\s*A\b/i];
 export const INVERTER_LISTING_PATTERNS: RegExp[] = [/\bUL\s*1741\b/i];
+
+/** The products whose listing the UL LISTINGS rule reads, and the printed words that name each. */
+export type ListingProduct = "module" | "racking" | "attachment";
+export const LISTING_PATTERNS_BY_PRODUCT: Record<ListingProduct, RegExp[]> = {
+  module: MODULE_LISTING_PATTERNS,
+  racking: RACKING_LISTING_PATTERNS,
+  attachment: ATTACHMENT_LISTING_PATTERNS,
+};
+
+// LISTING MARKS READ FROM IMAGE-ONLY SHEETS (#532). A certificate or cut sheet pasted into the plan
+// set as a picture carries only its title block in the text layer, so its UL mark never reached
+// the text read. imageSheetListings.ts reads those sheets by vision and the caller keeps the
+// printed words here, on the snapshot, with a plain statement of which sheets were and were not
+// read. The words are package evidence like any other text and go through the same reader
+// (affirmedIn — negations included).
+export const IMAGE_SHEET_LISTING_READINGS_KEY = "imageSheetListingReadings";
+export const IMAGE_SHEET_LISTING_COVERAGE_KEY = "imageSheetListingCoverage";
+export interface ImageSheetListingReading { page: number; product: ListingProduct; quote: string }
+export const imageSheetSourceLabel = (page: number): string => `Plan page ${page} (image-only sheet, read by vision)`;
+
+/** Do these printed words AFFIRM the product's listing — the rule's own reader, negations refused
+ *  ("not listed to UL 2703")? What a vision quote must pass to be kept at all. */
+export function listingAffirmed(product: ListingProduct, text: string): boolean {
+  return affirmedIn([{ label: "", text }], LISTING_PATTERNS_BY_PRODUCT[product]) != null;
+}
+
+/** The readings kept on the snapshot, validated (a malformed value reads as none). */
+export function imageSheetListingReadings(project: ProjectRecord): ImageSheetListingReading[] {
+  const raw = project.parserSnapshot?.[IMAGE_SHEET_LISTING_READINGS_KEY];
+  let parsed: unknown = raw;
+  if (typeof raw === "string") {
+    try { parsed = JSON.parse(raw); } catch { return []; }
+  }
+  if (!Array.isArray(parsed)) return [];
+  const out: ImageSheetListingReading[] = [];
+  for (const r of parsed) {
+    if (!r || typeof r !== "object") continue;
+    const o = r as Record<string, unknown>;
+    const page = Number(o.page);
+    const product = String(o.product ?? "");
+    const quote = typeof o.quote === "string" ? o.quote.trim() : "";
+    if (!Number.isInteger(page) || page < 1 || !quote || !(product in LISTING_PATTERNS_BY_PRODUCT)) continue;
+    out.push({ page, product: product as ListingProduct, quote });
+  }
+  return out;
+}
+
+/** Where the package shows each listing: its text, the module datasheet's vision read, and the
+ *  image-only sheets' vision read. THE ONE READER for city.plan.ul-listings-missing and for the
+ *  gate deciding whether an image-only sheet is worth a vision read at all — so the two cannot
+ *  disagree about what "shown" means. */
+export function packageListings(project: ProjectRecord, extraTexts: DesignTextSource[] = []): Record<ListingProduct, Affirmed | null> {
+  const packageTexts = packageTextSources(project, extraTexts);
+  // The module datasheet's listing, when its page was an IMAGE, is read once by vision
+  // (moduleListing.ensureModuleListingAgency) and kept with the printed words — those words are
+  // package evidence too ("UL listing not shown" was FALSE on City of Jefferson: the marks were on
+  // an image page).
+  const datasheetWords = str(project, "moduleListingAgencyEvidence");
+  const readings = imageSheetListingReadings(project);
+  // A reading counts only for the product it was read for: a racking sheet's "for use with UL 61730
+  // modules" is not the module's listing.
+  const fromImages = (product: ListingProduct) => affirmedIn(
+    readings.filter((r) => r.product === product).map((r) => ({ label: imageSheetSourceLabel(r.page), text: r.quote })),
+    LISTING_PATTERNS_BY_PRODUCT[product],
+  );
+  return {
+    module: affirmedIn(packageTexts, MODULE_LISTING_PATTERNS)
+      ?? (datasheetWords ? affirmedIn([{ label: "Module datasheet (read from the page image)", text: datasheetWords }], MODULE_LISTING_PATTERNS) : null)
+      ?? fromImages("module"),
+    racking: affirmedIn(packageTexts, RACKING_LISTING_PATTERNS) ?? fromImages("racking"),
+    attachment: affirmedIn(packageTexts, ATTACHMENT_LISTING_PATTERNS) ?? fromImages("attachment"),
+  };
+}
 
 // THE TEXT EACH ELECTRICAL RULE READS AS "SHOWN". Exported so requiredDocuments' sheet-content
 // layer (SHEET_CONTENT_ELEMENTS) reads the same words these rules do — a second copy of any of
@@ -1248,17 +1326,25 @@ export function evaluateDesignCodeFindings(
       : listingMount === "carport"
         ? "Provide UL listing for the panels and the carport's racking and mounting hardware."
         : "Provide UL listing for the panels, mounting and racking hardware.";
-    // The module datasheet's listing, when its page was an IMAGE, is read once by vision
-    // (moduleListing.ensureModuleListingAgency) and kept with the printed words — those words are
-    // package evidence too ("UL listing not shown" was FALSE on City of Jefferson: the marks were on
-    // an image page).
-    const datasheetWords = str(project, "moduleListingAgencyEvidence");
-    const moduleListing = affirmedIn(packageTexts, MODULE_LISTING_PATTERNS)
-      ?? (datasheetWords ? affirmedIn([{ label: "Module datasheet (read from the page image)", text: datasheetWords }], MODULE_LISTING_PATTERNS) : null);
-    const rackingListing = affirmedIn(packageTexts, RACKING_LISTING_PATTERNS);
+    // The package text, the module datasheet's vision read and the image-only sheets' vision read
+    // (#532) — one reader, packageListings, which the review gate also asks before paying for a read.
+    const listings = packageListings(project, documentTexts);
+    const moduleListing = listings.module;
+    const rackingListing = listings.racking;
     if (!moduleListing || !rackingListing) {
       const missing = [!moduleListing ? "module listing (UL 61730 or UL 1703)" : "", !rackingListing ? `${racking} listing (UL 2703)` : ""].filter(Boolean);
       const found = [moduleListing, rackingListing].filter((x): x is Affirmed => x != null);
+      // WHAT WAS READ. Where the image-only sheets were read for listing marks, the statement of
+      // which sheets were and were not read replaces "cut sheets whose pages are images are not
+      // read" — which is then no longer true. Without it (nothing read them) the sentence stands.
+      const coverage = str(project, IMAGE_SHEET_LISTING_COVERAGE_KEY);
+      const whereLooked = coverage
+        ? `in the package text or on the image-only sheets read for listing marks. ${coverage}`
+        : "in the package text that could be read (cut sheets whose pages are images are not read).";
+      // A roof-attachment listing (UL 2703A) is the flashing's, not the racking's: shown, never a pass.
+      const attachmentNote = !rackingListing && listings.attachment
+        ? ` A roof-attachment listing (UL 2703A, ${listings.attachment.source}) was found; it lists the attachment/flashing, not the ${racking}.`
+        : "";
       // A CALLOUT BY DEFAULT, A WARNING WHERE THE JURISDICTION HAS ASKED. It fired as a warning on
       // every roof job on production (19 of 19): most plan sets name the listings only on the
       // attached cut sheets, whose text is often image-only and never read — so "not found" is
@@ -1272,7 +1358,8 @@ export function evaluateDesignCodeFindings(
           severity: listingAsked ? "warning" : "callout",
           category: "plan_set",
           title: "UL listing for modules / racking not shown",
-          message: `No ${missing.join(" or ")} was found in the package text that could be read (cut sheets whose pages are images are not read). UL 1741 (inverters) and UL 1699B (arc-fault) are different listings and do not answer this.`
+          message: `No ${missing.join(" or ")} was found ${whereLooked} UL 1741 (inverters) and UL 1699B (arc-fault) are different listings and do not answer this.`
+            + attachmentNote
             + mountNote
             + (listingAsked ? ` ${ctx.ahj || "This jurisdiction"} has asked for this listing evidence before.` : ""),
           cityFeedback,
@@ -1285,19 +1372,24 @@ export function evaluateDesignCodeFindings(
         // — "racking" in the title maps it to rackingAttachment — and overwrites the status with
         // that topic's: "verified" on any plan set with a flashing detail, i.e. "UL listing not
         // shown — evidence: verified". The absence is the evidence.
-        evidenceFound: found.length
-          ? found.map((f) => affirmedEvidence(f, "Listing stated", "Listing found in the package."))
-          : [{
-            kind: "absence_check",
-            label: "UL 61730 / UL 1703 / UL 2703 not stated",
-            source: "Package text",
-            excerpt: "No module (UL 61730 / UL 1703) or racking (UL 2703) listing in the package text.",
-            confidence: "low",
-            pageHint: "",
-            screenshotPath: "",
-            verifier: "rule_engine",
-            note: "Absence check over the package text (parser commentary excluded).",
-          }],
+        evidenceFound: [
+          ...(found.length
+            ? found.map((f) => affirmedEvidence(f, "Listing stated", "Listing found in the package."))
+            : [{
+              kind: "absence_check" as const,
+              label: "UL 61730 / UL 1703 / UL 2703 not stated",
+              source: coverage ? "Package text and image-only sheets read by vision" : "Package text",
+              excerpt: "No module (UL 61730 / UL 1703) or racking (UL 2703) listing in the package text.",
+              confidence: "low" as const,
+              pageHint: "",
+              screenshotPath: "",
+              verifier: "rule_engine" as const,
+              note: coverage ? `Absence check over the package text (parser commentary excluded). ${coverage}` : "Absence check over the package text (parser commentary excluded).",
+            }]),
+          ...(listings.attachment
+            ? [affirmedEvidence(listings.attachment, "Attachment listing (UL 2703A)", "Lists the roof attachment/flashing; the racking itself is listed to UL 2703.")]
+            : []),
+        ],
       });
     }
   }
