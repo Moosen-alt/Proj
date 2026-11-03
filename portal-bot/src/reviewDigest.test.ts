@@ -513,5 +513,22 @@ await check("(k) the recipe's page count reads every advancing click: a hand-pat
   assert.equal(stagedReviewExpectedPages([fill, { action: "click", selector: { role: "button", name: "Add New Contact" }, note: "human-patch: Add New Contact" }, { action: "stopForReview" }] as any), 1);
 });
 
+// ── skeptic round 3, blocker 1: the walk runs UNDER the review lock ─────────────────────────────────
+await check("(o) the adapter locks the review page BEFORE the walk (source scan), and refuses the walk with no backstop", async () => {
+  const fs = await import("node:fs");
+  const src = fs.readFileSync(new URL("./adapters/recipeAdapter.ts", import.meta.url), "utf8");
+  const branch = src.indexOf("if (this.options.stagedReview && !this.options.autoSubmit");
+  assert.ok(branch > 0, "the staged-review branch is not where the scan looks");
+  const lock = src.indexOf("this.backstop?.lockReview(`replay stopped at review, reading the staged draft", branch);
+  const walk = src.indexOf("this.stagedReviewCapture = await this.captureStagedReview(", branch);
+  const blockEnd = src.indexOf("\n    }\n", branch);
+  assert.ok(lock > branch && walk > lock && walk < blockEnd, `the review lock is not set before the walk in the staged-review branch (lock ${lock}, walk ${walk})`);
+  const at = src.indexOf("private async captureStagedReview(");
+  const capture = src.slice(at, src.indexOf("\n  }\n", at));
+  assert.match(capture, /if \(!this\.backstop\) return unapprovableStagedReview\("the run has no network backstop/, "captureStagedReview walks with no backstop");
+  const opens = capture.indexOf("openPlaywrightDigestNavigator(");
+  assert.ok(opens > 0 && capture.indexOf("if (!this.backstop)") < opens, "the backstop check comes after the walk page is opened");
+});
+
 console.log(failures === 0 ? `\nAll ${total}/${total} reviewDigest checks passed.` : `\n${failures}/${total} reviewDigest check(s) FAILED.`);
 process.exit(failures === 0 ? 0 : 1);
