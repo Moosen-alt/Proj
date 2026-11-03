@@ -33,9 +33,14 @@
 //            MUST: a named failure ("not on the page") in seconds, never minutes of retries.
 //   wedge  — the category's click handler never returns (the page's script is stuck). MUST: the
 //            navigate click's budget ends the walk, named (AUTOLEARN_CLICK_BUDGET_MS=20000 here).
-//   stall  — the planner never answers. MUST: the stall watchdog ends the run, named, closes its
-//            page, and learn() returns (stallWatchdogMs=40000 here: well above this replica's
-//            longest healthy quiet stretch, ~16 s on page 1 even with the default 12 s section wait).
+//   freeze — the category click returns, its case types render, and then the page's main thread
+//            stops for good (no click in flight: the next read of the page never returns). MUST: the
+//            stall watchdog's WALK budget ends the run, named, closes its page, and learn() returns
+//            (stallWatchdogMs=25000 here: above this replica's longest healthy quiet stretch, ~16 s
+//            on page 1 even with the default 12 s section wait).
+//   stall  — the planner never answers. MUST: the watchdog gives a planner call its own, longer
+//            budget — the walk's 25 s does NOT end it (the LLM client retries a stalled attempt
+//            itself) — and the PLANNER budget (plannerStallWatchdogMs=50000 here) ends the run, named.
 //
 // Run: npx tsx portal-bot/src/adapters/cityworksCategory.dom.smoke.ts   (ONLY_MODES=live,eager,…)
 //   Past each mode's deadline the walk is reported as HUNG and the browser is closed to end it
@@ -90,9 +95,12 @@ const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 
 const norm = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
 
-type Mode = "live" | "eager" | "gone" | "wedge" | "stall";
+type Mode = "live" | "eager" | "gone" | "wedge" | "freeze" | "stall";
 /** Each mode's wall-clock bound in this smoke: well above its healthy time, far below the hang. */
-const DEADLINE_S: Record<Mode, number> = { live: 240, eager: 240, gone: 150, wedge: 150, stall: 180 };
+const DEADLINE_S: Record<Mode, number> = { live: 240, eager: 240, gone: 150, wedge: 150, freeze: 180, stall: 180 };
+/** The watchdog's budgets in the freeze and stall modes (the walk's own, and a planner call's). */
+const WALK_STALL_MS = 25_000;
+const PLANNER_STALL_MS = 50_000;
 type Call = { url: string; labels: string[]; hint: string; chose: string; at: number };
 type Result = Awaited<ReturnType<AutoLearnAdapter["learn"]>>;
 
@@ -146,6 +154,13 @@ async function walk(mode: Mode): Promise<void> {
       if (b) { for (;;) { /* stuck */ } }
     }, true);` });
   }
+  if (mode === "freeze") {
+    // The click itself returns and the case types render; then the main thread stops for good.
+    await ctx.addInitScript({ content: `document.addEventListener("click", function (e) {
+      var b = e.target && e.target.closest ? e.target.closest(".category-subcategories button") : null;
+      if (b) setTimeout(function () { for (;;) { /* stuck */ } }, 1000);
+    }, true);` });
+  }
   // No setDefaultTimeout here: production runs with Playwright's own defaults, and the hang is
   // about what those defaults let a click cost.
   const page: Page = await ctx.newPage();
@@ -183,7 +198,11 @@ async function walk(mode: Mode): Promise<void> {
   };
 
   await page.goto(`${base}/publicaccess/home/home`);
-  const adapter = new AutoLearnAdapter("Cityworks Category Smoke", planner, { maxPages: 10, ...(mode === "stall" ? { stallWatchdogMs: 40_000 } : {}) });
+  const adapter = new AutoLearnAdapter("Cityworks Category Smoke", planner, {
+    maxPages: 10,
+    ...(mode === "freeze" ? { stallWatchdogMs: WALK_STALL_MS } : {}),
+    ...(mode === "stall" ? { stallWatchdogMs: WALK_STALL_MS, plannerStallWatchdogMs: PLANNER_STALL_MS } : {}),
+  });
   (adapter as unknown as { page: unknown }).page = page;
   // gone: the chosen category leaves the page between the plan and the click (an SPA re-render),
   // timed off the learner's own navigate_chosen event so it lands before the click, every time.
@@ -277,20 +296,32 @@ async function walk(mode: Mode): Promise<void> {
       !!res && res.ok === false && evTypes.includes("navigate_timed_out") && /did not finish within 20 s/.test(String(res.message)), `events=${JSON.stringify(evTypes)} | ${trace}`);
     check(`wedge: ...at the budget, not minutes later (${secs} s from the choice to the end; bound 60 s)`, secs >= 0 && secs <= 60, trace);
   }
-  if (mode === "stall") {
-    const secs = stallAt && endedAt ? Math.round((endedAt - stallAt) / 1000) : -1;
-    check("stall: a planner that never answers is ended by the stall watchdog, named (stopReason 'stalled')",
-      !!res && res.ok === false && res.stopReason === "stalled" && /^Stopped by the stall watchdog: the walk showed no sign of progress for \d+ s \(budget 40 s; last: asking the planner \(page 2\)\)/.test(String(res.message)) && evTypes.includes("stall_watchdog"),
+  if (mode === "freeze") {
+    const ms = chosenAt && endedAt ? endedAt - chosenAt : -1;
+    const walkS = WALK_STALL_MS / 1000;
+    check(`freeze: a page that stops answering with no click in flight is ended by the watchdog's WALK budget, named (stopReason 'stalled', budget ${walkS} s)`,
+      !!res && res.ok === false && res.stopReason === "stalled" && new RegExp(`^Stopped by the stall watchdog: the walk showed no sign of progress for \\d+ s \\(budget ${walkS} s; last: `).test(String(res.message)) && evTypes.includes("stall_watchdog") && !evTypes.includes("navigate_timed_out"),
       `events=${JSON.stringify(evTypes)} | ${trace}`);
-    check(`stall: ...within its budget plus the grace (${secs} s from the stall to the end; bound 80 s), and its page is closed`,
-      secs >= 0 && secs <= 80 && pageClosed, `pageClosed=${pageClosed} | ${trace}`);
+    check(`freeze: ...after its budget and within it plus the grace (${Math.round(ms / 1000)} s from the choice to the end; bounds ${walkS}-90 s), and its page is closed`,
+      ms >= WALK_STALL_MS && ms <= 90_000 && pageClosed, `pageClosed=${pageClosed} | ${trace}`);
+  }
+  if (mode === "stall") {
+    const ms = stallAt && endedAt ? endedAt - stallAt : -1;
+    const plannerS = PLANNER_STALL_MS / 1000;
+    check(`stall: a planner that never answers is ended by the watchdog's PLANNER budget, named (stopReason 'stalled', budget ${plannerS} s)`,
+      !!res && res.ok === false && res.stopReason === "stalled" && new RegExp(`^Stopped by the stall watchdog: the walk showed no sign of progress for \\d+ s \\(budget ${plannerS} s; last: asking the planner \\(page 2\\)\\)`).test(String(res.message)) && evTypes.includes("stall_watchdog"),
+      `events=${JSON.stringify(evTypes)} | ${trace}`);
+    // The walk's own 25 s must not cut a planner call short: the LLM client retries a stalled
+    // attempt itself, and ending the run 25 s in would be a false stop on a live model.
+    check(`stall: ...not at the walk's ${WALK_STALL_MS / 1000} s budget: the planner call is given its own (${Math.round(ms / 1000)} s from the stall to the end; bounds ${plannerS - 1}-${plannerS + 30} s), and its page is closed`,
+      ms >= PLANNER_STALL_MS - 1000 && ms <= PLANNER_STALL_MS + 30_000 && pageClosed, `pageClosed=${pageClosed} | ${trace}`);
   }
   console.log(`  (took ${tookS} s)`);
   await browser.close().catch(() => null);
 }
 
 try {
-  for (const m of (process.env.ONLY_MODES ? process.env.ONLY_MODES.split(",") : ["live", "eager", "gone", "wedge", "stall"]) as Mode[]) await walk(m);
+  for (const m of (process.env.ONLY_MODES ? process.env.ONLY_MODES.split(",") : ["live", "eager", "gone", "wedge", "freeze", "stall"]) as Mode[]) await walk(m);
 } finally {
   server.close();
 }

@@ -401,12 +401,20 @@ function clickStepBudgetMs(): number {
 }
 /** #556 — THE STALL WATCHDOG: how long the walk may go without ANY sign of progress (an event, a
  *  planner reply, a fill completing, a new page) before it is ended, named. 300 s because it must sit
- *  above every bounded quiet stretch a healthy walk has — the upload phase (capped at 150 s), one
- *  planner-door click (clickStepBudgetMs, 90 s), one planner call (the SDK's 240 s per attempt) —
- *  and well below the run ceiling (PORTAL_RUN_MAX_MS, 25 min) and the ~15 minutes the #556 click
- *  cost: the live stall was noticed and killed by a person at five minutes. A person's hold
- *  (MFA / CAPTCHA park) is not a stall and is not counted. AUTOLEARN_STALL_MS tunes it; 0 = off. */
+ *  above every bounded quiet stretch the walk's OWN work has — one upload phase (capped at 150 s), one
+ *  planner-door click (clickStepBudgetMs, 90 s) — and well below the run ceiling (PORTAL_RUN_MAX_MS,
+ *  25 min) and the ~15 minutes the #556 click cost: the live stall was noticed and killed by a person
+ *  at five minutes. A planner call has its own, longer budget (PLANNER_STALL_DEFAULT_MS). A person's
+ *  hold (MFA / CAPTCHA park) is not a stall and is not counted. AUTOLEARN_STALL_MS tunes it; 0 = off. */
 const STALL_WATCHDOG_DEFAULT_MS = 300_000;
+/** #556 — THE WATCHDOG'S BUDGET WHILE A PLANNER CALL IS IN FLIGHT. The LLM client gives each attempt
+ *  240 s and then retries it itself (backend llm.ts: timeout 240 000, maxRetries 5) — the recovery a
+ *  live NEM learn's nine-minute stalled planner call was given. At the walk's 300 s that recovery
+ *  would be cut 60 s into its retry: a false stop on a slow but live model. 600 s holds one stalled
+ *  attempt plus one full retry with margin, and still ends a planner that never answers (a stream
+ *  that stalls after its headers has no client timeout at all) well inside the run ceiling.
+ *  AUTOLEARN_PLANNER_STALL_MS tunes it; never below the walk's own budget. */
+const PLANNER_STALL_DEFAULT_MS = 600_000;
 
 const SUBMIT_INTENT = /\b(continue application|submit application|file application|submit|finish|finalize|confirm submission|place order|complete submission)\b/i;
 /** A login-worded control ("Sign In", "Log in", "Login", "Log On"). Never a walk advance while its
@@ -2680,6 +2688,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
        *  to break the stuck call. Default STALL_WATCHDOG_DEFAULT_MS (env AUTOLEARN_STALL_MS); 0 = off.
        *  A person's hold (MFA / CAPTCHA park) does not count. */
       stallWatchdogMs?: number;
+      /** #556 — the watchdog's budget while a planner call is in flight (the LLM client retries a
+       *  stalled attempt itself). Default PLANNER_STALL_DEFAULT_MS (env AUTOLEARN_PLANNER_STALL_MS);
+       *  never below stallWatchdogMs. */
+      plannerStallWatchdogMs?: number;
       /** THIS PROJECT'S EXISTING DRAFT (#302): before starting a new application, look for the
        *  project's unsubmitted draft — by the number a run recorded, else by an unsubmitted row on
        *  the project's street — and open the form that continues it ("Interconnection Application
@@ -4243,13 +4255,16 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   // a page begun, a progress report. A click retrying itself emits none of those — which is exactly
   // the shape of the #556 stall — while a slow page of eighteen fills completes one every few
   // seconds and never trips it. A person's hold (MFA / CAPTCHA park) is a wait for a person with its
-  // own bound, not a stall.
+  // own bound, not a stall. A planner call in flight is a wait on the LLM client, which retries a
+  // stalled attempt itself: it is given the longer PLANNER_STALL_DEFAULT_MS, never waved through.
 
   /** When the walk last showed a sign of progress, and what it was. */
   private lastActivityAt = Date.now();
   private lastActivityWhat = "";
   /** Holds for a person in progress (they can nest); the watchdog does not count them. */
   private personHolds = 0;
+  /** Planner calls in flight; while one is, the watchdog's budget is plannerStallBudgetMs(). */
+  private plannerCalls = 0;
   /** Set once, when the watchdog ends the run. */
   private stalled: { quietMs: number; budgetMs: number; last: string } | null = null;
   private stallTimer: ReturnType<typeof setInterval> | null = null;
@@ -4270,6 +4285,17 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     return STALL_WATCHDOG_DEFAULT_MS;
   }
 
+  /** The watchdog's budget while a planner call is in flight: never below the walk's own. */
+  private plannerStallBudgetMs(): number {
+    const walk = this.stallBudgetMs();
+    const opt = this.options.plannerStallWatchdogMs;
+    const env = process.env.AUTOLEARN_PLANNER_STALL_MS;
+    const own = typeof opt === "number" && Number.isFinite(opt) && opt > 0 ? opt
+      : env !== undefined && env.trim() !== "" && Number.isFinite(Number(env)) && Number(env) > 0 ? Number(env)
+        : PLANNER_STALL_DEFAULT_MS;
+    return Math.max(walk, own);
+  }
+
   /** Run `fn` as a wait for a person: the watchdog holds while it runs, and its clock restarts after. */
   private async duringPersonHold<T>(fn: () => Promise<T>): Promise<T> {
     this.personHolds++;
@@ -4281,14 +4307,16 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    *  the stuck call so it rejects and the walk unwinds through its own path — with the network
    *  backstop still installed until learn()'s own teardown. Never settles when the walk is healthy. */
   private startStallWatchdog(): Promise<void> {
-    const budgetMs = this.stallBudgetMs();
+    const walkBudgetMs = this.stallBudgetMs();
+    const plannerBudgetMs = this.plannerStallBudgetMs();
     this.noteActivity("learn started");
-    if (!(budgetMs > 0)) return new Promise<void>(() => { /* off */ });
+    if (!(walkBudgetMs > 0)) return new Promise<void>(() => { /* off */ });
     return new Promise<void>((resolve) => {
       this.stallTimer = setInterval(() => {
         if (this.stalled) return;
         if (this.personHolds > 0) { this.noteActivity("waiting for a person"); return; }
         const quietMs = Date.now() - this.lastActivityAt;
+        const budgetMs = this.plannerCalls > 0 ? plannerBudgetMs : walkBudgetMs;
         if (quietMs < budgetMs) return;
         this.stalled = { quietMs, budgetMs, last: this.lastActivityWhat || "(nothing yet)" };
         this.clickGeneration++;
@@ -4300,7 +4328,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           await this.forceClose();
           resolve();
         })();
-      }, Math.max(200, Math.min(5000, Math.floor(budgetMs / 5))));
+      }, Math.max(200, Math.min(5000, Math.floor(walkBudgetMs / 5))));
       (this.stallTimer as { unref?: () => void }).unref?.();
     });
   }
@@ -9953,9 +9981,13 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    *  not text — it is masked where it is taken (capturePlanScreenshot). */
   private askPlanner(req: LearnPlanRequest): Promise<LearnPlanResponse> {
     // A planner reply, or its failure, is progress (#556 stall watchdog); and should the reply never
-    // come, the watchdog's message says that is where the walk was.
+    // come, the watchdog's message says that is where the walk was. While the call is in flight the
+    // watchdog gives it the planner's budget (the LLM client retries a stalled attempt itself).
     this.noteActivity(`asking the planner (page ${this.walkPageCount})`);
-    return this.planner(this.scrubPlanRequest(req)).finally(() => this.noteActivity("planner replied"));
+    this.plannerCalls++;
+    let call: Promise<LearnPlanResponse>;
+    try { call = Promise.resolve(this.planner(this.scrubPlanRequest(req))); } catch (e) { call = Promise.reject(e); }
+    return call.finally(() => { this.plannerCalls--; this.noteActivity("planner replied"); });
   }
 
   private scrubPlanRequest(req: LearnPlanRequest): LearnPlanRequest {
