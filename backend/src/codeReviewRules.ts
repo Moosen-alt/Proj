@@ -1339,7 +1339,7 @@ export function evaluateDesignCodeFindings(
       // read" — which is then no longer true. Without it (nothing read them) the sentence stands.
       const coverage = str(project, IMAGE_SHEET_LISTING_COVERAGE_KEY);
       const whereLooked = coverage
-        ? `in the package text or on the image-only sheets read for listing marks. ${coverage}`
+        ? `in the package text or on any image-only sheet read for listing marks. ${coverage}`
         : "in the package text that could be read (cut sheets whose pages are images are not read).";
       // A roof-attachment listing (UL 2703A) is the flashing's, not the racking's: shown, never a pass.
       const attachmentNote = !rackingListing && listings.attachment

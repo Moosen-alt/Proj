@@ -261,7 +261,7 @@ await check("(u0) control: no readings — both halves missing, the old sentence
 await check("(u1) a racking reading from an image sheet clears the racking half — and only it; the page is the evidence", () => {
   const f = get(evaluate(ruleProject(readings([{ page: 8, product: "racking", quote: "UL 2703 LISTED SYSTEM" }]))), LISTINGS);
   assert.ok(f, "the module half is still missing");
-  assert.match(f.message, /^No module listing \(UL 61730 or UL 1703\) was found in the package text or on the image-only sheets read for listing marks\. Image-only sheets read by vision/);
+  assert.match(f.message, /^No module listing \(UL 61730 or UL 1703\) was found in the package text or on any image-only sheet read for listing marks\. Image-only sheets read by vision/);
   assert.doesNotMatch(f.message, /cut sheets whose pages are images are not read/);
   assert.deepEqual(f.evidenceNeeded, ["Module listing (UL 61730 or UL 1703) on the plan set or an attached cut sheet/certificate"]);
   assert.equal(f.evidenceStatus, "weak");
@@ -338,7 +338,7 @@ await check("(e1) RED ON BASE: a plan set whose only UL 2703 evidence is an imag
   const { report } = await review(pdf, fake.llm);
   const f = get(report.findings, LISTINGS);
   assert.ok(f, "the module half is still missing (IEC is not the UL listing)");
-  assert.match(f.message, /^No module listing \(UL 61730 or UL 1703\) was found in the package text or on the image-only sheets read for listing marks\./);
+  assert.match(f.message, /^No module listing \(UL 61730 or UL 1703\) was found in the package text or on any image-only sheet read for listing marks\./);
   assert.doesNotMatch(f.message, /racking\/mounting listing \(UL 2703\)/, "the racking half is cleared");
   assert.match(f.message, /pages 4, 5, 6\./);
   assert.equal(f.evidenceFound?.find((e) => e.label === "Listing stated")?.source, "Plan page 5 (image-only sheet, read by vision)");
