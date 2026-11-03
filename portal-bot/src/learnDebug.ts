@@ -119,8 +119,13 @@ export class LearnRunDebug {
     }
   }
 
+  /** Told of every event as it is written (#556: the adapter's stall watchdog counts an event as a
+   *  sign of progress). Never allowed to break the write. */
+  onEvent: ((evt: Record<string, unknown>) => void) | null = null;
+
   /** Append a timestamped event to events.jsonl. */
   event(evt: Record<string, unknown>): void {
+    try { this.onEvent?.(evt); } catch { /* a listener never breaks the bundle */ }
     try {
       const line = this.clean(JSON.stringify({ t: new Date().toISOString(), ms: Date.now() - this.startedAtMs, ...evt }));
       fs.appendFileSync(path.join(this.dir, "events.jsonl"), line + "\n");
