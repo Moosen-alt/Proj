@@ -1641,6 +1641,15 @@ await check("#365, HELM'S 10-18 RE-CHECK OF #369: a lookup that names no platfor
   fx.recipes.savePortalRecipeSteps(db, jsRec.id, [...fx.fills(3), fx.REVIEW], { status: "complete" });
   assert.ok(fx.recipeRow(jsRec.id).status === "complete" && isNotServedRecipe(fx.recipeRow(jsRec.id)), "precondition: complete again, the refusal flag kept");
   await counts(project(JS), acaCedar, "B2 a recipe re-promoted with its refusal flag");
+  // …and a recipe that does NOT vouch still adds caution: a failed stub on the city's own portal
+  // beside a PowerClerk-only KB row counts, off that host (every portal the utility names must be a
+  // platform, vouching or not).
+  const KS = "Kingston Electric";
+  kbRow("kb-r5-ks", KS, tenantOf(KS));
+  const ksRec = fx.recipes.startPortalRecording(db, { scopeType: "utility", state: "OR", utility: KS, portalUrl: "https://permits.kingstoncity.gov/interconnection", portalPlatform: "", createdBy: "test" });
+  fx.recipes.savePortalRecipeSteps(db, ksRec.id, [], { status: "needs_rerecord", notes: "Auto-learn could not complete: synthetic." });
+  assert.equal(fx.recipeRow(ksRec.id).status, "needs_rerecord", "precondition: a failed stub on the city portal");
+  await counts(project(KS), acaCedar, "B2 a failed stub on a city portal still counts the number");
 
   // ══ SHOULD-FIX 1: A PERSON'S VERIFY ON THE REAL MERGE. Each row seeded under knowledgeProfileKey by
   // research (or the reference import), then saveVerifiedUtilityProfile with the URL left blank: the
