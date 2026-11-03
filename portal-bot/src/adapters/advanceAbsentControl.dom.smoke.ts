@@ -136,8 +136,8 @@ try {
   check("the walk reaches page 2 and its review", !!res && res.ok === true && res.reachedReview === true && calls.some((c) => c.url === "/apply/details" && c.chose === "review"), trace);
   check("the absent control is NAMED as absent, never as a timeout",
     !!absentEv && /^Proceed to details$/.test(String(absentEv.label)) && !evTypes.includes("advance_timed_out"), `events=${JSON.stringify(evTypes)} | ${trace}`);
-  check(`...in seconds, not at the click budget (${Number(absentEv?.ms ?? -1)} ms; bound 45 s)`,
-    !!absentEv && Number(absentEv.ms) >= 0 && Number(absentEv.ms) <= 45_000, trace);
+  check(`...in seconds, not at the click budget (${Number(absentEv?.tookMs ?? -1)} ms; bound 45 s)`,
+    !!absentEv && Number(absentEv.tookMs) >= 0 && Number(absentEv.tookMs) <= 45_000, trace);
   check("it is recovered from as an advance that did nothing: banned, and page 1 planned again (Continue)",
     evTypes.includes("advance_did_nothing") && calls.filter((c) => c.url === "/apply/applicant").length >= 2 && calls.some((c) => c.url === "/apply/applicant" && c.chose === "Continue"),
     `events=${JSON.stringify(evTypes)} | ${trace}`);
