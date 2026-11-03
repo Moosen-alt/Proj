@@ -46,6 +46,10 @@
 //                     never as Site photo;
 //                   heldGridTiedRow: "Is the system grid-tied? *" in the held slot's row — a radio
 //                     group is never discharged as a held upload.
+//   MUST-EXCLUDE  POWERCLERK'S ROW LAYOUT (#363) — 0 POSTs, the pair named by its question: a Yes/No
+//                 pair in a div.mb-3 beside its "Question *" row label (rowRadioAsterisk), and the
+//                 same pair with native `required` radios (rowRadioNative). MUST-PASS: with neither
+//                 (rowRadioOptional) the pair is optional and the draft is created.
 //   MUST-EXCLUDE  A SELECT2 UTILITY LEFT BLANK (#327) — 0 POSTs, Utility named: Bootstrap 4
 //                 (select2Bs4Utility) and django-crispy-forms (select2CrispyUtility), a filled
 //                 Service address above. The 1 x 1 sliver's widget box is the whole form-group,
@@ -250,9 +254,25 @@ const KENDO_DDL = `<span class="k-widget k-dropdown" style="display:inline-block
 SELECT2_LAYOUT.s2FieldsetRadio = `<fieldset style="border:1px solid #ccc;padding:0 8px 4px"><legend>Utility information</legend><label for="utilitySel">Utility</label>${S2_FILLED_SELECT}${S2_FILLED_FACE}${S2_NOTE}<div>Battery storage? <label><input type="radio" name="bat" value="y"> Yes</label> <label><input type="radio" name="bat" value="n"> No</label></div>${S2_FOOT}</fieldset>`;
 SELECT2_LAYOUT.s2FieldsetCheckbox = `<fieldset style="border:1px solid #ccc;padding:0 8px 4px"><legend>Utility information</legend><label for="utilitySel">Utility</label>${S2_FILLED_SELECT}${S2_FILLED_FACE}${S2_NOTE}<div><label><input type="checkbox" name="agree"> I agree to the interconnection terms</label></div>${S2_FOOT}</fieldset>`;
 SELECT2_LAYOUT.s2CardKendo = `<div class="card"><div class="card-body" style="border:1px solid #ccc;padding:8px"><label for="utilitySel">Utility</label>${S2_FILLED_SELECT}${S2_FILLED_FACE}${S2_NOTE}<div><label>Rate schedule</label> ${KENDO_DDL}</div>${S2_FOOT}</div></div>`;
+// POWERCLERK'S ROW LAYOUT (#363): the question and its red asterisk in one div, the Yes/No radios in a
+// sibling div.mb-3 whose own text is just "Yes No" (powerClerkDisconnect.dom.smoke.ts's markup). The
+// sweep read requiredness only from that div, so the stamped Submit was clicked with the pair blank:
+// one POST, the portal's validation page, "MAY HAVE FILED". Required by the row's asterisk, or by the
+// radios' own `required` (the form is novalidate, so the browser does not refuse the POST for the
+// run); with neither the pair is optional and the draft goes ahead.
+const PC_DIST = "Is the AC disconnect within the stated distance of the meter?";
+const pcRow = (star: boolean, required: boolean): string =>
+  `<div class="p-2"><div><label for="pcDist" class="d-inline" data-test-role="input-label">${PC_DIST}</label>${star ? '<span data-test-role="required-indicator" class="text-danger"> * </span>' : ""}</div><div class="mb-3"><div id="pcDist" data-test-role="radiobuttonlist-element">${["Yes", "No"].map((v, i) =>
+    `<div class="form-check form-check-inline"><input class="form-check-input" type="radio" name="pcDist" id="pcDist_${i}" value="${v}"${required ? " required" : ""}><label class="form-check-label" for="pcDist_${i}">${v}</label></div>`).join("")}</div></div></div>`;
+const ROW_LAYOUT: Record<string, string> = {
+  rowRadioAsterisk: pcRow(true, false),
+  rowRadioNative: pcRow(false, true),
+  rowRadioOptional: pcRow(false, false),
+};
 const heldBlock = (mode: string): string => HELD_LAYOUT[mode]
   ? `<div style="position:relative;height:120px;margin:12px 0">${HELD_LAYOUT[mode]}</div><div id="heldList" style="margin:8px 0"></div>${HELD_SCRIPT}`
-  : SELECT2_LAYOUT[mode] ? `${BS4}<div class="bs4">${SELECT2_LAYOUT[mode]}</div>` : "";
+  : SELECT2_LAYOUT[mode] ? `${BS4}<div class="bs4">${SELECT2_LAYOUT[mode]}</div>`
+  : ROW_LAYOUT[mode] ?? "";
 const ERROR = page("Error", `<h1>Error</h1><p>An error has occurred. Please try again later.</p>`);
 
 const server = http.createServer((req, res) => {
@@ -435,6 +455,17 @@ try {
     const o = await stage(mode, submitStep());
     check(`${mode}: a blank beside a filled select2 Utility, flagged at the foot — the draft is NOT created (0 POSTs)`, submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false, brief(o));
     check(`${mode}: the run names the portal's complaint (unattributed), never Utility`, /still empty on the page: .*portal reports "This field is required\."/.test(refusalOf(o)) && !/\bUtility\b/.test(refusalOf(o)), `refusal=${refusalOf(o)} | ${brief(o)}`);
+  }
+  // POWERCLERK'S ROW LAYOUT (#363): a required pair left blank is never a draft, and it is named by
+  // its question; an optional pair (no asterisk, no `required`) does not stop the draft.
+  for (const mode of ["rowRadioAsterisk", "rowRadioNative"]) {
+    const o = await stage(mode, submitStep());
+    check(`${mode}: a required Yes/No pair in PowerClerk's row layout, unanswered — the draft is NOT created (0 POSTs)`, submits(o) === 0 && !draftOf(o) && o.r.finalSubmitClicked === false && !incidentOf(o), brief(o));
+    check(`${mode}: the run names the pair by its question as the required field still empty`, /still empty on the page: .*Is the AC disconnect within the stated distance of the meter\?/.test(refusalOf(o)), `refusal=${refusalOf(o)} | ${brief(o)}`);
+  }
+  {
+    const o = await stage("rowRadioOptional", submitStep());
+    check("rowRadioOptional: the same pair with no asterisk and no `required` is optional — the draft is created (1 POST)", submits(o) === 1 && draftOf(o)?.applicationNumber === "NEM-90017" && o.r.finalSubmitClicked === false, brief(o));
   }
 } finally {
   server.close();
