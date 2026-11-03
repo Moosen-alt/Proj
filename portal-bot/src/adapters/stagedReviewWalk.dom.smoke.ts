@@ -19,10 +19,12 @@
 //   MUST-EXCL  each refused by name, 0 non-GET at the server: a step tab that opens by a script
 //              (__doPostBack); a cross-origin frame on a step; a dialog open on the review page; a
 //              step page that changes itself between the two reads; a step page that POSTs on load
-//              (the POST is blocked: 0 at the server, and the row is unapprovable, named).
+//              (the POST is blocked: 0 at the server, and the row is unapprovable, named); a NATIVE
+//              alert() on a step page (noted by the CDP watch, never answered by product code).
 //
 // Kill: openPlaywrightDigestNavigator's route → route.fallback() for every method → "onLoadPost" sees
 // a POST at the server. stepLinksInPage: drop the ACTS / ACT_PATH exclusion → Delete Draft is requested.
+// The CDP dialog watch: never note Page.javascriptDialogOpening → "nativeDialog" reads approvable.
 //
 //   npx tsx portal-bot/src/adapters/stagedReviewWalk.dom.smoke.ts
 import "../smokeArtifactDirs";
@@ -59,7 +61,7 @@ const nav = (pid: number, mode: string): string => `<ul class="form-steps">${STE
 const CHROME = `<nav><a href="/account">My Account</a> <a href="/logout">Sign Out</a></nav>`;
 const page = (title: string, pid: number, mode: string, body: string): string =>
   `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title></head><body>${CHROME}<aside>${nav(pid, mode)}</aside><main><h1>${title}</h1>${body}</main></body></html>`;
-const MODES: Record<number, string> = { 4417: "clean", 4418: "scriptTab", 4419: "crossFrame", 4420: "dialog", 4421: "selfChanging", 4422: "onLoadPost" };
+const MODES: Record<number, string> = { 4417: "clean", 4418: "scriptTab", 4419: "crossFrame", 4420: "dialog", 4421: "selfChanging", 4422: "onLoadPost", 4423: "nativeDialog" };
 
 const stepBody = (n: number, pid: number, mode: string): string => {
   if (n === 1) return `<label for="cn">Customer Name</label><input id="cn" value="Avery Fenwick">
@@ -69,7 +71,8 @@ const stepBody = (n: number, pid: number, mode: string): string => {
     <iframe src="${mode === "crossFrame" ? xoBase : ""}/frame/meter?ProjectId=${pid}" width="420" height="90"></iframe>
     ${mode === "selfChanging" ? `<p id="tick">Queue position 1</p><script>var q = 1; setInterval(function(){ q++; document.getElementById("tick").textContent = "Queue position " + q; }, 150);</script>` : ""}`;
   if (n === 3) return `<p>Documents on this application:</p><ul><li>site-plan.pdf</li><li>one-line.pdf</li></ul>
-    ${mode === "onLoadPost" ? `<script>fetch("/MvcProjects/SaveChanges?ProjectId=${pid}", { method: "POST", body: "autosave=1" }).catch(function(){});</script>` : ""}`;
+    ${mode === "onLoadPost" ? `<script>fetch("/MvcProjects/SaveChanges?ProjectId=${pid}", { method: "POST", body: "autosave=1" }).catch(function(){});</script>` : ""}
+    ${mode === "nativeDialog" ? `<script>alert("Your session will expire soon.");</script>` : ""}`;
   return `<fieldset><legend>Meter aggregation</legend><label><input type="radio" name="agg" value="y"> Yes</label><label><input type="radio" name="agg" value="n"> No</label></fieldset>
     <label for="cap">Aggregated capacity (kW)</label><input id="cap" value="${state.capacity}">
     <label><input type="checkbox" checked> I am authorized to submit this application</label>`;
@@ -200,6 +203,8 @@ try {
     await refusedCase("dialog", 4420, /a dialog is open on the page/);
     await refusedCase("selfChanging", 4421, /Equipment: the page changed between two reads/);
     await refusedCase("onLoadPost", 4422, /tried to send 1 request\(s\) while being read/);
+    // A NATIVE alert() on a step page: seen by the CDP watch only (no `dialog` listener answers it).
+    await refusedCase("nativeDialog", 4423, /Attachments: a dialog opened on the page/);
   } finally {
     await browser.close().catch(() => null);
   }

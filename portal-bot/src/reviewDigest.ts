@@ -42,6 +42,7 @@ import type {
 } from "../../shared/src/types";
 import { maskId, redactCaptureText } from "./safeAction";
 import { draftReferenceFromUrl } from "./adapters/submissionLedger";
+import { dialogsLeftToPerson } from "./personDialogs";
 import { recordNumberCandidates } from "./recordNumber";
 
 export const REVIEW_DIGEST_VERSION = 1;
@@ -331,6 +332,8 @@ export interface DigestNavigator {
   writesBlocked(): number;
   sleep(ms: number): Promise<void>;
   close(): Promise<void>;
+  /** Why the walk must not start at all ("" or absent = it may). Named in the row. */
+  refusal?(): string;
 }
 
 export interface DigestWalkSection {
@@ -380,8 +383,12 @@ export async function walkStagedDraft(nav: DigestNavigator, opts: {
     return { step, where, first, second, unreadable: second.unreadable };
   };
   try {
-    const opened = await nav.openReview();
-    if (opened) {
+    const refused = nav.refusal?.() ?? "";
+    const opened = refused ? "" : await nav.openReview();
+    if (refused) {
+      reasons.push(refused);
+      sections.push({ step: "review", where: whereOf(opts.reviewUrl), first: unreadableReading(opts.reviewUrl, refused), second: null, unreadable: refused });
+    } else if (opened) {
       reasons.push(`the review page does not reopen by its link (${opened})`);
       sections.push({ step: "review", where: whereOf(opts.reviewUrl), first: unreadableReading(opts.reviewUrl, opened), second: null, unreadable: opened });
     } else {
@@ -663,19 +670,39 @@ export interface PlaywrightDigestNavigator extends DigestNavigator {
 
 /** The walk page: a NEW page of `runPage`'s context (never the window a person submits in). Every
  *  request that is not a GET / HEAD is aborted and counted; a GET falls back to the context's own
- *  routes (the network backstop still judges it). A native dialog is dismissed and noted. */
+ *  routes (the network backstop still judges it).
+ *  A NATIVE DIALOG IS NOTED, NEVER ANSWERED HERE (#381; personDialogs.test pins that product code
+ *  answers a dialog only in the approved click's slot, and registers no other `dialog` listener). The
+ *  walk page registers none, so Playwright's own default answers a dialog exactly as it does on every
+ *  page before a hand-over on main; a CDP session only OBSERVES Page.javascriptDialogOpening (never
+ *  Page.handleJavaScriptDialog), and the page it opened on reads as unreadable, by name. A walk whose
+ *  dialogs cannot be watched, or whose window already leaves dialogs to a person (one would stall
+ *  every read), is refused before it opens anything. */
 export async function openPlaywrightDigestNavigator(runPage: Page, reviewUrl: string, opts: { navTimeoutMs?: number } = {}): Promise<PlaywrightDigestNavigator> {
   const ctx = runPage.context();
   const walk = await ctx.newPage();
   let blocked = 0;
   let dialog = false;
+  let refusal = dialogsLeftToPerson(runPage)
+    ? "the run's window already leaves its dialogs to a person, so a dialog on the draft's pages would stall the walk"
+    : "";
   await walk.route("**/*", (route) => {
     const m = route.request().method().toUpperCase();
     if (m === "GET" || m === "HEAD") return route.fallback();
     blocked++;
     return route.abort("blockedbyclient");
   });
-  walk.on("dialog", (d) => { dialog = true; d.dismiss().catch(() => null); });
+  let cdp: { detach(): Promise<void> } | null = null;
+  if (!refusal) {
+    try {
+      const session = await ctx.newCDPSession(walk);
+      await session.send("Page.enable");
+      session.on("Page.javascriptDialogOpening", () => { dialog = true; });
+      cdp = session;
+    } catch {
+      refusal = "native dialogs on the draft's pages could not be watched (no DevTools session), so the walk did not start";
+    }
+  }
   const timeout = opts.navTimeoutMs ?? 20_000;
   const go = async (url: string): Promise<string> => {
     dialog = false;
@@ -699,9 +726,11 @@ export async function openPlaywrightDigestNavigator(runPage: Page, reviewUrl: st
     writesBlocked: () => blocked,
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     close: async () => {
+      await cdp?.detach().catch(() => null);
       await walk.close().catch(() => null);
       await runPage.bringToFront().catch(() => null);
     },
+    refusal: () => refusal,
     page: walk,
   };
 }

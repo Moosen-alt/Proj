@@ -10,7 +10,8 @@
 //       changes the digest; the ordinals are 1, 2.
 //   (f) UNREADABLE, by name, never hashed: over 400 rows, over 64 KB, nothing read, a dialog, a
 //       cross-origin frame, a step that opens by a script, no step links on a multi-page recipe,
-//       writes blocked during the walk, two reads that disagree, no key, no draft id.
+//       writes blocked during the walk, two reads that disagree, no key, no draft id, a walk the
+//       navigator refuses before it opens anything (f6).
 //   (g) RULING 7, pinned: the cue and token patterns are exactly these; "Last saved 2:41 PM" and
 //       "Last saved 3:05 PM" read the same, but the name beside it, a control's value, and a time on
 //       a line with no cue all still count.
@@ -30,6 +31,7 @@
 //   K4 finishDigestReading: drop the row cap → (f) "over 400 rows" fails.
 //   K5 walkStagedDraft: push a non-navigable link as read → (f) "opens by a script" fails.
 //   K6 buildStagedReviewCapture: approvable ignores `why` → every (f) case fails.
+//   K10 walkStagedDraft: ignore nav.refusal() → (f6) fails (the refused walk opens the review page).
 //   K9 stagedReviewExpectedPages: count only /^advance\b/ notes (the pre-fix heuristic) → (k) fails.
 //
 //   npx tsx portal-bot/src/reviewDigest.test.ts
@@ -192,6 +194,20 @@ await check("(f3) refused by name: a dialog, a cross-origin frame, an unreadable
   const c4 = buildStagedReviewCapture({ walk: w4, secrets: [], key: KEY, nonce: NONCE });
   assert.equal(c4.approvable, false);
   assert.ok(c4.why.some((w) => /Equipment: the page changed between two reads \(System Size \(kW DC\)\)/.test(w)), c4.why.join(" | "));
+});
+
+await check("(f6) a walk the navigator refuses (dialogs unwatchable, or the window already the person's) opens nothing and is named", async () => {
+  const nav = stubNav(pagesOf(), [link("Customer", S1)]);
+  const refused = Object.assign(nav, { refusal: () => "native dialogs on the draft's pages could not be watched (no DevTools session), so the walk did not start" });
+  const walk = await walkStagedDraft(refused, { reviewUrl: REVIEW_URL, gapMs: 0 });
+  assert.deepEqual(nav.visited, [], "a refused walk opened a page");
+  const c = buildStagedReviewCapture({ walk, secrets: [], key: KEY, nonce: NONCE });
+  assert.equal(c.approvable, false);
+  assert.equal(c.digest, "");
+  assert.ok(c.why.some((w) => /could not be watched/.test(w)), c.why.join(" | "));
+  // MUST PASS: a navigator with no refusal walks as before.
+  const ok = await walkStagedDraft(Object.assign(stubNav(pagesOf(), [link("Customer", S1)]), { refusal: () => "" }), { reviewUrl: REVIEW_URL, gapMs: 0 });
+  assert.equal(buildStagedReviewCapture({ walk: ok, secrets: [], key: KEY, nonce: NONCE }).approvable, true);
 });
 
 await check("(f5) ruling 3: an uploaded file the draft's pages list is 'listed'; one they do not list is named and the row is not approvable", () => {
