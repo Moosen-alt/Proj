@@ -9,7 +9,7 @@ import { openPortal } from "../browser";
 import { selectWithFallback, readClosedComboboxOptions } from "../comboboxFill";
 import { assertFilerIdentityHeld, FilerIdentityStop, filerIdentityFieldForSelect, filerIdentityStopMessage, selectFilerIdentity } from "../filerIdentitySelect";
 import { detectChallengeFrame, frameSelectorFor, maskId, readbackMatches, redactCaptureText, redactStatusText, safeAction, sleep, smartWait, waitForElement, waitForInteractiveControls } from "../safeAction";
-import { secretMaskPatterns, tagSecretsInPage } from "../secretMask";
+import { clearSecretTags, secretMaskPatterns, tagSecretsInPage } from "../secretMask";
 import { applyFormatHint } from "../formatHint";
 import { scrapeReviewScreen as scrapeReviewScreenShared } from "../reviewScreenScraper";
 import { performLogin, lastRevealTrail, loginFormPresent, holdForPerson } from "./loginFlow";
@@ -9927,11 +9927,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     try {
       return await take(mask.length ? mask : undefined);
     } finally {
-      if (tagged > 0) {
-        await this.page.evaluate(() => {
-          for (const el of Array.from(document.querySelectorAll("[data-al-secret]"))) el.removeAttribute("data-al-secret");
-        }).catch(() => null);
-      }
+      // The tagger reaches open shadow roots now (#436), so its own clear does too.
+      if (tagged > 0) await clearSecretTags(this.page);
     }
   }
 
