@@ -414,6 +414,12 @@ class ControlAbsentError extends Error {
 function isControlAbsent(e: unknown): boolean {
   return !!e && typeof e === "object" && (e as { controlAbsent?: unknown }).controlAbsent === true;
 }
+/** #556 — what the planner is told when a door refuses a control that waits for an enabling choice
+ *  (waitsForEnablingChoice): the same words at the navigate door and the advance door. */
+function disabledControlHint(label: string): string {
+  return `"${label}" is DISABLED on this page: it becomes clickable only after a choice here (the option, type or category this application needs). ` +
+    `Make that choice first — click or select it — and use "${label}" once it is enabled. Never choose a disabled control.`;
+}
 /** #556 — THE STALL WATCHDOG: how long the walk may go without ANY sign of progress (an event, a
  *  planner reply, a fill completing, a new page) before it is ended, named. 300 s because it must sit
  *  above every bounded quiet stretch the walk's OWN work has — one upload phase (capped at 150 s), one
@@ -7744,7 +7750,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // let the next pass try again — a live run drifted into Accela's records module
           // exactly this way.
           this.debug?.event({ type: "navigate_offlimits_rejected", page: pageCount, label: (navField.label || "").slice(0, 60), dashboard: isDashboard });
-        } else if (navField && navField.disabled && await this.controlStillDisabled(navField)) {
+        } else if (navField && await this.waitsForEnablingChoice(navField)) {
           // A DISABLED PRIMARY BUTTON WAITS FOR THE CHOICE THAT ENABLES IT (#556). Cityworks' "Begin
           // Application" stays disabled until a case type is chosen; clicking it anyway costs the
           // click's every retry and does nothing. Not clicked, not recorded, and not registered as
@@ -7753,10 +7759,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // recovery cap and the page budget like any other re-plan. A plan that also FILLS this page
           // keeps its fills — they may be the very choice that enables the button — and the page is
           // planned again after them (the tail below), never left as if it had no way forward.
+          // The ADVANCE door asks the same question with the same predicate (waitsForEnablingChoice).
           const lbl = (navField.label || "").replace(/\s+/g, " ").trim().slice(0, 60);
           this.debug?.event({ type: "navigate_disabled_refused", page: pageCount, label: lbl });
-          pendingHint = `"${lbl}" is DISABLED on this page: it becomes clickable only after a choice here (the option, type or category this application needs). ` +
-            `Make that choice first — click or select it — and use "${lbl}" once it is enabled. Never choose a disabled control.`;
+          pendingHint = disabledControlHint(lbl);
           if (!(plan.fills ?? []).length) continue;
           navDisabledRefused = true;
         } else if (navField) {
@@ -8805,6 +8811,21 @@ export class AutoLearnAdapter extends BasePortalAdapter {
               stopReason: "login_advance_with_empty_credentials",
             };
           }
+        }
+        // A DISABLED ADVANCE WAITS FOR THE CHOICE THAT ENABLES IT (#556) — the navigate door's rule and
+        // predicate (waitsForEnablingChoice), here at the planner's other door. Clicked anyway, the
+        // force-click fallback "succeeds" on a disabled button, the page does not move, and the control
+        // is banned as dead under a page key the enabling choice does not change (deadPageKey: URL and
+        // field count) — so once enabled it was skipped as dead and the walk ended on the repeat-page
+        // stop, a do-nothing click left in the recipe. Not clicked, not recorded, never banned; the
+        // planner is told what the page is waiting for, and the page is planned again (this page's
+        // fills have already run). Bounded like every re-plan: the stuck guard, the page budget. After
+        // the safety refusals above, so it never stands in for one of their stops.
+        if (await this.waitsForEnablingChoice(advanceField)) {
+          const lbl = String(advanceField.label ?? "").replace(/\s+/g, " ").trim().slice(0, 60);
+          this.debug?.event({ type: "advance_disabled_refused", page: pageCount, label: lbl });
+          pendingHint = disabledControlHint(lbl);
+          continue;
         }
         // Same exit discipline as the atReview break above: re-assert what the portal wiped
         // since the mid-page verify, so the page we advance OFF carries what we typed. Then
@@ -11993,6 +12014,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     } finally {
       if (timer) clearTimeout(timer);
     }
+  }
+
+  /** A DISABLED CONTROL WAITS FOR THE CHOICE THAT ENABLES IT (#556) — the one answer at every planner
+   *  door (navigate and advance). The scrape read it as disabled, and it is still disabled live after
+   *  controlStillDisabled's short wait (a choice made on this page may still be propagating). A door
+   *  that gets true neither clicks nor records the control, never bans it as dead, tells the planner
+   *  (disabledControlHint) and plans the page again. */
+  private async waitsForEnablingChoice(field: ExtractedField): Promise<boolean> {
+    return !!field.disabled && await this.controlStillDisabled(field);
   }
 
   /** A DISABLED CONTROL IS A GATE, NOT A WAY FORWARD (#556). Is this control disabled NOW — after a

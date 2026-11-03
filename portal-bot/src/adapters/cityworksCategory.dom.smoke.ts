@@ -29,6 +29,15 @@
 //            clicked (no step, no wasted retries), the planner is told to make the enabling choice,
 //            and the walk still reaches the form — the later, enabled click is not refused as a
 //            "re-click".
+//   advance      — as live, but the planner names the enabled "Begin Application" as the page's
+//                  ADVANCE (its other door) instead of a navigation. MUST: the same walk to the form.
+//   eagerAdvance — the planner names "Begin Application" as the ADVANCE while it is still DISABLED,
+//                  then the case type, then Begin again once it is enabled. MUST: the advance door
+//                  asks the navigate door's question — not clicked, not recorded, never banned as a
+//                  dead advance, the planner told — and the walk reaches the form. (Without that rule
+//                  the force-click "succeeds" on the disabled button, the page does not move, Begin is
+//                  banned as dead under a page key the case type does not change, and once enabled it
+//                  is skipped: the walk ended on the repeat-page stop.)
 //   gone   — the chosen category disappears between the plan and the click (an SPA re-render).
 //            MUST: a named failure ("not on the page") in seconds, never minutes of retries.
 //   wedge  — the category's click handler never returns (the page's script is stuck). MUST: the
@@ -95,9 +104,14 @@ const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 
 const norm = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
 
-type Mode = "live" | "eager" | "gone" | "wedge" | "freeze" | "stall";
+type Mode = "live" | "eager" | "advance" | "eagerAdvance" | "gone" | "wedge" | "freeze" | "stall";
+const MODES: Mode[] = ["live", "eager", "advance", "eagerAdvance", "gone", "wedge", "freeze", "stall"];
 /** Each mode's wall-clock bound in this smoke: well above its healthy time, far below the hang. */
-const DEADLINE_S: Record<Mode, number> = { live: 240, eager: 240, gone: 150, wedge: 150, freeze: 180, stall: 180 };
+const DEADLINE_S: Record<Mode, number> = { live: 240, eager: 240, advance: 240, eagerAdvance: 240, gone: 150, wedge: 150, freeze: 180, stall: 180 };
+/** The modes whose planner walks to the form, and the door it names "Begin Application" through. */
+const WALKS: Partial<Record<Mode, "navigate" | "advance">> = { live: "navigate", eager: "navigate", advance: "advance", eagerAdvance: "advance" };
+/** The step note a click through each door records. */
+const STEP_NOTE = /^(?:navigate to application|advance): /;
 /** The watchdog's budgets in the freeze and stall modes (the walk's own, and a planner call's). */
 const WALK_STALL_MS = 25_000;
 const PLANNER_STALL_MS = 50_000;
@@ -114,7 +128,7 @@ async function readApp(page: Page): Promise<{ log?: string[]; caseType?: string 
 
 /** A replay walks the recorded clicks by their selectors: each must find exactly its control. */
 async function replayFinds(steps: RecipeStep[]): Promise<string> {
-  const clicks = steps.filter((s) => s.action === "click" && /^navigate to application:/.test(norm(s.note)));
+  const clicks = steps.filter((s) => s.action === "click" && STEP_NOTE.test(norm(s.note)));
   const b = await chromium.launch();
   const out: string[] = [];
   try {
@@ -126,7 +140,7 @@ async function replayFinds(steps: RecipeStep[]): Promise<string> {
       const loc = sel.role && sel.name ? p.getByRole(sel.role as "button", { name: sel.name, exact: !!sel.exact })
         : sel.text ? p.getByText(sel.text, { exact: !!sel.exact }) : sel.css ? p.locator(sel.css) : null;
       const n = loc ? await loc.count() : -1;
-      out.push(`${norm(s.note).replace(/^navigate to application: /, "")}=${n}`);
+      out.push(`${norm(s.note).replace(STEP_NOTE, "")}=${n}`);
       if (n !== 1 || !loc) break;
       // A recorded click the replay cannot perform (a disabled control) is a finding, not a crash.
       const clicked = await loc.click({ timeout: 5000 }).then(() => true, (e: unknown) => { out.push(`(click failed: ${String((e as Error)?.message ?? e).split("\n")[0].slice(0, 80)})`); return false; });
@@ -172,6 +186,9 @@ async function walk(mode: Mode): Promise<void> {
     const call: Call = { url: new URL(req.url).pathname, labels: req.fields.map((f) => norm(f.label)), hint: norm(req.recoveryHint), chose: "", at: Date.now() };
     calls.push(call);
     const pick = (i: number, why: string): LearnPlanResponse => { call.chose = `${why}: ${i >= 0 ? norm(req.fields[i]?.label) : "-"}`; return { fills: [], atReview: false, navigateSelectorIndex: i }; };
+    // The planner's other door: the same control named as the page's advance.
+    const pickAdvance = (i: number, why: string): LearnPlanResponse => { call.chose = `${why}: ${norm(req.fields[i]?.label)}`; return { fills: [], atReview: false, advanceSelectorIndex: i }; };
+    const beginVia = (i: number, why: string): LearnPlanResponse => (WALKS[mode] === "advance" ? pickAdvance(i, `${why} (as advance)`) : pick(i, why));
     // The application form: fill the description and stop there (what this smoke is about is
     // getting HERE).
     const desc = req.fields.findIndex((f) => /description of work/i.test(norm(f.label)));
@@ -180,9 +197,10 @@ async function walk(mode: Mode): Promise<void> {
     const solar = at(/residential solar pv$/i);
     const begin = at(/^begin application$/i);
     if (solar >= 0) {
-      // eager: a planner that jumps ahead to the primary button while it is still disabled.
-      if (mode === "eager" && !eagerDone && begin >= 0) { eagerDone = true; return pick(begin, "begin (eager)"); }
-      if (begin >= 0 && !req.fields[begin].disabled) return pick(begin, "begin");
+      // eager / eagerAdvance: a planner that jumps ahead to the primary button while it is still
+      // disabled, through either door.
+      if ((mode === "eager" || mode === "eagerAdvance") && !eagerDone && begin >= 0) { eagerDone = true; return beginVia(begin, "begin (eager)"); }
+      if (begin >= 0 && !req.fields[begin].disabled) return beginVia(begin, "begin");
       return pick(solar, "case type");
     }
     // The categories: exactly the live planner's choice, by the label it was given.
@@ -259,7 +277,8 @@ async function walk(mode: Mode): Promise<void> {
 
   check(`${mode}: the walk ends on its own within ${DEADLINE_S[mode]} s (it does not hang)`, !hung, trace);
 
-  if (mode === "live" || mode === "eager") {
+  const door = WALKS[mode];
+  if (door) {
     check(`${mode}: the category click opened its case types — in place, on the same URL`,
       log.includes("category:Building Permits") && calls.some((c) => c.url === "/publicaccess/case/create" && c.labels.some((l) => /Residential Solar PV$/.test(l))), trace);
     check(`${mode}: the learner chose the solar case type by the planner's choice`, log.includes("case_type:Residential Solar PV"), trace);
@@ -271,17 +290,29 @@ async function walk(mode: Mode): Promise<void> {
         /^folder Building Permits=1 description Residential Solar PV=1 Begin Application=1$/.test(found), `replay: ${found} | ${trace}`);
     }
   }
-  if (mode === "eager") {
-    const beginSteps = steps.filter((s) => /^navigate to application: Begin Application/.test(norm(s.note)));
+  if (door) {
+    // Through whichever door the planner named it, "Begin Application" is ONE recorded click, made
+    // after the case type that enabled it, and recorded as that door's step.
+    const beginNote = door === "advance" ? /^advance: Begin Application/ : /^navigate to application: Begin Application/;
+    const beginSteps = steps.filter((s) => /Begin Application/.test(norm(s.note)));
     const typeAt = steps.findIndex((s) => /Residential Solar PV/.test(norm(s.note)));
-    const beginAt = steps.findIndex((s) => /^navigate to application: Begin Application/.test(norm(s.note)));
-    check("eager: the disabled \"Begin Application\" is refused before any click (named), never recorded as a step",
-      evTypes.includes("navigate_disabled_refused") && beginSteps.length === 1 && typeAt >= 0 && beginAt > typeAt, `events=${JSON.stringify(evTypes)} | ${trace}`);
-    check("eager: the planner is told the control is disabled and what the page is waiting for",
+    const beginAt = steps.findIndex((s) => /Begin Application/.test(norm(s.note)));
+    check(`${mode}: "Begin Application" is one recorded ${door} click, after the case type that enabled it`,
+      beginSteps.length === 1 && beginNote.test(norm(beginSteps[0]?.note)) && typeAt >= 0 && beginAt > typeAt, `events=${JSON.stringify(evTypes)} | ${trace}`);
+  }
+  if (mode === "eager" || mode === "eagerAdvance") {
+    const refused = door === "advance" ? "advance_disabled_refused" : "navigate_disabled_refused";
+    check(`${mode}: the disabled "Begin Application" is refused before any click, named (${refused})`,
+      evTypes.includes(refused), `events=${JSON.stringify(evTypes)} | ${trace}`);
+    // A refused control was never clicked, so it never "did nothing": it is not banned, and the
+    // enabled Begin is not skipped as a dead advance.
+    check(`${mode}: the refused control is never treated as a dead advance (no did-nothing, no dead skip, no dead re-plan)`,
+      !evTypes.some((t) => /^(advance_did_nothing|advance_skipped_dead|dead_advance_replan|page_repeat_stop)$/.test(t)), `events=${JSON.stringify(evTypes)} | ${trace}`);
+    check(`${mode}: the planner is told the control is disabled and what the page is waiting for`,
       calls.some((c) => /Begin Application" is DISABLED/.test(c.hint) && /choice/.test(c.hint)), trace);
     // The enabling choice CHANGED the page (Begin is enabled now): the stuck guard must not call it
     // "the last action did not change the page" to the planner that just made it.
-    check("eager: after the enabling choice the planner is not told it is STUCK",
+    check(`${mode}: after the enabling choice the planner is not told it is STUCK`,
       !evTypes.includes("recovery_attempt") && !calls.some((c) => /You are STUCK/.test(c.hint)), `events=${JSON.stringify(evTypes)} | ${trace}`);
   }
   if (mode === "gone") {
@@ -321,7 +352,7 @@ async function walk(mode: Mode): Promise<void> {
 }
 
 try {
-  for (const m of (process.env.ONLY_MODES ? process.env.ONLY_MODES.split(",") : ["live", "eager", "gone", "wedge", "freeze", "stall"]) as Mode[]) await walk(m);
+  for (const m of (process.env.ONLY_MODES ? process.env.ONLY_MODES.split(",") : MODES) as Mode[]) await walk(m);
 } finally {
   server.close();
 }
