@@ -1061,12 +1061,26 @@ export async function enterApplicationFlow(
      * result and the damage was already done.
      */
     skipLabels?: Iterable<string>;
+    /**
+     * ONE LOOK AT THE PAGE AS IT IS, AND NOTHING ELSE (#410). Set by the learner once an entry
+     * click has landed this run: from then on the walk is INSIDE an application, and the deep
+     * search's other moves are page changes no recipe step records. It opens a collapsed menu
+     * and reloads the page it started on between looks — and on PowerClerk the page it started
+     * on is the project's own address, which resumes the application at the next form. Live
+     * (PGE, 2026-10-29): the reload carried the walk from Welcome to Preparer Information under
+     * a plan made for Welcome, and the Preparer's required fields went to review blank. The
+     * settle loop is skipped too: the page was already settled after the click that opened it.
+     */
+    shallow?: boolean;
   } = {},
 ): Promise<{ ok: boolean; message: string; url: string; label?: string; viaModule?: string; alreadyClicked?: boolean }> {
   // DEEP by design. Accela's logged-in home offers only module tabs — the entry is one hop
   // inside Permits — so a shallow look finds nothing and the caller falls through to the LLM
   // planner, which is exactly the path that drifted into the records module on a live run.
-  const deep = await findApplicationEntryDeep(page);
+  // (Shallow only once an entry has landed: see opts.shallow.)
+  const deep = opts.shallow
+    ? await findApplicationEntry(page).then((f) => (f ? { match: f.match, viaModule: undefined } : null))
+    : await findApplicationEntryDeep(page);
   if (!deep) {
     return { ok: false, message: "No 'start an application' control found on this page.", url: typeof page.url === "function" ? page.url() : "" };
   }
