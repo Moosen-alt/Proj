@@ -636,6 +636,31 @@ function currentFeeSource(fee: CitedFact<PermitFeeAnswer>, gone: string[]): Cite
   return why ? { ...fee, value: null, notFound: `the cited source is ${why} — not this job's fee (${fee.sourceUrl})` } : fee;
 }
 
+/** A CITATION THE SERVER SAYS IS GONE IS NOT EVIDENCE (#560). Saratoga Springs, UT's documents list
+ *  ("2 plan sets, a disk, 2014 NEC / 2015 I-codes") was cited to the city's retired solar PDF, a
+ *  404 — and nothing ever looked. A documents list or a fee whose source page we read and found gone
+ *  (404 / 410) is refused (currentFeeSource words the fee's as a replaced schedule). The agency, the
+ *  record type and the portal keep their own doors (supportsName, recordTypeBelongsToPortal,
+ *  acceptPortalForPermit): those are read off the agency's pages and the portal itself, not off a
+ *  document that can be retired. */
+export function refuseGoneCitation<T>(fact: CitedFact<T>, gone: readonly string[], what: string): CitedFact<T> {
+  if (fact.value == null || !gone.length || !gone.includes(pageKey(fact.sourceUrl))) return fact;
+  return { ...fact, value: null, notFound: `the cited page is no longer there (HTTP 404 / 410 when read) — not kept as the ${what} (${fact.sourceUrl})` };
+}
+/** Every permit's documents list and fee through refuseGoneCitation (#560): the last door before the
+ *  write, so a list carried from an earlier row (mergeWithEarlier) meets it too. */
+export function withoutGoneCitations<L extends { permits: PermitProcessPermitAnswer[] }>(lookup: L, gone: readonly string[]): L {
+  if (!gone.length) return lookup;
+  return {
+    ...lookup,
+    permits: lookup.permits.map((p) => ({
+      ...p,
+      documents: refuseGoneCitation(p.documents, gone, "required documents"),
+      fee: refuseGoneCitation(p.fee, gone, "fee"),
+    })),
+  };
+}
+
 export function parseDocsFeesPart(text: string, seenUrls: string[], stopReason: string | null, pageTexts: Map<string, string> = new Map(), gone: string[] = []): {
   byDiscipline: Map<PermitProcessDiscipline, { documents: CitedFact<string[]>; fee: CitedFact<PermitFeeAnswer> }>; problem: string;
 } {
@@ -665,7 +690,7 @@ export function parseDocsFeesPart(text: string, seenUrls: string[], stopReason: 
       },
       supports: supportsAmount,
     });
-    out.set(discipline, { documents: onOurPage(documents, pageTexts, "required documents"), fee: tiedFee(onOurPage(currentFeeSource(fee, gone), pageTexts, "fee"), pageTexts) });
+    out.set(discipline, { documents: onOurPage(refuseGoneCitation(documents, gone, "required documents"), pageTexts, "required documents"), fee: tiedFee(onOurPage(currentFeeSource(fee, gone), pageTexts, "fee"), pageTexts) });
   }
   return { byDiscipline: out, problem: "" };
 }
@@ -1280,6 +1305,16 @@ export async function runPermitProcessLookup(
           const pg = await reader.read(u);
           if (!pg.ok && (pg.status === 404 || pg.status === 410)) gone.push(pageKey(u));
         }
+        // THE SAME ONE READ FOR A CITED DOCUMENTS LIST (#560: a retired solar PDF, a 404, was kept
+        // as Saratoga Springs' list) — its own bound (≤ 2), so the fee reads above keep theirs.
+        const docUrls = [...new Set(((parseJsonLoose(a.r.text)?.permits ?? []) as Array<Record<string, unknown>>)
+          .map((p) => p?.documents as Record<string, unknown> | undefined).filter((d) => d?.value != null)
+          .map((d) => str(d?.sourceUrl)).filter((u) => /^https?:\/\//i.test(u)))]
+          .filter((u) => !pageTexts.has(pageKey(u)) && !gone.includes(pageKey(u)) && !feeUrls.includes(u)).slice(0, 2);
+        for (const u of docUrls) {
+          const pg = await reader.read(u);
+          if (!pg.ok && (pg.status === 404 || pg.status === 410)) gone.push(pageKey(u));
+        }
       }
       const df = grounded ? parseDocsFeesPart(a.r.text, [...seenOf(a.r), ...ourSeen], a.r.stopReason, pageTexts, gone) : { byDiscipline: new Map(), problem: a.r.error ?? "ungrounded" };
       if (df.problem) problems.push(df.problem);
@@ -1454,12 +1489,26 @@ export async function runPermitProcessLookup(
   if (groundedParts === 0) {
     throw new Error(`permit-process lookup for ${input.ahj} (${input.state}) did not run: no part was grounded (no web search returned results, no page was read) — nothing kept from memory`);
   }
+  // THE EARLIER ROW'S CITATIONS, CHECKED (#560). "Never forgets" carried Saratoga Springs' list cited
+  // to a retired PDF through every re-run that found nothing better. Before a re-run carries an
+  // earlier documents list or fee, the page it was cited to gets the same one polite read (≤ 3, not a
+  // permit platform's page — the portal door judges portals): one that is gone now is not carried.
+  if (reader && existing) {
+    const earlierUrls = [...new Set(existing.permits.flatMap((p) => [p.documents, p.fee])
+      .filter((f) => f && f.value != null).map((f) => str(f.sourceUrl)).filter((u) => /^https?:\/\//i.test(u)))]
+      .filter((u) => !pageTexts.has(pageKey(u)) && !gone.includes(pageKey(u)) && !isPermitPlatformUrl(u)).slice(0, 3);
+    for (const u of earlierUrls) {
+      const pg = await reader.read(u);
+      if (!pg.ok && (pg.status === 404 || pg.status === 410)) gone.push(pageKey(u));
+    }
+  }
   // A RE-RUN NEVER FORGETS A CITED ANSWER. Over an existing seeded row, a value this run could not
-  // establish (an aborted part, a search that came up empty) keeps the earlier cited answer.
+  // establish (an aborted part, a search that came up empty) keeps the earlier cited answer — unless
+  // its cited page is gone now (withoutGoneCitations, the last door before the write).
   // The earlier row's portal goes through the ONE door with THIS run's issuer (mergeWithEarlier).
-  const merged = mergeWithEarlier(existing, { issuingAgency, permitStructure: part1.permitStructure, permits },
+  const merged = withoutGoneCitations(mergeWithEarlier(existing, { issuingAgency, permitStructure: part1.permitStructure, permits },
     (d, earlierPortal) => acceptPortalForPermit({ value: earlierPortal.value, sourceUrl: earlierPortal.sourceUrl, quote: earlierPortal.quote }, "process part", doorContextFor(d, { seen: [], platformPages: [] })),
-    (d, earlierRecordType, portalUrl) => recordTypeBelongsToPortal(earlierRecordType, portalUrl, rtCtx(d)));
+    (d, earlierRecordType, portalUrl) => recordTypeBelongsToPortal(earlierRecordType, portalUrl, rtCtx(d))), gone);
   const res = savePermitProcessLookup(db, {
     state: input.state, ahj: input.ahj, lookedUpAt: new Date().toISOString(),
     issuingAgency: merged.issuingAgency, permitStructure: merged.permitStructure, permits: merged.permits, notes,
@@ -1708,6 +1757,49 @@ export async function ensurePermitProcessLookedUp(
     } catch { /* this agency's lookup is not queued; the others still are */ }
   }
   return queued;
+}
+
+/**
+ * A PERSON'S REFRESH (#560). The trigger above never re-runs a complete seeded row, so a stale one
+ * (Saratoga Springs, UT: a documents list cited to a retired PDF) had no way back. This queues the
+ * same permit_process_lookup job with `force`, for the project's own AHJ, on a person's request:
+ *   - a row a person VERIFIED is refused (rule 3: research never overwrites it — verify or replace
+ *     it through the verify route instead);
+ *   - no model key / lookups off is said, not queued (the job could only fail);
+ *   - a refresh already pending or running for this AHJ is that one, not a second;
+ *   - the 24 h dedupe does NOT apply: a person asked, and the job's own reads are bounded.
+ * `status` is the HTTP status the route answers with.
+ */
+export async function queueProcessLookupRefresh(
+  db: AppDb,
+  project: { id: string; state: string; ahj: string; utility?: string; parserSnapshot?: Record<string, unknown> },
+  requestedBy: string,
+): Promise<{ queued: boolean; status: number; reason: string; jobId?: string; lookupKey: string }> {
+  const ahj = str(project.ahj);
+  const state = str(project.state);
+  const lookupKey = `${state.toLowerCase()}|${normalizeAhjName(ahj)}`;
+  if (!ahj || !state) return { queued: false, status: 409, reason: "this project names no AHJ and state to look up", lookupKey };
+  const existing = getPermitProcessLookup(db, state, ahj);
+  if (existing?.confidence === "verified") {
+    return { queued: false, status: 409, reason: `a person verified ${ahj}'s permit process (${existing.verifiedBy || "named person"}, ${existing.verifiedAt || "date not recorded"}); research never overwrites it — verify or replace it instead`, lookupKey };
+  }
+  if (process.env.PERMIT_PROCESS_LOOKUP === "off" || !process.env.ANTHROPIC_API_KEY) {
+    return { queued: false, status: 503, reason: "permit-process lookups are not available here (no model key, or PERMIT_PROCESS_LOOKUP=off)", lookupKey };
+  }
+  const running = db.get<{ id: string }>(
+    "SELECT id FROM job_queue WHERE job_type = 'permit_process_lookup' AND payload LIKE ? AND status IN ('pending','running') LIMIT 1",
+    [`%"lookupKey":${JSON.stringify(lookupKey)}%`],
+  );
+  if (running) return { queued: true, status: 202, reason: "a lookup for this AHJ is already pending or running", jobId: running.id, lookupKey };
+  const snap = project.parserSnapshot ?? {};
+  const jobQueue = await import("./jobQueue");
+  const job = jobQueue.enqueueJob(db, "permit_process_lookup", {
+    state, ahj, utility: str(project.utility), lookupKey,
+    dcKw: str(snap.dcKw ?? snap.systemSizeDcKw), acKw: str(snap.acKw ?? snap.systemSizeAcKw), permitPath: str(snap.permitPath),
+    force: "1", requestedBy: str(requestedBy).slice(0, 120),
+  }, { priority: 2, maxRetries: 2, projectId: project.id });
+  logger.info("permit-process", `permit-process lookup REFRESH queued for ${ahj} (${state}) by ${str(requestedBy) || "a person"}`);
+  return { queued: true, status: 202, reason: existing ? "refresh queued: the seeded row is re-run" : "lookup queued", jobId: job.id, lookupKey };
 }
 
 /** A lookup the gates let through: the job payload, enqueued later in one synchronous pass. */

@@ -194,6 +194,102 @@ export function savePermitProcessLookup(
   return { saved: true, reason: payload.confidence, lookup: saved };
 }
 
+/** One fact a person states in a verify-and-replace (#560): the value, the page they read it on,
+ *  and (optionally) its words. Lands origin "operator". */
+export interface PermitProcessPersonFact<T> { value: T; sourceUrl: string; quote?: string }
+/** One permit as a person states it. Facts left out are carried from the row's same-discipline
+ *  permit as they stand. A PORTAL IS NOT A FIELD HERE: the portal door (rule 5's one predicate at
+ *  every door) is not something a verify route re-implements; and the fee has its own path. */
+export interface PermitProcessPermitReplacement {
+  discipline: PermitProcessPermitAnswer["discipline"];
+  label?: string;
+  issuingAgency?: PermitProcessPersonFact<string>;
+  recordType?: PermitProcessPersonFact<string>;
+  documents?: PermitProcessPersonFact<string[]>;
+}
+
+/**
+ * A PERSON VERIFIES OR REPLACES THIS AHJ'S PROCESS LOOKUP (#560) — the only caller of the write
+ * path's `verifiedBy`. Saratoga Springs, UT's row cited a retired PDF and nothing could correct it.
+ *   - No `permits`: the row on file is verified as it stands.
+ *   - `permits`: the person's list IS the row's permit list (a permit not listed is dropped — a stale
+ *     permit is how the dead list stayed); each listed permit takes the facts the person states, and
+ *     carries the rest from the row's same-discipline permit.
+ * Either way the row lands 'verified' with verified_by = the named person, and from then on a lookup
+ * never overwrites it (hard rule 3) — a person can verify it again with new facts.
+ */
+export function verifyPermitProcessLookup(
+  db: AppDb,
+  where: { state: string; ahj: string },
+  opts: { verifiedBy: string; permits?: PermitProcessPermitReplacement[] },
+): SavePermitProcessResult {
+  const who = String(opts.verifiedBy ?? "").trim().slice(0, 120);
+  if (!who) return { saved: false, reason: "a process lookup is verified by a named person", lookup: null };
+  if (!normalizeAhjName(where.ahj) || !String(where.state ?? "").trim()) return { saved: false, reason: "no AHJ name", lookup: null };
+  const existing = getPermitProcessLookup(db, where.state, where.ahj);
+  const replacing = Array.isArray(opts.permits);
+  if (!existing && !replacing) return { saved: false, reason: "no process lookup is on file to verify — state the permits you checked to replace it", lookup: null };
+  const person = <T>(f: PermitProcessPersonFact<T>): CitedFact<T> | string => {
+    const url = String(f.sourceUrl ?? "").trim();
+    if (!/^https?:\/\//i.test(url)) return "every fact a person states carries the http(s) page it was read on";
+    return { value: f.value, sourceUrl: url, quote: String(f.quote ?? "").trim().slice(0, 300), origin: "operator" };
+  };
+  const blank = (why: string): CitedFact<never> => ({ value: null, sourceUrl: "", quote: "", origin: "operator", notFound: why });
+  const replaced: string[] = [];
+  let permits = existing?.permits ?? [];
+  if (replacing) {
+    const out: PermitProcessPermitAnswer[] = [];
+    for (const r of opts.permits!) {
+      const base = existing?.permits.find((p) => p.discipline === r.discipline);
+      const next: PermitProcessPermitAnswer = base
+        ? { ...base }
+        : {
+            discipline: r.discipline, label: r.discipline,
+            issuingAgency: blank("not stated by the person who verified this row"),
+            portalUrl: blank("not stated by the person who verified this row"),
+            recordType: blank("not stated by the person who verified this row"),
+            documents: blank("not stated by the person who verified this row"),
+            fee: blank("not stated by the person who verified this row"),
+          };
+      if (r.label && String(r.label).trim()) next.label = String(r.label).trim().slice(0, 160);
+      for (const key of ["issuingAgency", "recordType", "documents"] as const) {
+        const f = r[key];
+        if (!f) continue;
+        if (key === "documents") {
+          const items = (Array.isArray(f.value) ? f.value : []).map((x) => String(x ?? "").trim()).filter(Boolean).slice(0, 40);
+          if (!items.length) return { saved: false, reason: "a documents list a person states names at least one document", lookup: existing };
+          const fact = person({ ...(f as PermitProcessPersonFact<string[]>), value: items });
+          if (typeof fact === "string") return { saved: false, reason: fact, lookup: existing };
+          next.documents = fact;
+        } else {
+          const value = String(f.value ?? "").trim().slice(0, 300);
+          if (!value) return { saved: false, reason: `the ${key === "issuingAgency" ? "issuing agency" : "record type"} a person states is not blank`, lookup: existing };
+          const fact = person({ ...(f as PermitProcessPersonFact<string>), value });
+          if (typeof fact === "string") return { saved: false, reason: fact, lookup: existing };
+          next[key] = fact;
+        }
+        replaced.push(`${r.discipline} ${key === "issuingAgency" ? "issuing agency" : key === "recordType" ? "record type" : "documents"}`);
+      }
+      // A replaced permit's catalog candidates were the old record type's; they go with it.
+      if (r.recordType) delete next.recordTypeCandidates;
+      out.push(next);
+    }
+    for (const p of permits) if (!out.some((o) => o.discipline === p.discipline)) replaced.push(`${p.discipline} permit dropped`);
+    permits = out;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const base: Omit<PermitProcessLookup, "profileKey" | "confidence"> = existing
+    ? (({ profileKey: _k, confidence: _c, verifiedAt: _va, verifiedBy: _vb, ...rest }) => rest)(existing)
+    : {
+        state: where.state, ahj: where.ahj,
+        issuingAgency: blank("not stated by the person who verified this row"),
+        permitStructure: blank("not stated by the person who verified this row"),
+        permits: [], lookedUpAt: new Date().toISOString(), model: "person",
+      };
+  const note = `Verified by ${who} on ${today}${replaced.length ? ` — replaced: ${replaced.join("; ")}` : " as it stood"}.`;
+  return savePermitProcessLookup(db, { ...base, permits, notes: [...(base.notes ?? []), note], confidence: "verified" }, { verifiedBy: who });
+}
+
 // ── Cited state rules (layer 3) ──────────────────────────────────────────────────────────
 // Each is a fact about EVERY jurisdiction in the state, with the rule/form it comes from and the
 // words it says. Add a state by adding its facts here — never a jurisdiction.

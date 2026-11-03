@@ -180,7 +180,7 @@ await run("a newer runtime lookup is never overwritten by the reference (the ref
   assert.deepEqual(lookupRequiredList({ state: "UT", ahj: "Provo" }).items, ["Runtime line P"]);
 });
 
-await run("an OLDER runtime lookup keeps its own answers; the cited checklist is added beside them", () => {
+await run("an OLDER runtime lookup keeps its own answers; the cited checklist REPLACES its documents list (#560: no stale list beside it)", () => {
   savePermitProcessLookup(db, runtime("Lehi", ["Runtime line L"]));
   db.run("UPDATE permit_process_lookups SET updated_at = ? WHERE profile_key = ?", ["2026-01-01T00:00:00.000Z", "ut|lehi"]);
   seedInitialKnowledgeBase(db);
@@ -190,7 +190,8 @@ await run("an OLDER runtime lookup keeps its own answers; the cited checklist is
   assert.equal(lk.issuingAgency.value, "City of Lehi");
   assert.deepEqual(lk.permits.map((p) => p.label), ["Residential Structural", REFERENCE_CHECKLIST_LABEL]);
   const got = lookupRequiredList({ state: "UT", ahj: "Lehi" });
-  assert.deepEqual(got.items, ["Runtime line L", ...docsOf("Lehi").items]);
+  assert.deepEqual(got.items, docsOf("Lehi").items, "the runtime list is superseded, not kept beside the checklist");
+  assert.match(String(lk.permits[0].documents.notFound), /superseded by .*published checklist/);
   // and a second boot leaves it alone (it is now newer than the page read)
   const before = rowOf("Lehi");
   seedInitialKnowledgeBase(db);

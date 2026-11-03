@@ -244,7 +244,9 @@ check("NY MUST-PASS: RCNYS / FCNYS parse whole, no self-base; stale RCNYS named 
   assert.ok(f && /RCNYS 2020/.test(f.message), f?.message);
 });
 check("MUST-EXCLUDE: '2017 & 2020 NEC CODE' is the NEC, never a code named 'NC'", () => {
-  assert.deepEqual(codes("LABELING REQUIREMENTS BASED ON THE 2017 & 2020 NEC CODE, OSHA STANDARD"), ["NEC 2020"]);
+  assert.deepEqual(codes("GOVERNING CODES: LABELING REQUIREMENTS BASED ON THE 2017 & 2020 NEC CODE, OSHA STANDARD"), ["NEC 2020"]);
+  // The same sentence on a labels sheet, outside any code-basis block, is no code basis (#559).
+  assert.deepEqual(codes("LABELING REQUIREMENTS BASED ON THE 2017 & 2020 NEC CODE, OSHA STANDARD"), []);
 });
 
 // ---------------------------------------------------------------------------------------------

@@ -797,7 +797,23 @@ export function fileTypeAllowed(filePath: string, accept: string): boolean {
 // and it is exactly the failure the meter-photo note above records. Leave these empty so the
 // required-field sweep reports them and a human supplies the real file.
 const UPLOAD_NO_SUBSTITUTE = /insurance|invoice|\bw-?9\b|tax\s*form|voided\s*check|bank|volt\s*var|settings\s*(picture|photo|screenshot)|commissioning\s*(photo|report)|interconnection\s*agreement|signed\s*agreement/i;
-const EXACT_UPLOAD_TYPES = new Set(["building_application", "electrical_application", "permit_application", "solar_checklist", "structural_letter", "pv_worksheet"]);
+// meter_photo is here for #542: PacifiCorp's REQUIRED "Upload a photo of meter where system will be
+// interconnected", with no photo on file, received the whole plan set from the split-mode tier 1b
+// substitute (and combined mode filed the plan set there even when the photo WAS held). A photo of
+// the customer's meter is the one document that can fill that slot; with none it stays empty and
+// is reported missing, and a recipe that recorded the plan set against it is refused at replay.
+const EXACT_UPLOAD_TYPES = new Set(["building_application", "electrical_application", "permit_application", "solar_checklist", "structural_letter", "pv_worksheet", "meter_photo"]);
+
+// A SLOT THAT ASKS FOR A PHOTO (#542). No plan sheet, spec or bill is a photograph of the installed
+// gear, so a required "Photo of the main service panel" / "Picture of signage…" slot whose own
+// photo we don't hold is left empty and reported, never handed a stand-in from the fallback tiers.
+// Word-bounded so "Photovoltaic" is not a photo request; a label that also asks for plans or
+// drawings ("Plans and photos") keeps the plan set.
+const PHOTO_SLOT = /\b(photo(graph)?s?|pictures?)\b/i;
+const PHOTO_SLOT_ALSO_PLANS = /\bplans?\b|plan\s*set|drawings?/i;
+export function uploadAsksForPhoto(label: string | undefined): boolean {
+  return !!label && PHOTO_SLOT.test(label) && !PHOTO_SLOT_ALSO_PLANS.test(label);
+}
 
 /**
  * A TYPED REQUIRED CARD THAT NAMES ITS DOCUMENT (B7). EnerGov CSS / DigEplan / ACA show one card
@@ -3510,6 +3526,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // empty lets the required-field sweep report it and a human attach the real file.
     if (uploadForbidsSubstitute(label)) {
       this.debug?.event({ type: "upload_no_substitute", label: (label || "").slice(0, 60) });
+      return null;
+    }
+    // A PHOTO SLOT TAKES ITS OWN PHOTO OR NOTHING (#542). Tier 1 above already attached the
+    // photo when we hold it; every tier below would hand the slot a document that is not a photo.
+    if (uploadAsksForPhoto(label)) {
+      this.debug?.event({ type: "upload_no_substitute", label: label.slice(0, 60), reason: "photo_slot" });
       return null;
     }
     // 1b) Specific label matched but split doc is missing → use plan_set as the best

@@ -240,9 +240,10 @@ const COLON_ROWS: Array<[string, string[]]> = [
   ["2021 INTERNATIONAL RESIDENTIAL CODE: SECTION R324 2017 NATIONAL ELECTRICAL CODE: ARTICLE 690", ["IRC 2021 sure", "NEC 2017 sure"]],
   ["2021 INTERNATIONAL RESIDENTIAL CODE: SECTION R324", ["IRC 2021 sure"]],
 ];
-// Table 3: a name with no year of its own (the first row has no header).
+// Table 3: a name with no year of its own. (Its first row had no header; since #559 a name in a
+// sentence outside a code-basis block reads nothing, so it is read inside one.)
 const YEARLESS_ROWS: Array<[string, string[]]> = [
-  ["ALL WORK PER THE BUILDING CODE 2020 NATIONAL ELECTRICAL CODE", ["NEC 2020 sure"]],
+  [GOV("ALL WORK PER THE BUILDING CODE 2020 NATIONAL ELECTRICAL CODE"), ["NEC 2020 sure"]],
   [GOV("LOCAL FIRE CODE 2021 IRC 2020 NEC"), ["IRC 2021 sure", "NEC 2020 sure"]],
 ];
 
@@ -307,7 +308,8 @@ check("MUST-PASS: a generic mention keeps its slot — its own year is never lef
 });
 
 check("MUST-PASS: all-caps prose before a name-first name is not part of it — 'SHALL CONFORM TO CHICAGO ELECTRICAL CODE 2018' is CEC 2018", () => {
-  assert.deepEqual(codes("SHALL CONFORM TO CHICAGO ELECTRICAL CODE 2018"), ["CEC 2018"]);
+  // Outside a code-basis block a sentence of prose is no code basis at all (#559).
+  assert.deepEqual(codes("SHALL CONFORM TO CHICAGO ELECTRICAL CODE 2018"), []);
   assert.deepEqual(codes(GOV("ALL WORK SHALL CONFORM TO CHICAGO ELECTRICAL CODE 2018")), ["CEC 2018"]);
 });
 
@@ -318,7 +320,7 @@ check("MUST-EXCLUDE: the heading, placard and conjunction shapes keep reading as
   assert.ok(!codes("NEC: 2020 PER CODE: NEC 690.54").some((c) => c.startsWith("PC ")), "no code named PC");
   // "AND" between two names joins no name: never a code named "ORSCAOSSC".
   assert.deepEqual(codes(GOV("2023 OREGON RESIDENTIAL SPECIALTY CODE AND OREGON STRUCTURAL SPECIALTY CODE 2023")), ["ORSC 2023", "OSSC 2023"]);
-  assert.deepEqual(codes("OREGON RESIDENTIAL SPECIALTY CODE AND OREGON STRUCTURAL SPECIALTY CODE 2023"), ["OSSC 2023"]);
+  assert.deepEqual(codes(GOV("OREGON RESIDENTIAL SPECIALTY CODE AND OREGON STRUCTURAL SPECIALTY CODE 2023")), ["OSSC 2023"]);
   assert.deepEqual(codes(GOV("2023 ORSC AND 2025 OSSC")), ["ORSC 2023", "OSSC 2025"]);
   assert.deepEqual(codes(GOV("2023 EDITION OF THE OREGON RESIDENTIAL SPECIALTY CODE")), ["ORSC 2023"]);
   assert.deepEqual(codes(GOV("IRC 2021 AND NATIONAL ELECTRICAL CODE 2020")), ["IRC 2021", "NEC 2020"]);
