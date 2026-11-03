@@ -638,26 +638,23 @@ function currentFeeSource(fee: CitedFact<PermitFeeAnswer>, gone: string[]): Cite
 
 /** A CITATION THE SERVER SAYS IS GONE IS NOT EVIDENCE (#560). Saratoga Springs, UT's documents list
  *  ("2 plan sets, a disk, 2014 NEC / 2015 I-codes") was cited to the city's retired solar PDF, a
- *  404 — and nothing ever looked. Any cited answer whose source page we read and found gone (404 /
- *  410) is refused, whatever the answer is: the documents list, the fee (currentFeeSource words it
- *  as a replaced schedule), the issuing agency, the record type. A portal is not judged here — the
- *  portal door (acceptPortalForPermit) is the one place a portal is kept or refused. */
+ *  404 — and nothing ever looked. A documents list or a fee whose source page we read and found gone
+ *  (404 / 410) is refused (currentFeeSource words the fee's as a replaced schedule). The agency, the
+ *  record type and the portal keep their own doors (supportsName, recordTypeBelongsToPortal,
+ *  acceptPortalForPermit): those are read off the agency's pages and the portal itself, not off a
+ *  document that can be retired. */
 export function refuseGoneCitation<T>(fact: CitedFact<T>, gone: readonly string[], what: string): CitedFact<T> {
   if (fact.value == null || !gone.length || !gone.includes(pageKey(fact.sourceUrl))) return fact;
   return { ...fact, value: null, notFound: `the cited page is no longer there (HTTP 404 / 410 when read) — not kept as the ${what} (${fact.sourceUrl})` };
 }
-/** Every citable fact of a saved lookup through refuseGoneCitation (#560): the last door before the
- *  write, so a value carried from an earlier row (mergeWithEarlier) meets it too. */
-export function withoutGoneCitations<L extends { issuingAgency: CitedFact<string>; permitStructure: CitedFact<"separate" | "combo">; permits: PermitProcessPermitAnswer[] }>(lookup: L, gone: readonly string[]): L {
+/** Every permit's documents list and fee through refuseGoneCitation (#560): the last door before the
+ *  write, so a list carried from an earlier row (mergeWithEarlier) meets it too. */
+export function withoutGoneCitations<L extends { permits: PermitProcessPermitAnswer[] }>(lookup: L, gone: readonly string[]): L {
   if (!gone.length) return lookup;
   return {
     ...lookup,
-    issuingAgency: refuseGoneCitation(lookup.issuingAgency, gone, "issuing agency"),
-    permitStructure: refuseGoneCitation(lookup.permitStructure, gone, "permit structure"),
     permits: lookup.permits.map((p) => ({
       ...p,
-      issuingAgency: refuseGoneCitation(p.issuingAgency, gone, "issuing agency"),
-      recordType: refuseGoneCitation(p.recordType, gone, "record type"),
       documents: refuseGoneCitation(p.documents, gone, "required documents"),
       fee: refuseGoneCitation(p.fee, gone, "fee"),
     })),
