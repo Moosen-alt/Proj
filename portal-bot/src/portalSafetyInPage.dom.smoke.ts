@@ -98,6 +98,10 @@ const PAGES: Record<string, string> = {
   "/step1-plus-review-heading": pgeWelcome("look", 0, "<h2>Review your application</h2><p>Review the application below, then click Submit.</p>"),
   // Step 1 current, and step 1 IS the review step ("1 Review and Submit"): still review.
   "/step1-is-review": pgeWelcome("look", 0, "", ["Review and Submit", "Payment", "Confirmation"]),
+  // Helm's #558 review: step 1 named by the BARE word ("1 Review", "1 Summary") over a summary page
+  // saying "Staff will review your application… Click Next": still review.
+  "/step1-bare-review": pgeWelcome("look", 0, `${SUMMARY_DL}<p>Staff will review your application within 5 business days. Click Next to send it to the city.</p>`, ["Review", "Payment", "Receipt"]),
+  "/step1-bare-summary": pgeWelcome("look", 0, `${SUMMARY_DL}<p>Staff will review your application within 5 business days. Click Next to send it to the city.</p>`, ["Summary", "Payment", "Receipt"]),
   // Step 2's number box has neither PowerClerk look (a "done" style): unknown, so main's reading.
   "/two-odd-looks": pgeWelcome("look", 0).replace('<div class="bg-white text-primary-600 border border-primary-600 fw-bold rounded pagination-num d-flex justify-content-center">2', '<div class="bg-success text-white fw-bold rounded pagination-num d-flex justify-content-center">2'),
   // Steps 1 AND 4 both filled: no single current step.
@@ -352,6 +356,8 @@ try {
       ["/step1-of-2", "a two-step bar"],
       ["/step1-plus-review-heading", "step 1 current, but the page also says \"Review your application\" / \"Review the application below, then click Submit\""],
       ["/step1-is-review", "step 1 current, and step 1 is \"Review and Submit\""],
+      ["/step1-bare-review", "\"1 Review / 2 Payment / 3 Receipt\" with step 1 current over a summary saying \"Staff will review your application… Click Next\""],
+      ["/step1-bare-summary", "\"1 Summary / 2 Payment / 3 Receipt\" with step 1 current over the same summary"],
       ["/menu-home-current-summary", "a site menu with Home current (not numbered) over a summary saying \"Staff will review your application\""],
       ["/review-future-plus-heading", "a review page that also says \"we will review your application\" (Helm's MUST-PASS)"],
     ] as const) {

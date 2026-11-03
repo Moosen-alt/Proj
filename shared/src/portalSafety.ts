@@ -683,6 +683,11 @@ export function portalSafetyFactory() {
   // THE STRUCTURAL FACT: a numbered step list's ONE current step is its first. True only when a
   // list's current step is known (a semantic marker, or PowerClerk's exact look) and is step 1, and
   // no numbered list on the page says otherwise; any doubt is false (main's reading).
+  // Step 1's OWN label must not name a terminal step. The bare words count, not only the phrases
+  // isReviewPageText knows: "1 Review / 2 Payment / 3 Receipt" or "1 Summary …" with step 1 current
+  // is a review wizard, and its "Staff will review your application… Click Next" keeps reading
+  // review (Helm's Full review of #558).
+  const stepOneLabelTerminal = (label: string): boolean => isReviewPageText(label) || /\b(review|summar|confirm|certif|sign|submit|pay)/i.test(label);
   const firstStepCurrentInPage = (d: Document): boolean => {
     let first = false;
     const listOf = (list: Element): Element[] | null => {
@@ -698,7 +703,7 @@ export function portalSafetyFactory() {
         const list: Element = n.parentElement;
         const items = listOf(list);
         if (items && items.includes(n)) {
-          if (items.indexOf(n) !== 0 || isReviewPageText(textOf(n)) || !shownEl(n)) return false;
+          if (items.indexOf(n) !== 0 || stepOneLabelTerminal(textOf(n)) || !shownEl(n)) return false;
           first = true;
           break;
         }
@@ -717,7 +722,7 @@ export function portalSafetyFactory() {
           if (boxes.some((b) => !b)) return false;
           const filled = boxes.filter((b) => pcFilled(b as Element)).length;
           if (filled !== 1 || !boxes.every((b) => pcFilled(b as Element) || pcOutlined(b as Element))) return false;
-          if (items.indexOf(n) !== 0 || isReviewPageText(textOf(n)) || !shownEl(n)) return false;
+          if (items.indexOf(n) !== 0 || stepOneLabelTerminal(textOf(n)) || !shownEl(n)) return false;
           first = true;
           break;
         }
