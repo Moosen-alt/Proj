@@ -2351,36 +2351,57 @@ export function capturedFieldIsSecret(p: { sensitive?: boolean; identity?: Field
  *  (SECRET_SEPARATOR_CLASS: whitespace — line breaks and CRLF included, so a wrapped number is still
  *  one number — any dash: ASCII, U+2010-2015 and the U+2212 minus, dots, '#', '/', and — #436
  *  skeptic — the comma of "8,814,402,937", the underscore and the parentheses of "(8814) 402-937"),
- *  never inside a longer digit run; the class wordingNamesProject reads too ('/' aside). A secret
- *  that carries LETTERS as well (an alphanumeric meter number, "1ND4421") is ALSO matched by its
- *  whole letter-and-digit sequence, case-insensitive, the same separators ignored between them: its
- *  digits alone ("14421") are never written together in "1ND4421" or "1-ND-4421", so the digit
- *  match alone let it through. Other secrets only when they carry a digit and are 6+ chars (a
+ *  never inside a longer digit run; the class wordingNamesProject reads too ('/' aside). Other
+ *  secrets only when they carry a digit and are 6+ chars, as a case-insensitive LITERAL (a
  *  meter-keyed word like "exterior" is not an identifier and must not erase that word from the
  *  notes). `replace` decides what a hit becomes — default "[redacted]"; a caller whose downstream
- *  check reads a last-4 may keep one (maskId). Widening this only ever redacts more. */
+ *  check reads a last-4 may keep one (maskId).
+ *
+ *  TWO PHASES, SO THE RESULT IS ALWAYS A SUPERSET OF THE ORIGINAL SCRUB'S (#436 fix round 1: a
+ *  widening that ran INSTEAD of the literal let "Sol@r2024", "SA:12AB34" and "AB*1234" through in
+ *  clear, where the original scrub redacted them).
+ *    1. THE ORIGINAL SCRUB, unchanged and first, for every secret: the digit match over the original
+ *       separators ([\s\-‐-―−.#/]) for 5+ digits, else the literal. Its output is the
+ *       original function's output, character for character (redactSecretValuesSuperset.test pins
+ *       that against a copy of the original function, over a corpus).
+ *    2. THE WIDENINGS, after it, on its output — each can only redact more:
+ *       - the digit match over SECRET_SEPARATOR_CLASS (the comma, underscore and parentheses too);
+ *       - a secret that carries LETTERS as well (an alphanumeric meter number, "1ND4421") by its
+ *         whole letter-and-digit sequence, case-insensitive, SECRET_SEPARATOR_CLASS ignored between
+ *         them: its digits alone ("14421") are never written together in "1ND4421" or "1-ND-4421".
+ *  A secret holding a character that is neither a letter, a digit nor a separator ("Pass!2024",
+ *  "Zürich12") is caught by phase 1's literal; phase 2 does not match it, and never has to. */
 export const SECRET_SEPARATOR_CLASS = "[\\s\\-\\u2010-\\u2015\\u2212.#/,_()]";
+/** The separators the original scrub read (phase 1). Never narrowed: phase 2 reads the wider class. */
+const SECRET_SEPARATOR_CLASS_ORIGINAL = "[\\s\\-\\u2010-\\u2015\\u2212.#/]";
 export function redactSecretValues(text: string, secrets: Iterable<string>, replace: (hit: string) => string = () => "[redacted]"): string {
   let out = text;
-  const sep = `${SECRET_SEPARATOR_CLASS}*`;
-  for (const secret of secrets) {
-    const raw = String(secret ?? "");
+  const list = Array.from(secrets ?? [], (secret) => String(secret ?? ""));
+  // PHASE 1 — the original scrub, exactly.
+  for (const raw of list) {
     const digits = raw.replace(/\D/g, "");
-    const alnum = raw.replace(/[^0-9A-Za-z]/g, "");
-    const lettered = /[A-Za-z]/.test(alnum) && /\d/.test(alnum);
     if (digits.length >= 5) {
-      const pattern = digits.split("").join(sep);
+      const pattern = digits.split("").join(`${SECRET_SEPARATOR_CLASS_ORIGINAL}*`);
       out = out.replace(new RegExp(`(?<!\\d)${pattern}(?!\\d)`, "g"), (m) => replace(m));
-    }
-    if (lettered && (digits.length >= 5 || raw.trim().length >= 6)) {
-      const pattern = alnum.split("").join(sep);
-      out = out.replace(new RegExp(`${/^\d/.test(alnum) ? "(?<!\\d)" : ""}${pattern}${/\d$/.test(alnum) ? "(?!\\d)" : ""}`, "gi"), (m) => replace(m));
-    } else if (digits.length < 5 && raw.trim().length >= 6 && /\d/.test(raw)) {
+    } else if (raw.trim().length >= 6 && /\d/.test(raw)) {
       // Whitespace inside the secret matches any whitespace run: text read off a page wraps "AB 1234"
       // at its space as easily as it prints it on one line (#260 review). Trimmed before the length
       // gate, so padding never lets a short value through to over-redact.
-      const literal = String(secret).trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
+      const literal = raw.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/\s+/g, "\\s+");
       out = out.replace(new RegExp(literal, "gi"), (m) => replace(m));
+    }
+  }
+  // PHASE 2 — the widenings, on phase 1's output.
+  const sep = `${SECRET_SEPARATOR_CLASS}*`;
+  for (const raw of list) {
+    const digits = raw.replace(/\D/g, "");
+    const alnum = raw.replace(/[^0-9A-Za-z]/g, "");
+    if (digits.length >= 5) {
+      out = out.replace(new RegExp(`(?<!\\d)${digits.split("").join(sep)}(?!\\d)`, "g"), (m) => replace(m));
+    }
+    if (/[A-Za-z]/.test(alnum) && /\d/.test(alnum) && (digits.length >= 5 || raw.trim().length >= 6)) {
+      const pattern = alnum.split("").join(sep);
+      out = out.replace(new RegExp(`${/^\d/.test(alnum) ? "(?<!\\d)" : ""}${pattern}${/\d$/.test(alnum) ? "(?!\\d)" : ""}`, "gi"), (m) => replace(m));
     }
   }
   return out;
