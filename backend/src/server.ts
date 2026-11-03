@@ -3488,13 +3488,14 @@ app.post("/api/projects/:id/prepare-submission", (req, res) => {
   // autopilot/approve does: a filing must always be attributable to a person.
   const allowFinalSubmit = req.body?.allowFinalSubmit === true || String(req.body?.allowFinalSubmit) === "true";
   // #436 RULING 5 (owner 2026-11-03): A TRACK ALREADY SUBMITTED AND TRACKED IS NEVER STAGED AGAIN — a
-  // filing is on record for it, or its tracking card holds the filing's number. Refused HERE, before
-  // an approval is minted or a job enqueued (the card holds Stage with the same reason, and the job
-  // asks the same predicate again). A plain Stage while a staged draft awaits approval is not this:
-  // it runs. The trackless legacy stage keeps its own refusals in the job.
+  // filing is on record for it (trackSubmittedAndTracked: main's duplicate guard, asked here too).
+  // Refused HERE, before an approval is minted or a job enqueued (the card holds Stage with the same
+  // reason, and the job asks the same predicate again). A number on the tracking card alone is NOT
+  // this (PowerClerk numbers a draft), and neither is a staged draft awaiting approval: both run.
+  // The trackless legacy stage keeps its own refusals in the job.
   if (track) {
     const filed = trackSubmittedAndTracked(db, projectId, track, requiredTracks(getProjectDetail(db, projectId).project));
-    if (filed) throw new HttpError(409, trackSubmittedSentence(filed), { track, submittedAndTracked: filed.via, number: filed.number });
+    if (filed) throw new HttpError(409, trackSubmittedSentence(filed), { track, submittedAndTracked: filed.via, number: filed.number, tracked: filed.tracked });
   }
   // APPROVE & SUBMIT: A NAMED PERSON APPROVES THIS RUN. The approval row is the only thing that
   // lets the run click the portal's final submit (repository.maySubmitAutomatically also needs

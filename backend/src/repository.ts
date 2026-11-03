@@ -8989,10 +8989,11 @@ export async function prepareSubmission(
   // run row ended up saying: a submissions row 'submitted_unconfirmed', a run whose result reports
   // the click (08909df6 / 5864e8ef clicked and were recorded 'failed', and the second filing went
   // through), or a portal.auto_submitted audit row for the track.
-  // #436 RULING 5: those three readings now live in submittalTracks.trackFilingOnRecord, and the ONE
-  // predicate — trackSubmittedAndTracked — adds the track's tracking card holding the filing's
-  // number. The Stage route asks it before an approval is minted, and the track card shows it beside
-  // a held Stage; here it is asked again before anything opens. A staged draft is never it.
+  // #436 RULING 5: those three readings now live in submittalTracks.trackFilingOnRecord, read through
+  // the ONE predicate — trackSubmittedAndTracked — which refuses on them alone (a number on the
+  // tracking card never does: PowerClerk numbers a draft). The Stage route asks it before an approval
+  // is minted, and the track card shows it beside a held Stage; here it is asked again before
+  // anything opens. A staged draft is never it.
   const filedOn = (t: string): Row | null => {
     const e = trackSubmittedAndTracked(db, projectId, t as SubmittalTrackType, required as SubmittalTrackType[]);
     return e ? { permit_number: e.number, application_number: "", submitted_at: e.at, via: e.via } : null;
@@ -9047,7 +9048,7 @@ export async function prepareSubmission(
     if (filedEvidence) {
       const num = filedNumber({ permit_number: filedEvidence.number, application_number: "", via: filedEvidence.via });
       throw new HttpError(409, trackSubmittedSentence(filedEvidence),
-        { track, permitNumber: num, submittedAt: filedEvidence.at, submittedAndTracked: filedEvidence.via });
+        { track, permitNumber: num, submittedAt: filedEvidence.at, submittedAndTracked: filedEvidence.via, tracked: filedEvidence.tracked });
     }
   } else {
     const found = footprint.map((t) => {

@@ -5389,7 +5389,7 @@ function trackCardHtml(t) {
     ? "This filing has a staged draft; finish it from the review window or by staging again, then a person submits."
     : "";
   // #436 RULING 5 (owner 2026-11-03): A FILING ALREADY SUBMITTED AND TRACKED IS NEVER STAGED AGAIN. The
-  // server's own reason (stageBlocked: a filing on record, or the tracking card holds its number); the
+  // server's own reason (stageBlocked: a filing on record; a number on the tracking card alone never is); the
   // route refuses the same request with a 409, so a stale card's click files nothing either.
   const stageBlocked = t.stageBlocked ? String(t.stageBlocked) : "";
   // #436 PR1 — WHAT THE STAGED DRAFT SHOWS, beside the held Approve: the masked picture of its review

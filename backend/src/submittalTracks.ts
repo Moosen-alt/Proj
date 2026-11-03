@@ -527,58 +527,56 @@ export function trackFilingOnRecord(db: AppDb, projectId: string, track: Submitt
   );
 }
 
-/** #436 ruling 5 — what makes a track SUBMITTED AND TRACKED, by name. */
+/** #436 ruling 5 — the filing on record that refuses a Stage of the track, by name. */
 export interface TrackSubmittedEvidence {
   track: SubmittalTrackType;
-  /** 'submitted' / 'submitted_unconfirmed' / 'automation_click': a filing on record (trackFilingOnRecord);
-   *  'tracking_card': the track's tracking card holds the filing's number. */
-  via: "submitted" | "submitted_unconfirmed" | "automation_click" | "tracking_card";
+  /** How the filing is on record (trackFilingOnRecord): a person captured it ('submitted'), or
+   *  automation clicked the final submit ('submitted_unconfirmed' / 'automation_click'). */
+  via: "submitted" | "submitted_unconfirmed" | "automation_click";
   /** The filing's number ("" when automation clicked and nothing was captured). */
   number: string;
   at: string | null;
+  /** Whether a tracking card follows the track (an active tracking target speaks for it). Said in the
+   *  refusal's details; it never decides the refusal. */
+  tracked: boolean;
 }
 
 /**
- * #436 RULING 5 (owner 2026-11-03, "b, let it run" — except once submitted and tracked): IS THIS
- * TRACK ALREADY SUBMITTED AND TRACKED? The ONE predicate the Stage route (a 409 before an approval is
- * minted), prepareSubmission (the job, before anything opens) and the track card (the reason beside a
- * held Stage) all read. Either a filing is on record for the track (trackFilingOnRecord), or its
- * tracking card holds the filing's number: the tracking target that speaks for the track — its own
- * tagged target, or an untagged one ONLY when this is the one track drawing on that pool (on a
- * multi-permit project one unattributed number cannot be pinned on building rather than
- * electrical, isTrackDone's rule) — carries an application or permit number.
+ * #436 RULING 5 (owner 2026-11-03: "let a plain Stage run, but BLOCK when the track is already
+ * SUBMITTED AND TRACKED"): IS A FILING ON RECORD FOR THIS TRACK? The ONE predicate the Stage route (a
+ * 409 before an approval is minted), prepareSubmission (the job, before anything opens) and the track
+ * card (the reason beside a held Stage) all read: a filing is on record (trackFilingOnRecord — the
+ * submissions record, or automation's click, main's duplicate guard). Tracked or not, a filed track
+ * is never staged again (main's guard refused it already; "a filed application is never re-staged").
  *
- * NOT a reason to refuse: a staged draft awaiting approval (an awaiting_human_submit submission —
- * whose row can hold the draft's own number: it is never read here). A plain Stage over it runs.
+ * NOT a reason to refuse (#436 fix round 1):
+ *   - a number on the track's TRACKING CARD alone. PowerClerk assigns its NEM-xxxxx at DRAFT time, so
+ *     a card can hold a draft's own number before anything is filed — it held Stage (and one-click)
+ *     on a track nobody had submitted;
+ *   - a staged draft awaiting approval (an awaiting_human_submit submission — whose row can hold the
+ *     draft's own number: it is never read here). A plain Stage over it runs.
  * A read: writes nothing.
  */
 export function trackSubmittedAndTracked(db: AppDb, projectId: string, track: SubmittalTrackType, required: readonly SubmittalTrackType[] = [track]): TrackSubmittedEvidence | null {
   const filed = trackFilingOnRecord(db, projectId, track);
-  if (filed) {
-    const via = s(filed.via);
-    return {
-      track,
-      via: via === "submitted" || via === "submitted_unconfirmed" ? via : "automation_click",
-      number: s(filed.permit_number) || s(filed.application_number),
-      at: s(filed.submitted_at) || null,
-    };
-  }
-  const judged = Array.from(new Set([...required, track]));
-  const { own, pool, poolDemand } = trackTargets(db, projectId, track, judged);
-  const numberOf = (r: Row | null): string => (r ? s(r.application_number).trim() || s(r.permit_number).trim() : "");
-  const card = own ? (numberOf(own) ? own : null) : (poolDemand <= 1 ? pool.find((r) => numberOf(r)) ?? null : null);
-  if (!card) return null;
-  return { track, via: "tracking_card", number: numberOf(card), at: s(card.created_at) || null };
+  if (!filed) return null;
+  const via = s(filed.via);
+  // Tracked: the tracking target that speaks for the track — its own tagged target, or an untagged
+  // one only when this is the one track drawing on that pool (isTrackDone's rule).
+  const { own, pool, poolDemand } = trackTargets(db, projectId, track, Array.from(new Set([...required, track])));
+  return {
+    track,
+    via: via === "submitted" || via === "submitted_unconfirmed" ? via : "automation_click",
+    number: s(filed.permit_number) || s(filed.application_number),
+    at: s(filed.submitted_at) || null,
+    tracked: Boolean(own) || (poolDemand <= 1 && pool.length > 0),
+  };
 }
 
-/** The refusal a Stage of a submitted-and-tracked track reads (the route's 409, the job's, the card). */
+/** The refusal a Stage of a filed track reads (the route's 409, the job's, the card) — main's
+ *  duplicate-guard sentence, word for word. */
 export function trackSubmittedSentence(e: TrackSubmittedEvidence): string {
   const when = e.at ? ` on ${e.at.slice(0, 10)}` : "";
-  if (e.via === "tracking_card") {
-    return `The ${e.track} track is already submitted and tracked: its tracking card holds ${e.number}${when}. `
-      + "Staging it again would open a duplicate application with the jurisdiction. "
-      + "Withdraw the existing filing first if it needs to be replaced.";
-  }
   const num = e.number
     || (e.via !== "submitted"
       ? "(no number captured — automation clicked the final submit and the portal did not confirm it; verify on the portal)"
