@@ -811,6 +811,19 @@ export async function selectWithFallback(page: any, loc: any, value: string, pic
     for (const o of options) {
       if (norm(o.textContent || "") === w) return o.value; // exact wins
     }
+    // EXACT BUT FOR PUNCTUATION (#530). PacifiCorp asks "Will the System be Customer-Owned or
+    // Third-Party Owned?" and its options read "Customer-Owned" / "Third-Party Owned"; an answer
+    // of "Customer Owned" missed every pass below ("customer owned" is not a substring of
+    // "customer-owned"), so the required select stayed blank and the recipe was refused. Only
+    // punctuation and spacing are ignored, and only as a whole-text match: it can never pick an
+    // option whose words differ, and it runs before the looser contains pass.
+    const loose = (s: string) => norm(s).replace(/[^a-z0-9]+/g, " ").trim();
+    const lw = loose(want);
+    if (lw) {
+      for (const o of options) {
+        if (loose(o.textContent || "") === lw) return o.value;
+      }
+    }
     for (const o of options) {
       const t = norm(o.textContent || "");
       if (t.includes(w) || w.includes(t)) return o.value;
