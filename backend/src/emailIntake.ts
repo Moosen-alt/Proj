@@ -37,7 +37,8 @@
 // EMAIL_INTAKE_DEDUPE_DAYS (default 30) attaches the files to that project instead of making a
 // second one; a file already on it (same slot, name and size) is not added again. The same MESSAGE
 // is never processed twice: every message is recorded by its Message-ID (else a hash of it), and
-// the IMAP poller re-reads the newest messages every tick.
+// a poll that fails before its read cursor moves reads the same messages again (#539). Intake runs
+// in an email_intake job, never inline in the monitor tick.
 //
 // RULE 2. Reading the customer's own bill at intake is the one allowed read: its text goes to the
 // extraction, as on the Parser page. Nothing is logged from it, and the reply never carries the
