@@ -12,6 +12,7 @@ import {
 } from "./adapters/autoLearnAdapter";
 import { buildLocator } from "./adapters/loginFlow";
 import { selectWithFallback } from "./comboboxFill";
+import { assertFilerIdentityHeld, FilerIdentityStop, filerIdentityFieldForSelect, filerIdentityStopMessage, selectFilerIdentity } from "./filerIdentitySelect";
 import { redactStatusText } from "./safeAction";
 
 // ---------------------------------------------------------------------------
@@ -55,10 +56,33 @@ export interface GapFillOutcome {
    *  operator's data problem — kept separate so nobody is sent to re-type data already on
    *  file, which is what the single undifferentiated list was causing. */
   unfilledDespiteData: string[];
+  /** #524 — company / contact-code selects left alone because no option is exactly this client's
+   *  (or two are): the stop's sentence, naming the company. Nothing was selected on them. */
+  filerIdentityRefused: string[];
 }
 
 function emptyOutcome(): GapFillOutcome {
-  return { filled: [], attempted: [], attemptedControls: [], skippedUngrounded: [], reportedMissing: [], unfilledDespiteData: [] };
+  return { filled: [], attempted: [], attemptedControls: [], skippedUngrounded: [], reportedMissing: [], unfilledDespiteData: [], filerIdentityRefused: [] };
+}
+
+/** #524 — WHO IS FILING on a gap-fill select: the client's own value for the key (never the planner's
+ *  wording), exactly one option, read back. Returns the landed label, or "" with the refusal pushed. */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+async function applyFilerIdentity(loc: any, field: ExtractedField, filer: string, projectFields: Record<string, string>, out: GapFillOutcome): Promise<string> {
+  const company = String(projectFields.installerCompanyName ?? "").replace(/\s+/g, " ").trim();
+  const value = String(projectFields[filer] ?? "").replace(/\s+/g, " ").trim();
+  const input = { field: filer, value, control: String(field.label ?? "").slice(0, 60), company };
+  try {
+    const hit = await selectFilerIdentity(loc, input);
+    if (typeof loc?.blur === "function") await loc.blur().catch(() => {});
+    await assertFilerIdentityHeld(loc, hit, input);
+    return hit.label;
+  } catch (err) {
+    const msg = err instanceof FilerIdentityStop ? err.message
+      : filerIdentityStopMessage({ ...input, code: filer === "installerCompanyName" ? undefined : value, why: `the list could not be read or set (${err instanceof Error ? err.message.slice(0, 120) : String(err)})` });
+    if (!out.filerIdentityRefused.includes(msg)) out.filerIdentityRefused.push(msg);
+    return "";
+  }
 }
 
 function normalize(v: string): string {
@@ -679,14 +703,23 @@ export async function gapFillCurrentPage(
       };
       out.attemptedControls.push(entry);   // a pick until what landed says otherwise
       let applied = false;
+      // WHO IS FILING (#524): a company / contact-code select never takes the contains match.
+      const filer = field.fieldType === "select" ? filerIdentityFieldForSelect(field.label, fill.field) : "";
+      let wrote = fill.value;
       try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        applied = await applyGrounded(page, loc as any, field, fill.value);
+        if (filer) {
+          const landedAs = await applyFilerIdentity(loc, field, filer, projectFields, out);
+          applied = !!landedAs;
+          if (landedAs) wrote = landedAs;
+        } else {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          applied = await applyGrounded(page, loc as any, field, fill.value);
+        }
       } finally {
         // WHAT LANDED decides data or pick (gapFillWriteKind); unread = pick. A pick's element is
         // stamped so a replay can find it again.
-        const landed = await landedText(loc, field, fill.value);
-        entry.kind = landed == null ? "pick" : gapFillWriteKind(field, fill.value, fill.field, projectFields, landed);
+        const landed = await landedText(loc, field, wrote);
+        entry.kind = landed == null ? "pick" : gapFillWriteKind(field, wrote, filer || fill.field, projectFields, landed);
         if (entry.kind === "pick" && typeof (loc as { evaluate?: unknown })?.evaluate === "function") {
           // eslint-disable-next-line @typescript-eslint/no-explicit-any
           await (loc as any).evaluate((el: Element, a: { attr: string; label: string }) => { el.setAttribute(a.attr, a.label); }, { attr: UNRECORDED_WRITE_ATTR, label: shown }, { timeout: 1500 }).catch(() => null);

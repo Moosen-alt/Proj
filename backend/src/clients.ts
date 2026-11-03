@@ -1077,6 +1077,26 @@ export function stagingIdentityPortal(input: { urls: Array<string | null | undef
   return "mock";
 }
 
+/**
+ * WHY NO IDENTITY ROW APPLIED, when the run's URLs disagree (Helm review of #527): the hosts and the
+ * identity type each names ("" = none), or null when they agree (or there are fewer than two). Hosts
+ * only — never a full URL, which can carry a query token. The realistic shape: a permit track whose
+ * login falls back to an AHJ information page while the recipe opens Oregon ePermitting, so the
+ * accela_oregon row and its contact code are dropped and the run files under the legal name — the
+ * safe side, but an operator who set the row needs to see why it did nothing.
+ */
+export function stagingIdentityDisagreement(urls: Array<string | null | undefined>): { hosts: string[]; keys: string[] } | null {
+  const seen = new Map<string, string>();
+  for (const u of urls.map((x) => String(x ?? "").trim()).filter(Boolean)) {
+    let host = "";
+    try { host = new URL(u).hostname.toLowerCase(); } catch { host = "(not a URL)"; }
+    if (!seen.has(host)) seen.set(host, portalIdentityKey(u));
+  }
+  const keys = new Set(seen.values());
+  if (keys.size < 2) return null;
+  return { hosts: [...seen.keys()], keys: [...seen.values()] };
+}
+
 // Returns the installer/licensing overlay for a project's linked client, keyed
 // to the snapshot field names the portal adapters already read. Empty object
 // when the project has no client.

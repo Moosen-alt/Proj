@@ -11,6 +11,8 @@
 //   (K)  portalIdentityKey: a URL names its portal by host; another PowerClerk tenant names none;
 //        "utility" / "AHJ" / "" name none; "mock" is the mock portal.
 //   (R)  stagingIdentityPortal: URLs that disagree name none; no URL and no profile is "mock".
+//   (D)  stagingIdentityDisagreement names the hosts (never a full URL) when the URLs disagree, and
+//        nothing when they agree — what prepareSubmission logs (Helm review of #527, carried by #524).
 //   (A/B) clientStagingOverlay: the PGE row is used on PGE (label + contact) and NOT on another
 //        PowerClerk tenant (legal name, no contact); the Accela row only on Oregon ePermitting.
 //   (V)  the track card / approval sheet values (stagingFieldValues) key on the recipe's portal.
@@ -27,7 +29,7 @@ import { setupStageFixture, check, finish } from "./_stageFixture";
 
 const fx = await setupStageFixture("portal-identity-keying");
 const { db, repo, recipes } = fx;
-const { clientStagingOverlay, portalIdentityKey, stagingIdentityPortal, updateClient } = await import("../src/clients");
+const { clientStagingOverlay, portalIdentityKey, stagingIdentityDisagreement, stagingIdentityPortal, updateClient } = await import("../src/clients");
 const { stagingFieldValues } = await import("../src/recipeStageGapsView");
 
 const PGE_URL = "https://pgenm.powerclerk.com/MvcAccount/Login";
@@ -62,6 +64,18 @@ await check("(R) stagingIdentityPortal: disagreeing URLs name none; no URL and n
   assert.equal(stagingIdentityPortal({ urls: ["", null], profilePortalType: "mock", isRealPortal: false }), "mock");
   assert.equal(stagingIdentityPortal({ urls: [], profilePortalType: "powerclerk_pge", isRealPortal: true }), "powerclerk_pge");
   assert.equal(stagingIdentityPortal({ urls: [OTHER_PC_URL], profilePortalType: "powerclerk_pge", isRealPortal: true }), "", "a URL outranks the profile");
+});
+
+await check("(D) stagingIdentityDisagreement: hosts and their identity types when the URLs disagree; null when they agree", () => {
+  const d = stagingIdentityDisagreement([ACCELA_OR_URL, "", "https://permits.coos.example/info?token=abc123"]);
+  assert.ok(d, "disagreeing URLs must be named");
+  assert.deepEqual(d!.hosts, ["aca-oregon.accela.com", "permits.coos.example"]);
+  assert.deepEqual(d!.keys, ["accela_oregon", ""]);
+  assert.ok(!JSON.stringify(d).includes("token"), "never a full URL (a query can carry a token)");
+  assert.equal(stagingIdentityDisagreement([PGE_URL, "https://pgenm.powerclerk.com/Other", null]), null, "one portal, two pages: agree");
+  assert.equal(stagingIdentityDisagreement(["https://permits.portland.example/apply"]), null, "one URL cannot disagree");
+  assert.equal(stagingIdentityDisagreement(["https://a.example/", "https://b.example/"]), null, "two hosts that both name no portal: nothing was dropped");
+  assert.ok(stagingIdentityDisagreement([PGE_URL, OTHER_PC_URL]), "PGE vs another tenant");
 });
 
 await check("(A) the PGE identity row is used on PGE: its label and its contact code", () => {

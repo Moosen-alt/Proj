@@ -7,6 +7,7 @@ import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep, StepFinge
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, type PortalContext, type PortalStepResult } from "../adapter";
 import { openPortal } from "../browser";
 import { selectWithFallback, readClosedComboboxOptions } from "../comboboxFill";
+import { assertFilerIdentityHeld, FilerIdentityStop, filerIdentityFieldForSelect, filerIdentityStopMessage, selectFilerIdentity } from "../filerIdentitySelect";
 import { detectChallengeFrame, frameSelectorFor, maskId, readbackMatches, redactCaptureText, redactStatusText, safeAction, sleep, smartWait, waitForElement, waitForInteractiveControls } from "../safeAction";
 import { applyFormatHint } from "../formatHint";
 import { scrapeReviewScreen as scrapeReviewScreenShared } from "../reviewScreenScraper";
@@ -280,6 +281,10 @@ export interface LearnResult {
    *  has no value on file — labels only. Not a trust blocker (the recipe binds them by name); a
    *  person types them at review. Undefined when none. */
   secretsLeftBlank?: string[];
+  /** #524 — WHO IS FILING lists this learn would not answer: an Installer Company / contact-code
+   *  select with no option that is exactly this client's (or two). Nothing was selected there, and
+   *  no step was recorded for it. Undefined when none. */
+  filerIdentityRefused?: string[];
   /** The FULL url (query string included) of the application this run worked on, captured
    *  where it stopped. Without it there is no way to audit the right application afterwards:
    *  a portal list can hold several drafts for the same customer, and auditing "the first" or
@@ -2445,6 +2450,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    *  required-field sweep excludes secret boxes (a project with no account on file must not block
    *  a recipe's promotion forever), so without this list the blank was silent. */
   private readonly secretsLeftBlank: Array<{ label: string; bound: boolean }> = [];
+  /** #524 — company / contact-code selects refused (see LearnResult.filerIdentityRefused). */
+  private readonly filerIdentityRefused: string[] = [];
   /** True once the delegated final submit actually went through. Read by the caller. */
   finalSubmitClicked = false;
   /** The completion/receipt page as text + URL, captured while standing on it. */
@@ -8731,10 +8738,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       + (unboundBlank.length
         ? ` 🔒 Left blank for you — required, and no binding a replay can resolve: ${unboundBlank.slice(0, 6).join(", ")}. A person types it on every filing until a project field exists for it.`
         : "");
+    // #524: who is filing is never a near-match — said, with the company, wherever the walk ended.
+    const filerWarning = this.filerIdentityRefused.length
+      ? ` 🏢 Not chosen — ${this.filerIdentityRefused.slice(0, 3).join(" | ")}`
+      : "";
     const message = reachedReview
-      ? `${HUMAN_REVIEW_MESSAGE} Auto-learn reached the review screen after ${pageCount} page(s). Verify every field/value below before a human submits.${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`
+      ? `${HUMAN_REVIEW_MESSAGE} Auto-learn reached the review screen after ${pageCount} page(s). Verify every field/value below before a human submits.${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${filerWarning}${noticeWarning}${choiceWarning}`
       : filledSomething
-        ? `Auto-learn filled ${pageCount} page(s) and recorded the steps, but did not reach a review screen. Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`
+        ? `Auto-learn filled ${pageCount} page(s) and recorded the steps, but did not reach a review screen. Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${filerWarning}${noticeWarning}${choiceWarning}`
         : tileStop
           ? `Auto-learn stopped at a page of ${tileStop.tiles.length} choice tile(s): ${tileStop.why}. The page offered: ${tileStop.tiles.map((t) => `"${t}"`).join(" | ")}. If one of these is the way in, a person clicks it; record that step manually. (${pageCount} page(s), no steps recorded.) Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`
           : `Auto-learn found nothing fillable on ${pageCount} page(s); no steps recorded.${nothingFillableHint} Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`;
@@ -8788,6 +8799,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       validationBlocks,
       portalNotices: portalNotices.length ? portalNotices.slice(0, 5) : undefined,
       secretsLeftBlank: this.secretsLeftBlank.length ? this.secretsLeftBlank.map((s) => s.label) : undefined,
+      filerIdentityRefused: this.filerIdentityRefused.length ? [...this.filerIdentityRefused] : undefined,
     };
   }
 
@@ -9898,6 +9910,47 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     };
   }
 
+  /** #524 — the filer-identity key a learn select answers, or "": the planner's binding when it is
+   *  one, else the company for a select whose label names the installer's company list. */
+  private filerIdentityFieldFor(field: ExtractedField, binding: string | undefined): string {
+    return filerIdentityFieldForSelect(field.label, binding);
+  }
+
+  /** #524 — select this client's option on a company / contact-code list, commit and read it back,
+   *  and record a step BOUND to the key (replay resolves it per client; a literal company would be
+   *  this client's on every later filing). The company is the filing company's own name
+   *  (contactIdentity), never the planner's. A miss: nothing selected, nothing recorded, said. The
+   *  option that landed is written back to fillReq.value, so the page's read-back (AppliedFill
+   *  .expected) and its one re-apply ask for that exact label, never the planner's wording. */
+  private async applyFilerIdentitySelect(field: ExtractedField, filer: string, fillReq: { value: string; field?: string }): Promise<RecipeStep | null> {
+    const company = String(this.contactIdentity.companyName ?? "").replace(/\s+/g, " ").trim();
+    const value = filer === "installerCompanyName" ? company : String(fillReq.value ?? "").trim();
+    const input = { field: filer, value, control: String(field.label ?? "").slice(0, 60), company };
+    try {
+      const loc = await this.locator(field.selector);
+      if (!loc) throw new Error("selector unresolved");
+      const hit = await selectFilerIdentity(loc, input);
+      if (typeof loc.blur === "function") await loc.blur().catch(() => {});
+      await assertFilerIdentityHeld(loc, hit, input);
+      fillReq.value = hit.label;
+      this.debug?.event({ type: "filer_identity_selected", label: input.control, field: filer, folded: hit.label !== value });
+    } catch (err) {
+      const msg = err instanceof FilerIdentityStop ? err.message
+        : filerIdentityStopMessage({ ...input, code: filer === "installerCompanyName" ? undefined : value, why: `the list could not be read or set (${err instanceof Error ? err.message.slice(0, 120) : String(err)})` });
+      if (!this.filerIdentityRefused.includes(msg)) this.filerIdentityRefused.push(msg);
+      this.debug?.event({ type: "filer_identity_refused", label: input.control, field: filer });
+      return null;
+    }
+    return {
+      action: "select",
+      phase: "fill",
+      selector: field.selector,
+      note: field.label || undefined,
+      field: filer,
+      ...(field.fingerprint ? { fingerprint: field.fingerprint } : {}),
+    };
+  }
+
   private async applyFillInner(
     field: ExtractedField,
     fillReq: { value: string; field?: string },
@@ -10086,6 +10139,16 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       : field.fieldType === "radio" ? (NEGATION.test(v) && !echoesOwnLabel)
       : false;
     if (negated) return null; // leave unselected — no action and no recorded step
+
+    // DETERMINISTIC GUARD: WHO IS FILING IS NOT A PLANNER CHOICE, AND NEVER A NEAR MATCH (#524).
+    // A select the planner bound to the company / a contact code, or one whose label names the
+    // installer's company list, takes THIS client's option exactly (filerIdentitySelect) — the
+    // contains match below would put "Sun Co" on "Sun Co Northwest". A miss selects nothing,
+    // records nothing, and is said in the result.
+    if (action === "select") {
+      const filer = this.filerIdentityFieldFor(field, fillReq.field);
+      if (filer) return this.applyFilerIdentitySelect(field, filer, fillReq);
+    }
 
     const res = await safeAction(
       // The label is non-PII enough for a log line, but keep it short.

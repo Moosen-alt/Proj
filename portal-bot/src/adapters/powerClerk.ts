@@ -8,6 +8,7 @@ import { detectChallengeFrame, scanStatusFromBody, safeAction, sleep, waitForInt
 import { snap, str } from "../snapshot";
 import { firstEmail } from "../../../shared/src/emailAddress";
 import { fillCustomCombobox, selectWithFallback } from "../comboboxFill";
+import { normalizeCompanyLabel } from "../filerIdentitySelect";
 import { scrapeReviewScreen, compareReviewFields } from "../reviewScreenScraper";
 
 // Select a value on a PowerClerk dropdown that may be a native <select> OR a custom
@@ -60,11 +61,9 @@ export function preparerEmailFor(s: Record<string, unknown>, installerEmail: str
 // back. Anything else throws, and the run stops before the page is saved.
 // ---------------------------------------------------------------------------
 
-/** Case, spacing and punctuation folded: "Acme Solar, LLC" and "ACME SOLAR LLC" are one name.
- *  Words are never dropped or reordered, so "Acme Solar" never matches "Acme Solar Pros". */
-export function normalizeCompanyLabel(v: string): string {
-  return String(v ?? "").toLowerCase().replace(/&/g, " and ").replace(/[^a-z0-9]+/g, " ").trim();
-}
+// normalizeCompanyLabel lives in filerIdentitySelect.ts (#524): replay, the learner and the gap-fill
+// fold company names the same way this adapter does. Re-exported for this file's callers.
+export { normalizeCompanyLabel };
 
 type SelectOptionView = { value: string; label: string };
 
