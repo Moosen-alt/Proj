@@ -6,7 +6,8 @@
 // when a monitored permit/NEM status CHANGES to something the client cares
 // about (permit issued, ready for issue/fees, NEM approved, correction, ready
 // for install handoff), we:
-//   1. build a plain-language update email for the submitting client,
+//   1. build a plain-language update email for the submitting client (text + HTML, one layout
+//      for every email we send: emailLayout.ts, #589),
 //   2. include their tokenized read-only status link (auto-created on first
 //      send) so they can self-serve progress checks,
 //   3. SEND it over SMTP when configured (SMTP_HOST + SMTP_FROM), and
@@ -30,7 +31,8 @@ import crypto from "node:crypto";
 import type { AppDb } from "./db";
 import type { ProjectRecord } from "../../shared/src/types";
 import { addCommunication, undeliveredCommunications } from "./crm";
-import { BRAND, clientUpdateFor, clientUpdateEmailBody, isClientFacingOutcome, recordClientUpdateNote } from "./clientUpdates";
+import { clientEmailSubject, clientUpdateFor, clientUpdateEmail, isClientFacingOutcome, recordClientUpdateNote, type ClientUpdate } from "./clientUpdates";
+import { mailFrom, wrapPlainText } from "./emailLayout";
 import { addAuditLog } from "./audit";
 import { text } from "./json";
 import { logger } from "./logger";
@@ -94,9 +96,32 @@ export function smtpConfigured(): boolean {
   return Boolean(process.env.SMTP_HOST && process.env.SMTP_FROM);
 }
 
+export interface SendEmailOptions {
+  /** The HTML part, rendered by the layout (emailLayout.renderEmail) from the same content as the
+   *  text. Unset: the text is wrapped in the layout (wrapPlainText), so every email gets the look. */
+  html?: string;
+}
+
+/**
+ * What sendEmail hands nodemailer — split out so a test can compile the message without opening a
+ * connection. MULTIPART: the text twin and the HTML part, always both. FROM (#589): SMTP_FROM is
+ * the bare address and SMTP_FROM_NAME the display name ("<BRAND> Filings" when unset); an older
+ * "Name <address>" SMTP_FROM still works (emailLayout.mailFrom).
+ */
+export function buildMailOptions(to: string, subject: string, textBody: string, attachments: HandoffAttachment[] = [], opts: SendEmailOptions = {}) {
+  return {
+    from: mailFrom(process.env.SMTP_FROM, process.env.SMTP_FROM_NAME),
+    to,
+    subject,
+    text: textBody,
+    html: opts.html || wrapPlainText(textBody, { subject }),
+    ...(attachments.length ? { attachments: attachments.map((a) => ({ filename: a.filename, path: a.path, ...(a.contentType ? { contentType: a.contentType } : {}) })) } : {}),
+  };
+}
+
 /** `attachments`: the installer handoff's issued documents (handoffDocuments.ts) — the one caller
- *  that attaches anything. */
-export async function sendEmail(to: string, subject: string, textBody: string, attachments: HandoffAttachment[] = []): Promise<void> {
+ *  that attaches anything. `opts.html`: the layout's HTML part (see buildMailOptions). */
+export async function sendEmail(to: string, subject: string, textBody: string, attachments: HandoffAttachment[] = [], opts: SendEmailOptions = {}): Promise<void> {
   const { default: nodemailer } = await import("nodemailer");
   const port = Number(process.env.SMTP_PORT || 587);
   const transporter = nodemailer.createTransport({
@@ -105,10 +130,7 @@ export async function sendEmail(to: string, subject: string, textBody: string, a
     secure: process.env.SMTP_SECURE === "true" || port === 465,
     auth: process.env.SMTP_USER ? { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS || "" } : undefined,
   });
-  await transporter.sendMail({
-    from: process.env.SMTP_FROM, to, subject, text: textBody,
-    ...(attachments.length ? { attachments: attachments.map((a) => ({ filename: a.filename, path: a.path, ...(a.contentType ? { contentType: a.contentType } : {}) })) } : {}),
-  });
+  await transporter.sendMail(buildMailOptions(to, subject, textBody, attachments, opts));
 }
 
 /**
@@ -174,6 +196,8 @@ export async function resendCommunication(
     ? installerHandoffAttachments(db, comm.projectId)
     : [];
   try {
+    // Only the stored text exists here, so the message goes out as that text wrapped in the
+    // layout (sendEmail's wrapPlainText fallback) — still the look, never a bare text email.
     await sendEmail(to, comm.subject, body, attachments);
     db.run(
       "UPDATE communications SET delivery_status = 'sent', delivery_detail = '', recipient = ?, body = ? WHERE id = ?",
@@ -222,6 +246,20 @@ export function clientUpdatesSilenced(db: AppDb, project: Pick<ProjectRecord, "i
     return true;
   }
   return false;
+}
+
+/**
+ * The client notice for one update: subject, the text twin (the stored body) and the HTML part.
+ * BRAND — EVENT — HOMEOWNER — ADDRESS (clientEmailSubject); the address falls back to the project
+ * id so a subject always identifies the job.
+ */
+export function clientUpdateNotice(
+  update: ClientUpdate,
+  opts: { company: string; homeownerName: string; address: string; fallbackRef: string; statusLine: string; link: string },
+): { subject: string; body: string; html: string } {
+  const subject = clientEmailSubject(update.subject, opts.homeownerName, opts.address || opts.fallbackRef);
+  const { body, html } = clientUpdateEmail(update, { company: opts.company, address: opts.address, statusLine: opts.statusLine, link: opts.link });
+  return { subject, body, html };
 }
 
 /** Notify the submitting client of a status change. Never throws — a delivery
@@ -284,16 +322,11 @@ export async function notifyClientOfStatusChange(
     const address = formatProjectAddress(project);
 
     // ONE VOICE, TWO CHANNELS: the same `update` the note above was rendered from.
-    // BRAND — EVENT — HOMEOWNER — ADDRESS. A client filing for several homeowners on one street
-    // cannot tell two jobs apart from the address alone, and the inbox shows the subject before
-    // anything else. Each segment is dropped when it is blank rather than leaving a dangling dash.
-    const subject = [BRAND, update.subject, text(project.homeownerName), address || project.id]
-      .map((part) => String(part || "").trim())
-      .filter(Boolean)
-      .join(" — ");
-    const body = clientUpdateEmailBody(update, {
+    const { subject, body, html } = clientUpdateNotice(update, {
       company: String(client?.company_name || ""),
+      homeownerName: text(project.homeownerName),
       address,
+      fallbackRef: project.id,
       statusLine: evt.statusLabel || evt.outcome,
       link,
     });
@@ -307,7 +340,7 @@ export async function notifyClientOfStatusChange(
     let deliveryDetail = "SMTP is not configured (SMTP_HOST / SMTP_FROM are unset), so no send was attempted.";
     if (smtpConfigured()) {
       try {
-        await sendEmail(to, subject, body);
+        await sendEmail(to, subject, body, [], { html });
         deliveryStatus = "sent";
         deliveryDetail = "";
       } catch (err) {

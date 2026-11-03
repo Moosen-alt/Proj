@@ -532,6 +532,7 @@ The October NEM fixes (#378 the review-page hand-over, #354, #400, #401, #385, #
 | `ALLOW_UNAUTHENTICATED_NETWORK` | off | `1` lets a non-loopback `SERVER_HOST` start with `AUTH_ENABLED` off. Don't. |
 | `PUBLIC_BASE_URL` | localhost | the base of every link a customer receives |
 | `SMTP_HOST` / `SMTP_FROM` | – | client email (and the watchdog's email). Without both, client updates are only saved as drafts; preflight `client email (SMTP)` warns. Prove with `npx tsx scripts/ops/test-email.ts --to <you>` |
+| `SMTP_FROM_NAME` | `Keelix Filings` | the display name beside `SMTP_FROM` on every email (#589). Keep `SMTP_FROM` a bare address; an older `Name <address>` value still works and its name is used while this is unset |
 | `SMTP_PORT` / `SMTP_SECURE` / `SMTP_USER` / `SMTP_PASS` | 587 / off (on for 465) / – / – | the mail server's port, TLS and sign-in |
 | `EMAIL_IMAP_HOST` / `EMAIL_IMAP_USER` / `EMAIL_IMAP_PASS` | – | the tracking inbox agency and utility mail is forwarded to; all three, or it is ignored (`EMAIL_IMAP_PORT` 993, `EMAIL_IMAP_TLS`, `EMAIL_IMAP_MAILBOX` INBOX). Preflight `tracking inbox` |
 | `EMAIL_IMAP_MAX_MESSAGES` | 100 | messages read per poll, per inbox. Each inbox remembers the last message it read; a poll reads everything newer, oldest first, up to this many, and the rest on the next poll, never dropped (#539) |

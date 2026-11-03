@@ -1,18 +1,24 @@
 // OPS ALERT DELIVERY — email through the product's OWN SMTP settings, plus an optional webhook.
 //
-// Email uses exactly the six variables backend/src/clientNotifier.ts reads (SMTP_HOST, SMTP_PORT,
-// SMTP_USER, SMTP_PASS, SMTP_FROM, SMTP_SECURE) with the same defaults, so configuring client email
-// configures alerts too and there is one set of credentials to rotate. It is re-implemented here
-// rather than imported because clientNotifier pulls in the database layer, and a watchdog must
-// keep working when the database is exactly what broke. backend/test/opsWatchdog.test.ts pins the
-// variable names against clientNotifier.ts so the two cannot drift apart.
+// Email uses exactly the seven variables backend/src/clientNotifier.ts reads (SMTP_HOST, SMTP_PORT,
+// SMTP_USER, SMTP_PASS, SMTP_FROM, SMTP_FROM_NAME, SMTP_SECURE) with the same defaults, so configuring
+// client email configures alerts too and there is one set of credentials to rotate. It is
+// re-implemented here rather than imported because clientNotifier pulls in the database layer, and a
+// watchdog must keep working when the database is exactly what broke. backend/test/opsWatchdog.test.ts
+// pins the variable names against clientNotifier.ts so the two cannot drift apart.
+//
+// THE LOOK (#589): the same From (SMTP_FROM_NAME as the display name, SMTP_FROM the bare address)
+// and the same layout as every other email — the plain text wrapped by backend/src/emailLayout.ts,
+// which is pure (env and strings, no database), so importing it keeps the watchdog independent.
 //
 // The webhook is for phone push / SMS bridges: WATCHDOG_WEBHOOK_URL receives a POST per alert
 // batch. WATCHDOG_WEBHOOK_FORMAT=json (default) sends {subject, text}; =text sends the plain text
 // with the subject as a "Title" header, which is what ntfy.sh expects (free phone push:
 // https://ntfy.sh/<your-private-topic>).
 
-export const SMTP_ENV_KEYS = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "SMTP_FROM", "SMTP_SECURE"] as const;
+import { footerContact, mailFrom, wrapPlainText } from "../../backend/src/emailLayout";
+
+export const SMTP_ENV_KEYS = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "SMTP_FROM", "SMTP_FROM_NAME", "SMTP_SECURE"] as const;
 
 export interface Delivery {
   channel: "email" | "webhook";
@@ -53,9 +59,21 @@ async function smtpTransport(env: NodeJS.ProcessEnv) {
   });
 }
 
+/** What either sender hands nodemailer: the From (display name + bare address, emailLayout.mailFrom),
+ *  the text, and the text wrapped in the layout as the HTML part. Pure, so a test needs no server. */
+export function opsMailOptions(to: string, subject: string, text: string, env: NodeJS.ProcessEnv = process.env) {
+  return {
+    from: mailFrom(env.SMTP_FROM, env.SMTP_FROM_NAME),
+    to,
+    subject,
+    text,
+    html: wrapPlainText(text, { subject, audience: "staff", contact: footerContact(env) }),
+  };
+}
+
 export async function sendAlertEmail(subject: string, text: string, env: NodeJS.ProcessEnv = process.env): Promise<void> {
   const transporter = await smtpTransport(env);
-  await transporter.sendMail({ from: env.SMTP_FROM, to: alertRecipients(env).join(", "), subject, text });
+  await transporter.sendMail(opsMailOptions(alertRecipients(env).join(", "), subject, text, env));
 }
 
 export interface TestSendResult {
@@ -76,7 +94,7 @@ export interface TestSendResult {
 export async function sendTestEmail(to: string, subject: string, text: string, env: NodeJS.ProcessEnv = process.env): Promise<TestSendResult> {
   try {
     const transporter = await smtpTransport(env);
-    const info = await transporter.sendMail({ from: env.SMTP_FROM, to, subject, text });
+    const info = await transporter.sendMail(opsMailOptions(to, subject, text, env));
     const list = (v: unknown): string[] => (Array.isArray(v) ? v.map((a) => (typeof a === "string" ? a : String((a as { address?: string })?.address ?? ""))) : []);
     const rejected = list(info.rejected);
     return { ok: rejected.length === 0, response: String(info.response ?? ""), code: "", accepted: list(info.accepted), rejected };

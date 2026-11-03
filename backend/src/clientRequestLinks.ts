@@ -53,8 +53,9 @@ import type { AppDb, SqlParam } from "./db";
 import type { ProjectRecord } from "../../shared/src/types";
 import { redactSecretValues } from "../../shared/src/portalSafety";
 import { addAuditLog } from "./audit";
-import { BRAND } from "./clientUpdates";
+import { BRAND, clientEmailSubject } from "./clientUpdates";
 import { formatProjectAddress, sendEmail, smtpConfigured } from "./clientNotifier";
+import { mapEmailText, renderEmail, type EmailContent } from "./emailLayout";
 import { addCommunication } from "./crm";
 import { createCredentialRequest } from "./credentialRequests";
 import { createIntakeRequest, missingIntakeFields, unansweredPortalQuestions, type IntakeField } from "./intakeRequests";
@@ -77,7 +78,8 @@ const INTAKE_FIELD_NEEDS: Record<IntakeField, string> = {
   homeownerPhone: "The homeowner's phone number",
 };
 
-export type Sender = (to: string, subject: string, body: string) => Promise<void>;
+/** `html`: the layout part (emailLayout.ts), rendered from the same scrubbed content as `body`. */
+export type Sender = (to: string, subject: string, body: string, html?: string) => Promise<void>;
 
 export interface ClientRequestOptions {
   now?: Date;
@@ -258,15 +260,18 @@ function requestCovers(r: CredentialRequestRow, portalUrl: string): boolean {
 // ---------------------------------------------------------------------------
 
 function subjectFor(project: ProjectRecord, what: string, reminder: boolean): string {
-  const address = formatProjectAddress(project);
-  return [BRAND, `${reminder ? "Reminder: " : ""}${what}`, project.homeownerName, address || project.id]
-    .map((p) => String(p || "").trim())
-    .filter(Boolean)
-    .join(" — ");
+  return clientEmailSubject(`${reminder ? "Reminder: " : ""}${what}`, project.homeownerName, formatProjectAddress(project) || project.id);
 }
 
 function scrub(project: ProjectRecord, text: string): string {
   return redactSecretValues(text, [String(project.accountNumber ?? ""), String(project.meterNumber ?? "")]);
+}
+
+/** Both parts from the SCRUBBED content (rule 2): the HTML can never carry what the text does not.
+ *  The text twin is scrubbed once more whole, as the body always was. */
+function renderScrubbed(project: ProjectRecord, content: EmailContent): { body: string; html: string } {
+  const { text, html } = renderEmail(mapEmailText(content, (s) => scrub(project, s)));
+  return { body: scrub(project, text), html };
 }
 
 export function intakeEmail(
@@ -275,29 +280,28 @@ export function intakeEmail(
   needs: IntakeNeeds,
   link: string,
   reminder = false,
-): { subject: string; body: string } {
+): { subject: string; body: string; html: string } {
   const address = formatProjectAddress(project) || "this job";
   const lines = intakeNeedLabels(needs);
-  const body = [
-    `Hi${company ? ` ${company}` : ""},`,
-    "",
-    reminder
+  const content: EmailContent = {
+    audience: "client",
+    preheader: reminder
+      ? `A reminder: the filing for ${address} is still waiting on a few things from you.`
+      : `To keep the filing for ${address} moving, we need a few things from you.`,
+    eyebrow: reminder ? "Reminder" : "Information needed",
+    headline: reminder ? "Still needed to file" : "Information needed to file",
+    greeting: `Hi${company ? ` ${company}` : ""},`,
+    intro: [reminder
       ? `A reminder: the filing for ${address} is still waiting on the following from you.`
-      : `To keep the filing for ${address} moving, we need the following from you:`,
-    "",
-    ...lines.map((l) => `  - ${l}`),
-    "",
-    ...(link ? [`Answer here (secure link, no login needed): ${link}`, ""] : []),
-    ...(needs.bill.length
-      ? [
-          `Please send the bill to your ${BRAND} coordinator the way you send plan sets. We read the account and meter numbers from the bill itself, so please do not type them into an email.`,
-          "",
-        ]
-      : []),
-    "Thank you,",
-    BRAND,
-  ].join("\n");
-  return { subject: scrub(project, subjectFor(project, "Information needed to file", reminder)), body: scrub(project, body) };
+      : `To keep the filing for ${address} moving, we need the following from you:`],
+    sections: [{ items: lines }],
+    ...(link ? { action: { label: "Answer securely", textLabel: "Answer here (secure link, no login needed)", url: link } } : {}),
+    note: needs.bill.length
+      ? [`Please send the bill to your ${BRAND} coordinator the way you send plan sets. We read the account and meter numbers from the bill itself, so please do not type them into an email.`]
+      : [],
+    signoff: ["Thank you,", BRAND],
+  };
+  return { subject: scrub(project, subjectFor(project, "Information needed to file", reminder)), ...renderScrubbed(project, content) };
 }
 
 export function credentialEmail(
@@ -307,35 +311,38 @@ export function credentialEmail(
   link: string,
   expiresAt: string,
   reminder = false,
-): { subject: string; body: string } {
+): { subject: string; body: string; html: string } {
   const address = formatProjectAddress(project) || "this job";
   let host = portal.url;
   try { host = new URL(portal.url).hostname; } catch { /* keep the URL as given */ }
-  const body = [
-    `Hi${company ? ` ${company}` : ""},`,
-    "",
-    reminder
+  const content: EmailContent = {
+    audience: "client",
+    preheader: `We need your company's login for ${portal.label} to file the interconnection application for ${address}.`,
+    eyebrow: reminder ? "Reminder" : "Portal login needed",
+    headline: reminder ? "Still needed: your portal login" : "Portal login needed to file",
+    greeting: `Hi${company ? ` ${company}` : ""},`,
+    intro: [reminder
       ? `A reminder: we still need your company's login for ${portal.label} (${host}) to file the interconnection application for ${address}.`
-      : `We file the interconnection application for ${address} on ${portal.label} (${host}) under your company's login, and we do not have one on file for that portal.`,
-    "",
-    `Please enter it on this one-time secure page: ${link}`,
-    `The page works once and expires ${expiresAt.slice(0, 10)}.`,
-    "",
-    "Never send a password by email, text or chat — that page is the only place to type it. We will never ask you to reply with it.",
-    "",
-    "Thank you,",
-    BRAND,
-  ].join("\n");
-  return { subject: scrub(project, subjectFor(project, "Portal login needed to file", reminder)), body: scrub(project, body) };
+      : `We file the interconnection application for ${address} on ${portal.label} (${host}) under your company's login, and we do not have one on file for that portal.`],
+    action: { label: "Enter the login securely", textLabel: "Please enter it on this one-time secure page", url: link },
+    note: [
+      `The page works once and expires ${expiresAt.slice(0, 10)}.`,
+      "Never send a password by email, text or chat — that page is the only place to type it. We will never ask you to reply with it.",
+    ],
+    signoff: ["Thank you,", BRAND],
+  };
+  return { subject: scrub(project, subjectFor(project, "Portal login needed to file", reminder)), ...renderScrubbed(project, content) };
 }
 
 // ---------------------------------------------------------------------------
 // Delivery + record.
 // ---------------------------------------------------------------------------
 
+const sendWithLayout: Sender = (to, subject, body, html) => sendEmail(to, subject, body, [], { html });
+
 async function deliver(
   db: AppDb,
-  input: { project: ProjectRecord; orgId: string; to: string; subject: string; body: string; storedBody: string; kind: string; reminder: boolean },
+  input: { project: ProjectRecord; orgId: string; to: string; subject: string; body: string; html: string; storedBody: string; kind: string; reminder: boolean },
   opts: ClientRequestOptions,
 ): Promise<{ status: "sent" | "draft" | "failed"; detail: string }> {
   let status: "sent" | "draft" | "failed" = "draft";
@@ -346,7 +353,7 @@ async function deliver(
     detail = "SMTP is not configured (SMTP_HOST / SMTP_FROM are unset), so no send was attempted.";
   } else {
     try {
-      await (opts.send ?? sendEmail)(input.to, input.subject, input.body);
+      await (opts.send ?? sendWithLayout)(input.to, input.subject, input.body, input.html);
       status = "sent";
     } catch (err) {
       status = "failed";

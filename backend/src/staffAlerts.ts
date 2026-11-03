@@ -50,6 +50,7 @@ import { id } from "./ids";
 import { logger } from "./logger";
 import { BRAND } from "./clientUpdates";
 import { formatProjectAddress, sendEmail } from "./clientNotifier";
+import { renderEmail, type EmailContent, type EmailSection } from "./emailLayout";
 import { projectSecretValuesById } from "./projectSecrets";
 import { redactSecretValues } from "../../shared/src/portalSafety";
 import { configuredStaffOrgs, staffAlertChannels, staffDigestHour, type StaffAlertChannels } from "./staffAlertConfig";
@@ -150,11 +151,11 @@ function errorCode(err: unknown): string {
   return String(e?.code || (e?.responseCode ? `SMTP_${e.responseCode}` : e?.name === "AbortError" ? "TIMEOUT" : "ERROR"));
 }
 
-async function deliverToChannels(channels: StaffAlertChannels, subject: string, body: string): Promise<{ status: string; detail: string }> {
+async function deliverToChannels(channels: StaffAlertChannels, subject: string, body: string, html?: string): Promise<{ status: string; detail: string }> {
   const results: Array<{ channel: string; ok: boolean; detail: string }> = [];
   if (channels.emails.length) {
     try {
-      await sendEmail(channels.emails.join(", "), subject, body);
+      await sendEmail(channels.emails.join(", "), subject, body, [], { html });
       results.push({ channel: "email", ok: true, detail: "sent" });
     } catch (err) {
       results.push({ channel: "email", ok: false, detail: errorCode(err) });
@@ -183,6 +184,8 @@ interface StaffMessage {
   state: string;
   subject: string;
   body: string;
+  /** The layout HTML part (email only; the webhook and the row carry `body`, the text twin). */
+  html?: string;
 }
 
 /**
@@ -219,7 +222,7 @@ async function recordAndSend(db: AppDb, msg: StaffMessage): Promise<void> {
     // replay a backlog of stale transitions.
     const rowId = claim(db, msg, recipient, on ? null : "off");
     if (!rowId || !on) return;
-    const { status, detail } = await deliverToChannels(channels, msg.subject, msg.body);
+    const { status, detail } = await deliverToChannels(channels, msg.subject, msg.body, msg.html);
     db.run(
       "UPDATE staff_notifications SET delivery_status = ?, delivery_detail = ?, sent_at = ? WHERE id = ?",
       [status, detail, status === "failed" ? null : new Date().toISOString(), rowId],
@@ -242,19 +245,54 @@ export function undeliveredStaffNotifications(db: AppDb, orgId: string | null): 
   return rows.map((r) => ({ id: r.id, kind: r.kind, state: r.state, subject: r.subject, deliveryStatus: r.delivery_status, deliveryDetail: r.delivery_detail, createdAt: r.created_at }));
 }
 
-function alertMessage(facts: ProjectFacts, projectId: string, track: string, what: string, why: string): { subject: string; body: string } {
-  const subject = `${BRAND} — needs you: ${trackLabel(track)} ${what} — ${facts.address}`;
-  const body = [
-    facts.address,
-    `Track: ${trackLabel(track)}`,
-    `What happened: ${what}`,
-    ...(why ? [`Why: ${why}`] : []),
-    `Open the project: ${projectLink(projectId)}`,
-  ].join("\n");
-  return { subject, body };
+// ── the messages (pure: the email preview and the tests render them without a database) ──────
+//
+// THE LOOK (#589): every message is layout content (emailLayout.ts) — a plain-words subject
+// ("Action needed: permit corrections requested — 123 Example Way"), a headline, the address, the
+// Track / What happened / Why rows, and one button to the project. `body` is the layout's text
+// twin: what the row stores and the webhook receives. The CONTENT RULES above are unchanged: the
+// address, the track and a reason in our own words (the free text already scrubbed by the caller).
+
+/** A message: subject, the text twin (stored + webhook) and the HTML part (email only). */
+export interface StaffEmail { subject: string; body: string; html: string }
+
+/** The track as it reads inside a sentence: "permit", "building permit", "NEM / interconnection". */
+function trackPhrase(track: string): string {
+  const label = trackLabel(track);
+  return /^[A-Z]{2}/.test(label) ? label : `${label.charAt(0).toLowerCase()}${label.slice(1)}`;
 }
 
-// ── the three triggers ──────────────────────────────────────────────────────────────────────
+function sentenceCase(s: string): string {
+  return s ? `${s.charAt(0).toUpperCase()}${s.slice(1)}` : s;
+}
+
+/** The street line ("123 Example Way") for a subject; the whole address when it has no comma. */
+export function shortAddress(address: string): string {
+  return String(address || "").split(",")[0].trim() || String(address || "");
+}
+
+function renderStaff(subject: string, content: EmailContent): StaffEmail {
+  const { text, html } = renderEmail(content);
+  return { subject, body: text, html };
+}
+
+/**
+ * One project alert. `event` is the plain-words thing that happened ("run failed", "corrections
+ * requested"); `what` and `why` are the Track / What happened / Why rows, as the alert always said.
+ */
+export function staffAlertEmail(input: { address: string; projectId: string; track: string; event: string; what: string; why: string }): StaffEmail {
+  const track = trackLabel(input.track);
+  const subject = `Action needed: ${trackPhrase(input.track)} ${input.event} — ${shortAddress(input.address)}`;
+  return renderStaff(subject, {
+    audience: "staff",
+    preheader: `${input.address}: ${input.why || input.what}`,
+    eyebrow: `Action needed · ${track}`,
+    headline: sentenceCase(`${trackPhrase(input.track)} ${input.event}`),
+    intro: [input.address],
+    rows: [["Track", track], ["What happened", input.what], ...(input.why ? [["Why", input.why] as [string, string]] : [])],
+    action: { label: "Open the project", url: projectLink(input.projectId) },
+  });
+}
 
 const RUN_WHAT: Record<string, string> = {
   paused_for_human: "run paused for a person",
@@ -262,6 +300,58 @@ const RUN_WHAT: Record<string, string> = {
   interrupted: "run interrupted",
   submitted_unconfirmed: "submit clicked, portal did not confirm",
 };
+/** The subject's / headline's words for each run ending. */
+const RUN_EVENT: Record<string, string> = {
+  paused_for_human: "run paused",
+  failed: "run failed",
+  interrupted: "run interrupted",
+  submitted_unconfirmed: "submit not confirmed",
+};
+/** The subject's / headline's words for each tracking outcome (OUTCOME_PHRASE is the Why row). */
+const STATUS_EVENT: Record<string, string> = {
+  reviewed_by_ahj: "plan review done",
+  ready_for_issue: "ready for issue",
+  issued: "issued",
+  nem_approved: "approved",
+  needs_human_review: "status needs a check",
+};
+
+/** A stage run ended on `runStatus`; `why` is already scrubbed (or one of our fixed sentences). */
+export function runAlertEmail(input: { address: string; projectId: string; track: string; runStatus: string; why: string }): StaffEmail {
+  return staffAlertEmail({
+    ...input,
+    event: RUN_EVENT[input.runStatus] ?? "run needs a person",
+    what: RUN_WHAT[input.runStatus] ?? input.runStatus.replace(/_/g, " "),
+  });
+}
+
+export function correctionAlertEmail(input: { address: string; projectId: string; track: string }): StaffEmail {
+  return staffAlertEmail({
+    ...input,
+    event: "corrections requested",
+    what: "correction notice received",
+    why: "the agency asked for changes. Triage it and draft the reply.",
+  });
+}
+
+/** `why` is already scrubbed: the gaps by their fieldName, never a portal label or a value. */
+export function stageHeldAlertEmail(input: { address: string; projectId: string; track: string; why: string }): StaffEmail {
+  return staffAlertEmail({ ...input, event: "staging held, details missing", what: "staging held, details missing" });
+}
+
+/** `outcome` is what was WRITTEN; named in our own words, never the portal's label. */
+export function statusAlertEmail(input: { address: string; projectId: string; track: string; outcome: string }): StaffEmail {
+  return staffAlertEmail({
+    address: input.address,
+    projectId: input.projectId,
+    track: input.track,
+    event: STATUS_EVENT[input.outcome] ?? "status changed",
+    what: "status changed",
+    why: OUTCOME_PHRASE[input.outcome] ?? input.outcome.replace(/_/g, " "),
+  });
+}
+
+// ── the three triggers ──────────────────────────────────────────────────────────────────────
 const RUN_FIXED_WHY: Record<string, string> = {
   interrupted: "the run's process went away; the portal may already hold a draft. Check the portal before staging this track again.",
   submitted_unconfirmed: "automation clicked the final submit and the portal did not confirm the filing. Verify on the portal before anything is staged or clicked again.",
@@ -280,8 +370,8 @@ export function alertStaffOnRunOutcome(
     // Fail closed on secrets: an unreadable project row means no free text at all.
     const secrets = projectSecretValuesById(db, input.projectId);
     const why = RUN_FIXED_WHY[input.runStatus] ?? (secrets ? scrubStaffText(input.reason, secrets) : "");
-    const { subject, body } = alertMessage(facts, input.projectId, input.track, RUN_WHAT[input.runStatus], why);
-    return recordAndSend(db, { orgId: facts.orgId, projectId: input.projectId, kind: "run", ref: input.runId, state: input.runStatus, subject, body });
+    const mail = runAlertEmail({ address: facts.address, projectId: input.projectId, track: input.track, runStatus: input.runStatus, why });
+    return recordAndSend(db, { orgId: facts.orgId, projectId: input.projectId, kind: "run", ref: input.runId, state: input.runStatus, ...mail });
   } catch (err) {
     logger.warn("staff-alert", `run alert skipped: ${err instanceof Error ? err.message : String(err)}`);
     return Promise.resolve();
@@ -293,9 +383,8 @@ export function alertStaffOnCorrection(db: AppDb, input: { projectId: string; co
   try {
     const facts = projectFacts(db, input.projectId);
     if (!facts || facts.archived) return Promise.resolve();
-    const { subject, body } = alertMessage(facts, input.projectId, input.track, "correction notice received",
-      "the agency asked for changes. Triage it and draft the reply.");
-    return recordAndSend(db, { orgId: facts.orgId, projectId: input.projectId, kind: "correction", ref: input.correctionId, state: "matched", subject, body });
+    const mail = correctionAlertEmail({ address: facts.address, projectId: input.projectId, track: input.track });
+    return recordAndSend(db, { orgId: facts.orgId, projectId: input.projectId, kind: "correction", ref: input.correctionId, state: "matched", ...mail });
   } catch (err) {
     logger.warn("staff-alert", `correction alert skipped: ${err instanceof Error ? err.message : String(err)}`);
     return Promise.resolve();
@@ -314,6 +403,29 @@ export function senderDomain(from: string): string {
   return all?.length ? all[all.length - 1].slice(1).toLowerCase().replace(/\.+$/, "") : "unknown sender";
 }
 
+function dashboardLink(): string {
+  return `${(process.env.PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 4173}`).replace(/\/+$/, "")}/`;
+}
+
+/** The unmatched-email alert: the sender's domain, the day and the kind — nothing else (below). */
+export function unmatchedEmailAlert(input: { domain: string; day: string; bucket: string }): StaffEmail {
+  const kind = UNMATCHED_KIND[input.bucket] ?? "correction";
+  return renderStaff(`Action needed: a ${kind} email matched no job (${input.domain})`, {
+    audience: "staff",
+    preheader: `A ${kind} email from ${input.domain} (${input.day}) could not be matched to any job.`,
+    eyebrow: "Action needed · Tracking inbox",
+    headline: "An email matched no job",
+    intro: [`A ${kind} email came into the tracking inbox and could not be matched to any job.`],
+    rows: [
+      ["From", input.domain],
+      ["Received", input.day],
+      ["Why", "it named no address, record number, account or meter that a job holds."],
+      ["Next", "find it in the tracking inbox by sender and date, open the job, and add the record or application number to its tracking so the next email matches on its own."],
+    ],
+    action: { label: `Open ${BRAND}`, url: dashboardLink() },
+  });
+}
+
 /**
  * A correction email from the tracking inbox matched no job (#522) — it used to be counted and
  * dropped. RULE 2 / no-homeowner-data: the alert carries the sender's domain, the date and the kind,
@@ -326,20 +438,12 @@ export function alertStaffOnUnmatchedCorrectionEmail(
   input: { orgId: string; signature: string; from: string; receivedAt: string | null; bucket: string },
 ): Promise<void> {
   try {
-    const domain = senderDomain(input.from);
-    const day = String(input.receivedAt || "").slice(0, 10) || "unknown date";
-    const kind = UNMATCHED_KIND[input.bucket] ?? "correction";
-    const base = (process.env.PUBLIC_BASE_URL || `http://localhost:${process.env.PORT || 4173}`).replace(/\/+$/, "");
-    const subject = `${BRAND} — needs you: a ${kind} email matched no job (${domain})`;
-    const body = [
-      `A ${kind} email came into the tracking inbox and could not be matched to any job.`,
-      `From: ${domain}`,
-      `Received: ${day}`,
-      "Why: it named no address, record number, account or meter that a job holds.",
-      "Next: find it in the tracking inbox by sender and date, open the job, and add the record or application number to its tracking so the next email matches on its own.",
-      `Open ${BRAND}: ${base}/`,
-    ].join("\n");
-    return recordAndSend(db, { orgId: input.orgId || DEFAULT_ORG_ID, projectId: null, kind: "unmatched_email", ref: input.signature, state: "unmatched", subject, body });
+    const mail = unmatchedEmailAlert({
+      domain: senderDomain(input.from),
+      day: String(input.receivedAt || "").slice(0, 10) || "unknown date",
+      bucket: input.bucket,
+    });
+    return recordAndSend(db, { orgId: input.orgId || DEFAULT_ORG_ID, projectId: null, kind: "unmatched_email", ref: input.signature, state: "unmatched", ...mail });
   } catch (err) {
     logger.warn("staff-alert", `unmatched email alert skipped: ${err instanceof Error ? err.message : String(err)}`);
     return Promise.resolve();
@@ -376,9 +480,9 @@ export function alertStaffOnStageHeld(
       return `${String(g.fieldName || g.key)}${where ? ` (${where})` : ""}`;
     }))];
     const why = scrubStaffText(`nothing was opened. Missing: ${names.join("; ")}. Fill ${names.length === 1 ? "it" : "them"}, or send the intake link, then stage again.`, secrets);
-    const { subject, body } = alertMessage(facts, input.projectId, input.track, "staging held, details missing", why);
+    const mail = stageHeldAlertEmail({ address: facts.address, projectId: input.projectId, track: input.track, why });
     const track = String(input.track || "permit");
-    return recordAndSend(db, { orgId: facts.orgId, projectId: input.projectId, kind: "stage_held", ref: `${input.projectId}:${track}`, state, subject, body });
+    return recordAndSend(db, { orgId: facts.orgId, projectId: input.projectId, kind: "stage_held", ref: `${input.projectId}:${track}`, state, ...mail });
   } catch (err) {
     logger.warn("staff-alert", `stage-held alert skipped: ${err instanceof Error ? err.message : String(err)}`);
     return Promise.resolve();
@@ -395,12 +499,11 @@ export function alertStaffOnStatusChange(
     if (!shouldAlertStaffOnStatus(input.outcome, input.previousOutcome)) return Promise.resolve();
     const facts = projectFacts(db, input.projectId);
     if (!facts || facts.archived) return Promise.resolve();
-    const phrase = OUTCOME_PHRASE[input.outcome] ?? input.outcome.replace(/_/g, " ");
-    const { subject, body } = alertMessage(facts, input.projectId, input.track, "status changed", phrase);
+    const mail = statusAlertEmail({ address: facts.address, projectId: input.projectId, track: input.track, outcome: input.outcome });
     // ref: the target (a project has one per filing). No target (an email with no filing to bind
     // to) dedupes per project + track.
     const ref = input.targetId || `${input.projectId}:${input.track || "permit"}`;
-    return recordAndSend(db, { orgId: facts.orgId, projectId: input.projectId, kind: "status", ref, state: input.outcome, subject, body });
+    return recordAndSend(db, { orgId: facts.orgId, projectId: input.projectId, kind: "status", ref, state: input.outcome, ...mail });
   } catch (err) {
     logger.warn("staff-alert", `status alert skipped: ${err instanceof Error ? err.message : String(err)}`);
     return Promise.resolve();
@@ -410,7 +513,7 @@ export function alertStaffOnStatusChange(
 // ── the morning digest ──────────────────────────────────────────────────────────────────────
 
 const URGENCY_ORDER: Record<string, number> = { overdue: 0, today: 1, waiting: 2, done: 3 };
-const URGENCY_HEADING: Record<string, string> = { overdue: "OVERDUE", today: "TODAY", waiting: "WHEN YOU CAN" };
+const URGENCY_HEADING: Record<string, string> = { overdue: "Overdue", today: "Today", waiting: "When you can" };
 
 /** The server's local calendar date, YYYY-MM-DD — the digest's dedupe ref. */
 export function localDateKey(now: Date): string {
@@ -423,10 +526,10 @@ export function localDateKey(now: Date): string {
  * loadNextStepFacts + decideNextStep per row — the same rule table the dashboard shows), scoped
  * by org at the query, so another org's job cannot appear.
  */
-export async function buildStaffDigest(db: AppDb, orgId: string, now: Date = new Date()): Promise<{ subject: string; body: string; count: number }> {
+export async function buildStaffDigest(db: AppDb, orgId: string, now: Date = new Date()): Promise<StaffEmail & { count: number }> {
   // Dynamic: repository imports this module (the jobQueue/repository circular-import guard).
   const { getProjectList } = await import("./repository");
-  const items: Array<{ id: string; address: string; urgency: string; headline: string }> = [];
+  const items: StaffDigestItem[] = [];
   for (let offset = 0; ; offset += 500) {
     const page = getProjectList(db, { orgId, includeArchived: false, limit: 500, offset, sort: "created_desc" });
     for (const p of page.projects) {
@@ -442,19 +545,34 @@ export async function buildStaffDigest(db: AppDb, orgId: string, now: Date = new
     }
     if (page.projects.length < 500) break;
   }
-  items.sort((a, b) => (URGENCY_ORDER[a.urgency] ?? 9) - (URGENCY_ORDER[b.urgency] ?? 9) || a.address.localeCompare(b.address));
+  return { ...staffDigestEmail(items, now), count: items.length };
+}
+
+/** One job on the digest: its address, urgency and the next step's headline (already scrubbed). */
+export interface StaffDigestItem { id: string; address: string; urgency: string; headline: string }
+
+/** The digest message for a list of jobs (pure): most urgent first, grouped, a link per job. */
+export function staffDigestEmail(jobs: StaffDigestItem[], now: Date): StaffEmail {
+  const items = [...jobs].sort((a, b) => (URGENCY_ORDER[a.urgency] ?? 9) - (URGENCY_ORDER[b.urgency] ?? 9) || a.address.localeCompare(b.address));
   const date = localDateKey(now);
-  const subject = items.length
-    ? `${BRAND} — ${items.length} job${items.length === 1 ? "" : "s"} need${items.length === 1 ? "s" : ""} you today (${date})`
-    : `${BRAND} — nothing needs you today (${date})`;
-  const lines: string[] = [items.length ? `${items.length} job(s) whose next step is ours, most urgent first.` : "No open job is waiting on the team this morning."];
-  let heading = "";
+  const n = items.length;
+  const needs = `${n} job${n === 1 ? "" : "s"} need${n === 1 ? "s" : ""} you today`;
+  const subject = n ? `${needs} (${date})` : `Nothing needs you today (${date})`;
+  const sections: EmailSection[] = [];
   for (const it of items) {
-    const h = URGENCY_HEADING[it.urgency] ?? it.urgency.toUpperCase();
-    if (h !== heading) { lines.push("", h); heading = h; }
-    lines.push(`- ${it.address}: ${it.headline || "open the project"}`, `  ${projectLink(it.id)}`);
+    const heading = URGENCY_HEADING[it.urgency] ?? sentenceCase(it.urgency.replace(/_/g, " "));
+    if (sections.at(-1)?.heading !== heading) sections.push({ heading, items: [] });
+    sections.at(-1)!.items!.push({ text: `${it.address}: ${it.headline || "open the project"}`, url: projectLink(it.id), linkLabel: "Open the project" });
   }
-  return { subject, body: lines.join("\n"), count: items.length };
+  return renderStaff(subject, {
+    audience: "staff",
+    preheader: n ? `${n} job${n === 1 ? "" : "s"} whose next step is ours, most urgent first.` : "No open job is waiting on the team this morning.",
+    eyebrow: `Morning digest · ${date}`,
+    headline: n ? sentenceCase(needs) : "Nothing needs you today",
+    intro: [n ? `${n} job(s) whose next step is ours, most urgent first.` : "No open job is waiting on the team this morning."],
+    sections,
+    action: { label: "Open the dashboard", url: dashboardLink() },
+  });
 }
 
 /**
@@ -472,8 +590,8 @@ export async function sendStaffDigestsIfDue(db: AppDb, now: Date = new Date()): 
       // Cheap pre-check before building: the digest reads every project of the org.
       const done = db.get("SELECT 1 FROM staff_notifications WHERE org_id = ? AND kind = 'digest' AND ref = ? LIMIT 1", [orgId, date]);
       if (done) continue;
-      const { subject, body } = await buildStaffDigest(db, orgId, now);
-      await recordAndSend(db, { orgId, projectId: null, kind: "digest", ref: date, state: "digest", subject, body });
+      const { subject, body, html } = await buildStaffDigest(db, orgId, now);
+      await recordAndSend(db, { orgId, projectId: null, kind: "digest", ref: date, state: "digest", subject, body, html });
       sent.push(orgId);
     }
   } catch (err) {
