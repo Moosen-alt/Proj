@@ -1803,9 +1803,12 @@ await check("#365, HELM'S 10-18 RE-CHECK OF #369: a lookup that names no platfor
 
   // ══ THE NIT: ODD URL SPELLINGS ARE READ (seeded, so only the parse decides) — a scheme-less IPv4,
   // smart quotes, a trailing-dot host; and a person's verified portal_url that yields no URL counts.
+  // Each on a host portalUrlsInText cannot find (it reads only its listed top-level domains), so the
+  // parse alone decides: a smart-quoted .gov value was found by it anyway, and its pin stayed green
+  // with the smart-quote strip gone (kill N-smart).
   for (const [utility, url] of [
     ["Quy Electric", "10.20.30.40/apply"],
-    ["Rampton Electric", "“https://permits.cedarvale.gov/apply”"],
+    ["Rampton Electric", "“https://permits.cedarvale.online/apply”"],
     ["Sawston Electric", "permits.cedarvale.online./apply"],
   ] as const) {
     beside(utility);
