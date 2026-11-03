@@ -7733,6 +7733,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
 
       let pageFillCountPre = 0;
       let answeredAnyPicker = false;
+      // The contact-source pickers answered below, label → the option chosen. Read by (d), which
+      // must not choose the same option again (#530).
+      const answeredPickers = new Map<string, string>();
       // c4c) A CONTACT BLOCK'S SOURCE PICKER MUST BE ANSWERED BEFORE ITS FIELDS ARE TYPED.
       //
       // PowerClerk renders each contact block with a select — "Existing contact to use for
@@ -7762,6 +7765,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             steps.push(step);
             pageFillCountPre++;
             this.debug?.event({ type: "contact_source_answered", page: pageCount, label: String(f.label ?? "").slice(0, 50), chose: chosen });
+            answeredPickers.set(String(f.label ?? ""), String(chosen));
             // CHOOSING RE-RENDERS THE BLOCK. PowerClerk rebuilds the contact fields when the
             // source changes, and their ids are render-order counters (pcInputBase15…), so a
             // fill applied against the pre-render list lands on a detached node or the wrong
@@ -7843,6 +7847,21 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         const field = fields[fillReq.selectorIndex];
         if (!field) continue; // out-of-range index from the planner — skip safely.
         if (field.fieldType === "file") continue; // handled by the upload pass above.
+        // A CONTACT-SOURCE PICKER IS ANSWERED ONCE (#530). The planner sees the same required
+        // select c4c just answered and asks for "New Contact" again. Choosing it again fires the
+        // picker's change a second time, and PowerClerk re-renders the block on every change:
+        // whatever this page filled before it in plan order (PacifiCorp's "Will the System be
+        // Customer-Owned or Third-Party Owned?") is reset. The learn's read-back can re-fill it,
+        // but the recorded steps keep the second pick AFTER that answer, so every replay resets
+        // it again and files the page with it blank. Same option = nothing to do.
+        if (field.fieldType === "select" && answeredPickers.has(String(field.label ?? ""))) {
+          const chose = answeredPickers.get(String(field.label ?? "")) ?? "";
+          const loose = (v: string): string => String(v ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+          if (loose(fillReq.value) === loose(chose)) {
+            this.debug?.event({ type: "contact_source_repick_skipped", page: pageCount, label: String(field.label ?? "").slice(0, 50) });
+            continue;
+          }
+        }
         const sensitive = isSensitiveLabel(field.label);
         const step = await this.applyFill(field, fillReq, sensitive);
         if (step) {
@@ -9050,6 +9069,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           });
           if (real.some((o) => norm(o.textContent || "") === w || norm(o.value) === w)) return true;
           if (w !== "" && options.some((o) => norm(o.value) === w)) return true;
+          // selectWithFallback's punctuation-blind exact pass (#530): "Customer Owned" is ready
+          // when "Customer-Owned" is listed, instead of burning the whole cap.
+          const loose = (s: string) => norm(s).replace(/[^a-z0-9]+/g, " ").trim();
+          const lw = loose(want);
+          if (lw && real.some((o) => loose(o.textContent || "") === lw)) return true;
           return real.some((o) => {
             const t = norm(o.textContent || "");
             return t.includes(w) || w.includes(t);
@@ -10348,7 +10372,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // interaction for styled-div dropdowns. Shared with replay via selectWithFallback so
           // a value like "Schedule 7" resolves to "Schedule 7 - Residential…" identically in
           // both paths (a learn that fills it must replay it the same way).
-          await selectWithFallback(this.page, loc, value);
+          const took = await selectWithFallback(this.page, loc, value);
+          // A CHOICE THE LIST DOES NOT HOLD IS SAID, WITH THE LIST (#530). This miss used to be
+          // silent here and surface only later as "fills_did_not_hold" + "required_never_filled",
+          // which cannot tell a portal that cleared the answer from one that never offered it.
+          if (!took) await this.noteSelectNotOffered(loc, field.label || "", value, sensitive);
         } else if (action === "check") {
           if (negated) {
             // Explicit false/no → uncheck the box (leave it unchecked).
@@ -10818,6 +10846,35 @@ export class AutoLearnAdapter extends BasePortalAdapter {
 
   // Read each applied fill back; re-apply once if it didn't hold; return the labels of REQUIRED
   // fields that STILL won't hold their value (the portal silently dropped them).
+  /** #530 — a select that took none of its options for `value`: name what it DID offer, once per
+   *  label and value, so a blank required select reads as "the answer is not one of these" rather
+   *  than as a fill the portal took back. Native <select> only (a styled widget's list is not in
+   *  the DOM until opened). The wanted value of a sensitive field is never logged. Never throws. */
+  private selectNotOfferedSeen = new Set<string>();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async noteSelectNotOffered(loc: any, label: string, value: string, sensitive: boolean): Promise<void> {
+    try {
+      if (!loc || typeof loc.evaluate !== "function") return;
+      const offered = await loc.evaluate((el: Element) => {
+        if ((el.tagName || "").toLowerCase() !== "select") return null;
+        return Array.from((el as HTMLSelectElement).options)
+          .map((o) => (o.textContent || "").replace(/\s+/g, " ").trim())
+          .filter((t) => t && !/^(please\s+)?(select|choose)\b\.{0,3}|^--/i.test(t));
+      }).catch(() => null) as string[] | null;
+      if (!Array.isArray(offered)) return;
+      const key = sensitive ? label : `${label}\u0000${value}`;
+      if (this.selectNotOfferedSeen.has(key)) return;
+      this.selectNotOfferedSeen.add(key);
+      this.debug?.event({
+        type: "select_value_not_offered",
+        label: label.slice(0, 80),
+        ...(sensitive ? {} : { wanted: String(value ?? "").slice(0, 80) }),
+        offered: offered.slice(0, 12).map((o) => o.slice(0, 60)),
+        ...(offered.length > 12 ? { more: offered.length - 12 } : {}),
+      });
+    } catch { /* reporting only */ }
+  }
+
   private async verifyFillsLanded(applied: AppliedFill[], opts?: { budgetMs?: number; requiredOnly?: boolean }): Promise<string[]> {
     const misses: string[] = [];
     // A RE-ASSERT PASS IS A SAFETY NET, NOT A SECOND FILL PHASE. Unbounded, the exit pass
@@ -10860,7 +10917,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         } else if (a.sensitive || !a.expected) {
           // nothing to retype — fall through to the re-check
         } else if (a.fieldType === "select") {
-          await selectWithFallback(this.page!, loc, a.expected);
+          if (!(await selectWithFallback(this.page!, loc, a.expected))) await this.noteSelectNotOffered(loc, a.label, a.expected, a.sensitive);
         } else if (a.fieldType === "checkbox" || a.fieldType === "radio") {
           if (/^(true|yes|on|1)$/i.test(a.expected) && typeof loc.check === "function") await loc.check({ timeout: 5000 });
         } else if (typeof loc.fill === "function") {
