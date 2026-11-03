@@ -16,7 +16,10 @@
 // the mask colour in the PNG itself, or the file is deleted and the picture is refused. #436 fix round
 // 2: what is PAINTED decides, never a tag name (a scriptless page paints <noscript>; placeholder, alt
 // and generated content are painted too), and the picture must be of the document that was checked
-// (each frame marked before tagging, read back after the shot, every marked box found again).
+// (each frame marked before tagging, read back after the shot, every marked box found again). #436
+// fix round 3: an <option> or <optgroup> OUTSIDE a <select> is content again — main's learner tagged
+// it, round 1's skip-by-name left it in clear — and the staged picture refuses one that paints a
+// secret, since neither its text node nor its own box says where Chromium draws its text.
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import type { CDPSession, ElementHandle, Frame, Locator, Page } from "playwright";
@@ -50,6 +53,9 @@ export function secretMaskPatterns(secrets: readonly string[]): SecretMaskPatter
  *  chosen option, and an <option> has no box of its own (#436 fix round 1 — the tagger tagged the
  *  0x0 option, so the mask drew nothing over the select). #436 fix round 2: an input or text area is
  *  tagged by its placeholder too, an image (or image button) by its alt, and a <noscript> is content.
+ *  #436 fix round 3: an <option> or <optgroup> is skipped only INSIDE a <select>; outside one it is
+ *  content, read by its text and its label attribute (main's learner tagged a stray <option>; the
+ *  name skip everywhere tagged nothing, ancestors included).
  *  Every change here tags MORE, never less: the learner's withSecretMask shares this tagger. Returns
  *  how many were tagged. Throws when the page cannot be evaluated (the caller decides whether that
  *  fails closed). */
@@ -102,8 +108,12 @@ export async function tagSecretsInPage(page: Pick<Page, "evaluate">, pats: Secre
       if (hit) { sel.setAttribute("data-al-secret", "1"); n++; }
     }
     // Text rendering one (a review page's "Account: 7734009155"). Most pages carry none, so
-    // the whole-root check keeps the element walk off the common path.
-    const bt = String(root === document ? (document.body ? document.body.textContent || "" : "") : (root.textContent || ""));
+    // the whole-root check keeps the element walk off the common path. An <option> or <optgroup>
+    // OUTSIDE a <select> paints its label attribute, which no textContent holds: read here too.
+    let bt = String(root === document ? (document.body ? document.body.textContent || "" : "") : (root.textContent || ""));
+    for (const o of Array.from(root.querySelectorAll("option[label], optgroup[label]"))) {
+      if (!o.closest("select")) bt += ` ${String(o.getAttribute("label") || "")}`;
+    }
     const btd = bt.replace(/\D/g, "");
     const btl = bt.toLowerCase();
     let textHas = false;
@@ -113,13 +123,18 @@ export async function tagSecretsInPage(page: Pick<Page, "evaluate">, pats: Secre
     if (!textHas) continue;
     for (const el of Array.from(root.querySelectorAll(root === document ? "body *" : "*"))) {
       const tag = el.tagName;
-      // An option's text is the select's (tagged above, by each option alone). A <noscript> is
-      // CONTENT (#436 fix round 2): on a page whose scripts are off — the staged walk's — the browser
-      // builds and paints what it holds, and skipping it by name (its ancestors skipped too, since
-      // their child carries the secret) left the account in clear. With scripts on it is not
-      // rendered, so tagging it masks nothing more.
-      if (tag === "SCRIPT" || tag === "STYLE" || tag === "INPUT" || tag === "TEXTAREA" || tag === "OPTION" || tag === "OPTGROUP") continue;
-      const text = String(el.textContent || "");
+      // An option's text INSIDE a <select> is the select's (tagged above, by each option alone). One
+      // OUTSIDE a select is CONTENT (#436 fix round 3): Chromium paints it, in its own box, and its
+      // label attribute instead of its text when it has one; skipping it by name everywhere (its
+      // ancestors skipped too, since their child carries the secret) tagged nothing where main's
+      // learner tagged the <option>. A <noscript> is CONTENT (#436 fix round 2): on a page whose
+      // scripts are off — the staged walk's — the browser builds and paints what it holds, and
+      // skipping it by name left the account in clear. With scripts on it is not rendered, so
+      // tagging it masks nothing more.
+      if (tag === "SCRIPT" || tag === "STYLE" || tag === "INPUT" || tag === "TEXTAREA") continue;
+      const opt = tag === "OPTION" || tag === "OPTGROUP";
+      if (opt && el.closest("select")) continue;
+      const text = String(el.textContent || "") + (opt ? ` ${String(el.getAttribute("label") || "")}` : "");
       if (!text) continue;
       const td = text.replace(/\D/g, "");
       const tl = text.toLowerCase();
@@ -213,6 +228,10 @@ const SHIM = "globalThis.__name = globalThis.__name || function (fn) { return fn
  *     alt text, a ::before / ::after / ::marker's generated content (attr(), quotes, a string
  *     list-style-type) — that carries a secret is UNCOVERED, tagged or not: where it paints cannot be
  *     read back, so the mask cannot be shown to hold it.
+ *   - so is an <option> or <optgroup> OUTSIDE a <select> that paints (#436 fix round 3): Chromium
+ *     draws its text or label with no rects on any text node, and not inside its own box either
+ *     (width:0, text-indent, display:contents). A tagged element whose subtree holds one that paints
+ *     anything is UNCOVERED; untagged, its text and label join the leftover run below as painted.
  *  Throws when the frame cannot be evaluated. */
 export async function secretMaskCoverageInPage(frame: Pick<Frame, "evaluate">, pats: SecretMaskPattern[], nonce = "1"): Promise<{ painted: number; uncovered: string[] }> {
   await frame.evaluate(SHIM);
@@ -248,10 +267,30 @@ export async function secretMaskCoverageInPage(frame: Pick<Frame, "evaluate">, p
       range.selectNodeContents(n);
       return Array.from(range.getClientRects()).some((r) => area(r) > 0);
     };
+    /** THE ONE ELEMENT WHOSE PAINTED TEXT HAS NO LIGHT-DOM RECTS, listed by name (#436 fix round 3):
+     *  an <option> or <optgroup> OUTSIDE a <select>. Chromium paints its text (or its label attribute)
+     *  itself — the text node has no client rects — and its own box does not bound the paint either
+     *  (width:0 leaves a 4px box with the text drawn 240px wide, text-indent moves it past the box,
+     *  display:contents leaves no box at all). Whether it MAY paint: no display:none on it or any
+     *  composed ancestor, and a box (of any size: a 0x0 one still paints its overflow) or
+     *  display:contents. */
+    const strayPaints = (el: Element): boolean => {
+      if (!(el.tagName === "OPTION" || el.tagName === "OPTGROUP") || el.closest("select")) return false;
+      for (let e: Element | null = el; e; e = up(e)) if (getComputedStyle(e).display === "none") return false;
+      return getComputedStyle(el).display === "contents" || el.getClientRects().length > 0;
+    };
+    /** The stray <option>/<optgroup> an element sits in (itself included), or null. */
+    const strayOf = (el: Element | null): Element | null => {
+      const o = el ? el.closest("option, optgroup") : null;
+      return o && !o.closest("select") ? o : null;
+    };
     /** Where an element's text is painted: the client rects of every text node in its composed
-     *  subtree. No element is skipped by name: one that paints nothing gives no rects. */
-    const textRects = (el: Element): DOMRect[] => {
+     *  subtree. No element is skipped by name: one that paints nothing gives no rects. `stray`: the
+     *  subtree holds a stray <option>/<optgroup> that paints text or a label — where that text lands
+     *  cannot be read back, so the element cannot be shown to be covered. */
+    const textRects = (el: Element): { rects: DOMRect[]; stray: boolean } => {
       const out: DOMRect[] = [];
+      let stray = false;
       const stack: Node[] = [el];
       while (stack.length) {
         const n = stack.pop() as Node;
@@ -262,18 +301,23 @@ export async function secretMaskCoverageInPage(frame: Pick<Frame, "evaluate">, p
           }
           continue;
         }
+        if (n.nodeType === 1 && !stray && strayPaints(n as Element) && `${String(n.textContent || "")}${String((n as Element).getAttribute("label") || "")}`.trim()) stray = true;
         const sr = n.nodeType === 1 ? (n as HTMLElement).shadowRoot : null;
         if (sr) for (const c of Array.from(sr.childNodes)) stack.push(c);
         for (const c of Array.from(n.childNodes)) stack.push(c);
       }
-      return out;
+      return { rects: out, stray };
     };
     for (const root of roots) {
       for (const el of Array.from(root.querySelectorAll(`[${a.attr}]`))) {
         let target: Element | null = el.closest("select") || el;
-        const rects = /^(INPUT|TEXTAREA|SELECT|IMG)$/.test(target.tagName)
-          ? Array.from(target.getClientRects()).filter((r) => area(r) > 0)
-          : textRects(target);
+        let rects: DOMRect[];
+        if (/^(INPUT|TEXTAREA|SELECT|IMG)$/.test(target.tagName)) rects = Array.from(target.getClientRects()).filter((r) => area(r) > 0);
+        else {
+          const tr = textRects(target);
+          if (tr.stray) { uncovered.push(`${name(el)} paints a known secret in an <option> or <optgroup> outside a <select>, whose text the mask cannot place`); continue; }
+          rects = tr.rects;
+        }
         if (!rects.length) continue;
         let held = false;
         for (let guard = 0; target && guard < 64; guard++) {
@@ -328,20 +372,33 @@ export async function secretMaskCoverageInPage(frame: Pick<Frame, "evaluate">, p
     }
     // ... and PAINTED text no tagged element covers, in runs split at each tagged element (a text node
     // that paints nothing is left out of the run, not a break in it: the picture shows its neighbours
-    // side by side).
+    // side by side). A stray <option>/<optgroup> that paints (strayPaints) paints its text with no
+    // rects on the text node, and its label with no text node at all: both join the run (#436 fix
+    // round 3 — `<p><option>8814</option></p><p>402937</p>` was kept with the number in clear).
     for (const root of roots) {
       const start: Node | null = root === document ? document.documentElement : root;
       if (!start) continue;
-      const walker = document.createTreeWalker(start, NodeFilter.SHOW_TEXT);
+      const walker = document.createTreeWalker(start, NodeFilter.SHOW_TEXT | NodeFilter.SHOW_ELEMENT);
       let seg = "";
       for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-        const pe = (n as Text).parentElement;
-        // What a text area or select paints is its value / options, asked by the control check above.
-        if (pe && pe.closest("textarea, select")) continue;
-        const t = String(n.textContent || "");
-        if (t.trim() && !textPainted(n)) continue;
+        let t: string;
+        let from: Element | null;
+        if (n.nodeType === 1) {
+          const el = n as Element;
+          if (!el.hasAttribute("label") || !strayPaints(el)) continue;
+          t = String(el.getAttribute("label") || "");
+          from = el;
+        } else {
+          const pe = (n as Text).parentElement;
+          // What a text area or select paints is its value / options, asked by the control check above.
+          if (pe && pe.closest("textarea, select")) continue;
+          t = String(n.textContent || "");
+          const so = strayOf(pe);
+          if (t.trim() && !(so ? strayPaints(so) : textPainted(n))) continue;
+          from = pe || up(n);
+        }
         let covered = false;
-        for (let e: Element | null = pe || up(n); e; e = up(e)) if (e.hasAttribute(a.attr)) { covered = true; break; }
+        for (let e: Element | null = from; e; e = up(e)) if (e.hasAttribute(a.attr)) { covered = true; break; }
         if (covered) {
           if (carries(seg)) uncovered.push(`text ${root === document ? "on the page" : "in a shadow root"} carries a known secret no element could be tagged for`);
           seg = "";

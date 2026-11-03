@@ -126,6 +126,98 @@ const PAGES: Record<string, string> = {
   frameReload: doc(`<iframe id="fr" src="/frameDoc" style="${abs(100, "width:500px;height:100px;border:0")}"></iframe>`, false),
   frameDoc: `<!doctype html><html><body style="margin:0"><p style="margin:0;font-size:20px">Account ${ACCOUNT}</p></body></html>`,
 };
+// #436 FIX ROUND 3 — an <option>/<optgroup> OUTSIDE a <select>. The account is drawn in pure green and
+// nothing else on these pages is green, so the green pixels in a picture are the account in clear.
+const GREEN = "color:rgb(0,200,0);font-weight:bold;font-size:28px";
+const stray = (body: string): string => `<!doctype html><html><head><meta charset="utf-8"><title>Review</title></head><body style="margin:0"><h1 style="margin:0;font-size:20px">Review and Submit</h1>${body}</body></html>`;
+const NOWRAP0 = `${GREEN};width:0;padding:0;white-space:nowrap`;
+const STRAY: Record<string, string> = {
+  // The round-2 check's five, as it ran them (but the listbox's green on the account's option alone,
+  // so its "One" is not counted as the account).
+  strayOption: stray(`<div><option style="${GREEN}">Account ${ACCOUNT}</option></div>`),
+  listboxDivOptions: stray(`<div role="listbox" style="font-size:28px"><option>One</option><option aria-selected="true" style="${GREEN}">${ACCOUNT}</option></div>`),
+  strayOptionInTable: stray(`<table><tr><th>Account</th><td style="${GREEN}"><option selected>${ACCOUNT}</option></td></tr></table>`),
+  strayOptgroupLabel: stray(`<div style="${GREEN}"><optgroup label="Account ${ACCOUNT}"></optgroup></div>`),
+  strayOptionLabel: stray(`<div style="${GREEN}"><option label="Account ${ACCOUNT}">x</option></div>`),
+  // Its siblings in the learner's tag-set diff.
+  strayOptionBare: stray(`<div style="${GREEN}"><option>Account ${ACCOUNT}</option></div>`),
+  strayOptgroup: stray(`<div><optgroup style="${GREEN}"><option>Account ${ACCOUNT}</option></optgroup></div>`),
+  // The option's OWN box does not hold what it paints: a 0-wide box with the text drawn past it, the
+  // text pushed off the box by text-indent, and no box at all (display:contents).
+  strayWidth0: stray(`<div><option style="${NOWRAP0}">Account ${ACCOUNT}</option></div>`),
+  strayIndent: stray(`<div style="width:300px"><option style="${GREEN};text-indent:350px;white-space:nowrap">Acct ${ACCOUNT}</option></div>`),
+  strayContents: stray(`<div><option style="${GREEN};display:contents">Account ${ACCOUNT}</option></div>`),
+  strayOptgroupContents: stray(`<div style="${GREEN}"><optgroup style="display:contents" label="Account ${ACCOUNT}"></optgroup></div>`),
+  // Split: no option holds the whole number. The tagger tags the narrow wrapper; both halves are
+  // drawn past it.
+  splitTwoOptions: stray(`<div style="width:20px"><option style="${NOWRAP0}">8814</option><option style="${NOWRAP0}">402937</option></div>`),
+  // Split across blocks, nothing tagged: the option's half has no text rects, its label none at all.
+  splitStrayP: stray(`<p><option style="${GREEN}">8814</option></p><p style="${GREEN}">402937</p>`),
+  splitLabel: stray(`<div><optgroup style="${GREEN}" label="Acct 8814"></optgroup><span style="${GREEN}">402937</span></div>`),
+  // MUST-PASS: a datalist's option paints nothing (the datalist is display:none), beside a plain
+  // masked account.
+  datalist: stray(`<input list="dl" style="width:200px"><datalist id="dl"><option>${ACCOUNT}</option></datalist><div style="${GREEN}">Account ${ACCOUNT}</div>`),
+  // Controls for the learner's tag-set diff.
+  plainGreen: stray(`<div style="${GREEN}">Account ${ACCOUNT}</div>`),
+  selectChosen: stray(`<select style="${GREEN};width:320px;height:44px"><option>Choose</option><option selected>${ACCOUNT}</option></select>`),
+  inputVal: stray(`<input value="${ACCOUNT}" style="${GREEN};width:320px;height:44px">`),
+  shadowStray: stray(`<div><template shadowrootmode="open"><option style="${GREEN}">Account ${ACCOUNT}</option></template></div>`),
+};
+Object.assign(PAGES, STRAY);
+/** MAIN'S LEARNER TAGGER (origin/main d07388da, autoLearnAdapter.ts withSecretMask's inline body),
+ *  copied verbatim from the diff's removed lines: the oracle the shared tagger must cover. */
+const mainTagger = (ps: Array<{ digits: string; literal: string }>): number => {
+  let n = 0;
+  // A box holding one (typed here, or pre-filled by the portal).
+  for (const el of Array.from(document.querySelectorAll("input, textarea"))) {
+    const v = String((el as HTMLInputElement).value || "");
+    if (!v) continue;
+    const vd = v.replace(/\D/g, "");
+    const vl = v.toLowerCase();
+    for (const p of ps) {
+      if ((p.digits && vd.indexOf(p.digits) >= 0) || (p.literal && vl.indexOf(p.literal) >= 0)) { el.setAttribute("data-al-secret", "1"); n++; break; }
+    }
+  }
+  // Text rendering one (a review page's "Account: 7734009155"). Most pages carry none, so
+  // the whole-body check keeps the element walk off the common path.
+  const bt = String(document.body ? document.body.textContent || "" : "");
+  const btd = bt.replace(/\D/g, "");
+  const btl = bt.toLowerCase();
+  let textHas = false;
+  for (const p of ps) {
+    if ((p.digits && btd.indexOf(p.digits) >= 0) || (p.literal && btl.indexOf(p.literal) >= 0)) { textHas = true; break; }
+  }
+  if (!textHas) return n;
+  for (const el of Array.from(document.querySelectorAll("body *"))) {
+    const tag = el.tagName;
+    if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT" || tag === "INPUT" || tag === "TEXTAREA") continue;
+    const text = String(el.textContent || "");
+    if (!text) continue;
+    const td = text.replace(/\D/g, "");
+    const tl = text.toLowerCase();
+    let hit = false;
+    for (const p of ps) {
+      if ((p.digits && td.indexOf(p.digits) >= 0) || (p.literal && tl.indexOf(p.literal) >= 0)) { hit = true; break; }
+    }
+    if (!hit) continue;
+    // The SMALLEST element carrying the whole secret: skip an ancestor when a child element
+    // carries it too (masking <body> would blank the whole picture).
+    let childCarries = false;
+    for (const c of Array.from(el.children)) {
+      const ct = String(c.textContent || "");
+      const cd = ct.replace(/\D/g, "");
+      const cl = ct.toLowerCase();
+      for (const p of ps) {
+        if ((p.digits && cd.indexOf(p.digits) >= 0) || (p.literal && cl.indexOf(p.literal) >= 0)) { childCarries = true; break; }
+      }
+      if (childCarries) break;
+    }
+    if (childCarries) continue;
+    el.setAttribute("data-al-secret", "1");
+    n++;
+  }
+  return n;
+};
 /** Served without the account on its first load, with it on every load after: a page that reloads
  *  itself INTO showing one. Nothing was marked before the shot, so only the document mark can tell. */
 const RELOAD_INTO = {
@@ -165,6 +257,25 @@ const maskShare = async (file: string, b: { x: number; y: number; w: number; h: 
   let n = 0;
   for (let i = 0; i < d.length; i += 4) if (d[i] >= 240 && d[i + 1] <= 20 && d[i + 2] >= 240) n++;
   return n / (d.length / 4);
+};
+/** How many pixels of a picture are the account's green (the round-3 pages draw nothing else green). */
+const greenPixels = async (png: Buffer): Promise<number> => {
+  const { createCanvas, loadImage } = await import("@napi-rs/canvas");
+  const img = await loadImage(png);
+  const cv = createCanvas(img.width, img.height);
+  const g = cv.getContext("2d");
+  g.drawImage(img, 0, 0);
+  const d = g.getImageData(0, 0, img.width, img.height).data;
+  let n = 0;
+  for (let i = 0; i < d.length; i += 4) if (d[i] < 70 && d[i + 1] > 150 && d[i + 2] < 70) n++;
+  return n;
+};
+/** A page as the learner sees one: its scripts run. */
+const scripted = async (name: string): Promise<Page> => {
+  const ctx = await browser.newContext({ viewport: { width: 800, height: 600 } });
+  const pg = await ctx.newPage();
+  await pg.goto(`${base}/${name}`);
+  return pg;
 };
 
 try {
@@ -309,6 +420,59 @@ try {
     const file = path.join(dir, "still.png");
     const m = await maskedFullPageScreenshot(pg, [ACCOUNT], file, { beforeShot: async () => {} });
     check("still: a page that does not move keeps its picture, ok:true", m.ok && fs.existsSync(file), JSON.stringify(m));
+    await pg.context().close();
+  }
+
+  console.log("\n7. FACE 1 (fix round 3): the learner's tagger covers every element main's tagged, and its mask leaves no green");
+  {
+    const pats = secretMaskPatterns([ACCOUNT]);
+    for (const name of ["strayOption", "listboxDivOptions", "strayOptionInTable", "strayOptgroupLabel", "strayOptionLabel", "strayOptionBare", "strayOptgroup", "shadowStray", "datalist", "plainGreen", "selectChosen", "inputVal"]) {
+      const pg = await scripted(name);
+      await pg.evaluate("globalThis.__name = globalThis.__name || function (fn) { return fn; };");
+      const raw = await greenPixels(await pg.screenshot());
+      // Main's tagger, then the learner's own mask over what it tagged (withSecretMask's locator).
+      const nMain = await pg.evaluate(mainTagger, pats);
+      const gMain = await greenPixels(await pg.screenshot(nMain > 0 ? { mask: [pg.locator("[data-al-secret]")] } : {}));
+      const mainTags = await pg.evaluate(() => {
+        const out: string[] = [];
+        for (const el of Array.from(document.querySelectorAll("[data-al-secret]"))) { el.removeAttribute("data-al-secret"); el.setAttribute("data-main-tag", "1"); out.push(el.tagName); }
+        return out;
+      });
+      const nBranch = await tagSecretsInPage(pg, pats);
+      const gBranch = await greenPixels(await pg.screenshot(nBranch > 0 ? { mask: [pg.locator("[data-al-secret]")] } : {}));
+      const branchTags = await pg.locator("[data-al-secret]").evaluateAll((els) => els.map((e) => e.tagName));
+      const missed = await pg.evaluate(() => Array.from(document.querySelectorAll("[data-main-tag]"))
+        .filter((el) => !el.hasAttribute("data-al-secret") && !el.closest("select")?.hasAttribute("data-al-secret"))
+        .map((el) => el.tagName));
+      const seen = JSON.stringify({ mainTags, branchTags, missed, raw, gMain, gBranch });
+      check(`${name}: every element main's learner tagger tagged is tagged (or its <select> is)`, missed.length === 0, seen);
+      check(`${name}: the account shows unmasked, and the learner's mask leaves none of it (main's left ${gMain} px)`, raw > 30 && gBranch === 0 && gBranch <= gMain, seen);
+      await clearSecretTags(pg);
+      await pg.context().close();
+    }
+  }
+
+  console.log("\n8. FACE 2 (fix round 3): a staged picture of a page painting the account in an <option>/<optgroup> outside a <select> is refused, or keeps none of it");
+  for (const name of ["strayOption", "listboxDivOptions", "strayOptionInTable", "strayOptgroupLabel", "strayOptionLabel", "strayOptionBare", "strayOptgroup", "shadowStray",
+    "strayWidth0", "strayIndent", "strayContents", "strayOptgroupContents", "splitTwoOptions", "splitStrayP", "splitLabel"]) {
+    const pg = await scriptless(name);
+    const raw = await greenPixels(await pg.screenshot({ fullPage: true, scale: "css" }));
+    const file = path.join(dir, `r3-${name}.png`);
+    const m = await maskedFullPageScreenshot(pg, [ACCOUNT], file);
+    const kept = fs.existsSync(file);
+    const green = kept ? await greenPixels(fs.readFileSync(file)) : 0;
+    const seen = JSON.stringify({ ...m, kept, raw, green });
+    check(`${name}: the page shows the account unmasked`, raw > 30, seen);
+    check(`${name}: ${m.ok ? `kept, with ${green} px of the account in clear` : `refused (${m.why.replace(/^the secret mask cannot cover the page \(|\), so no picture was taken$/g, "").slice(0, 110)})`} — refused with no picture on disk, or kept with none of it`, (!m.ok && !kept) || (m.ok && kept && green === 0), seen);
+    await pg.context().close();
+  }
+  {
+    // MUST-PASS: a datalist's option paints nothing, so it neither refuses nor needs a box.
+    const pg = await scriptless("datalist");
+    const file = path.join(dir, "r3-datalist.png");
+    const m = await maskedFullPageScreenshot(pg, [ACCOUNT], file);
+    const green = fs.existsSync(file) ? await greenPixels(fs.readFileSync(file)) : -1;
+    check("datalist: an option in a <datalist> paints nothing — ok:true, the plain account masked", m.ok && green === 0, JSON.stringify({ ...m, green }));
     await pg.context().close();
   }
 } finally {
