@@ -20,7 +20,8 @@
 //      the writer kept nothing) and the in-memory capture carries the digits.
 //   K2 reviewDigest.redactDigestText: return the text unredacted → (b) fails (labels / field report).
 //   K3 repository: hand the replay no secrets (stagedReview: { secrets: [] }) → (a) fails (the field
-//      report shows the account in clear, never last-4) and (b) fails.
+//      report no longer masks the account to its last 4). (b) still holds: the writer re-scrubs every
+//      label and value against the project's own secrets — the second layer, on purpose.
 //
 // Run: npx tsx backend/test/reviewDigestRule2.test.ts
 import "./_isolate"; // FIRST
