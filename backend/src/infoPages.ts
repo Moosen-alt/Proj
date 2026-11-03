@@ -317,9 +317,12 @@ function kbPortalUrlField(portalUrl: string): string[] {
 
 /** EVERY PORTAL URL A UTILITY KB ROW NAMES: its portal_url (kbPortalUrlField), plus the links
  *  portalUrlsInText finds in it ("[City portal](https://…)", "nem@cedarvale.gov") and in the
- *  free-text portal_name. */
-function kbRowPortalUrls(portalUrl: string, portalName: string): string[] {
-  return [...kbPortalUrlField(portalUrl), ...portalUrlsInText(portalUrl), ...portalUrlsInText(portalName)];
+ *  free-text portal_name. unread: the portal_url holds a value that yields no URL at all. (Each
+ *  value is read once: portalUrlsInText grows with the square of a long value.) */
+function kbRowPortalUrls(portalUrl: string, portalName: string): { urls: string[]; unread: boolean } {
+  const field = kbPortalUrlField(portalUrl);
+  const inText = portalUrlsInText(portalUrl);
+  return { urls: [...field, ...inText, ...portalUrlsInText(portalName)], unread: portalUrl.trim() !== "" && !field.length && !inText.length };
 }
 
 /** WHAT A KB ROW'S NOTES SAY ABOUT WHERE IT IS SUBMITTED (the 10-18 re-check, should-fix 2): every "Submit
@@ -405,12 +408,14 @@ function utilityFilesOnlyOnInterconnectionPlatform(db: AppDb, state: string, uti
     // prerequisite), for its words.
     ...db.query<Row>("SELECT state, utility, portal_url, portal_name, portal_platform, submission_method, notes, verified_at FROM permit_utility_knowledge WHERE (ahj IS NULL OR ahj = '') AND utility != ''")
       .filter(ours)
-      .map((r) => ({
-        r, urls: kbRowPortalUrls(s(r.portal_url), s(r.portal_name)),
-        words: [s(r.portal_name), s(r.portal_platform), s(r.submission_method), ...(identity ? [] : submissionWordsInNotes(r.notes))],
-        verified: isVerifiedKnowledge(r), kb: true, vouches: true,
-        urlUnread: s(r.portal_url).trim() !== "" && kbPortalUrlField(s(r.portal_url)).length === 0 && portalUrlsInText(s(r.portal_url)).length === 0,
-      })),
+      .map((r) => {
+        const read = kbRowPortalUrls(s(r.portal_url), s(r.portal_name));
+        return {
+          r, urls: read.urls,
+          words: [s(r.portal_name), s(r.portal_platform), s(r.submission_method), ...(identity ? [] : submissionWordsInNotes(r.notes))],
+          verified: isVerifiedKnowledge(r), kb: true, vouches: true, urlUnread: read.unread,
+        };
+      }),
     ...db.query<Row>("SELECT state, utility, portal_url, status, flag_reason FROM portal_recipes WHERE scope_type = 'utility' AND portal_url IS NOT NULL AND portal_url != ''")
       .filter(ours)
       .map((r) => ({ r, urls: [s(r.portal_url)], words: [], verified: false, kb: false, vouches: s(r.status) === "complete" && !isNotServedRecipe(r), urlUnread: false })),

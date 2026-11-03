@@ -1818,7 +1818,9 @@ await check("#365, HELM'S 10-18 RE-CHECK OF #369: a lookup that names no platfor
 
   // ══ THE NIT: ONE HUGE VALUE ON ANOTHER UTILITY'S ROW no longer slows every hand-out and admission
   // (round 4 read every row's URLs; 35 s for one hand-out plus one admission on a 120k-character value).
-  kbRow("kb-r5-huge", "Zzyzx Unrelated Power", `https://zzyzx.powerclerk.com/${"a".repeat(120_000)}`);
+  // (A bare run of letters is the slow shape: portalUrlsInText retries its host pattern at every
+  // position. A value that starts with a URL is consumed in one match.)
+  kbRow("kb-r5-huge", "Zzyzx Unrelated Power", "a".repeat(120_000));
   const PH = project("Wendy Electric");
   beside("Wendy Electric");
   const t0 = Date.now();
