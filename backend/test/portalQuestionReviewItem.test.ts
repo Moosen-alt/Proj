@@ -268,6 +268,115 @@ await check("T8 a project save answers the question; the next triage closes the 
   assert.equal(all[0].status, "approved");
 });
 
+// ---- T9: a note is closed only when it names THAT question (skeptic, round 2) ----------------------
+// The first cut matched notes by the ownership key's classifier regex (customer.?owned|third.?party|
+// financ|lease|ppa|owner ship…), project-wide, the moment the question was ASKED: real findings that
+// only mention one of those words vanished from Human Review. A note is that question only when it
+// quotes the question's own label.
+const UNRELATED = [
+  "The city asks whether a third-party inspector will be used.",
+  "The utility asks for the signed lease agreement document.",
+  "The utility asks for the third-party owner's company name.",
+  "The utility asks for the main breaker rating.",
+  "Upload proof of property ownership.",
+];
+/** A pending 'Run triage' finding in the shape applySafeFixes writes (no question, no engineering text). */
+function finding(projectId: string, title: string, fieldName = "portal_field"): string {
+  const id = `gap-${++runSeq}`;
+  const ts = new Date().toISOString();
+  db.run(
+    `INSERT INTO human_review_items (id, project_id, issue_type, field_name, parser_value, llm_suggested_value, source_excerpt, status, notes, created_at, updated_at)
+     VALUES (?, ?, 'Run triage', ?, '', '', ?, 'pending', '', ?, ?)`,
+    [id, projectId, fieldName, title, ts, ts],
+  );
+  return id;
+}
+const statusOf = (projectId: string, itemId: string) => items(projectId).find((i) => i.id === itemId)?.status;
+
+await check("T9 findings that only mention lease / third party / ownership stay pending when the question is asked", async () => {
+  const p = newProject({ owner: "Ninth Sample" });
+  const gaps = UNRELATED.map((t) => finding(p, t));
+  const legacy9 = legacyNote(p);
+  await triageLearnRun(db, writeBundle(), p);
+  assert.equal(questionItems(p).filter((i) => i.status === "pending").length, 1);
+  assert.deepEqual(gaps.map((g) => statusOf(p, g)), UNRELATED.map(() => "pending"), JSON.stringify(items(p).map((i) => [i.sourceExcerpt, i.status])));
+  assert.notEqual(statusOf(p, legacy9), "pending", "the note quoting the question's own label is that question");
+  // ... and when it is answered.
+  await answerPortalQuestions(db, p, { ownershipModel: "Customer-Owned" });
+  assert.equal(questionItems(p)[0].status, "edited");
+  assert.deepEqual(gaps.map((g) => statusOf(p, g)), UNRELATED.map(() => "pending"), JSON.stringify(items(p).map((i) => [i.sourceExcerpt, i.status])));
+});
+await check("T9 a finding whose field is the question's label (the agent's target) is that question", async () => {
+  const p = newProject({ owner: "Ninth Sample B" });
+  const same = finding(p, "The utility asks who owns the system.", Q);
+  await triageLearnRun(db, writeBundle(), p);
+  assert.notEqual(statusOf(p, same), "pending");
+});
+
+{
+  const { StubLLMProvider } = await import("../src/llm");
+  const { dataGapNamesAskedQuestion } = await import("../src/runTriage");
+  const realAgent = StubLLMProvider.prototype.runToolAgent;
+  type Finding = { title: string; target: string };
+  /** The agent reports these data-gap findings through its own report_finding tool. */
+  const agentReports = (reports: Finding[]) => {
+    StubLLMProvider.prototype.runToolAgent = (async (input: { tools: Array<{ name: string; handler: (i: Record<string, unknown>) => unknown }> }) => {
+      const tool = input.tools.find((t) => t.name === "report_finding")!;
+      for (const r of reports) {
+        await tool.handler({ severity: "warning", title: r.title, rootCause: "synthetic cause", suggestedFix: "synthetic fix", fixKind: "data_gap", target: r.target });
+      }
+      return { provider: "stub", finalText: "", iterations: 1, hitIterationCap: false, stopReason: null };
+    }) as unknown as typeof realAgent;
+  };
+  try {
+    await check("T9 the agent's data-gap findings that only mention the subject are filed; the one naming the asked question is not", async () => {
+      const p = newProject({ owner: "Ninth Sample C" });
+      agentReports([
+        ...UNRELATED.map((title) => ({ title, target: "portal_field" })),
+        { title: "The utility asks whether the system is customer-owned.", target: Q },
+      ]);
+      await triageLearnRun(db, writeBundle(), p);
+      const filed = items(p).filter((i) => i.issueType === "Run triage" && i.status === "pending" && !i.portalQuestion).map((i) => i.sourceExcerpt).sort();
+      assert.deepEqual(filed, [...UNRELATED].sort(), JSON.stringify(items(p).map((i) => [i.sourceExcerpt, i.fieldName, i.status])));
+      assert.equal(questionItems(p).length, 1);
+    });
+  } finally {
+    StubLLMProvider.prototype.runToolAgent = realAgent;
+  }
+  await check("T9 dataGapNamesAskedQuestion: by the question's label only, never by its subject", () => {
+    const asked = [{ label: Q }];
+    for (const title of UNRELATED) assert.equal(dataGapNamesAskedQuestion({ title, target: "portal_field" }, asked), false, title);
+    assert.equal(dataGapNamesAskedQuestion({ title: `Required question '${Q}' left blank`, target: "systemOwnership" }, asked), true);
+    assert.equal(dataGapNamesAskedQuestion({ title: "x", target: Q.toUpperCase() }, asked), true);
+    // fieldsSeen keeps 80 characters: a cut label still names the question.
+    const longQ = "Please confirm whether the generating facility will be owned by the customer or by a third party lessor";
+    assert.equal(dataGapNamesAskedQuestion({ title: `The portal asked: "${longQ}"`, target: "" }, [{ label: longQ.slice(0, 80) }]), true);
+    // A short label is a word findings use: only the whole text counts.
+    assert.equal(dataGapNamesAskedQuestion({ title: "Upload proof of property ownership.", target: "" }, [{ label: "Ownership" }]), false);
+    assert.equal(dataGapNamesAskedQuestion({ title: "", target: "Ownership:" }, [{ label: "Ownership" }]), true);
+  });
+}
+
+// ---- T10: a note left from before #544 is asked as its question --------------------------------------
+await check("T10 GET /portal-questions names the pending note that quotes an open question; only that one", async () => {
+  const p = newProject({ owner: "Tenth Sample" });
+  setPortalQuestionSource(() => [{ key: "ownershipModel", label: Q, options: ["Customer-Owned", "Third-Party Owned"], kind: "radio-choice" }]);
+  try {
+    const legacy10 = legacyNote(p);
+    const other = finding(p, UNRELATED[0]);
+    const st = await portalQuestionStatus(db, p);
+    const q = st.questions.find((x) => x.key === "ownershipModel");
+    assert.ok(q, JSON.stringify(st));
+    assert.deepEqual(q!.noteItemIds, [legacy10]);
+    // Answered through the panel / the card in the note's place: the note closes, the other stays.
+    await answerPortalQuestions(db, p, { ownershipModel: "Third-Party Owned" });
+    assert.equal(statusOf(p, legacy10), "approved");
+    assert.equal(statusOf(p, other), "pending");
+  } finally {
+    setPortalQuestionSource(null);
+  }
+});
+
 if (failures) {
   console.error(`\nportalQuestionReviewItem: ${failures} check(s) FAILED`);
   process.exit(1);

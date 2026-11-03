@@ -319,3 +319,28 @@ export function parsePerJobPortalQuestion(raw: unknown): PerJobPortalQuestion | 
   if (!asksAPersonForThisJob(key) || !label || options.length < 2) return null;
   return { key, label: label.slice(0, 300), options: options.slice(0, 25), control: o.control === "choice" ? "choice" : "select" };
 }
+
+const labelWords = (s: unknown): string => String(s ?? "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+
+/**
+ * DOES THIS TEXT NAME THAT PORTAL QUESTION? A triage note's title or field (the agent's words) against
+ * one question's own label (the portal's words): the label must appear in the text as whole words,
+ * with case, punctuation and quotes ignored. A question is ONE question.
+ *
+ * NEVER THE KEY'S RULE (skeptic, round 2). perJobRuleFor classifies a portal CONTROL'S label; a note's
+ * free text that merely mentions a lease, a third party, financing or ownership is not the ownership
+ * question. Matching notes by that rule closed "The city asks whether a third-party inspector will be
+ * used", "The utility asks for the signed lease agreement" and "proof of property ownership" the moment
+ * the ownership question was asked. A short label ("Ownership") is a word such notes use, so under
+ * three words only the whole text counts. A long label may end mid-word (a learn's fieldsSeen keeps 80
+ * characters of it), so from 40 characters on only its start must begin a word.
+ */
+export function textNamesPortalQuestion(text: unknown, label: unknown): boolean {
+  const t = labelWords(text);
+  const l = labelWords(label);
+  if (!t || !l) return false;
+  if (t === l) return true;
+  if (l.split(" ").length < 3) return false;
+  const padded = ` ${t} `;
+  return l.length >= 40 ? padded.includes(` ${l}`) : padded.includes(` ${l} `);
+}

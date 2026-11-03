@@ -25,7 +25,7 @@ import { logger } from "./logger";
 import { id } from "./ids";
 import { nowIso } from "./time";
 import { closeAnsweredPortalQuestionItems, closeLegacyTriageNotesFor, portalAnswerOnFile } from "./intakeRequests";
-import { asksAPersonForThisJob, perJobPortalQuestionOfField, perJobRuleFor, type PerJobPortalQuestion } from "../../shared/src/perJobQuestions";
+import { asksAPersonForThisJob, perJobPortalQuestionOfField, textNamesPortalQuestion, type PerJobPortalQuestion } from "../../shared/src/perJobQuestions";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9._-]+$/;
 const FIX_KINDS = ["equipment_alias", "kb_note", "learned_topic", "data_gap", "code_bug", "none"] as const;
@@ -201,10 +201,11 @@ export function blankPerJobQuestions(dir: string): PerJobPortalQuestion[] {
 }
 
 /** Ask each question on the project as ONE review item, unless the job already answers it or an item
- *  already asks it. Returns every key now asked on the project (new or already pending). The item is a
- *  'Run triage' item (advisory: it never holds staging — the per-job stage gate already does that). */
-function askBlankQuestions(db: AppDb, projectId: string, questions: PerJobPortalQuestion[]): { asked: Set<string>; added: PerJobPortalQuestion[] } {
-  const asked = new Set<string>();
+ *  already asks it. Returns every question now asked on the project (new or already pending), in this
+ *  run's words. The item is a 'Run triage' item (advisory: it never holds staging — the per-job stage
+ *  gate already does that). */
+function askBlankQuestions(db: AppDb, projectId: string, questions: PerJobPortalQuestion[]): { asked: PerJobPortalQuestion[]; added: PerJobPortalQuestion[] } {
+  const asked: PerJobPortalQuestion[] = [];
   const added: PerJobPortalQuestion[] = [];
   // A question item answered since through a door that does not close items (a re-parse, a snapshot
   // edit) is closed here first, so it is neither left pending nor counted as still asked.
@@ -213,20 +214,28 @@ function askBlankQuestions(db: AppDb, projectId: string, questions: PerJobPortal
   const project = safeProject(db, projectId);
   if (!project) return { asked, added };
   for (const q of questions) {
-    if (portalAnswerOnFile(db, project, q.key)) continue; // answered on file: a blank here is a run bug, not a question
+    // Answered on file: a blank here is a run bug, not a question. A note naming it is settled too.
+    if (portalAnswerOnFile(db, project, q.key)) { closeLegacyTriageNotesFor(db, projectId, q, "answered"); continue; }
     const pending = db.get<{ id: string }>(
       "SELECT id FROM human_review_items WHERE project_id = ? AND status = 'pending' AND issue_type = 'Run triage' AND field_name = ? AND portal_question_json != '' LIMIT 1",
       [projectId, q.key],
     );
-    asked.add(q.key);
+    asked.push(q);
     if (!pending) {
       insertTriageReviewItem(db, projectId, { fieldName: q.key, sourceExcerpt: q.label, portalQuestion: q });
       added.push(q);
     }
-    // An older triage note about this same question (the agent's engineering text) is superseded.
-    closeLegacyTriageNotesFor(db, projectId, q.key, "asked");
+    // An older triage note naming this same question (by its label) is superseded; no other note.
+    closeLegacyTriageNotesFor(db, projectId, q, "asked");
   }
   return { asked, added };
+}
+
+/** A data-gap finding that names a question this run already asks (by its label, in its target or its
+ *  title) is that same question: it gets no second item. One that only mentions the same subject — a
+ *  third-party inspector, a lease agreement, proof of ownership — is a different finding and is filed. */
+export function dataGapNamesAskedQuestion(f: { target?: string; title?: string }, asked: ReadonlyArray<{ label: string }>): boolean {
+  return asked.some((q) => textNamesPortalQuestion(f.target ?? "", q.label) || textNamesPortalQuestion(f.title ?? "", q.label));
 }
 
 function extractRequiredMisses(issues: string[]): string[] {
@@ -266,7 +275,7 @@ For each real issue call report_finding with:
 - severity: "blocker" (run can't succeed / wrong data submitted), "warning" (a field left blank that a human must fill), or "note" (minor).
 - fixKind, chosen carefully:
   - "learned_topic": a REQUIRED question was left blank because the planner lacked the design context to answer it. target = the exact question label. (This is auto-applied: the system will start surfacing plan-set lines matching the question's words to the planner next run.)
-  - "data_gap": the project record is genuinely missing a value the portal needs. target = the field name. (Auto-applied as a human-review item.)
+  - "data_gap": the project record is genuinely missing a value the portal needs. target = the field name; when the missing value answers a question the portal asked, target = that question's exact label as the portal shows it. (Auto-applied as a human-review item.)
   - "equipment_alias": a manufacturer/model dropdown didn't match because the portal lists the equipment under a different certified name. suggestedFix = the mapping "PlanName -> PortalName". (Report-only; a human adds the alias.)
   - "kb_note": a portal-specific quirk worth remembering for this AHJ/utility. (Report-only.)
   - "code_bug": the automation itself misbehaved (a loop, a wrong click, a crash). (Report-only.)
@@ -363,7 +372,7 @@ export async function triageLearnRun(db: AppDb, runId: string, projectId: string
 
   // THE QUESTIONS FIRST, FROM THE RUN ITSELF (#544): a per-job question the run left blank is asked
   // on the project as that question, whatever the model said (or, in stub mode, did not say).
-  let questions: { asked: Set<string>; added: PerJobPortalQuestion[] } = { asked: new Set(), added: [] };
+  let questions: { asked: PerJobPortalQuestion[]; added: PerJobPortalQuestion[] } = { asked: [], added: [] };
   try { questions = askBlankQuestions(db, projectId, blankPerJobQuestions(dir)); } catch (err) {
     logger.warn("triage", "could not ask the run's blank portal questions", { runId, projectId, error: String((err as Error)?.message ?? err) });
   }
@@ -380,16 +389,15 @@ export async function triageLearnRun(db: AppDb, runId: string, projectId: string
 
 // ---- safe-fix application (deterministic) ---------------------------------
 
-/** `askedKeys`: the per-job keys the run's own blanks already ask on the project. A data-gap finding
- *  about one of them is that same question — it gets no second item (its words go to the note). */
-function applySafeFixes(db: AppDb, projectId: string, findings: TriageFinding[], askedKeys: Set<string> = new Set()): number {
+/** `asked`: the questions the run's own blanks already ask on the project. A data-gap finding that
+ *  names one of them is that same question — it gets no second item (its words go to the note). */
+function applySafeFixes(db: AppDb, projectId: string, findings: TriageFinding[], asked: ReadonlyArray<PerJobPortalQuestion> = []): number {
   let applied = 0;
   for (const f of findings) {
     if (f.fixKind === "learned_topic" && f.target) {
       try { learnNoteTopicsFromMisses(db, [f.target]); f.applied = true; applied++; } catch { /* best-effort */ }
     } else if (f.fixKind === "data_gap") {
-      const binding = perJobRuleFor(`${f.target ?? ""} ${f.title}`)?.binding ?? "";
-      if (binding && askedKeys.has(binding)) { f.applied = true; applied++; continue; }
+      if (dataGapNamesAskedQuestion(f, asked)) { f.applied = true; applied++; continue; }
       try { insertTriageReviewItem(db, projectId, { fieldName: f.target || "portal_field", sourceExcerpt: f.title }); f.applied = true; applied++; } catch { /* best-effort */ }
     }
   }
