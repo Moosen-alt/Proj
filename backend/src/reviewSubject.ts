@@ -19,9 +19,8 @@ import type { AiPlanReviewResult, LLMProvider, ProjectRecord, ReviewerFinding, R
 import { resolveEffectiveCodeContext, ensureCodeProfilesResearched } from "./codeProfiles";
 import { runReviewPack, reviewPackFor } from "./reviewPacks";
 import { createLLMProvider, StubLLMProvider } from "./llm";
-import { extractPdfPages } from "./batchImport";
+import { extractPdfPagesCounted } from "./batchImport";
 import { renderPdfPageToPng } from "./pageImages";
-import { rasterPixelsPerPage } from "./scannedPlanSet";
 import { readImageSheetListings } from "./imageSheetListings";
 import { IMAGE_SHEET_LISTING_COVERAGE_KEY, IMAGE_SHEET_LISTING_READINGS_KEY, packageListings } from "./codeReviewRules";
 import { addAuditLog } from "./audit";
@@ -121,17 +120,23 @@ export const REVIEW_AI_TEXT_CHARS = 20000;
 /** First sheets rendered for the AI second opinion (intake triage) — unchanged. */
 const REVIEW_AI_PAGE_IMAGES = 6;
 
-/** The plan set has more pages than the text checks read: say which were not read. */
-export function unreadPagesFinding(read: number, total: number): ReviewerFinding {
-  const unread = total - read === 1 ? `Page ${total} was` : `Pages ${read + 1}–${total} were`;
+/** The text checks did not read the whole plan set: say which pages they did not read. `total`
+ *  null = the text could not be extracted at all, so no page was read (and the count is unknown). */
+export function unreadPagesFinding(read: number, total: number | null): ReviewerFinding {
+  const failed = total == null;
+  const unread = failed ? "" : total - read === 1 ? `Page ${total} was` : `Pages ${read + 1}–${total} were`;
   return {
     id: "reviewer.plan.text-pages-not-read",
     severity: "callout",
     category: "plan_set",
-    title: "Plan set only partly read",
-    message: `The plan set has ${total} pages; the text checks read pages 1–${read}. ${unread} not read, so nothing stated only there is reflected in this report.`,
+    title: failed ? "Plan set text not read" : "Plan set only partly read",
+    message: failed
+      ? "The plan set's text could not be extracted, so the text checks read none of its pages; nothing stated only in the plan set is reflected in this report."
+      : `The plan set has ${total} pages; the text checks read pages 1–${read}. ${unread} not read, so nothing stated only there is reflected in this report.`,
     cityFeedback: "",
-    designTeamAction: `Review page${total - read === 1 ? ` ${total}` : `s ${read + 1}–${total}`} by hand, or submit the plan set in parts.`,
+    designTeamAction: failed
+      ? "Review the plan set by hand, or re-export it as a standard PDF and submit it again."
+      : `Review page${total - read === 1 ? ` ${total}` : `s ${read + 1}–${total}`} by hand, or submit the plan set in parts.`,
     evidenceNeeded: [],
     codeReferences: [],
     installerCallout: false,
@@ -140,12 +145,12 @@ export function unreadPagesFinding(read: number, total: number): ReviewerFinding
       kind: "absence_check",
       label: "Pages not read",
       source: "Plan-set text extraction",
-      excerpt: `Read ${read} of ${total} pages (cap ${REVIEW_TEXT_MAX_PAGES}).`,
+      excerpt: failed ? "Text extraction failed: 0 pages read." : `Read ${read} of ${total} pages (cap ${REVIEW_TEXT_MAX_PAGES}).`,
       confidence: "high",
       pageHint: "",
       screenshotPath: "",
       verifier: "rule_engine",
-      note: "The text checks read at most the first pages of an uploaded plan set.",
+      note: failed ? "The plan set could not be parsed for text." : "The text checks read at most the first pages of an uploaded plan set.",
     }],
   };
 }
@@ -169,7 +174,7 @@ export async function runStandaloneReview(
   if (!ctx.verified) ensureCodeProfilesResearched(db, subject.state, subject.ahj);
   const project = reviewSubjectToProject(subject, submissionId);
   const snapshot = project.parserSnapshot as Record<string, string>;
-  // What the image-only-sheet read found is written by that read alone, never by the caller.
+  // What the title-block-only-sheet read found is written by that read alone, never by the caller.
   delete snapshot[IMAGE_SHEET_LISTING_READINGS_KEY];
   delete snapshot[IMAGE_SHEET_LISTING_COVERAGE_KEY];
   const llm = opts.llm ?? createLLMProvider();
@@ -179,14 +184,18 @@ export async function runStandaloneReview(
   let plansetPath = "";
   let pageImagesBase64: string[] = [];
   let extractedText = subject.fields?.splitPagesText ? String(subject.fields.splitPagesText) : "";
-  let unreadPages: { read: number; total: number } | null = null;
+  let unreadPages: { read: number; total: number | null } | null = null;
   if (planset && planset.buffer.length > 0) {
     fs.mkdirSync(REVIEW_FILES_DIR(), { recursive: true });
     plansetPath = path.join(REVIEW_FILES_DIR(), `${submissionId}.pdf`);
     fs.writeFileSync(plansetPath, planset.buffer);
     let pages: string[] = [];
     try {
-      pages = await extractPdfPages(plansetPath, REVIEW_TEXT_MAX_PAGES);
+      // The page count comes from the SAME pdf.js parse as the text: a second parser's count (the
+      // pdf-lib raster count) could fail alone and silently drop what the cap left unread.
+      const extracted = await extractPdfPagesCounted(plansetPath, REVIEW_TEXT_MAX_PAGES);
+      pages = extracted.pages;
+      if (extracted.pageCount > pages.length) unreadPages = { read: pages.length, total: extracted.pageCount };
       const fullText = pages.join("\n");
       if (!extractedText) extractedText = fullText.slice(0, REVIEW_AI_TEXT_CHARS);
       // The solar pack's plan-text checks read splitPagesText — every page of it.
@@ -201,27 +210,25 @@ export async function runStandaloneReview(
       }
     } catch (err) {
       logger.warn("review", `plan-set extraction failed: ${err instanceof Error ? err.message : String(err)}`);
+      // No page's text was read: the report says so rather than reading as a clean plan set.
+      pages = [];
+      unreadPages = { read: 0, total: null };
     }
-    // Every page's raster area: the page count (for what the text cap left unread) and the
-    // image-only pages (for the listing read below), from one pdf-lib parse.
-    let raster: number[] | undefined;
-    try { raster = await rasterPixelsPerPage(planset.buffer); } catch { raster = undefined; }
-    if (raster && pages.length && raster.length > pages.length) unreadPages = { read: pages.length, total: raster.length };
-    // LISTING MARKS ON IMAGE-ONLY SHEETS (#532): only for the solar pack (the only one with the
-    // UL LISTINGS rule), and only for the listings the text left unshown — the rule's own reader
-    // decides, so a set whose text shows both pays for nothing.
+    // LISTING MARKS ON TITLE-BLOCK-ONLY SHEETS (#532): only for the solar pack (the only one with
+    // the UL LISTINGS rule), and only for the listings the text left unshown — the rule's own
+    // reader decides, so a set whose text shows both pays for nothing.
     if (pack.deterministic && pages.length) {
       const shown = packageListings(project);
       const want = { module: !shown.module, racking: !shown.racking };
       if (want.module || want.racking) {
         try {
-          const read = await readImageSheetListings(llm instanceof StubLLMProvider ? null : llm, planset.buffer, pages, { want, rasterPixels: raster });
+          const read = await readImageSheetListings(llm instanceof StubLLMProvider ? null : llm, planset.buffer, pages, { want });
           snapshot[IMAGE_SHEET_LISTING_READINGS_KEY] = JSON.stringify(read.readings);
           if (read.coverage) snapshot[IMAGE_SHEET_LISTING_COVERAGE_KEY] = read.coverage;
         } catch (err) {
           // Never the response: only that the read failed.
           logger.warn("review", `image-sheet listing read failed: ${err instanceof Error ? err.message : String(err)}`);
-          snapshot[IMAGE_SHEET_LISTING_COVERAGE_KEY] = "The plan set's image-only sheets could not be read for listing marks.";
+          snapshot[IMAGE_SHEET_LISTING_COVERAGE_KEY] = "The plan set's title-block-only sheets could not be read for listing marks.";
         }
       }
     }

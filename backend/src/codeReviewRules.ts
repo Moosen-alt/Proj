@@ -546,16 +546,16 @@ export const LISTING_PATTERNS_BY_PRODUCT: Record<ListingProduct, RegExp[]> = {
   attachment: ATTACHMENT_LISTING_PATTERNS,
 };
 
-// LISTING MARKS READ FROM IMAGE-ONLY SHEETS (#532). A certificate or cut sheet pasted into the plan
-// set as a picture carries only its title block in the text layer, so its UL mark never reached
-// the text read. imageSheetListings.ts reads those sheets by vision and the caller keeps the
-// printed words here, on the snapshot, with a plain statement of which sheets were and were not
-// read. The words are package evidence like any other text and go through the same reader
-// (affirmedIn — negations included).
+// LISTING MARKS READ FROM TITLE-BLOCK-ONLY SHEETS (#532). A certificate or cut sheet pasted into
+// the plan set as a picture (or drawn as outlines) carries only its title block in the text layer,
+// so its UL mark never reached the text read. imageSheetListings.ts reads those sheets by vision
+// and the caller keeps the printed words here, on the snapshot, with a plain statement of which
+// sheets were and were not read. The words are package evidence like any other text and go through
+// the same reader (affirmedIn — negations included).
 export const IMAGE_SHEET_LISTING_READINGS_KEY = "imageSheetListingReadings";
 export const IMAGE_SHEET_LISTING_COVERAGE_KEY = "imageSheetListingCoverage";
 export interface ImageSheetListingReading { page: number; product: ListingProduct; quote: string }
-export const imageSheetSourceLabel = (page: number): string => `Plan page ${page} (image-only sheet, read by vision)`;
+export const imageSheetSourceLabel = (page: number): string => `Plan page ${page} (title-block-only sheet, read by vision)`;
 
 /** Do these printed words AFFIRM the product's listing — the rule's own reader, negations refused
  *  ("not listed to UL 2703")? What a vision quote must pass to be kept at all. */
@@ -585,8 +585,8 @@ export function imageSheetListingReadings(project: ProjectRecord): ImageSheetLis
 }
 
 /** Where the package shows each listing: its text, the module datasheet's vision read, and the
- *  image-only sheets' vision read. THE ONE READER for city.plan.ul-listings-missing and for the
- *  gate deciding whether an image-only sheet is worth a vision read at all — so the two cannot
+ *  title-block-only sheets' vision read. THE ONE READER for city.plan.ul-listings-missing and for
+ *  the gate deciding whether such a sheet is worth a vision read at all — so the two cannot
  *  disagree about what "shown" means. */
 export function packageListings(project: ProjectRecord, extraTexts: DesignTextSource[] = []): Record<ListingProduct, Affirmed | null> {
   const packageTexts = packageTextSources(project, extraTexts);
@@ -1326,20 +1326,21 @@ export function evaluateDesignCodeFindings(
       : listingMount === "carport"
         ? "Provide UL listing for the panels and the carport's racking and mounting hardware."
         : "Provide UL listing for the panels, mounting and racking hardware.";
-    // The package text, the module datasheet's vision read and the image-only sheets' vision read
-    // (#532) — one reader, packageListings, which the review gate also asks before paying for a read.
+    // The package text, the module datasheet's vision read and the title-block-only sheets' vision
+    // read (#532) — one reader, packageListings, which the review gate also asks before paying for a read.
     const listings = packageListings(project, documentTexts);
     const moduleListing = listings.module;
     const rackingListing = listings.racking;
     if (!moduleListing || !rackingListing) {
       const missing = [!moduleListing ? "module listing (UL 61730 or UL 1703)" : "", !rackingListing ? `${racking} listing (UL 2703)` : ""].filter(Boolean);
       const found = [moduleListing, rackingListing].filter((x): x is Affirmed => x != null);
-      // WHAT WAS READ. Where the image-only sheets were read for listing marks, the statement of
-      // which sheets were and were not read replaces "cut sheets whose pages are images are not
-      // read" — which is then no longer true. Without it (nothing read them) the sentence stands.
+      // WHAT WAS READ. Where the title-block-only sheets were tested for a listing read, the
+      // statement of which sheets were and were not read (or, with none, the test that found none
+      // and what it leaves unread) replaces "cut sheets whose pages are images are not read" —
+      // which is then no longer the whole truth. Without it (no read was run) the sentence stands.
       const coverage = str(project, IMAGE_SHEET_LISTING_COVERAGE_KEY);
       const whereLooked = coverage
-        ? `in the package text or on any image-only sheet read for listing marks. ${coverage}`
+        ? `in the package text or on any title-block-only sheet read by vision. ${coverage}`
         : "in the package text that could be read (cut sheets whose pages are images are not read).";
       // A roof-attachment listing (UL 2703A) is the flashing's, not the racking's: shown, never a pass.
       const attachmentNote = !rackingListing && listings.attachment
@@ -1378,7 +1379,7 @@ export function evaluateDesignCodeFindings(
             : [{
               kind: "absence_check" as const,
               label: "UL 61730 / UL 1703 / UL 2703 not stated",
-              source: coverage ? "Package text and image-only sheets read by vision" : "Package text",
+              source: coverage ? "Package text and title-block-only sheets read by vision" : "Package text",
               excerpt: "No module (UL 61730 / UL 1703) or racking (UL 2703) listing in the package text.",
               confidence: "low" as const,
               pageHint: "",

@@ -40,7 +40,7 @@ const PDFJS_WARN_RE = /^Warning: (TT: undefined function:|Font "[^"]+" is not av
 // Shared pdfjs driver: open the PDF, suppress the harmless image-decode warnings, and run
 // `perPage` over each page's text items, up to maxPages. The extractors below differ only in how
 // they turn a page's items into text.
-async function withPdfPages<T>(filePath: string, maxPages: number, perPage: (items: PdfjsTextItem[]) => T): Promise<T[]> {
+async function withPdfPages<T>(filePath: string, maxPages: number, perPage: (items: PdfjsTextItem[]) => T, meta?: { pageCount: number }): Promise<T[]> {
   const pdfjs = await getPdfjs();
   const data = new Uint8Array(fs.readFileSync(filePath));
   const origWarn = console.warn;
@@ -50,6 +50,7 @@ async function withPdfPages<T>(filePath: string, maxPages: number, perPage: (ite
   };
   try {
     const doc = await pdfjs.getDocument(pdfjsDocumentOptions({ data, useSystemFonts: true, disableWorker: true })).promise;
+    if (meta) meta.pageCount = doc.numPages;
     const pages = Math.min(doc.numPages, maxPages);
     const out: T[] = [];
     for (let i = 1; i <= pages; i++) {
@@ -79,6 +80,14 @@ export async function extractPdfText(filePath: string, maxPages = 30): Promise<s
 // to page ranges. maxPages caps the work for very large sets.
 export async function extractPdfPages(filePath: string, maxPages = 60): Promise<string[]> {
   return withPdfPages(filePath, maxPages, (items) => onePageLine(items).replace(/\s{3,}/g, "  ").trim());
+}
+
+/** extractPdfPages, plus the document's own page count from the same pdf.js parse — for a caller
+ *  that must say which pages its cap left unread (#532: a second parser's count can fail alone). */
+export async function extractPdfPagesCounted(filePath: string, maxPages = 60): Promise<{ pages: string[]; pageCount: number }> {
+  const meta = { pageCount: 0 };
+  const pages = await withPdfPages(filePath, maxPages, (items) => onePageLine(items).replace(/\s{3,}/g, "  ").trim(), meta);
+  return { pages, pageCount: Math.max(meta.pageCount, pages.length) };
 }
 
 // THE PAGE'S OWN LINES, for a reader that reasons about "the same line" (#260). pdf.js marks the

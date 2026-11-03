@@ -8,17 +8,24 @@
 //
 // The fixtures are SYNTHETIC PDFs built here (no names, addresses or plan-set prose from a real
 // job). The vision call is a FAKE that records what it was sent — no model, no spend. Pinned:
-//   1. the reader: image-only pages only, ordered by sheet name, capped (and the cap stated), early
+//   1. the reader: title-block-only pages (a picture OR a vector drawing — the test is the text
+//      layer alone), ordered by sheet name then picture-first, capped (and the cap stated), early
 //      stop, a bill/meter page withheld, a quote that does not name its product's listing dropped,
 //      the prompt a constant (rule 2), no vision model = nothing rendered and the report says so;
+//      what the coverage says when nothing could be tested or nothing qualified — never "the text
+//      layer was the whole read" (a raster count or a render that fails is said, not hidden);
 //   2. the rule: a racking reading clears the racking half only; UL 2703A (attachment) is shown,
 //      never a pass; the coverage statement replaces "cut sheets whose pages are images are not read";
-//   3. the gate end to end (runStandaloneReview): an image page as the ONLY UL 2703 evidence clears
-//      the racking half; a listing on a text page past character 20,000 counts with no vision call
-//      while the AI prompt's text stays capped; a set longer than the page cap names its unread pages.
+//   3. the gate end to end (runStandaloneReview): an image page — or a vector-drawn certificate — as
+//      the ONLY UL 2703 evidence clears the racking half; a listing on a text page past character
+//      20,000 counts with no vision call while the AI prompt's text stays capped; a set longer than
+//      the page cap names its unread pages (counted by pdf.js); a set whose text cannot be extracted
+//      says no page was read.
 // Fails without the fix: with the base gate (reviewSubject.ts) e0-e4 fail — the image page is never
 // read, the text past character 20,000 is never read, no page is named as unread; with the base
-// rule's reading (text and module datasheet only) u1-u4, e1 and e3 fail.
+// rule's reading (text and module datasheet only) u1-u4, e1 and e3 fail. Against the first cut of
+// this fix (3beef7c9: image-only = a large raster, and "No sheet of the plan set is image-only, so
+// its text layer was the whole read") r8, r10, r11, r12, e7, e8 and e9 fail.
 //
 // Run: npx tsx backend/test/imageSheetListings.test.ts
 import "./_isolate"; // FIRST
@@ -53,14 +60,16 @@ const check = async (name: string, fn: () => void | Promise<void>) => {
 // Synthetic plan sets
 // ---------------------------------------------------------------------------------------------
 
-type Sheet = { text: string[]; name: string } | { image: true; name: string };
+type Sheet = { text: string[]; name: string } | { image: true; name: string } | { vector: true; name: string };
 const FILLER = ["CONDUCTOR", "BREAKER", "RAFTER", "SETBACK", "AZIMUTH", "BUSBAR"];
 /** `count` lines of plan prose for sheet `i`, varied so no line repeats across sheets. */
 const prose = (i: number, count: number): string[] =>
   Array.from({ length: count }, (_, r) => `SHEET ${i} NOTE ${r}: ${FILLER[r % 6]} ${i * 100 + r} PER DETAIL ${i}-${r} ROOF MOUNT ARRAY ON RAFTERS AT ${16 + (r % 3) * 8} IN OC`);
 
 /** A plan set of 11x17 sheets, each with the same title block; image sheets are a large raster
- *  carrying only the title block and the sheet's name as text (a cut sheet pasted in as a picture). */
+ *  carrying only the title block and the sheet's name as text (a cut sheet pasted in as a picture);
+ *  vector sheets carry the same text and NO raster — their content is drawn as rectangles and lines
+ *  (a certificate exported as outlines). */
 async function planSet(sheets: Sheet[]): Promise<Buffer> {
   const doc = await PDFDocument.create();
   const font = await doc.embedFont(StandardFonts.Helvetica);
@@ -75,6 +84,9 @@ async function planSet(sheets: Sheet[]): Promise<Buffer> {
     p.drawText(`CONTRACTOR: SYNTHETIC SOLAR CO  ADDRESS: 1 EXAMPLE WAY ANYTOWN  SHEET SIZE ANSI B 11 X 17  SHEET NUMBER DS ${i}  SHEET NAME ${sheet.name}`, { x: 30, y: 20, size: 8, font });
     if ("image" in sheet) {
       p.drawImage(raster, { x: 30, y: 60, width: 1100, height: 700 });
+    } else if ("vector" in sheet) {
+      p.drawRectangle({ x: 30, y: 60, width: 1100, height: 700, borderWidth: 2 });
+      for (let y = 100; y < 740; y += 30) p.drawRectangle({ x: 60, y, width: 200 + ((y * 7) % 700), height: 12 });
     } else {
       sheet.text.forEach((line, r) => p.drawText(line, { x: 40, y: 750 - r * 13, size: 9, font }));
     }
@@ -84,9 +96,14 @@ async function planSet(sheets: Sheet[]): Promise<Buffer> {
 
 /** The per-page text the gate extracts (written to a temp file: the extractor reads a path). */
 async function pagesOf(pdf: Buffer): Promise<string[]> {
-  const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "isl-")), "set.pdf");
-  fs.writeFileSync(f, pdf);
-  return extractPdfPages(f, 400);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "autopilot-test-isl-"));
+  try {
+    const f = path.join(dir, "set.pdf");
+    fs.writeFileSync(f, pdf);
+    return await extractPdfPages(f, 400);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 }
 
 type VisionInput = { imageBase64: string; mimeType: string; prompt: string };
@@ -136,6 +153,7 @@ const realPages = await pagesOf(realShaped);
 await check("(r0) the fixture's cut sheets are image-only: title block + name in the text layer, a large raster", async () => {
   const { imageOnlyPages, rasterPixelsPerPage } = await import("../src/scannedPlanSet");
   assert.deepEqual(imageOnlyPages(realPages, await rasterPixelsPerPage(realShaped)), [4, 5, 6, 7, 8, 9, 10, 11, 12, 13]);
+  assert.deepEqual(listings.titleBlockOnlyPages(realPages), [4, 5, 6, 7, 8, 9, 10, 11, 12, 13], "the reader's own test (text only) finds the same pages");
 });
 
 await check("(r1) order: by the sheet's own name, listing + listed-product words first, other equipment last — nothing dropped", () => {
@@ -187,7 +205,7 @@ await check("(r4) a page whose text reads as a bill or meter record is withheld 
   const pages = await pagesOf(withBill);
   const fake = fakeLlm();
   const r = await listings.readImageSheetListings(fake.llm, withBill, pages, { want: { module: true, racking: true } });
-  assert.deepEqual(r.imagePages, [3, 4]);
+  assert.deepEqual(r.titleBlockOnlyPages, [3, 4]);
   assert.deepEqual(r.read, [4], "only the racking sheet was sent");
   assert.equal(fake.visionCalls.length, 1);
   assert.deepEqual(r.skipped, [{ page: 3, reason: "withheld: its text reads as a bill or meter record" }]);
@@ -217,11 +235,11 @@ await check("(r5) only a quote that names ITS product's listing is kept: wrong p
   assert.deepEqual(listings.acceptedListingReadings(9, { provider: "claude-vision", raw: "UL 2703" }), []);
 });
 
-await check("(r6) no vision model: nothing is rendered or sent, and the coverage says the image-only sheets were not read", async () => {
+await check("(r6) no vision model: nothing is rendered or sent, and the coverage says the title-block-only sheets were not read", async () => {
   const r = await listings.readImageSheetListings(null, realShaped, realPages, { want: { module: true, racking: true } });
   assert.deepEqual(r.read, []);
   assert.equal(r.skipped.length, 10);
-  assert.match(r.coverage, /image-only sheets \(pages 4, 5, 6, 7, 8, 9, 10, 11, 12, 13\) were not read for listing marks/);
+  assert.match(r.coverage, /title-block-only sheets \(pages 4, 5, 6, 7, 8, 9, 10, 11, 12, 13\) were not read for listing marks/);
   assert.match(r.coverage, /no vision model is configured/);
 });
 
@@ -230,6 +248,82 @@ await check("(r7) nothing wanted (the text showed both listings): no page is rea
   const r = await listings.readImageSheetListings(fake.llm, realShaped, realPages, { want: { module: false, racking: false } });
   assert.equal(fake.visionCalls.length, 0);
   assert.equal(r.coverage, "");
+});
+
+// A certificate exported as vector art / outlined text: the title block is its only text and it
+// paints NO raster. A "large raster" test skipped it — and then said the set had no image page.
+const withVector = await planSet([
+  { name: "COVER SHEET", text: prose(1, 30) },
+  { name: "SITE PLAN", text: prose(2, 30) },
+  { name: "ELECTRICAL", text: prose(3, 30) },
+  { vector: true, name: "RACKING UL CERTIFICATE" },
+  { image: true, name: "PV MODULE SPECIFICATION" },
+]);
+const vectorPages = await pagesOf(withVector);
+
+await check("(r8) a title-block-only sheet with NO raster (vector art) is a candidate and is read", async () => {
+  const { rasterPixelsPerPage } = await import("../src/scannedPlanSet");
+  const raster = await rasterPixelsPerPage(withVector);
+  assert.equal(raster[3], 0, "fixture: the vector sheet paints no raster");
+  const fake = fakeLlm((n) => (n === 0 ? reading("racking", "LISTED TO UL 2703") : { listings: [] }));
+  const r = await listings.readImageSheetListings(fake.llm, withVector, vectorPages, { want: { module: false, racking: true } });
+  assert.deepEqual(r.read, [4], "the vector certificate (listing + product words) is read first, and answers");
+  assert.deepEqual(r.titleBlockOnlyPages, [4, 5]);
+  assert.deepEqual(r.readings, [{ page: 4, product: "racking", quote: "LISTED TO UL 2703" }]);
+  assert.doesNotMatch(r.coverage, /whole read/);
+});
+
+await check("(r9) the raster count failing loses only the order's tie-break: every title-block-only page stays a candidate", async () => {
+  const fake = fakeLlm();
+  const r = await listings.readImageSheetListings(fake.llm, withVector, vectorPages, {
+    want: { module: true, racking: true },
+    countRaster: async () => { throw new Error("injected: raster count failed"); },
+  });
+  assert.deepEqual(r.titleBlockOnlyPages, [4, 5]);
+  assert.deepEqual([...r.read].sort(), [4, 5], "both read although the raster count failed");
+  assert.equal(fake.visionCalls.length, 2);
+  assert.match(r.coverage, /^Title-block-only sheets \(pictures, or drawings with no text of their own\) read by vision for listing marks \(at most 6 per review\): pages 4, 5\.$/);
+});
+
+await check("(r10) bytes no parser can open (the raster count AND the render fail): the pages are named as not read, never 'no image page'", async () => {
+  // The skeptic's probe: the extracted text of a real set, with bytes neither pdf-lib nor pdf.js opens.
+  const fake = fakeLlm();
+  const r = await listings.readImageSheetListings(fake.llm, Buffer.from("%PDF-1.7 truncated, not a document"), realPages, { want: { module: true, racking: true } });
+  assert.equal(fake.visionCalls.length, 0);
+  assert.doesNotMatch(r.coverage, /whole read|No sheet/i, r.coverage);
+  assert.deepEqual(r.titleBlockOnlyPages, [4, 5, 6, 7, 8, 9, 10, 11, 12, 13], "candidates come from the text, which was read");
+  assert.match(r.coverage, /^The plan set's title-block-only sheets \(pages 4, 5, 6, 7, 8, 9, 10, 11, 12, 13\) were not read for listing marks\./);
+  assert.match(r.coverage, /the plan set could not be rendered/);
+  assert.match(r.coverage, /over the 6-page cap/, "the cap is still applied and named");
+});
+
+await check("(r11) no title-block-only sheet: the coverage states the test that was run and what it leaves unread — never 'the whole read'", async () => {
+  const allText = await planSet([
+    { name: "COVER SHEET", text: prose(1, 30) },
+    { name: "SITE PLAN", text: prose(2, 30) },
+    { name: "ELECTRICAL", text: prose(3, 30) },
+  ]);
+  const fake = fakeLlm();
+  const r = await listings.readImageSheetListings(fake.llm, allText, await pagesOf(allText), { want: { module: true, racking: true } });
+  assert.equal(fake.visionCalls.length, 0);
+  assert.doesNotMatch(r.coverage, /whole read/);
+  assert.equal(r.coverage, "No sheet was sent to vision for listing marks: every sheet's text layer held 150 or more letters and digits beyond the title block the sheets share, and only title-block-only sheets (pictures, or drawings with no text of their own) are read that way. A listing printed inside a picture on a sheet that also carries text is not read.");
+});
+
+await check("(r12) under 3 sheets the title block cannot be told apart: the coverage says the whole text was tested", async () => {
+  const two = await planSet([{ name: "COVER SHEET", text: prose(1, 20) }, { name: "SITE PLAN", text: prose(2, 20) }]);
+  const r = await listings.readImageSheetListings(fakeLlm().llm, two, await pagesOf(two), { want: { module: true, racking: true } });
+  assert.match(r.coverage, /^No sheet was sent to vision for listing marks: with fewer than 3 sheets the title block cannot be told apart from a sheet's own text, and every sheet's whole text layer held 150 or more letters and digits\. A listing printed inside a picture on a sheet that also carries text is not read\.$/);
+});
+
+await check("(r13) order: at an equal sheet-name score a page that paints a large picture goes first; unknown raster = page order", () => {
+  // PV MODULE SPECIFICATION (4) and RACKING DATA (8) both score 2 by name.
+  const raster = Array.from({ length: realPages.length }, (_, i) => (i === 3 ? 0 : 2_000_000));
+  assert.deepEqual(listings.orderListingCandidates([4, 8], realPages, raster), [8, 4]);
+  assert.deepEqual(listings.orderListingCandidates([4, 8], realPages, null), [4, 8]);
+  // The name still wins over the picture: ATTACHMENT UL CERTIFICATE (13) with no raster before RACKING DATA (8).
+  const no13 = raster.map((v, i) => (i === 12 ? 0 : v));
+  assert.deepEqual(listings.orderListingCandidates([8, 13], realPages, no13), [13, 8]);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -249,7 +343,7 @@ const profile = (): JurisdictionCodeProfile => ({
   researchedAt: "2026-09-01T00:00:00.000Z",
 });
 const evaluate = (p: ProjectRecord) => rules.evaluateDesignCodeFindings(p, null, buildCodeContext("OR", "City of Testport", profile()), [], []);
-const readings = (rs: Array<{ page: number; product: string; quote: string }>, coverage = "Image-only sheets read by vision for listing marks (at most 6 per review): pages 7, 8.") =>
+const readings = (rs: Array<{ page: number; product: string; quote: string }>, coverage = "Title-block-only sheets (pictures, or drawings with no text of their own) read by vision for listing marks (at most 6 per review): pages 7, 8.") =>
   ({ [rules.IMAGE_SHEET_LISTING_READINGS_KEY]: JSON.stringify(rs), [rules.IMAGE_SHEET_LISTING_COVERAGE_KEY]: coverage });
 
 await check("(u0) control: no readings — both halves missing, the old sentence about image pages stands", () => {
@@ -261,12 +355,12 @@ await check("(u0) control: no readings — both halves missing, the old sentence
 await check("(u1) a racking reading from an image sheet clears the racking half — and only it; the page is the evidence", () => {
   const f = get(evaluate(ruleProject(readings([{ page: 8, product: "racking", quote: "UL 2703 LISTED SYSTEM" }]))), LISTINGS);
   assert.ok(f, "the module half is still missing");
-  assert.match(f.message, /^No module listing \(UL 61730 or UL 1703\) was found in the package text or on any image-only sheet read for listing marks\. Image-only sheets read by vision/);
+  assert.match(f.message, /^No module listing \(UL 61730 or UL 1703\) was found in the package text or on any title-block-only sheet read by vision\. Title-block-only sheets \(pictures, or drawings with no text of their own\) read by vision/);
   assert.doesNotMatch(f.message, /cut sheets whose pages are images are not read/);
   assert.deepEqual(f.evidenceNeeded, ["Module listing (UL 61730 or UL 1703) on the plan set or an attached cut sheet/certificate"]);
   assert.equal(f.evidenceStatus, "weak");
   const ev = f.evidenceFound?.find((e) => e.label === "Listing stated");
-  assert.equal(ev?.source, "Plan page 8 (image-only sheet, read by vision)");
+  assert.equal(ev?.source, "Plan page 8 (title-block-only sheet, read by vision)");
   assert.equal(ev?.excerpt, "UL 2703");
 });
 
@@ -282,7 +376,7 @@ await check("(u3) UL 2703A alone (the attachment's flashing listing) is shown, n
   const f = get(evaluate(ruleProject(readings([{ page: 9, product: "attachment", quote: "Conforms to UL Subject 2703A" }]))), LISTINGS);
   assert.ok(f);
   assert.match(f.message, /racking\/mounting listing \(UL 2703\)/);
-  assert.match(f.message, /A roof-attachment listing \(UL 2703A, Plan page 9 \(image-only sheet, read by vision\)\) was found; it lists the attachment\/flashing, not the racking\/mounting\./);
+  assert.match(f.message, /A roof-attachment listing \(UL 2703A, Plan page 9 \(title-block-only sheet, read by vision\)\) was found; it lists the attachment\/flashing, not the racking\/mounting\./);
   assert.equal(f.evidenceStatus, "missing");
   assert.ok(f.evidenceFound?.some((e) => e.kind === "absence_check"), "the absence is still evidence");
   assert.ok(f.evidenceFound?.some((e) => e.label === "Attachment listing (UL 2703A)" && /Plan page 9/.test(e.source)));
@@ -327,7 +421,7 @@ await check("(e1) RED ON BASE: a plan set whose only UL 2703 evidence is an imag
   const pdf = await planSet([
     { name: "COVER SHEET", text: prose(1, 30) },
     { name: "SITE PLAN", text: prose(2, 30) },
-    { name: "ELECTRICAL", text: [...prose(3, 20), "INVERTER: SYN-MICRO UL 1741 SB LISTED"] },
+    { name: "ELECTRICAL", text: [...prose(3, 30), "INVERTER: SYN-MICRO UL 1741 SB LISTED"] },
     { image: true, name: "PV MODULE SPECIFICATION" },
     { image: true, name: "RACKING DATA" },
     { image: true, name: "MICROINVERTER SPECIFICATION" },
@@ -338,10 +432,10 @@ await check("(e1) RED ON BASE: a plan set whose only UL 2703 evidence is an imag
   const { report } = await review(pdf, fake.llm);
   const f = get(report.findings, LISTINGS);
   assert.ok(f, "the module half is still missing (IEC is not the UL listing)");
-  assert.match(f.message, /^No module listing \(UL 61730 or UL 1703\) was found in the package text or on any image-only sheet read for listing marks\./);
+  assert.match(f.message, /^No module listing \(UL 61730 or UL 1703\) was found in the package text or on any title-block-only sheet read by vision\./);
   assert.doesNotMatch(f.message, /racking\/mounting listing \(UL 2703\)/, "the racking half is cleared");
   assert.match(f.message, /pages 4, 5, 6\./);
-  assert.equal(f.evidenceFound?.find((e) => e.label === "Listing stated")?.source, "Plan page 5 (image-only sheet, read by vision)");
+  assert.equal(f.evidenceFound?.find((e) => e.label === "Listing stated")?.source, "Plan page 5 (title-block-only sheet, read by vision)");
   assert.equal(fake.visionCalls.length, 3);
   assert.ok(fake.visionCalls.every((c) => c.prompt === listings.SHEET_LISTING_VISION_PROMPT), "rule 2: the constant prompt only");
 });
@@ -361,7 +455,7 @@ await check("(e2) RED ON BASE: a listing on a text page past character 20,000 co
   assert.doesNotMatch(fake.aiCalls[0].extractedText, /UL 2703/);
 });
 
-await check("(e3) no vision model (stub provider): the report says the image-only sheets were not read, and the racking half stays", async () => {
+await check("(e3) no vision model (stub provider): the report says the title-block-only sheets were not read, and the racking half stays", async () => {
   const pdf = await planSet([
     { name: "COVER SHEET", text: prose(1, 30) },
     { name: "SITE PLAN", text: prose(2, 30) },
@@ -372,7 +466,7 @@ await check("(e3) no vision model (stub provider): the report says the image-onl
   const f = get(report.findings, LISTINGS);
   assert.ok(f);
   assert.match(f.message, /racking\/mounting listing \(UL 2703\)/);
-  assert.match(f.message, /The plan set's image-only sheets \(page 4\) were not read for listing marks\. Not read: page 4 \(no vision model is configured\)\./);
+  assert.match(f.message, /The plan set's title-block-only sheets \(page 4\) were not read for listing marks\. Not read: page 4 \(no vision model is configured\)\./);
 });
 
 await check(`(e4) RED ON BASE: a set longer than the ${TEXT_PAGE_CAP}-page text cap names the pages it did not read`, async () => {
@@ -400,6 +494,46 @@ await check("(e6) a caller cannot hand the gate its own 'vision readings': only 
   assert.ok(f, "the racking half is still missing");
   assert.match(f.message, /^No racking\/mounting listing \(UL 2703\) was found in the package text that could be read/);
   assert.doesNotMatch(f.message, /Every sheet was read/);
+});
+
+await check("(e7) a plan set whose only UL 2703 evidence is a VECTOR-drawn certificate (no raster) clears the racking half", async () => {
+  const pdf = await planSet([
+    { name: "COVER SHEET", text: prose(1, 30) },
+    { name: "SITE PLAN", text: prose(2, 30) },
+    { name: "ELECTRICAL", text: [...prose(3, 30), "INVERTER: SYN-MICRO UL 1741 SB LISTED"] },
+    { vector: true, name: "RACKING UL CERTIFICATE" },
+  ]);
+  const fake = fakeLlm((n) => (n === 0 ? reading("racking", "UL 2703 LISTED SYSTEM") : { listings: [] }));
+  const { report } = await review(pdf, fake.llm);
+  const f = get(report.findings, LISTINGS);
+  assert.ok(f, "the module half is still missing");
+  assert.doesNotMatch(f.message, /racking\/mounting listing \(UL 2703\)/, "the racking half is cleared by the vector sheet");
+  assert.doesNotMatch(f.message, /whole read/);
+  assert.equal(f.evidenceFound?.find((e) => e.label === "Listing stated")?.source, "Plan page 4 (title-block-only sheet, read by vision)");
+  assert.equal(fake.visionCalls.length, 1);
+});
+
+await check("(e8) a plan set whose text cannot be extracted: the report says no page was read", async () => {
+  const { report } = await review(Buffer.from("%PDF-1.7 truncated, not a document"), fakeLlm().llm);
+  const f = get(report.findings, "reviewer.plan.text-pages-not-read");
+  assert.ok(f, "the unread plan set is on the report");
+  assert.equal(f.title, "Plan set text not read");
+  assert.match(f.message, /could not be extracted, so the text checks read none of its pages/);
+});
+
+await check("(e9) a set with no title-block-only sheet: the finding says what was tested, not that the text was the whole read", async () => {
+  const pdf = await planSet([
+    { name: "COVER SHEET", text: prose(1, 30) },
+    { name: "SITE PLAN", text: prose(2, 30) },
+    { name: "ELECTRICAL", text: prose(3, 30) },
+  ]);
+  const fake = fakeLlm();
+  const { report } = await review(pdf, fake.llm);
+  const f = get(report.findings, LISTINGS);
+  assert.ok(f);
+  assert.equal(fake.visionCalls.length, 0);
+  assert.doesNotMatch(f.message, /whole read/);
+  assert.match(f.message, /No sheet was sent to vision for listing marks: every sheet's text layer held 150 or more letters and digits beyond the title block the sheets share.*A listing printed inside a picture on a sheet that also carries text is not read\./);
 });
 
 console.log(`\n${passed} passed, ${failures} failed`);
