@@ -6534,7 +6534,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // directive (capped at MAX_RECOVERY) so the model can choose a different action and heal.
       let recoveryHint = pendingHint;
       pendingHint = "";
-      const loopFp = await this.pageFingerprint();
+      const loopFp = await this.loopFingerprint();
       const consecutiveStuck = !!loopFp && loopFp === lastLoopFp;
       const cycling = !!loopFp && !consecutiveStuck && recentFingerprints.includes(loopFp);
       if (loopFp) {
@@ -12041,6 +12041,20 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   // just "did the page meaningfully change". Returns "" on a mock/no-DOM page.
   private async pageFingerprint(): Promise<string> {
     return pageFingerprintOf(this.page);
+  }
+
+  /** THE STUCK GUARD'S READING (#556): the page fingerprint plus how many buttons are ENABLED. A choice
+   *  that enables the page's way forward (Cityworks: a case type enables "Begin Application") changes
+   *  no text, heading or field count — read by the fingerprint alone it was "the last action did not
+   *  change the page", and the planner was told it was STUCK right after making the right choice.
+   *  waitAfterClick keeps the plain fingerprint: a Next that disables itself mid-submit must not end
+   *  that wait early. "" = unreadable, as before. */
+  private async loopFingerprint(): Promise<string> {
+    const fp = await this.pageFingerprint();
+    if (!fp) return fp;
+    const enabled = await evaluateWithin(this.page, PAGE_READ_BOUND_MS, -1, () =>
+      document.querySelectorAll("button:not(:disabled), input[type=submit]:not(:disabled), input[type=button]:not(:disabled)").length);
+    return `${fp}|${enabled}`;
   }
 
   // Remove stubborn overlay SCRIMS that intercept pointer events but aren't dismissible by a

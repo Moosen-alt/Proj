@@ -116,10 +116,14 @@ async function replayFinds(steps: RecipeStep[]): Promise<string> {
       const n = loc ? await loc.count() : -1;
       out.push(`${norm(s.note).replace(/^navigate to application: /, "")}=${n}`);
       if (n !== 1 || !loc) break;
-      await loc.click({ timeout: 5000 });
+      // A recorded click the replay cannot perform (a disabled control) is a finding, not a crash.
+      const clicked = await loc.click({ timeout: 5000 }).then(() => true, (e: unknown) => { out.push(`(click failed: ${String((e as Error)?.message ?? e).split("\n")[0].slice(0, 80)})`); return false; });
+      if (!clicked) break;
       await p.waitForTimeout(600);
     }
     if (!/\/case\/apply$/.test(new URL(p.url()).pathname)) out.push(`ended at ${new URL(p.url()).pathname}`);
+  } catch (e) {
+    out.push(`(replay error: ${String((e as Error)?.message ?? e).split("\n")[0].slice(0, 80)})`);
   } finally {
     await b.close();
   }
@@ -252,6 +256,10 @@ async function walk(mode: Mode): Promise<void> {
       evTypes.includes("navigate_disabled_refused") && beginSteps.length === 1 && typeAt >= 0 && beginAt > typeAt, `events=${JSON.stringify(evTypes)} | ${trace}`);
     check("eager: the planner is told the control is disabled and what the page is waiting for",
       calls.some((c) => /Begin Application" is DISABLED/.test(c.hint) && /choice/.test(c.hint)), trace);
+    // The enabling choice CHANGED the page (Begin is enabled now): the stuck guard must not call it
+    // "the last action did not change the page" to the planner that just made it.
+    check("eager: after the enabling choice the planner is not told it is STUCK",
+      !evTypes.includes("recovery_attempt") && !calls.some((c) => /You are STUCK/.test(c.hint)), `events=${JSON.stringify(evTypes)} | ${trace}`);
   }
   if (mode === "gone") {
     const secs = chosenAt && endedAt ? Math.round((endedAt - chosenAt) / 1000) : -1;
