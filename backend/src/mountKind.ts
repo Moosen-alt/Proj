@@ -89,14 +89,32 @@ export function mountKind(project: MountInputs, allText: string): MountKind {
 // over and over, on the cover, the notes and the attachment detail.
 //
 // So the free text counts, and not every roof word counts the same.
-//   ROOF-ARRAY evidence, a full vote each: "roof mount(ed)", rooftop, flush mount, rafters, a roof
-//     attachment — words that say where THIS array is fastened.
-//   ROOF-SHEET evidence, HALF a vote each: flashing, a roof penetration / framing / plan / layout /
-//     section. These are sheet names and general-notes boilerplate that a ground set's template
-//     carries too ("ROOF MOUNTED SYSTEMS - ALL ROOF PENETRATIONS SHALL BE SEALED WITH FLASHING", a
-//     "PV-2 ROOF PLAN" in the sheet index). Counted whole, one such notes line tied a ground set's
-//     own three "ground mount" phrases, the tie read unknown, and the job collected the roof
-//     BLOCKERS (fire pathways, framing, rapid shutdown, the roof site plan) it reads clear of on main.
+//   A CODE REQUIREMENT NAMES NO ARRAY: a roof word inside a requirement or calc clause does not vote
+//     at all. The codes themselves are written about roofs (the fire classification of roof-mounted
+//     PV, conduit height above a roof, rooftop raceway temperature and ampacity, roof attachment
+//     spacing, the dead load of roof-mounted panels), so a designer's template carries those notes on
+//     every set whatever the mount. Counted, they outvoted a ground set's own GROUND MOUNT title
+//     blocks: a real roof template carries about as many of them as it has job-specific roof words,
+//     and a half vote still let them tie. A clause is a sentence of the extracted text (pages arrive
+//     as one line each, so it ends at . ; : ! ? before a space, or at a line break; a double space
+//     is not a boundary, justified notes text has one between every word), and it is a requirement
+//     when it carries a modal (shall, must, will be, to be), a code or manufacturer reference (per
+//     code / NEC / the manufacturer, in compliance with, an article or table number, IRC R-sections),
+//     or a calc or limit term (ampacity, temperature, fire classification / resistance / rating, dead
+//     load, minimum, maximum, no greater than, not to exceed). Only ROOF words are discounted this
+//     way: ground and carport words are not template boilerplate, and a ground set's own scope line
+//     can read "ARRAY TO BE GROUND MOUNTED ON PIERS". A clause misread as a requirement therefore
+//     only moves a reading toward main's own, which took any ground-mount phrase as a ground array.
+//   ROOF-ARRAY evidence, a full vote each, outside a requirement clause: "roof mount(ed)", rooftop,
+//     flush mount, rafters, a roof attachment — a title block, a scope line, a framing callout.
+//   ROOF-SHEET evidence, HALF a vote each (outside a requirement clause too): flashing, a roof
+//     penetration / framing / plan / layout / section. These are sheet names and detail labels that
+//     a ground set's template carries too (a "PV-2 ROOF PLAN" in the sheet index). Counted whole, one
+//     notes line tied a ground set's own three "ground mount" phrases, the tie read unknown, and the
+//     job collected the roof BLOCKERS (fire pathways, framing, rapid shutdown, the roof site plan) it
+//     reads clear of on main.
+//   "NON-ROOF MOUNTED" / "non-rooftop" is a negation, not a roof vote (text only: the field's
+//     NEGATED_ROOF, shared with the blocking consumers, is unchanged).
 //   GROUND: a mount noun — "ground mount(ed)", "ground array", "pole mount" — never a ground-mounted
 //     INVERTER / disconnect / meter / battery / transformer (equipment, not the array), "underground
 //     array feeder", or a negated "not a ground mount". NOT "ground rack(ing)": in plan prose that
@@ -126,15 +144,29 @@ const GROUND_ARRAY_TEXT = /\bground[-\s_/]?(?:mount\w*|arrays?\b)|\bpole[-\s_/]?
 const CARPORT_TEXT = /\bcarports?\b|\bcanop(?:y|ies)\b|\bawnings?\b|\bpatio[-\s]+covers?\b/gi;
 const GROUND_MOUNTED_CARPORT = /\b(?:ground|pole)[-\s]?mount\w*\s+(?:(?:pv|solar)\s+)?(?:carports?|canop(?:y|ies))\b/i;
 const TREE_CANOPY = /\btrees?\s+canop(?:y|ies)\b|\bcanop(?:y|ies)\s+of\s+(?:the\s+)?(?:\(e\)\s*|existing\s+)?trees?\b/gi;
+const NON_ROOF_TEXT = /\bnon[-\s]?roof[-\s]?(?:mount\w*|tops?\b)/gi;
+const CLAUSE_END = /(?<=[.;:!?])\s+|\n/;
+const REQUIREMENT_CLAUSE = new RegExp([
+  String.raw`\b(?:shall|must|(?:will|to)\s+be)\b`,
+  String.raw`\bper\s+(?:the\s+)?(?:code|nec|irc|ibc|ifc|nfpa|asce|local|ahj|mfr|manufacturer)`,
+  String.raw`\b(?:in\s+)?compliance\s+with\b|\b(?:art(?:icle)?|tables?)\.?\s*\d{3}|\bnec\b|\bR\d{3}\.\d`,
+  String.raw`\bampacit\w*|\btemp(?:erature)?s?\b|\bfire[-\s]+(?:classification|resistance|rating)|\bdead\s+loads?\b`,
+  String.raw`\b(?:min(?:imum)?|max(?:imum)?)\b|\bno\s+greater\s+than\b|\bnot\s+(?:to\s+)?exceed`,
+].join("|"), "i");
 const mentions = (text: string, re: RegExp): number => (text.match(re) || []).length;
+/** The roof evidence, with the requirement clauses left out (see "A CODE REQUIREMENT NAMES NO ARRAY"). */
+const roofVotes = (text: string): number => text.split(CLAUSE_END)
+  .filter((clause) => !REQUIREMENT_CLAUSE.test(clause))
+  .reduce((sum, clause) => sum + 2 * mentions(clause, ROOF_ARRAY_TEXT) + mentions(clause, ROOF_SHEET_TEXT), 0);
 
 function mountKindFromText(probe: string): MountKind {
   const text = probe
     .replace(NEGATED_MOUNT, " ")
     .replace(NEGATED_ROOF, " ")
+    .replace(NON_ROOF_TEXT, " ")
     .replace(MOUNTED_EQUIPMENT, " ")
     .replace(TREE_CANOPY, " ");
-  const roof = 2 * mentions(text, ROOF_ARRAY_TEXT) + mentions(text, ROOF_SHEET_TEXT);
+  const roof = roofVotes(text);
   const ground = mentions(text, GROUND_ARRAY_TEXT);
   const carport = mentions(text, CARPORT_TEXT);
   if (2 * ground > roof) {

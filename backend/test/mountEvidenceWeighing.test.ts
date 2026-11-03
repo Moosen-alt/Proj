@@ -13,7 +13,10 @@
 // main passes: it pins a regression the first version of this fix brought in, and fails on that
 // version. Every MUST-EXCLUDE is a way the weighing could over-correct into calling a real ground or
 // carport array a roof; the TIE-BAND ones failed on that first version, which counted a ground set's
-// roof-notes boilerplate as a full vote per word.
+// roof-notes boilerplate as a full vote per word, and the TEMPLATE ones (section 2b) failed on the
+// second, which still counted a roof word inside a code-requirement or calc clause. The over-discount
+// guard in 2b passes on every version; it fails if the discount drops a whole page line instead of a
+// clause.
 //
 // Run: npx tsx backend/test/mountEvidenceWeighing.test.ts
 import "./_isolate";
@@ -105,6 +108,47 @@ const GROUND_PLAN_WITH_ROOF_NOTES = [
   "GROUND MOUNTED ARRAY SET BACK 10' FROM THE PROPERTY LINE",
   "GENERAL NOTES: ROOF MOUNTED SYSTEMS - ALL ROOF PENETRATIONS SHALL BE SEALED WITH FLASHING",
   "INVERTERS LISTED TO UL 1741.",
+].join("\n");
+
+// A GROUND SET FROM A ROOF-ORIENTED DESIGNER TEMPLATE. Pages arrive from the extractor as ONE line
+// each (items joined by double spaces), so each page below is one line. The title block says GROUND
+// MOUNT on two sheets; the general notes, design criteria and conductor calcs keep the template's
+// standard code-requirement wording, which is written about roofs whatever the mount: fire
+// classification, raceway height above the roof, rooftop penetrations, attachment spacing and
+// staggering, the dead load of roof-mounted modules, rooftop ampacity and design temperature. Counted
+// as votes they are fifteen roof points against the title blocks' four ground points, and the set read
+// "unknown" — the roof rules — where main reads ground. (All wording here is synthetic.)
+const TEMPLATE_NOTES = [
+  "GENERAL NOTES:  7.  ROOF MOUNTED PV ARRAYS SHALL HAVE A FIRE CLASSIFICATION EQUAL TO THE ROOF ASSEMBLY.",
+  "8.  ALL ROOF MOUNTED RACEWAYS TO BE INSTALLED A MINIMUM 7/8 IN. ABOVE THE ROOF.",
+  "9.  ROOFTOP PENETRATIONS WILL BE SEALED PER CODE.",
+  "10.  ROOF ATTACHMENTS SHALL NOT EXCEED THE RACKING MANUFACTURER'S SPAN.",
+  "11.  WHEN POSSIBLE,  ATTACHMENTS  WILL  BE  STAGGERED ACROSS THE ROOF FRAMING.",
+].join("  ");
+const TEMPLATE_CRITERIA = "DESIGN CRITERIA:  DEAD LOAD OF ROOF-MOUNTED MODULES  3 PSF  WIND SPEED  100 MPH";
+const TEMPLATE_CALCS = "CONDUCTOR SIZING:  ROOFTOP AMPACITY ADJUSTED PER NEC 310.15.  ROOF TOP DESIGN TEMP  47C";
+const GENERIC_NOTE = "NOTE:  ALL WORK SHALL COMPLY WITH THE ADOPTED CODES.";
+const groundTitle = "PHOTOVOLTAIC GROUND MOUNT SYSTEM - 16 MODULES";
+const TEMPLATE_GROUND_PLAN = [
+  `PV-0 COVER  ${groundTitle}  ${TEMPLATE_NOTES}  ${TEMPLATE_CRITERIA}`,
+  `PV-1 SITE PLAN  ${groundTitle}  PROPERTY LINE  (E) DRIVEWAY  (E) RESIDENCE  ${GENERIC_NOTE}`,
+  `PV-2 ARRAY LAYOUT  (N) 16 MODULES  2 ROWS  ${GENERIC_NOTE}`,
+  `S-1 PIER DETAIL  DRIVEN STEEL PIERS  ${GENERIC_NOTE}`,
+  `E-1 SINGLE LINE  UNDERGROUND FEEDER IN TRENCH, 24 IN. COVER  ${TEMPLATE_CALCS}  INVERTERS LISTED TO UL 1741.`,
+].join("\n");
+
+// THE OVER-DISCOUNT GUARD: a ROOF set from the same template, with TWO existing carports on its site
+// and plot plans. Its job-specific roof words — the title block, the roof-plan sheet, flush-mounted
+// modules, the rafters — share each page's line with a requirement note, so a discount that dropped a
+// whole line (a page) instead of a clause would leave the two carports outvoting nothing.
+const roofTitle = "PHOTOVOLTAIC ROOF MOUNT SYSTEM - 16 MODULES";
+const TEMPLATE_ROOF_WITH_TWO_CARPORTS = [
+  `PV-0 COVER  ${roofTitle}  ${TEMPLATE_NOTES}  ${TEMPLATE_CRITERIA}`,
+  `PV-1 SITE PLAN  ${roofTitle}  PROPERTY LINE  (E) DRIVEWAY  (E) CARPORT  (E) RESIDENCE  ${GENERIC_NOTE}`,
+  `PV-2 ROOF PLAN  (N) 16 MODULES FLUSH MOUNTED ON (E) COMP SHINGLE  ${GENERIC_NOTE}`,
+  `PV-3 PLOT PLAN  (E) CARPORT  (E) SHED  ${GENERIC_NOTE}`,
+  `S-1 ATTACHMENT DETAIL  (N) L-FOOT INTO (E) 2X6 RAFTERS @ 24 IN. O.C.  ${GENERIC_NOTE}`,
+  `E-1 SINGLE LINE  ${TEMPLATE_CALCS}  INVERTERS LISTED TO UL 1741.`,
 ].join("\n");
 
 // A carport set: the structure IS the array's mount.
@@ -236,6 +280,53 @@ check("MUST EXCLUDE (tie band): one ground-mount phrase beside a lone roof-plan 
 });
 check("MUST PASS (tie band): one ground-mount phrase against one roof-mount phrase is a tie, and a tie keeps the roof rules", () => {
   assert.equal(mountKindForProject(textOnly("GROUND MOUNT ARRAY\nROOF MOUNT RACKING")), "unknown");
+});
+
+console.log("\n2b. A GROUND SET FROM A ROOF TEMPLATE — ITS CODE NOTES NAME NO ARRAY");
+const blockerIds = (p: ProjectRecord): string[] => report(p).filter((f) => f.severity === "blocker").map((f) => f.id).sort();
+check("MUST EXCLUDE (template): the template's roof code notes do not outvote its GROUND MOUNT title blocks", () => {
+  const p = textOnly(TEMPLATE_GROUND_PLAN);
+  assert.equal(mountKindForProject(p), "ground", "requirement boilerplate outvoted two ground-mount title blocks");
+  assert.equal(rapidShutdownApplies(p, designText(p)), false);
+  const fs = report(p);
+  assert.equal(get(fs, GROUND_SITE)?.severity, "callout", "the ground-array callout did not fire");
+  const leaked = ROOF_ONLY_IDS.filter((id) => get(fs, id));
+  assert.deepEqual(leaked, [], `roof rules fired on a ground array: ${leaked.join(", ")}`);
+  assert.match(get(fs, LISTINGS)?.message || "", /ground-mount racking listing \(UL 2703\)/, "the listing check still runs, in ground words");
+});
+check("MUST EXCLUDE (template): read from its text, the set gets exactly the blockers a 'Ground mount' field gives it", () => {
+  const fromText = blockerIds(textOnly(TEMPLATE_GROUND_PLAN));
+  const fromField = blockerIds(textOnly(TEMPLATE_GROUND_PLAN, { mounting: "Ground mount" }));
+  assert.deepEqual(fromText.filter((id) => !fromField.includes(id)), [], "the text reading raised roof blockers main's ground reading does not");
+  assert.deepEqual(fromText, fromField);
+});
+check("MUST EXCLUDE (template): one ground title beside ONE code-requirement roof line still reads ground", () => {
+  for (const text of [
+    `GROUND MOUNTED PV ARRAY ON DRIVEN PIERS\nROOF MOUNTED PV ARRAYS SHALL HAVE A FIRE CLASSIFICATION EQUAL TO THE ROOF ASSEMBLY.`,
+    `GROUND MOUNTED PV SYSTEM ON DRIVEN PIERS\n${TEMPLATE_CALCS}`,
+    `GROUND MOUNTED PV SYSTEM\n${TEMPLATE_CRITERIA}`,
+    "GROUND MOUNTED PV SYSTEM\nFLASHING PER MANUFACTURER.\nFLASHING: N/A",
+  ]) {
+    assert.equal(mountKindForProject(textOnly(text)), "ground", JSON.stringify(text));
+  }
+});
+check("MUST EXCLUDE: 'NON-ROOF MOUNTED' is a negation, not a roof vote", () => {
+  assert.equal(mountKindForProject(textOnly("THIS IS A NON-ROOF MOUNTED ARRAY - GROUND MOUNT")), "ground");
+});
+check("MUST PASS (over-discount guard): a roof set from the same template with TWO site-plan carports keeps the roof rules", () => {
+  const p = textOnly(TEMPLATE_ROOF_WITH_TWO_CARPORTS);
+  assert.equal(mountKindForProject(p), "unknown", "the requirement discount left two carport labels outvoting the roof's own title blocks and rafters");
+  assert.equal(isRoofMounted(p, designText(p)), true);
+  const fs = report(p);
+  assert.ok(!get(fs, GROUND_SITE), "the roof job was told its roof access rules do not apply");
+  assert.ok(FIRE_IDS.some((id) => get(fs, id)), "no fire-pathway review on a roof job");
+  assert.match(get(fs, LISTINGS)?.message || "", /racking\/mounting listing \(UL 2703\)/);
+  assert.doesNotMatch(get(fs, LISTINGS)?.message || "", /ground|carport/i);
+});
+check("MUST PASS: a roof job's job-specific roof words still outvote a ground-mount phrase in a code note", () => {
+  // Only ROOF words in a requirement clause are discounted; a roof template's ground note is not a ground array.
+  const p = textOnly(`${TEMPLATE_ROOF_WITH_TWO_CARPORTS}\nGROUND MOUNTED ARRAYS SHALL BE SET BACK FROM PROPERTY LINES PER CODE.`);
+  assert.equal(mountKindForProject(p), "unknown");
 });
 
 console.log("\n3. A REAL CARPORT PLAN — CARPORT, RAPID SHUTDOWN KEPT, LISTINGS CHECKED");
