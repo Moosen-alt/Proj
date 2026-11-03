@@ -15,10 +15,9 @@
 //       slot is not reported empty.
 //   [B] the project holds no document at all: nothing is attached, and the hand-off names the
 //       empty required meter-photo slot (it is never left blank silently).
-//
-// (With a plan set on file but no meter photo, the split-mode fallback files the plan set into
-// a required meter-photo slot — on a slot present at entry too. That is the upload pass's own
-// substitute rule, not this fix; it is filed separately.)
+//   [C] the project holds a plan set but no meter photo (#542): the split-mode substitute tier
+//       used to file the PLAN SET into the required meter-photo slot and report nothing missing.
+//       Now nothing is attached, no upload step is recorded, and the hand-off names the slot.
 //
 // Run: npx tsx portal-bot/src/adapters/revealedUploadSlot.dom.smoke.ts
 import "../smokeArtifactDirs"; // hand-run safe: artifact dirs default to a temp folder, never data/
@@ -123,8 +122,9 @@ try {
     await p.close();
   }
 
-  for (const which of ["A", "B"] as const) {
-    console.log(which === "A" ? "\n[A] the project holds the meter photo (.jpg)" : "\n[B] the project holds no document");
+  for (const which of ["A", "B", "C"] as const) {
+    console.log(which === "A" ? "\n[A] the project holds the meter photo (.jpg)"
+      : which === "B" ? "\n[B] the project holds no document" : "\n[C] the project holds a plan set but no meter photo (#542)");
     const ctx = await browser.newContext();
     ctx.setDefaultTimeout(8000);
     await ctx.addInitScript({ content: "globalThis.__name = globalThis.__name || ((f) => f);" });
@@ -132,7 +132,8 @@ try {
     await page.goto(`${base}/service`);
     posts.length = 0;
     uploads.length = 0;
-    const docsByType: Record<string, string> = which === "A" ? { meter_photo: meterPhoto, plan_set: planSet } : {};
+    const docsByType: Record<string, string> = which === "A" ? { meter_photo: meterPhoto, plan_set: planSet }
+      : which === "C" ? { plan_set: planSet } : {};
     const adapter = new AutoLearnAdapter("PowerClerk Replica", planner, { maxPages: 4, docsByType });
     const events: Array<Record<string, unknown>> = [];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -176,9 +177,9 @@ try {
         answerAt >= 0 && uploadAt > answerAt, `answerAt=${answerAt} uploadAt=${uploadAt}`);
       check("[A] the meter-photo slot is not reported empty", !missing.some((m) => /photo of meter/i.test(m)), JSON.stringify(missing));
     } else {
-      check("[B] nothing was attached",
+      check(`[${which}] nothing was attached${which === "C" ? " — the plan set is not filed into the meter-photo slot" : ""}`,
         uploads.length === 0 && uploadSteps.length === 0, `uploads=${JSON.stringify(uploads)} steps=${JSON.stringify(uploadSteps)}`);
-      check("[B] the hand-off names the empty required meter-photo slot",
+      check(`[${which}] the hand-off names the empty required meter-photo slot`,
         missing.some((m) => /photo of meter/i.test(m)) && /photo of meter/i.test(msg), `missing=${JSON.stringify(missing)} ${msg.slice(0, 300)}`);
     }
   }
