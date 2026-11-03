@@ -65,11 +65,37 @@ const PAGES: Record<string, string> = {
   bodyText: `<!doctype html><html><head><title>Review</title></head><body>Account ${ACCOUNT}</body></html>`,
   twice: doc(`<div id="t" style="${abs(100, "font-size:20px")}">${ACCOUNT} <b>${ACCOUNT}</b></div>`, false),
   hidden: doc(`<input type="hidden" name="acct" value="${ACCOUNT}"><div style="display:none">Account ${ACCOUNT}</div><p style="${abs(100)}">Nothing of it shows.</p>`, false),
+  // #436 FIX ROUND 2 — painted, never tagged: the checker's shapes, no extra CSS (a scriptless page
+  // paints a <noscript>'s content by itself).
+  painted: doc([
+    `<div id="ns1" style="${abs(100, "font-size:20px")}"><noscript>Account ${ACCOUNT}</noscript></div>`,
+    `<div id="ns2" style="${abs(200, "font-size:20px")}"><noscript>Account 8814<b>402937</b></noscript></div>`,
+    `<input id="ph" placeholder="${ACCOUNT}" style="${abs(300, "width:300px;height:40px;font-size:18px")}">`,
+  ].join(""), false),
+  imgAlt: doc(`<img alt="${ACCOUNT}" src="/missing.png" style="${abs(100, "font-size:20px")}">`, false),
+  inputImage: doc(`<input type="image" alt="${ACCOUNT}" src="/missing.png" style="${abs(100, "width:300px;height:40px;font-size:18px")}">`, false),
+  after: `<!doctype html><html><head><title>Review</title><style>#x::after{content:attr(data-acct)}</style></head><body><div id="x" data-acct="${ACCOUNT}"></div></body></html>`,
+  quotes: `<!doctype html><html><head><title>Review</title><style>#q{quotes:"${ACCOUNT}" ""}#q::before{content:open-quote}</style></head><body><div id="q">on file</div></body></html>`,
+  marker: `<!doctype html><html><head><title>Review</title><style>li{list-style-type:"${ACCOUNT} "}</style></head><body><ul><li>on file</li></ul></body></html>`,
+  // A broken image whose alt carries nothing and generated content that carries nothing, beside a
+  // plain masked account: not refused (the checks read what is painted, not the tag).
+  harmless: `<!doctype html><html><head><title>Review</title><style>#h::after{content:"Review"}</style></head><body><div id="h">x</div><img alt="Logo" src="/missing.png"><ul><li>one</li></ul><p>Account ${ACCOUNT}</p></body></html>`,
+  // THE PAGE MOVES UNDER THE PICTURE: reloaded between the check and the shot (opts.beforeShot).
+  reload: doc(`<div id="r" style="${abs(100, "width:400px;height:40px;font-size:20px")}">Account ${ACCOUNT}</div>`, false),
+  frameReload: doc(`<iframe id="fr" src="/frameDoc" style="${abs(100, "width:500px;height:100px;border:0")}"></iframe>`, false),
+  frameDoc: `<!doctype html><html><body style="margin:0"><p style="margin:0;font-size:20px">Account ${ACCOUNT}</p></body></html>`,
 };
+/** Served without the account on its first load, with it on every load after: a page that reloads
+ *  itself INTO showing one. Nothing was marked before the shot, so only the document mark can tell. */
+const RELOAD_INTO = {
+  before: doc(`<div style="${abs(100, "font-size:20px")}">Nothing on file yet</div>`, false),
+  after: doc(`<div style="${abs(100, "font-size:20px")}">Account ${ACCOUNT}</div>`, false),
+};
+let reloadIntoHits = 0;
 
 const server = http.createServer((req, res) => {
   const name = String(req.url || "/").replace(/^\/+/, "").split("?")[0];
-  const html = PAGES[name];
+  const html = name === "reloadInto" ? (reloadIntoHits++ === 0 ? RELOAD_INTO.before : RELOAD_INTO.after) : PAGES[name];
   res.writeHead(html ? 200 : 404, { "content-type": "text/html; charset=utf-8" });
   res.end(html ?? "<h1>Not found</h1>");
 });
@@ -126,7 +152,7 @@ try {
       const heading = await maskShare(file, { x: 2, y: 2, w: 150, h: 16 });
       check("probe: the heading (no secret) is not masked", heading < 0.05, `mask share=${heading.toFixed(3)}`);
     }
-    const left = await pg.evaluate(() => document.querySelectorAll("[data-al-secret], [data-al-secret-check]").length);
+    const left = await pg.evaluate(() => document.querySelectorAll("[data-al-secret], [data-al-secret-check], [data-al-secret-doc]").length);
     check("probe: every tag is cleared afterwards", left === 0, `left=${left}`);
     // THE PIXEL CHECK ITSELF: an UNMASKED picture of the same page reads as short.
     const plainFile = path.join(dir, "probe-unmasked.png");
@@ -171,6 +197,75 @@ try {
     check("hidden: ok:true (a hidden input and a display:none div paint nothing)", m.ok && fs.existsSync(file), JSON.stringify(m));
     const none = await maskedFullPageScreenshot(pg, [], path.join(dir, "nosecret.png"));
     check("no secret known: a plain picture, ok:true", none.ok && fs.existsSync(path.join(dir, "nosecret.png")), JSON.stringify(none));
+    await pg.context().close();
+  }
+
+  console.log("\n4. MUST-PASS (fix round 2): what a scriptless page paints is masked, whatever its tag");
+  {
+    const pg = await scriptless("painted");
+    const file = path.join(dir, "painted.png");
+    const m = await maskedFullPageScreenshot(pg, [ACCOUNT], file);
+    check("painted: ok:true and the picture is on disk", m.ok && fs.existsSync(file), JSON.stringify(m));
+    if (m.ok && fs.existsSync(file)) {
+      const spots: Array<[string, { x: number; y: number; w: number; h: number }]> = [
+        ["a <noscript>'s own text (the walk's scriptless page paints it)", { x: 14, y: 104, w: 120, h: 14 }],
+        ["a <noscript> whose account is split across a <b>", { x: 14, y: 204, w: 120, h: 14 }],
+        ["an input's placeholder", { x: 14, y: 304, w: 290, h: 32 }],
+      ];
+      for (const [label, box] of spots) {
+        const share = await maskShare(file, box);
+        check(`painted: ${label} is masked`, share >= 0.9, `mask share=${share.toFixed(3)} box=${JSON.stringify(box)}`);
+      }
+    }
+    await pg.context().close();
+  }
+  {
+    const pg = await scriptless("harmless");
+    const file = path.join(dir, "harmless.png");
+    const m = await maskedFullPageScreenshot(pg, [ACCOUNT], file);
+    check("harmless: an alt and generated content that carry nothing are not refused", m.ok && fs.existsSync(file), JSON.stringify(m));
+    await pg.context().close();
+  }
+
+  console.log("\n5. MUST-EXCLUDE (fix round 2): text painted with no text node to measure gives no picture");
+  await refused("imgAlt", /alt text carries a known secret/);
+  await refused("inputImage", /alt text carries a known secret/);
+  await refused("after", /generated content carries a known secret/);
+  await refused("quotes", /generated content carries a known secret/);
+  await refused("marker", /generated content carries a known secret/);
+
+  console.log("\n6. MUST-EXCLUDE (fix round 2): a page that moves between the check and the shot gives no picture");
+  const moved = async (label: string, name: string, before: (pg: Page) => Promise<void>, want: RegExp): Promise<void> => {
+    const pg = await scriptless(name);
+    const file = path.join(dir, `${label}.png`);
+    const m = await maskedFullPageScreenshot(pg, [ACCOUNT], file, { beforeShot: () => before(pg) });
+    check(`${label}: ok:false, named`, !m.ok && want.test(m.why), JSON.stringify(m));
+    check(`${label}: no picture on disk`, !fs.existsSync(file), file);
+    await pg.context().close();
+  };
+  // The checker's race, made deterministic: the same URL loads again, so a new document with nothing
+  // tagged is what the shot sees.
+  await moved("reload", "reload", async (pg) => { await pg.goto(`${base}/reload`); }, /page changed/);
+  // Nothing was marked before the shot (painted 0), and the reload shows the account: the count alone
+  // (0 = 0) cannot tell; the document mark does.
+  await moved("reloadInto", "reloadInto", async (pg) => { await pg.goto(`${base}/reloadInto`); }, /page changed/);
+  // A shown frame reloads itself.
+  await moved("frameReload", "frameReload", async (pg) => {
+    const fr = pg.frames().find((f) => f !== pg.mainFrame());
+    if (!fr) throw new Error("no child frame");
+    await fr.goto(`${base}/frameDoc`);
+  }, /page changed/);
+  // The same document, but the marked box is no longer found (its tags gone, as when the element is
+  // swapped for a copy): the document mark holds, so only the count can tell.
+  await moved("tagsGone", "reload", async (pg) => {
+    await pg.evaluate(() => { for (const el of Array.from(document.querySelectorAll("[data-al-secret], [data-al-secret-check]"))) { el.removeAttribute("data-al-secret"); el.removeAttribute("data-al-secret-check"); } });
+  }, /0 of the 1 masked box\(es\) the check marked were found again/);
+  {
+    // The control: the same seam doing nothing keeps the picture.
+    const pg = await scriptless("reload");
+    const file = path.join(dir, "still.png");
+    const m = await maskedFullPageScreenshot(pg, [ACCOUNT], file, { beforeShot: async () => {} });
+    check("still: a page that does not move keeps its picture, ok:true", m.ok && fs.existsSync(file), JSON.stringify(m));
     await pg.context().close();
   }
 } finally {
