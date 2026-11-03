@@ -16,7 +16,9 @@
 //   3. the gate end to end (runStandaloneReview): an image page as the ONLY UL 2703 evidence clears
 //      the racking half; a listing on a text page past character 20,000 counts with no vision call
 //      while the AI prompt's text stays capped; a set longer than the page cap names its unread pages.
-// Sections 3a, 3b and 3d fail on the base branch (#533's head) — see the PR for the red run.
+// Fails without the fix: with the base gate (reviewSubject.ts) e0-e4 fail — the image page is never
+// read, the text past character 20,000 is never read, no page is named as unread; with the base
+// rule's reading (text and module datasheet only) u1-u4, e1 and e3 fail.
 //
 // Run: npx tsx backend/test/imageSheetListings.test.ts
 import "./_isolate"; // FIRST
@@ -33,7 +35,11 @@ const listings = await import("../src/imageSheetListings");
 const rules = await import("../src/codeReviewRules");
 const { buildCodeContext } = await import("../src/codeProfiles");
 const { extractPdfPages } = await import("../src/batchImport");
-const { runStandaloneReview, REVIEW_AI_TEXT_CHARS, REVIEW_TEXT_MAX_PAGES } = await import("../src/reviewSubject");
+const reviewSubjectModule = await import("../src/reviewSubject");
+const { runStandaloneReview } = reviewSubjectModule;
+// The two caps, as numbers (the fixtures are sized against them; (e0) pins the module's values).
+const AI_TEXT_CHARS = 20_000;
+const TEXT_PAGE_CAP = 200;
 const { StubLLMProvider } = await import("../src/llm");
 const db = await (await import("../src/db")).openDatabase();
 const { createCanvas } = await import("@napi-rs/canvas" as string);
@@ -311,6 +317,12 @@ const subject = (fields: Record<string, string> = {}): ReviewSubject => ({
 const review = async (pdf: Buffer, llm: unknown) =>
   runStandaloneReview(db, "default", subject(), { buffer: pdf, filename: "set.pdf" }, { llm: llm as LLMProvider });
 
+await check("(e0) the caps: the AI second opinion keeps 20,000 characters; the text checks read up to 200 pages", () => {
+  const caps = reviewSubjectModule as unknown as { REVIEW_AI_TEXT_CHARS?: number; REVIEW_TEXT_MAX_PAGES?: number };
+  assert.equal(caps.REVIEW_AI_TEXT_CHARS, AI_TEXT_CHARS);
+  assert.equal(caps.REVIEW_TEXT_MAX_PAGES, TEXT_PAGE_CAP);
+});
+
 await check("(e1) RED ON BASE: a plan set whose only UL 2703 evidence is an image page clears the racking half", async () => {
   const pdf = await planSet([
     { name: "COVER SHEET", text: prose(1, 30) },
@@ -339,13 +351,13 @@ await check("(e2) RED ON BASE: a listing on a text page past character 20,000 co
   sheets.push({ name: "EQUIPMENT NOTES", text: ["PV MODULES: SYN-400, LISTED TO UL 61730.", "RACKING: SYN-RAIL SYSTEM, LISTED TO UL 2703.", ...prose(10, 10)] });
   const pdf = await planSet(sheets);
   const full = (await pagesOf(pdf)).join("\n");
-  assert.ok(full.indexOf("UL 2703") > REVIEW_AI_TEXT_CHARS && full.indexOf("UL 61730") > REVIEW_AI_TEXT_CHARS, `fixture: the listings sit past character ${REVIEW_AI_TEXT_CHARS} (at ${full.indexOf("UL 61730")})`);
+  assert.ok(full.indexOf("UL 2703") > AI_TEXT_CHARS && full.indexOf("UL 61730") > AI_TEXT_CHARS, `fixture: the listings sit past character ${AI_TEXT_CHARS} (at ${full.indexOf("UL 61730")})`);
   const fake = fakeLlm();
   const { report } = await review(pdf, fake.llm);
   assert.equal(get(report.findings, LISTINGS), undefined, "both listings read from the back of the text");
   assert.equal(fake.visionCalls.length, 0, "the text showed both: no image read is paid for");
   assert.equal(fake.aiCalls.length, 1);
-  assert.ok(fake.aiCalls[0].extractedText.length <= REVIEW_AI_TEXT_CHARS, "the AI second opinion's text is still capped — nothing new sent");
+  assert.ok(fake.aiCalls[0].extractedText.length <= AI_TEXT_CHARS, "the AI second opinion's text is still capped — nothing new sent");
   assert.doesNotMatch(fake.aiCalls[0].extractedText, /UL 2703/);
 });
 
@@ -363,16 +375,16 @@ await check("(e3) no vision model (stub provider): the report says the image-onl
   assert.match(f.message, /The plan set's image-only sheets \(page 4\) were not read for listing marks\. Not read: page 4 \(no vision model is configured\)\./);
 });
 
-await check(`(e4) RED ON BASE: a set longer than the ${REVIEW_TEXT_MAX_PAGES}-page text cap names the pages it did not read`, async () => {
+await check(`(e4) RED ON BASE: a set longer than the ${TEXT_PAGE_CAP}-page text cap names the pages it did not read`, async () => {
   const doc = await PDFDocument.create();
   const font = await doc.embedFont(StandardFonts.Helvetica);
-  const total = REVIEW_TEXT_MAX_PAGES + 3;
+  const total = TEXT_PAGE_CAP + 3;
   for (let i = 1; i <= total; i++) doc.addPage([612, 792]).drawText(`SHEET ${i} ROOF MOUNT NOTE ${i * 7}`, { x: 40, y: 700, size: 12, font });
   const { report } = await review(Buffer.from(await doc.save()), fakeLlm().llm);
   const f = get(report.findings, "reviewer.plan.text-pages-not-read");
   assert.ok(f, "the unread pages are on the report");
   assert.equal(f.severity, "callout");
-  assert.match(f.message, new RegExp(`The plan set has ${total} pages; the text checks read pages 1–${REVIEW_TEXT_MAX_PAGES}\\. Pages ${REVIEW_TEXT_MAX_PAGES + 1}–${total} were not read`));
+  assert.match(f.message, new RegExp(`The plan set has ${total} pages; the text checks read pages 1–${TEXT_PAGE_CAP}\\. Pages ${TEXT_PAGE_CAP + 1}–${total} were not read`));
 });
 
 await check("(e5) a set inside the cap carries no unread-pages finding", async () => {
