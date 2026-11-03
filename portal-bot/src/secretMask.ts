@@ -8,7 +8,7 @@
 // Identifier-shaped secrets (5+ digits) match digit-for-digit with every separator ignored; a shorter
 // or non-numeric secret matches as a case-insensitive literal of 4+ characters. The smallest element
 // carrying a whole secret is tagged (masking <body> would blank the picture).
-import type { Locator, Page } from "playwright";
+import type { Frame, Locator, Page } from "playwright";
 
 export const SECRET_MASK_ATTR = "data-al-secret";
 
@@ -22,14 +22,26 @@ export function secretMaskPatterns(secrets: readonly string[]): SecretMaskPatter
   }).filter((p) => p.digits || p.literal.length >= 4);
 }
 
-/** Tag every element of `page` (its main frame) that renders one of `pats`. Returns how many were
+/** Tag every element of `page` (ONE frame: a Page reads its main frame, a Frame itself) that renders
+ *  one of `pats` — inside every OPEN shadow root too (#436 skeptic: a secret in a web component's
+ *  shadow tree went unmasked; a declarative one exists even with scripts off, and Playwright's CSS
+ *  locator pierces open roots, so the mask covers what is tagged there). Returns how many were
  *  tagged. Throws when the page cannot be evaluated (the caller decides whether that fails closed). */
 export async function tagSecretsInPage(page: Pick<Page, "evaluate">, pats: SecretMaskPattern[]): Promise<number> {
   // Plain loops only: a function DECLARED inside an evaluated body needs the __name shim.
   return Number(await page.evaluate((ps: Array<{ digits: string; literal: string }>) => {
     let n = 0;
+    // Every root: the document, then each open shadow root (nested ones are found as the list grows).
+    const roots: Array<Document | ShadowRoot> = [document];
+    for (let i = 0; i < roots.length; i++) {
+      for (const el of Array.from(roots[i].querySelectorAll("*"))) {
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr) roots.push(sr);
+      }
+    }
+    for (const root of roots) {
     // A box holding one (typed here, or pre-filled by the portal).
-    for (const el of Array.from(document.querySelectorAll("input, textarea"))) {
+    for (const el of Array.from(root.querySelectorAll("input, textarea"))) {
       const v = String((el as HTMLInputElement).value || "");
       if (!v) continue;
       const vd = v.replace(/\D/g, "");
@@ -39,16 +51,16 @@ export async function tagSecretsInPage(page: Pick<Page, "evaluate">, pats: Secre
       }
     }
     // Text rendering one (a review page's "Account: 7734009155"). Most pages carry none, so
-    // the whole-body check keeps the element walk off the common path.
-    const bt = String(document.body ? document.body.textContent || "" : "");
+    // the whole-root check keeps the element walk off the common path.
+    const bt = String(root === document ? (document.body ? document.body.textContent || "" : "") : (root.textContent || ""));
     const btd = bt.replace(/\D/g, "");
     const btl = bt.toLowerCase();
     let textHas = false;
     for (const p of ps) {
       if ((p.digits && btd.indexOf(p.digits) >= 0) || (p.literal && btl.indexOf(p.literal) >= 0)) { textHas = true; break; }
     }
-    if (!textHas) return n;
-    for (const el of Array.from(document.querySelectorAll("body *"))) {
+    if (!textHas) continue;
+    for (const el of Array.from(root.querySelectorAll(root === document ? "body *" : "*"))) {
       const tag = el.tagName;
       if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT" || tag === "INPUT" || tag === "TEXTAREA") continue;
       const text = String(el.textContent || "");
@@ -76,35 +88,61 @@ export async function tagSecretsInPage(page: Pick<Page, "evaluate">, pats: Secre
       el.setAttribute("data-al-secret", "1");
       n++;
     }
+    }
     return n;
   }, pats));
 }
 
-/** Remove the tags tagSecretsInPage set (best-effort). */
+/** Remove the tags tagSecretsInPage set (best-effort; open shadow roots included). */
 export async function clearSecretTags(page: Pick<Page, "evaluate">): Promise<void> {
   await page.evaluate(() => {
-    for (const el of Array.from(document.querySelectorAll("[data-al-secret]"))) el.removeAttribute("data-al-secret");
+    const roots: Array<Document | ShadowRoot> = [document];
+    for (let i = 0; i < roots.length; i++) {
+      for (const el of Array.from(roots[i].querySelectorAll("*"))) {
+        const sr = (el as HTMLElement).shadowRoot;
+        if (sr) roots.push(sr);
+        if (el.hasAttribute("data-al-secret")) el.removeAttribute("data-al-secret");
+      }
+    }
   }).catch(() => null);
 }
 
 /**
  * A FULL-PAGE SCREENSHOT OF `page` WITH EVERY KNOWN SECRET MASKED, written to `file` (#436's staged
- * review picture). Fail closed: when secrets are known and the tagger cannot run, no picture is
- * taken ({ ok: false }). With no secret known the picture is a plain full-page screenshot.
+ * review picture). EVERY FRAME is tagged and masked (#436 skeptic: an account shown only inside a
+ * same-origin iframe was in the picture, unmasked — the tagger read the main frame alone); a visible
+ * frame that cannot be tagged fails the picture closed, a hidden one is not in the picture. Fail
+ * closed: when secrets are known and the tagger cannot run, no picture is taken ({ ok: false }). With
+ * no secret known the picture is a plain full-page screenshot.
  */
 export async function maskedFullPageScreenshot(page: Page, secrets: readonly string[], file: string): Promise<{ ok: boolean; why: string }> {
   const pats = secretMaskPatterns(secrets);
-  let tagged = 0;
-  if (pats.length) {
-    try { tagged = await tagSecretsInPage(page, pats); } catch { return { ok: false, why: "the secret mask could not be built on the page, so no picture was taken" }; }
-  }
+  const tagged: Frame[] = [];
+  const mask: Locator[] = [];
   try {
-    const mask: Locator[] = tagged > 0 ? [page.locator(`[${SECRET_MASK_ATTR}]`)] : [];
+    if (pats.length) {
+      for (const frame of page.frames()) {
+        const main = frame === page.mainFrame();
+        let n = 0;
+        try { n = await tagSecretsInPage(frame, pats); } catch {
+          if (main) return { ok: false, why: "the secret mask could not be built on the page, so no picture was taken" };
+          // A frame the picture shows must be masked too; one it does not show cannot leak.
+          const fe = await frame.frameElement().catch(() => null);
+          const box = fe ? await fe.boundingBox().catch(() => null) : null;
+          if (box && box.width >= 2 && box.height >= 2) return { ok: false, why: "the secret mask could not be built in a frame on the page, so no picture was taken" };
+          continue;
+        }
+        if (n > 0) {
+          tagged.push(frame);
+          mask.push(frame.locator(`[${SECRET_MASK_ATTR}]`));
+        }
+      }
+    }
     await page.screenshot({ path: file, fullPage: true, ...(mask.length ? { mask } : {}) });
     return { ok: true, why: "" };
   } catch (e) {
     return { ok: false, why: `the picture could not be taken (${String((e as { message?: string })?.message ?? e).slice(0, 80)})` };
   } finally {
-    if (tagged > 0) await clearSecretTags(page);
+    for (const f of tagged) await clearSecretTags(f);
   }
 }
