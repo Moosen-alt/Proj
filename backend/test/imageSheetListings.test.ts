@@ -13,19 +13,24 @@
 //      stop, a bill/meter page withheld, a quote that does not name its product's listing dropped,
 //      the prompt a constant (rule 2), no vision model = nothing rendered and the report says so;
 //      what the coverage says when nothing could be tested or nothing qualified — never "the text
-//      layer was the whole read" (a raster count or a render that fails is said, not hidden);
+//      layer was the whole read" (a raster count or a render that fails is said, not hidden); a page
+//      counts as read only when the answer carries the listings list — a reply cut short, empty or
+//      not JSON (visionExtract RETURNS those, it does not throw) is named as not read (r14, r15);
 //   2. the rule: a racking reading clears the racking half only; UL 2703A (attachment) is shown,
 //      never a pass; the coverage statement replaces "cut sheets whose pages are images are not read";
 //   3. the gate end to end (runStandaloneReview): an image page — or a vector-drawn certificate — as
 //      the ONLY UL 2703 evidence clears the racking half; a listing on a text page past character
 //      20,000 counts with no vision call while the AI prompt's text stays capped; a set longer than
 //      the page cap names its unread pages (counted by pdf.js); a set whose text cannot be extracted
-//      says no page was read.
+//      says no page was read; a cut-short answer leaves the racking half and says the page was not
+//      read (e10).
 // Fails without the fix: with the base gate (reviewSubject.ts) e0-e4 fail — the image page is never
 // read, the text past character 20,000 is never read, no page is named as unread; with the base
 // rule's reading (text and module datasheet only) u1-u4, e1 and e3 fail. Against the first cut of
 // this fix (3beef7c9: image-only = a large raster, and "No sheet of the plan set is image-only, so
-// its text layer was the whole read") r8, r10, r11, r12, e7, e8 and e9 fail.
+// its text layer was the whole read") r8, r10, r11, r12, e7, e8 and e9 fail. Without the reader's
+// unusable-answer guard (796b3ccd: any answer that did not throw counted the page as read) every
+// r14 case, r15 and e10 fail.
 //
 // Run: npx tsx backend/test/imageSheetListings.test.ts
 import "./_isolate"; // FIRST
@@ -126,6 +131,18 @@ function fakeLlm(answer: (n: number) => unknown = () => ({ listings: [] })) {
   return { llm, visionCalls, visionKeys, aiCalls };
 }
 const reading = (product: string, quote: string) => ({ listings: [{ product, standard: quote, quote }] });
+/** What visionExtract can RETURN (not throw) when its answer cannot be used: ClaudeLLMProvider gives
+ *  {provider, raw} for text that does not parse (a reply cut short at max_tokens) and
+ *  {provider, confidence: 0} for no text; plus the stub's answer and shapes that are not the one asked for. */
+const UNUSABLE_ANSWERS: Array<{ what: string; raw: unknown }> = [
+  { what: "a reply cut short mid-JSON (parse fallback)", raw: { provider: "claude-vision", raw: '{"listings": [{"product": "racking", "standard": "UL 2703", "quote": "UL 2703 LIS' } },
+  { what: "an empty reply (no text block)", raw: { provider: "claude-vision", confidence: 0 } },
+  { what: "the stub provider's answer", raw: { provider: "stub", confidence: 0, notes: "No ANTHROPIC_API_KEY configured." } },
+  { what: "a bare array, not the object asked for", raw: [{ product: "racking", quote: "UL 2703 LISTED SYSTEM" }] },
+  { what: "listings that is not a list", raw: { listings: "UL 2703 LISTED SYSTEM" } },
+  { what: "listings null", raw: { listings: null } },
+  { what: "no answer at all", raw: null },
+];
 
 const LISTINGS = "city.plan.ul-listings-missing";
 const get = (list: ReviewerFinding[], id: string) => list.find((f) => f.id === id);
@@ -230,9 +247,13 @@ await check("(r5) only a quote that names ITS product's listing is kept: wrong p
     { page: 9, product: "attachment", quote: "Conforms to UL Subject 2703A" },
     { page: 9, product: "module", quote: "UL 61730-1 / UL 61730-2" },
   ]);
-  // The stub provider's answer, and an unparsed model reply, read as nothing.
+  // The stub provider's answer, and an unparsed model reply, support no reading — and are NOT
+  // answers at all (no listings list): the reader names their page as not read (r14), unlike {"listings": []}.
   assert.deepEqual(listings.acceptedListingReadings(9, { provider: "stub", confidence: 0, notes: "No ANTHROPIC_API_KEY configured." }), []);
   assert.deepEqual(listings.acceptedListingReadings(9, { provider: "claude-vision", raw: "UL 2703" }), []);
+  for (const shape of UNUSABLE_ANSWERS) assert.equal(listings.listingAnswerEntries(shape.raw), null, shape.what);
+  assert.deepEqual(listings.listingAnswerEntries({ listings: [] }), [], "an empty list is an answer: the page prints no listing");
+  assert.equal(listings.listingAnswerEntries(raw)?.length, 10);
 });
 
 await check("(r6) no vision model: nothing is rendered or sent, and the coverage says the title-block-only sheets were not read", async () => {
@@ -324,6 +345,32 @@ await check("(r13) order: at an equal sheet-name score a page that paints a larg
   // The name still wins over the picture: ATTACHMENT UL CERTIFICATE (13) with no raster before RACKING DATA (8).
   const no13 = raster.map((v, i) => (i === 12 ? 0 : v));
   assert.deepEqual(listings.orderListingCandidates([8, 13], realPages, no13), [13, 8]);
+});
+
+for (const shape of UNUSABLE_ANSWERS) {
+  await check(`(r14) an answer that cannot be used is a page NOT read, never one that "prints no listing": ${shape.what}`, async () => {
+    const fake = fakeLlm(() => shape.raw);
+    const r = await listings.readImageSheetListings(fake.llm, withVector, vectorPages, { want: { module: true, racking: true } });
+    assert.equal(fake.visionCalls.length, 2, "both pages were sent (the cap counts calls)");
+    assert.deepEqual(r.read, [], "no page is reported as read");
+    assert.deepEqual(r.readings, []);
+    assert.deepEqual(r.skipped, [{ page: 4, reason: listings.VISION_ANSWER_UNREADABLE }, { page: 5, reason: listings.VISION_ANSWER_UNREADABLE }]);
+    assert.doesNotMatch(r.coverage, /read by vision for listing marks \(at most/, r.coverage);
+    assert.equal(r.coverage, "The plan set's title-block-only sheets (pages 4, 5) were not read for listing marks. Not read: pages 4, 5 (the vision answer could not be read).");
+  });
+}
+
+await check("(r15) an unusable answer and a real empty one are told apart; an unusable page never stops the search", async () => {
+  // Page 4 (RACKING UL CERTIFICATE) is read first and its answer is cut short; page 5 answers.
+  const both = await listings.readImageSheetListings(fakeLlm(() => ({ listings: [] })).llm, withVector, vectorPages, { want: { module: true, racking: true } });
+  assert.deepEqual(both.read, [4, 5], "{\"listings\": []} on both: both read, nothing printed");
+  const fake = fakeLlm((n) => (n === 0 ? UNUSABLE_ANSWERS[0].raw : reading("racking", "UL 2703 LISTED SYSTEM")));
+  const r = await listings.readImageSheetListings(fake.llm, withVector, vectorPages, { want: { module: false, racking: true } });
+  assert.equal(fake.visionCalls.length, 2, "the unusable answer did not count as the racking found");
+  assert.deepEqual(r.read, [5]);
+  assert.deepEqual(r.skipped, [{ page: 4, reason: listings.VISION_ANSWER_UNREADABLE }]);
+  assert.deepEqual(r.readings, [{ page: 5, product: "racking", quote: "UL 2703 LISTED SYSTEM" }]);
+  assert.equal(r.coverage, "Title-block-only sheets (pictures, or drawings with no text of their own) read by vision for listing marks (at most 6 per review): page 5. Not read: page 4 (the vision answer could not be read).");
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -455,12 +502,14 @@ await check("(e1) RED ON BASE: a plan set whose only UL 2703 evidence is an imag
   const { report } = await review(pdf, fake.llm);
   const f = get(report.findings, LISTINGS);
   assert.ok(f, "the module half is still missing (IEC is not the UL listing)");
-  assert.match(f.message, /^No module listing \(UL 61730 or UL 1703\) was found in the package text or on any title-block-only sheet read by vision\./);
+  // Behaviour first (the red run on base fails here): the image page was read and cleared the racking half.
+  assert.equal(fake.visionCalls.length, 3, "the three title-block-only sheets were sent to vision");
   assert.doesNotMatch(f.message, /racking\/mounting listing \(UL 2703\)/, "the racking half is cleared");
-  assert.match(f.message, /pages 4, 5, 6\./);
   assert.equal(f.evidenceFound?.find((e) => e.label === "Listing stated")?.source, "Plan page 5 (title-block-only sheet, read by vision)");
-  assert.equal(fake.visionCalls.length, 3);
   assert.ok(fake.visionCalls.every((c) => c.prompt === listings.SHEET_LISTING_VISION_PROMPT), "rule 2: the constant prompt only");
+  // Then the wording.
+  assert.match(f.message, /^No module listing \(UL 61730 or UL 1703\) was found in the package text or on any title-block-only sheet read by vision\./);
+  assert.match(f.message, /pages 4, 5, 6\./);
 });
 
 await check("(e2) RED ON BASE: a listing on a text page past character 20,000 counts — no vision call — and the AI prompt's text stays capped", async () => {
@@ -557,6 +606,23 @@ await check("(e9) a set with no title-block-only sheet: the finding says what wa
   assert.equal(fake.visionCalls.length, 0);
   assert.doesNotMatch(f.message, /whole read/);
   assert.match(f.message, /No sheet was sent to vision for listing marks: every sheet's text layer held 150 or more letters and digits beyond the title block the sheets share.*A listing printed inside a picture on a sheet that also carries text is not read\./);
+});
+
+await check("(e10) the vision answer is cut short: the racking half stays, and the finding names the page as NOT read", async () => {
+  const pdf = await planSet([
+    { name: "COVER SHEET", text: prose(1, 30) },
+    { name: "SITE PLAN", text: prose(2, 30) },
+    { name: "ELECTRICAL", text: prose(3, 30) },
+    { image: true, name: "RACKING DATA" },
+  ]);
+  const fake = fakeLlm(() => UNUSABLE_ANSWERS[0].raw);
+  const { report } = await review(pdf, fake.llm);
+  const f = get(report.findings, LISTINGS);
+  assert.ok(f);
+  assert.equal(fake.visionCalls.length, 1, "the page was sent");
+  assert.match(f.message, /racking\/mounting listing \(UL 2703\)/, "the racking half stays missing");
+  assert.doesNotMatch(f.message, /read by vision for listing marks \(at most/, "never 'read by vision' for a page whose answer was unusable");
+  assert.match(f.message, /The plan set's title-block-only sheets \(page 4\) were not read for listing marks\. Not read: page 4 \(the vision answer could not be read\)\./);
 });
 
 console.log(`\n${passed} passed, ${failures} failed`);

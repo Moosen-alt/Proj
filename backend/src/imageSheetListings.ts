@@ -21,11 +21,15 @@
 // COST. At most MAX_LISTING_VISION_PAGES (6) pages per review, one visionExtract call each, each
 // image inside the model's limits (scannedPlanSet's VISION_MAX_* and MAX_IMAGE_BYTES). Nothing is
 // read when the text already shows every listing the rule asks for (the caller asks
-// packageListings), and the read stops as soon as the missing ones are found.
+// packageListings), and the read stops as soon as the missing ones are found. A call whose answer
+// cannot be used still spent its slot: the cap counts calls, so "at most 6" stays true. No retry.
 //
 // WHAT IS SAID. The coverage sentence states the test that was run, never more: with no candidate
 // it says no sheet was sent to vision and why, and that a picture on a sheet that ALSO carries text
-// is not read — never that the text layer was "the whole read".
+// is not read — never that the text layer was "the whole read". A page counts as READ only when the
+// answer carries the listings list asked for (listingAnswerEntries): a reply cut short at
+// max_tokens, empty, or not JSON is named as not read (VISION_ANSWER_UNREADABLE), exactly like a
+// call that threw — never as a page that "prints no listing".
 //
 // RULE 2. What is sent is the page image and SHEET_LISTING_VISION_PROMPT — a constant: no project
 // field, no extracted text. A page whose text reads as a bill or meter record is withheld before it
@@ -59,9 +63,9 @@ export interface ImageSheetListingRead {
   readings: ImageSheetListingReading[];
   /** Every title-block-only page of the set (before withholding and the cap). */
   titleBlockOnlyPages: number[];
-  /** Pages sent to vision, in the order read. */
+  /** Pages sent to vision whose answer carried the listings list, in the order read. */
   read: number[];
-  /** Title-block-only pages not read, and why. */
+  /** Title-block-only pages not read, and why — including a page sent whose answer was unusable. */
   skipped: Array<{ page: number; reason: string }>;
   /** One plain statement of what was and was not read, for the report ("" when no read was needed). */
   coverage: string;
@@ -96,10 +100,24 @@ export function orderListingCandidates(pages: number[], pageTexts: string[], ras
     .map((x) => x.page);
 }
 
+/** Why a page whose vision answer carried no `listings` list is named as not read. */
+export const VISION_ANSWER_UNREADABLE = "the vision answer could not be read";
+
+/** The answer's listing entries — or null when the answer is not the shape asked for (no `listings`
+ *  array). ClaudeLLMProvider.visionExtract does not throw on a reply cut short at max_tokens, an
+ *  empty reply or one that is not JSON: it returns {provider, raw} or {provider, confidence: 0}. Null
+ *  means the PAGE WAS NOT READ — never "the page prints no listing", which is {"listings": []}. */
+export function listingAnswerEntries(raw: unknown): unknown[] | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const list = (raw as { listings?: unknown }).listings;
+  return Array.isArray(list) ? list : null;
+}
+
 /** The readings a vision answer supports: a known product, and a quote that itself affirms that
- *  product's listing. Tolerates any shape (the stub's {provider:"stub"} reads as none). */
+ *  product's listing. An answer with no listings list (listingAnswerEntries null) supports none —
+ *  and the reader names its page as not read. */
 export function acceptedListingReadings(page: number, raw: unknown): ImageSheetListingReading[] {
-  const list = raw && typeof raw === "object" && Array.isArray((raw as { listings?: unknown }).listings) ? (raw as { listings: unknown[] }).listings : [];
+  const list = listingAnswerEntries(raw) ?? [];
   const out: ImageSheetListingReading[] = [];
   const seen = new Set<string>();
   for (const e of list) {
@@ -216,6 +234,12 @@ export async function readImageSheetListings(
           raw = await llm.visionExtract({ imageBase64: img.bytes.toString("base64"), mimeType: img.mimeType, prompt: SHEET_LISTING_VISION_PROMPT });
         } catch {
           result.skipped.push({ page, reason: "the vision read failed" });
+          continue;
+        }
+        // An answer with no listings list is an unknown, said as one — never a page "read" that
+        // printed nothing. Nothing of the answer goes into the reason.
+        if (listingAnswerEntries(raw) === null) {
+          result.skipped.push({ page, reason: VISION_ANSWER_UNREADABLE });
           continue;
         }
         result.read.push(page);
