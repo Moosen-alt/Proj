@@ -34,7 +34,8 @@
 //   wedge  — the category's click handler never returns (the page's script is stuck). MUST: the
 //            navigate click's budget ends the walk, named (AUTOLEARN_CLICK_BUDGET_MS=20000 here).
 //   stall  — the planner never answers. MUST: the stall watchdog ends the run, named, closes its
-//            page, and learn() returns (stallWatchdogMs=40000 here: above this replica's longest healthy quiet stretch, ~16 s on page 1).
+//            page, and learn() returns (stallWatchdogMs=40000 here: well above this replica's
+//            longest healthy quiet stretch, ~16 s on page 1 even with the default 12 s section wait).
 //
 // Run: npx tsx portal-bot/src/adapters/cityworksCategory.dom.smoke.ts   (ONLY_MODES=live,eager,…)
 //   Past each mode's deadline the walk is reported as HUNG and the browser is closed to end it
@@ -49,6 +50,9 @@ import type { ProjectRecord, RecipeStep } from "../../../shared/src/types";
 
 delete process.env.PORTAL_ALLOW_FINAL_SUBMIT;
 process.env.ENTRY_SETTLE_MS = "0";
+// The category pages have no visible input, so each one would otherwise wait the full 12 s for an
+// interactive control before it is read (waitForInteractiveControls) — five modes x three pages.
+process.env.PORTAL_SECTION_READY_MS = "2000";
 
 let failures = 0;
 const check = (label: string, ok: boolean, detail = ""): void => {
