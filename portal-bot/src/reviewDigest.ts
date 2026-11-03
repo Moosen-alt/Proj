@@ -10,17 +10,22 @@
 //
 // WHAT IS READ, PER PAGE (readDigestPageInPage, in the page, read-only):
 //   every visible form control, empty ones included; checkboxes as checked / unchecked; each radio
-//   group as its chosen option or "(none)"; <dl> pairs; table rows of any width; the visible text
-//   lines in order; visible same-origin frames, each read the same way. Nothing is excluded by id or
-//   class name: only <header>, <nav> and <footer> are skipped, by tag, and only when they hold no
-//   control and no label/value row.
+//   group as its chosen option or "(none)"; every ARIA state control (role checkbox / radio / switch,
+//   aria-checked / aria-pressed / aria-selected — a styled toggle such as ComEd's mat-button-toggle)
+//   with each state it carries, an unknown value kept as written; <dl> pairs; table rows of any
+//   width; the visible text lines in order; visible same-origin frames, each read the same way.
+//   OPEN SHADOW ROOTS are walked where their hosts stand (controls and text alike). Nothing is
+//   excluded by id or class name: only <header>, <nav> and <footer> are skipped, by tag, and only
+//   when they hold no control and no label/value row.
 // NORMALIZATION: whitespace collapsed; case kept; no NFKC. Repeated labels are counted by ordinal and
 //   order is part of the digest. RULING 7 (owner 2026-11-03, "ignore it, don't refuse"): in a text
 //   line, <dl> pair or table row that ALSO carries a saved / updated / modified / edited / as-of cue
 //   (SELF_CHANGING_CUE), clock-time and date tokens (SELF_CHANGING_TOKEN) are dropped; every other
 //   character of that line still counts. A control's value is never touched by it.
 // UNREADABLE, BY NAME, NEVER HASHED: the read throws or reads nothing; more than 400 rows or 64 KB;
-//   a dialog is open; a visible cross-origin frame; the two reads (DIGEST_READ_GAP_MS apart) disagree.
+//   a dialog is open; a visible cross-origin frame; a CLOSED shadow root on the page (found through
+//   DevTools — a page script cannot see into one), or no way to check for one; the two reads
+//   (DIGEST_READ_GAP_MS apart) disagree.
 //   The adapter adds the page-level ones: the page does not read as review, the terminal control is
 //   not exactly one or sits in a frame, no draft id.
 // MULTI-PAGE (owner ruling 2): the draft's step pages are walked READ-ONLY in a separate page of the
@@ -40,7 +45,7 @@
 //   id, no project secret, no email) — never masked.
 import crypto from "node:crypto";
 import fs from "node:fs";
-import type { Locator, Page } from "playwright";
+import type { CDPSession, Locator, Page } from "playwright";
 import { redactSecretValues } from "../../shared/src/portalSafety";
 import type {
   RecipeSelector, StagedReviewAttachment, StagedReviewCapture, StagedReviewFieldReportRow, StagedReviewItem, StagedReviewItemKind, StagedReviewSection,
@@ -161,32 +166,106 @@ export function readDigestPageInPage(): InPageReading {
     const cs = getComputedStyle(el as HTMLElement);
     return cs.visibility !== "hidden" && cs.display !== "none";
   };
-  // <header>/<nav>/<footer> are skipped only when they hold no control and no label/value row.
+  // EVERY ELEMENT IN TREE ORDER, each OPEN SHADOW ROOT walked where its host stands (a web
+  // component's input is a control like any other). A closed shadow root cannot be read from the
+  // page at all: readDigestPage finds those through DevTools and refuses the page by name.
+  const all: Element[] = [];
+  const shadows: ShadowRoot[] = [];
+  const collect = (root: Document | ShadowRoot | Element): void => {
+    for (const el of Array.from(root.children)) {
+      all.push(el);
+      const sr = (el as HTMLElement).shadowRoot;
+      if (sr) { shadows.push(sr); collect(sr); }
+      collect(el);
+    }
+  };
+  collect(document);
+  /** The parent, across a shadow boundary (a shadow root's top element → its host). */
+  const up = (n: Element): Element | null => n.parentElement || ((n.parentNode as ShadowRoot | null)?.host ?? null);
+  const rootOf = (el: Element): Document | ShadowRoot => el.getRootNode() as Document | ShadowRoot;
+  const byId = (el: Element, id: string): Element | null => {
+    const r = rootOf(el) as { getElementById?: (i: string) => Element | null };
+    return typeof r.getElementById === "function" ? r.getElementById(id) : null;
+  };
+  const labelFor = (el: Element): Element | null => {
+    const id = el.getAttribute("id");
+    if (!id) return null;
+    try { return rootOf(el).querySelector(`label[for="${CSS.escape(id)}"]`); } catch { return null; }
+  };
+  // ARIA STATE CONTROLS: a styled toggle (role=radio / checkbox / switch, aria-checked, aria-pressed,
+  // aria-selected) carries its state in an attribute, not in a native input. Native controls are read
+  // natively, never twice.
+  const NATIVE = /^(INPUT|SELECT|TEXTAREA|OPTION)$/;
+  const ARIA_ROLE = /^(checkbox|radio|switch|menuitemcheckbox|menuitemradio)$/i;
+  const isAria = (el: Element): boolean => !NATIVE.test(el.tagName)
+    && (el.hasAttribute("aria-checked") || el.hasAttribute("aria-pressed") || el.hasAttribute("aria-selected") || ARIA_ROLE.test(String(el.getAttribute("role") || "").trim()));
+  const holdsRow = (e: Element): boolean => /^(INPUT|SELECT|TEXTAREA|DL|TABLE)$/.test(e.tagName) || isAria(e);
+  const within = (e: Element, c: Element): boolean => { for (let n = up(e); n; n = up(n)) if (n === c) return true; return false; };
+  // <header>/<nav>/<footer> are skipped only when they hold no control and no label/value row
+  // (searched across open shadow roots too).
+  const holdsCache = new Map<Element, boolean>();
   const chromeOnly = (el: Element): boolean => {
-    for (let n: Element | null = el; n && n !== document.body; n = n.parentElement) {
+    for (let n: Element | null = el; n && n !== document.body; n = up(n)) {
       const t = n.tagName;
-      if (t === "HEADER" || t === "NAV" || t === "FOOTER") return !n.querySelector("input, select, textarea, dl, table");
+      if (t === "HEADER" || t === "NAV" || t === "FOOTER") {
+        let holds = holdsCache.get(n);
+        if (holds === undefined) {
+          const c = n;
+          holds = all.some((e) => e !== c && holdsRow(e) && within(e, c));
+          holdsCache.set(n, holds);
+        }
+        return !holds;
+      }
     }
     return false;
   };
   const textOf = (el: Element | null): string => (el ? clean((el as HTMLElement).innerText || el.textContent || "") : "");
   const labelOf = (el: Element): string => {
-    const id = el.getAttribute("id");
-    let t = "";
-    if (id) {
-      try { t = textOf(document.querySelector(`label[for="${CSS.escape(id)}"]`)); } catch { t = ""; }
-    }
+    let t = textOf(labelFor(el));
     if (!t) t = textOf(el.closest("label"));
     if (!t) {
       const ids = String(el.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean);
-      t = clean(ids.map((i) => textOf(document.getElementById(i))).join(" "));
+      t = clean(ids.map((i) => textOf(byId(el, i))).join(" "));
     }
     if (!t) t = clean(el.getAttribute("aria-label") || el.getAttribute("title") || el.getAttribute("placeholder") || el.getAttribute("name") || "");
     return t;
   };
+  /** An ARIA control's name: aria-labelledby, aria-label, its own text, then the native label rules. */
+  const ariaLabelOf = (el: Element): string => {
+    const ids = String(el.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean);
+    let t = clean(ids.map((i) => textOf(byId(el, i))).join(" "));
+    if (!t) t = clean(el.getAttribute("aria-label") || "");
+    if (!t) t = textOf(el);
+    if (!t) t = labelOf(el);
+    return t;
+  };
+  /** Its state, every attribute that carries one; an unknown value is kept as written (never read
+   *  as "unchecked", or a "yes" → "no" flip would go unseen). */
+  const ariaState = (el: Element): string => {
+    const parts: string[] = [];
+    const take = (attr: string, on: string, off: string): void => {
+      const raw = el.getAttribute(attr);
+      if (raw == null) return;
+      const v = raw.trim().toLowerCase();
+      parts.push(v === "true" ? on : v === "false" ? off : v === "mixed" ? `${attr} mixed` : `${attr} "${clean(raw).slice(0, 24)}"`);
+    };
+    take("aria-checked", "checked", "unchecked");
+    take("aria-pressed", "pressed", "not pressed");
+    take("aria-selected", "selected", "not selected");
+    return parts.length ? parts.join(", ") : "(no state)";
+  };
+  const ariaGroupLabel = (el: Element): string => {
+    if (!/radio/i.test(String(el.getAttribute("role") || ""))) return "";
+    for (let n = up(el); n; n = up(n)) {
+      if (n.getAttribute("role") !== "radiogroup") continue;
+      const ids = String(n.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean);
+      return clean(ids.map((i) => textOf(byId(n, i))).join(" ")) || clean(n.getAttribute("aria-label") || "") || textOf(n.querySelector("legend"));
+    }
+    return "";
+  };
   const items: Array<{ kind: string; label: string; value: string }> = [];
   const radios = new Map<string, { label: string; chosen: string; at: number }>();
-  for (const el of Array.from(document.querySelectorAll("input, select, textarea, dl, tr"))) {
+  for (const el of all) {
     const tag = el.tagName;
     if (tag === "DL") {
       if (!shown(el) || chromeOnly(el)) continue;
@@ -200,25 +279,34 @@ export function readDigestPageInPage(): InPageReading {
     if (tag === "TR") {
       if (!shown(el) || chromeOnly(el)) continue;
       const cells = Array.from(el.children).filter((c) => c.tagName === "TD" || c.tagName === "TH").map((c) => textOf(c));
-      if (!cells.some(Boolean)) continue;
-      items.push({ kind: "row", label: cells[0] || "", value: cells.slice(1).join(" | ") });
+      if (cells.some(Boolean)) items.push({ kind: "row", label: cells[0] || "", value: cells.slice(1).join(" | ") });
+      // A selectable row (aria-selected) keeps its cells AND its state.
+      if (isAria(el)) items.push({ kind: "check", label: cells[0] || "row", value: ariaState(el) });
       continue;
     }
+    if (isAria(el)) {
+      if (!shown(el) || chromeOnly(el)) continue;
+      const g = ariaGroupLabel(el);
+      items.push({ kind: "check", label: `${g ? `${g}: ` : ""}${ariaLabelOf(el)}`, value: ariaState(el) });
+      continue;
+    }
+    if (tag !== "INPUT" && tag !== "SELECT" && tag !== "TEXTAREA") continue;
     const type = String(el.getAttribute("type") || "").toLowerCase();
     if (tag === "INPUT" && (type === "hidden" || type === "submit" || type === "button" || type === "reset" || type === "image" || type === "file" || type === "password")) continue;
     if (chromeOnly(el)) continue;
     if (type === "checkbox" || type === "radio") {
       // A styled box is often the input hidden behind its label: shown when either is.
-      const lab = el.getAttribute("id") ? document.querySelector(`label[for="${CSS.escape(String(el.getAttribute("id")))}"]`) : el.closest("label");
+      const lab = labelFor(el) || el.closest("label");
       if (!shown(el) && !shown(lab)) continue;
       if (type === "checkbox") {
         items.push({ kind: "check", label: labelOf(el), value: (el as HTMLInputElement).checked ? "checked" : "unchecked" });
         continue;
       }
-      const name = String(el.getAttribute("name") || "") || `radio-${items.length}`;
+      // A radio group is its name within ITS tree (two web components may both name a group "agg").
+      const name = `${shadows.indexOf(rootOf(el) as ShadowRoot) + 1}:${String(el.getAttribute("name") || "") || `radio-${items.length}`}`;
       const fset = el.closest("fieldset");
       const group = el.closest('[role="radiogroup"]');
-      const groupLabel = (fset ? textOf(fset.querySelector("legend")) : "") || (group ? clean(group.getAttribute("aria-label") || "") : "") || name;
+      const groupLabel = (fset ? textOf(fset.querySelector("legend")) : "") || (group ? clean(group.getAttribute("aria-label") || "") : "") || String(el.getAttribute("name") || "") || `radio-${items.length}`;
       let g = radios.get(name);
       if (!g) {
         g = { label: groupLabel, chosen: "(none)", at: items.length };
@@ -247,9 +335,29 @@ export function readDigestPageInPage(): InPageReading {
       if (at >= 0) lines = lines.slice(0, at).concat(lines.slice(at + 1));
     }
   }
+  // OPEN SHADOW ROOTS' TEXT: body.innerText leaves a shadow tree's text out (Chromium), so each open
+  // root's rendered text is read too, root by root in tree order (nested roots are roots of their own).
+  const shadowText = (n: Node, out: string[], host: Element): void => {
+    for (const c of Array.from(n.childNodes)) {
+      if (c.nodeType === 3) {
+        const t = clean(c.textContent);
+        const hs = getComputedStyle(host as HTMLElement);
+        if (t && hs.display !== "none" && hs.visibility !== "hidden") out.push(t);
+        continue;
+      }
+      if (c.nodeType !== 1) continue;
+      const e = c as HTMLElement;
+      if (/^(STYLE|SCRIPT|TEMPLATE|LINK|META)$/.test(e.tagName)) continue;
+      if (e.tagName === "SLOT" && (e as unknown as HTMLSlotElement).assignedNodes().length) continue; // light DOM, read already
+      if (e.tagName === "SLOT" || getComputedStyle(e).display === "contents") { shadowText(e, out, host); continue; }
+      if (!shown(e) || chromeOnly(e)) continue;
+      for (const l of String(e.innerText || "").split("\n").map(clean).filter(Boolean)) out.push(l);
+    }
+  };
+  for (const sr of shadows) shadowText(sr, lines, sr.host);
   let dialogOpen = false;
-  for (const d of Array.from(document.querySelectorAll('dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]'))) {
-    if (shown(d)) { dialogOpen = true; break; }
+  for (const d of all) {
+    if (d.matches('dialog[open], [role="dialog"], [role="alertdialog"], [aria-modal="true"]') && shown(d)) { dialogOpen = true; break; }
   }
   return { title: clean(document.title), items, lines, dialogOpen };
 }
@@ -268,14 +376,46 @@ const SHIM = "globalThis.__name = globalThis.__name || function (fn) { return fn
 const originOf = (u: string): string => { try { return new URL(u).origin; } catch { return ""; } };
 const whereOf = (u: string): string => { try { const x = new URL(u); return `${x.origin}${x.pathname}`; } catch { return ""; } };
 
+interface CdpDomNode { shadowRootType?: string; children?: CdpDomNode[]; shadowRoots?: CdpDomNode[]; contentDocument?: CdpDomNode }
+
+/** How many CLOSED shadow roots the page holds (its same-process frames included), through a
+ *  short-lived DevTools session: a page script cannot see into one, so neither can the reader. A
+ *  browser's own (user-agent) roots — a date input's, a video's — are not counted. null = could not
+ *  be checked. Read-only: DOM.getDocument inspects; it dispatches nothing to the page. */
+export async function closedShadowRootCount(page: Page): Promise<number | null> {
+  let session: CDPSession | null = null;
+  try {
+    session = await page.context().newCDPSession(page);
+    const doc = await session.send("DOM.getDocument", { depth: -1, pierce: true }) as unknown as { root: CdpDomNode };
+    let n = 0;
+    const stack: CdpDomNode[] = [doc.root];
+    while (stack.length) {
+      const x = stack.pop()!;
+      if (x.shadowRootType === "closed") n++;
+      for (const c of x.children ?? []) stack.push(c);
+      for (const r of x.shadowRoots ?? []) stack.push(r);
+      if (x.contentDocument) stack.push(x.contentDocument);
+    }
+    return n;
+  } catch {
+    return null;
+  } finally {
+    await session?.detach().catch(() => null);
+  }
+}
+
 /** Read one page for the digest (its main frame and every visible same-origin frame). Never throws:
  *  a failure is an unreadable reading, by name. `dialogSeen` reports a native dialog the walk page
- *  dismissed since its last navigation. */
+ *  dismissed since its last navigation. A page holding a CLOSED shadow root (or one that cannot be
+ *  checked for them) is unreadable: its controls are out of a page script's reach. */
 export async function readDigestPage(page: Page, opts: { dialogSeen?: () => boolean } = {}): Promise<RawDigestReading> {
   let url = "";
   try { url = String(page.url() ?? ""); } catch { url = ""; }
   try {
     if (opts.dialogSeen?.()) return unreadableReading(url, "a dialog opened on the page");
+    const closed = await closedShadowRootCount(page);
+    if (closed === null) return unreadableReading(url, "the page could not be checked for closed shadow roots (no DevTools session)");
+    if (closed > 0) return unreadableReading(url, `the page holds ${closed} closed shadow root(s), whose controls a page script cannot read`);
     const mainOrigin = originOf(url);
     const main = page.mainFrame();
     await main.evaluate(SHIM).catch(() => null);
