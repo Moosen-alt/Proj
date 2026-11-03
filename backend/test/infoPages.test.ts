@@ -1816,6 +1816,20 @@ await check("#365, HELM'S 10-18 RE-CHECK OF #369: a lookup that names no platfor
   kb.saveVerifiedUtilityProfile(db, { state: "OR", utility: "Toft Electric", portalUrl: "see the city's own site", verifiedBy });
   await counts(project("Toft Electric"), permitUrl, "nit: a verified portal_url that yields no URL");
 
+  // ══ ROUND 1'S THIS-HOST EXCEPTION, ALONE. Its kill (K-c) went green once round 2's S3 let a NEM
+  // row's own off-platform URL decide, so every earlier pin of it was decided twice. Here only the
+  // exception decides: a permit number on a LEGACY row recorded on the very platform host the
+  // utility-side pass is on (the door refuses that URL today, refuseUtilityUrlOnPermitTarget; an
+  // older row or a raw write holds it). Every portal in question is a platform.
+  const pgeHost = "https://pgenm.powerclerk.com/MvcAccount/Login";
+  const LH = fx.newProject();
+  db.run("INSERT INTO permit_check_targets (id, project_id, portal_url, application_number, target_type, permit_type, created_at, updated_at) VALUES (?, ?, ?, 'BLD-2026-881', 'permit', 'building', ?, ?)",
+    [`r5-lh-${LH}`, LH, "https://pgenm.powerclerk.com/Projects/881", at, at]);
+  assert.equal(IP.infoPagePriorProgress(db, LH, pgeHost, "utility"), true, "K-c: a permit number recorded on this very platform host counts there (the hand-out)");
+  const lhAdmit = IP.reserveInfoPagePassUse(db, LH, "", "utility", { passId: (await currentPage()).passId, where: pgeHost });
+  assert.ok(lhAdmit.some((x) => /tracked by number/.test(x)), `K-c: …and at the admission — ${JSON.stringify(lhAdmit)}`);
+  assert.equal(IP.infoPagePriorProgress(db, LH, "https://pacificorpnetmetering.powerclerk.com/MvcAccount/Login", "utility"), false, "K-c: …and is skipped on another platform host");
+
   // ══ THE NIT: ONE HUGE VALUE ON ANOTHER UTILITY'S ROW no longer slows every hand-out and admission
   // (round 4 read every row's URLs; 35 s for one hand-out plus one admission on a 120k-character value).
   // (A bare run of letters is the slow shape: portalUrlsInText retries its host pattern at every
