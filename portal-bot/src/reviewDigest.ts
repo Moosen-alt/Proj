@@ -35,7 +35,9 @@
 // RULE 2: raw values reach Node only to be HMACed here (stagedReviewDigestKey: a scrypt subkey of
 //   SESSION_ENCRYPTION_KEY, and the row's own nonce), then dropped. Labels and display values pass
 //   redactSecretValues, then redactCaptureText. With no key, nothing is hashed and the row is
-//   unapprovable.
+//   unapprovable. The draft id and review link are the exception: PR2 binds them, so they are kept
+//   EXACTLY as the portal gave them or refused by name (stagedDraftReference: by shape, the link's own
+//   id, no project secret, no email) — never masked.
 import crypto from "node:crypto";
 import fs from "node:fs";
 import type { Locator, Page } from "playwright";
@@ -45,6 +47,7 @@ import type {
 } from "../../shared/src/types";
 import { maskId, redactCaptureText } from "./safeAction";
 import { draftReferenceFromUrl } from "./adapters/submissionLedger";
+import { stagedDraftReference } from "./stagedDraftReference";
 import { dialogsLeftToPerson } from "./personDialogs";
 import { recordNumberCandidates } from "./recordNumber";
 
@@ -494,9 +497,12 @@ export function buildStagedReviewCapture(input: BuildDigestInput): StagedReviewC
   const mac: DigestMac | null = input.mac ?? (key ? hmacWith(key.key) : null);
   if (!mac) why.push("SESSION_ENCRYPTION_KEY is not set, so nothing on the draft's pages could be hashed");
   const red = (s: string, max = LABEL_MAX): string => redactDigestText(s, secrets, max);
-  const reviewLink = draftReferenceFromUrl(input.walk.reviewUrl).link;
-  const draftId = draftReferenceFromUrl(input.walk.reviewUrl).id;
-  if (!draftId) why.push("the review page's link carries no draft id");
+  // The draft id and link EXACTLY as the portal gave them, or refused by name (never masked): PR2 binds them.
+  const own = draftReferenceFromUrl(input.walk.reviewUrl);
+  const ref = stagedDraftReference(own.id, own.link, secrets);
+  const reviewLink = ref.reviewLink;
+  const draftId = ref.draftId;
+  if (ref.refused) why.push(ref.refused);
 
   const sections: StagedReviewSection[] = [];
   const fieldReport: StagedReviewFieldReportRow[] = [];

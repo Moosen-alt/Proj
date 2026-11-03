@@ -12,6 +12,8 @@
 // writer re-checks it: every mac and digest must be a 64-hex HMAC (an identity "hash" — a raw value —
 // is refused and nothing from that reading is kept), and every label, display value and reason is
 // scrubbed again against the project's own secrets (projectSecretValues) and redactCaptureText.
+// The draft id and review link are the exception: they are KEPT EXACTLY (PR2 binds them) or refused
+// by name, never masked — stagedDraftReference, the one predicate the reader uses too.
 //
 // PR1 records and shows. Nothing clicks on a row: Approve on a staged draft stays held (#449), and
 // `approvable` is what the card says, not an authority anywhere.
@@ -23,6 +25,7 @@ import type {
 } from "../../shared/src/types";
 import { redactSecretValues } from "../../shared/src/portalSafety";
 import { maskId, redactCaptureText } from "../../portal-bot/src/safeAction";
+import { stagedDraftReference } from "../../portal-bot/src/stagedDraftReference";
 import { stagedReviewShotsDir } from "./statePaths";
 import { nowIso } from "./time";
 import { id } from "./ids";
@@ -122,7 +125,12 @@ export function recordStagedReview(db: AppDb, input: RecordStagedReviewInput): {
   }));
   const shot = servableShot(c?.screenshotPath);
   const digest = hashed ? s(c?.digest) : "";
-  const draftId = scrub(c?.draftId, 80);
+  // THE DRAFT ID AND LINK ARE KEPT EXACTLY OR NOT AT ALL (stagedDraftReference, the reader's own
+  // predicate, again with the project's secrets): never through scrub(), whose display redaction masks
+  // every 5+ digit run — PowerClerk's ProjectId=204411 became "**4411", an id that binds nothing.
+  const ref = stagedDraftReference(c?.draftId, c?.reviewLink, secrets);
+  if (ref.refused) why.push(ref.refused);
+  const draftId = ref.draftId;
   const approvable = hashed && c?.approvable === true && HEX64.test(digest) && !!draftId
     && sections.length > 0 && sections.every((sec) => !sec.unreadable) && why.length === 0;
   if (!approvable && !why.length) why.push("the reading is not approvable");
@@ -139,7 +147,7 @@ export function recordStagedReview(db: AppDb, input: RecordStagedReviewInput): {
       [
         rowId, input.runId, input.projectId, input.track, s(input.recipeId), s(input.stepsSignature),
         Number(c?.version) || 0, KEY_ID.test(s(c?.keyId)) ? s(c?.keyId) : "", NONCE.test(s(c?.nonce)) ? s(c?.nonce) : "", digest,
-        JSON.stringify(sections), draftId, scrub(c?.reviewLink, 300), JSON.stringify(fieldReport), JSON.stringify(attachments), shot,
+        JSON.stringify(sections), draftId, ref.reviewLink, JSON.stringify(fieldReport), JSON.stringify(attachments), shot,
         approvable ? 1 : 0, approvable ? "" : reason, nowIso(),
       ],
     );

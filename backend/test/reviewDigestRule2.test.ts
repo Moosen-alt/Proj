@@ -14,6 +14,9 @@
 //   (c) THE IDENTITY SWAP: the same reading built with an identity "mac" carries the digits (the scan
 //       catches it — the HMAC is what protects them), and the writer refuses to keep it: no item, not
 //       approvable, said why.
+//   (d) A REVIEW LINK THAT CARRIES THE ACCOUNT (as its ProjectId: plain, with separators, with
+//       percent-encoded spaces) is REFUSED by the reader and again by the writer (stagedDraftReference):
+//       draft_id and review_link are "", the row is unapprovable and says why — never a masked id.
 //
 // KILL TESTS (run by hand on this tree):
 //   K1 reviewDigest.buildStagedReviewCapture: default the mac to identity → (a) fails (no 64-hex macs;
@@ -22,6 +25,9 @@
 //   K3 repository: hand the replay no secrets (stagedReview: { secrets: [] }) → (a) fails (the field
 //      report no longer masks the account to its last 4). (b) still holds: the writer re-scrubs every
 //      label and value against the project's own secrets — the second layer, on purpose.
+//   K4 stagedDraftReference: drop the secret check → (d) fails (the reader keeps the account as the id;
+//      the writer keeps it approvable). Reverting the writer to scrub() the id → (d) fails on approvable
+//      (the old masked "******2937" row stood approvable).
 //
 // Run: npx tsx backend/test/reviewDigestRule2.test.ts
 import "./_isolate"; // FIRST
@@ -42,6 +48,7 @@ const fx = await setupStageFixture("review-digest-rule2");
 const { db, repo, recipes } = fx;
 const digest = await import("../../portal-bot/src/reviewDigest");
 const { recordStagedReview } = await import("../src/stagedReviews");
+const { draftReferenceFromUrl } = await import("../../portal-bot/src/adapters/submissionLedger");
 
 const NEM_URL = "https://pgenm.powerclerk.example/MvcAccount/Login";
 const REVIEW_URL = "https://pgenm.powerclerk.example/MvcProjects/EditForm?ProjectId=5521&FormId=9";
@@ -143,6 +150,33 @@ await check("(c) the identity swap: the digits ride in the reading, and the writ
   const kept = db.get<Record<string, unknown>>("SELECT * FROM portal_staged_reviews WHERE project_id = ?", [pid2])!;
   assert.deepEqual(leaksIn(JSON.stringify(kept)), [], "MUST-EXCLUDE: the writer kept a raw value");
   assert.ok((JSON.parse(String(kept.sections_json)) as Array<{ items: unknown[] }>).every((s) => s.items.length === 0));
+});
+
+await check("(d) a review link that carries the account (plain, with separators, percent-encoded spaces) is REFUSED, never masked into the row", () => {
+  for (const id of [ACCOUNT, `${ACCOUNT.slice(0, 4)}-${ACCOUNT.slice(4, 7)}-${ACCOUNT.slice(7)}`, `${ACCOUNT.slice(0, 4)} ${ACCOUNT.slice(4, 7)} ${ACCOUNT.slice(7)}`]) {
+    const url = `https://pgenm.powerclerk.example/MvcProjects/EditForm?ProjectId=${encodeURIComponent(id)}&FormId=9`;
+    const w = { ...walkOf(), reviewUrl: url };
+    // The reader, with the run's secrets: refused by name; neither the id nor the link is kept.
+    const c = digest.buildStagedReviewCapture({ walk: w, secrets: [ACCOUNT, METER], nonce: "00112233445566778899aabbccddeeff" });
+    assert.equal(c.approvable, false, `${id}: a review link carrying the account read approvable`);
+    assert.equal(c.draftId, "", `${id}: the reader kept the draft id`);
+    assert.equal(c.reviewLink, "", `${id}: the reader kept the link`);
+    assert.ok(c.why.some((x) => /carries one of the project's own account or meter numbers/.test(x)), c.why.join(" | "));
+    assert.deepEqual(leaksIn(JSON.stringify(c)), [], `${id}: the reader's capture carries the account`);
+    // The writer, handed a reading that MISSED it (built with no secrets; the id and link forced to the
+    // link's own, as a reader that skipped the check would hand them over): refused again at the door.
+    const own = draftReferenceFromUrl(url);
+    const missed = { ...digest.buildStagedReviewCapture({ walk: w, secrets: [], nonce: "00112233445566778899aabbccddeeff" }), draftId: own.id, reviewLink: own.link };
+    assert.ok(leaksIn(JSON.stringify(missed)).length > 0, "fixture: the missed reading does not carry the account (the writer's check proves nothing)");
+    const pid3 = fx.newProject({ account: ACCOUNT, meter: METER });
+    const wr = recordStagedReview(db, { runId: `link-${pid3}`, projectId: pid3, track: "nem", recipeId: "r", stepsSignature: "s", capture: missed, secrets: [ACCOUNT, METER] });
+    assert.equal(wr.approvable, false, `${id}: the writer kept a link carrying the account as approvable`);
+    assert.match(wr.why, /carries one of the project's own account or meter numbers/);
+    const kept = db.get<Record<string, unknown>>("SELECT * FROM portal_staged_reviews WHERE project_id = ?", [pid3])!;
+    assert.equal(kept.draft_id, "", `${id}: the row holds a (masked) draft id: ${String(kept.draft_id)}`);
+    assert.equal(kept.review_link, "", `${id}: the row holds a (masked) review link`);
+    assert.deepEqual(leaksIn(JSON.stringify(kept)), [], `MUST-EXCLUDE: ${id}: the row carries the account`);
+  }
 });
 
 finish("review-digest-rule2");

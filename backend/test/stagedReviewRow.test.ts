@@ -19,12 +19,17 @@
 //   (g) THE ROUTE (rule 6): the project's own run → 200, the masked file's bytes; the same run id under
 //       ANOTHER project → 404; no row → 404; a row naming a file outside the staged-review folder → 404;
 //       the run's portal_runs.screenshots_path (the unmasked outcome shot) is never served by it.
+//   (h) THE DRAFT ID AND LINK ARE KEPT EXACTLY: ProjectId 204411 / 42199 / AB12345CDE and an Accela
+//       capID row hold the portal's own id and link, approvable; an id the link does not carry, or a
+//       link with session material, is refused (both ""), never masked.
 //
 // KILL TESTS (run by hand on this tree):
 //   K1 repository: record from JSON.parse(result_json).stagedReview instead of the taken capture → (d) fails.
 //   K2 stagedReviewScreenshotFile: drop `AND project_id = ?` → (g) "another project" fails (200).
 //   K3 takeStagedReviewCapture: do not strip steps[].data → (c) fails (result_json carries it).
 //   K4 repository: drop the supersede at run start and in the writer → (e) fails.
+//   K5 recordStagedReview: store scrub(draftId) / scrub(reviewLink) again (the pre-fix display
+//      redaction) → (h) fails: "**4411", "*****", "AB*****CDE".
 //
 // Run: npx tsx backend/test/stagedReviewRow.test.ts
 import "./_isolate"; // FIRST
@@ -58,8 +63,8 @@ const shotFor = (tag: string): string => {
 };
 
 /** The capture a real walk of a two-step draft would hand back (the real builder, the real key). */
-const captureOf = (tag: string, systemSize = "7.2") => {
-  const r = (items: Array<{ kind: "field" | "line" | "check"; label: string; value: string }>, url = REVIEW_URL) => ({ title: "Review and Submit", url, items, unreadable: "" });
+const captureOf = (tag: string, systemSize = "7.2", reviewUrl = REVIEW_URL) => {
+  const r = (items: Array<{ kind: "field" | "line" | "check"; label: string; value: string }>, url = reviewUrl) => ({ title: "Review and Submit", url, items, unreadable: "" });
   const review = r([{ kind: "line", label: "", value: "Review and Submit" }, { kind: "field", label: "System Size (kW DC)", value: systemSize }]);
   const step = r([{ kind: "field", label: "Customer Name", value: "Avery Fenwick" }], REVIEW_URL.replace("FormId=9", "FormId=1"));
   return digest.buildStagedReviewCapture({
@@ -68,7 +73,7 @@ const captureOf = (tag: string, systemSize = "7.2") => {
         { step: "review", where: "https://pgenm.powerclerk.example/MvcProjects/EditForm", first: review, second: review, unreadable: "" },
         { step: "Customer", where: "https://pgenm.powerclerk.example/MvcProjects/EditForm", first: step, second: step, unreadable: "" },
       ],
-      reasons: [], stepsFound: 1, stepsRead: 1, writesBlocked: 0, reviewUrl: REVIEW_URL,
+      reasons: [], stepsFound: 1, stepsRead: 1, writesBlocked: 0, reviewUrl,
     },
     secrets: [], boundValues: [{ key: "systemSizeDcKw", value: systemSize }], screenshotPath: shotFor(tag),
   });
@@ -187,6 +192,46 @@ await check("(f2) STAGED_REVIEW_WALK=0: a NEM stage is not asked for the reading
   process.env.STAGED_REVIEW_WALK = "0";
   try { await repo.prepareSubmission(db, pid, "nem"); } finally { delete process.env.STAGED_REVIEW_WALK; }
   assert.equal(seenOpts?.stagedReview ?? null, null, "the switch did not turn the walk off");
+});
+
+await check("(h) the draft id and review link are kept EXACTLY (5- and 6-digit ids, letters, Accela) — or refused, never masked", async () => {
+  const PC = "https://pgenm.powerclerk.example/MvcProjects/EditForm";
+  for (const [url, id] of [
+    [`${PC}?ProjectId=204411&FormId=9`, "204411"],
+    [`${PC}?ProjectId=42199&FormId=9`, "42199"],
+    [`${PC}?ProjectId=AB12345CDE&FormId=9`, "AB12345CDE"],
+    ["https://aca.example.gov/Cap/CapEdit.aspx?capID1=26CAP&capID2=00000&capID3=00ABC", "26CAP-00000-00ABC"],
+  ] as const) {
+    const pid = fx.newProject();
+    const cap = captureOf(`h-${id}`, "7.2", url);
+    assert.equal(cap.draftId, id, `fixture: the reader did not take ${id} off the link`);
+    nextResult = () => staged({ stagedReview: cap });
+    await repo.prepareSubmission(db, pid, "nem");
+    const row = rowsFor(pid)[0];
+    assert.ok(row, `${id}: no row`);
+    assert.equal(row.draft_id, id, `${id}: the row's draft id is not the portal's (masked?): ${String(row.draft_id)}`);
+    assert.equal(row.review_link, url, `${id}: the row's review link is not the portal's: ${String(row.review_link)}`);
+    assert.equal(Number(row.approvable), 1, `${id}: ${String(row.unapprovable_reason)}`);
+  }
+  // MUST-EXCLUDE: a reading whose id is not the one its own link carries (a forged or confused capture).
+  const pid = fx.newProject();
+  const cap = { ...captureOf("h-mismatch", "7.2", `${PC}?ProjectId=204411&FormId=9`), draftId: "204412" };
+  nextResult = () => staged({ stagedReview: cap });
+  await repo.prepareSubmission(db, pid, "nem");
+  const row = rowsFor(pid)[0];
+  assert.equal(Number(row.approvable), 0, "a draft id the link does not carry was kept approvable");
+  assert.equal(row.draft_id, "");
+  assert.equal(row.review_link, "");
+  assert.match(String(row.unapprovable_reason), /the draft id is not the one the review page's link carries/);
+  // MUST-EXCLUDE: a link carrying session material (more than the record's own parameters).
+  const pid2 = fx.newProject();
+  const cap2 = { ...captureOf("h-session", "7.2", `${PC}?ProjectId=204411&FormId=9`), reviewLink: `${PC}?ProjectId=204411&FormId=9&sessionToken=abc` };
+  nextResult = () => staged({ stagedReview: cap2 });
+  await repo.prepareSubmission(db, pid2, "nem");
+  const row2 = rowsFor(pid2)[0];
+  assert.equal(Number(row2.approvable), 0, "a link carrying a session token was kept approvable");
+  assert.equal(row2.review_link, "");
+  assert.match(String(row2.unapprovable_reason), /not in its kept form/);
 });
 
 // ── the route, on a real server ─────────────────────────────────────────────────────────────
