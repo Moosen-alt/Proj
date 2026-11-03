@@ -3,7 +3,9 @@
 //
 // Shapes are the production ones (read from the live DB, amounts only):
 //   · Tigard: electrical $133.56 + structural $180.00 + 12% OR surcharge = the $351.19 receipt
-//     the parser labels "electrical". Neither schedule holds the surcharge -> both SHORT.
+//     the parser labels "electrical". Neither schedule holds the surcharge; the QUOTE now adds it
+//     (feeSchedules.stateSurchargeFor, #421), so both are CORROBORATED, flagged neededSurcharge.
+//     (Before #421 they were "corroborated_missing_surcharge" — the quote was 12% short.)
 //   · Salem: $94 × 1.12 + $5 processing = $110.28. ($94 + $5) × 1.12 = $110.88 is NOT a bill.
 //   · "Lincoln County" scores 65 against "City of Lincoln City" — over the fuzzy bar — and must
 //     not be read as that city's receipt.
@@ -19,7 +21,7 @@ const { openDatabase } = await import("../src/db");
 const { recordPaidFeeReceipt } = await import("../src/feeReceipts");
 const { createProject, isCriticalReviewItem } = await import("../src/repository");
 const fees = await import("../src/feeSchedules");
-const { reconcileReceiptsWithSchedules, raiseReceiptContradictionReviews, feeScheduleProfileKey, RECEIPT_REVIEW_ISSUE_TYPE, MISSING_OR_SURCHARGE_CAUSE } = fees;
+const { reconcileReceiptsWithSchedules, raiseReceiptContradictionReviews, feeScheduleProfileKey, RECEIPT_REVIEW_ISSUE_TYPE } = fees;
 import type { PaidFeeReceipt } from "../../shared/src/types";
 
 const db = await openDatabase();
@@ -64,7 +66,7 @@ const salemKey = schedule("City of Testsalem", "", "system_kw", [
   { minKw: 5.01, maxKw: 15, feeUsd: 94, label: "5.01 to 15 kVA", ancillaryCharges: [processing5] },
 ]);
 // Same table, but the only receipt is the WRONG order of operations: ($94 + $5) × 1.12.
-schedule("City of Orderville", "", "system_kw", [{ minKw: 5.01, maxKw: 15, feeUsd: 94, label: "5.01 to 15 kVA", ancillaryCharges: [processing5] }]);
+const ordervilleKey = schedule("City of Orderville", "", "system_kw", [{ minKw: 5.01, maxKw: 15, feeUsd: 94, label: "5.01 to 15 kVA", ancillaryCharges: [processing5] }]);
 // Holds the 12% itself: base × 1.12 is a plain corroboration.
 const heldKey = schedule("City of Heldsurch", "", "flat", [{ feeUsd: 200, label: "Solar permit", ancillaryCharges: [surcharge12] }]);
 const lincolnKey = schedule("City of Lincoln City", "", "other", [{ feeUsd: 250, label: "Solar Permit — Prescriptive Path", ancillaryCharges: [surcharge12] }]);
@@ -78,6 +80,8 @@ schedule("City of Conflictton", "", "flat", [{ feeUsd: 50, label: "Solar permit"
 // --- receipts, through the real write path --------------------------------------------------
 const tigardProject = createProject(db, { owner: "Receipt Test", address: "1 Test Way", city: "Testigard", state: "OR", zip: "97223", ahj: tigard, utility: "PGE", dcKw: "8", valuation: "20000" }).project;
 const tigardReceipt = receipt(tigard, 351.19);
+// A project-anchored receipt no total the quote produces explains — what the review hook is for.
+const ordervilleProject = createProject(db, { owner: "Receipt Test", address: "2 Test Way", city: "Orderville", state: "OR", zip: "97301", ahj: "City of Orderville", utility: "PGE", dcKw: "8", valuation: "20000" }).project;
 // Salem's and the others' receipts carry no project, as the imported production ones do.
 for (const [j, amt, d] of [
   ["City of Testsalem", 110.28, "electrical"], ["City of Testsalem", 46.21, "building"],
@@ -93,7 +97,7 @@ const reviewsBefore = db.get<{ n: number }>("SELECT COUNT(*) n FROM human_review
 const report = reconcileReceiptsWithSchedules(db);
 const verdictOf = (key: string, discipline = "") => report.results.find((r) => r.profileKey === key && r.discipline === discipline);
 
-await run("Tigard: combined electrical + structural + 12% explains the 'electrical' receipt; both schedules are SHORT", () => {
+await run("Tigard: combined electrical + structural + the 12% THE QUOTE ADDS explains the 'electrical' receipt; both CORROBORATED (#421)", () => {
   // The one receipt WITH a project is recorded here, after the snapshot above, so the hook test
   // below can attribute exactly one review item to it.
   const r = recordPaidFeeReceipt(db, tigardReceipt, tigardProject.id);
@@ -102,15 +106,15 @@ await run("Tigard: combined electrical + structural + 12% explains the 'electric
   for (const disc of ["electrical", "structural"]) {
     const v = again.results.find((x) => x.profileKey === tigardKey && x.discipline === disc);
     assert.ok(v, `no result for tigard ${disc}`);
-    assert.equal(v.verdict, "corroborated_missing_surcharge", `${disc}: ${v.verdict}`);
-    assert.equal(v.likelyCause, MISSING_OR_SURCHARGE_CAUSE);
-    assert.match(v.receipts[0].explainedBy, /133\.56.*180\.00.*12% OR state surcharge/);
+    assert.equal(v.verdict, "corroborated", `${disc}: ${v.verdict}`);
+    assert.equal(v.receipts[0].neededSurcharge, true, "the 12% in the explanation is the quote's modeled one, not the schedule's");
+    assert.match(v.receipts[0].explainedBy, /133\.56.*180\.00.*12% OR state surcharge \(not held by the schedule; the quote adds it/);
   }
 });
 
-await run("Salem: surcharge on the permit line THEN the flat processing fee ($110.28) — SHORT, not contradicted", () => {
+await run("Salem: surcharge on the permit line THEN the flat processing fee ($110.28) — corroborated with the modeled 12%, not contradicted", () => {
   const v = verdictOf(salemKey)!;
-  assert.equal(v.verdict, "corroborated_missing_surcharge");
+  assert.equal(v.verdict, "corroborated");
   const hit = v.receipts.find((x) => x.authorityAmountUsd === 110.28)!;
   assert.match(hit.explainedBy, /\$94\.00 \+ 12% OR state surcharge.*\+ \$5\.00 processing/);
   assert.equal(v.receipts.find((x) => x.authorityAmountUsd === 46.21)!.explainedBy, "", "the building receipt is not explained by an electrical table");
@@ -152,13 +156,18 @@ await run("reconcile is READ-ONLY: no schedule or review row changes", () => {
   assert.equal(db.get<{ n: number }>("SELECT COUNT(*) n FROM human_review_items")!.n, reviewsBefore + raisedByHook);
 });
 
-await run("recording a receipt raises the review item for its jurisdiction (hook)", async () => {
+await run("recording a receipt the quote's total explains raises NOTHING; one it contradicts raises the item for its jurisdiction (hook)", async () => {
+  await tick();
+  // Tigard's anchored receipt is explained by the quote's own total (with the modeled 12%).
+  assert.equal(db.query("SELECT id FROM human_review_items WHERE issue_type = ?", [RECEIPT_REVIEW_ISSUE_TYPE]).length, 0,
+    "a receipt the quote reproduces is not a disagreement");
+  assert.equal(recordPaidFeeReceipt(db, receipt("City of Orderville", 120, "electrical"), ordervilleProject.id).recorded, true);
   await tick();
   const items = db.query<{ project_id: string; field_name: string; notes: string }>(
     "SELECT project_id, field_name, notes FROM human_review_items WHERE issue_type = ?", [RECEIPT_REVIEW_ISSUE_TYPE]);
   assert.equal(items.length, 1, JSON.stringify(items.map((i) => i.field_name)));
-  assert.equal(items[0].field_name, `fee_schedule:${tigardKey}`);
-  assert.equal(items[0].project_id, tigardProject.id);
+  assert.equal(items[0].field_name, `fee_schedule:${ordervilleKey}`);
+  assert.equal(items[0].project_id, ordervilleProject.id);
 });
 
 await run("the item is ADVISORY: it never holds the anchoring project's submission", () => {
@@ -172,22 +181,25 @@ await run("the item is ADVISORY: it never holds the anchoring project's submissi
 await run("raise: ONE item per key, deduped, amounts only (no receipt/permit numbers), anchored or no_anchor", () => {
   const first = raiseReceiptContradictionReviews(db, reconcileReceiptsWithSchedules(db));
   const second = raiseReceiptContradictionReviews(db, reconcileReceiptsWithSchedules(db));
-  assert.equal(first.find((o) => o.profileKey === tigardKey)!.action, "unchanged", "the hook already raised it");
-  assert.equal(first.find((o) => o.profileKey === salemKey)!.action, "no_anchor", "a project-less receipt has nowhere to land");
+  assert.equal(first.find((o) => o.profileKey === ordervilleKey)!.action, "unchanged", "the hook already raised it");
+  assert.equal(first.find((o) => o.profileKey === lincolnKey)!.action, "no_anchor", "a project-less receipt has nowhere to land");
   assert.ok(!first.some((o) => o.profileKey === heldKey), "a corroborated schedule raises nothing");
+  assert.ok(!first.some((o) => o.profileKey === tigardKey || o.profileKey === salemKey),
+    "a schedule corroborated with the quote's modeled surcharge raises nothing (#421)");
   assert.ok(second.every((o) => o.action === "unchanged" || o.action === "no_anchor"));
   const items = db.query<{ notes: string }>("SELECT notes FROM human_review_items WHERE issue_type = ?", [RECEIPT_REVIEW_ISSUE_TYPE]);
   assert.equal(items.length, 1);
-  assert.match(items[0].notes, /\$351\.19/);
-  assert.match(items[0].notes, new RegExp(tigardKey.replace(/[|]/g, "\\|")));
+  assert.match(items[0].notes, /\$110\.88/);
+  assert.match(items[0].notes, /\$120\.00/);
+  assert.match(items[0].notes, new RegExp(ordervilleKey.replace(/[|]/g, "\\|")));
   assert.doesNotMatch(items[0].notes, /PERMNUM|RCPTNUM/);
   // No schedule was touched by any of it.
   assert.equal(JSON.stringify(db.query("SELECT * FROM fee_schedules ORDER BY id")), schedulesBefore);
 });
 
 await run("raise: new evidence updates the pending item instead of adding a second one", () => {
-  recordPaidFeeReceipt(db, receipt(tigard, 999.99), tigardProject.id);
-  const outcome = raiseReceiptContradictionReviews(db, reconcileReceiptsWithSchedules(db)).find((o) => o.profileKey === tigardKey)!;
+  recordPaidFeeReceipt(db, receipt("City of Orderville", 999.99), ordervilleProject.id);
+  const outcome = raiseReceiptContradictionReviews(db, reconcileReceiptsWithSchedules(db)).find((o) => o.profileKey === ordervilleKey)!;
   assert.equal(outcome.action === "updated" || outcome.action === "unchanged", true, outcome.action);
   assert.equal(db.query("SELECT id FROM human_review_items WHERE issue_type = ?", [RECEIPT_REVIEW_ISSUE_TYPE]).length, 1);
 });

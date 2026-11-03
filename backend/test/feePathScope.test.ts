@@ -440,21 +440,27 @@ async function main(): Promise<void> {
   //    comes from; a fix that only moved feeForProject would be invisible here.
   // -------------------------------------------------------------------------
   const annQuote = buildPaymentQuote(db, ANN, "permit");
-  check("4. Emery's QUOTE is no longer sourced to the published schedule",
-    annQuote.permitFeeSource !== "published_schedule", annQuote.permitFeeSource);
+  // #421: a schedule that prices PART of the filing is a FLOOR, never a reason to fall to a guess
+  // lower than it. Emery's path reaches the county electrical line ($160 + the 12% state surcharge
+  // the quote adds = $179.20) and not the city's prescriptive-only structural line, which is named
+  // as not priced. The defect this section guards — the $200 prescriptive line quoted for an
+  // engineered job — stays fixed: $200 is in no part of the number.
+  check("4. Emery's QUOTE is not the schedule's ANSWER: a FLOOR of the lines her path reaches, the refused line named",
+    annQuote.permitFeeIsFloor === true && annQuote.permitFeeUsd === 179.2 && /PLUS the City of Coos Bay structural permit, not yet priced/.test(annQuote.permitFeeBasis),
+    `${annQuote.permitFeeSource} ${annQuote.permitFeeUsd} ${annQuote.permitFeeBasis.slice(0, 200)}`);
   check("  and it is neither $360 nor $200",
     annQuote.permitFeeUsd !== 360 && annQuote.permitFeeUsd !== 200, String(annQuote.permitFeeUsd));
   check("  the refusal travels with the quote, so the operator can act on it",
     /NO ENGINEERED FEE HELD/.test(annQuote.permitFeeBasis), annQuote.permitFeeBasis.slice(0, 200));
   check("  the fallback is LABELLED an estimate, not presented as the schedule's answer",
-    annQuote.permitFeeConfidence !== "verified" && /Rough estimate/i.test(annQuote.permitFeeBasis),
+    annQuote.permitFeeConfidence === "estimated" && /^AT LEAST \$179\.20/.test(annQuote.permitFeeBasis),
     `${annQuote.permitFeeConfidence} / ${annQuote.permitFeeBasis.slice(0, 80)}`);
   check("  confidence is untouched — nothing here writes 'verified' (hard rule 3)",
     db.query<{ n: number }>("SELECT COUNT(*) AS n FROM fee_schedules WHERE confidence = 'verified'")[0]?.n === 0);
 
   const ivyQuote = buildPaymentQuote(db, IVY, "permit");
-  check("  MUST EXCLUDE: Ivy's quote still comes FROM the schedule, at $335.00",
-    ivyQuote.permitFeeUsd === 335 && ivyQuote.permitFeeSource === "published_schedule",
+  check("  MUST EXCLUDE: Ivy's quote still comes FROM the schedule, at $375.20 ($335.00 + the modeled 12% state surcharge), and is no floor",
+    ivyQuote.permitFeeUsd === 375.2 && ivyQuote.permitFeeSource === "published_schedule" && ivyQuote.permitFeeIsFloor !== true,
     `${ivyQuote.permitFeeUsd} / ${ivyQuote.permitFeeSource}`);
 
   // -------------------------------------------------------------------------
@@ -542,12 +548,12 @@ async function main(): Promise<void> {
   // invisible: the quote must fall to the LABELLED estimate carrying the reason,
   // never to the prescriptive number wearing a citation.
   const unknownQuote = buildPaymentQuote(db, UNKNOWN, "permit");
-  check("5d. the undecided project's QUOTE is not sourced to the published schedule",
-    unknownQuote.permitFeeSource !== "published_schedule", unknownQuote.permitFeeSource);
+  check("5d. the undecided project's QUOTE is not the schedule's ANSWER: a FLOOR of the lines no path decides (#421)",
+    unknownQuote.permitFeeIsFloor === true && unknownQuote.permitFeeConfidence === "estimated", `${unknownQuote.permitFeeSource} ${unknownQuote.permitFeeUsd}`);
   check("  it is neither $360 nor $200",
     unknownQuote.permitFeeUsd !== 360 && unknownQuote.permitFeeUsd !== 200, String(unknownQuote.permitFeeUsd));
   check("  and the refusal travels with it, so the operator sees what to decide",
-    /PERMIT PATH UNDECIDED/.test(unknownQuote.permitFeeBasis) && /Rough estimate/i.test(unknownQuote.permitFeeBasis),
+    /PERMIT PATH UNDECIDED/.test(unknownQuote.permitFeeBasis) && /^AT LEAST \$/.test(unknownQuote.permitFeeBasis),
     unknownQuote.permitFeeBasis.slice(0, 200));
 
   // -------------------------------------------------------------------------
@@ -773,7 +779,7 @@ async function main(): Promise<void> {
   check("  and hands over the reason, so it is actionable rather than just a scold",
     /Superseded pass/.test(archivedQuote.permitFeeBasis), archivedQuote.permitFeeBasis.slice(0, 220));
   check("12b. MUST EXCLUDE: the AMOUNT is unchanged — labelled, never suppressed",
-    archivedQuote.permitFeeUsd === liveIvyQuote.permitFeeUsd && archivedQuote.permitFeeUsd === 335,
+    archivedQuote.permitFeeUsd === liveIvyQuote.permitFeeUsd && archivedQuote.permitFeeUsd === 375.2,
     `${archivedQuote.permitFeeUsd} vs ${liveIvyQuote.permitFeeUsd}`);
   check("  and the basis it labels is still the schedule's own account of the number",
     /published fee schedule/i.test(archivedQuote.permitFeeBasis), archivedQuote.permitFeeBasis.slice(-200));

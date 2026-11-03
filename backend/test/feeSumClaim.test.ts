@@ -257,12 +257,15 @@ async function main(): Promise<void> {
   // THE MULTI-PERMIT SENTENCE, same claim, schedule tier: Coos Bay's two permits and
   // no ancillary charges.
   const coosSchedule = draw("proj-ivy");
-  check("2e. PRECONDITION: Coos is two permits, schedule-sourced, no ancillary charges",
-    coosSchedule.line.source === "published_schedule" && coosSchedule.line.feeUsd === 335
-    && coosSchedule.line.charges.every((c) => c.partOfLineFee),
+  // #421: the quote adds the 12% Oregon state surcharge these rows do not hold — one itemised charge
+  // per permit — so $335.00 of permits is a $375.20 filing, and the one claim that the fee is a
+  // total moves from the permits block to the charges block (it is printed once, not twice).
+  check("2e. PRECONDITION: Coos is two permits, schedule-sourced, nothing beyond them but the state surcharge the quote adds",
+    coosSchedule.line.source === "published_schedule" && coosSchedule.line.feeUsd === 375.2
+    && coosSchedule.line.charges.every((c) => c.partOfLineFee || c.kind === "state_surcharge"),
     `source=${coosSchedule.line.source} fee=${coosSchedule.line.feeUsd}`);
-  check("2f. the CLI says the two permits total the fee above",
-    /2 separate permits — the fee above is their total/.test(coosSchedule.cli), coosSchedule.cli.slice(0, 500));
+  check("2f. the CLI says the filing's charges — two permits and their surcharges — total the fee above",
+    /2 separate permits/.test(coosSchedule.cli) && /charges on this filing — the fee above is their total/.test(coosSchedule.cli), coosSchedule.cli.slice(0, 500));
 
   // =========================================================================
   // 3. HIGHER TIER — the operator's $812.40 portal actual. THE CLAIM GOES;

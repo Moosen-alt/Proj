@@ -2527,7 +2527,7 @@ function renderPaymentQuoteCard(quote) {
       <div class="item-title"><span>${esc(trackLabel)} submission</span>${statusBadge(status)}</div>
       ${quote.permitFeeIssuerLabel ? `<p class="muted" style="margin:2px 0;font-size:12px">${esc(quote.permitFeeIssuerLabel)}</p>` : ""}
       <table style="font-size:12px;margin:4px 0;border-collapse:collapse">
-        <tr><td style="padding:1px 14px 1px 0">Permit fees</td><td style="text-align:right"><strong>${money(quote.permitFeeUsd)}</strong></td>
+        <tr><td style="padding:1px 14px 1px 0">Permit fees</td><td style="text-align:right"><strong>${quote.permitFeeIsFloor && quote.permitFeeUsd != null ? "at least " : ""}${money(quote.permitFeeUsd)}</strong></td>
             <td style="padding-left:10px" class="muted">${esc(FEE_SOURCE_LABELS[quote.permitFeeSource] || "")}</td></tr>
         <tr><td style="padding:1px 14px 1px 0">Our service fee</td><td style="text-align:right"><strong>${money(quote.serviceFeeUsd)}</strong></td><td></td></tr>
         <tr style="border-top:1px solid var(--border)"><td style="padding:3px 14px 1px 0"><strong>Client total</strong></td><td style="text-align:right"><strong>${money(quote.totalUsd)}</strong></td><td></td></tr>
@@ -2947,7 +2947,10 @@ function renderFeeSheetLine(line) {
         <span>${esc(heading)}</span>
         <span class="badge ${conf.badge}">${esc(conf.label)}</span>
       </div>
-      <p style="margin:2px 0;font-size:19px;font-weight:700">${feeMoney(line.feeUsd)}${line.paymentMethod === "none" && line.feeUsd != null
+      <p style="margin:2px 0;font-size:19px;font-weight:700">${line.feeIsFloor && line.feeUsd != null
+        // A FLOOR (#421): the schedule priced part of this filing — the number is a lower bound.
+        ? `<span style="font-size:13px;font-weight:600">AT LEAST </span>`
+        : ""}${feeMoney(line.feeUsd)}${line.paymentMethod === "none" && line.feeUsd != null
         ? `<span style="font-size:12px;font-weight:400"> — no fee charged</span>`
         : ""}</p>
       ${line.paymentMethod === "none" && line.feeUsd != null
@@ -3036,6 +3039,8 @@ function renderFeeSheetPanel() {
   // Keyed on totalConfidence — computed by the backend BESIDE the sum — so the
   // marker cannot drift from the arithmetic it qualifies.
   const totalEstimated = !anyUnknown && sheet.totalConfidence === "estimated";
+  // A FLOOR (#421) — a line marked AT LEAST — makes the total a lower bound: said as one, never "≈".
+  const totalIsFloor = totalEstimated && sheet.lines.some((l) => l.feeIsFloor && l.feeUsd != null);
   // FOLDED TO ONE LINE, AND THE LINE CARRIES EVERY QUALIFIER. The panel was 486-537px on every
   // project and sat above the Next step. Closed, the summary still says, per track, the amount
   // AND its confidence ("provisional", "estimate", "UNKNOWN"), how many fees are still unknown,
@@ -3054,7 +3059,7 @@ function renderFeeSheetPanel() {
   const unknownCount = (sheet.unknowns || []).length;
   const totalPart = anyUnknown
     ? "total UNKNOWN — not final"
-    : `total ${totalEstimated ? "≈ " : ""}${foldMoney(sheet.totalUsd)}${totalEstimated ? " (estimate)" : provisional.length ? " (provisional)" : ""}`;
+    : `total ${totalIsFloor ? "at least " : totalEstimated ? "≈ " : ""}${foldMoney(sheet.totalUsd)}${totalEstimated ? " (estimate)" : provisional.length ? " (provisional)" : ""}`;
   const foldParts = [...trackParts, totalPart];
   if (unknownCount) foldParts.push(`${unknownCount} still unknown`);
   if ((sheet.outOfPortalPayments || []).length) foldParts.push(`${sheet.outOfPortalPayments.length} not payable in a portal`);
@@ -3099,7 +3104,7 @@ function renderFeeSheetPanel() {
         <tr><td style="padding:1px 14px 1px 0">Our service fees${sheet.billingRequired ? " (per submission)" : ""}</td>
             <td style="text-align:right"><strong>${feeMoney(sheet.serviceFeesUsd)}</strong></td></tr>
         <tr style="border-top:1px solid var(--border)"><td style="padding:3px 14px 1px 0"><strong>Project total${totalEstimated ? " (estimate)" : ""}</strong></td>
-            <td style="text-align:right"><strong>${totalEstimated ? "≈ " : ""}${feeMoney(sheet.totalUsd)}</strong></td></tr>
+            <td style="text-align:right"><strong>${totalIsFloor ? "AT LEAST " : totalEstimated ? "≈ " : ""}${feeMoney(sheet.totalUsd)}</strong></td></tr>
       </table>
       ${receiptsBlock}
       ${sheet.billingRequired ? "" : `
@@ -3111,7 +3116,8 @@ function renderFeeSheetPanel() {
         <div class="provenance-body"><p>This client is not billed per submission (billing mode ${esc(sheet.billingMode || "monthly / none")}), so the service fees above are shown for reference and are not collected here.</p></div>
       </details>`}
       ${anyUnknown ? `<p style="margin:6px 0 2px;font-size:12px"><strong>The total is UNKNOWN because at least one fee is.</strong> It is not a zero and it is not a partial sum — do not put a number in front of this customer yet.</p>` : ""}
-      ${totalEstimated ? `<p style="margin:6px 0 2px;font-size:12px"><strong>⚠ This total INCLUDES AN ESTIMATE.</strong> At least one fee is a valuation heuristic, not a published or recorded number — true it up from the portal's fee screen before quoting a customer.</p>` : ""}
+      ${totalIsFloor ? `<p style="margin:6px 0 2px;font-size:12px"><strong>⚠ This total is a FLOOR.</strong> At least one fee is marked AT LEAST: its published schedule priced part of the filing and the rest is not priced yet, so the real total is higher — price what is missing or enter the portal's own fee before quoting a customer.</p>`
+        : totalEstimated ? `<p style="margin:6px 0 2px;font-size:12px"><strong>⚠ This total INCLUDES AN ESTIMATE.</strong> At least one fee is a valuation heuristic, not a published or recorded number — true it up from the portal's fee screen before quoting a customer.</p>` : ""}
       <!-- These two lists were the largest block of honesty prose on the screen
            (499 words on one project) and they are the REASON the total above says
            ESTIMATE / UNKNOWN. So they collapse behind a summary that states the

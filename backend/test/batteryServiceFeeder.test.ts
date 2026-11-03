@@ -313,8 +313,10 @@ async function main(): Promise<void> {
 
   const sheetBattery = buildProjectFeeSheet(db, tigardBattery);
   const permitLine = sheetBattery.lines.find((l) => l.track === "permit")!;
-  check("fee sheet: battery job's permit total = structural 180 + electrical 262.37",
-    permitLine.feeUsd === 442.37 && permitLine.source === "published_schedule", `${permitLine.feeUsd} ${permitLine.source}`);
+  // #421: + the 12% Oregon state surcharge on the structural $180 the row does not hold ($21.60),
+  // which the quote now adds — the same 12% the electrical row already carries on both its lines.
+  check("fee sheet: battery job's permit total = structural 180 + electrical 262.37 + structural surcharge 21.60",
+    permitLine.feeUsd === 463.97 && permitLine.source === "published_schedule", `${permitLine.feeUsd} ${permitLine.source}`);
   check("fee sheet: the services line is itemised with its amount",
     (permitLine.charges ?? []).some((c) => c.kind === SERVICE_FEEDER_CHARGE_KIND && c.amountUsd === 100.7));
 
@@ -369,8 +371,13 @@ async function main(): Promise<void> {
   // schedule the same sheet just itemised.
   const gapPermitUnknown = gapSheet.unknowns.find((u) => /^Permit fee for City of Gapville/.test(u)) ?? "";
   check("F MUST PASS: schedule evaluated, only an unpriced charge nulled the total — the sentence says so",
-    gapPermit.source === "valuation_estimate" && /published fee schedule WAS read/.test(gapPermitUnknown)
-      && /one charge on it is\s+not priced/.test(gapPermitUnknown) && !/no published fee schedule resolved/.test(gapPermitUnknown),
+    // #421: the priced lines ($150 + its held 12% = $168) are a floor, but the $180 valuation
+    // estimate is higher, so the estimate stays the amount (the quote never reads lower than it
+    // did before the floor existed) and the floor is named beside it.
+    gapPermit.source === "valuation_estimate" && !gapPermit.feeIsFloor && gapPermit.feeUsd === 180
+      && /published fee schedule WAS read/.test(gapPermitUnknown)
+      && /one charge on it is\s+not priced/.test(gapPermitUnknown) && !/no published fee schedule resolved/.test(gapPermitUnknown)
+      && /The schedule DID price part of this filing: AT LEAST \$168\.00/.test(gapPermitUnknown),
     gapPermitUnknown);
   check("GAP: the charge's own unknown carries it — no second, generic battery note on top",
     !gapSheet.unknowns.some((u) => /^Battery\/ESS job: /.test(u)), JSON.stringify(gapSheet.unknowns));

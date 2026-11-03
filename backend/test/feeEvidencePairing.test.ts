@@ -395,7 +395,7 @@ async function main(): Promise<void> {
   delete process.env.FEE_MATCH_BADGE;
   const badgeOff = quoteNow();
   check("with the badge off (the default) the quote claims neither CORROBORATED nor 'verified' for a machine check",
-    !badgeOff.permitFeeBasis.includes("CORROBORATED") && !/\bhuman-verified\)/.test(badgeOff.permitFeeBasis.replace(/not (yet )?human-verified/g, "")) && badgeOff.permitFeeUsd === 135,
+    !badgeOff.permitFeeBasis.includes("CORROBORATED") && !/\bhuman-verified\)/.test(badgeOff.permitFeeBasis.replace(/not (yet )?human-verified/g, "")) && badgeOff.permitFeeUsd === 151.2,
     badgeOff.permitFeeBasis);
   process.env.FEE_MATCH_BADGE = "1";
   const corroboratedQuote = quoteNow();
@@ -404,9 +404,12 @@ async function main(): Promise<void> {
     corroboratedQuote.permitFeeBasis.includes("CORROBORATED")
     && !/\bhuman-verified\)/.test(corroboratedQuote.permitFeeBasis.replace("not human-verified", "")),
     corroboratedQuote.permitFeeBasis);
+  // #421: the quote is the $135.00 line PLUS the 12% state surcharge the row does not hold; the
+  // printed evidence is still the $135.00 row, and the added $16.20 is named beside it.
   check("…and the evidence it prints is the printed row for the amount it charges",
-    corroboratedQuote.permitFeeUsd === 135
+    corroboratedQuote.permitFeeUsd === 151.2
     && corroboratedQuote.permitFeeBasis.includes("5 KVA or less | $135.00")
+    && corroboratedQuote.permitFeeBasis.includes("INCLUDES $16.20 of state surcharge the schedule does not print")
     && !corroboratedQuote.permitFeeBasis.includes("$160.00"),
     corroboratedQuote.permitFeeBasis);
   check("…the resolution still reports 'seeded' confidence",
