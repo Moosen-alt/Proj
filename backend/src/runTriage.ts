@@ -24,6 +24,8 @@ import { learnNoteTopicsFromMisses } from "./noteTopics";
 import { logger } from "./logger";
 import { id } from "./ids";
 import { nowIso } from "./time";
+import { closeLegacyTriageNotesFor, portalAnswerOnFile } from "./intakeRequests";
+import { isPerJobAnswerKey, perJobPortalQuestionOfField, perJobRuleFor, type PerJobPortalQuestion } from "../../shared/src/perJobQuestions";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9._-]+$/;
 const FIX_KINDS = ["equipment_alias", "kb_note", "learned_topic", "data_gap", "code_bug", "none"] as const;
@@ -47,6 +49,8 @@ export interface TriageResult {
   appliedCount: number;
   digestSummary: string;
   message: string;
+  /** #544: the portal questions this run left blank that are now asked on the project (new items). */
+  questionsAsked?: PerJobPortalQuestion[];
 }
 
 // ---- bundle location + safe reads ----------------------------------------
@@ -143,6 +147,80 @@ export function digestBundle(dir: string): { summary: string; pages: PageSummary
   for (const iss of resultIssues.slice(0, 6)) lines.push(`issue: ${iss}`);
 
   return { summary: lines.join("\n").slice(0, 6000), pages, misses };
+}
+
+// ---- per-job questions the run left blank for a person (#544) --------------
+
+const questionNorm = (s: unknown): string => String(s ?? "").toLowerCase().replace(/\s+/g, " ").trim().replace(/[\s:?!.*]+$/, "");
+
+/**
+ * THE QUESTIONS THIS RUN LEFT FOR A PERSON, read from the run's own page plans — no model call, so a
+ * stub-mode triage finds them too. Two signals, both about the portal's own control:
+ *   - a planner decision bound to a per-job key ONLY A PERSON answers, with no value (autoLearn's
+ *     planner files the job's own answer or leaves the box blank for a person — never its pick);
+ *   - a REQUIRED field the run reports left blank whose control the one predicate names per-job.
+ * Each comes back in the portal's wording with the options it offered (placeholders removed), one per
+ * key. A control that offers no options to choose from is not here: it cannot be answered by choosing.
+ */
+export function blankPerJobQuestions(dir: string): PerJobPortalQuestion[] {
+  const result = readJson<Record<string, unknown>>(dir, "result.json", {});
+  const verdict = readJson<Record<string, unknown>>(dir, "verdict.json", {});
+  const verification = (result.verification ?? {}) as Record<string, unknown>;
+  const issues = [
+    ...(Array.isArray(verification.issues) ? (verification.issues as unknown[]).map(String) : []),
+    ...(Array.isArray(verdict.finalIssues) ? (verdict.finalIssues as unknown[]).map(String) : []),
+  ];
+  const misses = extractRequiredMisses(issues).map(questionNorm).filter(Boolean);
+  const out: PerJobPortalQuestion[] = [];
+  const add = (q: PerJobPortalQuestion | null): void => {
+    if (q && !out.some((o) => o.key === q.key)) out.push(q);
+  };
+  for (const name of listBundleFiles(dir)) {
+    if (!/^p\d+-plan\.json$/.test(name)) continue;
+    const plan = readJson<Record<string, unknown>>(dir, name, {});
+    const seen = Array.isArray(plan.fieldsSeen) ? (plan.fieldsSeen as Array<Record<string, unknown>>) : [];
+    const decisions = Array.isArray(plan.decisions) ? (plan.decisions as Array<Record<string, unknown>>) : [];
+    const asQuestion = (f: Record<string, unknown> | undefined): PerJobPortalQuestion | null => (f
+      ? perJobPortalQuestionOfField({ label: String(f.label ?? ""), fieldType: String(f.type ?? ""), options: Array.isArray(f.options) ? f.options : null })
+      : null);
+    for (const d of decisions) {
+      if (!isPerJobAnswerKey(d.boundField) || String(d.value ?? "").trim()) continue;
+      const q = asQuestion(seen.find((f) => f.i === d.index));
+      if (q && q.key === d.boundField) add(q);
+    }
+    for (const f of seen) {
+      const label = questionNorm(f.label);
+      // fieldsSeen keeps 80 characters of a label; the miss list keeps all of it.
+      if (label && misses.some((m) => m === label || (label.length >= 40 && m.startsWith(label)))) add(asQuestion(f));
+    }
+  }
+  return out;
+}
+
+/** Ask each question on the project as ONE review item, unless the job already answers it or an item
+ *  already asks it. Returns every key now asked on the project (new or already pending). The item is a
+ *  'Run triage' item (advisory: it never holds staging — the per-job stage gate already does that). */
+function askBlankQuestions(db: AppDb, projectId: string, questions: PerJobPortalQuestion[]): { asked: Set<string>; added: PerJobPortalQuestion[] } {
+  const asked = new Set<string>();
+  const added: PerJobPortalQuestion[] = [];
+  if (!questions.length) return { asked, added };
+  const project = safeProject(db, projectId);
+  if (!project) return { asked, added };
+  for (const q of questions) {
+    if (portalAnswerOnFile(db, project, q.key)) continue; // answered on file: a blank here is a run bug, not a question
+    const pending = db.get<{ id: string }>(
+      "SELECT id FROM human_review_items WHERE project_id = ? AND status = 'pending' AND issue_type = 'Run triage' AND field_name = ? AND portal_question_json != '' LIMIT 1",
+      [projectId, q.key],
+    );
+    asked.add(q.key);
+    if (!pending) {
+      insertTriageReviewItem(db, projectId, { fieldName: q.key, sourceExcerpt: q.label, portalQuestion: q });
+      added.push(q);
+    }
+    // An older triage note about this same question (the agent's engineering text) is superseded.
+    closeLegacyTriageNotesFor(db, projectId, q.key, "asked");
+  }
+  return { asked, added };
 }
 
 function extractRequiredMisses(issues: string[]): string[] {
@@ -276,43 +354,72 @@ export async function triageLearnRun(db: AppDb, runId: string, projectId: string
     effort: "medium",
   });
 
-  const appliedCount = applySafeFixes(db, projectId, findings);
-  recordTriageNote(db, projectId, runId, findings, appliedCount);
+  // THE QUESTIONS FIRST, FROM THE RUN ITSELF (#544): a per-job question the run left blank is asked
+  // on the project as that question, whatever the model said (or, in stub mode, did not say).
+  let questions: { asked: Set<string>; added: PerJobPortalQuestion[] } = { asked: new Set(), added: [] };
+  try { questions = askBlankQuestions(db, projectId, blankPerJobQuestions(dir)); } catch (err) {
+    logger.warn("triage", "could not ask the run's blank portal questions", { runId, projectId, error: String((err as Error)?.message ?? err) });
+  }
+  const appliedCount = applySafeFixes(db, projectId, findings, questions.asked) + questions.added.length;
+  recordTriageNote(db, projectId, runId, findings, appliedCount, questions.added);
 
+  const asked = questions.added.length ? ` Asked ${questions.added.length} portal question(s) the run left blank.` : "";
   const message = run.provider === "stub"
-    ? "Run triage skipped — no ANTHROPIC_API_KEY (stub mode)."
-    : `Run triage found ${findings.length} finding(s); ${appliedCount} auto-applied.`;
+    ? `Run triage skipped — no ANTHROPIC_API_KEY (stub mode).${asked}`
+    : `Run triage found ${findings.length} finding(s); ${appliedCount} auto-applied.${asked}`;
   logger.info("triage", message, { runId, projectId });
-  return { runId, provider: run.provider, findings, appliedCount, digestSummary: summary, message };
+  return { runId, provider: run.provider, findings, appliedCount, digestSummary: summary, message, questionsAsked: questions.added };
 }
 
 // ---- safe-fix application (deterministic) ---------------------------------
 
-function applySafeFixes(db: AppDb, projectId: string, findings: TriageFinding[]): number {
+/** `askedKeys`: the per-job keys the run's own blanks already ask on the project. A data-gap finding
+ *  about one of them is that same question — it gets no second item (its words go to the note). */
+function applySafeFixes(db: AppDb, projectId: string, findings: TriageFinding[], askedKeys: Set<string> = new Set()): number {
   let applied = 0;
   for (const f of findings) {
     if (f.fixKind === "learned_topic" && f.target) {
       try { learnNoteTopicsFromMisses(db, [f.target]); f.applied = true; applied++; } catch { /* best-effort */ }
     } else if (f.fixKind === "data_gap") {
-      try { insertTriageReviewItem(db, projectId, f); f.applied = true; applied++; } catch { /* best-effort */ }
+      const binding = perJobRuleFor(`${f.target ?? ""} ${f.title}`)?.binding ?? "";
+      if (binding && askedKeys.has(binding)) { f.applied = true; applied++; continue; }
+      try { insertTriageReviewItem(db, projectId, { fieldName: f.target || "portal_field", sourceExcerpt: f.title }); f.applied = true; applied++; } catch { /* best-effort */ }
     }
   }
   return applied;
 }
 
-function insertTriageReviewItem(db: AppDb, projectId: string, f: TriageFinding): void {
+/**
+ * A 'Run triage' review item. WHAT THE PERSON SEES IS THE QUESTION OR THE FINDING'S TITLE — never the
+ * agent's engineering note (#544): its root cause and suggested fix used to land in notes and
+ * llm_suggested_value, and the dashboard put the suggestion ("Add a systemOwnership field … and bind
+ * it to this question") in an editable box whose Save Edit wrote that sentence into the project. They
+ * now go to the run's triage note only (recordTriageNote). A portal question rides as
+ * portal_question_json and is answered through /api/projects/:id/portal-questions.
+ */
+function insertTriageReviewItem(
+  db: AppDb,
+  projectId: string,
+  item: { fieldName: string; sourceExcerpt: string; portalQuestion?: PerJobPortalQuestion },
+): void {
   const ts = nowIso();
   db.run(
     `INSERT INTO human_review_items
-      (id, project_id, issue_type, field_name, parser_value, llm_suggested_value, source_excerpt, status, notes, created_at, updated_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [id(), projectId, "Run triage", f.target || "portal_field", "", f.suggestedFix, f.title.slice(0, 800), "pending", f.rootCause.slice(0, 400), ts, ts],
+      (id, project_id, issue_type, field_name, parser_value, llm_suggested_value, source_excerpt, status, notes, created_at, updated_at, portal_question_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [id(), projectId, "Run triage", item.fieldName, "", "", item.sourceExcerpt.slice(0, 800), "pending", "", ts, ts,
+      item.portalQuestion ? JSON.stringify(item.portalQuestion) : ""],
   );
 }
 
-function recordTriageNote(db: AppDb, projectId: string, runId: string, findings: TriageFinding[], applied: number): void {
-  if (!findings.length) return;
-  const lines = findings.map((f) => `• [${f.severity}] ${f.title}${f.applied ? " (auto-applied)" : ""} — ${f.suggestedFix}`);
+/** THE RUN'S TRIAGE RECORD: a project note with every finding — its root cause and the suggested fix
+ *  for whoever works on the automation — and the questions asked of the person. */
+function recordTriageNote(db: AppDb, projectId: string, runId: string, findings: TriageFinding[], applied: number, asked: PerJobPortalQuestion[] = []): void {
+  if (!findings.length && !asked.length) return;
+  const lines = [
+    ...findings.map((f) => `• [${f.severity}] ${f.title}${f.applied ? " (auto-applied)" : ""}${f.rootCause ? ` — cause: ${f.rootCause}` : ""} — fix: ${f.suggestedFix}`),
+    ...asked.map((q) => `• [question] left blank for a person, asked on Human Review: "${q.label}" (${q.options.join(" / ")})`),
+  ];
   try {
     addProjectNote(db, projectId, {
       noteType: "system_note",

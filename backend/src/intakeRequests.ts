@@ -12,7 +12,8 @@ import { issuingAgencyFor } from "./permitProcess";
 import { resolvePermitPath } from "./permitPath";
 import { iowaPvWorksheetValues } from "./iowaPvWorksheet";
 import { pvWorksheetRequirement } from "./requiredDocuments";
-import { operatorPolicyAnswer } from "../../shared/src/perJobQuestions";
+import { operatorPolicyAnswer, parsePerJobPortalQuestion, perJobRuleFor, PER_JOB_ANSWER_KEYS } from "../../shared/src/perJobQuestions";
+import { addAuditLog } from "./audit";
 
 // Per-project client intake requests.
 //
@@ -320,15 +321,95 @@ function questionIsOpen(project: ProjectRecord, q: PortalIntakeQuestion, columns
   return true;
 }
 
-/** Bank questions this project has NOT answered yet. */
+/** The project's answer on file for a question key ("" = unanswered): the parser snapshot, the
+ *  record, then the v17 per-job column — the same lookup questionIsOpen reads. */
+export function portalAnswerOnFile(db: AppDb, project: ProjectRecord, key: string): string {
+  return projectAnswer(project, key, perJobColumnAnswers(db, project.id));
+}
+
+/** THE QUESTIONS A RUN LEFT BLANK FOR A PERSON (#544): every PENDING review item that carries one
+ *  (human_review_items.portal_question_json, written by runTriage from the run's own page plan),
+ *  in the portal's own words and options. Before the column exists (an old DB) there are none. */
+function reviewItemPortalQuestions(db: AppDb, projectId: string): PortalIntakeQuestion[] {
+  let rows: Array<{ portal_question_json: string }> = [];
+  try {
+    rows = db.query<{ portal_question_json: string }>(
+      "SELECT portal_question_json FROM human_review_items WHERE project_id = ? AND status = 'pending' AND portal_question_json != '' ORDER BY created_at DESC",
+      [projectId],
+    );
+  } catch { return []; }
+  return normalizeQuestions(rows.map((r) => parsePerJobPortalQuestion(r.portal_question_json)).filter(Boolean));
+}
+
+/** Questions this project has NOT answered yet — the run's own blanks, the bank's, and the form facts.
+ *
+ *  ONE QUESTION PER KEY, AND THE RUN'S WINS. The same key can come from a pending review item (the
+ *  options the portal offered on the latest run) and from the bank (a recipe's recorded options, or
+ *  the canonical vocabulary when the recorder saw none). The answer route validates against THIS
+ *  list, so the options the person was shown on the item are the options the route accepts. */
 export async function unansweredPortalQuestions(db: AppDb, project: ProjectRecord): Promise<PortalIntakeQuestion[]> {
   // FORM FACTS NO DOCUMENT STATES (bcdChecklistFacts.formFactQuestions — roof layer count, module
   // height per the figures, structure description, a city's zoning sign-off when a county issues):
   // asked through the SAME intake mechanism, answered into the project, read by every form.
-  const bank = [...await bankQuestionsForProject(db, project), ...formFactIntakeQuestions(project)];
-  if (!bank.length) return [];
+  const all = [...reviewItemPortalQuestions(db, project.id), ...await bankQuestionsForProject(db, project), ...formFactIntakeQuestions(project)];
+  if (!all.length) return [];
+  const seen = new Set<string>();
+  const bank = all.filter((q) => (seen.has(q.key) ? false : (seen.add(q.key), true)));
   const columns = perJobColumnAnswers(db, project.id);
   return bank.filter((q) => questionIsOpen(project, q, columns));
+}
+
+/** A PORTAL QUESTION ON A REVIEW ITEM CLOSES WHEN IT IS ANSWERED (#544) — by the item itself, the
+ *  parser page's panel or the intake link: every pending item whose key now has an answer on file
+ *  is marked edited (a person supplied the value), and an older triage note about the same question
+ *  is closed with it. Called by the answer doors only, never a read. */
+function closeAnsweredPortalQuestionItems(db: AppDb, projectId: string, actor: string): number {
+  let rows: Array<{ id: string; portal_question_json: string }> = [];
+  try {
+    rows = db.query<{ id: string; portal_question_json: string }>(
+      "SELECT id, portal_question_json FROM human_review_items WHERE project_id = ? AND status = 'pending' AND issue_type = 'Run triage'",
+      [projectId],
+    );
+  } catch { return 0; }
+  if (!rows.length) return 0;
+  const project = getProjectDetail(db, projectId).project;
+  const columns = perJobColumnAnswers(db, projectId);
+  let closed = 0;
+  for (const row of rows) {
+    const q = parsePerJobPortalQuestion(row.portal_question_json);
+    if (!q || !projectAnswer(project, q.key, columns)) continue;
+    db.run("UPDATE human_review_items SET status = 'edited', updated_at = ? WHERE id = ? AND status = 'pending'", [nowIso(), row.id]);
+    addAuditLog(db, projectId, "human", actor, "human_review.updated", { reviewItemId: row.id, action: "edit", fieldName: q.key, via: "portal-questions" });
+    closed++;
+  }
+  for (const key of PER_JOB_ANSWER_KEYS) {
+    if (projectAnswer(project, key, columns)) closed += closeLegacyTriageNotesFor(db, projectId, key, "answered");
+  }
+  return closed;
+}
+
+/**
+ * AN OLDER TRIAGE NOTE ABOUT THE SAME QUESTION IS NOT A SECOND ITEM (#544). A 'Run triage' item with
+ * no portal_question_json is the agent's note (every one written before #544 carries its engineering
+ * text): once its per-job question is asked as a question, or answered, the note is closed, so the
+ * person meets the question once. Matched by the one per-job rule on the note's field and title.
+ */
+export function closeLegacyTriageNotesFor(db: AppDb, projectId: string, key: string, why: "asked" | "answered"): number {
+  let rows: Array<{ id: string; field_name: string; source_excerpt: string }> = [];
+  try {
+    rows = db.query<{ id: string; field_name: string; source_excerpt: string }>(
+      "SELECT id, field_name, source_excerpt FROM human_review_items WHERE project_id = ? AND status = 'pending' AND issue_type = 'Run triage' AND portal_question_json = ''",
+      [projectId],
+    );
+  } catch { return 0; }
+  let closed = 0;
+  for (const row of rows) {
+    if (perJobRuleFor(`${row.field_name} ${row.source_excerpt}`)?.binding !== key) continue;
+    db.run("UPDATE human_review_items SET status = 'approved', updated_at = ? WHERE id = ? AND status = 'pending'", [nowIso(), row.id]);
+    addAuditLog(db, projectId, "system", "portal questions", "human_review.superseded", { reviewItemId: row.id, fieldName: key, why });
+    closed++;
+  }
+  return closed;
 }
 
 // ---------------------------------------------------------------------------
@@ -560,6 +641,7 @@ export function submitIntakeRequest(
         db.run(`UPDATE projects SET ${column} = ?, updated_at = ? WHERE id = ?`, [String(value), nowIso(), row.project_id]);
       } catch { /* pre-v17 DB — the snapshot write above already carries the answer */ }
     }
+    closeAnsweredPortalQuestionItems(db, row.project_id, "intake link");
   }
   db.run("UPDATE project_intake_requests SET fields_json = ?, status = 'completed', completed_at = ? WHERE id = ?", [
     storedJson(fields, questions),
@@ -618,6 +700,7 @@ export async function answerPortalQuestions(
       db.run(`UPDATE projects SET ${column} = ?, updated_at = ? WHERE id = ?`, [String(value), nowIso(), projectId]);
     } catch { /* pre-v17 DB - the snapshot write above already carries the answer */ }
   }
+  closeAnsweredPortalQuestionItems(db, projectId, "operator");
   const stillOpen = await unansweredPortalQuestions(db, getProjectDetail(db, projectId).project);
   return { written, remaining: stillOpen.length };
 }

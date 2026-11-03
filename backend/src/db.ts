@@ -869,6 +869,11 @@ function migrate(db: AppDb): void {
   // next-step panel for one-click confirmation; never written as the filing's number. Its own
   // column, not result_json, so nothing that reads a run's result ever carries these numbers.
   addColumnIfMissing(db, "portal_runs", "submit_capture_candidates", "TEXT NOT NULL DEFAULT ''");
+  // A PORTAL QUESTION A RUN LEFT BLANK FOR A PERSON (#544): JSON { key, label, options, control } —
+  // the per-job key only a person answers, in the portal's own words and options — or ''. Written
+  // only by runTriage from the run's own page plan; the dashboard asks it in place and the answer
+  // goes through /api/projects/:id/portal-questions (intakeRequests), which closes the item.
+  addColumnIfMissing(db, "human_review_items", "portal_question_json", "TEXT NOT NULL DEFAULT ''");
 
   // Per-permit submittal tracks — a project can need NEM (utility), plus either a
   // combined building+electrical permit or SEPARATE building (BLD) and electrical

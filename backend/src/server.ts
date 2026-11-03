@@ -3631,10 +3631,12 @@ app.post("/api/projects/:id/autofill-specs", asyncHandler(async (req, res) => {
   // dead 400. An explicit override always wins over the snapshot.
   const bodyModel = String((req.body as Record<string, unknown>)?.modelOverride || "").trim();
   const bodyQty = Number((req.body as Record<string, unknown>)?.qtyOverride || 0);
-  const model = bodyModel || String(snap.invModel || snap.pvMicroModel || "").trim();
-  const qtyRaw = bodyQty > 0 ? bodyQty : Number(snap.invQty || snap.pvMicroQty || 0);
+  // The same keys, in the same order, as the dashboard's inverter item prefills from (#544:
+  // inverterSpecsFromSnapshot) — so the model the person sees is the model looked up.
+  const model = bodyModel || String(snap.invModel || snap.inverterModel || snap.pvMicroModel || "").trim();
+  const qtyRaw = bodyQty > 0 ? bodyQty : Number(snap.invQty || snap.inverterQty || snap.inverterQuantity || snap.inverterCount || snap.pvMicroQty || 0);
   const qty = Number.isFinite(qtyRaw) && qtyRaw > 0 ? qtyRaw : undefined;
-  if (!model) throw new HttpError(400, "No inverter model found. Type the inverter/microinverter model in the field above the button, then try Auto-fill again.");
+  if (!model) throw new HttpError(400, "No inverter model on file. Type the inverter or microinverter model on the Inverter output item, then look it up again.");
 
   const { createLLMProvider } = await import("./llm");
   const llm = createLLMProvider();
