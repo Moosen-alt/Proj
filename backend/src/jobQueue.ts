@@ -986,6 +986,9 @@ async function runClaimedJob(db: AppDb, job: JobRecord): Promise<boolean> {
       const run = await runPermitProcessLookup(db, createLLMProvider(), {
         state: String(p.state || ""), ahj: String(p.ahj || ""), utility: String(p.utility || ""),
         dcKw: String(p.dcKw || ""), acKw: String(p.acKw || ""), permitPath: String(p.permitPath || ""),
+        // A PERSON'S REFRESH (#560: POST /api/projects/:id/permit-process/refresh) re-runs over a
+        // complete seeded row; a verified row is still refused by runPermitProcessLookup (rule 3).
+        force: p.force === true || String(p.force ?? "") === "1",
         onIssuerKnown: () => { void queueFeeResearch(); },
       });
       result = { saved: run.saved, reason: run.reason, calls: run.calls };

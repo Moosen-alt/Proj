@@ -75,6 +75,21 @@ const codeEditionSchema = z.object({
   notes: z.string().max(500).optional(),
 });
 
+// A PERSON VERIFIES OR REPLACES AN AHJ'S PERMIT-PROCESS LOOKUP (#560). No `permits`: verify the row
+// as it stands. `permits`: the person's list replaces the row's (permitProcess.verifyPermitProcessLookup).
+// No portal and no fee field: the portal door and the fee path are their own (rule 5, fee research).
+const personFactUrl = z.string().trim().max(500).regex(/^https?:\/\//i, "must be the http(s) page the fact was read on");
+export const permitProcessVerifySchema = z.object({
+  verifiedBy: z.string().max(120).optional(),
+  permits: z.array(z.object({
+    discipline: z.enum(["structural", "electrical", "combo", "other"]),
+    label: z.string().max(160).optional(),
+    issuingAgency: z.object({ value: z.string().trim().min(1).max(300), sourceUrl: personFactUrl, quote: z.string().max(300).optional() }).optional(),
+    recordType: z.object({ value: z.string().trim().min(1).max(300), sourceUrl: personFactUrl, quote: z.string().max(300).optional() }).optional(),
+    documents: z.object({ value: z.array(z.string().trim().min(1).max(300)).min(1).max(40), sourceUrl: personFactUrl, quote: z.string().max(300).optional() }).optional(),
+  })).min(1).max(6).optional(),
+});
+
 export const codeProfileVerifySchema = z.object({
   state: z.string().min(2).max(40),
   ahj: z.string().max(160).optional().default(""),
