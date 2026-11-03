@@ -37,12 +37,18 @@ export interface UtilityFilingLocation {
   /** The application portal's own entry URL — null when the utility names a method, not a URL. */
   url: string | null;
 }
+/** The filing fact as stored. `droppedUrls` (PR #369, review round 4): the filing URL(s) the answer
+ *  named that the door (acceptFilingUrl) did NOT keep — a permit vendor's portal, a host the search
+ *  never returned, a page off the platform the answer names. Kept as EVIDENCE of where the utility's
+ *  own lookup says it files (infoPages reads it as caution, and by host), never as a portal: nothing
+ *  resolves, shows or launches it. Rows written before round 4 do not carry it. */
+export type UtilityFilingFact = CitedFact<UtilityFilingLocation> & { droppedUrls?: string[] };
 export interface UtilityFilingLookup {
   profileKey: string;
   state: string;
   utility: string;
   confidence: "seeded" | "verified";
-  filing: CitedFact<UtilityFilingLocation>;
+  filing: UtilityFilingFact;
   program: CitedFact<UtilityProgramKind>;
   /** The program in the utility's own words ("Customer Generation", "Net Metering Rider"). */
   programName?: string;
@@ -173,7 +179,7 @@ export function acceptFilingUrl(url: string, seenUrls: string[], namedPlatform: 
   return { url: u, why: "" };
 }
 
-export function parseUtilityFilingAnswer(text: string, seenUrls: string[]): { filing: CitedFact<UtilityFilingLocation>; program: CitedFact<UtilityProgramKind>; programName: string; dropped: string[] } {
+export function parseUtilityFilingAnswer(text: string, seenUrls: string[]): { filing: UtilityFilingFact; program: CitedFact<UtilityProgramKind>; programName: string; dropped: string[] } {
   let json: Record<string, unknown> | null = null;
   const t = str(text);
   const start = t.indexOf("{");
@@ -182,8 +188,9 @@ export function parseUtilityFilingAnswer(text: string, seenUrls: string[]): { fi
     try { json = JSON.parse(t.slice(start, end + 1)) as Record<string, unknown>; } catch { json = null; }
   }
   const dropped: string[] = [];
+  const droppedUrls: string[] = [];
   const rawFiling = (json?.filing ?? null) as RawFact;
-  const filing = cited<UtilityFilingLocation>(
+  const cites = cited<UtilityFilingLocation>(
     rawFiling, seenUrls,
     (v) => {
       const o = (v && typeof v === "object" ? v : { name: v }) as Record<string, unknown>;
@@ -192,12 +199,17 @@ export function parseUtilityFilingAnswer(text: string, seenUrls: string[]): { fi
       // dropped off-platform URL still leaves "PowerClerk — tenant URL unconfirmed" on the card.
       const name = str(o.name) || namedInterconnectionPlatforms(named)[0] || "";
       const accepted = acceptFilingUrl(str(o.url), seenUrls, named);
-      if (str(o.url) && !accepted.url) dropped.push(`filing URL ${str(o.url)} dropped: ${accepted.why}`);
+      if (str(o.url) && !accepted.url) {
+        dropped.push(`filing URL ${str(o.url)} dropped: ${accepted.why}`);
+        // The URL as the answer named it — evidence, never a portal (UtilityFilingFact).
+        if (portalHostOf(str(o.url))) droppedUrls.push(str(o.url).slice(0, 500));
+      }
       if (!name && !accepted.url) return null;
       return { name: name || portalHostOf(accepted.url!), url: accepted.url };
     },
     quoteNamesFiling, "filing location",
   );
+  const filing: UtilityFilingFact = droppedUrls.length ? { ...cites, droppedUrls } : cites;
   const rawProgram = (json?.program ?? null) as RawFact;
   const program = cited<UtilityProgramKind>(
     rawProgram, seenUrls,
@@ -290,7 +302,7 @@ export async function runUtilityFilingLookup(
   const programName = keepProgram ? existing?.programName ?? "" : parsed.programName;
   const save = saveUtilityFilingLookup(db, {
     state: input.state, utility: input.utility,
-    filing: (keepFiling ? existing!.filing : parsed.filing) as CitedFact<UtilityFilingLocation>,
+    filing: (keepFiling ? existing!.filing : parsed.filing) as UtilityFilingFact,
     program: (keepProgram ? existing!.program : parsed.program) as CitedFact<UtilityProgramKind>,
     ...(programName ? { programName } : {}),
     lookedUpAt: new Date().toISOString(),
