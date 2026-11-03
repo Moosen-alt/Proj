@@ -1,5 +1,5 @@
 import "dotenv/config";
-import { validate, portalCredentialCreateSchema, portalCredentialUpdateSchema, autoLearnSchema, codeProfileResearchSchema, codeProfileVerifySchema, reviewSubjectSchema } from "./validation";
+import { validate, portalCredentialCreateSchema, portalCredentialUpdateSchema, autoLearnSchema, codeProfileResearchSchema, codeProfileVerifySchema, permitProcessVerifySchema, reviewSubjectSchema } from "./validation";
 import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import express, { type NextFunction, type Request, type Response } from "express";
@@ -141,6 +141,7 @@ import {
   getOperationsDailyReport,
   getProjectCommunicationDrafts,
   getProjectDetail,
+  rejudgeQcDocumentsAfterLookup,
   getProjectHandoffPacket,
   getProjectList,
   getProjectProcessMap,
@@ -170,7 +171,7 @@ import { createSignatureRequestApproval } from "./signatureRequestApproval";
 import { confirmSignatureRequestSent } from "./signatureTrack";
 import { getSubmittalTracks, markTrackSubmitted } from "./submittalTracks";
 import { buildApprovalSheet } from "./approvalSheet";
-import { projectForTrack } from "./permitProcess";
+import { getPermitProcessLookup, projectForTrack, verifyPermitProcessLookup } from "./permitProcess";
 import { ahjProcessKnowledgeStatus, AHJ_PROCESS_REFERENCE_ENV } from "./processProfiles";
 import { enqueueStageSteps } from "./autoStageSteps";
 import type { ClientResolution, EditionProposalDecisionResult, ParserExtractionResponse, SubmittalTrackType } from "../../shared/src/types";
@@ -2335,6 +2336,50 @@ app.post("/api/projects/:id/research-ahj", asyncHandler(async (req, res) => {
   } catch (err) {
     throw normalizeLlmError(err);
   }
+}));
+
+// THIS PROJECT'S AHJ PROCESS LOOKUP: READ, VERIFY / REPLACE, REFRESH (#560). Saratoga Springs, UT's
+// lookup cited the city's retired solar PDF and nothing could correct it: no route read, wrote,
+// verified or forced permit_process_lookups. Under /api/projects/:id, so each inherits the tenancy
+// guard (rule 6) and getProjectDetail 404s an unknown or out-of-scope project first; the row itself
+// is SHARED knowledge on purpose (one AHJ's process serves every tenant), keyed by the project's
+// own state + AHJ — a body never names another AHJ.
+//   GET     the row on file (null when none).
+//   PUT     .../verify — a NAMED PERSON (namedPersonDecider: the signed-in user; with auth off the
+//           name sent, or a 400) verifies the row as it stands, or replaces its permits. Lands
+//           'verified'; research never overwrites it again (rule 3). QC's document rows re-judged.
+//   POST    .../refresh — re-runs the lookup with `force` over a SEEDED row (a verified one is a
+//           409: verify or replace it instead). 202 with the job.
+app.get("/api/projects/:id/permit-process", (req, res) => {
+  const { project } = getProjectDetail(db, String(req.params.id));
+  res.json({ state: project.state, ahj: project.ahj, lookup: String(project.ahj || "").trim() ? getPermitProcessLookup(db, project.state, project.ahj) : null });
+});
+app.put("/api/projects/:id/permit-process/verify", (req, res) => {
+  const projectId = String(req.params.id);
+  const { project } = getProjectDetail(db, projectId);
+  const b = validate(permitProcessVerifySchema, req.body);
+  // Named BEFORE anything is written: a blank name (auth off) is a 400 that verifies nothing.
+  const verifiedBy = namedPersonDecider(req, "verifiedBy",
+    "Sign in to verify a permit-process lookup.",
+    "Name the person verifying: a permit-process lookup is verified by a named person.");
+  const r = verifyPermitProcessLookup(db, { state: project.state, ahj: project.ahj }, { verifiedBy, ...(b.permits ? { permits: b.permits } : {}) });
+  if (!r.saved) throw new HttpError(r.lookup ? 409 : 400, r.reason);
+  addAuditLog(db, projectId, "human", verifiedBy, b.permits ? "permit_process.replaced" : "permit_process.verified", {
+    ahj: project.ahj, state: project.state, permits: (r.lookup?.permits ?? []).map((p) => p.discipline),
+  });
+  let rejudged: string[] = [];
+  try { rejudged = rejudgeQcDocumentsAfterLookup(db, { state: project.state, ahj: project.ahj }, "permit_process_verified"); } catch { rejudged = []; }
+  res.json({ lookup: r.lookup, rejudgedProjects: rejudged.length });
+});
+app.post("/api/projects/:id/permit-process/refresh", asyncHandler(async (req, res) => {
+  const projectId = String(req.params.id);
+  const { project } = getProjectDetail(db, projectId);
+  const requestedBy = AUTH_ENABLED ? String(currentUser(db, req)?.email || currentUser(db, req)?.name || "") : String(req.body?.requestedBy || "").trim().slice(0, 120);
+  const { queueProcessLookupRefresh } = await import("./permitProcessLookup");
+  const r = await queueProcessLookupRefresh(db, project as never, requestedBy);
+  if (!r.queued) throw new HttpError(r.status, r.reason);
+  addAuditLog(db, projectId, "human", requestedBy || "dashboard", "permit_process.refresh_requested", { ahj: project.ahj, state: project.state, jobId: r.jobId ?? null });
+  res.status(202).json({ queued: true, jobId: r.jobId, reason: r.reason, lookupKey: r.lookupKey });
 }));
 
 // THE MANUAL WRITER. The body is passed through as recordPermitStatusCheck's input, so

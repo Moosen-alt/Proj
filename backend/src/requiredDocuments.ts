@@ -373,6 +373,55 @@ export function sheetInPlanSet(project: ProjectRecord, docType: string, docsByTy
   return readyLine || splitLine;
 }
 
+// A CITY FORM BOUND INTO THE PLAN SET (#560). Saratoga Springs, UT's QC said "5 of 7 missing" and
+// counted the city's form as missing while that form was a PAGE of the uploaded plan set: the split
+// map names plan sheets only, so nothing looked. The plan set's extracted text is one line per page
+// (batchImport.extractPdfText), so a page is read whole, and it counts as the form only when it
+// READS as that AHJ's form, not as a sheet that mentions one:
+//   - the plan-set FILE exists (never prose alone — the same floor as sheetInPlanSet);
+//   - the form's title opens the page (its first 240 characters) — the slot's own words: an
+//     electrical application for electrical_application, a building / solar one for the building
+//     slot, any permit application for permit_application, a solar checklist for that slot;
+//   - the page names THIS AHJ (every distinctive word of its name), so another city's form bound
+//     in by mistake does not count;
+//   - the page carries form fields: a signature line and at least two more blanks (applicant, owner,
+//     contractor, licence number, valuation, parcel, job / project address, phone, e-mail);
+//   - and it is not a drawing sheet (sheet number, scale, drawn by, PV-n) — a cover sheet's index
+//     lists "permit application" beside the owner and contractor.
+// ADVISORY ONLY: it answers the required-list row (docs.complete) — never the blocking inventory, and
+// owedAttachmentsFor attaches only a file in the slot, so nothing is uploaded on the strength of it.
+const FORM_TITLE_FOR_SLOT: Record<string, RegExp> = {
+  electrical_application: /\belectrical\b[\w\s/&().-]{0,40}?\bapplication\b|\bapplication\s+for\s+(?:an?\s+)?electrical\b/i,
+  building_application: /\b(?:building|structural|solar|photovoltaic|pv|residential)\b[\w\s/&().-]{0,40}?\bapplication\b|\bapplication\s+for\s+(?:a\s+)?(?:building|solar)\b/i,
+  permit_application: /\bpermit\s+application\b|\bapplication\s+for\s+(?:an?\s+)?(?:[\w-]+\s+){0,2}permit\b/i,
+  solar_checklist: /\bsolar\b[\w\s/&().-]{0,40}?\bchecklist\b/i,
+};
+const FORM_FIELD_LABELS: RegExp[] = [
+  /\bapplicant\b/i, /\b(?:property\s+)?owner(?:'s)?\s+name\b|\bproperty\s+owner\b/i, /\bcontractor\b/i,
+  /\blicen[cs]e\s*(?:no\.?|number|#)/i, /\bvaluation\b/i, /\bparcel\b/i, /\b(?:job|project|site)\s+(?:site\s+)?address\b/i,
+  /\bphone\b/i, /\be-?mail\b/i,
+];
+const DRAWING_SHEET_MARKS = /\bsheet\s*(?:no\.?|number|#)|\bscale\s*:|\bdrawn\s+by\b|\bPV[-\s]?\d{1,2}(?:\.\d)?\b/i;
+const GENERIC_AHJ_WORDS = new Set(["city", "town", "village", "county", "borough", "township", "parish", "of", "the", "unincorporated"]);
+export function formPageInPlanSet(project: ProjectRecord, docTypes: string[], docsByType: Record<string, string>): boolean {
+  if (!planSetPresent(docsByType)) return false;
+  const titles = docTypes.map((t) => FORM_TITLE_FOR_SLOT[t]).filter(Boolean);
+  if (!titles.length) return false;
+  const ahjWords = normalizeAhjName(String(project.ahj || "")).split(" ").filter((w) => w.length > 1 && !GENERIC_AHJ_WORDS.has(w));
+  if (!ahjWords.length) return false;
+  const text = snap(project, "planSetExtractedText");
+  if (!text) return false;
+  return text.split(/\n+/).some((page) => {
+    const head = page.slice(0, 240);
+    if (!titles.some((re) => re.test(head))) return false;
+    if (DRAWING_SHEET_MARKS.test(page)) return false;
+    const lower = page.toLowerCase().replace(/[^a-z0-9]+/g, " ");
+    if (!ahjWords.every((w) => new RegExp(`\\b${w}\\b`).test(lower))) return false;
+    if (!/\bsignature\b/i.test(page)) return false;
+    return FORM_FIELD_LABELS.filter((re) => re.test(page)).length >= 2;
+  });
+}
+
 function present(
   item: RequiredDocItem,
   project: ProjectRecord,
@@ -1438,6 +1487,8 @@ export function requiredListCheck(db: AppDb, project: ProjectRecord, inventory: 
       // A sheet the inventory does not list as its own row may still be inside the plan set.
       if (PLAN_SHEET_HINTS[t] && sheetInPlanSet(project, t, uploads)) return { text, docTypes, present: true, via: "in plan set" };
     }
+    // The AHJ's own form, bound in as a page of the plan set (#560) — advisory, this row only.
+    if (formPageInPlanSet(project, docTypes, uploads)) return { text, docTypes, present: true, via: "a page of the plan set" };
     return { text, docTypes, present: false, via: "" };
   });
   return { source, sourceLabel, items, missing: items.filter((i) => !i.present && !i.skipped) };
