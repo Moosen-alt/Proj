@@ -10876,9 +10876,17 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     if (!this.pageExitReads.unread.includes(page)) this.pageExitReads.unread.push(page);
     const strayWrites = this.pageEquipmentStrays.splice(0);
     const unheld = ledger ? await this.recordUnheldEquipment(ledger) : [];
-    const validation = await this.collectFieldValidationErrors();
-    const unchecked = await this.collectRequiredUnchecked();
-    const stale = this.page ? await computeStaleAtExit(this.page) : null;
+    let validation = await this.collectFieldValidationErrors();
+    let unchecked = await this.collectRequiredUnchecked();
+    let stale = this.page ? await computeStaleAtExit(this.page) : null;
+    // A page mid-postback (an autopostback select, a re-render) can refuse an evaluate for a moment:
+    // one bounded wait and one more try for whatever did not answer, before the page is called unread.
+    if ((validation === null || unchecked === null || stale === null) && this.page && typeof this.page.waitForLoadState === "function") {
+      await this.page.waitForLoadState("domcontentloaded", { timeout: 5_000 }).catch(() => null);
+      if (validation === null) validation = await this.collectFieldValidationErrors();
+      if (unchecked === null) unchecked = await this.collectRequiredUnchecked();
+      if (stale === null) stale = await computeStaleAtExit(this.page);
+    }
     const where = safeHostPath(url);
     const missing = [validation === null ? "validation" : "", unchecked === null ? "required checkboxes" : "", stale === null ? "computed totals" : ""].filter(Boolean);
     if (missing.length) {
