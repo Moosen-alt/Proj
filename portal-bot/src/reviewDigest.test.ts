@@ -11,7 +11,8 @@
 //   (f) UNREADABLE, by name, never hashed: over 400 rows, over 64 KB, nothing read, a dialog, a
 //       cross-origin frame, a step that opens by a script, no step links on a multi-page recipe,
 //       writes blocked during the walk, two reads that disagree, no key, no draft id, a walk the
-//       navigator refuses before it opens anything (f6).
+//       navigator refuses before it opens anything (f6), fewer step pages opened than the recipe
+//       walks (f7, the page-count floor).
 //   (g) RULING 7, pinned: the cue and token patterns are exactly these; "Last saved 2:41 PM" and
 //       "Last saved 3:05 PM" read the same, but the name beside it, a control's value, and a time on
 //       a line with no cue all still count.
@@ -32,6 +33,7 @@
 //   K5 walkStagedDraft: push a non-navigable link as read → (f) "opens by a script" fails.
 //   K6 buildStagedReviewCapture: approvable ignores `why` → every (f) case fails.
 //   K10 walkStagedDraft: ignore nav.refusal() → (f6) fails (the refused walk opens the review page).
+//   K11 walkStagedDraft: drop the page-count floor → (f7) fails (1 of 3 step pages read, approvable).
 //   K9 stagedReviewExpectedPages: count only /^advance\b/ notes (the pre-fix heuristic) → (k) fails.
 //
 //   npx tsx portal-bot/src/reviewDigest.test.ts
@@ -208,6 +210,27 @@ await check("(f6) a walk the navigator refuses (dialogs unwatchable, or the wind
   // MUST PASS: a navigator with no refusal walks as before.
   const ok = await walkStagedDraft(Object.assign(stubNav(pagesOf(), [link("Customer", S1)]), { refusal: () => "" }), { reviewUrl: REVIEW_URL, gapMs: 0 });
   assert.equal(buildStagedReviewCapture({ walk: ok, secrets: [], key: KEY, nonce: NONCE }).approvable, true);
+});
+
+await check("(f7) the page-count floor: a recipe of 4 pages whose review page opened 1 step page is refused by that count, named", async () => {
+  // The skeptic's shape: the step list offered 5 tabs, the reader found 1 link (the rest were named
+  // or missed); the recipe walks 4 pages. Before the floor this read approvable with no reason.
+  const one = await walkStagedDraft(stubNav(pagesOf(), [link("Customer Information", S1)]), { reviewUrl: REVIEW_URL, gapMs: 0, expectedPages: 4 });
+  const c = buildStagedReviewCapture({ walk: one, secrets: [], key: KEY, nonce: NONCE });
+  assert.equal(c.approvable, false, "MUST-EXCLUDE: 1 of 3 step pages read and the row is approvable");
+  assert.equal(c.digest, "");
+  assert.ok(c.why.some((w) => /the recipe walks 4 page\(s\) but only 1 step page\(s\) besides the review page could be opened by navigation alone/.test(w)), c.why.join(" | "));
+  // MUST PASS: as many step pages as the recipe walks (or more) is the floor met.
+  const met = await walkStagedDraft(stubNav(pagesOf(), [link("Customer", S1), link("Equipment", S2)]), { reviewUrl: REVIEW_URL, gapMs: 0, expectedPages: 3 });
+  assert.equal(buildStagedReviewCapture({ walk: met, secrets: [], key: KEY, nonce: NONCE }).approvable, true, "3 pages walked, 2 step pages + review read: refused");
+  const more = await walkStagedDraft(stubNav(pagesOf(), [link("Customer", S1), link("Equipment", S2)]), { reviewUrl: REVIEW_URL, gapMs: 0, expectedPages: 1 });
+  assert.equal(buildStagedReviewCapture({ walk: more, secrets: [], key: KEY, nonce: NONCE }).approvable, true, "a one-page recipe whose draft shows two more steps: refused");
+  // A step that is found but not opened does not count toward the floor.
+  const named = await walkStagedDraft(stubNav(pagesOf(), [link("Customer", S1), { label: "Interconnection Request", href: "", navigable: false, why: "its name or its link reads as an action, so the walk never opens it" }]), { reviewUrl: REVIEW_URL, gapMs: 0, expectedPages: 3 });
+  const cn = buildStagedReviewCapture({ walk: named, secrets: [], key: KEY, nonce: NONCE });
+  assert.equal(cn.approvable, false);
+  assert.ok(cn.why.some((w) => /step "Interconnection Request" cannot be opened by navigation alone \(its name or its link reads as an action/.test(w)), cn.why.join(" | "));
+  assert.ok(cn.why.some((w) => /the recipe walks 3 page\(s\) but only 1 step page/.test(w)), cn.why.join(" | "));
 });
 
 await check("(f5) ruling 3: an uploaded file the draft's pages list is 'listed'; one they do not list is named and the row is not approvable", () => {

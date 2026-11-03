@@ -27,7 +27,10 @@
 //   run's context — never the window a person submits in — by their step tabs/links only (a GET),
 //   never Next / Save / Submit or anything that autosaves. The walk page aborts and counts every
 //   request that is not a GET (its own read-only lock; the context's network backstop still judges
-//   each GET). A step that cannot be opened by a plain link is named, and the row is unapprovable.
+//   each GET). A step that cannot be opened by a plain link is named, and the row is unapprovable:
+//   a step link the walk will not open (its name or path reads as an action, it opens by a script,
+//   it has no name) is NAMED, never dropped; and a walk that opened fewer step pages than the recipe
+//   walks (stepsRead + 1 < expectedPages) is refused by that count (the page-count floor).
 //   walkStagedDraft takes a DigestNavigator, so a test stubs the whole walk.
 // RULE 2: raw values reach Node only to be HMACed here (stagedReviewDigestKey: a scrypt subkey of
 //   SESSION_ENCRYPTION_KEY, and the row's own nonce), then dropped. Labels and display values pass
@@ -359,9 +362,10 @@ export interface DigestWalk {
 /**
  * WALK THE STAGED DRAFT READ-ONLY. Opens the review page by its link, reads it twice, runs
  * `atReview` there (the adapter's page-level checks and the masked picture), then opens each step
- * by its link and reads it twice. `expectedPages` is how many pages the recipe walks: a recipe of
- * more than one page whose review page offers no step link cannot be compared beyond the review
- * page, and says so. Never throws.
+ * by its link and reads it twice. A step link the walk will not open is named (never skipped).
+ * `expectedPages` is how many pages the recipe walks: a recipe of more than one page whose review
+ * page offers no step link cannot be compared beyond the review page, and says so; nor can one
+ * whose review page opened fewer step pages than the recipe walked (the page-count floor). Never throws.
  */
 export async function walkStagedDraft(nav: DigestNavigator, opts: {
   reviewUrl: string;
@@ -422,6 +426,12 @@ export async function walkStagedDraft(nav: DigestNavigator, opts: {
           }
           stepsRead++;
           sections.push(await readTwice(step, whereOf(link.href)));
+        }
+        // THE PAGE-COUNT FLOOR: the recipe walked `expectedPages` pages (the review page among them);
+        // fewer step pages opened than that is a draft not read in full, whatever the links said.
+        const expected = opts.expectedPages ?? 1;
+        if (links.length && stepsRead + 1 < expected) {
+          reasons.push(`the recipe walks ${expected} page(s) but only ${stepsRead} step page(s) besides the review page could be opened by navigation alone`);
         }
       }
     }
@@ -585,11 +595,18 @@ export function unapprovableStagedReview(why: string, reviewUrl = ""): StagedRev
 // The Playwright navigator: a separate page of the run's context, its own read-only lock.
 // ---------------------------------------------------------------------------------------------
 
-/** Runs IN THE PAGE: the step tabs / links of a wizard. A link that acts on a GET (sign out, delete,
- *  withdraw, cancel, new, copy...) and any Next / Save / Submit is never a step. Only links inside a
- *  step-shaped container (a tablist, or a container whose class or id names steps / a wizard /
- *  progress / tabs) that point at this draft (same origin, and the same path, or a shared query
- *  parameter such as PowerClerk's ProjectId) are steps. */
+/** Runs IN THE PAGE: the step tabs / links of a wizard. Only links inside a step-shaped container (a
+ *  tablist, or a container whose class or id names steps / a wizard / progress / tabs) that point at
+ *  this draft (same origin, and the same path, or a shared query parameter such as PowerClerk's
+ *  ProjectId) are candidates; the link to the page being read is that page, already read.
+ *  EVERY OTHER CANDIDATE IS RETURNED — none is dropped. One the walk will not open is returned
+ *  `navigable: false` with its reason, so the row names it and is not approvable (ruling 2: every step
+ *  page is read, or the row says which one was not): a name that reads as an action on a GET (sign
+ *  out, delete, withdraw, cancel, new, copy, print, request... and any Next / Save / Submit — even
+ *  "Interconnection Request" or "Battery Back-up", which may well be steps: the walk never guesses),
+ *  a link whose path names an action, a step that opens by a script or has no link or no name.
+ *  What the walk OPENS is unchanged by this: only a named, plain, same-draft link that reads as no
+ *  action. Open shadow roots are searched too. */
 export function stepLinksInPage(): Array<{ label: string; href: string; navigable: boolean; why: string }> {
   const clean = (s: unknown): string => String(s == null ? "" : s).replace(/\s+/g, " ").trim();
   const here = new URL(location.href);
@@ -599,13 +616,24 @@ export function stepLinksInPage(): Array<{ label: string; href: string; navigabl
   const ACTS = /\b(log\s*-?\s*(out|off)|sign\s*-?\s*out|delete|remove|withdraw|cancel|discard|submit|save|next|continue|back|previous|pay|new|create|copy|clone|duplicate|print|download|export|request|send|e-?sign)\b/i;
   const ACT_PATH = /logout|logoff|signout|sign-out|delete|remove|withdraw|cancel|discard|copy|clone/i;
   const STEPPY = /(^|[\s_-])(steps|stepper|step-?nav|step-?list|wizard|progress|tabs|tablist|form-?nav|form-?steps)([\s_-]|$)/i;
-  const containers: Element[] = [];
-  for (const el of Array.from(document.querySelectorAll('[role="tablist"], [class], [id]'))) {
-    if (el.getAttribute("role") === "tablist" || STEPPY.test(String(el.getAttribute("class") || "")) || STEPPY.test(String(el.getAttribute("id") || ""))) containers.push(el);
-  }
+  // Every element in tree order, open shadow roots included (a step list inside a web component).
+  const all: Element[] = [];
+  const collect = (root: Document | ShadowRoot | Element): void => {
+    for (const el of Array.from(root.children)) {
+      all.push(el);
+      const sr = (el as HTMLElement).shadowRoot;
+      if (sr) collect(sr);
+      collect(el);
+    }
+  };
+  collect(document);
+  const containers = all.filter((el) => el.getAttribute("role") === "tablist" || STEPPY.test(String(el.getAttribute("class") || "")) || STEPPY.test(String(el.getAttribute("id") || "")));
   const out: Array<{ label: string; href: string; navigable: boolean; why: string }> = [];
   const seen = new Set<Element>();
   const hrefs = new Set<string>();
+  const hereNoHash = new URL(location.href);
+  hereNoHash.hash = "";
+  const ACTION_WHY = "its name or its link reads as an action, so the walk never opens it";
   for (const c of containers) {
     for (const a of Array.from(c.querySelectorAll('a, [role="tab"]'))) {
       if (seen.has(a)) continue;
@@ -613,25 +641,28 @@ export function stepLinksInPage(): Array<{ label: string; href: string; navigabl
       const r = (a as HTMLElement).getBoundingClientRect();
       if (r.width < 1 || r.height < 1) continue;
       const label = clean((a as HTMLElement).innerText || a.getAttribute("aria-label") || a.getAttribute("title") || "");
-      if (!label || ACTS.test(label)) continue;
       const raw = a.getAttribute("href");
-      if (raw == null || raw === "" || /^\s*#/.test(raw) || /^\s*javascript:/i.test(raw)) {
-        out.push({ label, href: "", navigable: false, why: raw && /javascript:/i.test(raw) ? "it opens by a script" : "it has no link" });
-        continue;
+      const scripted = raw == null || raw === "" || /^\s*#/.test(raw) || /^\s*javascript:/i.test(raw);
+      let href = "";
+      let actPath = false;
+      if (!scripted) {
+        let u: URL;
+        try { u = new URL(String(raw), location.href); } catch { out.push({ label: label || "(unnamed step)", href: "", navigable: false, why: "its link does not parse" }); continue; }
+        // Not this draft's page: another site, another scheme, a path and query that share nothing.
+        if (!/^https?:$/.test(u.protocol) || u.origin !== here.origin) continue;
+        let shares = u.pathname === here.pathname || u.pathname.replace(/\/[^/]*$/, "/") === hereDir;
+        u.searchParams.forEach((v, k) => { if (v && hereParams.has(`${k.toLowerCase()}=${v}`)) shares = true; });
+        if (!shares) continue;
+        u.hash = "";
+        href = u.toString();
+        // The page being read IS this page (the review page's own "Review and Submit" tab): read already.
+        if (href === hereNoHash.toString() || hrefs.has(href)) continue;
+        hrefs.add(href);
+        actPath = ACT_PATH.test(u.pathname);
       }
-      let u: URL;
-      try { u = new URL(raw, location.href); } catch { continue; }
-      if (!/^https?:$/.test(u.protocol) || u.origin !== here.origin) continue;
-      if (ACT_PATH.test(u.pathname)) continue;
-      let shares = u.pathname === here.pathname || u.pathname.replace(/\/[^/]*$/, "/") === hereDir;
-      u.searchParams.forEach((v, k) => { if (v && hereParams.has(`${k.toLowerCase()}=${v}`)) shares = true; });
-      if (!shares) continue;
-      u.hash = "";
-      const href = u.toString();
-      const hereNoHash = new URL(location.href);
-      hereNoHash.hash = "";
-      if (href === hereNoHash.toString() || hrefs.has(href)) continue;
-      hrefs.add(href);
+      if (ACTS.test(label) || actPath) { out.push({ label: label || "(unnamed step)", href: "", navigable: false, why: ACTION_WHY }); continue; }
+      if (!label) { out.push({ label: "(unnamed step)", href: "", navigable: false, why: "it has no name, so the walk never opens it" }); continue; }
+      if (scripted) { out.push({ label, href: "", navigable: false, why: raw && /javascript:/i.test(raw) ? "it opens by a script" : "it has no link" }); continue; }
       out.push({ label, href, navigable: true, why: "" });
     }
   }
