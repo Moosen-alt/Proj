@@ -190,6 +190,16 @@ await check("(f3) refused by name: a dialog, a cross-origin frame, an unreadable
   assert.ok(c4.why.some((w) => /Equipment: the page changed between two reads \(System Size \(kW DC\)\)/.test(w)), c4.why.join(" | "));
 });
 
+await check("(f5) ruling 3: an uploaded file the draft's pages list is 'listed'; one they do not list is named and the row is not approvable", () => {
+  const items = [...BASE, { kind: "line" as const, label: "", value: "site-plan.pdf  uploaded 11/02/2026" }];
+  const listed = buildStagedReviewCapture({ walk: walkOf(items), secrets: [], key: KEY, nonce: NONCE, uploads: [{ fileName: "site-plan.pdf", docType: "site_plan" }] });
+  assert.ok(listed.approvable, listed.why.join("; "));
+  assert.deepEqual(listed.attachments.map((a) => [a.name, a.listed]), [["site-plan.pdf", true]]);
+  const absent = buildStagedReviewCapture({ walk: walkOf(items), secrets: [], key: KEY, nonce: NONCE, uploads: [{ fileName: "one-line.pdf", docType: "sld" }] });
+  assert.equal(absent.approvable, false);
+  assert.ok(absent.why.some((w) => /attachment: one-line\.pdf is not listed on the draft's pages/.test(w)), absent.why.join(" | "));
+});
+
 await check("(f4) refused by name: no key (nothing hashed), and no draft id in the review link", () => {
   const c1 = buildStagedReviewCapture({ walk: walkOf(BASE), secrets: [], key: null, nonce: NONCE });
   assert.equal(c1.approvable, false);

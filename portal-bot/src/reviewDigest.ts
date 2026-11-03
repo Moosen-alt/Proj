@@ -543,6 +543,8 @@ export function buildStagedReviewCapture(input: BuildDigestInput): StagedReviewC
     const want = String(u.fileName ?? "").toLowerCase();
     return { name: red(String(u.fileName ?? "")), docType: String(u.docType ?? ""), sha256, listed: !!want && allText.some((t) => t.includes(want)) };
   });
+  // RULING 3 (a): the approved Stage's uploads are trusted only while the draft's pages still list each.
+  for (const a of attachments) if (!a.listed) why.push(`attachment: ${a.name || "(unnamed file)"} is not listed on the draft's pages`);
   const approvable = !!mac && why.length === 0 && sections.length > 0 && sections.every((s) => !s.unreadable);
   const digest = approvable && mac
     ? mac([`v${REVIEW_DIGEST_VERSION}`, nonce, "draft", draftId, sections.map((s) => s.digest).join(",")].join(SEP))

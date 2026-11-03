@@ -181,6 +181,14 @@ await check("(f) a trackless (permit) stage never asks for the reading and recor
   assert.equal(rowsFor(pid).length, 0);
 });
 
+await check("(f2) STAGED_REVIEW_WALK=0: a NEM stage is not asked for the reading (the operator's off switch)", async () => {
+  const pid = fx.newProject();
+  nextResult = () => staged();
+  process.env.STAGED_REVIEW_WALK = "0";
+  try { await repo.prepareSubmission(db, pid, "nem"); } finally { delete process.env.STAGED_REVIEW_WALK; }
+  assert.equal(seenOpts?.stagedReview ?? null, null, "the switch did not turn the walk off");
+});
+
 // ── the route, on a real server ─────────────────────────────────────────────────────────────
 // No job is enqueued here: only GETs of the picture route.
 // A fresh live row for the route (the earlier rows were superseded by (e)'s failed re-stage).

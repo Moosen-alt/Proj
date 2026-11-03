@@ -10013,7 +10013,11 @@ export async function prepareSubmission(
       // #436 PR1 — A PLAIN NEM STAGE READS ITS STAGED DRAFT FOR THE REVIEW DIGEST (portal-bot
       // reviewDigest.ts), never an approved run (that run files on its own gate). The project's secrets
       // go along so the masked picture and every label blank them. Nothing clicks on the reading.
-      const stagedReview = track === "nem" && !resolvedAutoSubmit ? { secrets: projectSecretValues(stagedProject) } : null;
+      // STAGED_REVIEW_WALK=0 turns the walk off (the Stage then runs exactly as before #436): it is a
+      // second tab GETting each step page of a live draft, so an operator can stop it without a deploy.
+      const stagedReview = track === "nem" && !resolvedAutoSubmit && process.env.STAGED_REVIEW_WALK !== "0"
+        ? { secrets: projectSecretValues(stagedProject) }
+        : null;
       if (stagedReview) stagedReviewFor = { recipeId: recipe.id, stepsSignature: replayStepsSig };
       const replayOptions = { ...stageOptions, draftSubmitStamp, stagedReview };
       ledgerStagingLaunch(`staging replay (${track ?? "permit"} track, run ${runId})`, String(recipe.portalUrl || credentialUrl || ""));
