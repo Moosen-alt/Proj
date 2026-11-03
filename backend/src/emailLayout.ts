@@ -294,7 +294,7 @@ function itemsTable(items: EmailItem[], ordered: boolean): string {
         : `<span style="font-size:13px;color:${C.muted};">${escText(it.url)}</span>`}`
       : "";
     return `<tr>`
-      + `<td width="22" valign="top" bgcolor="${C.card}" style="padding:0 0 8px 0;${textStyle({ size: 15, line: 24, color: C.primary, bg: C.card, weight: 700 })}">${ordered ? `${i + 1}.` : "&#8226;"}</td>`
+      + `<td width="${ordered ? 30 : 22}" valign="top" bgcolor="${C.card}" style="padding:0 0 8px 0;${textStyle({ size: 15, line: 24, color: C.primary, bg: C.card, weight: 700 })}">${ordered ? `${i + 1}.` : "&#8226;"}</td>`
       + `<td valign="top" bgcolor="${C.card}" style="padding:0 0 8px 0;${textStyle({ size: 15, line: 24, color: C.text, bg: C.card })}">${escText(it.text)}${under}</td>`
       + `</tr>`;
   }).join("");
@@ -338,7 +338,7 @@ function actionHtml(action: EmailAction): string {
 function footerHtml(audience: EmailAudience, contact: string): string {
   const who = `${escapeHtml(BRAND)} Automation${contact ? ` &middot; ${escapeHtml(contact)}` : ""}`;
   const small = audience === "client"
-    ? `An automated update from ${escapeHtml(BRAND)}. Reply to this email to reach the team.`
+    ? `${escapeHtml(BRAND)} prepares, files and tracks your permit and interconnection applications.`
     : `An automated alert for the ${escapeHtml(BRAND)} team.`;
   return `<tr><td bgcolor="${C.page}" style="padding:16px 32px 0 32px;${textStyle({ size: 12, line: 18, color: C.muted, bg: C.page, weight: 600 })}">${who}</td></tr>`
     + `<tr><td bgcolor="${C.page}" style="padding:2px 32px 24px 32px;${textStyle({ size: 12, line: 18, color: C.muted, bg: C.page })}">${small}</td></tr>`;
