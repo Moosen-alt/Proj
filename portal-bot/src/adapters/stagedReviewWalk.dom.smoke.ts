@@ -50,10 +50,13 @@
 // Network.setBypassServiceWorker → "scripted" sees the service worker's POST. The Fetch handler
 // continuing every request → "redirectSubmit" and "metaSubmit" GET /MvcProjects/SubmitProject.
 // maskedFullPageScreenshot tagging the main frame only → "maskFrame" has no mask pixels in the frame.
-// The adapter without shownOnlyWithScripts → "scriptValue" reads approvable. walkStagedDraft calling
-// atReview on an unreadable review reading AND maskedFullPageScreenshot without its closed-root
-// refusal → "maskClosed" writes a picture. The tagger tagging the <option> → "maskSelect" has no mask
-// pixels over the select (and the coverage check refuses the picture).
+// The adapter without shownOnlyWithScripts → "scriptValue" reads approvable. "maskClosed" is guarded
+// three times, each alone enough: it writes a picture only with ALL THREE off — walkStagedDraft calling
+// atReview on an unreadable review reading, captureStagedReview's atReview without its early return on
+// an unreadable scriptless reading, and maskedFullPageScreenshot without its closed-root refusal.
+// "maskSelect" has no mask pixels over the select only with BOTH the tagger's <select> loop and the
+// coverage check's untagged-control refusal off (the loop alone off: the coverage check refuses the
+// picture, and "the picture was written" fails).
 //
 //   npx tsx portal-bot/src/adapters/stagedReviewWalk.dom.smoke.ts
 import "../smokeArtifactDirs";

@@ -19,10 +19,12 @@
 //   THE LEARNER'S TAGGER (shared): the <select> is tagged, never its <option>; clearSecretTags removes
 //              every tag.
 //
-// Kill (each turns this red, by hand): the tagger without its <select> loop → probe "select" pixels
-// (and the coverage check's untagged-select refusal) fail; maskedFullPageScreenshot screenshotting
-// with no mask → probe ok:false (the pixel check refuses); no closedShadowRootCount refusal →
-// "closed" ok:true; no residual-text check → "bodyText" and "twice" ok:true.
+// Kill (each turns this red, by hand): the tagger without its <select> loop → "probe: ok:true" fails
+// (the coverage check refuses the untagged select) and "tagger: the <select>s are tagged" fails; with
+// the coverage check's untagged-control refusal off too → the select and listbox pixels are 0;
+// maskedFullPageScreenshot screenshotting with no mask → "probe: ok:true" fails (the pixel check
+// refuses); no closedShadowRootCount refusal → "closed" ok:true and a file on disk; no residual-text
+// check → "bodyText" and "twice" ok:true and a file on disk.
 //
 //   npx tsx portal-bot/src/secretMask.dom.smoke.ts
 import "./smokeArtifactDirs";
