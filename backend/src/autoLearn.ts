@@ -1461,6 +1461,10 @@ async function autoLearnPortalInner(
         // row code, which also reads the certified module model and the system total.
         ...Object.fromEntries(Object.entries(projectFields).filter(([k]) => /^array\d+(ModuleQuantity|ModuleManufacturer|ModuleModel|Tilt|Azimuth)$/.test(k))),
         moduleModelCertified: projectFields.moduleModelCertified || "",
+        // #535 — the inverter's certified string too: the learner's model fill tries it first, as
+        // the replay does, so a plan-set marketing name ("IQ8+ Microinverter") still finds the
+        // portal's part-number option.
+        inverterModelCertified: projectFields.inverterModelCertified || "",
         totalModuleQuantity: projectFields.totalModuleQuantity || "",
         // Battery/ESS repeaters on NEM apps (storage sections ask make/model/qty).
         batteryMake: projectFields.batteryMake || projectFields.battMake || "",
