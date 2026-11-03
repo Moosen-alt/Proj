@@ -39,6 +39,11 @@ export type RowVariant = {
   noRowHooks?: boolean;
   /** ?moduleFace=unknown — the module make/model faces use classes the face walk does not know. */
   moduleFaceUnknown?: boolean;
+  /** ?ownRows=1 — the #535 shape (PacifiCorp multi-array learn, 2026-11-02): the module list carries
+   *  one series in several wattages, which a plan-set name without the wattage matches every one of
+   *  (Q.TRON BLK M-G2+ 405 / 420 / 440), and the Enphase inverter list names the IQ8+ only by its
+   *  part number. */
+  ownRows?: boolean;
 };
 
 export const variantOf = (url: string): RowVariant => {
@@ -52,6 +57,7 @@ export const variantOf = (url: string): RowVariant => {
     rowMicro: q.get("micro") === "1",
     noRowHooks: q.get("noHooks") === "1",
     moduleFaceUnknown: q.get("moduleFace") === "unknown",
+    ownRows: q.get("ownRows") === "1",
   };
 };
 
@@ -73,6 +79,7 @@ export const page = (v: RowVariant = {}): string => `<!doctype html><html><head>
     var REWRITE_AZIMUTH = ${flag(v.rewriteAzimuth)}; // the portal keeps "0" for every row's azimuth
     var REWRITE_MODEL = ${flag(v.rewriteModel)}, EMPTY_VALUE = ${flag(v.emptyComboValue)}, HIDE_MODEL_FACE = ${flag(v.hideSetModelFace)};
     var MODEL_LABEL = ${flag(v.modelLabel)}, MICRO = ${flag(v.rowMicro)}, NO_HOOKS = ${flag(v.noRowHooks)}, MODULE_FACE_UNKNOWN = ${flag(v.moduleFaceUnknown)};
+    var OWN_ROWS = ${flag(v.ownRows)};
     var MODULE_MAKES = ["Hanwha Q CELLS", "Znshine PV-Tech", "REC Solar"];
     var INV_MAKES = ["Altenergy Power System", "Enphase Energy Inc."];
     var MICRO_MAKES = ["Enphase Energy Inc.", "Altenergy Power System"].concat(MODULE_MAKES); // also carries the module makes
@@ -87,6 +94,10 @@ export const page = (v: RowVariant = {}): string => `<!doctype html><html><head>
       "Altenergy Power System": ["0.8 kW (Model DS3-L {240V} [SI1])", "0.8 kW (Model DS3-LV {120V} [SI1])"],
       "Enphase Energy Inc.": ["0.96 kW (Model QT2 {240V})"]
     };
+    if (OWN_ROWS) {
+      MODELS["Hanwha Q CELLS"] = ["405W (Model Q.TRON BLK M-G2+ 405)", "420W (Model Q.TRON BLK M-G2+ 420)", "440W (Model Q.TRON BLK M-G2+ 440)"];
+      MODELS["Enphase Energy Inc."] = ["0.29 kW (Model IQ8PLUS-72-2-US {240V})", "0.32 kW (Model IQ8M-72-2-US {240V})"];
+    }
     var server = { rows: [newRow()], invMfr: "", invModel: "" };
     var idn = 53; // per-render ids, renumbered from the top: row 1's Qty is #pcInputBase56 on a learn page
     var lists = 0;

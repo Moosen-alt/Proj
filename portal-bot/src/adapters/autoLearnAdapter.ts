@@ -2509,6 +2509,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   // Equipment fields whose select verification failed for EVERY candidate this
   // run — retrying them each rescan pass just burns waitForOptionReady caps.
   private equipmentFillFailed = new Set<string>();
+  /** #535 — The candidate an equipment fill landed, per field (the equipmentFillFailed key): a later
+   *  pass reads it as held even when it is the plan-set fallback, not the certified string. */
+  private equipmentLanded = new Map<string, string>();
   /** #536 — every equipment write that reached (or would have reached) a control it was not aimed
    *  at, for the whole walk (labels only), and the ones on the page being walked now. */
   private equipmentStrays: string[] = [];
@@ -2716,7 +2719,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     bareSelect = false,
     /** The page shows PV Array repeater rows (arrayRowsInPage, the replay's own row predicate). */
     arrayRowPage = false,
-  ): { key: string; candidates: string[]; side: "inverter" | "module" | null } | null {
+  ): { key: string; candidates: string[]; side: "inverter" | "module" | null; held?: string[] } | null {
     const l = (context || "").toLowerCase();
     const isModel = /\bmodel\b/.test(l);
     const isMake = /manufacturer|\bmake\b|\bbrand\b/.test(l);
@@ -2747,6 +2750,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const make = (this.equipment[`${prefix}Make`] || "").trim();
       if (!model && !make) return null;
       const candidates: string[] = [];
+      // #535: the portal's own string first (see certifiedModel below).
+      const certifiedBare = bareBattery ? "" : this.certifiedModel(prefix as "inverter" | "module");
+      if (certifiedBare) candidates.push(certifiedBare);
       if (model) {
         candidates.push(model);
         const tokens = model.split(/[\s,()[\]{}]+/).filter((t) => /\d/.test(t) && t.length >= 3);
@@ -2758,7 +2764,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         const compactMake0 = make.toLowerCase().replace(/[^a-z0-9]/g, "");
         candidates.push(...(EQUIPMENT_MAKE_ALIASES[compactMake0] ?? []), ...(this.certifiedAliases[compactMake0] ?? []));
       }
-      return { key: `${prefix}Model`, candidates: [...new Set(candidates)], side: bareBattery ? null : bareSide };
+      return { key: `${prefix}Model`, candidates: [...new Set(candidates)], side: bareBattery ? null : bareSide, ...(certifiedBare ? { held: [certifiedBare] } : {}) };
     }
     // NEGATIVE GUARD: service equipment, storage, EV gear, generators, racking,
     // optimizers, monitoring — anything with its own make/model that is NOT the
@@ -2817,6 +2823,16 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     const value = (this.equipment[key] || "").trim();
     if (!value) return null;
     const candidates = [value];
+    // #535 — THE PORTAL'S OWN STRING FIRST, as the replay does (recipeAdapter: a */model$ step reads
+    // <field>Certified before the plan-set value). The plan set often names a module series without
+    // its wattage ("Q.TRON BLK M-G2+"), which EVERY wattage of the series contains, so the option
+    // matcher took the first one (405 W); the rows the learn adds run the replay's code and took the
+    // certified one (440 W), and the job filed two modules for one. An inverter the plan set names by
+    // its marketing name ("IQ8+ Microinverter") matched nothing and stayed blank, while the list
+    // names it by the part number its certified string carries. The plan-set value stays behind it
+    // for a portal whose list the CEC name does not match.
+    const certified = isModel ? this.certifiedModel(side) : "";
+    if (certified) candidates.unshift(certified);
     if (isMake) {
       const compactMake2 = value.toLowerCase().replace(/[^a-z0-9]/g, "");
       candidates.push(...(EQUIPMENT_MAKE_ALIASES[compactMake2] ?? []), ...(this.certifiedAliases[compactMake2] ?? []));
@@ -2830,7 +2846,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const core = tokens.sort((a, b) => b.length - a.length)[0];
       if (core && core.toLowerCase() !== value.toLowerCase()) candidates.push(core);
     }
-    return { key, candidates: [...new Set(candidates)], side };
+    // With a certified string, only IT says the control already holds our model: the bare series
+    // name "holds" in the 405 W option as well as the 440 W one.
+    return { key, candidates: [...new Set(candidates)], side, ...(certified ? { held: [certified] } : {}) };
+  }
+
+  /** #535 — The backend's certified model string for this side (portalRecipes certifiedModelFields:
+   *  the CEC name the portal builds its list from), or "". */
+  private certifiedModel(side: "inverter" | "module"): string {
+    return String(this.equipment[`${side}ModelCertified`] ?? "").trim();
   }
 
   /** The control's CURRENT value(s): for selects, the selected option's TEXT and
@@ -3009,7 +3033,14 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       labelSeen.set(field.label || "", occurrence + 1);
       if (field.fieldType === "button" || field.fieldType === "file" || field.fieldType === "checkbox" || field.fieldType === "radio") continue;
       const dupLabel = (labelCounts.get(field.label || "") || 0) > 1;
-      if (field.label && !dupLabel && alreadyFilledLabels.includes(field.label)) continue;
+      // #535 — A PV ARRAY ROW'S CONTROLS ARE PROJECT DATA, WHOEVER FILLED THEM FIRST. The row's Qty
+      // is the page's only "pv array quantity", so once the planner had typed the SYSTEM total
+      // there (8, for two arrays of 4) this skip left it: array1ModuleQuantity was never typed or
+      // recorded, and the rows the learn adds from the recorded array1* steps got no Qty at all.
+      // On a page of array rows, a control inside a row is never skipped for its label; the value
+      // check below leaves one already holding this project's value alone.
+      const rowControl = arrayRowPage && /pv ?array|\barray\b/i.test(`${field.section || ""} ${field.label || ""}`);
+      if (field.label && !dupLabel && !rowControl && alreadyFilledLabels.includes(field.label)) continue;
       // Proximity only carries WITHIN one section and only a few fields deep.
       if ((field.section || "") !== lastSection) {
         lastSide = undefined;
@@ -3092,8 +3123,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // re-selecting a manufacturer re-fires the portal's cascade and WIPES the
       // dependent model select that was just filled.
       const currentRaw = await this.currentControlValue(target);
-      if (currentRaw && resolved.candidates.some((c) => AutoLearnAdapter.equipmentValueMatches(currentRaw, c))) {
+      // #535: with a certified model only it (or what this pass already landed here) counts as held.
+      const landed = this.equipmentLanded.get(failKey);
+      const heldBy = [...(resolved.held ?? resolved.candidates), ...(landed ? [landed] : [])];
+      if (currentRaw && heldBy.some((c) => AutoLearnAdapter.equipmentValueMatches(currentRaw, c))) {
         if (field.label) alreadyFilledLabels.push(field.label);
+        // A row control the planner filled with this project's value but bound to another key
+        // (the total, a bare "tilt") is rebound, so the rows the learn adds — and every replay —
+        // read this array's own key.
+        if (rowControl) this.rebindRowStep(steps, field, resolved.key);
         continue;
       }
       let sawNotHeld = false;
@@ -3134,8 +3172,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             continue;
           }
         }
+        // #535: a row control's earlier write this page (the planner's system total, a 405 W pick)
+        // is superseded: its step goes, so the recipe types this control once, from this key.
+        if (rowControl) this.dropSupersededRowSteps(steps, field);
         steps.push(step);
         if (field.label) alreadyFilledLabels.push(field.label);
+        this.equipmentLanded.set(failKey, candidate);
         filled++;
         success = true;
         this.debug?.event({ type: "equipment_fill", label: context.slice(0, 80), key: resolved.key, candidate: candidate.slice(0, 60) });
@@ -3146,6 +3188,41 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       if (!success && sawNotHeld && !strayed) this.equipmentFillFailed.add(failKey);
     }
     return filled;
+  }
+
+  /** #535 — This page's earlier fill/select steps aimed at `field`'s control: the same scraped
+   *  selector (the planner and this pass read one scrape), searched back to the page's last
+   *  advance — another page's per-render id is another control. */
+  private rowStepsFor(steps: RecipeStep[], field: ExtractedField): number[] {
+    const sel = JSON.stringify(field.selector);
+    const out: number[] = [];
+    for (let k = steps.length - 1; k >= 0; k--) {
+      const s = steps[k];
+      if (s.action === "goto" || (s.action === "click" && /^advance:/.test(String(s.note ?? "")))) break;
+      if ((s.action === "fill" || s.action === "select") && JSON.stringify(s.selector) === sel) out.push(k);
+    }
+    return out;
+  }
+
+  /** #535 — Drop this page's earlier steps on a row control the equipment pass just filled. */
+  private dropSupersededRowSteps(steps: RecipeStep[], field: ExtractedField): void {
+    const idx = this.rowStepsFor(steps, field);
+    for (const k of idx) {
+      this.debug?.event({ type: "row_step_superseded", label: String(field.label ?? "").slice(0, 60), field: String(steps[k].field ?? "").slice(0, 60) });
+      steps.splice(k, 1); // descending order: earlier indices stay valid
+    }
+  }
+
+  /** #535 — Rebind this page's step on a row control that already holds this project's value for
+   *  `key` (the planner bound it to another key, or typed it as a literal). */
+  private rebindRowStep(steps: RecipeStep[], field: ExtractedField, key: string): void {
+    for (const k of this.rowStepsFor(steps, field)) {
+      const s = steps[k];
+      if (s.field === key) continue;
+      this.debug?.event({ type: "row_step_rebound", label: String(field.label ?? "").slice(0, 60), from: String(s.field ?? "(literal)").slice(0, 60), to: key });
+      const { value: _literal, ...rest } = s;
+      steps[k] = { ...rest, field: key };
+    }
   }
 
   /** A read-back of an equipment value: the select/text matcher, plus numbers compared as numbers
@@ -7972,6 +8049,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
               const equipFilled = await this.fillEquipmentSelects(postFields, alreadyFilledLabels, steps);
               pageFillCount += equipFilled;
               revealedThisPass += equipFilled;
+              // #535 — the same grace as the late pass above. Here a control the pass cannot fill (an
+              // inverter Model nothing matched) keeps the revealed set non-empty, and without it the
+              // row's next control (its Model, after the make's debounced save) arrived after the
+              // last scrape: the row ended without a model, tilt or azimuth.
+              if (equipFilled > 0) await sleep(LATE_EQUIP_REVEAL_GRACE_MS);
             } catch { /* best-effort */ }
 
             // Debug: dump what appeared after the reveal so the operator can audit it.
