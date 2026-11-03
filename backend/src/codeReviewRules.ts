@@ -530,12 +530,15 @@ export const MODULE_LISTING_PATTERNS: RegExp[] = [
   /\bIEC\s*\/\s*UL\s*61730\b/i,
   /\bUL\s*-?\s*1703\b/i,
 ];
-export const RACKING_LISTING_PATTERNS: RegExp[] = [/\bUL\s*-?\s*2703\b/i];
 // THE ROOF ATTACHMENT'S LISTING (#532): UL Subject 2703A, the Outline of Investigation for flashing
-// devices ("UL 2703A", "UL SUBJECT 2703A:2022"). It lists the attachment/flashing, NOT the racking,
-// so it is shown as evidence and never clears the UL 2703 half (the racking pattern's \b already
-// refuses "2703A").
-export const ATTACHMENT_LISTING_PATTERNS: RegExp[] = [/\bUL\s*(?:subject\s*)?-?\s*2703\s*A\b/i];
+// devices ("UL 2703A", "UL 2703-A", "UL SUBJECT 2703A:2022"). It lists the attachment/flashing, NOT
+// the racking, so it is shown as evidence and never clears the UL 2703 half. ONE suffix test splits
+// the two: "2703A" / "2703-A" in any case, or a SPACED capital "2703 A", is the attachment's; a
+// spaced lower-case "a" is the article ("UL 2703 a listed system") and stays the racking's. The
+// patterns are case-insensitive by spelled classes, not /i, so that capital A can be told apart.
+const UL_2703_A_SUFFIX = String.raw`(?:-?[Aa]|\s+-?\s*A)\b`;
+export const RACKING_LISTING_PATTERNS: RegExp[] = [new RegExp(String.raw`\b[Uu][Ll]\s*-?\s*2703\b(?!${UL_2703_A_SUFFIX})`)];
+export const ATTACHMENT_LISTING_PATTERNS: RegExp[] = [new RegExp(String.raw`\b[Uu][Ll]\s*(?:[Ss][Uu][Bb][Jj][Ee][Cc][Tt]\s*)?-?\s*2703${UL_2703_A_SUFFIX}`)];
 export const INVERTER_LISTING_PATTERNS: RegExp[] = [/\bUL\s*1741\b/i];
 
 /** The products whose listing the UL LISTINGS rule reads, and the printed words that name each. */

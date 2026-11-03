@@ -388,6 +388,29 @@ await check("(u4) a reading counts only for the product it was read for (a modul
   assert.match(f.message, /^No racking\/mounting listing \(UL 2703\) was found/);
 });
 
+await check("(u6) one suffix test splits UL 2703 (racking) from UL 2703A (attachment): hyphen and spaced capital A are the attachment's, the article 'a' is not", () => {
+  const racking = (t: string) => rules.listingAffirmed("racking", t);
+  const attachment = (t: string) => rules.listingAffirmed("attachment", t);
+  for (const t of ["UL 2703A", "UL 2703-A", "UL 2703 A", "UL SUBJECT 2703A:2022", "ul subject 2703a", "UL Subject 2703 - A"]) {
+    assert.equal(attachment(t), true, `attachment: ${t}`);
+    assert.equal(racking(t), false, `never the racking's: ${t}`);
+  }
+  for (const t of ["UL 2703", "ul 2703 listed", "UL 2703 a listed system", "UL 2703 AND UL 61730", "UL-2703 (2023)", "UL2703"]) {
+    assert.equal(racking(t), true, `racking: ${t}`);
+    assert.equal(attachment(t), false, `not an attachment listing: ${t}`);
+  }
+});
+
+await check("(u7) in the package text: 'UL 2703-A' alone never clears the racking half; 'UL 2703 a listed system' adds no attachment row", () => {
+  const hyphen = get(evaluate(ruleProject({ planSetExtractedText: "ROOF MOUNT ARRAY ON RAFTERS. FLASHING: SYN-FOOT, LISTED TO UL 2703-A. MODULES LISTED TO UL 61730." })), LISTINGS);
+  assert.ok(hyphen, "the racking half is still missing");
+  assert.match(hyphen.message, /^No racking\/mounting listing \(UL 2703\) was found/);
+  assert.match(hyphen.message, /A roof-attachment listing \(UL 2703A, .*\) was found/);
+  const article = evaluate(ruleProject({ planSetExtractedText: "ROOF MOUNT ARRAY ON RAFTERS. RACKING: SYN-RAIL, UL 2703 a listed system. MODULES LISTED TO UL 61730." }));
+  assert.equal(get(article, LISTINGS), undefined, "the racking listing is read and both halves clear");
+  assert.equal(rules.packageListings(ruleProject({ planSetExtractedText: "RACKING: SYN-RAIL, UL 2703 a listed system." })).attachment, null, "no spurious attachment listing");
+});
+
 await check("(u5) the readings key is written by the read, not trusted blindly: malformed JSON reads as none", () => {
   const f = get(evaluate(ruleProject({ [rules.IMAGE_SHEET_LISTING_READINGS_KEY]: "{not json" })), LISTINGS);
   assert.ok(f);
