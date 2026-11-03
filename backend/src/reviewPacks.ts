@@ -85,6 +85,26 @@ export function aiResultToFindings(ai: AiPlanReviewResult, ctx: EffectiveCodeCon
       : [],
     installerCallout: false,
   }));
+  // AN INCOMPLETE REVIEW IS NOT A CLEAN ONE (#531). A real provider whose answer was cut off,
+  // unreadable or failed says so on the report: an AI section with no findings would otherwise
+  // read as "the AI found nothing". A warning, so it asks for action, but category ai_review like
+  // every AI item, so it can never block. Anything but an explicit "complete" counts.
+  if (ai.provider !== "stub" && ai.completeness !== "complete") {
+    const why = ai.notes || "AI review incomplete: the model's answer did not come back whole.";
+    const message = `${why} The AI pre-review did not finish, so its findings are partial or missing. An empty AI section here does NOT mean the plan set has no issues.`;
+    out.push({
+      id: "ai.review.incomplete",
+      severity: "warning",
+      category: "ai_review",
+      title: "[AI pre-review] AI review incomplete",
+      message,
+      cityFeedback: message,
+      designTeamAction: "Re-run the review, or have a human reviewer read the sheets the AI pass could not cover.",
+      evidenceNeeded: [],
+      codeReferences: [],
+      installerCallout: false,
+    });
+  }
   if (ai.provider === "stub" && ai.notes) {
     out.push({
       id: "ai.review.unavailable",
@@ -100,6 +120,16 @@ export function aiResultToFindings(ai: AiPlanReviewResult, ctx: EffectiveCodeCon
     });
   }
   return out;
+}
+
+/** The summary every reader of an incomplete review sees: the API's aiSummary and the
+ *  review_submissions.ai_summary column both take it from here. Empty must never stand for an
+ *  incomplete review, because an empty AI summary reads as "nothing found". */
+export function withIncompleteSummary(ai: AiPlanReviewResult): AiPlanReviewResult {
+  if (ai.provider === "stub" || ai.completeness === "complete") return ai;
+  const why = (ai.notes || "AI review incomplete: the model's answer did not come back whole.").slice(0, 400);
+  const partial = ai.summary ? ` Partial assessment: ${ai.summary}` : "";
+  return { ...ai, summary: `${why} Its findings are partial; this does not mean nothing was found.${partial}`.slice(0, 1500) };
 }
 
 /** Run the hybrid review for a work type. The deterministic solar pack keeps its
@@ -118,42 +148,45 @@ export async function runReviewPack(input: {
   const pack = reviewPackFor(input.workType);
   const jurisdictionLabel = [input.ctx.ahj, input.ctx.state].filter(Boolean).join(", ") || "the jurisdiction";
 
-  const runAi = async (): Promise<AiPlanReviewResult> =>
-    input.llm.reviewPlanSetGeneral({
-      workType: input.workType,
-      jurisdictionLabel,
-      codeSummary: codeSummaryForPrompt(input.ctx),
-      verifiedProfile: input.ctx.verified,
-      pageImagesBase64: input.pageImagesBase64 ?? [],
-      extractedText: input.extractedText,
-      applicantFacts: {
-        address: input.project.projectAddress,
-        systemSizeDcKw: input.project.systemSizeDcKw ? String(input.project.systemSizeDcKw) : "",
-      },
-    });
+  // A call that FAILS is an incomplete review too, on either path: the AI pass was asked for and
+  // did not run. (Before #531 the solar second opinion swallowed the error and left nothing on the
+  // report; the AI-served path told the reader to configure an API key that was configured.)
+  const runAi = async (): Promise<AiPlanReviewResult> => {
+    let ai: AiPlanReviewResult;
+    try {
+      ai = await input.llm.reviewPlanSetGeneral({
+        workType: input.workType,
+        jurisdictionLabel,
+        codeSummary: codeSummaryForPrompt(input.ctx),
+        verifiedProfile: input.ctx.verified,
+        pageImagesBase64: input.pageImagesBase64 ?? [],
+        extractedText: input.extractedText,
+        applicantFacts: {
+          address: input.project.projectAddress,
+          systemSizeDcKw: input.project.systemSizeDcKw ? String(input.project.systemSizeDcKw) : "",
+        },
+      });
+    } catch (err) {
+      ai = {
+        provider: "claude", completeness: "incomplete", findings: [], summary: "", confidence: "low",
+        notes: `AI review incomplete: the AI review call failed (${err instanceof Error ? err.message : String(err)}).`,
+      };
+    }
+    return withIncompleteSummary(ai);
+  };
 
   if (pack.deterministic) {
     const report = buildReviewerReport(input.project, { codeContext: input.ctx });
     let ai: AiPlanReviewResult | null = null;
     if (input.includeAiSecondOpinion && (input.pageImagesBase64?.length || input.extractedText)) {
-      try {
-        ai = await runAi();
-        report.findings.push(...aiResultToFindings(ai, input.ctx));
-      } catch { ai = null; /* second opinion is best-effort */ }
+      ai = await runAi();
+      report.findings.push(...aiResultToFindings(ai, input.ctx));
     }
     return { report, ai };
   }
 
   // AI-served work type: advisory-only report (no deterministic findings exist).
-  let ai: AiPlanReviewResult;
-  try {
-    ai = await runAi();
-  } catch (err) {
-    ai = {
-      provider: "stub", findings: [], summary: "", confidence: "low",
-      notes: `AI review failed: ${err instanceof Error ? err.message : String(err)}. Re-run or review manually.`,
-    };
-  }
+  const ai = await runAi();
   const report: ReviewerReport = {
     projectId: input.project.id,
     generatedAt: nowIso(),
