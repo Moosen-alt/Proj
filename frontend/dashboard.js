@@ -7099,7 +7099,9 @@ function correctionReviewBodyHtml(item) {
 // in place, and says in one line who acts and what happens after saving:
 const REVIEW_NEXT_LINE = {
   typed: "You enter it. Saving updates the project and re-runs QC.",
-  question: "You answer it for this job. The next portal run fills in your answer.",
+  question: "You answer it for this job. The next portal run fills in your answer. Dismissing it only clears this card: the portal still asks it on the next run.",
+  // A question the job answered since the run asked it (a project save): nothing to choose.
+  questionAnswered: "Nothing to choose: the job already holds this answer. Dismiss it to clear the card.",
   inverter: "You confirm it, or enter it from the datasheet. Saving re-runs QC, and the PV breaker check uses this current.",
   advisory: "For your information: nothing to enter. Dismiss it once you've read it.",
   // A run's note is about the filing itself: it must not read as settled (an older one can name a
@@ -7174,15 +7176,30 @@ function inverterOutputBodyHtml(item, ctx) {
 }
 
 // A PORTAL QUESTION A RUN LEFT BLANK — asked as the portal asked it, with its own options. Nothing is
-// pre-selected: the answer is the person's, for this job. Saved through /portal-questions.
+// pre-selected: the answer is the person's, for this job. Saved through /portal-questions; Dismiss
+// clears the card, like a note.
+//
+// ANSWERED SINCE IT WAS ASKED (#544): a project save can write the key after the run asked it. The
+// question is then no longer open (the answer route takes only open ones), so the card shows the
+// job's answer (GET /portal-questions' answeredItems) instead of options, and offers Dismiss only.
 function portalQuestionBodyHtml(item, ctx) {
   const q = item.portalQuestion;
   const id = String(item.id);
   const head = `<p style="margin:0 0 6px"><strong>${esc(q.label)}</strong></p>`;
+  const dismiss = `<button class="secondary" data-review-action="reject" data-review-id="${esc(id)}"><i data-lucide="x"></i><span>Dismiss</span></button>`;
   if (item.status !== "pending") {
     const project = ctx.project || {};
-    const answer = String(project[q.key] ?? (ctx.snapshot || {})[q.key] ?? "").trim();
-    return `${head}<p class="muted" style="margin:0">${answer ? `Answered for this job: ${esc(answer)}` : "Answered."}</p>`;
+    const answer = String(project[q.key] || (ctx.snapshot || {})[q.key] || "").trim();
+    // A dismissed question was never answered here: it must not read as "Answered."
+    const closed = item.status === "rejected" ? "Dismissed. No answer was saved here." : "Answered.";
+    return `${head}<p class="muted" style="margin:0">${answer ? `Answered for this job: ${esc(answer)}` : closed}</p>`;
+  }
+  const onFile = ctx.answeredQuestions ? ctx.answeredQuestions[id] : null;
+  if (onFile) {
+    return `
+      ${head}
+      <p style="margin:0 0 6px">Already answered for this job: <strong>${esc(onFile)}</strong></p>
+      <div class="actions">${dismiss}</div>`;
   }
   const options = Array.isArray(q.options) ? q.options : [];
   const control = options.length <= 4
@@ -7194,13 +7211,15 @@ function portalQuestionBodyHtml(item, ctx) {
       <p style="margin:0 0 4px">The portal asks this and the job's documents don't say.</p>
       ${head}
       ${control}
-      <div class="actions"><button class="primary" data-portal-answer="${esc(id)}" data-portal-key="${esc(q.key)}"><i data-lucide="check"></i><span>Save answer</span></button></div>`;
+      <div class="actions"><button class="primary" data-portal-answer="${esc(id)}" data-portal-key="${esc(q.key)}"><i data-lucide="check"></i><span>Save answer</span></button>${dismiss}</div>`;
 }
 
 /**
- * One Human Review card. `ctx`: { project, snapshot, inverterLookup, noteQuestions } — the selected
- * project, its parser snapshot, the last inverter lookup this page made (or null), and the open portal
- * questions that pending run notes name, by note id (from GET /portal-questions' noteItemIds).
+ * One Human Review card. `ctx`: { project, snapshot, inverterLookup, noteQuestions, answeredQuestions }
+ * — the selected project, its parser snapshot, the last inverter lookup this page made (or null), the
+ * open portal questions that pending run notes name, by note id (from GET /portal-questions'
+ * noteItemIds), and the job's answer to each pending question item it has answered since, by item id
+ * (from GET /portal-questions' answeredItems).
  */
 function reviewCardHtml(itemIn, ctxIn) {
   const ctx = ctxIn || {};
@@ -7211,6 +7230,7 @@ function reviewCardHtml(itemIn, ctxIn) {
   const noteQuestion = pending && !itemIn.portalQuestion && ctx.noteQuestions ? ctx.noteQuestions[String(itemIn.id)] : null;
   const item = noteQuestion ? { ...itemIn, portalQuestion: noteQuestion } : itemIn;
   const isQuestion = !!(item.portalQuestion && item.portalQuestion.key);
+  const answeredOnFile = isQuestion && pending && !!(ctx.answeredQuestions && ctx.answeredQuestions[String(item.id)]);
   const isAdvisory = !isQuestion && ADVISORY_REVIEW_ISSUE_TYPES.includes(item.issueType || "");
   const isInverter = !isQuestion && !isAdvisory && item.fieldName === "inverterOutput";
   const isCorrection = item.fieldName === "correction";
@@ -7218,11 +7238,11 @@ function reviewCardHtml(itemIn, ctxIn) {
   const label = isQuestion ? "Portal question for this job"
     : isAdvisory ? (REVIEW_ADVISORY_TITLES[item.issueType] || reviewLabel(item))
       : isInverter ? "Inverter output current (A)" : reviewLabel(item);
-  const tone = !pending ? "pass" : (isAdvisory || isWarning) ? "info" : "warning";
+  const tone = !pending ? "pass" : (isAdvisory || isWarning || answeredOnFile) ? "info" : "warning";
   const next = (kind) => (pending ? `<p class="muted review-next" style="margin:6px 0 0;font-size:12px">${esc(REVIEW_NEXT_LINE[kind])}</p>` : "");
   let body = "";
   if (isQuestion) {
-    body = portalQuestionBodyHtml(item, ctx) + next("question");
+    body = portalQuestionBodyHtml(item, ctx) + next(answeredOnFile ? "questionAnswered" : "question");
   } else if (isAdvisory) {
     // THE FINDING, NOT THE ENGINEERING NOTE: a run triage item shows its one-line title; its root
     // cause and suggested fix live in the run's triage note (project notes), never in a box here.
@@ -7280,7 +7300,14 @@ function renderReview() {
     if (!q || !q.key || askedKeys.has(q.key) || !Array.isArray(q.noteItemIds) || !Array.isArray(q.options) || q.options.length < 2) continue;
     for (const noteId of q.noteItemIds) noteQuestions[String(noteId)] = { key: q.key, label: q.label, options: q.options, control: "choice" };
   }
-  const ctx = { project, snapshot: project.parserSnapshot || {}, inverterLookup: lookup, noteQuestions };
+  // Pending question items the job has answered since they were asked (the backend's answeredItems:
+  // the same "answered on file" the answer route reads), by item id → the job's answer. Named
+  // explicitly, never inferred from a key missing from the open list (that list is capped and filtered).
+  const answeredQuestions = {};
+  for (const a of (state.portalQuestions && state.portalQuestions.answeredItems) || []) {
+    if (a && a.itemId && String(a.answer || "").trim()) answeredQuestions[String(a.itemId)] = String(a.answer).trim();
+  }
+  const ctx = { project, snapshot: project.parserSnapshot || {}, inverterLookup: lookup, noteQuestions, answeredQuestions };
   const reviewCard = (item) => reviewCardHtml(item, ctx);
 
   const pendingHtml = pending.map(reviewCard).join("");
@@ -7346,14 +7373,20 @@ async function savePortalQuestionAnswer(itemId, key, button) {
   }
   if (button) button.disabled = true;
   try {
-    await api(`/api/projects/${state.selectedProjectId}/portal-questions`, {
+    const out = await api(`/api/projects/${state.selectedProjectId}/portal-questions`, {
       method: "POST",
       body: JSON.stringify({ answers: { [key]: value } }),
     });
     await selectProject(state.selectedProjectId);
-    showMessage("Answer saved for this job. The next portal run fills it in.");
+    // Answered since the run asked it (a project save): the job's answer stands and the card closed.
+    const already = ((out && out.alreadyAnswered) || []).find((a) => a && a.key === key);
+    showMessage(already
+      ? `This job already had an answer to that question: ${String(already.answer || "").trim() || "on file"}. Nothing was changed, and the card is closed.`
+      : "Answer saved for this job. The next portal run fills it in.");
   } catch (err) {
-    showMessage(err.message || "Could not save the answer.", "error");
+    // A person reads this: the server's sentence when it is plain, never one naming the internal key.
+    const said = String((err && err.message) || "").trim();
+    showMessage(said && !said.includes(key) ? said : "Could not save the answer. Reload the page to see the questions still open.", "error");
     if (button) button.disabled = false;
   }
 }

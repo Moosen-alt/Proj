@@ -364,9 +364,9 @@ export async function unansweredPortalQuestions(db: AppDb, project: ProjectRecor
  *  is marked edited (a person supplied the value), and an older triage note about the same question
  *  is closed with it. Called by the answer doors and by run triage, never a read.
  *
- *  `actor` "run triage": the answer reached the job through some OTHER door (a re-parse, a snapshot
- *  edit) since the item was asked. Triage closes it before asking again — as superseded by the system,
- *  not as an edit a person made on the item.
+ *  `how` "superseded" (the default for `actor` "run triage"): the answer reached the job through some
+ *  OTHER door (a re-parse, a project save) since the item was asked. Triage, and the answer route
+ *  before it writes, close it as superseded by the system — not as an edit a person made on the item.
  *
  *  `answered`: the questions the calling door just took an answer for, in the words the person saw
  *  (the parser page's panel and the intake link ask the bank's questions, not an item's). A note is
@@ -377,6 +377,7 @@ export function closeAnsweredPortalQuestionItems(
   projectId: string,
   actor: string,
   answered: ReadonlyArray<{ key: string; label: string }> = [],
+  how: "superseded" | "edited" = actor === "run triage" ? "superseded" : "edited",
 ): number {
   let rows: Array<{ id: string; portal_question_json: string }> = [];
   try {
@@ -393,7 +394,7 @@ export function closeAnsweredPortalQuestionItems(
   for (const row of rows) {
     const q = parsePerJobPortalQuestion(row.portal_question_json);
     if (!q || !projectAnswer(project, q.key, columns)) continue;
-    if (actor === "run triage") {
+    if (how === "superseded") {
       db.run("UPDATE human_review_items SET status = 'approved', updated_at = ? WHERE id = ? AND status = 'pending'", [nowIso(), row.id]);
       addAuditLog(db, projectId, "system", actor, "human_review.superseded", { reviewItemId: row.id, fieldName: q.key, why: "answered on file" });
     } else {
@@ -405,6 +406,30 @@ export function closeAnsweredPortalQuestionItems(
   }
   for (const q of named) closed += closeLegacyTriageNotesFor(db, projectId, q, "answered");
   return closed;
+}
+
+/** THE QUESTION ITEMS THE JOB HAS ALREADY ANSWERED, still pending (#544): asked by a run, then answered
+ *  through a door that does not close items (a project save, a re-parse, a column write) — so the key is
+ *  no longer an open question, and the answer route would refuse it. Read only: the answer route closes
+ *  them, the next triage closes them, and GET /portal-questions reports them so the card reads as
+ *  answered. Same predicate as questionIsOpen (projectAnswer), so the two can never disagree. */
+export function answeredPortalQuestionItems(db: AppDb, project: ProjectRecord): Array<{ itemId: string; key: string; label: string; answer: string }> {
+  let rows: Array<{ id: string; portal_question_json: string }> = [];
+  try {
+    rows = db.query<{ id: string; portal_question_json: string }>(
+      "SELECT id, portal_question_json FROM human_review_items WHERE project_id = ? AND status = 'pending' AND issue_type = 'Run triage' AND portal_question_json != '' ORDER BY created_at DESC",
+      [project.id],
+    );
+  } catch { return []; }
+  if (!rows.length) return [];
+  const columns = perJobColumnAnswers(db, project.id);
+  const out: Array<{ itemId: string; key: string; label: string; answer: string }> = [];
+  for (const row of rows) {
+    const q = parsePerJobPortalQuestion(row.portal_question_json);
+    const answer = q ? projectAnswer(project, q.key, columns) : "";
+    if (q && answer) out.push({ itemId: row.id, key: q.key, label: q.label, answer });
+  }
+  return out;
 }
 
 /** The pending triage notes (a 'Run triage' item with no portal_question_json: the agent's finding,
@@ -695,29 +720,51 @@ export function submitIntakeRequest(
  * key is accepted, only the portal's own options are valid (no free text - anything else
  * files a wrong answer silently), and answers land in the parser snapshot AND the v17
  * column so resolveRecipeFieldValues sees them from either side.
+ *
+ * A QUESTION THE JOB ANSWERED SINCE IT WAS ASKED IS NOT A REFUSAL (#544). A run asks a question as a
+ * review item; a project save then writes the key, so it is no longer open, while the card still
+ * offers the options. Saving it there answers nothing new: the answer on file stands (this route takes
+ * only open questions — it never overwrites), the item closes as superseded, and the answer on file is
+ * returned in `alreadyAnswered` so the person is told what the job holds. Any other key that is not
+ * open is refused in plain words: a person reads this message, and it never names an internal key.
  */
 export async function answerPortalQuestions(
   db: AppDb,
   projectId: string,
   answers: Record<string, string>,
-): Promise<{ written: string[]; remaining: number }> {
+): Promise<{ written: string[]; alreadyAnswered: Array<{ key: string; label: string; answer: string }>; remaining: number }> {
   const project = getProjectDetail(db, projectId).project;
   const unanswered = await unansweredPortalQuestions(db, project);
   const byKey = new Map(unanswered.map((q) => [q.key, q]));
+  const answeredItems = new Map(answeredPortalQuestionItems(db, project).map((a) => [a.key, a]));
   const payload: Record<string, string> = {};
   const written: string[] = [];
+  const alreadyAnswered: Array<{ key: string; label: string; answer: string }> = [];
   for (const [key, raw] of Object.entries(answers ?? {})) {
     const value = String(raw ?? "").trim();
     if (!value) continue;
     const q = byKey.get(key);
-    if (!q) throw new HttpError(400, `"${key}" is not an open portal question for this project.`);
+    if (!q) {
+      const onFile = answeredItems.get(key);
+      if (onFile) { alreadyAnswered.push({ key, label: onFile.label, answer: onFile.answer }); continue; }
+      throw new HttpError(400, "That question is no longer open for this job. Reload the page to see the questions still open.");
+    }
     if (!q.options.includes(value)) {
       throw new HttpError(400, `"${q.label}" must be one of the portal's own options.`);
     }
     payload[key] = value;
     written.push(key);
   }
-  if (written.length === 0) throw new HttpError(400, "No values provided.");
+  if (written.length === 0 && alreadyAnswered.length === 0) throw new HttpError(400, "No values provided.");
+  // Every check passed, nothing is written yet: the items another door answered close first, as
+  // superseded (with the notes naming them), so the operator close below counts only this post's.
+  if (alreadyAnswered.length) {
+    closeAnsweredPortalQuestionItems(db, projectId, "portal questions", alreadyAnswered, "superseded");
+  }
+  if (written.length === 0) {
+    const stillOpen = await unansweredPortalQuestions(db, getProjectDetail(db, projectId).project);
+    return { written, alreadyAnswered, remaining: stillOpen.length };
+  }
   updateProject(db, projectId, payload);
   for (const [key, column] of Object.entries(PER_JOB_ANSWER_COLUMNS)) {
     const value = payload[key];
@@ -728,11 +775,12 @@ export async function answerPortalQuestions(
   }
   closeAnsweredPortalQuestionItems(db, projectId, "operator", written.map((key) => byKey.get(key)!).filter(Boolean));
   const stillOpen = await unansweredPortalQuestions(db, getProjectDetail(db, projectId).project);
-  return { written, remaining: stillOpen.length };
+  return { written, alreadyAnswered, remaining: stillOpen.length };
 }
 
 export async function portalQuestionStatus(db: AppDb, projectId: string): Promise<{
   questions: Array<{ key: string; label: string; options: string[]; portalType?: string; unsure: boolean; noteItemIds: string[] }>;
+  answeredItems: Array<{ itemId: string; key: string; answer: string }>;
   unansweredCount: number;
   unsureCount: number;
 }> {
@@ -758,6 +806,10 @@ export async function portalQuestionStatus(db: AppDb, projectId: string): Promis
   }));
   return {
     questions,
+    // A pending question item whose key the job has answered since (a project save, a re-parse): the
+    // card reads "Already answered" instead of offering options the answer route would refuse. This
+    // read closes nothing; the answer route and the next triage do.
+    answeredItems: answeredPortalQuestionItems(db, project).map(({ itemId, key, answer }) => ({ itemId, key, answer })),
     unansweredCount: questions.length,
     unsureCount: questions.filter((q) => q.unsure).length,
   };

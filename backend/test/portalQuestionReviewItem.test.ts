@@ -31,6 +31,9 @@
 //       a recipe step bound to it with no value ("bound-empty") is still asked.
 //   T8  an answer that reaches the job through another door (a project save) is closed by the next
 //       triage instead of staying pending.
+//   T11 ... and before that triage: GET /portal-questions names the item as answered on file (closing
+//       nothing), Save answer on its card closes it without overwriting the answer on file, and a
+//       refusal never names the internal key.
 //
 //   npx tsx backend/test/portalQuestionReviewItem.test.ts
 import "./_isolate";
@@ -375,6 +378,47 @@ await check("T10 GET /portal-questions names the pending note that quotes an ope
   } finally {
     setPortalQuestionSource(null);
   }
+});
+
+// ---- T11: the probe — a project save answers the question while its card is still open -------------
+// Skeptic, round 3: triage asks ownershipModel, then R.updateProject writes ownershipModel. The card
+// stayed pending with its options, GET /portal-questions no longer listed the key, and Save answer was a
+// 400 that named the internal key ('"ownershipModel" is not an open portal question …') on screen.
+await check("T11 GET /portal-questions names the pending item as answered on file (and no longer as open); the read closes nothing", async () => {
+  const p = newProject({ owner: "Eleventh Sample" });
+  await triageLearnRun(db, writeBundle(), p);
+  const asked = questionItems(p)[0];
+  assert.equal(asked?.status, "pending");
+  R.updateProject(db, p, { ownershipModel: "Customer-Owned" } as never);
+  const st = await portalQuestionStatus(db, p);
+  assert.ok(!st.questions.some((x) => x.key === "ownershipModel"), JSON.stringify(st.questions));
+  assert.deepEqual(st.answeredItems, [{ itemId: asked.id, key: "ownershipModel", answer: "Customer-Owned" }]);
+  assert.equal(statusOf(p, asked.id), "pending", "a read must write nothing");
+});
+await check("T11 Save answer on that card closes it: no 400, the job's answer stands and is reported back", async () => {
+  const p = newProject({ owner: "Eleventh Sample B" });
+  await triageLearnRun(db, writeBundle(), p);
+  const asked = questionItems(p)[0];
+  R.updateProject(db, p, { ownershipModel: "Customer-Owned" } as never);
+  const out = await answerPortalQuestions(db, p, { ownershipModel: "Third-Party Owned" });
+  assert.deepEqual(out.written, []);
+  assert.deepEqual(out.alreadyAnswered, [{ key: "ownershipModel", label: Q, answer: "Customer-Owned" }]);
+  assert.equal(statusOf(p, asked.id), "approved", "closed as superseded (answered through another door)");
+  assert.equal(String(R.getProjectDetail(db, p).project.parserSnapshot?.ownershipModel ?? ""), "Customer-Owned", "the route never overwrites an answer on file");
+  const col = db.get<{ ownership_model: string | null }>("SELECT ownership_model FROM projects WHERE id = ?", [p]);
+  assert.notEqual(col?.ownership_model, "Third-Party Owned");
+  const st = await portalQuestionStatus(db, p);
+  assert.deepEqual(st.answeredItems, []);
+  assert.equal(R.getProjectDetail(db, p).humanReviewItems.filter((i) => i.status === "pending" && i.portalQuestion).length, 0);
+});
+await check("T11 a key that is neither open nor asked is still refused, in plain words that never name the key", async () => {
+  const p = newProject({ owner: "Eleventh Sample C" });
+  R.updateProject(db, p, { ownershipModel: "Customer-Owned" } as never);
+  await assert.rejects(answerPortalQuestions(db, p, { ownershipModel: "Customer-Owned" }), (err: { status?: number; message?: string }) => {
+    assert.equal(err.status, 400);
+    assert.ok(!/ownershipModel/.test(String(err.message)), String(err.message));
+    return true;
+  });
 });
 
 if (failures) {

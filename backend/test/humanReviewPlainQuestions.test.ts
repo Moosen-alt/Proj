@@ -11,7 +11,11 @@
 // touches. Checks:
 //   Q  a portal-question item renders the portal's question with its own options as radios (a select
 //      past four), NOTHING pre-selected, no free-text box, a Save answer button;
+//      Every question card also offers Dismiss, like a note;
 //   S  Save answer POSTs this job's answer to /api/projects/:id/portal-questions — never human-verify;
+//   P  the probe (skeptic, round 3): triage asks ownershipModel, a project save then writes it. The card
+//      the backend names as answered on file shows the job's answer and Dismiss, no options; a save
+//      from a card rendered before says the answer stands; a save that fails never shows the key;
 //   A  an advisory (legacy run-triage) item is information: no input, no engineering text, Dismiss;
 //   I  the inverter item is ONE card: model + qty prefilled from the snapshot (each key the issue
 //      names), a lookup, no amps box; a found lookup shows "model × qty → N A total" to confirm; the
@@ -94,10 +98,12 @@ const els: Record<string, { textContent?: string; innerHTML?: string; querySelec
   reviewItems: { innerHTML: "", querySelectorAll: () => [] },
 };
 let domRadios: Array<{ dataset: Record<string, string>; checked: boolean; value: string }> = [];
+/** What the next POST answers: {} by default; [P] makes it the route's refusal or its "already answered". */
+let apiReply: () => Promise<unknown> = async () => ({});
 const env: Env = {
   state: { selectedProjectId: "p-1", detail: null, inverterLookup: null },
   $: (id: string) => els[id] ?? null,
-  api: async (url, opts) => { calls.push({ url, method: String(opts?.method || "GET"), body: opts?.body ? JSON.parse(opts.body) : null }); return {}; },
+  api: async (url, opts) => { calls.push({ url, method: String(opts?.method || "GET"), body: opts?.body ? JSON.parse(opts.body) : null }); return apiReply(); },
   selectProject: async () => {},
   showMessage: (msg) => { messages.push(msg); },
   document: { querySelectorAll: (sel: string) => (sel.startsWith("input") ? domRadios : []) },
@@ -142,6 +148,8 @@ check("Q one radio per portal option", radios.length === 2 && radios.some((r) =>
 check("Q nothing pre-selected (the answer is the person's)", !/\bchecked\b/.test(qCard) && !/\bselected\b/.test(qCard), qCard);
 check("Q no free-text box and no Save Edit", !/id="review-q1"/.test(qCard) && !/Save Edit/.test(qCard) && !/<input(?![^>]*type="radio")[^>]*>/.test(qCard), qCard);
 check("Q a Save answer button carrying the per-job key", /data-portal-answer="q1"/.test(qCard) && /data-portal-key="ownershipModel"/.test(qCard) && /Save answer/.test(qCard), qCard);
+check("Q a Dismiss, like a note (it clears the card; it writes no answer)", /data-review-action="reject" data-review-id="q1"/.test(qCard) && /Dismiss/.test(text(qCard))
+  && /clears this card/i.test(text(qCard)), qCard);
 const many = item({ id: "q2", issueType: "Run triage", fieldName: "ownershipModel",
   portalQuestion: { key: "ownershipModel", label: "Ownership type", options: ["Customer-Owned", "Third-Party Owned", "Lease", "PPA", "Loan", "Cash"], control: "select" } });
 const [manyCard = ""] = render([many]);
@@ -180,8 +188,11 @@ const PQ = { questions: [
 const [noteAsQ = "", otherNote = ""] = render([legacy, item({ id: "lg2", issueType: "Run triage", fieldName: "portal_field", sourceExcerpt: "The city asks whether a third-party inspector will be used." })], {}, null, PQ);
 const noteRadios = noteAsQ.match(/<input[^>]*type="radio"[^>]*>/g) ?? [];
 check("N the note is the portal's question with its options, nothing pre-selected", noteAsQ.includes(Q) && noteRadios.length === 2 && !/\bchecked\b/.test(noteAsQ), noteAsQ);
-check("N it saves through the portal-questions door (Save answer with the per-job key), not Dismiss",
-  /data-portal-answer="lg1"/.test(noteAsQ) && /data-portal-key="ownershipModel"/.test(noteAsQ) && !/data-review-action="reject"/.test(noteAsQ), noteAsQ);
+// Asked as a question, the note saves through the portal-questions door; its Dismiss is the question
+// card's own (every question card offers one, like a note) and clears only the note.
+check("N it saves through the portal-questions door (Save answer with the per-job key), with the question card's Dismiss",
+  /data-portal-answer="lg1"/.test(noteAsQ) && /data-portal-key="ownershipModel"/.test(noteAsQ)
+  && /data-review-action="reject" data-review-id="lg1"/.test(noteAsQ) && !/data-review-action="edit"/.test(noteAsQ), noteAsQ);
 check("N none of the agent's engineering text", !/systemOwnership|planner|\bbind\b|nothing to map|left blank/i.test(text(noteAsQ)), text(noteAsQ));
 check("N a note the backend did not name stays a note", !/type="radio"/.test(otherNote) && /data-review-action="reject"/.test(otherNote) && /third-party inspector/.test(otherNote), otherNote);
 const [resolvedNote = ""] = render([{ ...legacy, status: "rejected" }], {}, null, PQ);
@@ -189,6 +200,42 @@ check("N a dismissed note is not re-asked", !/type="radio"/.test(resolvedNote), 
 const both = render([question, legacy], {}, null, PQ);
 check("N a question a pending item already asks is asked once (the note naming it stays a note)",
   both.length === 2 && /type="radio"/.test(both[0]) && !/type="radio"/.test(both[1]) && /data-review-action="reject"/.test(both[1]), both.join("\n----\n"));
+
+console.log("\n[P] a question the job answered since it was asked (the probe: triage asks, a project save answers)");
+// GET /portal-questions no longer lists the key; it names the pending item as answered on file.
+const ANSWERED_PQ = { questions: [], answeredItems: [{ itemId: "q1", key: "ownershipModel", answer: "Customer-Owned" }], unansweredCount: 0, unsureCount: 0 };
+const [answeredCard = ""] = render([question], {}, null, ANSWERED_PQ);
+check("P the card reads as answered, with the job's answer", /Already answered for this job/.test(text(answeredCard)) && text(answeredCard).includes("Customer-Owned"), text(answeredCard));
+check("P no options to choose and no Save answer (the route would refuse them)",
+  !/type="radio"/.test(answeredCard) && !/<select/.test(answeredCard) && !/data-portal-answer=/.test(answeredCard), answeredCard);
+check("P it offers Dismiss", /data-review-action="reject" data-review-id="q1"/.test(answeredCard), answeredCard);
+check("P no internal key on screen", !/ownershipModel/.test(text(answeredCard)), text(answeredCard));
+check("P a question the backend does not name stays a question (answered is never inferred)",
+  /type="radio"/.test(render([question], {}, null, { questions: [], answeredItems: [], unansweredCount: 0, unsureCount: 0 })[0] ?? ""));
+if (lib.savePortalQuestionAnswer) {
+  // A card rendered before the save landed still posts: the route closes the item and says what is on file.
+  domRadios = [{ dataset: { portalQuestionOption: "q1" }, checked: true, value: "Third-Party Owned" }];
+  apiReply = async () => ({ written: [], alreadyAnswered: [{ key: "ownershipModel", label: Q, answer: "Customer-Owned" }], remaining: 0 });
+  messages.length = 0;
+  await lib.savePortalQuestionAnswer("q1", "ownershipModel");
+  const said = messages[messages.length - 1] || "";
+  check("P already answered: the person is told the job's answer stands, in plain words", /already had an answer/i.test(said) && said.includes("Customer-Owned") && /Nothing was changed/.test(said), said);
+  check("P ... and no internal key", !/ownershipModel/.test(said), said);
+  // The route's refusal as it read before this fix: the message names the key.
+  apiReply = async () => { throw new Error('"ownershipModel" is not an open portal question for this project.'); };
+  messages.length = 0;
+  await lib.savePortalQuestionAnswer("q1", "ownershipModel");
+  const failed = messages[messages.length - 1] || "";
+  check("P a save that still fails shows a plain message that never names the internal key", !!failed && !/ownershipModel/.test(failed), failed);
+  apiReply = async () => { throw new Error('"Will the System be Customer-Owned or Third-Party Owned?" must be one of the portal\'s own options.'); };
+  await lib.savePortalQuestionAnswer("q1", "ownershipModel");
+  check("P a plain refusal from the route is shown as it is", /must be one of the portal's own options/.test(messages[messages.length - 1] || ""), messages[messages.length - 1] || "");
+  apiReply = async () => ({});
+} else {
+  check("P savePortalQuestionAnswer exists", false, "dashboard.js has no savePortalQuestionAnswer");
+}
+const [dismissedQ = ""] = render([{ ...question, status: "rejected" }]);
+check("P a dismissed question with no answer on file never reads as answered", !/\bAnswered\b/.test(text(dismissedQ)) && /Dismissed/.test(text(dismissedQ)), text(dismissedQ));
 
 console.log("\n[I] the inverter item is one card");
 const inputValue = (html: string, idPrefix: string): string | null => {

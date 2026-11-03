@@ -931,7 +931,10 @@ app.get("/api/projects/:id/portal-questions", asyncHandler(async (req, res) => {
 app.post("/api/projects/:id/portal-questions", asyncHandler(async (req, res) => {
   const out = await answerPortalQuestions(db, String(req.params.id), (req.body ?? {}).answers ?? {});
   // Answers re-run QC; like /qc and /human-verify, the chain continues from wherever QC left it.
-  try { enqueueStageSteps(db, String(req.params.id)); } catch { /* convenience, never the answers */ }
+  // A post that only closed an already-answered question wrote nothing: nothing to re-drive.
+  if (out.written.length) {
+    try { enqueueStageSteps(db, String(req.params.id)); } catch { /* convenience, never the answers */ }
+  }
   res.json(out);
 }));
 
