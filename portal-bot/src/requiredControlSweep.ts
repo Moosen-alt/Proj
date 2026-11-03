@@ -437,6 +437,66 @@ const sweepInPage = (
       if (!key) continue;
       (groups.get(key) ?? groups.set(key, []).get(key)!).push(r);
     }
+    // A GROUP WHOSE OWN CONTAINER ASKS NOTHING TAKES ITS ROW'S CAPTION (#363).
+    //
+    // The rule below reads requiredness from the smallest element holding every radio. PowerClerk's
+    // row layout puts the question and its asterisk in one div and the radios in a sibling
+    // `div.mb-3`: "<div><label>Disconnect within the stated distance?</label><span> * </span></div>
+    // <div class="mb-3">(o) Yes (o) No</div>". That container's text is "Yes No", so the group was
+    // never reported, and the stamped draft Submit (#354) was clicked with it blank.
+    //
+    // So when the container holds nothing but the options, the question is looked for outside it:
+    // a <label for> naming the container, its radiogroup or a member (never an option's own label),
+    // the container's or radiogroup's aria-labelledby, else the nearest preceding sibling with text,
+    // climbing only through ancestors that hold no other control. Bounded both ways: a container
+    // that already carries its own question never borrows a neighbour's (a section heading above a
+    // captioned group is not its caption), and the climb stops at the first sibling or ancestor that
+    // holds another control (that is the previous field, not this one's caption). A legend ("* means
+    // required") is never a caption. "" when there is none.
+    const rowCaptionOf = (cont: HTMLElement, members: HTMLInputElement[]): string => {
+      const flat = (s: string): string => s.replace(/\s+/g, " ").trim();
+      const optionLabels = members.flatMap((r) => Array.from(r.labels ?? []))
+        .filter((l) => cont.contains(l) || !!l.querySelector("input[type=radio]"));
+      let own = flat(cont.innerText || "");
+      for (const l of optionLabels) own = own.replace(flat((l as HTMLElement).innerText || ""), " ");
+      // What is left once the options are read off: a question if anything but yes/no-ish words.
+      if (own.replace(/\b(yes|no|n\/?a|true|false|unknown|other)\b/gi, "").replace(/[\s*:.,;()/-]+/g, "")) return "";
+      const usable = (t: string): string => (t && t.length <= 300 && !LEGEND.test(t) ? t : "");
+      const radiogroup = members[0].closest('[role="radiogroup"]') as HTMLElement | null;
+      const ids = [cont.id, radiogroup?.id ?? "", ...members.map((r) => r.id)].filter(Boolean);
+      for (const id of ids) {
+        for (const l of Array.from(document.querySelectorAll(`label[for="${CSS.escape(id)}"]`)) as HTMLElement[]) {
+          if (cont.contains(l) || l.querySelector("input[type=radio]")) continue;
+          // The label and the asterisk beside it in the same row: "<label>Q</label><span> * </span>".
+          const row = l.parentElement && !l.parentElement.contains(cont)
+            && !l.parentElement.querySelector("input:not([type=hidden]), select, textarea") ? l.parentElement : l;
+          const t = usable(flat(row.innerText || ""));
+          if (t) return t;
+        }
+      }
+      for (const host of [cont, radiogroup]) {
+        const refs = (host?.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean);
+        const t = usable(flat(refs.map((r) => (document.getElementById(r) as HTMLElement | null)?.innerText || "").join(" ")));
+        if (t) return t;
+      }
+      const memberSet = new Set<Element>(members);
+      const isControl = (el: Element): boolean => el.matches("input:not([type=hidden]), select, textarea") && !memberSet.has(el);
+      const otherControl = (el: Element): boolean => Array.from(el.querySelectorAll("input:not([type=hidden]), select, textarea"))
+        .some((c) => !memberSet.has(c));
+      let node: HTMLElement = cont;
+      for (let depth = 0; depth < 4; depth++) {
+        let sib = node.previousElementSibling as HTMLElement | null;
+        while (sib && !flat(sib.innerText || "") && !isControl(sib) && !otherControl(sib)) sib = sib.previousElementSibling as HTMLElement | null;
+        if (sib) {
+          if (isControl(sib) || otherControl(sib)) return "";
+          return usable(flat(sib.innerText || ""));
+        }
+        const up = node.parentElement;
+        if (!up || up === document.body || otherControl(up)) return "";
+        node = up;
+      }
+      return "";
+    };
     for (const [, members] of groups) {
       if (members.length < 2 || members.some((r) => r.checked)) continue;
       let cont: HTMLElement | null = members[0].parentElement;
@@ -457,8 +517,9 @@ const sweepInPage = (
         && (members.some((r) => shownEl(r) || Array.from(r.labels ?? []).some((l) => shownEl(l))) && shownEl(cont));
       const marked = answerable && (members.some((r) => r.required || r.getAttribute("aria-required") === "true")
         || !!members[0].closest('[role="radiogroup"][aria-required="true"]'));
-      if (!marked && !/\*/.test(text.slice(0, 200)) && !COMPLAINT.test(text)) continue;
-      push(text.replace(/\s*\*\s*/g, " ").trim(), "radio-group");
+      const caption = answerable ? rowCaptionOf(cont, members) : "";
+      if (!marked && !/\*/.test(text.slice(0, 200)) && !COMPLAINT.test(text) && !/\*/.test(caption)) continue;
+      push((caption || text).replace(/\s*\*\s*/g, " ").trim(), "radio-group");
     }
 
     // ---- an unticked REQUIRED checkbox (#362, Helm review of 4081f12, SF5) ------------

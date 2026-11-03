@@ -3133,12 +3133,36 @@ function seedSanitizedAhjProfiles(db: AppDb): void {
 // portal, record type and fee are marked NOT ASKED (permitProcessLookup.isUnaskedFact reads the
 // "not asked" prefix), so the per-job lookup still runs and answers them.
 //   - A row a person verified (verified_at) is never touched (hard rule 3).
-//   - A runtime lookup saved on or after the page was read wins: the reference loses the tie.
-//     An OLDER runtime row keeps its own answers; only this checklist permit is replaced or added.
+//   - A runtime lookup saved AFTER the page was read wins. LIKE IS COMPARED WITH LIKE (#560): a
+//     date-only observedAt is compared with the runtime row's date, a timestamp with its timestamp.
+//     The old text compare put "2026-10-06T…" after "2026-10-06", so a lookup run the same day the
+//     page was read always won — Saratoga Springs, UT kept a list cited to a retired PDF beside the
+//     reference read that day. On a same-day tie a date cannot say which came first, and the
+//     reference is a person's read of the page: it wins.
+//   - An OLDER runtime row keeps its own answers — its agency, portal, record type and fee — but
+//     the reference REPLACES EVERY PERMIT'S DOCUMENTS LIST it covers (#560): the AHJ's published
+//     checklist is the residential solar permit's list, so a runtime list beside it is a second,
+//     older answer to the same question (the "5 of 7 missing" QC row). Each runtime permit's
+//     documents say so (notFound), and the checklist permit carries the list.
 //   - Our own row is rewritten only when the reference changed, so a reboot writes nothing new.
 // Boot only: a read path never calls this (reads write nothing — nextStep.test).
 export const REFERENCE_CHECKLIST_MODEL = "reference-ahj-processes";
 export const REFERENCE_CHECKLIST_LABEL = "Residential solar PV permit (the AHJ's published checklist)";
+
+/** Is the runtime row (its updated_at, a full ISO timestamp) NEWER than the page read (observedAt)?
+ *  Like with like (#560): a date-only observedAt against the row's own date — strictly later wins,
+ *  a same-day tie goes to the reference; a timestamp against the timestamp (on or after wins).
+ *  An unreadable observedAt never lets the reference overwrite a runtime row. */
+export function runtimeRowIsNewer(updatedAt: string, observedAt: string): boolean {
+  const obs = String(observedAt ?? "").trim();
+  const upd = String(updatedAt ?? "").trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(obs)) return upd.slice(0, 10) > obs;
+  const o = Date.parse(obs);
+  const u = Date.parse(upd);
+  if (!Number.isFinite(o)) return true;
+  if (!Number.isFinite(u)) return false;
+  return u >= o;
+}
 
 function seedReferenceDocumentChecklist(db: AppDb, profile: AhjProcessProfile): void {
   const docs = profile.documents;
@@ -3167,9 +3191,13 @@ function seedReferenceDocumentChecklist(db: AppDb, profile: AhjProcessProfile): 
   if (row?.verified_at) return;
   const earlier = row ? parseJson<PermitProcessLookup | null>(text(row.payload_json), null) : null;
   const ours = earlier?.model === REFERENCE_CHECKLIST_MODEL;
-  if (row && !ours && text(row.updated_at) >= text(docs.observedAt)) return;
-  const kept = (earlier?.permits ?? []).filter((p) => p.label !== REFERENCE_CHECKLIST_LABEL);
-  if (ours && kept.length === 0 && JSON.stringify(earlier?.permits) === JSON.stringify([permit])) return;
+  if (row && !ours && runtimeRowIsNewer(text(row.updated_at), text(docs.observedAt))) return;
+  const superseded = `superseded by ${profile.ahj}'s published checklist (${docs.sourceUrl}, read ${text(docs.observedAt)}) — see "${REFERENCE_CHECKLIST_LABEL}"`;
+  const kept = (earlier?.permits ?? []).filter((p) => p.label !== REFERENCE_CHECKLIST_LABEL)
+    .map((p) => ({ ...p, documents: { value: null, sourceUrl: "", quote: "", origin: "kb" as const, notFound: superseded } }));
+  // Nothing to change (our own row, or a runtime row this seed already applied on a same-day tie):
+  // a reboot writes nothing.
+  if (earlier && JSON.stringify(earlier.permits) === JSON.stringify([...kept, permit])) return;
   const base: Omit<PermitProcessLookup, "profileKey" | "confidence"> = earlier && !ours
     ? earlier
     : {

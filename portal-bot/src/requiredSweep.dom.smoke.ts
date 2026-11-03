@@ -48,6 +48,13 @@ const S2_FACE_FILLED = S2_FACE("width:300px").replace('<span class="select2-sele
 const S2_ADDRESS = `<div class="form-group"><label for="s2a">Service address</label><input id="s2a" name="s2a" class="form-control" value="5010 Fixture Ave"></div>`;
 const S2_HELP = `<small class="form-text text-muted">The utility that serves the meter.</small>`;
 
+// PowerClerk's row markup (powerClerkDisconnect.dom.smoke.ts): the label and the red asterisk in one
+// div, the control in a sibling div.mb-3. PC_RADIOS is a Bootstrap 5 inline Yes/No pair.
+const PC_ROW = (id: string, label: string, star: boolean, control: string): string =>
+  `<div class="p-2"><div><label for="${id}" class="d-inline" data-test-role="input-label">${label}</label>${star ? '<span data-test-role="required-indicator" class="text-danger"> * </span>' : ""}</div><div class="mb-3">${control}</div></div>`;
+const PC_RADIOS = (id: string, required: boolean): string => `<div id="${id}" data-test-role="radiobuttonlist-element">${["Yes", "No"].map((v, i) =>
+  `<div class="form-check form-check-inline"><input class="form-check-input" type="radio" name="${id}" id="${id}_${i}" value="${v}"${required ? " required" : ""}><label class="form-check-label" for="${id}_${i}">${v}</label></div>`).join("")}</div>`;
+
 const PAGES: Record<string, string> = {
   // ---- the live miss, shape 1: a complaint in a row that holds TWO controls ----------
   arrayRow: shell(`
@@ -292,6 +299,21 @@ const PAGES: Record<string, string> = {
   radioRequired: shell(`<div class="form-group"><div>Is the system grid-tied?</div>
     <input type="radio" name="g" id="gY" required><label for="gY">Yes</label>
     <input type="radio" name="g" id="gN" required><label for="gN">No</label></div>`),
+  // ---- #363: PowerClerk's ROW layout — the question and its asterisk in one div, the radios in a
+  // sibling div.mb-3 whose own text is just "Yes No". Required by the row's asterisk; by the
+  // radios' own `required`; and, with neither, optional (not a blank). A neighbouring field's
+  // asterisk above must never mark an optional pair, nor a section heading over a group that
+  // carries its own question.
+  rowRadioAsterisk: shell(`${PC_ROW("pcDist", "Is the AC disconnect within the stated distance of the meter?", true, PC_RADIOS("pcDist", false))}`),
+  rowRadioNative: shell(`${PC_ROW("pcDist", "Is the AC disconnect within the stated distance of the meter?", false, PC_RADIOS("pcDist", true))}`),
+  rowRadioOptional: shell(`${PC_ROW("pcDist", "Is the AC disconnect within the stated distance of the meter?", false, PC_RADIOS("pcDist", false))}`),
+  rowRadioAnswered: shell(`${PC_ROW("pcDist", "Is the AC disconnect within the stated distance of the meter?", true, PC_RADIOS("pcDist", false).replace('value="Yes"', 'value="Yes" checked'))}`),
+  rowRadioAfterField: shell(`${PC_ROW("pcMake", "Disconnect Switch Manufacturer", true, '<input class="form-control" type="text" id="pcMake" value="Sample Switch Co">')}
+    <div class="p-2"><div class="mb-3">${PC_RADIOS("pcMeter", false)}</div></div>`),
+  rowRadioNoLabelFor: shell(`<div class="p-2"><div><span>Possible meter access issues?</span><span class="text-danger"> * </span></div><div class="mb-3">${PC_RADIOS("pcAccess", false)}</div></div>`),
+  rowRadioOwnQuestion: shell(`<div><h4>Section B *</h4></div><div class="form-group"><span>Would you like marketing emails?</span>
+      <label><input type="radio" name="mkt"> Yes</label> <label><input type="radio" name="mkt"> No</label></div>`),
+  rowRadioLegend: shell(`<div><p>All fields marked with a red * are required.</p></div><div class="mb-3">${PC_RADIOS("pcLeg", false)}</div>`),
   radioHidden: shell(`<div class="form-group" style="display:none"><div>Is the system grid-tied?</div>
     <input type="radio" name="g" id="gY" required><label for="gY">Yes</label>
     <input type="radio" name="g" id="gN" required><label for="gN">No</label></div>`),
@@ -474,6 +496,23 @@ check("...and the LEGEND SENTENCE itself is not counted as a required field",
 check("a required radio group a person can answer is a blank", (await sweep("radioRequired")).length === 1);
 check("...the same group hidden is not", (await sweep("radioHidden")).length === 0);
 check("...nor disabled", (await sweep("radioDisabled")).length === 0);
+// #363 — PowerClerk's row layout, both directions.
+{
+  const DIST = /Is the AC disconnect within the stated distance of the meter\?/;
+  const star = await sweep("rowRadioAsterisk");
+  check("#363 a row-layout required Yes/No pair (asterisk beside the row label) is a blank, named by its question",
+    star.length === 1 && star[0].why === "radio-group" && DIST.test(star[0].name) && !/\*/.test(star[0].name), JSON.stringify(star));
+  const native = await sweep("rowRadioNative");
+  check("#363 the same pair required by the radios' native `required` is a blank, named by its question",
+    native.length === 1 && DIST.test(native[0].name), JSON.stringify(native));
+  check("#363 the same pair with no asterisk and no `required` is optional — not a blank", (await sweep("rowRadioOptional")).length === 0);
+  check("#363 ...nor once it is answered", (await sweep("rowRadioAnswered")).length === 0);
+  check("#363 the previous field's asterisk never marks an uncaptioned pair below it", (await sweep("rowRadioAfterField")).length === 0);
+  const noFor = await sweep("rowRadioNoLabelFor");
+  check("#363 a row caption with no <label for> still marks the pair", noFor.length === 1 && /meter access issues/.test(noFor[0].name), JSON.stringify(noFor));
+  check("#363 a group that asks its own question never borrows a heading's asterisk", (await sweep("rowRadioOwnQuestion")).length === 0);
+  check("#363 a legend above is not a caption", (await sweep("rowRadioLegend")).length === 0);
+}
 check("a required unticked 'I am ready to submit' checkbox is a blank",
   (await sweep("checkboxRequired")).some((e) => /ready to submit/i.test(e.name)));
 check("...an optional unticked checkbox is not", (await sweep("checkboxOptional")).length === 0);

@@ -576,6 +576,10 @@ export function getCodeProfile(db: AppDb, input: { state?: string; ahj?: string 
   }
   // fireSetbacks are taken whole from one layer (below), so that layer answers whether they are
   // verified: a seeded city row's rules must not read as verified under a verified state row.
+  // Adopted editions are presented per entry (inheritedFrom "state" marks the state row's), so each
+  // layer records its own row: a code-basis finding names whose edition it compared with (#559).
+  fieldSources["adoptedCodes.state"] = sourceOf(base);
+  fieldSources["adoptedCodes.ahj"] = sourceOf(exact);
   const setbackLayer = exact.fireSetbacks.length ? exact : base.fireSetbacks.length ? base : null;
   if (setbackLayer) fieldSources.fireSetbacks = sourceOf(setbackLayer);
   // Amendments are concatenated state-then-AHJ: each records its own row, so the amendment check

@@ -36,7 +36,10 @@ export type JobType =
   // The LOCAL pipeline steps (QC, doc package, reviewer gate, historical check) running
   // automatically when a project enters their stage. NEVER a portal effect: the chain in
   // autoStageSteps.ts stops cold at ready_to_stage, and staging stays a human gesture.
-  | "stage_step";
+  | "stage_step"
+  // EMAILED JOBS, FILED OFF THE MONITOR TICK (#539): the intake mail one inbox poll found (IMAP
+  // UIDs or Gmail ids, never the raw message), fetched again and run through emailIntake.ts.
+  | "email_intake";
 
 export type JobStatus = "pending" | "running" | "done" | "failed";
 
@@ -737,6 +740,15 @@ async function runClaimedJob(db: AppDb, job: JobRecord): Promise<boolean> {
       result = { checked: checkResult.checked };
     } else if (job.jobType === "mbox_import") {
       result = await runMboxImportJob(db, job);
+    } else if (job.jobType === "email_intake") {
+      // Dynamic: emailPoller/gmail import this module to enqueue the job.
+      if (job.payload.channel === "gmail") {
+        const { runGmailIntakeJob } = await import("./gmail");
+        result = await runGmailIntakeJob(db, job.payload);
+      } else {
+        const { runImapIntakeJob } = await import("./emailPoller");
+        result = await runImapIntakeJob(db, job.payload);
+      }
     } else if (job.jobType === "folder_scan") {
       result = await runFolderScanJob(db, job);
     } else if (job.jobType === "stage_step") {
@@ -986,6 +998,9 @@ async function runClaimedJob(db: AppDb, job: JobRecord): Promise<boolean> {
       const run = await runPermitProcessLookup(db, createLLMProvider(), {
         state: String(p.state || ""), ahj: String(p.ahj || ""), utility: String(p.utility || ""),
         dcKw: String(p.dcKw || ""), acKw: String(p.acKw || ""), permitPath: String(p.permitPath || ""),
+        // A PERSON'S REFRESH (#560: POST /api/projects/:id/permit-process/refresh) re-runs over a
+        // complete seeded row; a verified row is still refused by runPermitProcessLookup (rule 3).
+        force: p.force === true || String(p.force ?? "") === "1",
         onIssuerKnown: () => { void queueFeeResearch(); },
       });
       result = { saved: run.saved, reason: run.reason, calls: run.calls };

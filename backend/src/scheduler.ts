@@ -81,10 +81,9 @@ export function startMonitorScheduler(db: AppDb): void {
             logger.info("monitor", `IMAP: fetched ${imap.fetched} message(s), ${imap.matches} match(es).`);
             sseBroadcast({ type: "imap_poll_done", message: `IMAP: ${imap.fetched} fetched, ${imap.matches} matched.`, data: { fetched: imap.fetched, matches: imap.matches } });
           }
-          // Emailed jobs (#489): new projects, files added to a recent one, and what waits on a person.
-          if (imap.intakeCreated || imap.intakeAttached || imap.intakeUnsorted) {
-            logger.info("monitor", `Email intake: ${imap.intakeCreated} project(s) created, ${imap.intakeAttached} attached, ${imap.intakeUnsorted} unsorted.`);
-          }
+          // Emailed jobs (#489) are filed by an email_intake job (#539), off this tick: one model
+          // read each held every permit/NEM check behind a burst.
+          if (imap.intakeQueued) logger.info("monitor", `Email intake: ${imap.intakeQueued} message(s) queued.`);
         } catch (err) {
           logger.warn("monitor", `IMAP poll failed: ${err instanceof Error ? err.message : String(err)}`);
         }
@@ -93,11 +92,12 @@ export function startMonitorScheduler(db: AppDb): void {
       // Gmail OAuth polling. Same tracker pipeline as mbox/IMAP; previously this
       // ONLY ran via a manual POST /api/gmail/poll, so a connected Gmail inbox was
       // silently never watched. Skipped entirely (not an error) when Gmail isn't
-      // configured+authorized, and polls a short window since the last tick.
+      // configured+authorized. `scheduled` reads everything since the last tick that caught up,
+      // in pages, carrying what one tick's bound leaves over (#539).
       let gmailMatches = 0;
       if (gmailStatus().authorized) {
         try {
-          const gm = await pollGmail(db, "newer_than:1d");
+          const gm = await pollGmail(db, undefined, { scheduled: true });
           gmailMatches = gm.matches?.length ?? 0;
           if (gm.fetched > 0) {
             logger.info("monitor", `Gmail: fetched ${gm.fetched} message(s), ${gmailMatches} match(es).`);
