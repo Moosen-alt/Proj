@@ -54,6 +54,23 @@ const aspxR3 = (content: string): string => page(`<form method="post" action="/x
 <div id="content"><h1>Project Information</h1>${content}</div>
 <div id="footer" class="site-footer">City Development Services</div>
 </form>`);
+// #403: PowerClerk's numbered step bar ("1 Interconnection Information" … "10 Submit") over PGE's
+// welcome page, as read live (DOM structure and classes only) on 2026-11-03: PowerClerk marks the
+// current step ONLY by its look (a filled number box, a bold title), never aria-current or an
+// "active" class. `mark` = how step `at` is marked current: "look" (PowerClerk's), "aria"
+// (aria-current="step"), or "" (nothing marks it).
+const PGE_STEPS = ["Interconnection Information", "Preparer Information", "PGE Customer Information", "Installer Information", "Description of Service", "System Information", "Options", "Review Type", "Documents", "Submit"];
+const PGE_WELCOME_TEXT = "All new renewable and renewable + storage installations need to have an application submitted for PGE's Net Metering program. This keeps our system safe and reliable and ensures that you will receive an offset for purchased power. When a project is submitted, we will review the application to verify it is complete within 3 business days. Complete applications will be reviewed by PGE to ensure that the interconnection is safe.<br><br>We recommend that you wait for the results of the review before starting construction of your project.<br><br>When you apply using PowerClerk your progress will be automatically saved.";
+const pcStep = (t: string, i: number, current: boolean, mark: "look" | "aria" | ""): string => {
+  const look = current && mark === "look";
+  const num = look ? "bg-primary-600 text-white fw-bold rounded pagination-num d-flex justify-content-center" : "bg-white text-primary-600 border border-primary-600 fw-bold rounded pagination-num d-flex justify-content-center";
+  return `<div class="p-2"><div id="page-header${i + 1}" class="use-hover d-flex flex-column align-items-center text-center h-100" data-visible="visible"${current && mark === "aria" ? ' aria-current="step"' : ""}><div class="${num}">${i + 1}</div><div data-test-role="page-title" class="${look ? "fw-bold " : ""}pagination-text w-100 pt-2">${t}</div></div></div>`;
+};
+const pgeWelcome = (mark: "look" | "aria" | "", at = 0, extra = "", steps: string[] = PGE_STEPS): string => page(`<h1 class="h4"><div data-test-role="form-title">Application for Net Metering Facility Interconnection</div></h1>
+    <div class="mb-3 py-3 border-bottom"><div class="d-flex" data-test-role="pagination-tabs-container"><div class="invisible d-flex flex-column px-2 justify-content-center"><button id="HeaderBackBtn" class="bg-transparent border-0"><span class="visually-hidden">Previous page</span></button></div>
+    <div class="w-100"><div class="d-flex">${steps.map((t, i) => pcStep(t, i, i === at, mark)).join("")}</div></div></div></div>
+    <div id="formPage1" class="form-page"><div class="literal-element"><h1><b>Welcome to PGE’s Application for <br>Customer Interconnection</b></h1>${PGE_WELCOME_TEXT}</div>${extra}</div>
+    <button id="NextButton" class="btn-secondary btn shadow-none">Next</button>`);
 const PAGES: Record<string, string> = {
   // Step 2 of an Accela-shaped wizard: real inputs, and the advance is "Continue Application »".
   "/form": page(`${HEADER}<h2>Step 2: Project Information</h2>
@@ -66,6 +83,45 @@ const PAGES: Record<string, string> = {
     <dl><dt>Job Description</dt><dd>Rooftop PV</dd></dl>
     <label><input type="checkbox" id="cert"> I certify that the information above is correct</label>
     <a href="#" id="cont" role="button" onclick="return false">Continue Application »</a>`),
+  // #403: PGE's PowerClerk WELCOME page (step 1 of 10, nothing to fill), modelled on the owner's
+  // 2026-11-02 screenshot and the 2026-10-29 capture, no account data: the form title, the NUMBERED
+  // 10-step bar with step 1 current, and the welcome text, which says what PGE does AFTER submission
+  // ("we will review the application"). A production replay read it as the review step and refused
+  // its Next. pgeWelcome(marker) varies only what marks step 1 current.
+  "/pge-welcome": pgeWelcome("look"),
+  "/pge-welcome-aria": pgeWelcome("aria"),
+  "/pge-welcome-unmarked": pgeWelcome(""),
+  // The same sentence with a numbered bar whose CURRENT step is a later one: no step-1 evidence.
+  "/future-review-step3": pgeWelcome("look", 2),
+  "/future-review-step3-aria": pgeWelcome("aria", 2),
+  // Step 1 current, but the page also names itself review in an imperative: still review.
+  "/step1-plus-review-heading": pgeWelcome("look", 0, "<h2>Review your application</h2><p>Review the application below, then click Submit.</p>"),
+  // Step 1 current, and step 1 IS the review step ("1 Review and Submit"): still review.
+  "/step1-is-review": pgeWelcome("look", 0, "", ["Review and Submit", "Payment", "Confirmation"]),
+  // Step 2's number box has neither PowerClerk look (a "done" style): unknown, so main's reading.
+  "/two-odd-looks": pgeWelcome("look", 0).replace('<div class="bg-white text-primary-600 border border-primary-600 fw-bold rounded pagination-num d-flex justify-content-center">2', '<div class="bg-success text-white fw-bold rounded pagination-num d-flex justify-content-center">2'),
+  // Steps 1 AND 4 both filled: no single current step.
+  "/two-filled": pgeWelcome("look", 0).replace('<div class="bg-white text-primary-600 border border-primary-600 fw-bold rounded pagination-num d-flex justify-content-center">4', '<div class="bg-primary-600 text-white fw-bold rounded pagination-num d-flex justify-content-center">4'),
+  // Helm's pins: the LAST step current (a fake review page with the 10-step bar at step 10)…
+  "/step10-current": pgeWelcome("look", 9),
+  // …step 1 current but the page shows a Submit / pay / sign control…
+  "/step1-plus-submit": pgeWelcome("look", 0, '<button type="button" id="sub">Submit Application</button>'),
+  "/step1-plus-pay": pgeWelcome("look", 0, '<button type="button" id="pay">Pay Fees</button>'),
+  "/step1-plus-sign": pgeWelcome("look", 0, '<button type="button" id="sgn">Sign Application</button>'),
+  // …and a one-step / two-step "wizard" ("Step 1 of 1"), which is not a numbered wizard.
+  "/step1-of-1": pgeWelcome("look", 0, "", ["Interconnection Information"]),
+  "/step1-of-2": pgeWelcome("look", 0, "", ["Interconnection Information", "Submit"]),
+  // PacifiCorp's PowerClerk WELCOME page (owner's screenshot, 2026-11-02): no review sentence, so it
+  // is not review on main or here — unchanged.
+  "/pac-welcome": page(`<div class="mb-3 py-3 border-bottom"><div class="d-flex" data-test-role="pagination-tabs-container"><div class="w-100"><div class="d-flex">${["Welcome", "Preparer Information", "Customer Information", "Property Owner Information", "System Information", "Documents", "Submit"].map((t, i) => pcStep(t, i, i === 0, "look")).join("")}</div></div></div></div>
+    <div id="formPage1" class="form-page"><h2>Welcome</h2><p>Pacific Power application for <b>Customer Generation</b></p><p>Please complete this application if you are interested in installing a customer-owned generation system (solar power, wind power, hydro power, etc) at your site to offset power usage.</p>
+    <p>Keep in mind these tips as you fill out the application:</p><ul><li>PowerClerk automatically saves your progress.</li><li>After you log out, you can log back in and pick up where you left off.</li><li>Navigate using the buttons at the bottom of the page or the page boxes above.</li><li>Click the "<b>Submit</b>" button at the end of the application to submit.</li></ul></div>
+    <button id="NextButton" class="btn-secondary btn shadow-none">Next</button>`),
+  // A site menu (not numbered) with "Home" current + the m7 sentence on a summary: still review.
+  "/menu-home-current-summary": page(`<nav><ul><li class="active"><a href="#">Home</a></li><li><a href="#">My Projects</a></li><li><a href="#">Help</a></li></ul></nav>
+    <h2>Solar permit request</h2>${SUMMARY_DL}<p>Staff will review your application within 5 business days. Click Next to send it to the city.</p><button type="button" id="next">Next</button>`),
+  // Helm's MUST-PASS: a real review page that ALSO says what happens after submission.
+  "/review-future-plus-heading": page(`${HEADER}<h2>Review your application</h2><p>Once submitted, we will review your application.</p>${SUMMARY_DL}<p>Review your application below, then click Submit.</p><button type="button" id="next">Submit</button>`),
   // ONE REVIEW PREDICATE (portal-run-close MF2): a combined confirm-and-sign page — "Please
   // review and sign" with a live consent box and a Next that files. The learner stops here and
   // the backstop's lockdown reads the SAME answer: terminal (reviewPage true).
@@ -270,6 +326,38 @@ try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return p.evaluate(() => { const ps = (globalThis as any).__portalSafety; return { ...ps.terminalPageInPage(), navOnly: ps.navigatorOnlyControlLabelsInPage(), sig: ps.signatureStepInPage().kind }; });
     };
+    // #403 (owner ruling 2026-11-03, "Step-1 rule, no verify"): PGE's welcome page, step 1 of a
+    // numbered wizard marked current, is NOT the review step (red on main: its "we will review the
+    // application" read as the page naming itself). Every other shape keeps main's reading.
+    const pac = await terminal("/pac-welcome");
+    check("#403: PacifiCorp's PowerClerk welcome page (no review sentence) is not the review page and its Next is not terminal — unchanged from main", pac.reviewPage === false && pac.terminal === false, JSON.stringify(pac));
+    for (const [path, what] of [
+      ["/pge-welcome", "PGE's welcome page, step 1 current by PowerClerk's look alone (as on the live portal)"],
+      ["/pge-welcome-aria", "the same page with step 1 marked aria-current=\"step\""],
+    ] as const) {
+      const pw = await terminal(path);
+      check(`#403 MUST-EXCLUDE: ${what}, "we will review the application": not the review page, and its Next is not terminal`, pw.reviewPage === false && pw.terminal === false, JSON.stringify(pw));
+    }
+    for (const [path, what] of [
+      ["/pge-welcome-unmarked", "the same page with NO current-step marker (no evidence: main's reading)"],
+      ["/future-review-step3", "the same sentence under a numbered bar whose current step (by look) is step 3"],
+      ["/future-review-step3-aria", "the same sentence under a numbered bar whose aria-current step is step 3"],
+      ["/two-odd-looks", "step 2's number box has neither PowerClerk look (no single current step)"],
+      ["/two-filled", "steps 1 and 4 both filled (no single current step)"],
+      ["/step10-current", "the 10-step bar with step 10 (the last) current"],
+      ["/step1-plus-submit", "step 1 current, but the page shows \"Submit Application\""],
+      ["/step1-plus-pay", "step 1 current, but the page shows \"Pay Fees\""],
+      ["/step1-plus-sign", "step 1 current, but the page shows \"Sign Application\""],
+      ["/step1-of-1", "a one-step bar (\"Step 1 of 1\")"],
+      ["/step1-of-2", "a two-step bar"],
+      ["/step1-plus-review-heading", "step 1 current, but the page also says \"Review your application\" / \"Review the application below, then click Submit\""],
+      ["/step1-is-review", "step 1 current, and step 1 is \"Review and Submit\""],
+      ["/menu-home-current-summary", "a site menu with Home current (not numbered) over a summary saying \"Staff will review your application\""],
+      ["/review-future-plus-heading", "a review page that also says \"we will review your application\" (Helm's MUST-PASS)"],
+    ] as const) {
+      const r = await terminal(path);
+      check(`#403 MUST-PASS: ${what} still reads as the review page (terminal)`, r.reviewPage === true && r.terminal === true, JSON.stringify(r));
+    }
     const rs = await terminal("/review-sign");
     check("MF2: a combined 'Please review and sign' page reads as the review page to the backstop (terminalPageInPage.reviewPage) — the learner stops on the same answer", rs.reviewPage === true, JSON.stringify(rs));
     check("MF2: its live consent box is still the typed signature step (signed there, then the stop)", rs.sig === "typed", JSON.stringify(rs));

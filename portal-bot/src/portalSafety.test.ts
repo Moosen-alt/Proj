@@ -269,7 +269,16 @@ await check("isReviewPageText: the page NAMES itself the review step (MUST-MATCH
     "Please review all information before you submit.", "Review the details below and submit",
     "Review and Confirm\nPermit type: Residential Solar", "Please review and confirm your application.", "Review and certify",
     // The captured review page names itself AND carries locked sections: still the review page.
-    "Step 4 : Review Site Address (Read-only) Parcel (Read-only) Owner (Read-only) Continue Application »"];
+    "Step 4 : Review Site Address (Read-only) Parcel (Read-only) Owner (Read-only) Continue Application »",
+    // #403: TEXT ALONE never sets a future-tense review sentence aside. Only the in-page reading may,
+    // on a numbered wizard whose current step is step 1 (portalSafetyInPage.dom.smoke): a summary page
+    // saying "Staff will review your application…" must keep reading as review (#344's held shapes).
+    "When a project is submitted, we will review the application to verify it is complete within 3 business days.",
+    "Staff will review your application within 5 business days. Click Next to send it to the city.",
+    "Please review your application before submitting", "Review the application below, then click Submit",
+    // PacifiCorp's PowerClerk SUBMIT page (captured replica pacific-power page 18) names itself only
+    // through "Once we review the application": a guard on that alternative.
+    "Press Submit below to submit your Interconnection Application. Once we review the application and confirm it is eligible for interconnection, we will send a request for signatures through DocuSign."];
   const NOT = ["Please review the terms and conditions below", "I accept the terms and conditions", "Plan Review Fee", "Review Type",
     // A bare "please review" is the entry disclaimer's; a review noun in a heading is not the step.
     "Please review before continuing", "Plan Review Details", "Review Comments", "Review Status: In Review",

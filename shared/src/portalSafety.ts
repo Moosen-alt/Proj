@@ -641,12 +641,105 @@ export function portalSafetyFactory() {
       .map((id) => { const n = d.getElementById(id); return n ? textOf(n) : ""; }).join(" ");
     return `${el.getAttribute("aria-label") || ""} ${byId}`.replace(/\s+/g, " ").trim();
   }).filter(Boolean);
+  //
+  // STEP ONE OF A NUMBERED WIZARD IS NOT THE REVIEW STEP (#403, owner ruling 2026-11-03: "Step-1
+  // rule, no verify"). PGE's PowerClerk WELCOME page (step 1 of 10, nothing to fill) says "When a
+  // project is submitted, we will review the application to verify it is complete", and that
+  // sentence alone read as the page naming itself the review step: a production replay refused its
+  // ordinary Next (2026-10-27, an empty draft left behind). Text alone cannot tell that sentence from
+  // a real summary page's "Staff will review your application…" (#344: narrowing the text let 18 of
+  // the 33 held shapes leak a filing or a card charge, and the owner ruled text narrowing out). So
+  // the future-tense reading is set aside ONLY on positive evidence from the page's own wizard: a
+  // NUMBERED step list (items "1 …", "2 …", "3 …" in order, at least three, short, no fillable, no
+  // heading) whose CURRENT step (aria-current / aria-selected / a whole active|current|selected
+  // class token, on the step or inside it — or PowerClerk's exact filled number box, below) is its
+  // FIRST, and that step's label is not review. Any numbered list marking a later step current, a
+  // review step, or no single current step gives no evidence (main's reading); so does a page that
+  // shows a submit / file / pay / sign control. A site menu with "Home" current is not numbered, so
+  // it never counts, and a one- or two-step list is not a wizard (at least three steps).
+  // Only the "will / shall / we'll review your|the application…" class is set aside; the bare "we"
+  // stays (PacifiCorp's real SUBMIT page names itself only through "Once we review the
+  // application"), and every imperative, heading, URL, active-step and panel-name signal still reads
+  // review. The words are replaced in the text this reading returns, so every door that re-reads it
+  // (reviewPageInPage, terminalPageInPage, the learner's reviewTextInPage) gets the same answer.
+  const FUTURE_REVIEW = /\b(will|shall|we['’]ll)(\s+)review(?=\s+(all\s+(of\s+)?(your\s+|the\s+)?|(your|the)\s+)(application|information|details|entries|submission)\b)/gi;
+  const numberedSteps = (items: Element[]): boolean => items.every((c, i) => {
+    const t = textOf(c).trim();
+    return t.length < 60 && new RegExp(`^(step\\s*)?${i + 1}(?!\\d)`, "i").test(t);
+  });
+  // POWERCLERK'S CURRENT STEP, BY ITS EXACT MARKUP (read live on PGE, DOM structure and classes
+  // only, 2026-11-03). PowerClerk marks the current step ONLY by style: its number box
+  // (.pagination-num) is "bg-primary-600 text-white", every other step's is "bg-white
+  // text-primary-600 border …" — no aria-current, no active class. Styling counts only in exactly
+  // that shape: each step holds one .pagination-num, exactly ONE is filled (bg-primary-600 +
+  // text-white, not bg-white) and every other is outlined (bg-white, not text-white). Anything
+  // else — no filled step, two filled, a box with neither look — is unknown: no evidence.
+  const pcNumBox = (item: Element): Element | null => {
+    const boxes = Array.from(item.querySelectorAll(".pagination-num"));
+    return boxes.length === 1 ? boxes[0] : null;
+  };
+  const pcFilled = (box: Element): boolean => box.classList.contains("bg-primary-600") && box.classList.contains("text-white") && !box.classList.contains("bg-white");
+  const pcOutlined = (box: Element): boolean => box.classList.contains("bg-white") && !box.classList.contains("text-white") && !box.classList.contains("bg-primary-600");
+  // THE STRUCTURAL FACT: a numbered step list's ONE current step is its first. True only when a
+  // list's current step is known (a semantic marker, or PowerClerk's exact look) and is step 1, and
+  // no numbered list on the page says otherwise; any doubt is false (main's reading).
+  const firstStepCurrentInPage = (d: Document): boolean => {
+    let first = false;
+    const listOf = (list: Element): Element[] | null => {
+      const items = Array.from(list.children).filter((c) => textOf(c).trim() !== "");
+      return items.length >= 3 && numberedSteps(items) && !holdsFillable(list) && !holdsHeading(list) ? items : null;
+    };
+    // (a) A step the markup marks current (aria-current / aria-selected / a whole active|current|
+    //     selected class token, on the step or inside it).
+    for (const a of Array.from(d.querySelectorAll("*"))) {
+      if (!a.matches(ACTIVE_STEP_ATTR) && !activeByClass(a)) continue;
+      let n: Element = a;
+      for (let up = 0; up < 6 && n.parentElement && n !== d.body; up++) {
+        const list: Element = n.parentElement;
+        const items = listOf(list);
+        if (items && items.includes(n)) {
+          if (items.indexOf(n) !== 0 || isReviewPageText(textOf(n)) || !shownEl(n)) return false;
+          first = true;
+          break;
+        }
+        n = list;
+      }
+    }
+    // (b) PowerClerk's exact look (above). A later step filled = a later step current: no evidence.
+    for (const box of Array.from(d.querySelectorAll(".pagination-num"))) {
+      if (!pcFilled(box)) continue;
+      let n: Element = box;
+      for (let up = 0; up < 6 && n.parentElement && n !== d.body; up++) {
+        const list: Element = n.parentElement;
+        const items = listOf(list);
+        if (items && items.includes(n)) {
+          const boxes = items.map(pcNumBox);
+          if (boxes.some((b) => !b)) return false;
+          const filled = boxes.filter((b) => pcFilled(b as Element)).length;
+          if (filled !== 1 || !boxes.every((b) => pcFilled(b as Element) || pcOutlined(b as Element))) return false;
+          if (items.indexOf(n) !== 0 || isReviewPageText(textOf(n)) || !shownEl(n)) return false;
+          first = true;
+          break;
+        }
+        n = list;
+      }
+    }
+    return first;
+  };
+  // A page that shows a submit / file / pay / sign control (or a "Continue Application", read as on
+  // a review page) never gets the carve-out, whatever its step bar says.
+  const SIGN_CONTROL = /\b(e-?sign|signature|sign)\b(?!\s*(in|out|up|off|on)\b)/i;
+  const terminalShapedControlInPage = (d: Document): boolean => Array.from(d.querySelectorAll("button, a, input[type=submit], input[type=button], input[type=image], [role=button], [role=link]"))
+    .filter((el) => { const r = (el as HTMLElement).getBoundingClientRect(); return r.width > 2 && r.height > 2; })
+    .map((el) => String(controlLabelInPage(el) || (el as HTMLElement).innerText || (el as HTMLInputElement).value || ""))
+    .some((t) => isFinalSubmitControl(t, { reviewPage: true }) || isSubmitIntent(t, { reviewPage: true, readOnlyPage: true }) || isPayFee(t) || isSignatureRequestControl(t) || SIGN_CONTROL.test(t));
   const reviewReadingInPage = (d: Document): { review: boolean; text: string; navs: Element[] } => {
     const url = (globalThis as { location?: { href?: string } }).location?.href;
     const wide = wideBarsInPage(d);
     const narrow = narrowBarsInPage(d);
-    const textWide = textWithout(d, wide);
-    const textNarrow = textWithout(d, narrow);
+    const stepOne = firstStepCurrentInPage(d) && !terminalShapedControlInPage(d);
+    const textWide = stepOne ? textWithout(d, wide).replace(FUTURE_REVIEW, "$1$2assess") : textWithout(d, wide);
+    const textNarrow = stepOne ? textWithout(d, narrow).replace(FUTURE_REVIEW, "$1$2assess") : textWithout(d, narrow);
     // Only a bar that LISTS the review step speaks for the step: a site menu's aria-current="page"
     // ("My Permits") says nothing about where the wizard is, and must not count as a form step.
     const active = activeStepTexts(outermost(wide.concat(narrow)).filter((b) => isReviewPageText(textOf(b))));
