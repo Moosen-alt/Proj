@@ -35,6 +35,7 @@
 // designCriteria — the fix is data (the profile), never a city-specific branch here.
 // ---------------------------------------------------------------------------
 import type {
+  CodeEdition,
   CodeReference,
   JurisdictionCriterionKey,
   JurisdictionDesignCriteria,
@@ -52,7 +53,7 @@ import type {
   StatedRoofPlanDimension,
   UpcomingCodeEdition,
 } from "../../shared/src/types";
-import type { EffectiveCodeContext } from "./codeProfiles";
+import type { EffectiveCodeContext, PresentedCodeEdition } from "./codeProfiles";
 import { codeFamilyOf, editionsInEffect, type EditionsInEffect } from "./codeFamilies";
 
 export interface DesignTextSource {
@@ -1062,6 +1063,14 @@ function extractSnow(text: string, source: string, out: StatedDesignCriterion[],
 // NEC 690.54" (a section number is not an edition) nor a placard's "PER CODE: NEC 2020" (measured on the
 // labels sheet of the most common plan-set template).
 const CODE_BASIS_HEADER = /\b(governing\s+codes?|applicable\s+codes?|code\s+basis|design\s+codes?|codes?\s+and\s+standards|references\s+and\s+codes|building\s+codes?\s+used|codes?\s+used)\b\s*[:\-–]?|\bcodes\s*:|(?<!\bper\s{1,3})\bcode\s*:(?=\s*(?:(?:19|20)\d{2}\s+[A-Z]{2,6}\b|[A-Z]{2,6}\s+(?:19|20)\d{2}\b))/gi;
+/** A "… Code:" field label a code's name is printed after ("Building Code:", "Design Criteria
+ *  Code:"); never a placard's "PER CODE:" citation. */
+const CODE_LABEL = /(?<!\bper\s{1,3})\bcodes?\s*:\s*/gi;
+/** What parts two entries of a printed list: space and list punctuation, never a word of prose. */
+const LIST_SEPARATOR = /^[\s,;•·▪●■◦*|/\-–—]*$/;
+/** The title of an AHJ's own document embedded in a plan set ("RESIDENTIAL SOLAR PHOTOVOLTAIC
+ *  CHECKLIST", "SUBMITTAL HANDOUT"): a code-basis block never runs on into it (#559). */
+const AHJ_DOCUMENT_TITLE = /\b(?:check\s?-?lists?|handouts?)\b/i;
 const NAME_STOPWORDS = new Set(["OF", "THE", "AND", "FOR", "&", "PER", "BY", "IN", "TO", "WITH", "AS", "ON", "AT", "SEE"]);
 /** Qualifiers that make a generic mention of a code, not its name: "LOCAL FIRE CODE", "CURRENT BUILDING CODE". */
 const GENERIC_QUALIFIER = /^(?:(?:LOCAL|APPLICABLE|GOVERNING|ADOPTED|CURRENT|LATEST|MUNICIPAL|PREVAILING|REQUIRED|ALL)\s+)+/i;
@@ -1210,6 +1219,14 @@ const PAREN_AFTER = /^\s*,?\s*(?:Edition|EDITION|edition)?\s*\(\s*([^)]{1,40}?)\
  *  list marker, "Edition", a volume word, a blanked parenthetical. A word of prose or of another
  *  field ends the run. (A range's second year is no token — codeTokens drops it — so a dash is glue.) */
 const RUN_GLUE = /^(?:\s|[,;:•·▪●■◦*/&\-–—]|\(\s*[a-z0-9]{1,2}\s*\)|\b\d{1,2}[.)](?=\s)|\b(?:Edition|EDITION|edition|and|AND|the|THE|of|OF|RESIDENTIAL|BUILDING|Residential|Building)\b)*$/;
+/** A glue WORD after a closing parenthesis ends the run: the parenthetical closed its item, and
+ *  "and the" after it starts a sentence's next clause, not the next entry of a list. An AHJ's
+ *  checklist embedded in a plan set reads "designed to the 2017 National Electrical Code (NEC) and
+ *  the 2015 International Codes"; with its "2017" split by OCR, "(NEC) and the 2015" paired the NEC
+ *  with the International Codes' year and blocked a correct plan on "NEC 2015" (#559). Punctuation
+ *  and space after a parenthetical stay glue ("2023 OREGON ELECTRICAL SPECIALTY CODE (NEC 2020) ·
+ *  2022 OREGON FIRE CODE"). */
+const GLUE_WORD_PAST_PAREN = /\)[^]*\b(?:and|the|of)\b/i;
 
 type CodeToken = {
   kind: "year" | "name" | "abbr";
@@ -1344,12 +1361,13 @@ function nameTokenCode(t: CodeToken): string {
  * opens and closes with the same kind is ambiguous — one token is stray either way ("2023 OREGON
  * FIRE CODE 2025", "ORSC 2023 OESC 2023 OFC") — so its pairs are WEAK; the stray token reads nothing.
  */
-function pairCodeTokens(tokens: CodeToken[], blanked: string): Array<{ code: CodeToken; year: CodeToken; weak: boolean }> {
+function pairCodeTokens(tokens: CodeToken[], text: string): Array<{ code: CodeToken; year: CodeToken; weak: boolean }> {
+  const blanked = blankParentheticals(text);
   const runs: CodeToken[][] = [];
   for (const t of tokens) {
     const run = runs[runs.length - 1];
     const prev = run?.[run.length - 1];
-    if (prev && (prev.kind === "year") !== (t.kind === "year") && RUN_GLUE.test(blanked.slice(prev.end, t.at))) run.push(t);
+    if (prev && (prev.kind === "year") !== (t.kind === "year") && RUN_GLUE.test(blanked.slice(prev.end, t.at)) && !GLUE_WORD_PAST_PAREN.test(text.slice(prev.end, t.at))) run.push(t);
     else runs.push([t]);
   }
   const pairs: Array<{ code: CodeToken; year: CodeToken; weak: boolean }> = [];
@@ -1398,7 +1416,7 @@ function codeBasisItems(text: string): BasisItem[] {
   const windows: Array<[number, number]> = [];
   while ((m = header.exec(text))) windows.push([m.index + m[0].length, Math.min(text.length, m.index + m[0].length + 520)]);
   const tokens = codeTokens(text, windows, items.map((i) => [i.at, i.end]));
-  for (const pair of pairCodeTokens(tokens, blankParentheticals(text))) {
+  for (const pair of pairCodeTokens(tokens, text)) {
     const { year, weak } = pair;
     let code = pair.code;
     if (code.generic) continue;
@@ -1425,13 +1443,25 @@ function codeBasisItems(text: string): BasisItem[] {
 }
 
 /**
- * Every code-basis entry a text states. A spelled-out name with its year is self-anchoring, so it
- * is read ANYWHERE: PDF text order often puts the list BEFORE its "GOVERNING CODES:" heading
- * (measured on the live book). Bare abbreviations ("2021 IBC", "NEC 2020") are read only inside a
- * code-basis block, and a block is contiguous — once the entries stop, whatever follows is another
- * note: the labels sheet repeats "NEC: 2020, PER CODE: NEC 690.31" dozens of times, and those are
- * placard citations, not the design's code basis. `weak` / `sure` collect the reading keys
- * (codeBasisKey) of the entries read through an ambiguous block and the others.
+ * Every code-basis entry a text states — read from a CODE-BASIS BLOCK only (#559). A plan set's PDF
+ * also carries documents that are not the plan: an AHJ's checklist embedded in the package says
+ * "all systems are to be designed to the 2017 National Electrical Code", and read as the plan's own
+ * statement it blocked a correct plan on a verified profile. So an entry counts only where the
+ * package states ITS code basis:
+ *  · inside a code-basis block (CODE_BASIS_HEADER, then its entries while they are contiguous —
+ *    once they stop, whatever follows is another note: the labels sheet repeats "NEC: 2020, PER
+ *    CODE: NEC 690.31" dozens of times, and those are placard citations, not the design's code
+ *    basis; and once an AHJ document's title — a checklist, a handout — starts, the plan's block has
+ *    ended, however close the PDF's text order puts the two). Bare abbreviations ("2021 IBC", "NEC
+ *    2020") count only here;
+ *  · a spelled-out name, directly after a "… Code:" label ("Building Code: Oregon Structural
+ *    Specialty Code, 2025 Edition (2024 IBC)" on an engineer's letter);
+ *  · spelled-out names forming a LIST with no heading — two or more entries side by side, parted by
+ *    nothing but space and list punctuation ("FLORIDA BUILDING CODE, RESIDENTIAL 8TH EDITION (2023)
+ *    2020 NATIONAL ELECTRICAL CODE" on a cover sheet; PDF text order may also put the list before its
+ *    heading). A name in a sentence of prose ("SHALL CONFORM TO …", "designed to the …") is no block.
+ * `weak` / `sure` collect the reading keys (codeBasisKey) of the entries read through an ambiguous
+ * block and the others.
  */
 function extractCodeBasis(text: string, source: string, out: StatedCodeBasisEntry[], weak: Set<string>, sure: Set<string>): void {
   const items = codeBasisItems(text);
@@ -1443,13 +1473,23 @@ function extractCodeBasis(text: string, source: string, out: StatedCodeBasisEntr
     let lastEnd = start;
     for (const item of items) {
       if (item.at < start) continue;
-      if (item.end > start + 520 || item.at - lastEnd > 120) break;
+      if (item.end > start + 520 || item.at - lastEnd > 120 || AHJ_DOCUMENT_TITLE.test(text.slice(lastEnd, item.at))) break;
       lastEnd = item.end;
       admitted.add(item);
     }
   }
+  const names = items.filter((i) => !i.abbreviation);
+  const label = new RegExp(CODE_LABEL.source, "gi");
+  while ((h = label.exec(text))) {
+    const end = h.index + h[0].length;
+    const first = names.find((i) => i.at >= end);
+    if (first && first.at === end) admitted.add(first);
+  }
+  for (let i = 0; i + 1 < names.length; i++) {
+    if (LIST_SEPARATOR.test(text.slice(names[i].end, names[i + 1].at))) admitted.add(names[i]).add(names[i + 1]);
+  }
   for (const item of items) {
-    if (item.abbreviation && !admitted.has(item)) continue;
+    if (!admitted.has(item)) continue;
     out.push({ ...item.entry, source, excerpt: flat(text.slice(item.at, item.end)).slice(0, 90) });
     (item.weak ? weak : sure).add(codeBasisKey(source, item.entry));
   }
@@ -2543,19 +2583,53 @@ function provenance(ctx: EffectiveCodeContext): string {
   // Name the ROW the value came from, not the project's AHJ: a city with no row of its own
   // resolves to the state-level default, and "City of X code profile (human-verified)" would
   // claim a verification nobody did for that city.
-  const who = ctx.profile?.ahj ? `${ctx.profile.ahj} (${ctx.profile.state || ctx.state})` : `${ctx.state || "state"} state-level`;
-  const url = ctx.designCriteria.sourceUrl ? `; source ${ctx.designCriteria.sourceUrl}` : "";
-  if (ctx.verified) {
-    const at = ctx.profile?.verifiedAt ? ` on ${ctx.profile.verifiedAt.slice(0, 10)}` : "";
+  return rowProvenance({
+    ahj: ctx.profile?.ahj ?? "", state: ctx.profile?.ahj ? ctx.profile.state || ctx.state : ctx.state, verified: ctx.verified,
+    verifiedBy: ctx.profile?.verifiedBy, verifiedAt: ctx.profile?.verifiedAt, researchedAt: ctx.profile?.researchedAt,
+  }, ctx.designCriteria.sourceUrl ? [ctx.designCriteria.sourceUrl] : []);
+}
+
+function rowProvenance(row: { ahj: string; state: string; verified: boolean; verifiedBy?: string; verifiedAt?: string; researchedAt?: string }, urls: string[]): string {
+  const who = row.ahj ? `${row.ahj} (${row.state})` : `${row.state || "state"} state-level`;
+  const url = urls.length ? `; source ${urls.join(", ")}` : "";
+  if (row.verified) {
+    const at = row.verifiedAt ? ` on ${row.verifiedAt.slice(0, 10)}` : "";
     // seedReferenceCodeProfiles stamps shipped rows "verified" with verifiedBy
     // "reference-seed". That is a row nobody at this install checked — calling it
     // "human-verified by reference-seed" contradicts itself on the operator's screen.
-    if (ctx.profile?.verifiedBy === "reference-seed") return `${who} code profile (verified via the shipped reference seed${at}, not by an operator here${url})`;
-    const by = ctx.profile?.verifiedBy ? ` by ${ctx.profile.verifiedBy}` : "";
+    if (row.verifiedBy === "reference-seed") return `${who} code profile (verified via the shipped reference seed${at}, not by an operator here${url})`;
+    const by = row.verifiedBy ? ` by ${row.verifiedBy}` : "";
     return `${who} code profile (human-verified${by}${at}${url})`;
   }
-  const at = ctx.profile?.researchedAt ? ` ${ctx.profile.researchedAt.slice(0, 10)}` : "";
+  const at = row.researchedAt ? ` ${row.researchedAt.slice(0, 10)}` : "";
   return `${who} code profile (seeded${at} — researched/imported, not yet human-verified${url})`;
+}
+
+/**
+ * WHERE THE COMPARED EDITIONS COME FROM (#559). A city under a state's uniform code reads the
+ * STATE row's editions (getCodeProfile marks them inheritedFrom "state"), so the code-basis finding
+ * names that row and the editions' own sources — never the city row, and never the city's
+ * design-criteria page, which is where its snow and wind values come from, not its code editions
+ * (Saratoga Springs, UT: the blocker named the city's design-criteria URL as the source of Utah's
+ * statewide editions). Each layer answers for its own verification (fieldSources "adoptedCodes.state"
+ * / "adoptedCodes.ahj" on a layered read; a single row answers for itself).
+ */
+function codeEditionsProvenance(ctx: EffectiveCodeContext, rows: CodeEdition[]): string {
+  if (!rows.some((r) => r.inheritedFrom === "state")) return provenance(ctx);
+  const urls = (rs: CodeEdition[]): string[] => [...new Set(rs.map((r) => String(r.sourceUrl || "").trim()).filter(Boolean))];
+  const layer = (key: "state" | "ahj", rs: CodeEdition[]): string => {
+    const src = ctx.profile?.fieldSources?.[`adoptedCodes.${key}`];
+    const editions = rs.map((r) => `${r.code} ${r.edition}`).join(" / ");
+    const text = rowProvenance(src
+      ? { ahj: src.ahj, state: (src.state || ctx.state).toUpperCase(), verified: src.confidence === "verified", verifiedBy: src.verifiedBy, verifiedAt: src.verifiedAt }
+      : { ahj: key === "state" ? "" : ctx.profile?.ahj ?? "", state: ctx.profile?.state || ctx.state, verified: ctx.verified, verifiedBy: ctx.profile?.verifiedBy, verifiedAt: ctx.profile?.verifiedAt, researchedAt: ctx.profile?.researchedAt }, urls(rs));
+    if (key === "ahj") return `${text} for ${editions}`;
+    const label = (rs[0] as PresentedCodeEdition).layerLabel;
+    return `${text} for ${editions}${ctx.ahj ? `, inherited by ${ctx.ahj}${label ? ` — ${label}` : ""}` : ""}`;
+  };
+  const inherited = rows.filter((r) => r.inheritedFrom === "state");
+  const own = rows.filter((r) => r.inheritedFrom !== "state");
+  return [...(own.length ? [layer("ahj", own)] : []), layer("state", inherited)].join("; ");
 }
 
 /**
@@ -3314,8 +3388,10 @@ export function evaluateDesignCriteriaFindings(
   const adopted = ctx.profile?.adoptedCodes?.length ? ctx.adoptedCodes : [];
   if (!adopted.length && stated.codeBasis.length) out.push(codeBasisUnverified(ctx, stated.codeBasis, who));
   if (adopted.length && stated.codeBasis.length) {
-    const profileEntries = adopted.map(profileCodeEntry);
+    const profileEntries = adopted.map((a) => ({ ...profileCodeEntry(a), row: a }));
     const lines: string[] = [];
+    // The profile entries the reported lines were compared with: the message names their rows.
+    const comparedRows = new Set<CodeEdition>();
     // Lines whose plan edition is the state's upcoming edition, due within the window: these
     // never block, and say the date.
     const softened = new Set<string>();
@@ -3332,9 +3408,10 @@ export function evaluateDesignCriteriaFindings(
     // another reading of the same code in the package matches the profile — not every reading
     // disagrees. These never block; they land as a callout naming the weak reading.
     const weakLines = new Set<string>();
-    const report = (key: string, line: string, compared: { code: string; edition: string }, graceVia?: { code: string; edition: string }, weakWhy?: string): void => {
+    const report = (key: string, line: string, rows: CodeEdition[], compared: { code: string; edition: string }, graceVia?: { code: string; edition: string }, weakWhy?: string): void => {
       if (seen.has(key)) return;
       seen.add(key);
+      for (const r of rows) comparedRows.add(r);
       const due = upcomingFor(compared);
       const grace = due ? null : graceFor(compared) ?? (graceVia ? graceFor(graceVia) : null);
       const base = weakWhy ? `${line} — ${weakWhy}` : line;
@@ -3360,7 +3437,7 @@ export function evaluateDesignCriteriaFindings(
       const same = profileEntries.filter((a) => a.code === code);
       if (same.length && !same.some((a) => a.edition === b.edition)) {
         const agreeing = stated.codeBasis.filter((o) => normCodeToken(o.code) === code && same.some((a) => a.edition === o.edition));
-        report(`${code}|${b.edition}`, `plan states ${b.code} ${b.edition} (${b.source}) — profile records ${same.map((a) => a.label).join(" / ")}`, b, undefined, weakWhyFor(b, code, agreeing));
+        report(`${code}|${b.edition}`, `plan states ${b.code} ${b.edition} (${b.source}) — profile records ${same.map((a) => a.label).join(" / ")}`, same.map((a) => a.row), b, undefined, weakWhyFor(b, code, agreeing));
       }
       // The plan's printed base, compared with a base the profile states for that model code.
       if (b.baseCode && b.baseEdition) {
@@ -3368,13 +3445,13 @@ export function evaluateDesignCriteriaFindings(
         const own = baseModelCode(code);
         if (!own || own === model) {
           const recorded = [
-            ...profileEntries.filter((a) => a.code === model).map((a) => ({ edition: a.edition, label: a.label })),
-            ...profileEntries.filter((a) => a.base?.code === model).map((a) => ({ edition: a.base!.edition, label: `${a.label} (based on ${model} ${a.base!.edition})` })),
+            ...profileEntries.filter((a) => a.code === model).map((a) => ({ edition: a.edition, label: a.label, row: a.row })),
+            ...profileEntries.filter((a) => a.base?.code === model).map((a) => ({ edition: a.base!.edition, label: `${a.label} (based on ${model} ${a.base!.edition})`, row: a.row })),
           ];
           if (recorded.length && !recorded.some((r) => r.edition === b.baseEdition)) {
             const agreeing = stated.codeBasis.filter((o) => (normCodeToken(o.code) === model && recorded.some((r) => r.edition === o.edition))
               || (o.baseCode && normCodeToken(o.baseCode) === model && recorded.some((r) => r.edition === o.baseEdition)));
-            report(`${code}|${b.edition}|${model}|${b.baseEdition}`, `plan states ${b.code} ${b.edition} based on ${model} ${b.baseEdition} (${b.source}) — profile records ${recorded.map((r) => r.label).join(" / ")}`, { code: model, edition: b.baseEdition }, b, weakWhyFor(b, model, agreeing));
+            report(`${code}|${b.edition}|${model}|${b.baseEdition}`, `plan states ${b.code} ${b.edition} based on ${model} ${b.baseEdition} (${b.source}) — profile records ${recorded.map((r) => r.label).join(" / ")}`, recorded.map((r) => r.row), { code: model, edition: b.baseEdition }, b, weakWhyFor(b, model, agreeing));
           }
         }
       }
@@ -3384,7 +3461,7 @@ export function evaluateDesignCriteriaFindings(
         const via = profileEntries.filter((a) => a.base?.code === code);
         if (via.length && !via.some((a) => a.base!.edition === b.edition)) {
           const agreeing = stated.codeBasis.filter((o) => normCodeToken(o.code) === code && via.some((a) => a.base!.edition === o.edition));
-          report(`${code}|${b.edition}`, `plan states ${b.code} ${b.edition} (${b.source}) — profile records ${via.map((a) => `${a.label} (based on ${code} ${a.base!.edition})`).join(" / ")}`, b, undefined, weakWhyFor(b, code, agreeing));
+          report(`${code}|${b.edition}`, `plan states ${b.code} ${b.edition} (${b.source}) — profile records ${via.map((a) => `${a.label} (based on ${code} ${a.base!.edition})`).join(" / ")}`, via.map((a) => a.row), b, undefined, weakWhyFor(b, code, agreeing));
         }
       }
     }
@@ -3405,7 +3482,7 @@ export function evaluateDesignCriteriaFindings(
         title: graceOnly
           ? "Plan's code basis is the previous edition — still allowed during the phase-in"
           : "Plan's code basis differs from the jurisdiction's adopted codes",
-        message: `${lines.join("; ")}. Profile: ${provenance(ctx)}. ${blocks
+        message: `${lines.join("; ")}. Profile: ${codeEditionsProvenance(ctx, [...comparedRows])}. ${blocks
           ? "The adopted editions are verified — the plan's governing-codes block must state them."
           : graceOnly
             ? "The jurisdiction still accepts the previous edition until the mandatory date — a submittal on or after that date must state the new edition."
