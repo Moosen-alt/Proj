@@ -22,11 +22,11 @@
 //   6. TEXT SHAPE   the lines the readers parse survive: the client notice's "Live status page (no
 //                   login needed): <url>" line (refreshStatusLink), the handoff's closing signoff.
 //
-// KILLS (each run by hand; each turns this file red):
-//   (a) emailLayout.escapeHtml → `return String(value ?? "")`            → 2 fails.
-//   (b) emailLayout.safeHttpUrl → accept any scheme (return raw)         → 3 fails.
-//   (c) emailLayout.mailFrom → drop `cleanDisplayName(rawName) ||`       → 4 fails.
-//   (d) clientNotifier.buildMailOptions → drop the `html:` line          → 4 fails (and 1).
+// KILLS (each run by hand 2026-11-03; each turns this file red):
+//   (a) emailLayout.escapeHtml → `return String(value ?? "")`            → 2, 2b, 3, 4b fail.
+//   (b) emailLayout.safeHttpUrl → return the raw value for any scheme    → 2, 3 fail.
+//   (c) emailLayout.mailFrom → drop `cleanDisplayName(rawName) ||`       → 4, 4b, 4c fail.
+//   (d) clientNotifier.buildMailOptions → drop the `html:` line          → 1, 4b fail.
 //   (e) clientRequestLinks.renderScrubbed → render `content`, not the mapEmailText(...) copy → 5 fails.
 //
 //   npx tsx backend/test/emailLayout.test.ts
@@ -268,16 +268,16 @@ await check("4. FROM: SMTP_FROM_NAME is the display name, SMTP_FROM the bare add
 
 await check("4b. sendEmail's message: multipart text + html, From with the display name, the envelope sender bare", async () => {
   process.env.SMTP_FROM = "alerts@keelix.example.test";
-  process.env.SMTP_FROM_NAME = "Keelix Filings";
+  process.env.SMTP_FROM_NAME = "Keelix Permits Desk";
   try {
     const opts = notifier.buildMailOptions("ops@client.example.test", "Permit issued", "Hello <b> & bye", [], { html: "<p>rendered</p>" });
     assert.equal(process.env.SMTP_FROM, "alerts@keelix.example.test", "SMTP_FROM itself is never rewritten");
-    assert.deepEqual(opts.from, { name: "Keelix Filings", address: "alerts@keelix.example.test" });
+    assert.deepEqual(opts.from, { name: "Keelix Permits Desk", address: "alerts@keelix.example.test" });
     assert.equal(opts.html, "<p>rendered</p>", "the caller's HTML part is the one sent");
     const composed = new MailComposer(opts).compile();
     assert.equal(composed.getEnvelope().from, "alerts@keelix.example.test", "the envelope sender is the bare address");
     const raw = (await composed.build()).toString("utf8");
-    assert.match(raw, /^From: Keelix Filings <alerts@keelix\.example\.test>$/m, raw.slice(0, 400));
+    assert.match(raw, /^From: Keelix Permits Desk <alerts@keelix\.example\.test>$/m, raw.slice(0, 400));
     assert.match(raw, /Content-Type: multipart\/alternative/i);
     assert.match(raw, /Content-Type: text\/plain/i);
     assert.match(raw, /Content-Type: text\/html/i);

@@ -6,7 +6,8 @@
 // when a monitored permit/NEM status CHANGES to something the client cares
 // about (permit issued, ready for issue/fees, NEM approved, correction, ready
 // for install handoff), we:
-//   1. build a plain-language update email for the submitting client,
+//   1. build a plain-language update email for the submitting client (text + HTML, one layout
+//      for every email we send: emailLayout.ts, #589),
 //   2. include their tokenized read-only status link (auto-created on first
 //      send) so they can self-serve progress checks,
 //   3. SEND it over SMTP when configured (SMTP_HOST + SMTP_FROM), and
@@ -195,6 +196,8 @@ export async function resendCommunication(
     ? installerHandoffAttachments(db, comm.projectId)
     : [];
   try {
+    // Only the stored text exists here, so the message goes out as that text wrapped in the
+    // layout (sendEmail's wrapPlainText fallback) — still the look, never a bare text email.
     await sendEmail(to, comm.subject, body, attachments);
     db.run(
       "UPDATE communications SET delivery_status = 'sent', delivery_detail = '', recipient = ?, body = ? WHERE id = ?",
