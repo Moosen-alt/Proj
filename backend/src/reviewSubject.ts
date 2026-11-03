@@ -228,7 +228,8 @@ export async function runStandaloneReview(
         } catch (err) {
           // Never the response: only that the read failed.
           logger.warn("review", `image-sheet listing read failed: ${err instanceof Error ? err.message : String(err)}`);
-          snapshot[IMAGE_SHEET_LISTING_COVERAGE_KEY] = "The plan set's title-block-only sheets could not be read for listing marks.";
+          // An unknown, said as one: not even which sheets would have qualified is known.
+          snapshot[IMAGE_SHEET_LISTING_COVERAGE_KEY] = "The plan set's sheets could not be checked for listing marks: the read failed, so no sheet was read by vision.";
         }
       }
     }
