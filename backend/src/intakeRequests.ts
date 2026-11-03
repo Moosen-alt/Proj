@@ -362,8 +362,12 @@ export async function unansweredPortalQuestions(db: AppDb, project: ProjectRecor
 /** A PORTAL QUESTION ON A REVIEW ITEM CLOSES WHEN IT IS ANSWERED (#544) — by the item itself, the
  *  parser page's panel or the intake link: every pending item whose key now has an answer on file
  *  is marked edited (a person supplied the value), and an older triage note about the same question
- *  is closed with it. Called by the answer doors only, never a read. */
-function closeAnsweredPortalQuestionItems(db: AppDb, projectId: string, actor: string): number {
+ *  is closed with it. Called by the answer doors and by run triage, never a read.
+ *
+ *  `actor` "run triage": the answer reached the job through some OTHER door (a re-parse, a snapshot
+ *  edit) since the item was asked. Triage closes it before asking again — as superseded by the system,
+ *  not as an edit a person made on the item. */
+export function closeAnsweredPortalQuestionItems(db: AppDb, projectId: string, actor: string): number {
   let rows: Array<{ id: string; portal_question_json: string }> = [];
   try {
     rows = db.query<{ id: string; portal_question_json: string }>(
@@ -378,8 +382,13 @@ function closeAnsweredPortalQuestionItems(db: AppDb, projectId: string, actor: s
   for (const row of rows) {
     const q = parsePerJobPortalQuestion(row.portal_question_json);
     if (!q || !projectAnswer(project, q.key, columns)) continue;
-    db.run("UPDATE human_review_items SET status = 'edited', updated_at = ? WHERE id = ? AND status = 'pending'", [nowIso(), row.id]);
-    addAuditLog(db, projectId, "human", actor, "human_review.updated", { reviewItemId: row.id, action: "edit", fieldName: q.key, via: "portal-questions" });
+    if (actor === "run triage") {
+      db.run("UPDATE human_review_items SET status = 'approved', updated_at = ? WHERE id = ? AND status = 'pending'", [nowIso(), row.id]);
+      addAuditLog(db, projectId, "system", actor, "human_review.superseded", { reviewItemId: row.id, fieldName: q.key, why: "answered on file" });
+    } else {
+      db.run("UPDATE human_review_items SET status = 'edited', updated_at = ? WHERE id = ? AND status = 'pending'", [nowIso(), row.id]);
+      addAuditLog(db, projectId, "human", actor, "human_review.updated", { reviewItemId: row.id, action: "edit", fieldName: q.key, via: "portal-questions" });
+    }
     closed++;
   }
   for (const key of PER_JOB_ANSWER_KEYS) {

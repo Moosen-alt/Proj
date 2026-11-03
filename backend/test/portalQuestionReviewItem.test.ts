@@ -22,6 +22,15 @@
 //       v17 column and CLOSES the item; the question is then no longer open.
 //   T5  re-triage files no duplicate; a job that already answered gets no item.
 //   T6  the intake link's answer closes it too (submitIntakeRequest).
+//   T7  A QUESTION THE OPERATOR'S STANDING ANSWER SETTLES IS NOT ASKED (skeptic, round 1). A learn that
+//       left PGE's "Is your disconnect within 10 feet of the PGE utility meter?" blank (a select that
+//       did not hold, the decision bound to disconnectWithin10ft = "Yes") must file no question item,
+//       add nothing to the open portal questions or the client intake (that question reaching the
+//       homeowner's intake on every PGE job is the defect OPERATOR_POLICY_ANSWERS fixed), and must not
+//       displace the bank's own question for the key either way: one the policy settles stays settled,
+//       a recipe step bound to it with no value ("bound-empty") is still asked.
+//   T8  an answer that reaches the job through another door (a project save) is closed by the next
+//       triage instead of staying pending.
 //
 //   npx tsx backend/test/portalQuestionReviewItem.test.ts
 import "./_isolate";
@@ -37,7 +46,8 @@ process.env.CODE_RESEARCH = "off";
 const { openDatabase } = await import("../src/db");
 const R = await import("../src/repository");
 const { triageLearnRun } = await import("../src/runTriage");
-const { portalQuestionStatus, answerPortalQuestions, createIntakeRequest, submitIntakeRequest } = await import("../src/intakeRequests");
+const { portalQuestionStatus, answerPortalQuestions, createIntakeRequest, submitIntakeRequest, unansweredPortalQuestions, setPortalQuestionSource } = await import("../src/intakeRequests");
+const { intakeNeedsFor, intakeHeld } = await import("../src/clientRequestLinks");
 const { learnRunsDir } = await import("../src/statePaths");
 
 const db = await openDatabase();
@@ -179,6 +189,83 @@ await check("T6 the intake link's answer closes the item too", async () => {
   assert.ok(req.questions.some((q) => q.key === "ownershipModel"), JSON.stringify(req.questions));
   submitIntakeRequest(db, req.token, { ownershipModel: "Customer-Owned" });
   assert.equal(questionItems(p4)[0].status, "edited");
+});
+
+// ---- T7: the operator's standing answer settles the disconnect-distance question -------------------
+const DQ = "Is your disconnect within 10 feet of the PGE utility meter?";
+/** A PGE-shaped learn whose disconnect select did not hold: the planner bound it to the standing "Yes",
+ *  and the run's verification still lists it as a required field left blank. */
+function writeDisconnectBundle(): string {
+  const runId = `learn-544-dq-${Date.now()}-${++runSeq}`;
+  const dir = path.join(learnRunsDir(), runId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "result.json"), JSON.stringify({
+    status: "needs_review", pageCount: 2, finalSubmitRecorded: false,
+    verification: { accurate: false, confidence: "medium", issues: [`Required field(s) left blank/unselected — fill before trusting: ${DQ}.`] },
+  }));
+  fs.writeFileSync(path.join(dir, "p002-plan.json"), JSON.stringify({
+    page: 2, title: "Equipment",
+    fieldsSeen: [{ i: 0, type: "select", label: DQ, options: ["-- Select --", "Yes", "No"] }],
+    decisions: [{ index: 0, label: DQ, boundField: "disconnectWithin10ft", value: "Yes", source: "data-bound" }],
+  }));
+  return runId;
+}
+const openQuestions = async (projectId: string) => unansweredPortalQuestions(db, R.getProjectDetail(db, projectId).project);
+const { parsePerJobPortalQuestion } = await import("../../shared/src/perJobQuestions");
+
+await check("T7 a blank the operator's standing answer settles files no question item", async () => {
+  const p = newProject({ owner: "Seventh Sample" });
+  const t = await triageLearnRun(db, writeDisconnectBundle(), p);
+  assert.equal(questionItems(p).length, 0, JSON.stringify(questionItems(p).map((i) => i.portalQuestion)));
+  assert.equal(t.questionsAsked?.length ?? 0, 0, t.message);
+});
+await check("T7 ... and adds nothing to the open portal questions or the client intake", async () => {
+  const p = newProject({ owner: "Seventh Sample B", homeownerEmail: "owner7@example.test" });
+  const needsBefore = await intakeNeedsFor(db, R.getProjectDetail(db, p).project);
+  await triageLearnRun(db, writeDisconnectBundle(), p);
+  assert.ok(!(await openQuestions(p)).some((q) => q.key === "disconnectWithin10ft"), JSON.stringify(await openQuestions(p)));
+  const st = await portalQuestionStatus(db, p);
+  assert.ok(!st.questions.some((q) => q.key === "disconnectWithin10ft"), JSON.stringify(st.questions));
+  const needsAfter = await intakeNeedsFor(db, R.getProjectDetail(db, p).project);
+  assert.ok(!JSON.stringify(needsAfter.questions).includes("within 10 feet"), JSON.stringify(needsAfter.questions));
+  assert.deepEqual(needsAfter.questions, needsBefore.questions);
+  assert.equal(intakeHeld(needsAfter), intakeHeld(needsBefore));
+});
+await check("T7 a stored question row for the settled key is not read back as a question", () => {
+  assert.equal(parsePerJobPortalQuestion(JSON.stringify({ key: "disconnectWithin10ft", label: DQ, options: ["Yes", "No"], control: "select" })), null);
+  assert.ok(parsePerJobPortalQuestion(JSON.stringify({ key: "ownershipModel", label: Q, options: ["Customer-Owned", "Third-Party Owned"], control: "select" })));
+});
+try {
+  await check("T7 the bank's question the policy settles stays settled (not displaced by the run's blank)", async () => {
+    setPortalQuestionSource(() => [{ key: "disconnectWithin10ft", label: DQ, options: ["Yes", "No"], kind: "radio-choice" }]);
+    const p = newProject({ owner: "Seventh Sample C" });
+    assert.ok(!(await openQuestions(p)).some((q) => q.key === "disconnectWithin10ft"), "settled before the triage");
+    await triageLearnRun(db, writeDisconnectBundle(), p);
+    assert.ok(!(await openQuestions(p)).some((q) => q.key === "disconnectWithin10ft"), JSON.stringify(await openQuestions(p)));
+  });
+  await check("T7 the bank's bound-empty question for the key is still asked, as the bank's", async () => {
+    setPortalQuestionSource(() => [{ key: "disconnectWithin10ft", label: DQ, options: ["Yes", "No"], kind: "bound-empty" }]);
+    const p = newProject({ owner: "Seventh Sample D" });
+    await triageLearnRun(db, writeDisconnectBundle(), p);
+    const q = (await openQuestions(p)).find((x) => x.key === "disconnectWithin10ft");
+    assert.ok(q, "the recipe-bound blank is no longer asked");
+    assert.equal(q!.kind, "bound-empty", JSON.stringify(q));
+  });
+} finally {
+  setPortalQuestionSource(null);
+}
+
+// ---- T8: an answer through another door is closed by the next triage -------------------------------
+await check("T8 a project save answers the question; the next triage closes the item instead of leaving it pending", async () => {
+  const p = newProject({ owner: "Eighth Sample" });
+  await triageLearnRun(db, writeBundle(), p);
+  assert.equal(questionItems(p)[0]?.status, "pending");
+  R.updateProject(db, p, { ownershipModel: "Customer-Owned" } as never);
+  assert.equal(String(R.getProjectDetail(db, p).project.parserSnapshot?.ownershipModel ?? ""), "Customer-Owned");
+  await triageLearnRun(db, writeBundle(), p);
+  const all = questionItems(p);
+  assert.equal(all.length, 1, JSON.stringify(all.map((i) => [i.status, i.fieldName])));
+  assert.equal(all[0].status, "approved");
 });
 
 if (failures) {

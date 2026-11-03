@@ -24,8 +24,8 @@ import { learnNoteTopicsFromMisses } from "./noteTopics";
 import { logger } from "./logger";
 import { id } from "./ids";
 import { nowIso } from "./time";
-import { closeLegacyTriageNotesFor, portalAnswerOnFile } from "./intakeRequests";
-import { isPerJobAnswerKey, perJobPortalQuestionOfField, perJobRuleFor, type PerJobPortalQuestion } from "../../shared/src/perJobQuestions";
+import { closeAnsweredPortalQuestionItems, closeLegacyTriageNotesFor, portalAnswerOnFile } from "./intakeRequests";
+import { asksAPersonForThisJob, perJobPortalQuestionOfField, perJobRuleFor, type PerJobPortalQuestion } from "../../shared/src/perJobQuestions";
 
 const SAFE_RUN_ID = /^[A-Za-z0-9._-]+$/;
 const FIX_KINDS = ["equipment_alias", "kb_note", "learned_topic", "data_gap", "code_bug", "none"] as const;
@@ -161,6 +161,9 @@ const questionNorm = (s: unknown): string => String(s ?? "").toLowerCase().repla
  *   - a REQUIRED field the run reports left blank whose control the one predicate names per-job.
  * Each comes back in the portal's wording with the options it offered (placeholders removed), one per
  * key. A control that offers no options to choose from is not here: it cannot be answered by choosing.
+ * Nor is a key the operator's standing answer settles (asksAPersonForThisJob — the disconnect-distance
+ * question): a run that left THAT blank has a bug to fix, and the person (or the client, through the
+ * intake these questions feed) is not asked it.
  */
 export function blankPerJobQuestions(dir: string): PerJobPortalQuestion[] {
   const result = readJson<Record<string, unknown>>(dir, "result.json", {});
@@ -184,7 +187,7 @@ export function blankPerJobQuestions(dir: string): PerJobPortalQuestion[] {
       ? perJobPortalQuestionOfField({ label: String(f.label ?? ""), fieldType: String(f.type ?? ""), options: Array.isArray(f.options) ? f.options : null })
       : null);
     for (const d of decisions) {
-      if (!isPerJobAnswerKey(d.boundField) || String(d.value ?? "").trim()) continue;
+      if (!asksAPersonForThisJob(d.boundField) || String(d.value ?? "").trim()) continue;
       const q = asQuestion(seen.find((f) => f.i === d.index));
       if (q && q.key === d.boundField) add(q);
     }
@@ -203,6 +206,9 @@ export function blankPerJobQuestions(dir: string): PerJobPortalQuestion[] {
 function askBlankQuestions(db: AppDb, projectId: string, questions: PerJobPortalQuestion[]): { asked: Set<string>; added: PerJobPortalQuestion[] } {
   const asked = new Set<string>();
   const added: PerJobPortalQuestion[] = [];
+  // A question item answered since through a door that does not close items (a re-parse, a snapshot
+  // edit) is closed here first, so it is neither left pending nor counted as still asked.
+  closeAnsweredPortalQuestionItems(db, projectId, "run triage");
   if (!questions.length) return { asked, added };
   const project = safeProject(db, projectId);
   if (!project) return { asked, added };
@@ -256,6 +262,7 @@ const TRIAGE_SYSTEM = `You are triaging a completed solar-permit portal automati
 You may read raw bundle files (page plans, the review screenshot) with read_bundle_file, and the project's data with get_project_summary, to confirm a root cause before reporting. Prefer the digest; only open files when you need to confirm something specific. Keep tool calls minimal.
 
 For each real issue call report_finding with:
+- title: ONE plain sentence for the person who runs the job, naming what the portal asked for or what went wrong in the portal's own words (e.g. "The utility asks for the main breaker rating."). It is shown to them as written: never use internal words such as planner, bind, binding, record, triage, snapshot or a field key there — those belong in rootCause and suggestedFix.
 - severity: "blocker" (run can't succeed / wrong data submitted), "warning" (a field left blank that a human must fill), or "note" (minor).
 - fixKind, chosen carefully:
   - "learned_topic": a REQUIRED question was left blank because the planner lacked the design context to answer it. target = the exact question label. (This is auto-applied: the system will start surfacing plan-set lines matching the question's words to the planner next run.)
@@ -321,7 +328,7 @@ export async function triageLearnRun(db: AppDb, runId: string, projectId: string
         type: "object",
         properties: {
           severity: { type: "string", enum: ["blocker", "warning", "note"] },
-          title: { type: "string" },
+          title: { type: "string", description: "One plain sentence for the person running the job, in the portal's own words; no internal words (planner, bind, record, triage, field keys)." },
           rootCause: { type: "string" },
           suggestedFix: { type: "string" },
           fixKind: { type: "string", enum: [...FIX_KINDS] },

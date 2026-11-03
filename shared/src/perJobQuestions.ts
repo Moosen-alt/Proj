@@ -270,10 +270,27 @@ export interface PerJobPortalQuestion {
 }
 
 /**
+ * A per-job key a run's blank may be ASKED of a person as a question: one only a person answers
+ * (PER_JOB_ANSWER_KEYS) AND one the operator has no standing answer for (OPERATOR_POLICY_ANSWERS).
+ *
+ * THE STANDING ANSWER SETTLES IT HERE TOO. "Is your disconnect within 10 feet of the PGE utility
+ * meter?" is per-job in principle, but the operator's standing "Yes" answers it on every job; it was
+ * reaching the homeowner's intake form on every PGE job until that table was read. A run that left it
+ * blank (a select that did not hold) is a run bug, not a question for the person: asked as a review
+ * item, it fed the intake ("the run's question wins" over the bank's) and the client was emailed it
+ * again. The bank's own disconnect question is untouched by this — it keeps its kind, so a recipe step
+ * bound to the key with no value ("bound-empty") is still asked there, exactly as before.
+ */
+export function asksAPersonForThisJob(key: unknown): key is PerJobAnswerKey {
+  return isPerJobAnswerKey(key) && !operatorPolicyAnswer(key);
+}
+
+/**
  * A learn page's control as a question ONLY A PERSON answers for this job, or null. The one predicate
  * (perJobAnswerKeyFor) names the key from the control's own words and options; the control must offer
  * at least two real options — a text box, or a dropdown whose options were not captured, cannot be
- * answered by choosing.
+ * answered by choosing — and the key must be one the operator's standing answers leave open
+ * (asksAPersonForThisJob).
  */
 export function perJobPortalQuestionOfField(field: { label?: string | null; fieldType?: string | null; options?: unknown[] | null }): PerJobPortalQuestion | null {
   const label = String(field.label ?? "").replace(/\s+/g, " ").trim();
@@ -281,11 +298,13 @@ export function perJobPortalQuestionOfField(field: { label?: string | null; fiel
   const control = perJobControlOfField({ fieldType: field.fieldType, options });
   if (!label || (control !== "select" && control !== "choice") || options.length < 2) return null;
   const key = perJobAnswerKeyFor(label, { control, options });
-  return key ? { key, label: label.slice(0, 300), options: options.slice(0, 25), control } : null;
+  return key && asksAPersonForThisJob(key) ? { key, label: label.slice(0, 300), options: options.slice(0, 25), control } : null;
 }
 
 /** A stored question (human_review_items.portal_question_json) read back, or null when it is not one a
- *  person can answer: unparseable, a key outside PER_JOB_ANSWER_KEYS, no wording, under two options. */
+ *  person can answer: unparseable, a key outside PER_JOB_ANSWER_KEYS or settled by the operator's
+ *  standing answer (asksAPersonForThisJob — so a stored row can never feed the intake or displace the
+ *  bank's question for that key), no wording, under two options. */
 export function parsePerJobPortalQuestion(raw: unknown): PerJobPortalQuestion | null {
   let v: unknown = raw;
   if (typeof raw === "string") {
@@ -297,6 +316,6 @@ export function parsePerJobPortalQuestion(raw: unknown): PerJobPortalQuestion | 
   const key = String(o.key ?? "");
   const label = String(o.label ?? "").replace(/\s+/g, " ").trim();
   const options = answerableOptions(o.options);
-  if (!isPerJobAnswerKey(key) || !label || options.length < 2) return null;
+  if (!asksAPersonForThisJob(key) || !label || options.length < 2) return null;
   return { key, label: label.slice(0, 300), options: options.slice(0, 25), control: o.control === "choice" ? "choice" : "select" };
 }
