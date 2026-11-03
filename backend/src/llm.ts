@@ -569,7 +569,11 @@ const KNOWN_INVERTERS: KnownInverter[] = [
   // Tesla Powerwall 3 — integrated PV+battery inverter, 11.5 kVA continuous on-grid.
   { label: "Tesla Powerwall 3", matches: ["powerwall3", "pw3", "1850000", "1707000ess"], outputCurrentA: 48, outputVa: 11500, note: "Powerwall 3 integrated inverter, 11.5 kVA / 48 A continuous @ 240 V. Verify the backfed PV portion against the SLD." },
   // Enphase microinverters (per-unit).
-  { label: "Enphase IQ8+", matches: ["iq8plus", "iq8", "iq8a", "iq8h", "iq8m", "iq8mc", "iq8x"], outputCurrentA: 1.0, outputVa: 240, note: "Enphase IQ8-series microinverter (per unit ~ 240 VA / 1.0 A; multiply by qty)." },
+  // IQ8M BEFORE the IQ8-series row (#544): the series row's "iq8" also matches IQ8M-72-2-US, and gave
+  // it 1.0 A — 10 units read 10 A (a 15 A breaker) where the IQ8M's 1.35 A gives 13.5 A (20 A). The
+  // Human Review card offers that total as a one-click Confirm, so the row has to be right.
+  { label: "Enphase IQ8M", matches: ["iq8m"], outputCurrentA: 1.35, outputVa: 325, note: "Enphase IQ8M microinverter (per unit 325 VA / 1.35 A @ 240 V; multiply by qty)." },
+  { label: "Enphase IQ8+", matches: ["iq8plus", "iq8", "iq8a", "iq8h", "iq8mc", "iq8x"], outputCurrentA: 1.0, outputVa: 240, note: "Enphase IQ8-series microinverter (per unit ~ 240 VA / 1.0 A; multiply by qty)." },
   { label: "Enphase IQ7", matches: ["iq7plus", "iq7", "iq7a", "iq7x", "iq7pd"], outputCurrentA: 0.96, outputVa: 230, note: "Enphase IQ7-series microinverter (per unit; multiply by qty)." },
   // SolarEdge HD-Wave string inverters (240 V).
   { label: "SolarEdge SE7600H", matches: ["se7600h", "se7600"], outputCurrentA: 32, outputVa: 7600 },
@@ -716,13 +720,15 @@ function heuristicVerifyFill(input: PortalFillVerifyInput): PortalFillVerificati
   };
 }
 
+/** A row whose match the model CONTAINS wins over one whose match merely contains the model (a bare
+ *  "IQ8" typed is the IQ8-series row, not the first row that has "iq8" in a longer match), each in
+ *  table order. */
 function lookupKnownInverter(model: string): KnownInverter | null {
   const n = normModel(model);
   if (!n) return null;
-  for (const k of KNOWN_INVERTERS) {
-    if (k.matches.some((m) => n.includes(m) || m.includes(n))) return k;
-  }
-  return null;
+  return KNOWN_INVERTERS.find((k) => k.matches.some((m) => n.includes(m)))
+    ?? KNOWN_INVERTERS.find((k) => k.matches.some((m) => m.includes(n)))
+    ?? null;
 }
 
 // Build the final lookup result from a per-unit current, with PV breaker derivation.
