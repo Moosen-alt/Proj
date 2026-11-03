@@ -64,7 +64,7 @@ import {
   type ContactFieldKind, type ContactRole, type ContactTrack,
 } from "../../../shared/src/contactRoles";
 import { portalSaysNotServed } from "../../../shared/src/portalNotServed";
-import { prepareComputeSettle, waitForComputeSettled } from "../computeSettle";
+import { computeStaleAtExit, prepareComputeSettle, waitForComputeSettled } from "../computeSettle";
 
 // AutoLearnAdapter — AUTONOMOUSLY learns an unknown AHJ/utility portal form instead of
 // having a human record it. Each page is scraped into a structured snapshot
@@ -218,14 +218,26 @@ export type LearnPlanner = (req: LearnPlanRequest) => Promise<LearnPlanResponse>
  *   - requiredUnchecked: a REQUIRED checkbox still unchecked. `acknowledgment` marks the boxes the
  *     walk leaves for a person by design (the review gate's "will not be submitted until…", terms).
  *   - strayWrites: an equipment write that reached another control (put back, not recorded) or
- *     whose selector reached another field's control (not typed). */
+ *     whose selector reached another field's control (not typed).
+ *   - computePending (#534): the portal's own words that a computed total on the page is stale
+ *     ("Needs to be recalculated" — the PacifiCorp two-array learn, 2026-11-02, page 9); "" when
+ *     none showed.
+ *  The backend's trust gate (pageExitTrustSignals → evaluateTrustGate, #534) blocks on every kind
+ *  except a requiredUnchecked box marked `acknowledgment`. */
 export type PageTrustEvidence = {
   page: number;
   where: string;
   validationErrors: string[];
   requiredUnchecked: Array<{ label: string; acknowledgment: boolean }>;
   strayWrites: string[];
+  computePending: string;
 };
+
+/** #534 — WHICH PAGES THE EXIT READING (recordPageTrustEvidence) ACTUALLY READ. `read`: every reader
+ *  answered. `unread`: the reading was due and at least one reader could not answer (the page could
+ *  not be evaluated, or the reading threw part-way) — the gate takes an unread page as a blocker,
+ *  never as a clean one. A page with no form field (login, dashboard) is not due and is in neither. */
+export type PageExitReads = { read: number[]; unread: number[] };
 
 export interface LearnResult {
   ok: boolean;
@@ -266,9 +278,20 @@ export interface LearnResult {
   /** Inline validation errors the portal raised when an advance was blocked. */
   validationBlocks?: string[];
   /** #536 — PER-PAGE TRUST EVIDENCE, one entry per page that ended with any (see
-   *  PageTrustEvidence). Recorded for the trust gate to read (#534); this field alone changes no
-   *  decision. Undefined when no page had any. */
+   *  PageTrustEvidence). The trust gate reads it (#534). Undefined when no page had any — which
+   *  says nothing on its own: `pageExitReads` says which pages were read at all. */
   trustEvidence?: PageTrustEvidence[];
+  /** #534 — the pages the exit reading read, and the ones it was due on and could not (see
+   *  PageExitReads). Set on every return of learn(); absent only from a learner that predates it,
+   *  which the gate treats as "not read". */
+  pageExitReads?: PageExitReads;
+  /** #534 — EQUIPMENT VALUES THE PORTAL DID NOT KEEP: a control the deterministic equipment pass
+   *  set from the project's own equipment, read back NOT holding it (equipment_fill_not_held), and
+   *  not holding it when the walk left its page. Each label is ALSO in requiredFieldMisses (it is a
+   *  required field left blank: an application's equipment make/model is never optional, whatever
+   *  marker the widget carries); listed here too so the backend can tell them from a QUESTION the
+   *  planner left unanswered (the note-topic learner reads only the latter). */
+  equipmentNotHeld?: string[];
   /** Page-level messages the PORTAL printed during the walk, on any page, whether or not
    *  it advanced ("Property Address not found."). Distinct from validationBlocks, which
    *  only ever means "an advance was refused". */
@@ -2166,6 +2189,23 @@ interface AppliedFill {
   secretBinding?: string;
 }
 
+/** What the required-field sweep (collectUnfilledRequired) never counts as a blank: secret boxes the
+ *  learn leaves blank by design (bound by name at replay) and the review-gate acknowledgment. One
+ *  definition, handed into the sweep's page function as sources and read by the page-exit validation
+ *  reader (#534), so the two can never disagree about what is excluded. */
+const REQUIRED_SWEEP_SENSITIVE = /\b(password|passcode|account\s*(number|no|#)?|acct|meter\s*(number|no|#)?|ssn|social security|tax\s*id|ein|routing|card\s*number|cvv|security code)\b/i;
+const REQUIRED_SWEEP_ACK = /will not be submitted until|i understand\b|i acknowledge|i certify|i attest|accept (the )?terms|terms (and|&) conditions/i;
+
+/** #534 — where the exit reading puts an equipment value the portal did not keep. `misses` and
+ *  `didNotHold` are learn()'s own fillVerifyMisses / missesDidNotHold (an unheld equipment value is a
+ *  required field left blank, typed and not kept); `equipmentNotHeld` is its own result field. Every
+ *  other page-exit finding lives in the page's PageTrustEvidence. */
+interface PageExitLedger {
+  misses: string[];
+  didNotHold: string[];
+  equipmentNotHeld: string[];
+}
+
 export interface UploadSlot {
   /** A unique per-page key; the matching element is tagged with data-al-upl="<key>". */
   key: string;
@@ -2538,9 +2578,19 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   private equipmentStrays: string[] = [];
   private pageEquipmentStrays: string[] = [];
   /** #536 — per-page TRUST EVIDENCE (labels and the portal's own words, scrubbed): a visible
-   *  validation error after the fills, a required checkbox left unchecked, a stray equipment write.
-   *  Recorded only; the trust gate's reading of it is #534's. */
+   *  validation error after the fills, a required checkbox left unchecked, a stray equipment write,
+   *  a computed total left stale (#534). The backend's trust gate reads it (#534). */
   private trustEvidence: PageTrustEvidence[] = [];
+  /** #534 — the pages the exit reading read, and the ones it was due on and could not read. */
+  private readonly pageExitReads: PageExitReads = { read: [], unread: [] };
+  /** #534 — EQUIPMENT CONTROLS THE PORTAL DID NOT KEEP, keyed by the CONTROL (its `section label`
+   *  context), not by the value key: the bare-select side guess can legitimately miss under one key
+   *  and land under the other on the same control. Set when every candidate was applied and read
+   *  back NOT holding (equipment_fill_not_held with no success); cleared by a later fill on that
+   *  control that held, or by finding it already holding the project's value. Whatever is still
+   *  here when the walk leaves the page is decided by a read-back against the same candidates
+   *  (settleUnheldEquipment). */
+  private readonly equipmentUnheld = new Map<string, { target: ExtractedField; key: string; candidates: string[] }>();
   /** The run's own credential (from login()); used mid-run only on the start URL's site. */
   private runCredential: { username: string; password: string } | undefined;
   /** The URL the run was opened at — the run's own credential belongs to its host + first path
@@ -3160,6 +3210,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // (the total, a bare "tilt") is rebound, so the rows the learn adds — and every replay —
         // read this array's own key.
         if (rowControl) this.rebindRowStep(steps, field, resolved.key);
+        this.equipmentUnheld.delete(context); // it holds the project's value now (#534)
         continue;
       }
       let sawNotHeld = false;
@@ -3208,12 +3259,19 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         this.equipmentLanded.set(failKey, candidate);
         filled++;
         success = true;
+        this.equipmentUnheld.delete(context); // a later fill that held clears an earlier miss (#534)
         this.debug?.event({ type: "equipment_fill", label: context.slice(0, 80), key: resolved.key, candidate: candidate.slice(0, 60) });
         break;
       }
       // Every candidate applied but none held: remember and stop retrying this
       // field for the rest of the run (each retry burns option-wait caps).
-      if (!success && sawNotHeld && !strayed) this.equipmentFillFailed.add(failKey);
+      if (!success && sawNotHeld && !strayed) {
+        this.equipmentFillFailed.add(failKey);
+        // ...AND THE BLANK IS OWED TO THE TRUST GATE (#534). Live PacifiCorp: the inverter Model never
+        // held, nothing filled it after, and the recipe was promoted with it blank — this event was
+        // the only record, and nothing read it. Decided when the walk leaves the page.
+        if (!this.equipmentUnheld.has(context)) this.equipmentUnheld.set(context, { target, key: resolved.key, candidates: [...resolved.candidates] });
+      }
     }
     return filled;
   }
@@ -4358,6 +4416,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // #536: per-page trust evidence (for the gate, #534) and, in the hand-off, any equipment write
       // that reached another control — a person checks both boxes before submitting.
       if (this.trustEvidence.length) result = { ...result, trustEvidence: this.trustEvidence.map((e) => ({ ...e, validationErrors: [...e.validationErrors], requiredUnchecked: e.requiredUnchecked.map((u) => ({ ...u })), strayWrites: [...e.strayWrites] })) };
+      // #534: on EVERY return, so the gate can tell "read and clean" from "never read".
+      result = { ...result, pageExitReads: { read: [...this.pageExitReads.read], unread: [...this.pageExitReads.unread] } };
       if (this.equipmentStrays.length) {
         result = { ...result, message: `${result.message} EQUIPMENT FILL REACHED ANOTHER CONTROL — check before submitting: ${this.equipmentStrays.slice(0, 6).map((l) => this.scrubSecrets(l)).join("; ")}.` };
       }
@@ -6112,6 +6172,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // The same misses, split by WHY — see the note at verifyFillsLanded's call site.
     const missesDidNotHold: string[] = [];
     const missesNeverFilled: string[] = [];
+    // #534 — where the page-exit reading (recordPageTrustEvidence) puts an equipment value the portal
+    // did not keep. Run-wide: a page left incomplete stays incomplete in the draft, whatever the
+    // final page looks like.
+    const exitLedger: PageExitLedger = { misses: fillVerifyMisses, didNotHold: missesDidNotHold, equipmentNotHeld: [] };
 
     // Pathnames already walked this run. Mid-wizard, a planner NAVIGATE back to one of
     // these RESTARTS the flow (live Salem/Accela: from CapHome it clicked a link back to
@@ -8390,10 +8454,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         }
       }
 
-      // d4c) TRUST EVIDENCE (#536) — what the page ends with: a field the portal shows as invalid,
-      //      a required box left unchecked, an equipment write that strayed. Recorded for the trust
-      //      gate (#534) to read; nothing here changes the walk.
-      if (!isDashboard && hasFillable) await this.recordPageTrustEvidence(pageCount, url).catch(() => null);
+      // d4c) THE PAGE AS THE WALK LEAVES IT (#536, #534) — a field the portal shows as invalid, a
+      //      required box left unchecked, an equipment write that strayed, an equipment value the
+      //      portal did not keep, a computed total still to be recalculated. Reads only; nothing here
+      //      changes the walk, and the trust gate reads all of it. After the retraction just above
+      //      (which splices by label), so nothing recorded here can be retracted by it. The review page
+      //      is read HERE too, before (e): a delegated final submit at (e) moves the page, so a
+      //      reading at (f) could be of the receipt. A reading that throws leaves the page UNREAD
+      //      (marked due first inside), which the gate refuses — never a clean page.
+      if (!isDashboard && hasFillable) await this.recordPageTrustEvidence(pageCount, url, exitLedger).catch(() => null);
 
       // e) Record the final submit (if any). Clicked ONLY on the operator's explicit
       //    delegation; otherwise recorded and left for a human. Pay/fee buttons rejected.
@@ -8879,6 +8948,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       break;
     }
 
+    // #534 — an equipment miss no page exit decided (the walk ended mid-page, or left it by a path
+    // that skips the sweep) is decided now, by the same read-back. Fail closed: a control that
+    // cannot be found any more is still a value the portal did not keep.
+    await this.recordUnheldEquipment(exitLedger).catch(() => null);
+
     // 3) Scrape the review screen (best effort).
     let reviewScreen: LearnResult["reviewScreen"] = { fields: [], bodyTextSnippet: "" };
     try {
@@ -8920,6 +8994,25 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         + (missesNeverFilled.length ? ` NEVER FILLED (nothing was typed): ${missesNeverFilled.slice(0, 8).join(", ")}.` : "")
         + " Re-check these before submit."
       : "";
+    // #534 — what a page still showed wrong when the walk LEFT it (the pages' trust evidence). Said
+    // here as well as handed to the trust gate: the person at review reads this message, and the
+    // final page will not show it. (Stray equipment writes have their own line, added on return.)
+    const exitStale = this.trustEvidence.filter((e) => e.computePending).map((e) => `page ${e.page}: ${e.computePending}`);
+    const exitInvalid = this.trustEvidence.flatMap((e) => e.validationErrors.map((v) => `page ${e.page}: ${v}`));
+    const exitUnchecked = this.trustEvidence.flatMap((e) => e.requiredUnchecked.filter((u) => !u.acknowledgment).map((u) => `page ${e.page}: ${u.label}`));
+    const exitWarning =
+      (exitStale.length
+        ? ` 🧮 ${exitStale.length} page(s) were left with a computed total still to be recalculated — open each and recalculate before submit: ${exitStale.slice(0, 6).join("; ")}.`
+        : "")
+      + (exitInvalid.length
+        ? ` ⛔ ${exitInvalid.length} field(s) still showed a validation error when the walk left the page — fix before submit: ${exitInvalid.slice(0, 8).join("; ")}.`
+        : "")
+      + (exitUnchecked.length
+        ? ` ☐ ${exitUnchecked.length} required box(es) were left unchecked — check before submit: ${exitUnchecked.slice(0, 8).join("; ")}.`
+        : "")
+      + (this.pageExitReads.unread.length
+        ? ` ❔ page(s) ${this.pageExitReads.unread.join(", ")} could not be read as the walk left them — check each before submit.`
+        : "");
     // The portal's own words, quoted. On a run that never reached review this is usually the
     // ONLY line that names a cause — the trace shows the same page seven times and the
     // validation channel is empty, because every advance "worked".
@@ -8952,9 +9045,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       ? ` 🏢 Not chosen — ${this.filerIdentityRefused.slice(0, 3).join(" | ")}`
       : "";
     const message = reachedReview
-      ? `${HUMAN_REVIEW_MESSAGE} Auto-learn reached the review screen after ${pageCount} page(s). Verify every field/value below before a human submits.${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${filerWarning}${noticeWarning}${choiceWarning}`
+      ? `${HUMAN_REVIEW_MESSAGE} Auto-learn reached the review screen after ${pageCount} page(s). Verify every field/value below before a human submits.${validationWarning}${docsWarning}${verifyWarning}${exitWarning}${secretWarning}${filerWarning}${noticeWarning}${choiceWarning}`
       : filledSomething
-        ? `Auto-learn filled ${pageCount} page(s) and recorded the steps, but did not reach a review screen. Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${filerWarning}${noticeWarning}${choiceWarning}`
+        ? `Auto-learn filled ${pageCount} page(s) and recorded the steps, but did not reach a review screen. Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${exitWarning}${secretWarning}${filerWarning}${noticeWarning}${choiceWarning}`
         : tileStop
           ? `Auto-learn stopped at a page of ${tileStop.tiles.length} choice tile(s): ${tileStop.why}. The page offered: ${tileStop.tiles.map((t) => `"${t}"`).join(" | ")}. If one of these is the way in, a person clicks it; record that step manually. (${pageCount} page(s), no steps recorded.) Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`
           : `Auto-learn found nothing fillable on ${pageCount} page(s); no steps recorded.${nothingFillableHint} Page trace: ${traceLine}${validationWarning}${docsWarning}${verifyWarning}${secretWarning}${noticeWarning}${choiceWarning}`;
@@ -9006,6 +9099,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       requiredFieldMisses: fillVerifyMisses,
       missingRequiredDocs,
       validationBlocks,
+      // #534 — the labels in requiredFieldMisses that are equipment values the portal did not keep
+      // (the backend keeps them out of the note-topic learner). The page-exit findings themselves
+      // travel as trustEvidence + pageExitReads, attached in learn() on every return.
+      equipmentNotHeld: exitLedger.equipmentNotHeld,
       portalNotices: portalNotices.length ? portalNotices.slice(0, 5) : undefined,
       secretsLeftBlank: this.secretsLeftBlank.length ? this.secretsLeftBlank.map((s) => s.label) : undefined,
       filerIdentityRefused: this.filerIdentityRefused.length ? [...this.filerIdentityRefused] : undefined,
@@ -10686,9 +10783,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
 
   private async collectUnfilledRequired(): Promise<string[]> {
     if (!this.page || typeof this.page.evaluate !== "function") return [];
-    const labels = await this.page.evaluate(() => {
-      const SENSITIVE = /\b(password|passcode|account\s*(number|no|#)?|acct|meter\s*(number|no|#)?|ssn|social security|tax\s*id|ein|routing|card\s*number|cvv|security code)\b/i;
-      const ACK = /will not be submitted until|i understand\b|i acknowledge|i certify|i attest|accept (the )?terms|terms (and|&) conditions/i;
+    const labels = await this.page.evaluate((src: { sensitive: string; ack: string }) => {
+      // The exclusions are module constants (REQUIRED_SWEEP_SENSITIVE / _ACK) handed in as sources,
+      // so the page-exit validation reader (#534) excludes exactly what this sweep excludes.
+      const SENSITIVE = new RegExp(src.sensitive, "i");
+      const ACK = new RegExp(src.ack, "i");
       const norm = (s: string | null | undefined) => (s || "").trim().replace(/\s+/g, " ");
       // Walk OPEN shadow roots too — a required field inside a web component must gate
       // trust exactly like a light-DOM one (the fill loop can see and fill it, so this
@@ -10757,7 +10856,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         }
       }
       return Array.from(out).slice(0, 20);
-    }).catch(() => [] as string[]);
+    }, { sensitive: REQUIRED_SWEEP_SENSITIVE.source, ack: REQUIRED_SWEEP_ACK.source }).catch(() => [] as string[]);
     const all = Array.isArray(labels) ? labels : [];
     // A BATTERY SPEC ON A NO-BATTERY JOB IS BLANK BY DESIGN, like a sensitive field: the fill
     // guard refuses to invent it, so counting it as a required miss would block the trust gate on
@@ -10772,117 +10871,155 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     return kept;
   }
 
-  /** #536 — THE PAGE'S TRUST EVIDENCE, recorded as the walk is about to leave it (see
-   *  PageTrustEvidence). Two in-page readings plus the equipment pass's own stray writes:
-   *   - a control the portal marks INVALID (aria-invalid="true", Bootstrap's .is-invalid, or a
-   *     native constraint failure on a box that holds a value) with the message beside it, and any
-   *     visible field-level message element (.invalid-feedback, .field-validation-error,
-   *     [class*=validation-message], [class*=error-message]) — named by its field. Page banners
-   *     (role=alert summaries) are portalNotices' channel, not this one: a notice is not a field
-   *     the walk got wrong.
-   *   - a REQUIRED checkbox (required / aria-required / an asterisk on its own or its group's
-   *     label) still unchecked, flagged `acknowledgment` when it is a box the walk leaves for a
-   *     person by design (the same wording collectUnfilledRequired excludes).
-   *  Nothing here changes what the walk does next. */
-  private async recordPageTrustEvidence(page: number, url: string): Promise<void> {
+  /** THE PAGE AS THE WALK LEAVES IT — its TRUST EVIDENCE (#536, #534; see PageTrustEvidence),
+   *  recorded at d4c on every page with a form field, the review page included. Reads only: nothing
+   *  here clicks or types, and nothing changes what the walk does next.
+   *
+   *  A live PacifiCorp learn (2026-11-02, a two-array job) walked ten pages and was trusted, because
+   *  its verifiers read only the final page. Page 9 had been left with the inverter Model blank,
+   *  "This field is required." under it and System Rating reading "Needs to be recalculated"; the
+   *  run's own events said so (equipment_fill_not_held, compute_settled settled:false) and nothing
+   *  carried either to the trust gate. The readings, each the ONE answer to its question:
+   *   - validationErrors — fieldValidationErrorsInPage, the one field-level validation reader (it
+   *     matches PowerClerk's own data-test-role="validation-error" container);
+   *   - requiredUnchecked — requiredCheckboxesUncheckedInPage, a required checkbox left unchecked,
+   *     `acknowledgment` by the required sweep's own REQUIRED_SWEEP_ACK;
+   *   - strayWrites — the equipment pass's own record of a write that reached another control;
+   *   - computePending — computeStaleAtExit, the Calculate wait's own stale-marker predicate;
+   *   - with `ledger` (the walk passes it): an equipment value the portal did not keep, decided by
+   *     settleUnheldEquipment and put in the run's required misses (a required field left blank).
+   *  THE PAGE IS MARKED DUE FIRST and moved to `read` only when every reader answered, so a reading
+   *  that throws part-way, or a page that cannot be evaluated, leaves it UNREAD — which the gate
+   *  refuses, never takes as clean. An entry is kept only for a page that ended with something. */
+  private async recordPageTrustEvidence(page: number, url: string, ledger?: PageExitLedger): Promise<void> {
+    if (!this.pageExitReads.unread.includes(page)) this.pageExitReads.unread.push(page);
     const strayWrites = this.pageEquipmentStrays.splice(0);
-    type Read = { validationErrors: string[]; requiredUnchecked: Array<{ label: string; acknowledgment: boolean }> };
-    let read = null as Read | null;
-    if (this.page && typeof this.page.evaluate === "function") {
-      read = await this.page.evaluate(() => {
-        const norm = (s: string | null | undefined) => (s || "").replace(/\s+/g, " ").trim();
-        const ACK = /will not be submitted until|i understand\b|i acknowledge|accept (the )?terms|terms (and|&) conditions/i;
-        const GROUP = "fieldset, .form-group, [class*='form-group'], [class*='field'], .row, [class*='row']";
-        const visible = (el: Element) => {
-          const r = (el as HTMLElement).getBoundingClientRect?.();
-          if (!r || !(r.width > 0 && r.height > 0)) return false;
-          const st = getComputedStyle(el as HTMLElement);
-          return st.visibility !== "hidden" && st.display !== "none";
-        };
-        const labelOf = (el: Element): string => {
-          const id = el.getAttribute("id");
-          if (id) { const l = document.querySelector(`label[for="${CSS.escape(id)}"]`); if (l?.textContent?.trim()) return norm(l.textContent); }
-          const w = el.closest("label"); if (w?.textContent?.trim()) return norm(w.textContent);
-          const aria = el.getAttribute("aria-label"); if (aria) return norm(aria);
-          const grp = el.closest(GROUP);
-          const gl = grp?.querySelector("legend, label, .control-label, .field-label");
-          return norm(gl?.textContent || el.getAttribute("name") || "");
-        };
-        const clean = (l: string) => l.replace(/\s*\*\s*$/, "").replace(/\s*\*\s*/g, " ").trim();
-        const MSG = ".invalid-feedback, .field-validation-error, [class*='validation-message'], [class*='error-message']";
-        const errors = new Set<string>();
-        const controls = Array.from(document.querySelectorAll("input, select, textarea")) as Array<HTMLInputElement>;
-        for (const c of controls) {
-          const type = (c.getAttribute("type") || "").toLowerCase();
-          if (type === "hidden" || type === "button" || type === "submit") continue;
-          if (!visible(c)) continue;
-          const flagged = c.getAttribute("aria-invalid") === "true" || c.classList.contains("is-invalid")
-            // A native number box holding a non-number. Other native constraints (step, range,
-            // pattern) are not read: a novalidate form may never enforce them, and evidence the
-            // portal itself would not complain about is noise for the gate.
-            || (!!c.validity && c.validity.badInput === true);
-          if (!flagged) continue;
-          const grp = c.closest(GROUP) || c.parentElement;
-          const msgEl = grp ? Array.from(grp.querySelectorAll(MSG)).find((m) => visible(m) && norm(m.textContent)) : null;
-          const msg = norm(msgEl?.textContent) || norm(c.validationMessage) || "shown as invalid";
-          errors.add(`${clean(labelOf(c)) || "field"}: ${msg}`.slice(0, 200));
-        }
-        for (const m of Array.from(document.querySelectorAll(MSG))) {
-          if (!visible(m)) continue;
-          const t = norm(m.textContent);
-          if (t.length < 4) continue;
-          const grp = m.closest(GROUP) || m.parentElement;
-          const c = grp?.querySelector("input:not([type=hidden]), select, textarea");
-          const line = `${c ? clean(labelOf(c)) || "field" : "field"}: ${t}`.slice(0, 200);
-          if (![...errors].some((e) => e.endsWith(`: ${t}`) || e === line)) errors.add(line);
-        }
-        const unchecked: Array<{ label: string; acknowledgment: boolean }> = [];
-        const seen = new Set<string>();
-        for (const c of Array.from(document.querySelectorAll("input[type=checkbox]")) as HTMLInputElement[]) {
-          if (c.checked) continue;
-          // A styled checkbox's input is often visually hidden behind its label: visible if either is.
-          const id = c.getAttribute("id");
-          const forLbl = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
-          if (!visible(c) && !(forLbl && visible(forLbl)) && !(c.closest("label") && visible(c.closest("label") as Element))) continue;
-          const own = norm(forLbl?.textContent || c.closest("label")?.textContent || c.getAttribute("aria-label") || "");
-          const grp = c.closest(GROUP);
-          const gl = grp?.querySelector("legend, label, .control-label, .field-label");
-          // PowerClerk puts the red asterisk in a sibling span after the label
-          // (data-test-role="required-indicator"), so a lone "*" element in the box that holds only
-          // this checkbox counts as well.
-          const box = grp || c.parentElement;
-          const lone = !!box && box.querySelectorAll("input[type=checkbox]").length === 1;
-          const indicator = lone && !!box && Array.from(box.querySelectorAll("span, abbr, sup, i, b, strong")).some((e) => /^\s*\*\s*$/.test(e.textContent || ""));
-          const required = c.required || c.getAttribute("aria-required") === "true" || /\*/.test(own) || (!own && /\*/.test(gl?.textContent || "")) || indicator;
-          if (!required) continue;
-          const label = clean(own || norm(gl?.textContent) || c.getAttribute("name") || "checkbox").slice(0, 200);
-          if (seen.has(label)) continue;
-          seen.add(label);
-          unchecked.push({ label, acknowledgment: ACK.test(label) });
-        }
-        return { validationErrors: Array.from(errors).slice(0, 20), requiredUnchecked: unchecked.slice(0, 20) };
-      }).catch(() => null) as Read | null;
+    const unheld = ledger ? await this.recordUnheldEquipment(ledger) : [];
+    let validation = await this.collectFieldValidationErrors();
+    let unchecked = await this.collectRequiredUnchecked();
+    let stale = this.page ? await computeStaleAtExit(this.page) : null;
+    // A page mid-postback (an autopostback select, a re-render) can refuse an evaluate for a moment:
+    // one bounded wait and one more try for whatever did not answer, before the page is called unread.
+    if ((validation === null || unchecked === null || stale === null) && this.page && typeof this.page.waitForLoadState === "function") {
+      await this.page.waitForLoadState("domcontentloaded", { timeout: 5_000 }).catch(() => null);
+      if (validation === null) validation = await this.collectFieldValidationErrors();
+      if (unchecked === null) unchecked = await this.collectRequiredUnchecked();
+      if (stale === null) stale = await computeStaleAtExit(this.page);
     }
-    const shape = read && Array.isArray(read.validationErrors) && Array.isArray(read.requiredUnchecked) ? read : { validationErrors: [], requiredUnchecked: [] };
+    const where = safeHostPath(url);
+    const missing = [validation === null ? "validation" : "", unchecked === null ? "required checkboxes" : "", stale === null ? "computed totals" : ""].filter(Boolean);
+    if (missing.length) {
+      this.debug?.event({ type: "page_exit_unread", page, where, couldNotRead: missing });
+    } else {
+      const due = this.pageExitReads.unread.indexOf(page);
+      if (due >= 0) this.pageExitReads.unread.splice(due, 1);
+      if (!this.pageExitReads.read.includes(page)) this.pageExitReads.read.push(page);
+    }
     const entry: PageTrustEvidence = {
       page,
-      where: safeHostPath(url),
-      validationErrors: shape.validationErrors.map((e) => this.scrubSecrets(String(e))),
-      requiredUnchecked: shape.requiredUnchecked.map((u) => ({ label: this.scrubSecrets(String(u.label)), acknowledgment: u.acknowledgment === true })),
+      where,
+      validationErrors: validation ?? [],
+      requiredUnchecked: (unchecked ?? []).map((u) => ({ label: this.scrubSecrets(String(u.label)), acknowledgment: u.acknowledgment === true })),
       strayWrites: strayWrites.map((w) => this.scrubSecrets(w)),
+      computePending: stale ? this.scrubSecrets(stale) : "",
     };
-    if (!entry.validationErrors.length && !entry.requiredUnchecked.length && !entry.strayWrites.length) return;
+    if (unheld.length) {
+      this.debug?.event({ type: "equipment_not_held_at_exit", page, where, labels: unheld.slice(0, 8).map((l) => l.slice(0, 80)) });
+    }
+    if (!entry.validationErrors.length && !entry.requiredUnchecked.length && !entry.strayWrites.length && !entry.computePending) return;
     this.trustEvidence.push(entry);
-    // One event per kind of evidence, named for what it is (the gate's reader, #534, keys on them).
+    // One event per kind of evidence, named for what it is.
     if (entry.validationErrors.length) {
-      this.debug?.event({ type: "validation_error_after_fill", page, where: entry.where, errors: entry.validationErrors.slice(0, 12) });
+      this.debug?.event({ type: "validation_error_after_fill", page, where, errors: entry.validationErrors.slice(0, 12) });
     }
     if (entry.requiredUnchecked.length) {
-      this.debug?.event({ type: "required_checkbox_unchecked", page, where: entry.where, boxes: entry.requiredUnchecked.slice(0, 12) });
+      this.debug?.event({ type: "required_checkbox_unchecked", page, where, boxes: entry.requiredUnchecked.slice(0, 12) });
     }
     if (entry.strayWrites.length) {
-      this.debug?.event({ type: "equipment_fill_reached_other_control", page, where: entry.where, writes: entry.strayWrites.slice(0, 12) });
+      this.debug?.event({ type: "equipment_fill_reached_other_control", page, where, writes: entry.strayWrites.slice(0, 12) });
     }
+    if (entry.computePending) {
+      this.debug?.event({ type: "computed_total_stale_at_exit", page, where, marker: entry.computePending.slice(0, 120) });
+    }
+  }
+
+  /** An equipment value the portal did not keep — decide every pending one by reading its control
+   *  back, and record the ones not kept as required misses. Returns the labels recorded. */
+  private async recordUnheldEquipment(into: PageExitLedger): Promise<string[]> {
+    const unheld = await this.settleUnheldEquipment();
+    for (const label of unheld) {
+      if (!into.misses.includes(label)) into.misses.push(label);
+      if (!into.didNotHold.includes(label)) into.didNotHold.push(label);
+      if (!into.equipmentNotHeld.includes(label)) into.equipmentNotHeld.push(label);
+    }
+    return unheld;
+  }
+
+  /** Read back each equipment control the portal did not keep (equipmentUnheld) and empty the list.
+   *  A control is cleared ONLY by a read-back that holds one of the project's own candidates — the
+   *  fill loop's own test (equipmentReadBackHolds), so "did the portal keep it" has one answer.
+   *  Everything else is returned as not kept — FAIL CLOSED: blank, a placeholder, ANOTHER value (a
+   *  re-render renumbers PowerClerk's per-render ids, so the recorded selector can reach the
+   *  neighbouring control and read its value — the #536 finding), unreadable, or no longer found.
+   *  A hidden control is judged by its value like any other: hidden is not a reason to stop asking. */
+  private async settleUnheldEquipment(): Promise<string[]> {
+    const out: string[] = [];
+    const pending = [...this.equipmentUnheld.entries()];
+    this.equipmentUnheld.clear();
+    for (const [context, u] of pending) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const loc = (await this.locator(u.target.selector).catch(() => null)) as any;
+      // Counted first: an evaluate on a locator that matches nothing waits out its timeout.
+      const found = loc ? (await loc.count?.().catch(() => 1)) !== 0 : false;
+      const raw = found ? await this.currentControlValue(u.target).catch(() => null) : null;
+      if (raw !== null && u.candidates.some((c) => AutoLearnAdapter.equipmentReadBackHolds(raw, c))) {
+        this.debug?.event({ type: "equipment_unheld_cleared", label: context.slice(0, 80), key: u.key });
+        continue;
+      }
+      out.push(context);
+    }
+    return out;
+  }
+
+  /** The field-level validation errors still showing (fieldValidationErrorsInPage), as
+   *  "<field>: <message>". The required sweep's exclusions apply (secret boxes left blank by design,
+   *  the review acknowledgment, a battery spec on a no-battery job), and every line is scrubbed of
+   *  the run's secrets before it can leave the adapter — a portal repeats a typed account back in
+   *  its error, exactly as with validationBlocks. null = the page could not be read (never "clean"). */
+  private async collectFieldValidationErrors(): Promise<string[] | null> {
+    if (!this.page || typeof this.page.evaluate !== "function") return null;
+    await this.page.evaluate("globalThis.__name = globalThis.__name || function (f) { return f; };").catch(() => null);
+    const raw = await this.page.evaluate(fieldValidationErrorsInPage).catch(() => null);
+    if (!Array.isArray(raw)) return null;
+    const norm = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
+    const out: string[] = [];
+    for (const r of raw as Array<{ label?: string; section?: string; message?: string }>) {
+      const label = norm(r.label).slice(0, 80);
+      const message = norm(r.message).slice(0, 160);
+      if (!message) continue;
+      if (REQUIRED_SWEEP_SENSITIVE.test(label) || REQUIRED_SWEEP_ACK.test(label)) continue;
+      if (!label && (REQUIRED_SWEEP_SENSITIVE.test(message) || REQUIRED_SWEEP_ACK.test(message))) continue;
+      if (this.hasBattery === false && label && batteryControlKind(label, { control: "text" }) === "spec") continue;
+      const section = norm(r.section).slice(0, 60);
+      const field = section && label && !label.toLowerCase().includes(section.toLowerCase()) ? `${section} ${label}` : (label || section);
+      const line = this.scrubSecrets(`${field || "field"}: ${message}`).slice(0, 200);
+      if (!out.includes(line)) out.push(line);
+    }
+    return out.slice(0, 20);
+  }
+
+  /** The REQUIRED checkboxes still unchecked (requiredCheckboxesUncheckedInPage), each flagged
+   *  `acknowledgment` by the required sweep's own REQUIRED_SWEEP_ACK. null = the page could not be
+   *  read (never "none"). */
+  private async collectRequiredUnchecked(): Promise<Array<{ label: string; acknowledgment: boolean }> | null> {
+    if (!this.page || typeof this.page.evaluate !== "function") return null;
+    await this.page.evaluate("globalThis.__name = globalThis.__name || function (f) { return f; };").catch(() => null);
+    const raw = await this.page.evaluate(requiredCheckboxesUncheckedInPage, { ack: REQUIRED_SWEEP_ACK.source }).catch(() => null);
+    if (!Array.isArray(raw)) return null;
+    return (raw as Array<{ label?: unknown; acknowledgment?: unknown }>)
+      .map((u) => ({ label: String(u.label ?? "").slice(0, 200), acknowledgment: u.acknowledgment === true }))
+      .filter((u) => u.label)
+      .slice(0, 20);
   }
 
   // Read each applied fill back; re-apply once if it didn't hold; return the labels of REQUIRED
@@ -12382,6 +12519,156 @@ export async function collectValidationErrorsFrom(page: any): Promise<string[]> 
   } catch {
     return [];
   }
+}
+
+/**
+ * FIELD-LEVEL VALIDATION STILL SHOWING ON THE PAGE (#536, #534) — THE ONE READER of "does a field on
+ * this page show as invalid as the walk leaves it". Read by recordPageTrustEvidence on every page
+ * with a form field. A portal that saves drafts lets the walk advance past "This field is required."
+ * (PowerClerk did, under a blank inverter Model, on a learn that was then trusted; and past "Please
+ * enter a valid decimal number" in Total System Export on the battery learn), so
+ * collectValidationErrorsFrom — which runs only after an advance that did NOT move — never sees it.
+ *
+ * Deliberately NOT that function. It is the post-advance guard learn and replay share, and it reads
+ * page-level banners (role=alert, .alert-danger, aria-live) that are often not about any field. This
+ * reads only what a portal attaches to a CONTROL:
+ *   - a visible field-feedback element with text: .invalid-feedback, .field-validation-error,
+ *     *validation-feedback* (PowerClerk's element-validation-feedback), *validation-message*,
+ *     *error-message*, data-test-role="validation-error" (PowerClerk's own container) and
+ *     data-valmsg-for — tied to its control by aria-describedby, data-valmsg-for, an
+ *     "<id>-validation-error" id, or else the nearest ancestor holding a control (its invalid one,
+ *     else the control just before it);
+ *   - a visible control the portal marks invalid with no message tied to it: aria-invalid="true",
+ *     Bootstrap's .is-invalid, or a native number box holding a non-number (validity.badInput —
+ *     other native constraints are not read: a novalidate form may never enforce them).
+ * Shown = a box with both sides > 0 and not display:none / visibility:hidden (PowerClerk's 1x1
+ * visually-hidden combobox input is shown; a collapsed 0-height box is not). Page-side and
+ * self-contained (evaluate serializes it). Labels: label[for], the wrapping label, aria-label, the
+ * group's legend / label, name — asterisks removed — plus the nearest fieldset legend as `section`.
+ * The required sweep's exclusions are applied by the caller (collectFieldValidationErrors).
+ */
+export function fieldValidationErrorsInPage(): Array<{ label: string; section: string; message: string }> {
+  const norm = (s: string | null | undefined): string => String(s || "").replace(/\s+/g, " ").trim();
+  const deepQueryAll = (root: ParentNode, sel: string): Element[] => {
+    const found: Element[] = Array.from(root.querySelectorAll(sel));
+    for (const host of Array.from(root.querySelectorAll("*"))) {
+      if ((host as Element).shadowRoot) found.push(...deepQueryAll((host as Element).shadowRoot as ShadowRoot, sel));
+    }
+    return found;
+  };
+  const shown = (el: Element): boolean => {
+    const r = (el as HTMLElement).getBoundingClientRect?.();
+    if (!r || !(r.width > 0 && r.height > 0)) return false;
+    const cs = getComputedStyle(el);
+    return cs.display !== "none" && cs.visibility !== "hidden";
+  };
+  const clean = (l: string): string => l.replace(/\s*\*\s*$/, "").replace(/\s*\*\s*/g, " ").trim();
+  const GROUP = "fieldset, .form-group, [class*='form-group'], [class*='field'], .row, [class*='row']";
+  const labelOf = (el: Element): string => {
+    const root = el.getRootNode() as Document | ShadowRoot;
+    const id = el.getAttribute("id");
+    if (id) { const l = root.querySelector(`label[for="${CSS.escape(id)}"]`); if (l?.textContent?.trim()) return clean(norm(l.textContent)); }
+    const w = el.closest("label"); if (w?.textContent?.trim()) return clean(norm(w.textContent));
+    const aria = el.getAttribute("aria-label"); if (aria && aria.trim()) return clean(norm(aria));
+    const grp = el.closest(GROUP);
+    const gl = grp?.querySelector("legend, label, .control-label, .field-label");
+    return clean(norm(gl?.textContent || el.getAttribute("name") || ""));
+  };
+  const sectionOf = (el: Element): string => {
+    const legend = el.closest("fieldset")?.querySelector(":scope > legend");
+    return legend ? clean(norm(legend.textContent)).slice(0, 60) : "";
+  };
+  const CONTROL = "input:not([type=hidden]):not([type=button]):not([type=submit]), select, textarea, [role=combobox], [role=listbox], [role=radiogroup]";
+  const FEEDBACK = ".invalid-feedback, .field-validation-error, [class*='validation-feedback'], [class*='field-validation-error'], [class*='validation-message'], [class*='error-message'], [data-test-role='validation-error'], [data-valmsg-for]";
+  const flagged = (c: Element): boolean => c.getAttribute("aria-invalid") === "true" || c.classList.contains("is-invalid")
+    || (!!(c as HTMLInputElement).validity && (c as HTMLInputElement).validity.badInput === true);
+  const out: Array<{ label: string; section: string; message: string }> = [];
+  const seen = new Set<string>();
+  const tied = new Set<Element>();
+  const push = (control: Element | null, near: Element, message: string): void => {
+    const label = control ? labelOf(control) : "";
+    const section = sectionOf(control ?? near);
+    const key = `${section}|${label}|${message}`;
+    if (control) tied.add(control);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ label, section, message: message.slice(0, 200) });
+  };
+  const fbs = deepQueryAll(document, FEEDBACK);
+  for (const fb of fbs) {
+    // A feedback element inside another one (PowerClerk's container holds a div with the text) is
+    // read once, as its outermost match.
+    if (fbs.some((o) => o !== fb && o.contains(fb))) continue;
+    const message = norm((fb as HTMLElement).innerText || fb.textContent);
+    if (message.length < 4 || !shown(fb)) continue;
+    const root = fb.getRootNode() as Document | ShadowRoot;
+    let control: Element | null = null;
+    const fbId = fb.getAttribute("id") || "";
+    if (fbId) control = root.querySelector(`[aria-describedby~="${CSS.escape(fbId)}"]`);
+    const forName = fb.getAttribute("data-valmsg-for");
+    if (!control && forName) control = root.querySelector(`[name="${CSS.escape(forName)}"]`);
+    if (!control && /-(validation-)?error$/.test(fbId)) {
+      const cid = fbId.replace(/-(validation-)?error$/, "");
+      if (cid) control = root.querySelector(`#${CSS.escape(cid)}`);
+    }
+    for (let a = fb.parentElement; a && !control; a = a.parentElement) {
+      const inside = Array.from(a.querySelectorAll(CONTROL)).filter((c) => !fb.contains(c));
+      if (!inside.length) continue;
+      control = inside.find(flagged)
+        ?? inside.filter((c) => !!(c.compareDocumentPosition(fb) & Node.DOCUMENT_POSITION_FOLLOWING)).pop()
+        ?? inside[0];
+    }
+    push(control, fb, message);
+  }
+  for (const c of deepQueryAll(document, CONTROL)) {
+    if (tied.has(c) || !flagged(c) || !shown(c)) continue;
+    push(c, c, norm((c as HTMLInputElement).validationMessage) || "shown as invalid");
+  }
+  return out.slice(0, 20);
+}
+
+/**
+ * THE REQUIRED CHECKBOXES STILL UNCHECKED (#536) — read by recordPageTrustEvidence as the walk leaves
+ * a page. Required = `required`, aria-required, an asterisk in its own label, an asterisk on its
+ * group's label when it has none of its own, or PowerClerk's lone "*" indicator element in a box that
+ * holds only this checkbox (data-test-role="required-indicator" is a sibling span after the label).
+ * Visible = the input or its label (a styled checkbox's input is often hidden behind its label).
+ * `acknowledgment` = the label matches `src.ack` — the required sweep's own REQUIRED_SWEEP_ACK, handed
+ * in as a source — a box the walk leaves for a person by design. Page-side and self-contained.
+ */
+export function requiredCheckboxesUncheckedInPage(src: { ack: string }): Array<{ label: string; acknowledgment: boolean }> {
+  const norm = (s: string | null | undefined): string => (s || "").replace(/\s+/g, " ").trim();
+  const ACK = new RegExp(src.ack, "i");
+  const GROUP = "fieldset, .form-group, [class*='form-group'], [class*='field'], .row, [class*='row']";
+  const visible = (el: Element): boolean => {
+    const r = (el as HTMLElement).getBoundingClientRect?.();
+    if (!r || !(r.width > 0 && r.height > 0)) return false;
+    const st = getComputedStyle(el as HTMLElement);
+    return st.visibility !== "hidden" && st.display !== "none";
+  };
+  const clean = (l: string): string => l.replace(/\s*\*\s*$/, "").replace(/\s*\*\s*/g, " ").trim();
+  const unchecked: Array<{ label: string; acknowledgment: boolean }> = [];
+  const seen = new Set<string>();
+  for (const c of Array.from(document.querySelectorAll("input[type=checkbox]")) as HTMLInputElement[]) {
+    if (c.checked) continue;
+    const id = c.getAttribute("id");
+    const forLbl = id ? document.querySelector(`label[for="${CSS.escape(id)}"]`) : null;
+    const wrap = c.closest("label");
+    if (!visible(c) && !(forLbl && visible(forLbl)) && !(wrap && visible(wrap))) continue;
+    const own = norm(forLbl?.textContent || wrap?.textContent || c.getAttribute("aria-label") || "");
+    const grp = c.closest(GROUP);
+    const gl = grp?.querySelector("legend, label, .control-label, .field-label");
+    const box = grp || c.parentElement;
+    const lone = !!box && box.querySelectorAll("input[type=checkbox]").length === 1;
+    const indicator = lone && !!box && Array.from(box.querySelectorAll("span, abbr, sup, i, b, strong")).some((e) => /^\s*\*\s*$/.test(e.textContent || ""));
+    const required = c.required || c.getAttribute("aria-required") === "true" || /\*/.test(own) || (!own && /\*/.test(gl?.textContent || "")) || indicator;
+    if (!required) continue;
+    const label = clean(own || norm(gl?.textContent) || c.getAttribute("name") || "checkbox").slice(0, 200);
+    if (seen.has(label)) continue;
+    seen.add(label);
+    unchecked.push({ label, acknowledgment: ACK.test(label) });
+  }
+  return unchecked.slice(0, 20);
 }
 
 // A PAGE THAT MOVED CAN STILL HAVE MOVED BACKWARDS.

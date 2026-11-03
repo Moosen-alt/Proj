@@ -85,6 +85,9 @@ await check("(B10) a trusted learn's message and recipe note name the real gate 
     ],
     reviewScreen: { fields: [{ label: "Owner", value: "x" }], bodyTextSnippet: "Review your application before submitting." },
     reviewScreenshotBase64: "iVBORw0KGgo=",
+    // #534: the real learner reports which pages it read as it left them; a learn that reports
+    // none is never trusted.
+    pageExitReads: { read: [2, 3, 4], unread: [] },
   };
   const result = await autoLearn.autoLearnPortal(db, projectId, { scope: "ahj", portalUrl, createdBy: "operator" });
   assert.equal(result.status, "trusted", `setup: the learn must be trusted (${result.message})`);

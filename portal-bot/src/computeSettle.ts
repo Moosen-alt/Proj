@@ -46,8 +46,13 @@ export interface ComputeSettleResult {
 }
 
 /** What still says "computing" on the page right now: "" when nothing does. Page-side, no closures
- *  over Node values (a plain function the evaluate serializes). Exported for the unit test. */
-export function computePendingInPage(): string {
+ *  over Node values (a plain function the evaluate serializes). Exported for the unit test.
+ *
+ *  `staleOnly` (#534) asks only for the portal's OWN WORDS that its totals are stale, never a busy
+ *  indicator: the learner reads it as it leaves each page, where a spinner elsewhere on the page is
+ *  not a fact about the filing but "System Rating: Needs to be recalculated" is. One function, so the
+ *  click-wait and the exit read can never disagree about what "stale" looks like. */
+export function computePendingInPage(staleOnly?: boolean): string {
   const shown = (el: Element): boolean => {
     const r = (el as HTMLElement).getBoundingClientRect?.();
     if (!r || r.width <= 4 || r.height <= 4) return false;
@@ -64,6 +69,7 @@ export function computePendingInPage(): string {
     const el = n.parentElement;
     if (el && shown(el)) return `"${t}"`;
   }
+  if (staleOnly === true) return "";
   // A BUSY INDICATOR. aria-busy and the common spinner classes, matched as whole class TOKENS (a
   // numeric box's "k-spinner-increase" arrows are not a spinner); a "loader" / "loading" box counts
   // only while it holds something (PowerClerk's Calculate loader is an empty, zero-height box when
@@ -76,6 +82,31 @@ export function computePendingInPage(): string {
     return `busy indicator <${el.tagName.toLowerCase()} class="${cls.slice(0, 60)}">`;
   }
   return "";
+}
+
+/**
+ * WHAT THE PAGE STILL SAYS IS STALE AS THE WALK LEAVES IT (#534): the portal's own marker
+ * ("Needs to be recalculated"), "" when none shows. A live PacifiCorp learn clicked Calculate, then
+ * added the second PV array row; the rating went back to "Needs to be recalculated", the walk
+ * advanced, and the recipe was trusted with the page saved that way. A transient "Calculating…" is
+ * given the bounded settle first; a stale total never clears by itself, so it is read once. Never
+ * throws. null = the page could not be read — NOT "nothing stale": the trust gate refuses a page it
+ * could not read (an unknown is never a clean bill).
+ */
+export async function computeStaleAtExit(page: Page, opts: { waitMs?: number } = {}): Promise<string | null> {
+  if (!page || typeof page.evaluate !== "function") return null;
+  // The __name shim, as in waitForComputeSettled: without it the page function throws.
+  await page.evaluate("globalThis.__name = globalThis.__name || function (f) { return f; };").catch(() => null);
+  const read = async (): Promise<string | null> => {
+    const r = await page.evaluate(computePendingInPage, true).catch(() => null);
+    return typeof r === "string" ? r : null;
+  };
+  let marker = await read();
+  if (marker !== null && /^"?calculating\b/i.test(marker)) {
+    await waitForComputeSettled(page, { timeoutMs: opts.waitMs ?? 10_000 }).catch(() => null);
+    marker = await read();
+  }
+  return marker;
 }
 
 /**
@@ -96,7 +127,7 @@ export async function waitForComputeSettled(page: Page, opts: { timeoutMs?: numb
   // read, so "nothing showing yet" is not read as "already done".
   await new Promise((r) => setTimeout(r, 150));
   for (;;) {
-    const read = await page.evaluate(computePendingInPage).catch(() => null);
+    const read = await page.evaluate(computePendingInPage, false).catch(() => null);
     // Strict string only: unreadable (a navigation swapping the document, a test fake) is not busy.
     pending = typeof read === "string" ? read : "";
     if (pending && !sawPending) sawPending = pending;
