@@ -316,6 +316,73 @@ await run("CLIENT_NOTIFICATIONS=off silences it too", async () => {
   } finally { delete process.env.CLIENT_NOTIFICATIONS; }
 });
 
+// ── #551: a filing whose recipe types a missing intake field holds the job on the client ─────────
+const recipes = await import("../src/portalRecipes");
+const { intakeFieldsInGaps } = await import("../src/clientRequestLinks");
+
+await run("intakeFieldsInGaps: project field gaps the form answers; the contract on either key; never a client field, a question or a document", () => {
+  const gap = (kind: "field" | "question" | "document", key: string, where: "project" | "client" | "documents" | "portal_questions" = "project") =>
+    ({ kind, key, label: key, fieldName: key, where, secret: false });
+  assert.deepEqual(intakeFieldsInGaps([gap("field", "contractAmount"), gap("field", "jobValue"), gap("field", "homeownerPhone"), gap("field", "homeownerEmail")]).sort(),
+    ["homeownerEmail", "homeownerPhone", "jobValue"]);
+  assert.deepEqual(intakeFieldsInGaps([gap("field", "homeownerEmail", "client"), gap("question", "homeownerEmail", "portal_questions"),
+    gap("document", "meter_photo", "documents"), gap("field", "inverterModel"), gap("field", "ccbLicenseNumber", "client")]), []);
+});
+const { updateProject } = await import("../src/repository");
+
+await run("MUST NOT (unchanged): contract / email / phone missing with no recipe that types them sends nothing", async () => {
+  db.run("DELETE FROM portal_recipes");
+  const c = makeClient("No Recipe Solar LLC", "norecipe.test");
+  const p = makeProject(c.id, { account: ACCOUNT, meter: METER }); // the bill is in: nothing else holds it
+  const needs = await intakeNeedsFor(db, getProjectDetail(db, p).project);
+  assert.ok(needs.fields.includes("homeownerEmail"), `fixture: the email must be missing (${JSON.stringify(needs.fields)})`);
+  assert.deepEqual(needs.heldFields, [], JSON.stringify(needs));
+  const out = await autoSendClientRequests(db, p, { nemPortalUrl: noPortal, send });
+  assert.deepEqual(out.sent, [], JSON.stringify(out));
+});
+
+await run("a NEM recipe that types the homeowner email → held on the client → ONE intake link email; filling them closes the ask", async () => {
+  db.run("DELETE FROM portal_recipes");
+  const r = recipes.startPortalRecording(db, {
+    scopeType: "utility", state: "OR", utility: "PGE", portalUrl: "https://pge.powerclerk.example/apply", portalPlatform: "powerclerk", createdBy: "test",
+  });
+  const fill = (label: string, field: string) => ({ action: "fill", selector: { label }, field, note: label });
+  recipes.savePortalRecipeSteps(db, r.id, [
+    fill("Customer Name", "homeownerName"), fill("Owner Email", "homeownerEmail"), fill("Owner Phone", "homeownerPhone"),
+    { action: "stopForReview", selector: {} },
+  ] as never, { status: "complete", notes: "Auto-learned and verified (high confidence)." });
+  const c = makeClient("Recipe Hold Solar LLC", "recipehold.test");
+  const p = makeProject(c.id, { account: ACCOUNT, meter: METER });
+  const needs = await intakeNeedsFor(db, getProjectDetail(db, p).project);
+  assert.equal(needs.bill.length + needs.questions.length, 0, `fixture: nothing else may hold it (${JSON.stringify(needs)})`);
+  assert.deepEqual(needs.heldFields, ["homeownerEmail"], JSON.stringify(needs));
+  outbox.length = 0;
+  process.env.PUBLIC_BASE_URL = "https://keelix.example";
+  try {
+    const out = await autoSendClientRequests(db, p, { nemPortalUrl: noPortal, send });
+    assert.deepEqual(out.sent, [{ kind: "intake", status: "sent" }], JSON.stringify(out));
+    assert.equal(outbox.length, 1);
+    assert.equal(outbox[0].to, "updates@recipehold.test");
+    assert.match(outbox[0].body, /homeowner's email address/);
+    assert.match(outbox[0].body, /homeowner's phone number/, "the missing phone still rides along");
+    assert.match(outbox[0].body, /contract \/ installed cost/, "the missing contract cost still rides along");
+    assert.match(outbox[0].body, /https:\/\/keelix\.example\/intake\?token=/, "the link is in the email");
+    // Once, not per chain run.
+    const again = await autoSendClientRequests(db, p, { nemPortalUrl: noPortal, send });
+    assert.deepEqual(again.sent, [], JSON.stringify(again));
+    // Filled (the installer answered the form): the ask closes on the next pass.
+    updateProject(db, p, { homeownerEmail: "owner@example.test", homeownerPhone: "+1 555 0100" } as never);
+    const after = await intakeNeedsFor(db, getProjectDetail(db, p).project);
+    assert.deepEqual(after.heldFields, [], JSON.stringify(after));
+    const closed = await autoSendClientRequests(db, p, { nemPortalUrl: noPortal, send });
+    assert.equal(closed.closed, 1, JSON.stringify(closed));
+    assert.equal(sendsFor(p).filter((a) => a.closed_at === "").length, 0, "the ask still reads open");
+  } finally {
+    delete process.env.PUBLIC_BASE_URL;
+    db.run("DELETE FROM portal_recipes");
+  }
+});
+
 if (failures) {
   console.error(`\n${failures} check(s) failed`);
   process.exit(1);
