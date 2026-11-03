@@ -265,6 +265,22 @@ run(
   `POST /api/projects/:id/status is not registered at that path: ${JSON.stringify(apiRoutes.filter((r) => r.path.endsWith("/status")))}`,
 );
 
+// THE PERMIT-PROCESS LOOKUP'S READ / VERIFY / REFRESH (#560) write SHARED knowledge (one AHJ's row
+// serves every tenant) on a person's word, keyed by the project's own AHJ. Each must stay under
+// /api/projects/:id, behind its tenancy guard, so a caller can only reach the row of an AHJ one of its
+// own projects names (out of scope is the guard's 404); a move to a top-level path such as
+// /api/permit-process would lose that silently.
+for (const [verb, routePath] of [["get", "/api/projects/:id/permit-process"], ["put", "/api/projects/:id/permit-process/verify"], ["post", "/api/projects/:id/permit-process/refresh"]] as const) {
+  run(
+    `${verb.toUpperCase()} ${routePath} is registered under the /api/projects/:id tenancy guard`,
+    apiRoutes.some((r) => r.verb === verb && r.path === routePath) && guardedPrefixes.includes("/api/projects"),
+    `routes: ${JSON.stringify(apiRoutes.filter((r) => r.path.includes("permit-process")))}; guards: ${guardedPrefixes.join(", ")}`,
+  );
+  const start = source.indexOf(`app.${verb}("${routePath}"`);
+  const body = start < 0 ? "" : source.slice(start, source.indexOf("\napp.", start + 10));
+  run(`${verb.toUpperCase()} ${routePath} reads the project through getProjectDetail first (404 out of scope)`, /getProjectDetail\(db, /.test(body), body.slice(0, 300));
+}
+
 // STAFF LOGINS (#431). Exempted above by name, so assert what the exemption leans on: every
 // /api/staff route goes through requireStaffAdmin, and the self-service change refuses a
 // request with no session (it sits under /api/auth/, which the sign-in gate waves through).
