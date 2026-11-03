@@ -12,7 +12,11 @@
 //     a pending review item of WAITING_ON_BILL_ISSUE_TYPE), or the portal asks a per-job question
 //     nobody has answered (unansweredPortalQuestions — a staging blocker). The link then also asks
 //     the usual intake fields still missing (contract value, homeowner email/phone): they ride
-//     along, but on their own they are callouts that hold nothing, so they never trigger a send.
+//     along, and on their own they hold nothing — UNLESS a filing still to be made has a recipe
+//     that types one of them (#551: Coos Bay binds the contract cost, many NEM recipes the
+//     homeowner email/phone). The stage gate (#445) refuses that filing until it is filled, so
+//     the job IS held on the client, and the link goes out the same way. The read is the track
+//     card's own (submittalTracks stageGaps → recipeStageGaps), never a second copy.
 //   · CREDENTIALS — the NEM track files on a known utility portal and the client has no stored
 //     login whose URL fits it (the same host + jurisdiction-segment rule staging chooses logins by,
 //     selectCredentialUrlsFor). A client with a stored login that carries no URL is NOT asked:
@@ -60,6 +64,7 @@ import { trackSafeUrl } from "./portalChannel";
 import { WAITING_ON_BILL_ISSUE_TYPE } from "./qc";
 import { getProjectDetail } from "./repository";
 import { getSubmittalTracks, requiredTracks, trackHasFiling } from "./submittalTracks";
+import type { RecipeStageGap } from "../../shared/src/types";
 
 const ACTOR = "client-request-links";
 /** Where the chain may have stopped for an ask to go out (see WHEN above). */
@@ -141,8 +146,38 @@ export interface IntakeNeeds {
   bill: string[];
   /** Portal per-job questions nobody has answered (labels). */
   questions: string[];
-  /** The usual intake fields still missing — ride along only. */
+  /** The usual intake fields still missing — ride along, unless held (below). */
   fields: IntakeField[];
+  /** Of `fields`, the ones a filing still to be made cannot stage without (#551): its recipe
+   *  types the box and the job has no value. These hold the job on the client. */
+  heldFields?: IntakeField[];
+}
+
+/** The recipe keys a stage gap names that the intake form answers. The contract sits on either
+ *  parser key (valuation.ts: the Coos Bay recipes bind both). */
+const GAP_KEY_INTAKE_FIELD: Record<string, IntakeField> = {
+  jobValue: "jobValue",
+  contractAmount: "jobValue",
+  homeownerEmail: "homeownerEmail",
+  homeownerPhone: "homeownerPhone",
+};
+
+/** The intake fields a recipe stage gap list names (field gaps on the project only). */
+export function intakeFieldsInGaps(gaps: RecipeStageGap[]): IntakeField[] {
+  const out = new Set<IntakeField>();
+  for (const g of gaps) {
+    if (g.kind !== "field" || g.where !== "project") continue;
+    const f = GAP_KEY_INTAKE_FIELD[g.key];
+    if (f) out.add(f);
+  }
+  return [...out];
+}
+
+/** The intake fields that hold a filing still to be made: every unfiled track's stage gaps, as
+ *  its card reads them (complete recipe, not started or staged-not-submitted). */
+function intakeFieldsHoldingAFiling(db: AppDb, project: ProjectRecord): IntakeField[] {
+  const gaps = getSubmittalTracks(db, project).flatMap((t) => t.stageGaps ?? []);
+  return intakeFieldsInGaps(gaps);
 }
 
 export async function intakeNeedsFor(db: AppDb, project: ProjectRecord): Promise<IntakeNeeds> {
@@ -156,12 +191,19 @@ export async function intakeNeedsFor(db: AppDb, project: ProjectRecord): Promise
   try { questions = (await unansweredPortalQuestions(db, project)).map((q) => q.label).filter(Boolean); } catch { questions = []; }
   let fields: IntakeField[] = [];
   try { fields = missingIntakeFields(db, project.id); } catch { fields = []; }
-  return { bill: [...new Set(bill)].sort(), questions, fields };
+  // Only a field the form will actually ask (it is missing) can hold the job on the client.
+  let heldFields: IntakeField[] = [];
+  try {
+    const holding = new Set(intakeFieldsHoldingAFiling(db, project));
+    heldFields = fields.filter((f) => holding.has(f));
+  } catch { heldFields = []; }
+  return { bill: [...new Set(bill)].sort(), questions, fields, heldFields };
 }
 
-/** Held on the client: something that actually stops a filing (bill wait, portal question). */
+/** Held on the client: something that actually stops a filing (bill wait, portal question, or a
+ *  recipe box only the client can fill — #551). */
 export function intakeHeld(n: IntakeNeeds): boolean {
-  return n.bill.length > 0 || n.questions.length > 0;
+  return n.bill.length > 0 || n.questions.length > 0 || (n.heldFields?.length ?? 0) > 0;
 }
 
 function intakeNeedLabels(n: IntakeNeeds): string[] {

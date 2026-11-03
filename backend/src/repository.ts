@@ -76,7 +76,7 @@ import { findCompleteRecipeForProject, findAnyRecipeForProject, resolveRecipeFie
 import { notServedInResult } from "../../shared/src/portalNotServed";
 import { notifyClientOfStatusChange, shouldNotifyClient } from "./clientNotifier";
 import { notifyClientOfFiling } from "./clientFilingUpdate";
-import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStatusChange, alertStaffOnUnmatchedCorrectionEmail } from "./staffAlerts";
+import { alertStaffOnCorrection, alertStaffOnRunOutcome, alertStaffOnStageHeld, alertStaffOnStatusChange, alertStaffOnUnmatchedCorrectionEmail } from "./staffAlerts";
 import { installerHandoffNoteBody, sendInstallerHandoff } from "./installerHandoff";
 // detectPlatform moved with the target INSERT into submittalTracks.ts's ensureCheckTarget; the
 // card's Edit (updatePermitCheckTarget) re-detects with the same function when the URL changes.
@@ -9868,6 +9868,9 @@ export async function prepareSubmission(
           track: track ?? "permit", recipeId: recipe.id, missing: missingRecipeInputs.map((g) => ({ kind: g.kind, key: g.key, label: g.label })),
         });
       }
+      // The team hears about it (#551): this refusal comes before any run row, so the run alert
+      // never fires, and a background Autopilot / approval run that stops here was silent.
+      void alertStaffOnStageHeld(db, { projectId, track: track ?? "permit", gaps });
       throw new HttpError(409, stageGapsRefusal(gaps, portalLabel), {
         ...(open.length ? { unansweredPortalQuestions: open } : {}),
         ...(missingRecipeInputs.length ? { missingRecipeInputs } : {}),
