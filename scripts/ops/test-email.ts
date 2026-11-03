@@ -18,6 +18,7 @@
 import "dotenv/config";
 import os from "node:os";
 import { sendTestEmail, smtpConfigured } from "./mailer";
+import { mailFrom } from "../../backend/src/emailLayout";
 
 const env = process.env;
 const args = process.argv.slice(2);
@@ -61,7 +62,8 @@ const r = await sendTestEmail(to, subject, text, env);
 const port = Number(env.SMTP_PORT || 587);
 console.log(`test-email   ${new Date().toISOString()}`);
 console.log(`  server     ${env.SMTP_HOST}:${port}${env.SMTP_SECURE === "true" || port === 465 ? " (TLS)" : ""}${env.SMTP_USER ? ", signed in" : ", no sign-in"}`);
-console.log(`  from       ${env.SMTP_FROM}`);
+const from = mailFrom(env.SMTP_FROM, env.SMTP_FROM_NAME);
+console.log(`  from       ${from && typeof from === "object" ? `${from.name} <${from.address}>` : env.SMTP_FROM}`);
 console.log(`  to         ${to}`);
 if (r.ok) {
   console.log(`  answer     ${scrub(r.response) || "(no answer line)"}`);

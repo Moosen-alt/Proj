@@ -68,6 +68,7 @@ import { enqueueStageSteps } from "./autoStageSteps";
 import { classifyDoc, extractPdfText } from "./batchImport";
 import { BRAND } from "./clientUpdates";
 import { ensureStatusShareToken, formatProjectAddress, sendEmail, smtpConfigured, statusShareUrl } from "./clientNotifier";
+import { mapEmailText, renderEmail, type EmailContent, type EmailSection } from "./emailLayout";
 import { addCommunication } from "./crm";
 import { describeKind, isImageKind, looksLikeCad, sniffFileKind } from "./fileTypes";
 import { HttpError } from "./httpError";
@@ -86,7 +87,8 @@ type Row = Record<string, unknown>;
 const ACTOR = "email intake";
 const MAX_FILES = 20;
 
-export type IntakeSender = (to: string, subject: string, body: string) => Promise<void>;
+/** `html`: the layout part (emailLayout.ts), rendered from the same scrubbed content as `body`. */
+export type IntakeSender = (to: string, subject: string, body: string, html?: string) => Promise<void>;
 export type IntakeExtractor = (input: { planText: string; utilityBillText: string; structuralLetterText: string }, orgId: string) => Promise<ParserExtractionResponse>;
 
 export interface IntakeOptions {
@@ -436,25 +438,34 @@ export function intakeReplyEmail(input: {
   project: ProjectRecord; attached: boolean; link: string; missing: string[]; unsure: string[]; refused: EmailIntakeFile[];
   /** Every secret value to scrub (projectSecretValuesById plus the read's own secret fields). */
   secrets: string[];
-}): { subject: string; body: string } {
+}): { subject: string; body: string; html: string } {
   const address = formatProjectAddress(input.project) || "your job";
-  const lines = [
-    "Hello,",
-    "",
-    input.attached
-      ? `We received your email for ${address} and added the files to the project we already have for that address.`
+  const sections: EmailSection[] = [];
+  if (input.missing.length) sections.push({ heading: "Still needed — reply with these, or send them in a new email to the same address", items: input.missing });
+  if (input.unsure.length) sections.push({ heading: "We will double-check these against your documents before anything is filed", items: input.unsure });
+  if (input.refused.length) sections.push({ heading: "Files we could not use", items: input.refused.map((f) => `${f.name}: ${f.refused}`) });
+  const content: EmailContent = {
+    audience: "client",
+    preheader: input.attached
+      ? `We received your email for ${address} and added the files to the project.`
       : `We received your email for ${address} and started a new project for it.`,
-    "",
-    `Live status page (no login needed): ${input.link}`,
-  ];
-  if (input.missing.length) lines.push("", "Still needed — reply with these, or send them in a new email to the same address:", ...input.missing.map((m) => `  • ${m}`));
-  if (input.unsure.length) lines.push("", "We will double-check these against your documents before anything is filed:", ...input.unsure.map((u) => `  • ${u}`));
-  if (input.refused.length) lines.push("", "Files we could not use:", ...input.refused.map((f) => `  • ${f.name}: ${f.refused}`));
-  lines.push("", "Thank you,", BRAND);
+    eyebrow: "Files received",
+    headline: input.attached ? "Files added to your project" : "New project started",
+    greeting: "Hello,",
+    intro: [input.attached
+      ? `We received your email for ${address} and added the files to the project we already have for that address.`
+      : `We received your email for ${address} and started a new project for it.`],
+    sections,
+    action: { label: "View live status", textLabel: "Live status page (no login needed)", url: input.link },
+    signoff: ["Thank you,", BRAND],
+  };
   const secrets = [...input.secrets, String(input.project.accountNumber ?? ""), String(input.project.meterNumber ?? "")];
+  // Both parts from the SCRUBBED content (rule 2), and the text twin once more whole, as before.
+  const { text: body, html } = renderEmail(mapEmailText(content, (s) => redactSecretValues(s, secrets)));
   return {
     subject: redactSecretValues(`Received: ${address}`, secrets),
-    body: redactSecretValues(lines.join("\n"), secrets),
+    body: redactSecretValues(body, secrets),
+    html,
   };
 }
 
@@ -464,14 +475,16 @@ function autoReplyOff(): string {
   return "";
 }
 
-async function reply(db: AppDb, input: { project: ProjectRecord; orgId: string; to: string; subject: string; body: string }, opts: IntakeOptions): Promise<string> {
+const sendWithLayout: IntakeSender = (to, subject, body, html) => sendEmail(to, subject, body, [], { html });
+
+async function reply(db: AppDb, input: { project: ProjectRecord; orgId: string; to: string; subject: string; body: string; html: string }, opts: IntakeOptions): Promise<string> {
   let status: "sent" | "draft" | "failed" = "draft";
   let detail = autoReplyOff();
   if (detail) { /* stays a draft */ }
   else if (!String(process.env.PUBLIC_BASE_URL ?? "").trim()) detail = "PUBLIC_BASE_URL is not set, so the status link would point at this machine; nothing was sent.";
   else if (!opts.send && !smtpConfigured()) detail = "SMTP is not configured (SMTP_HOST / SMTP_FROM are unset), so no send was attempted.";
   else {
-    try { await (opts.send ?? sendEmail)(input.to, input.subject, input.body); status = "sent"; }
+    try { await (opts.send ?? sendWithLayout)(input.to, input.subject, input.body, input.html); status = "sent"; }
     catch (err) { status = "failed"; detail = err instanceof Error ? err.message : String(err); }
   }
   addCommunication(db, {

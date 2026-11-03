@@ -106,7 +106,8 @@ WATCHDOG_HEARTBEAT_URL=https://hc-ping.com/<uuid>
 WATCHDOG_NAME=Keelix server
 # Client email and the tracking inbox (§5.1): the desk's lines where it has them
 SMTP_HOST=<mail server>
-SMTP_FROM=<the address clients see>
+SMTP_FROM=<the address clients see>   # a bare address
+SMTP_FROM_NAME=Keelix Filings   # the name inboxes show beside it (this is the default)
 SMTP_PORT=587
 SMTP_USER=<mail account>
 SMTP_PASS=<app password>

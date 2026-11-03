@@ -168,7 +168,8 @@ await check("a stage run that FAILS alerts once: address, track, the run's reaso
   assert.equal(mine[0].recipient, "webhook", "the webhook URL is never stored");
   assert.equal(hooks.filter((h) => h.path === "/staff").length, 1);
   const h = hooks[0];
-  assert.match(h.title, /needs you: Building permit run failed/);
+  // #589: plain-words subject (was "Keelix — needs you: Building permit run failed — <address>").
+  assert.match(h.title, /^Action needed: building permit run failed /);
   assert.match(h.body, /Solar Way/, "the address");
   assert.match(h.body, /Track: Building permit/);
   assert.match(h.body, /Why: .*Meter number/, "the run's own reason");
@@ -201,7 +202,7 @@ await check("an INTERRUPTED run (its process went away) alerts once", async () =
   const mine = rows("project_id = ? AND kind = 'run'", [pid]);
   assert.equal(mine.length, 1);
   assert.equal(mine[0].state, "interrupted");
-  assert.match(mine[0].subject, /NEM \/ interconnection run interrupted/);
+  assert.match(mine[0].subject, /^Action needed: NEM \/ interconnection run interrupted — /);
 });
 
 await check("a stage HELD on a missing box alerts once, in our words, before any run; same gaps again send nothing; new gaps send once (#551)", async () => {
@@ -224,7 +225,7 @@ await check("a stage HELD on a missing box alerts once, in our words, before any
   assert.equal(rows("project_id = ? AND kind = 'run'", [pid]).length, 0, "no run row, so no run alert");
   const h = hooks.filter((x) => x.path === "/staff");
   assert.equal(h.length, 1);
-  assert.match(h[0].title, /needs you: Building permit staging held, details missing/);
+  assert.match(h[0].title, /^Action needed: building permit staging held, details missing /);
   assert.match(h[0].body, /Homeowner email \(project\)/, h[0].body);
   assert.match(h[0].body, /intake link/);
   assert.ok(!h[0].body.includes("Quillfeather") && !h[0].body.includes("Electronic Mail"), `the portal's recorded label leaked: ${h[0].body}`);
@@ -275,7 +276,10 @@ await check("a matched CORRECTION alerts as a correction (not also as a status c
   await settle();
   const corr = rows("project_id = ? AND kind = 'correction'", [pid]);
   assert.equal(corr.length, 1, JSON.stringify(rows("project_id = ?", [pid])));
-  assert.match(corr[0].subject, /correction notice received/);
+  // #589: the subject says it in plain words (was "… Permit correction notice received …"); the
+  // body keeps the What happened row.
+  assert.match(corr[0].subject, /^Action needed: permit corrections requested — /);
+  assert.match(corr[0].body, /What happened: correction notice received/);
   assert.equal(rows("project_id = ? AND kind = 'status'", [pid]).length, 0);
 });
 await check("DEDUPE: a status that moves away and back is a NEW transition and alerts again", async () => {
@@ -321,6 +325,10 @@ await check("EMAIL: goes out on the product's SMTP settings to the org's STAFF_A
   assert.equal(mails.length, 1);
   assert.deepEqual(mails[0].rcpt, ["staff@keelix.invalid"]);
   assert.match(mails[0].data, /Track: NEM \/ interconnection\nWhat happened: run failed/);
+  // #589: the layout's HTML part rides along (multipart), under the configured display name.
+  assert.match(mails[0].data, /Content-Type: multipart\/alternative/i, "the alert is not multipart (text + html)");
+  assert.match(mails[0].data, /Content-Type: text\/html/i);
+  assert.match(mails[0].data, /^From: Keelix <alerts@keelix\.invalid>$/m, "SMTP_FROM's own name is kept while SMTP_FROM_NAME is unset");
 });
 
 // ── org scoping ─────────────────────────────────────────────────────────────────────────────

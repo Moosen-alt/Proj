@@ -34,11 +34,13 @@
 import type { AppDb } from "./db";
 import type { ProjectRecord } from "../../shared/src/types";
 import { text } from "./json";
+import { BRAND } from "./brand";
+import { renderEmail, type EmailContent } from "./emailLayout";
 
-/** The name a client sees on every update. PROVISIONAL — the operator has not settled the
- *  company name, so it lives here as one constant with an env override rather than being
- *  scattered through the templates. Change BRAND_NAME in .env, or this default. */
-export const BRAND = (process.env.BRAND_NAME || "Keelix").trim() || "Keelix";
+/** The name a client sees on every update — defined in brand.ts (a leaf, so the email layout can
+ *  read it without the database layer) and re-exported here for the modules that always took it
+ *  from here. Change BRAND_NAME in .env. */
+export { BRAND };
 import { id } from "./ids";
 import { nowIso } from "./time";
 import { isNemApprovalOutcome, outcomeTrack, trackKind } from "./permitMonitor";
@@ -389,24 +391,50 @@ export function clientUpdateNoteBody(update: ClientUpdate): string {
   return [update.headline, update.meaning, update.action].join(" ");
 }
 
-/** The email body. Same words, plus the greeting and the link the email needs. */
+/**
+ * A client email subject: BRAND — EVENT — HOMEOWNER — ADDRESS. A client filing for several
+ * homeowners on one street cannot tell two jobs apart from the address alone, and the inbox shows
+ * the subject before anything else. Each segment is dropped when it is blank rather than leaving a
+ * dangling dash. The one composition every client email uses (notices, asks, the handoff).
+ */
+export function clientEmailSubject(...parts: Array<string | null | undefined>): string {
+  return [BRAND, ...parts].map((part) => String(part ?? "").trim()).filter(Boolean).join(" — ");
+}
+
+/** The email, as layout content (emailLayout.ts). Same words as the note, plus the greeting and the
+ *  link the email needs; the action line is set apart as the next step. */
+export function clientUpdateEmailContent(
+  update: ClientUpdate,
+  opts: { company: string; address: string; statusLine: string; link: string },
+): EmailContent {
+  return {
+    audience: "client",
+    preheader: update.headline,
+    eyebrow: "Project update",
+    headline: update.subject,
+    greeting: `Hi ${opts.company || "there"},`,
+    intro: [`Update on your solar project at ${opts.address || "the project site"}:`, update.headline, update.meaning],
+    nextStep: update.action,
+    action: { label: "View live status", textLabel: "Live status page (no login needed)", url: opts.link },
+    signoff: [`— ${BRAND} (automated update; reply to reach the team)`],
+  };
+}
+
+/** Both parts of the email; the text twin is the body the communication row stores. */
+export function clientUpdateEmail(
+  update: ClientUpdate,
+  opts: { company: string; address: string; statusLine: string; link: string },
+): { body: string; html: string } {
+  const { text: body, html } = renderEmail(clientUpdateEmailContent(update, opts));
+  return { body, html };
+}
+
+/** The email body (the text twin). Same words, plus the greeting and the link the email needs. */
 export function clientUpdateEmailBody(
   update: ClientUpdate,
   opts: { company: string; address: string; statusLine: string; link: string },
 ): string {
-  return [
-    `Hi ${opts.company || "there"},`,
-    "",
-    `Update on your solar project at ${opts.address || "the project site"}:`,
-    "",
-    update.headline,
-    update.meaning,
-    update.action,
-    "",
-    `Live status page (no login needed): ${opts.link}`,
-    "",
-    `— ${BRAND} (automated update; reply to reach the team)`,
-  ].join("\n");
+  return clientUpdateEmail(update, opts).body;
 }
 
 /**

@@ -40,7 +40,8 @@ import { addCommunication, undeliveredCommunications } from "./crm";
 import {
   clientUpdatesSilenced, ensureStatusShareToken, formatProjectAddress, sendEmail, smtpConfigured, statusShareUrl,
 } from "./clientNotifier";
-import { BRAND, clientFacingPermitType, clientPermitStructure, recordClientUpdateNote, type ClientUpdate } from "./clientUpdates";
+import { BRAND, clientEmailSubject, clientFacingPermitType, clientPermitStructure, recordClientUpdateNote, type ClientUpdate } from "./clientUpdates";
+import { mapEmailText, renderEmail, renderEmailText, type EmailContent } from "./emailLayout";
 import { INSTALLER_HANDOFF_SENDER, installerHandoffAttachments } from "./handoffDocuments";
 import { isNemApprovalOutcome, trackKind } from "./permitMonitor";
 import { projectSecretValuesById } from "./projectSecrets";
@@ -167,6 +168,68 @@ function handoffClientUpdate(project: ProjectRecord, permitCount: number): Clien
   };
 }
 
+/**
+ * The handoff email (pure: the preview and the tests render it without a database). The text twin
+ * is the body the communication row stores; both parts render from the SCRUBBED content (rule 2),
+ * and the text is scrubbed once more whole, as it always was. `rawSubject` / `rawBody` are the
+ * unscrubbed text, for the audit's "was anything scrubbed" flag only — never sent or stored.
+ */
+export function installerHandoffEmail(input: {
+  project: ProjectRecord;
+  company: string;
+  address: string;
+  link: string;
+  approved: string[];
+  attachmentLabels: string[];
+  update: ClientUpdate;
+  secrets: string[];
+}): { subject: string; body: string; html: string; rawSubject: string; rawBody: string } {
+  const { project, update } = input;
+  const hasIssuedPermit = input.attachmentLabels.includes("Issued permit");
+  const rawSubject = clientEmailSubject(update.subject, text(project.homeownerName), input.address || project.id);
+  const content: EmailContent = {
+    audience: "client",
+    preheader: update.headline,
+    eyebrow: "Installer handoff",
+    headline: update.subject,
+    greeting: `Hi ${input.company || "there"},`,
+    intro: [
+      `Closeout for your solar project at ${input.address || "the project site"}:`,
+      update.headline,
+      // The portal note's meaning line says the packet "goes to your updates inbox by email";
+      // inside that very email it points at what follows instead.
+      "Our filing work on it is complete. Below are the approvals with their reference numbers, the issued documents we have on file and the steps to permission to operate.",
+    ],
+    sections: [
+      { heading: "Approved", items: input.approved.length ? input.approved : ["The permit and the interconnection (see the status page for each filing)."] },
+      {
+        heading: "Documents",
+        items: input.attachmentLabels.length
+          ? input.attachmentLabels.map((label) => `${label} (attached)`)
+          : ["None on file with us yet. The issued permit and the utility's approval are on each agency's record; we will send them once we have them."],
+      },
+      {
+        paragraphs: [hasIssuedPermit
+          ? "Conditions of approval are printed on the issued permit — read them before work starts."
+          : `Conditions of approval are printed on the issued permit — download it from ${project.ahj || "the jurisdiction"}'s record and read them before work starts.`],
+      },
+      { heading: "Installer handoff checklist", items: installerHandoffChecklist(project), ordered: true },
+    ],
+    nextStep: update.action,
+    action: { label: "View live status", textLabel: "Live status page (no login needed)", url: input.link },
+    signoff: [`— ${BRAND} (automated update; reply to reach the team)`],
+  };
+  const scrub = (s: string): string => redactSecretValues(s, input.secrets);
+  const rendered = renderEmail(mapEmailText(content, scrub));
+  return {
+    subject: scrub(rawSubject),
+    body: scrub(rendered.text),
+    html: rendered.html,
+    rawSubject,
+    rawBody: renderEmailText(content),
+  };
+}
+
 export interface InstallerHandoffResult {
   /** sent | draft | failed when an email was recorded; skipped when nothing was. */
   deliveryStatus: "sent" | "draft" | "failed" | "skipped";
@@ -237,41 +300,16 @@ export async function sendInstallerHandoff(
     const address = formatProjectAddress(project);
     const link = statusShareUrl(ensureStatusShareToken(db, project.id));
     const update = handoffClientUpdate(project, permitCount);
-    const hasIssuedPermit = attachments.some((a) => a.label === "Issued permit");
-    const rawSubject = [BRAND, update.subject, text(project.homeownerName), address || project.id]
-      .map((part) => String(part || "").trim()).filter(Boolean).join(" — ");
-    const rawBody = [
-      `Hi ${text(client?.company_name) || "there"},`,
-      "",
-      `Closeout for your solar project at ${address || "the project site"}:`,
-      "",
-      update.headline,
-      // The portal note's meaning line says the packet "goes to your updates inbox by email";
-      // inside that very email it points at what follows instead.
-      "Our filing work on it is complete. Below are the approvals with their reference numbers, the issued documents we have on file and the steps to permission to operate.",
-      "",
-      "Approved:",
-      ...(approved.length ? approved.map((l) => `- ${l}`) : ["- The permit and the interconnection (see the status page for each filing)."]),
-      "",
-      "Documents:",
-      ...(attachments.length
-        ? attachments.map((a) => `- ${a.label} (attached)`)
-        : ["- None on file with us yet. The issued permit and the utility's approval are on each agency's record; we will send them once we have them."]),
-      hasIssuedPermit
-        ? "Conditions of approval are printed on the issued permit — read them before work starts."
-        : `Conditions of approval are printed on the issued permit — download it from ${project.ahj || "the jurisdiction"}'s record and read them before work starts.`,
-      "",
-      "Installer handoff checklist:",
-      ...installerHandoffChecklist(project).map((line, i) => `${i + 1}. ${line}`),
-      "",
-      update.action,
-      "",
-      `Live status page (no login needed): ${link}`,
-      "",
-      `— ${BRAND} (automated update; reply to reach the team)`,
-    ].join("\n");
-    const subject = redactSecretValues(rawSubject, secrets);
-    const body = redactSecretValues(rawBody, secrets);
+    const { subject, body, html, rawSubject, rawBody } = installerHandoffEmail({
+      project,
+      company: text(client?.company_name),
+      address,
+      link,
+      approved,
+      attachmentLabels: attachments.map((a) => a.label),
+      update,
+      secrets,
+    });
 
     // The client portal hears it once per handoff — a re-send is the same event.
     if (!prior) {
@@ -300,7 +338,7 @@ export async function sendInstallerHandoff(
     let detail = configured ? "" : "SMTP is not configured (SMTP_HOST / SMTP_FROM are unset), so no send was attempted.";
     if (configured) {
       try {
-        await sendEmail(to, subject, body, attachments);
+        await sendEmail(to, subject, body, attachments, { html });
         deliveryStatus = "sent";
       } catch (err) {
         deliveryStatus = "failed";
