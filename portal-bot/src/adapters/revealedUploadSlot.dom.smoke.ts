@@ -18,6 +18,8 @@
 //   [C] the project holds a plan set but no meter photo (#542): the split-mode substitute tier
 //       used to file the PLAN SET into the required meter-photo slot and report nothing missing.
 //       Now nothing is attached, no upload step is recorded, and the hand-off names the slot.
+//   [D] the same page, but the revealed required slot is a generic "Plans" slot, and the project
+//       holds only the plan set: the plan set IS still attached there (the fix must not over-refuse).
 //
 // Run: npx tsx portal-bot/src/adapters/revealedUploadSlot.dom.smoke.ts
 import "../smokeArtifactDirs"; // hand-run safe: artifact dirs default to a temp folder, never data/
@@ -36,7 +38,8 @@ const check = (label: string, ok: boolean, detail = ""): void => {
   else { failures++; console.error(`  FAIL - ${label}\n         ${detail}`); }
 };
 
-const SERVICE = `<h1>Description of Service</h1>
+const METER_LABEL = "Upload a photo of meter where system will be interconnected";
+const serviceHtml = (slotLabel: string): string => `<h1>Description of Service</h1>
   <div class="form-group">
     <label for="where" class="control-label">Is the system interconnected at an existing meter? *</label>
     <select id="where" required>
@@ -53,7 +56,7 @@ const SERVICE = `<h1>Description of Service</h1>
       // Revealed a beat later, as PowerClerk's partial render does — never present at entry.
       setTimeout(function () {
         document.getElementById("slot").innerHTML =
-          '<div class="form-group"><label for="meter" class="control-label">Upload a photo of meter where system will be interconnected *</label>' +
+          '<div class="form-group"><label for="meter" class="control-label">${slotLabel} *</label>' +
           '<input id="meter" type="file" accept=".docx, .pdf" required></div>';
         document.getElementById("meter").addEventListener("change", function (e2) {
           var fd = new FormData();
@@ -87,7 +90,8 @@ const server = http.createServer((req, res) => {
     return;
   }
   res.writeHead(200, { "content-type": "text/html" });
-  res.end(`<!doctype html><html><head><title>PowerClerk replica</title></head><body>${url.pathname === "/review" ? REVIEW : SERVICE}</body></html>`);
+  const body = url.pathname === "/review" ? REVIEW : serviceHtml(url.pathname === "/service-plans" ? "Plans" : METER_LABEL);
+  res.end(`<!doctype html><html><head><title>PowerClerk replica</title></head><body>${body}</body></html>`);
 });
 await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
 const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
@@ -122,18 +126,22 @@ try {
     await p.close();
   }
 
-  for (const which of ["A", "B", "C"] as const) {
+  for (const which of ["A", "B", "C", "D"] as const) {
     console.log(which === "A" ? "\n[A] the project holds the meter photo (.jpg)"
-      : which === "B" ? "\n[B] the project holds no document" : "\n[C] the project holds a plan set but no meter photo (#542)");
+      : which === "B" ? "\n[B] the project holds no document"
+      : which === "C" ? "\n[C] the project holds a plan set but no meter photo (#542)"
+      : "\n[D] a generic required \"Plans\" slot, plan set only: the substitute still applies");
+    const servicePath = which === "D" ? "/service-plans" : "/service";
+    const slotRe = which === "D" ? /\bplans\b/i : /photo of meter/i;
     const ctx = await browser.newContext();
     ctx.setDefaultTimeout(8000);
     await ctx.addInitScript({ content: "globalThis.__name = globalThis.__name || ((f) => f);" });
     const page = await ctx.newPage();
-    await page.goto(`${base}/service`);
+    await page.goto(`${base}${servicePath}`);
     posts.length = 0;
     uploads.length = 0;
     const docsByType: Record<string, string> = which === "A" ? { meter_photo: meterPhoto, plan_set: planSet }
-      : which === "C" ? { plan_set: planSet } : {};
+      : which === "C" || which === "D" ? { plan_set: planSet } : {};
     const adapter = new AutoLearnAdapter("PowerClerk Replica", planner, { maxPages: 4, docsByType });
     const events: Array<Record<string, unknown>> = [];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -146,7 +154,7 @@ try {
     let r: Awaited<ReturnType<AutoLearnAdapter["learn"]>> | null = null;
     let threw = "";
     try {
-      r = await adapter.learn({ portalUrl: `${base}/service` } as never,
+      r = await adapter.learn({ portalUrl: `${base}${servicePath}` } as never,
         { projectAddress: "1 Test St, Springfield, IL, 62701", city: "Springfield", state: "IL", zip: "62701", homeownerName: "T" } as never);
     } catch (e) { threw = String(e).slice(0, 200); }
     await new Promise((res) => setTimeout(res, 800)); // let a late request land
@@ -163,7 +171,7 @@ try {
     check("premise: the answer was recorded (select → Yes)",
       steps.some((s) => s.action === "select" || (s.action === "fill" && /exist/i.test(String(s.note ?? "")))), JSON.stringify(steps.map((s) => `${s.action}:${s.note ?? ""}`)));
     check("the revealed slot got an upload pass of its own",
-      events.some((e) => e.type === "upload_revealed_slots" && /photo of meter/i.test(String(e.labels ?? ""))), uploadEvents);
+      events.some((e) => e.type === "upload_revealed_slots" && slotRe.test(String(e.labels ?? ""))), uploadEvents);
     check("nothing was submitted (no POST /SubmitApplication)", !posts.some((p) => p.endsWith("/SubmitApplication")), `posts=[${posts.join(",")}]`);
     check("the run stopped at review", r?.reachedReview === true, `reachedReview=${r?.reachedReview} ${msg.slice(0, 300)}`);
     if (which === "A") {
@@ -176,6 +184,12 @@ try {
       check("[A] the upload step comes AFTER the answer that revealed the slot, so a replay meets it in order",
         answerAt >= 0 && uploadAt > answerAt, `answerAt=${answerAt} uploadAt=${uploadAt}`);
       check("[A] the meter-photo slot is not reported empty", !missing.some((m) => /photo of meter/i.test(m)), JSON.stringify(missing));
+    } else if (which === "D") {
+      check("[D] the plan set was attached to the generic Plans slot",
+        uploads.length === 1 && /plan-set\.pdf$/i.test(uploads[0].filename), JSON.stringify(uploads));
+      check("[D] …recorded as a plan_set upload step",
+        uploadSteps.length === 1 && uploadSteps[0].docType === "plan_set", JSON.stringify(uploadSteps));
+      check("[D] …and the Plans slot is not reported empty", !missing.some((m) => /\bplans\b/i.test(m)), JSON.stringify(missing));
     } else {
       check(`[${which}] nothing was attached${which === "C" ? " — the plan set is not filed into the meter-photo slot" : ""}`,
         uploads.length === 0 && uploadSteps.length === 0, `uploads=${JSON.stringify(uploads)} steps=${JSON.stringify(uploadSteps)}`);
