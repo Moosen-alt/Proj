@@ -399,6 +399,21 @@ function clickStepBudgetMs(): number {
   const v = Number(process.env.AUTOLEARN_CLICK_BUDGET_MS);
   return Number.isFinite(v) && v > 0 ? v : CLICK_STEP_BUDGET_DEFAULT_MS;
 }
+/** #556 — A CONTROL THAT IS NOT ON THE PAGE: clickResilient's fast, named failure for a selector
+ *  that matches no element, so no click was ever made. A TYPED MARKER, not a message: safeAction
+ *  flattens an error to its words, and boundedClick reads this marker to tell its doors "absent"
+ *  apart from "failed". The words must never say "timeout": safeAction's withRetry retries on that
+ *  word, which is the multiplied wait this error exists to end. */
+class ControlAbsentError extends Error {
+  readonly controlAbsent = true;
+  constructor() {
+    super("the control is not on the page: its selector matches no element");
+    this.name = "ControlAbsentError";
+  }
+}
+function isControlAbsent(e: unknown): boolean {
+  return !!e && typeof e === "object" && (e as { controlAbsent?: unknown }).controlAbsent === true;
+}
 /** #556 — THE STALL WATCHDOG: how long the walk may go without ANY sign of progress (an event, a
  *  planner reply, a fill completing, a new page) before it is ended, named. 300 s because it must sit
  *  above every bounded quiet stretch the walk's OWN work has — one upload phase (capped at 150 s), one
@@ -8864,7 +8879,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         // fires on the pathological case, and lands the walk in the did-nothing path, which
         // already knows what to do — ban the control, try the results row, try the fallbacks.
         const advStarted = Date.now();
-        let res: { ok: boolean; field?: string; message?: string; timedOut?: boolean };
+        let res: { ok: boolean; field?: string; message?: string; timedOut?: boolean; absent?: boolean };
         try {
           res = await this.boundedClick("advance", clickStepBudgetMs(), async () => {
             const loc = await this.locator(advanceField.selector);
@@ -8887,6 +8902,21 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // (boundedClick has already retired the click still in flight.)
           this.debug?.event({
             type: "advance_timed_out",
+            page: pageCount,
+            label: String(advanceField.label ?? "").slice(0, 60),
+            ms: Date.now() - advStarted,
+          });
+        }
+        // AN ADVANCE WHOSE CONTROL IS NOT ON THE PAGE DID NOTHING — it does not end the run (#556).
+        // clickResilient now names an absent control in seconds instead of timing out on it for
+        // minutes. On main that timeout fell to the budget above and landed in the did-nothing path
+        // below (ban the control, try the results row, re-plan): an SPA that re-rendered the control
+        // away, or a button whose spoken name is not its text, was recovered from. A fast answer must
+        // land in the same place, never in the hard stop that a real click failure gets.
+        const controlAbsent = !res.ok && res.absent === true;
+        if (controlAbsent) {
+          this.debug?.event({
+            type: "advance_control_absent",
             page: pageCount,
             label: String(advanceField.label ?? "").slice(0, 60),
             ms: Date.now() - advStarted,
@@ -8919,7 +8949,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           this.infoProof = { passes: [...infoAdmitted], page: pageCount, step: null, left: false, candidates: [] };
           this.debug?.event({ type: "info_page_proof_pending", page: pageCount });
         }
-        if (!res.ok) {
+        if (!res.ok && !controlAbsent) {
           return fail(steps, this.portalName, `Failed to click the advance button on page ${pageCount}: ${res.message ?? "unknown"}`, null, pageCount, portalNotices);
         }
 
@@ -8971,6 +9001,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
               // Remove the advance step we just recorded — it didn't actually work.
               if (steps.length && steps[steps.length - 1].note?.startsWith("advance:")) steps.pop();
             }
+            // A CONTROL THAT WAS NEVER CLICKED IS NOT A STEP: a replay would walk a click on a control
+            // that is not there. By identity and after the line above, so it can never take a second
+            // step (that line may already have removed this one).
+            if (controlAbsent && steps.length && steps[steps.length - 1] === advStep) steps.pop();
             // THE MOMENT WE KNOW THE PAGE DID NOT MOVE is the moment to try the results row.
             //
             // The first version of this only ran when the planner offered NO advance or
@@ -11848,13 +11882,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // withRetry repeats — four times, ~15 minutes with no event. Absent after the first look
       // (12 s) and the second (6 s) is absent: say so, in words that are not a timeout, so the
       // caller gets a named failure instead of a retry. (A click that navigated away has
-      // already returned through the URL / tab check below.)
+      // already returned through the URL / tab check below.) Each door decides what absent
+      // means (boundedClick carries the marker): the navigate door stops, named; the ADVANCE
+      // door treats it as an advance that did nothing and recovers, as it did on a timeout.
       const present = typeof loc.count === "function" ? await loc.count().catch(() => -1) : -1;
       if (present === 0) {
         const nowUrl = (this.page && typeof this.page.url === "function") ? String(this.page.url() ?? "") : "";
         if ((nowUrl && nowUrl !== preClickUrl) || this.tabCount() > preClickTabs) return;
         if (attempt === 0) continue; // the second look
-        throw new Error("the control is not on the page: its selector matches no element");
+        throw new ControlAbsentError();
       }
       // Scroll into viewport — elements below the fold are not clickable until scrolled.
       try { await loc.scrollIntoViewIfNeeded?.({ timeout: 2000 }); } catch { /* off-screen or mock — ignore */ }
@@ -11925,21 +11961,35 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    *  The bound does not cancel the click (nothing can): on expiry the click still in flight is
    *  RETIRED (clickGeneration) so it can never land after the walk has moved on, and the result
    *  says `timedOut`. Each door decides what a timed-out click means. The timer is unref'd and
-   *  cleared on the happy path — left running it would hold the process open past its summary. */
+   *  cleared on the happy path — left running it would hold the process open past its summary.
+   *
+   *  A FAILURE WHOSE CONTROL WAS NOT ON THE PAGE says `absent` (clickResilient's ControlAbsentError;
+   *  safeAction keeps only the words, so the marker is read here, from the last throw). Nothing was
+   *  clicked and nothing is in flight, so nothing is retired. Each door decides what absent means. */
   private async boundedClick(
     label: string,
     budgetMs: number,
     action: () => Promise<void>,
-  ): Promise<{ ok: boolean; field?: string; message?: string; timedOut?: boolean }> {
+  ): Promise<{ ok: boolean; field?: string; message?: string; timedOut?: boolean; absent?: boolean }> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const budget = new Promise<{ ok: boolean; field: string; message: string; timedOut: boolean }>((resolve) => {
       timer = setTimeout(() => resolve({ ok: true, field: label, message: `${label} click exceeded its budget`, timedOut: true }), budgetMs);
       (timer as { unref?: () => void }).unref?.();
     });
+    // The LAST throw decides: a timed-out attempt that withRetry repeated into an absent control is absent.
+    let absent = false;
+    const marked = async (): Promise<void> => {
+      try {
+        await action();
+      } catch (e) {
+        absent = isControlAbsent(e);
+        throw e;
+      }
+    };
     try {
-      const res = await Promise.race([safeAction(label, action, { required: true }), budget]);
-      if ((res as { timedOut?: boolean }).timedOut) this.clickGeneration++; // retire the click still in flight
-      return res;
+      const res = await Promise.race([safeAction(label, marked, { required: true }), budget]);
+      if ((res as { timedOut?: boolean }).timedOut) { this.clickGeneration++; return res; } // retire the click still in flight
+      return !res.ok && absent ? { ...res, absent: true } : res;
     } finally {
       if (timer) clearTimeout(timer);
     }
