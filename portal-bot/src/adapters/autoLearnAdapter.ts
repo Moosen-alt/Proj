@@ -389,8 +389,26 @@ const REPEAT_PAGE_LIMIT = 3;
  *  land and render what it unlocks (a PowerClerk row's Model after its make) before the next
  *  re-scrape. Only paid when that pass actually filled something. */
 const LATE_EQUIP_REVEAL_GRACE_MS = 2_000;
+/** One planner-door click (advance or navigate), with its wait for the page after it: the most it may
+ *  cost before the walk gives up on it (boundedClick). Well above a healthy click on a slow portal
+ *  (Accela's AJAX dashboards, PowerClerk's project creation: tens of seconds), far below the ~15
+ *  minutes the unbounded retries cost (Miami's advance, #556's navigate). AUTOLEARN_CLICK_BUDGET_MS
+ *  tunes it (read at each click). */
+const CLICK_STEP_BUDGET_DEFAULT_MS = 90_000;
+function clickStepBudgetMs(): number {
+  const v = Number(process.env.AUTOLEARN_CLICK_BUDGET_MS);
+  return Number.isFinite(v) && v > 0 ? v : CLICK_STEP_BUDGET_DEFAULT_MS;
+}
+/** #556 — THE STALL WATCHDOG: how long the walk may go without ANY sign of progress (an event, a
+ *  planner reply, a fill completing, a new page) before it is ended, named. 300 s because it must sit
+ *  above every bounded quiet stretch a healthy walk has — the upload phase (capped at 150 s), one
+ *  planner-door click (clickStepBudgetMs, 90 s), one planner call (the SDK's 240 s per attempt) —
+ *  and well below the run ceiling (PORTAL_RUN_MAX_MS, 25 min) and the ~15 minutes the #556 click
+ *  cost: the live stall was noticed and killed by a person at five minutes. A person's hold
+ *  (MFA / CAPTCHA park) is not a stall and is not counted. AUTOLEARN_STALL_MS tunes it; 0 = off. */
+const STALL_WATCHDOG_DEFAULT_MS = 300_000;
 
-const SUBMIT_INTENT = /\b(continue application|submit application|file application|submit|finish|finalize|confirm submission|place order|complete submission)\b/i;
+const SUBMIT_INTENT =/\b(continue application|submit application|file application|submit|finish|finalize|confirm submission|place order|complete submission)\b/i;
 /** A login-worded control ("Sign In", "Log in", "Login", "Log On"). Never a walk advance while its
  *  credential boxes are empty — see the login_advance_refused stop. */
 const LOGIN_ADVANCE = /^\s*(sign\s*-?\s*in|log\s*-?\s*in|login|log\s*on|sign\s*on)\b/i;
@@ -1938,7 +1956,20 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
       const cls = `${e.className ?? ""} ${(e.querySelector("i, span, svg")?.className ?? "")}`;
       return typeof cls === "string" && /material-(icons|symbols)|mat-icon|glyphicon|\bfa-|\bicon\b/i.test(cls);
     };
-    const rawText = (el.textContent || "").trim();
+    // THE NAME A ROLE SELECTOR MATCHES IS THE ACCESSIBLE NAME, AND aria-hidden IS NOT IN IT (#556).
+    // Cityworks wraps each category's Material icon in an aria-hidden div, so the button's text is
+    // "folder Building Permits" and its accessible name is "Building Permits". Recorded with the
+    // ligature, getByRole('button', { name: 'folder Building Permits', exact: true }) matched
+    // NOTHING — and the navigate click spent minutes retrying a control it could never find. The
+    // text a selector is built from is the text with aria-hidden subtrees removed; the LABEL (what
+    // the planner reads, and what loop guards key on) is untouched.
+    const rawText = ((): string => {
+      const all = (el.textContent || "").trim();
+      if (!el.querySelector('[aria-hidden="true"]')) return all;
+      const copy = el.cloneNode(true) as Element;
+      copy.querySelectorAll('[aria-hidden="true"]').forEach((n) => n.remove());
+      return (copy.textContent || "").replace(/\s+/g, " ").trim();
+    })();
     const ariaName = el.getAttribute("aria-label")?.trim() || "";
     const ligatureShaped = /^[a-z][a-z0-9_]{1,24}$/.test(rawText); // one lowercase token, no spaces
     const buttonText = ariaName && (ligatureShaped || !rawText || iconish(el)) ? ariaName : rawText;
@@ -2644,6 +2675,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
        *  itself, named. Default 360 000 (live Accela reaches its first fill ~4 pages / ~250 s in). A page that never becomes fillable must not cost
        *  90 s x N advance passes. */
       noProgressBudgetMs?: number;
+      /** #556 — the stall watchdog: wall-clock with no sign of progress at all (an event, a planner
+       *  reply, a fill completing, a new page) before the run is ended, named, and its browser closed
+       *  to break the stuck call. Default STALL_WATCHDOG_DEFAULT_MS (env AUTOLEARN_STALL_MS); 0 = off.
+       *  A person's hold (MFA / CAPTCHA park) does not count. */
+      stallWatchdogMs?: number;
       /** THIS PROJECT'S EXISTING DRAFT (#302): before starting a new application, look for the
        *  project's unsubmitted draft — by the number a run recorded, else by an unsubmitted row on
        *  the project's street — and open the form that continues it ("Interconnection Application
@@ -2724,6 +2760,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     this.docsByType = options.docsByType ?? {};
     this.uploadMode = options.uploadMode ?? "split";
     this.debug = LearnRunDebug.start(portalName, { maxPages: this.maxPages, uploadMode: this.uploadMode });
+    // Every event the walk writes is a sign of progress for the stall watchdog (#556).
+    if (this.debug) this.debug.onEvent = (evt) => this.noteActivity(String(evt.type ?? "event"));
   }
 
   // ---------------------------------------------------------------------------
@@ -4141,7 +4179,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         stopReason: "login_needed_no_credential",
       };
     }
-    const res = await performLogin(this.page, cred, { onPark: this.options.onPark, parkMs: this.options.parkMs });
+    // A mid-run login can park for a person's second factor: the #556 watchdog holds while it runs.
+    const page = this.page;
+    const res = await this.duringPersonHold(() => performLogin(page, cred, { onPark: this.options.onPark, parkMs: this.options.parkMs }));
     this.debug?.event({ type: "login_midrun", page: pageCount, host, status: res.status });
     if (res.status === "mfa_captcha") {
       return { ...fail(steps, this.portalName, `Stopped at ${host}'s login: ${res.message} A human must complete the MFA/CAPTCHA.`, "mfa_captcha", pageCount, notices), stopReason: "login_midrun_mfa" };
@@ -4164,6 +4204,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // measures elapsed-on-this-step from here.
     this.lastProgress = p;
     this.lastProgressAtMs = Date.now();
+    this.noteActivity(`progress: ${String(p.message ?? "").slice(0, 60)}`);
     if (!this.onProgress) return;
     try { this.onProgress({ ...p, elapsedMs: 0 }); } catch { /* progress sink must never break the run */ }
   }
@@ -4189,6 +4230,111 @@ export class AutoLearnAdapter extends BasePortalAdapter {
 
   private stopHeartbeat(): void {
     if (this.hbTimer) { clearInterval(this.hbTimer); this.hbTimer = null; }
+  }
+
+  // --- #556: THE STALL WATCHDOG ----------------------------------------------------------------
+  // The heartbeat above SAYS a step is quiet; nothing ENDED one. A live Cityworks learn sat in one
+  // navigate click for over five minutes with no event, holding a portal-run slot, until a person
+  // closed the browser — the only thing that breaks a stuck Playwright call. The run ceiling
+  // (index.ts, PORTAL_RUN_MAX_MS) does the same at 25 minutes whatever the walk is doing; this does
+  // it after STALL_WATCHDOG_DEFAULT_MS of NO SIGN OF PROGRESS, and names where the walk was.
+  //
+  // Progress is an outcome, never an attempt: an event written, a planner reply, a fill completing,
+  // a page begun, a progress report. A click retrying itself emits none of those — which is exactly
+  // the shape of the #556 stall — while a slow page of eighteen fills completes one every few
+  // seconds and never trips it. A person's hold (MFA / CAPTCHA park) is a wait for a person with its
+  // own bound, not a stall.
+
+  /** When the walk last showed a sign of progress, and what it was. */
+  private lastActivityAt = Date.now();
+  private lastActivityWhat = "";
+  /** Holds for a person in progress (they can nest); the watchdog does not count them. */
+  private personHolds = 0;
+  /** Set once, when the watchdog ends the run. */
+  private stalled: { quietMs: number; budgetMs: number; last: string } | null = null;
+  private stallTimer: ReturnType<typeof setInterval> | null = null;
+  /** The walk's recorded steps and pages, for the result when the walk itself cannot return. */
+  private walkSteps: RecipeStep[] = [];
+  private walkPageCount = 0;
+
+  private noteActivity(what: string): void {
+    this.lastActivityAt = Date.now();
+    this.lastActivityWhat = String(what ?? "").slice(0, 120);
+  }
+
+  private stallBudgetMs(): number {
+    const opt = this.options.stallWatchdogMs;
+    if (typeof opt === "number" && Number.isFinite(opt) && opt >= 0) return opt;
+    const env = process.env.AUTOLEARN_STALL_MS;
+    if (env !== undefined && env.trim() !== "" && Number.isFinite(Number(env)) && Number(env) >= 0) return Number(env);
+    return STALL_WATCHDOG_DEFAULT_MS;
+  }
+
+  /** Run `fn` as a wait for a person: the watchdog holds while it runs, and its clock restarts after. */
+  private async duringPersonHold<T>(fn: () => Promise<T>): Promise<T> {
+    this.personHolds++;
+    try { return await fn(); } finally { this.personHolds--; this.noteActivity("a person's hold ended"); }
+  }
+
+  /** Arm the watchdog. The promise settles once it has ENDED the run: every click retired (nothing in
+   *  flight can land after this), the event written, the page and the browser closed out from under
+   *  the stuck call so it rejects and the walk unwinds through its own path — with the network
+   *  backstop still installed until learn()'s own teardown. Never settles when the walk is healthy. */
+  private startStallWatchdog(): Promise<void> {
+    const budgetMs = this.stallBudgetMs();
+    this.noteActivity("learn started");
+    if (!(budgetMs > 0)) return new Promise<void>(() => { /* off */ });
+    return new Promise<void>((resolve) => {
+      this.stallTimer = setInterval(() => {
+        if (this.stalled) return;
+        if (this.personHolds > 0) { this.noteActivity("waiting for a person"); return; }
+        const quietMs = Date.now() - this.lastActivityAt;
+        if (quietMs < budgetMs) return;
+        this.stalled = { quietMs, budgetMs, last: this.lastActivityWhat || "(nothing yet)" };
+        this.clickGeneration++;
+        this.debug?.event({ type: "stall_watchdog", quietMs, budgetMs, last: this.stalled.last });
+        if (this.stallTimer) { clearInterval(this.stallTimer); this.stallTimer = null; }
+        void (async () => {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          try { await (this.page as any)?.close?.({ runBeforeUnload: false }); } catch { /* already closed */ }
+          await this.forceClose();
+          resolve();
+        })();
+      }, Math.max(200, Math.min(5000, Math.floor(budgetMs / 5))));
+      (this.stallTimer as { unref?: () => void }).unref?.();
+    });
+  }
+
+  private stopStallWatchdog(): void {
+    if (this.stallTimer) { clearInterval(this.stallTimer); this.stallTimer = null; }
+  }
+
+  /** The walk, raced against the watchdog. Once the watchdog has closed the page the walk gets a short
+   *  grace to unwind through its own path (its stuck call rejects); a walk that does not — a promise
+   *  that is not the browser's — is abandoned, inert: every click is retired and its page is gone.
+   *  Either way the result is the watchdog's, named. */
+  private async walkOrStall(context: PortalContext, project: ProjectRecord): Promise<LearnResult> {
+    const fired = this.startStallWatchdog();
+    const walk = this.learnImpl(context, project).catch((err) => {
+      if (this.stalled) return null; // the closed page's rejection is the watchdog's doing
+      throw err;
+    });
+    const STALL_GRACE_MS = 15_000;
+    const abandoned = fired.then(() => sleep(STALL_GRACE_MS)).then(() => null);
+    const r = await Promise.race([walk, abandoned]);
+    const s = this.stalled;
+    if (!s) { this.stopStallWatchdog(); return r as LearnResult; }
+    const base = r ?? fail(this.walkSteps, this.portalName, "", null, this.walkPageCount);
+    this.debug?.event({ type: "stall_watchdog_stopped", unwound: r !== null });
+    return {
+      ...base,
+      ok: false,
+      reachedReview: false,
+      stopReason: "stalled",
+      message: `Stopped by the stall watchdog: the walk showed no sign of progress for ${Math.round(s.quietMs / 1000)} s ` +
+        `(budget ${Math.round(s.budgetMs / 1000)} s; last: ${s.last}), so its browser was closed to end the stuck step.` +
+        (base.message ? ` ${base.message}` : ""),
+    };
   }
 
   private continueDraftTried = false;
@@ -4343,7 +4489,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         const apn = String(((project as { parserSnapshot?: Record<string, unknown> }).parserSnapshot ?? {}).apn ?? "").trim();
         this.infoPageProjectValues = [street, String(project.homeownerName ?? "").trim(), apn, kw].filter((v) => v.length >= 4);
       }
-      result = await this.learnImpl(context, project);
+      result = await this.walkOrStall(context, project);
       // #344 round 3 — PROOF OF PROGRESS: a verified information page's click led to a page the walk
       // left, ended, stopped or found nothing fillable on without entering this job's own data there
       // — the incident, settled here (every exit of the walk), before the backstop is disposed.
@@ -4414,6 +4560,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       });
       throw err;
     } finally {
+      this.stopStallWatchdog();
       await backstop?.dispose().catch(() => null);
       this.stopHeartbeat();
       // A run that TYPED a secret has it in the trace raw (the fill's value, every DOM snapshot
@@ -6148,6 +6295,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         break;
       }
       pageCount++;
+      // A page begun is progress (#556 stall watchdog); and where the walk is, should it stall.
+      this.walkSteps = steps;
+      this.walkPageCount = pageCount;
+      this.noteActivity(`page ${pageCount} begun`);
+      if (this.stalled) return fail(steps, this.portalName, "the walk was stopped by the stall watchdog.", null, pageCount, portalNotices);
       // Where this page's recorded steps begin (#382: the PV Array row steps it records).
       const pageStepsFrom = steps.length;
       // THE BACKSTOP ABORTED A FILING, A PAYMENT OR A REVIEW-PAGE POST: stop here, named. Walking
@@ -6416,7 +6568,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           const page = this.page;
           const parkedUrl = typeof page.url === "function" ? String(page.url() ?? "") : "";
           const left = this.walkParkDeadline === null ? undefined : Math.max(0, this.walkParkDeadline - Date.now());
-          const held = left === 0 ? { status: "expired" as const, proof: "", waitMs: 0 } : await holdForPerson(page, {
+          // (A wait for a person, not a stall: the #556 watchdog holds while it runs.)
+          const held = left === 0 ? { status: "expired" as const, proof: "", waitMs: 0 } : await this.duringPersonHold(() => holdForPerson(page, {
             reason: challenge,
             opts: {
               parkMs: this.options.parkMs,
@@ -6438,7 +6591,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
               const still = await detectChallengeFrame(page).catch(() => "unreadable");
               return still ? "" : "the challenge is no longer on the page";
             },
-          });
+          }));
           if (held.status === "resumed") {
             this.debug?.event({ type: "challenge_resumed", page: pageCount, detail: held.proof });
             lastFillProgressAt = Date.now();
@@ -7524,6 +7677,18 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           // let the next pass try again — a live run drifted into Accela's records module
           // exactly this way.
           this.debug?.event({ type: "navigate_offlimits_rejected", page: pageCount, label: (navField.label || "").slice(0, 60), dashboard: isDashboard });
+        } else if (navField && navField.disabled && await this.controlStillDisabled(navField)) {
+          // A DISABLED PRIMARY BUTTON WAITS FOR THE CHOICE THAT ENABLES IT (#556). Cityworks' "Begin
+          // Application" stays disabled until a case type is chosen; clicking it anyway costs the
+          // click's every retry and does nothing. Not clicked, not recorded, and not registered as
+          // clicked (the loop guard must not refuse it once it is enabled); the planner is told what
+          // the page is waiting for, and the page is planned again. Bounded by the stuck guard's
+          // recovery cap and the page budget like any other re-plan.
+          const lbl = (navField.label || "").replace(/\s+/g, " ").trim().slice(0, 60);
+          this.debug?.event({ type: "navigate_disabled_refused", page: pageCount, label: lbl });
+          pendingHint = `"${lbl}" is DISABLED on this page: it becomes clickable only after a choice here (the option, type or category this application needs). ` +
+            `Make that choice first — click or select it — and use "${lbl}" once it is enabled. Never choose a disabled control.`;
+          continue;
         } else if (navField) {
           // WHAT IT DECIDED TO CLICK, not only what it refused.
           //
@@ -7561,38 +7726,44 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           const navBeforeUrl = typeof this.page.url === "function" ? String(this.page.url() ?? "") : "";
           const navBeforeFp = await this.pageFingerprint();
           const navTabsBefore = this.tabCount(); // capture BEFORE the click — the popup opens during it
-          const res = await safeAction(
-            "navigate",
-            async () => {
-              const loc = await this.locator(navField.selector);
-              if (!loc) throw new Error("navigate selector unresolved");
-              const href = navField.href;
-              const realHref = !!href && href !== "#" && !/^javascript:/i.test(href);
-              const gotoHref = async () => {
-                const abs = new URL(href!, String(this.page!.url())).href;
-                if (process.env.AUTOLEARN_DEBUG === "1") console.error(`[navigate] navigating to href ${abs}`);
-                await this.page!.goto(abs, { waitUntil: "domcontentloaded", timeout: 30000 });
-              };
-              // FAST PATH: a hidden/menu-nested anchor with a real href is never clickable —
-              // don't burn ~80s on click retries; navigate straight to the href. (Accela's
-              // "Building Dept Application" is a hidden <a href="...CapApplyDisclaimer.aspx">.)
-              let visible = false;
-              try { visible = (await loc.count()) > 0 && (await loc.isVisible().catch(() => false)); } catch { visible = false; }
-              if (!visible && realHref) {
-                await gotoHref();
-              } else {
-                try {
-                  await this.clickResilient(loc);
-                } catch (clickErr) {
-                  // Fallback: a link we couldn't click but that has a usable href.
-                  if (realHref && this.page) await gotoHref();
-                  else throw clickErr;
-                }
+          // BOUNDED LIKE THE ADVANCE DOOR (#556): this click had no budget, and an unclickable
+          // target held a live Cityworks learn for minutes with no event, until a person closed
+          // the browser. Past the budget the click is retired and the run stops, named.
+          const navStarted = Date.now();
+          const res = await this.boundedClick("navigate", clickStepBudgetMs(), async () => {
+            const loc = await this.locator(navField.selector);
+            if (!loc) throw new Error("navigate selector unresolved");
+            const href = navField.href;
+            const realHref = !!href && href !== "#" && !/^javascript:/i.test(href);
+            const gotoHref = async () => {
+              const abs = new URL(href!, String(this.page!.url())).href;
+              if (process.env.AUTOLEARN_DEBUG === "1") console.error(`[navigate] navigating to href ${abs}`);
+              await this.page!.goto(abs, { waitUntil: "domcontentloaded", timeout: 30000 });
+            };
+            // FAST PATH: a hidden/menu-nested anchor with a real href is never clickable —
+            // don't burn ~80s on click retries; navigate straight to the href. (Accela's
+            // "Building Dept Application" is a hidden <a href="...CapApplyDisclaimer.aspx">.)
+            let visible = false;
+            try { visible = (await loc.count()) > 0 && (await loc.isVisible().catch(() => false)); } catch { visible = false; }
+            const gen = this.clickGeneration;
+            if (!visible && realHref) {
+              await gotoHref();
+            } else {
+              try {
+                await this.clickResilient(loc);
+              } catch (clickErr) {
+                // Fallback: a link we couldn't click but that has a usable href.
+                if (realHref && this.page && this.clickGeneration === gen) await gotoHref();
+                else throw clickErr;
               }
-              await this.waitAfterClick(navBeforeUrl, navBeforeFp, navTabsBefore);
-            },
-            { required: true },
-          );
+            }
+            if (this.clickGeneration !== gen) return; // retired mid-click; the walk owns the page
+            await this.waitAfterClick(navBeforeUrl, navBeforeFp, navTabsBefore);
+          });
+          if (res.timedOut) {
+            this.debug?.event({ type: "navigate_timed_out", page: pageCount, label: (navField.label || "").slice(0, 60), ms: Date.now() - navStarted });
+            return fail(steps, this.portalName, `Failed to click navigation link "${navField.label}" on page ${pageCount}: the click did not finish within ${Math.round(clickStepBudgetMs() / 1000)} s (the control never responded); the walk stopped rather than keep retrying it.`, null, pageCount, portalNotices);
+          }
           if (!res.ok) {
             return fail(steps, this.portalName, `Failed to click navigation link "${navField.label}" on page ${pageCount}: ${res.message ?? "unknown"}`, null, pageCount, portalNotices);
           }
@@ -8632,61 +8803,33 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         const advBeforeFp = await this.pageFingerprint();
         const advBeforeSig = await advanceSignatureOf(this.page);
         const advTabsBefore = this.tabCount(); // capture BEFORE the click — the popup opens during it
-        // ONE ADVANCE IS ONE PAGE'S WORK, NOT A BUDGET.
-        //
-        // safeAction retries the whole action, clickResilient retries four times inside it,
-        // and each of those waits for the element and then for the network. Multiplied out,
-        // Miami's page 6 spent FIFTEEN MINUTES on a single advance click and emitted not one
-        // event — the portal cap killed the run, and the trace showed a walk that simply
-        // stopped after "upload_phase_done". A run that cannot say where its time went
-        // cannot be debugged.
-        //
-        // The bound does not cancel the click (nothing can), so it is set well above any
-        // healthy advance: it only ever fires on the pathological case, and lands the walk
-        // in the did-nothing path, which already knows what to do — ban the control, try the
-        // results row, try the fallbacks.
-        const ADVANCE_BUDGET_MS = 90_000;
+        // ONE ADVANCE IS ONE PAGE'S WORK, NOT A BUDGET (boundedClick, the one mechanism every
+        // planner door uses). Miami's page 6 spent FIFTEEN MINUTES on a single advance click and
+        // emitted not one event. The bound is set well above any healthy advance: it only ever
+        // fires on the pathological case, and lands the walk in the did-nothing path, which
+        // already knows what to do — ban the control, try the results row, try the fallbacks.
         const advStarted = Date.now();
-        // The timer is unref'd and cleared on the happy path. Armed and left running, every
-        // advance would hold the process open for 90 seconds past its own summary — which
-        // reads exactly like the hang this exists to catch.
-        let advTimer: ReturnType<typeof setTimeout> | undefined;
-        const advBudget = new Promise<{ ok: boolean; field: string; message: string; timedOut: boolean }>((resolve) => {
-          advTimer = setTimeout(
-            () => resolve({ ok: true, field: "advance", message: "advance click exceeded its budget", timedOut: true }),
-            ADVANCE_BUDGET_MS,
-          );
-          (advTimer as { unref?: () => void }).unref?.();
-        });
         let res: { ok: boolean; field?: string; message?: string; timedOut?: boolean };
         try {
-          res = await Promise.race([
-            safeAction(
-              "advance",
-              async () => {
-                const loc = await this.locator(advanceField.selector);
-                if (!loc) throw new Error("advance selector unresolved");
-                if (infoPassTried) {
-                  if (infoDoor && typeof infoDoor.closeInfoPagePass === "function") infoDoor.closeInfoPagePass();
-                } else if (interstitialAdvanceKey && infoDoor && typeof infoDoor.openInfoPagePass === "function") {
-                  infoPassTried = true;
-                  infoShot = await this.askInfoPagePass(infoDoor as FilingBackstop, loc, advPrior, pageCount, signatureDone);
-                }
-                const gen = this.clickGeneration;
-                await this.clickResilient(loc);
-                if (this.clickGeneration !== gen) return; // retired mid-click; the walk owns the page
-                await this.waitAfterClick(advBeforeUrl, advBeforeFp, advTabsBefore);
-              },
-              { required: true },
-            ),
-            advBudget,
-          ]);
+          res = await this.boundedClick("advance", clickStepBudgetMs(), async () => {
+            const loc = await this.locator(advanceField.selector);
+            if (!loc) throw new Error("advance selector unresolved");
+            if (infoPassTried) {
+              if (infoDoor && typeof infoDoor.closeInfoPagePass === "function") infoDoor.closeInfoPagePass();
+            } else if (interstitialAdvanceKey && infoDoor && typeof infoDoor.openInfoPagePass === "function") {
+              infoPassTried = true;
+              infoShot = await this.askInfoPagePass(infoDoor as FilingBackstop, loc, advPrior, pageCount, signatureDone);
+            }
+            const gen = this.clickGeneration;
+            await this.clickResilient(loc);
+            if (this.clickGeneration !== gen) return; // retired mid-click; the walk owns the page
+            await this.waitAfterClick(advBeforeUrl, advBeforeFp, advTabsBefore);
+          });
         } finally {
           if (infoPassTried && infoDoor) infoAdmitted = this.settleInfoPagePass(infoDoor as FilingBackstop, advStep, infoAdmissionsBefore, infoShot, pageCount);
         }
-        if (advTimer) clearTimeout(advTimer);
         if ((res as { timedOut?: boolean }).timedOut) {
-          this.clickGeneration++; // retire the click still in flight before anything else
+          // (boundedClick has already retired the click still in flight.)
           this.debug?.event({
             type: "advance_timed_out",
             page: pageCount,
@@ -9778,7 +9921,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
    *  length and order, so the planner's indices still mean the caller's list. The screenshot is
    *  not text — it is masked where it is taken (capturePlanScreenshot). */
   private askPlanner(req: LearnPlanRequest): Promise<LearnPlanResponse> {
-    return this.planner(this.scrubPlanRequest(req));
+    // A planner reply, or its failure, is progress (#556 stall watchdog).
+    return this.planner(this.scrubPlanRequest(req)).finally(() => this.noteActivity("planner replied"));
   }
 
   private scrubPlanRequest(req: LearnPlanRequest): LearnPlanRequest {
@@ -10018,6 +10162,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     sensitive: boolean,
   ): Promise<RecipeStep | null> {
     const step = await withOwnWriteWindow(this.page, `learner ${field.fieldType || "field"} write (${String(field.label ?? "").slice(0, 40)})`, () => this.applyFillInner(field, fillReq, sensitive));
+    this.noteActivity(`fill: ${String(field.label ?? "").slice(0, 40)}`); // a fill completing is progress (#556)
     // #344 round 3: what was entered (memory only; never a secret), and — round 4 — a CANDIDATE for
     // the proof that the page after a verified information page took this job's own data. Nothing is
     // decided here: what the control HOLDS is read just before the run leaves the page.
@@ -11552,7 +11697,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   private async neutralizeInterceptor(loc: any): Promise<boolean> {
     if (!this.page || typeof this.page.evaluate !== "function") return false;
     try {
-      const box = await loc.boundingBox?.().catch(() => null);
+      // Bounded (#556): with no timeout, boundingBox waits Playwright's 30 s default for an
+      // element that is not there — measured as 30 of every 46 s a missing control's click cost.
+      const box = await loc.boundingBox?.({ timeout: 2000 }).catch(() => null);
       if (!box) return false;
       const x = box.x + box.width / 2;
       const y = box.y + box.height / 2;
@@ -11625,6 +11772,21 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // actionable until the mask is fully gone. Give the first attempt extra time (12s) so
       // slow AJAX dashboard renders don't fail immediately.
       await waitForElement(loc, attempt === 0 ? 12000 : 6000);
+      // A CONTROL THAT IS NOT ON THE PAGE IS NOT A CLICK TO RETRY (#556). Live on Cityworks the
+      // selector matched nothing, and each attempt still paid the 8 s click, a boundingBox at
+      // Playwright's 30 s default, and the force-click and dispatchEvent fallbacks after them:
+      // ~3.8 min per call, and every attempt ended in a timeout, which is what safeAction's
+      // withRetry repeats — four times, ~15 minutes with no event. Absent after the first look
+      // (12 s) and the second (6 s) is absent: say so, in words that are not a timeout, so the
+      // caller gets a named failure instead of a retry. (A click that navigated away has
+      // already returned through the URL / tab check below.)
+      const present = typeof loc.count === "function" ? await loc.count().catch(() => -1) : -1;
+      if (present === 0) {
+        const nowUrl = (this.page && typeof this.page.url === "function") ? String(this.page.url() ?? "") : "";
+        if ((nowUrl && nowUrl !== preClickUrl) || this.tabCount() > preClickTabs) return;
+        if (attempt === 0) continue; // the second look
+        throw new Error("the control is not on the page: its selector matches no element");
+      }
       // Scroll into viewport — elements below the fold are not clickable until scrolled.
       try { await loc.scrollIntoViewIfNeeded?.({ timeout: 2000 }); } catch { /* off-screen or mock — ignore */ }
       if (dbg) {
@@ -11676,11 +11838,58 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     // Fallback 2: synthetic JS click — works for <a href> navigation links on any portal.
     try {
       await this.clearOverlays();
-      await loc.dispatchEvent("click");
+      // Bounded: with no timeout this waits Playwright's 30 s default for the element.
+      await loc.dispatchEvent("click", undefined, { timeout: 4000 });
       if (dbg) console.error(`[clickResilient] dispatchEvent OK`);
       return;
     } catch (e) { if (dbg) console.error(`[clickResilient] dispatchEvent FAIL ${(e as Error).message.split("\n")[0]}`); }
     throw lastErr instanceof Error ? lastErr : new Error("clickResilient: click failed after retries");
+  }
+
+  /** ONE CLICK IS ONE STEP'S WORK, NOT A BUDGET — the same bound at every door the planner has.
+   *
+   *  safeAction retries the whole action, clickResilient retries four times inside it, and each of
+   *  those waits for the element and then for the network. Multiplied out, Miami's page 6 spent
+   *  fifteen minutes on one ADVANCE click with not one event (hence the advance door's budget), and
+   *  #556's Cityworks learn spent the same on one NAVIGATE click, which had no budget at all.
+   *
+   *  The bound does not cancel the click (nothing can): on expiry the click still in flight is
+   *  RETIRED (clickGeneration) so it can never land after the walk has moved on, and the result
+   *  says `timedOut`. Each door decides what a timed-out click means. The timer is unref'd and
+   *  cleared on the happy path — left running it would hold the process open past its summary. */
+  private async boundedClick(
+    label: string,
+    budgetMs: number,
+    action: () => Promise<void>,
+  ): Promise<{ ok: boolean; field?: string; message?: string; timedOut?: boolean }> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const budget = new Promise<{ ok: boolean; field: string; message: string; timedOut: boolean }>((resolve) => {
+      timer = setTimeout(() => resolve({ ok: true, field: label, message: `${label} click exceeded its budget`, timedOut: true }), budgetMs);
+      (timer as { unref?: () => void }).unref?.();
+    });
+    try {
+      const res = await Promise.race([safeAction(label, action, { required: true }), budget]);
+      if ((res as { timedOut?: boolean }).timedOut) this.clickGeneration++; // retire the click still in flight
+      return res;
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** A DISABLED CONTROL IS A GATE, NOT A WAY FORWARD (#556). Is this control disabled NOW — after a
+   *  short wait for it to enable (the scrape can be a moment stale: a choice made on this page may
+   *  still be propagating)? Read live, on the control itself; unresolvable or unreadable = false
+   *  (the door's ordinary path then handles it, as before). Bounded: ~3 s. */
+  private async controlStillDisabled(field: ExtractedField): Promise<boolean> {
+    if (!this.page) return false;
+    const loc = await this.locator(field.selector).catch(() => null);
+    if (!loc || typeof loc.isDisabled !== "function") return false;
+    for (let i = 0; i < 6; i++) {
+      const dis = await loc.isDisabled({ timeout: 1000 }).catch(() => null);
+      if (dis !== true) return false;
+      if (i < 5) await sleep(500);
+    }
+    return true;
   }
 
   // Wait for a page transition to COMPLETE after a navigate/advance click. PowerClerk (and
@@ -12114,7 +12323,8 @@ export async function dismissPageModals(
 export async function clearPageOverlays(page: any): Promise<void> {
   if (!page || typeof page.evaluate !== "function") return;
   try {
-    await page.evaluate(() => {
+    // Bounded (#556): run before every click attempt; a renderer that never answers must not hold it.
+    await evaluateWithin(page, PAGE_READ_BOUND_MS, undefined, () => {
       const sel = [
         // PowerClerk (Bootstrap/Vue): semi-transparent position-absolute loading scrims
         "div.position-absolute.opacity-50.bg-black",
@@ -12308,14 +12518,37 @@ export async function pageIdentityOf(page: any): Promise<{ where: string; contro
 
 export async function pageFingerprintOf(page: any): Promise<string> {
   if (!page || typeof page.evaluate !== "function") return "";
+  // Bounded (#556): read before and after every click and polled by waitAfterClick; "" = unknown,
+  // which every caller already treats as "no reading".
+  return evaluateWithin(page, PAGE_READ_BOUND_MS, "", () => {
+    const inputs = document.querySelectorAll("input, select, textarea").length;
+    const heading = (document.querySelector("h1, h2, legend, .wizard-step.active, .active")?.textContent || "").trim().slice(0, 50);
+    return `${location.href}|${inputs}|${heading}|${(document.body?.innerText || "").length}`;
+  });
+}
+
+/** How long one of the walk's own reads around a click may take (pageFingerprintOf, clearPageOverlays). */
+const PAGE_READ_BOUND_MS = 5_000;
+
+/** A page.evaluate HAS NO TIMEOUT in Playwright: a renderer that never answers (a page script stuck in
+ *  a loop, a dialog nobody handles) holds it forever, and with it the walk. The walk's own reads get a
+ *  bound; past it — or on any error — they answer `fallback`. The abandoned evaluate is left to settle
+ *  on its own (its rejection is caught). (#556) */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export async function evaluateWithin<T>(page: any, ms: number, fallback: T, fn: (arg: any) => T | Promise<T>, arg?: unknown): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    return await page.evaluate(() => {
-      const inputs = document.querySelectorAll("input, select, textarea").length;
-      const heading = (document.querySelector("h1, h2, legend, .wizard-step.active, .active")?.textContent || "").trim().slice(0, 50);
-      return `${location.href}|${inputs}|${heading}|${(document.body?.innerText || "").length}`;
-    });
+    return await Promise.race([
+      Promise.resolve(arg === undefined ? page.evaluate(fn) : page.evaluate(fn, arg)).catch(() => fallback) as Promise<T>,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(fallback), ms);
+        (timer as { unref?: () => void }).unref?.();
+      }),
+    ]);
   } catch {
-    return "";
+    return fallback;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 
