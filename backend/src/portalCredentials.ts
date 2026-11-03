@@ -5,6 +5,7 @@ import { id } from "./ids";
 import { nowIso } from "./time";
 import { text as s } from "./json";
 import { isHarnessAbort } from "./runAbort";
+import { portalHostOf } from "./portalChannel";
 
 type Row = Record<string, unknown>;
 
@@ -367,13 +368,15 @@ export function getDecryptedCredentialAny(
     [clientId],
   );
   if (rows.length !== 1 || !s(rows[0].encrypted_secret)) return null;
-  const stored = s(rows[0].portal_url);
-  if (targetUrl && stored) {
-    try {
-      const targetHost = new URL(targetUrl).hostname.toLowerCase();
-      const storedHost = new URL(stored).hostname.toLowerCase();
-      if (!hostsMatch(targetHost, storedHost)) return null; // known mismatch — never cross portals
-    } catch { /* unparseable URL — fall through to the single-credential behavior */ }
+  // FAIL CLOSED ONCE THE CALLER NAMES A TARGET (#425). The only login stands only when BOTH hosts
+  // read and match. A login stored with no address, or a target nobody could read (an empty
+  // utility portal, an unparseable value), is refused rather than tried: a client whose one
+  // login is their city's permit portal must never have it typed into a utility's PowerClerk
+  // because nothing said otherwise — that burns an attempt and reads as "credentials rejected".
+  if (targetUrl !== undefined) {
+    const targetHost = portalHostOf(targetUrl);
+    const storedHost = portalHostOf(s(rows[0].portal_url));
+    if (!targetHost || !storedHost || !hostsMatch(targetHost, storedHost)) return null;
   }
   try {
     const dec = decryptStorageState(s(rows[0].encrypted_secret)) as { username?: string; password?: string };
