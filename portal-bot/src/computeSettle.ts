@@ -90,18 +90,19 @@ export function computePendingInPage(staleOnly?: boolean): string {
  * added the second PV array row; the rating went back to "Needs to be recalculated", the walk
  * advanced, and the recipe was trusted with the page saved that way. A transient "Calculating…" is
  * given the bounded settle first; a stale total never clears by itself, so it is read once. Never
- * throws; an unreadable page reads "" (the caller has nothing to report, not a clean bill).
+ * throws. null = the page could not be read — NOT "nothing stale": the trust gate refuses a page it
+ * could not read (an unknown is never a clean bill).
  */
-export async function computeStaleAtExit(page: Page, opts: { waitMs?: number } = {}): Promise<string> {
-  if (!page || typeof page.evaluate !== "function") return "";
-  // The __name shim, as in waitForComputeSettled: without it the page function throws and reads "".
+export async function computeStaleAtExit(page: Page, opts: { waitMs?: number } = {}): Promise<string | null> {
+  if (!page || typeof page.evaluate !== "function") return null;
+  // The __name shim, as in waitForComputeSettled: without it the page function throws.
   await page.evaluate("globalThis.__name = globalThis.__name || function (f) { return f; };").catch(() => null);
-  const read = async (): Promise<string> => {
+  const read = async (): Promise<string | null> => {
     const r = await page.evaluate(computePendingInPage, true).catch(() => null);
-    return typeof r === "string" ? r : "";
+    return typeof r === "string" ? r : null;
   };
   let marker = await read();
-  if (/^"?calculating\b/i.test(marker)) {
+  if (marker !== null && /^"?calculating\b/i.test(marker)) {
     await waitForComputeSettled(page, { timeoutMs: opts.waitMs ?? 10_000 }).catch(() => null);
     marker = await read();
   }

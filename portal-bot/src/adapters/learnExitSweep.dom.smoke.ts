@@ -18,10 +18,17 @@
 //
 //   MUST CATCH (bad portal) — the learn result names, for the middle page:
 //     1. the model as a required field left blank/unheld (requiredFieldMisses);
-//     2. the rating still to be recalculated when the walk left it (computePendingAtExit);
-//     3. the validation error still showing when the walk left it (exitValidationErrors);
-//   and none of them is about the final page (it is the MIDDLE page that was incomplete).
-//   MUST PASS (clean portal: the model is accepted, Calculate computes): all three are empty, so
+//     2. the rating still to be recalculated when the walk left it (the page's trustEvidence
+//        computePending);
+//     3. the validation error still showing when the walk left it (the page's trustEvidence
+//        validationErrors — read by the ONE field-validation reader, which matches PowerClerk's
+//        data-test-role="validation-error" container);
+//   and none of them is about the final page (it is the MIDDLE page that was incomplete); and the
+//   middle page is on record as READ (pageExitReads), so a clean result could not be an unread one.
+//   MUST CATCH (wrong portal: the pick lands on ANOTHER model, not a blank — what a stale selector
+//   reaching the neighbouring control reads like): the model is still a required miss. Only a
+//   read-back holding the project's own value clears an unheld equipment fill.
+//   MUST PASS (clean portal: the model is accepted, Calculate computes): all of them are empty, so
 //   a complete fill can still be trusted (the gate's over-correction guard).
 //
 // The backend half (these signals block the trust gate; the trusted message stops saying "the
@@ -103,11 +110,13 @@ const STEP4 = `
   <p>Please review your application before submitting.</p>
   <button id="submit" type="button">Submit Application</button>`;
 
-const page = (clean: boolean): string => `<!doctype html><html><head><title>Edit Project</title></head>
+type Mode = "bad" | "clean" | "wrong";
+const page = (mode: Mode): string => `<!doctype html><html><head><title>Edit Project</title></head>
 <body style="font:14px sans-serif;padding:16px">
 <div id="app"></div>
 <script>
-  var CLEAN = ${clean ? "true" : "false"};
+  var CLEAN = ${mode === "clean" ? "true" : "false"};
+  var WRONG = ${mode === "wrong" ? "true" : "false"};
   var STEPS = [${[STEP1, STEP2, STEP3, STEP4].map((s) => JSON.stringify(s)).join(",")}];
   var OPTS = {
     invMfr: ['Altenergy Power System', 'Enphase Energy Inc.'],
@@ -124,7 +133,10 @@ const page = (clean: boolean): string => `<!doctype html><html><head><title>Edit
     inp.setAttribute('aria-expanded', 'false');
     // THE BAD PORTAL REFUSES THE MODEL for the chosen manufacturer: the pick reverts at once, as
     // the live save round-trip handed the inverter model back empty.
-    if (!CLEAN && id === 'invModel') { inp.value = ''; document.getElementById(id + '-disp').textContent = 'Please select...'; stale(); return; }
+    // THE WRONG PORTAL lands the pick on ANOTHER model (what a stale selector reaching the
+    // neighbouring control reads like): not blank, and not the project's.
+    if (WRONG && id === 'invModel') text = OPTS.invModel[1];
+    else if (!CLEAN && id === 'invModel') { inp.value = ''; document.getElementById(id + '-disp').textContent = 'Please select...'; stale(); return; }
     inp.value = text;
     document.getElementById(id + '-disp').textContent = text;
     saved[id] = text;
@@ -190,7 +202,8 @@ const page = (clean: boolean): string => `<!doctype html><html><head><title>Edit
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "text/html" });
-  res.end(page(String(req.url || "").startsWith("/clean")));
+  const u = String(req.url || "");
+  res.end(page(u.startsWith("/clean") ? "clean" : u.startsWith("/wrong") ? "wrong" : "bad"));
 });
 await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
 const port = (server.address() as { port: number }).port;
@@ -245,22 +258,30 @@ async function learnOn(url: string, tag: string): Promise<{ result: LearnResult;
 }
 
 const T0 = Date.now();
-const [bad, clean] = await Promise.all([learnOn(`${base}/`, "bad"), learnOn(`${base}/clean`, "clean")]);
-console.log(`  [${((Date.now() - T0) / 1000).toFixed(0)}s] both learns finished`);
+const [bad, clean, wrong] = await Promise.all([learnOn(`${base}/`, "bad"), learnOn(`${base}/clean`, "clean"), learnOn(`${base}/wrong`, "wrong")]);
+console.log(`  [${((Date.now() - T0) / 1000).toFixed(0)}s] all three learns finished`);
 
-type ExitFields = { computePendingAtExit?: string[]; exitValidationErrors?: string[] };
+// The page-exit findings travel as the pages' trust evidence (one record per page that ended with
+// something) plus which pages were read at all; flattened here to "page N: …" lines.
+type Exit = { trustEvidence?: Array<{ page: number; validationErrors: string[]; requiredUnchecked: Array<{ label: string; acknowledgment: boolean }>; strayWrites: string[]; computePending?: string }>; pageExitReads?: { read: number[]; unread: number[] } };
+const ev = (r: LearnResult) => (r as LearnResult & Exit).trustEvidence ?? [];
+const reads = (r: LearnResult) => (r as LearnResult & Exit).pageExitReads;
 const misses = (r: LearnResult): string[] => r.requiredFieldMisses ?? [];
-const pending = (r: LearnResult): string[] => (r as LearnResult & ExitFields).computePendingAtExit ?? [];
-const invalid = (r: LearnResult): string[] => (r as LearnResult & ExitFields).exitValidationErrors ?? [];
+const pending = (r: LearnResult): string[] => ev(r).filter((e) => e.computePending).map((e) => `page ${e.page}: ${e.computePending}`);
+const invalid = (r: LearnResult): string[] => ev(r).flatMap((e) => e.validationErrors.map((v) => `page ${e.page}: ${v}`));
+const blockingEvidence = (r: LearnResult): number => ev(r).reduce((n, e) => n + e.validationErrors.length + e.strayWrites.length + (e.computePending ? 1 : 0) + e.requiredUnchecked.filter((u) => !u.acknowledgment).length, 0);
 const pageOf = (line: string): number => Number(/^page (\d+):/.exec(line)?.[1] ?? NaN);
 const summary = (r: LearnResult): string =>
-  `reachedReview=${r.reachedReview} pages=${r.pageCount} misses=${JSON.stringify(misses(r))} pending=${JSON.stringify(pending(r))} invalid=${JSON.stringify(invalid(r))}`;
+  `reachedReview=${r.reachedReview} pages=${r.pageCount} misses=${JSON.stringify(misses(r))} pending=${JSON.stringify(pending(r))} invalid=${JSON.stringify(invalid(r))} reads=${JSON.stringify(reads(r))}`;
 console.log(`   bad:   ${summary(bad.result)}`);
 console.log(`   clean: ${summary(clean.result)}`);
+console.log(`   wrong: ${summary(wrong.result)}`);
 const trail = (events: string): string => events.split("\n")
-  .filter((l) => /"type":"(equipment_fill[a-z_]*|compute_settled|required_never_filled|fills_did_not_hold|page_exit_[a-z_]*)"/.test(l))
+  .filter((l) => /"type":"(equipment_fill[a-z_]*|equipment_unheld_[a-z]*|equipment_not_held_at_exit|compute_settled|required_never_filled|fills_did_not_hold|page_exit_[a-z_]*|validation_error_after_fill|computed_total_stale_at_exit)"/.test(l))
   .map((l) => `      ${l.replace(/^\{"t":"[^"]*","ms":\d+,/, "{").slice(0, 220)}`).join("\n");
 console.log(`   bad run trail:\n${trail(bad.events)}`);
+// The middle page: where the Generation System step was walked (the page the model miss is on).
+const middle = (r: LearnResult): number => Math.min(...invalid(r).concat(pending(r)).map(pageOf).filter(Number.isFinite));
 
 // Precondition: the fixture reproduces the live shape — the walk reached review, and the model
 // fill was seen not to hold (the very event the live run recorded and nothing read).
@@ -274,22 +295,37 @@ check("bad portal: the inverter Model is a required field left blank (requiredFi
   misses(bad.result).some((m) => /\bModel\b/i.test(m) && /inverter/i.test(m)),
   `requiredFieldMisses=${JSON.stringify(misses(bad.result))} — an equipment value the portal refused, with no required marker, reaches no gate`);
 // 2. The rating still to be recalculated when the walk left the middle page.
-check("bad portal: the middle page was left with its rating still to be recalculated (computePendingAtExit)",
+check("bad portal: the middle page was left with its rating still to be recalculated (trustEvidence computePending)",
   pending(bad.result).some((l) => /needs to be recalculated/i.test(l) && pageOf(l) < bad.result.pageCount),
-  `computePendingAtExit=${JSON.stringify(pending(bad.result))} pageCount=${bad.result.pageCount}`);
-// 3. The portal's own validation line, still showing on exit.
-check("bad portal: the middle page was left showing the model's validation error (exitValidationErrors)",
+  `pending=${JSON.stringify(pending(bad.result))} pageCount=${bad.result.pageCount}`);
+// 3. The portal's own validation line, still showing on exit — read by the one validation reader.
+check("bad portal: the middle page was left showing the model's validation error (trustEvidence validationErrors)",
   invalid(bad.result).some((l) => /Model/i.test(l) && /this field is required/i.test(l) && pageOf(l) < bad.result.pageCount),
-  `exitValidationErrors=${JSON.stringify(invalid(bad.result))}`);
+  `validationErrors=${JSON.stringify(invalid(bad.result))}`);
+check("bad portal: the middle page is on record as READ, and no page as unread",
+  !!reads(bad.result) && reads(bad.result)!.read.includes(middle(bad.result)) && reads(bad.result)!.unread.length === 0,
+  `pageExitReads=${JSON.stringify(reads(bad.result))} middle=${middle(bad.result)}`);
 check("bad portal: the run's message tells the operator, not just the gate",
   /recalculated/i.test(bad.result.message) && /validation/i.test(bad.result.message),
   bad.result.message.slice(0, 500));
+
+// MUST CATCH — a pick that landed on ANOTHER value is not a value the portal kept.
+check("wrong portal: the walk reaches review", wrong.result.reachedReview === true && wrong.step === 4, `reachedReview=${wrong.result.reachedReview} step=${wrong.step}`);
+check("wrong portal: the run records equipment_fill_not_held for the inverter model",
+  /"type":"equipment_fill_not_held"[^\n]*inverterModel/.test(wrong.events), wrong.events.split("\n").filter((l) => /equipment_fill/.test(l)).join("\n").slice(0, 600));
+check("wrong portal: the inverter Model holding ANOTHER model is still a required field not kept (requiredFieldMisses)",
+  misses(wrong.result).some((m) => /\bModel\b/i.test(m) && /inverter/i.test(m)),
+  `requiredFieldMisses=${JSON.stringify(misses(wrong.result))} — a non-blank read-back that is not the project's value cleared the miss`);
 
 // MUST PASS — a complete fill is not refused.
 check("clean portal: the walk reaches review", clean.result.reachedReview === true && clean.step === 4, `reachedReview=${clean.result.reachedReview} step=${clean.step}`);
 check("clean portal: no required field reported blank", misses(clean.result).length === 0, JSON.stringify(misses(clean.result)));
 check("clean portal: no page left with a rating to recalculate", pending(clean.result).length === 0, JSON.stringify(pending(clean.result)));
 check("clean portal: no page left showing a validation error", invalid(clean.result).length === 0, JSON.stringify(invalid(clean.result)));
+check("clean portal: nothing on any page the gate would block on", blockingEvidence(clean.result) === 0, JSON.stringify(ev(clean.result)));
+check("clean portal: every form page was READ (pages 1-3; the review step has no form field), none unread",
+  !!reads(clean.result) && reads(clean.result)!.unread.length === 0 && reads(clean.result)!.read.length >= 3,
+  `pageExitReads=${JSON.stringify(reads(clean.result))} pageCount=${clean.result.pageCount}`);
 
 await browser.close();
 server.close();

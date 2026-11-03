@@ -115,6 +115,9 @@ function trustedLearnFor(projectId: string, portalUrl: string, reviewFields: Arr
     ],
     reviewScreen: { fields: reviewFields, bodyTextSnippet: "Review your application before submitting." },
     reviewScreenshotBase64: "iVBORw0KGgo=",
+    // #534: the real learner reports which pages it read as it left them; a learn that reports
+    // none is never trusted.
+    pageExitReads: { read: [2, 3], unread: [] },
   };
 }
 

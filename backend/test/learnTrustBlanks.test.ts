@@ -5,24 +5,35 @@
 // earlier pages were not re-read … The recipe is trusted". Page 9 had been left with the inverter
 // Model blank, "This field is required." under it and System Rating "Needs to be recalculated".
 //
-// The adapter half (portal-bot/src/adapters/learnExitSweep.dom.smoke.ts, real Chromium) proves the
-// learn now RECORDS those facts for every page it leaves. This file proves, through the REAL
-// autoLearnPortal with only the browser and the LLM stubbed, that the trust gate ACTS on them:
+// The adapter records, for every page with a form field, what the page ended with (#536's
+// PageTrustEvidence, plus #534's computed-total reading) and which pages it read at all
+// (pageExitReads); portal-bot/src/adapters/learnExitSweep.dom.smoke.ts proves that in real
+// Chromium. This file proves, through the REAL autoLearnPortal with only the browser and the LLM
+// stubbed, that the trust gate ACTS on all of it, on a MIDDLE page:
 //
-//   1. a learn whose MIDDLE page was left with a computed total to recalculate is not trusted;
-//   2. ...or left showing a field validation error;
-//   3. ...or left an equipment value the portal did not keep (a required miss), and that
-//      equipment label never becomes a learned digest topic (it is not a question), while a real
-//      unanswered question still does;
-//   4. a clean learn IS still trusted (the over-correction guard), and its message never says
-//      "trusted" while also saying the earlier pages were not re-read;
-//   5. evaluateTrustGate itself blocks on each new signal and passes without them.
+//   1. a required select left blank on a MIDDLE page (the portal's "This field is required." under
+//      it) -> not trusted;
+//   2. a MIDDLE page left with a computed total to recalculate -> not trusted;
+//   3. an equipment value the portal did not keep (a required miss) -> not trusted, and that
+//      equipment label never becomes a learned digest topic, while a real question still does;
+//   4. a REQUIRED checkbox left unchecked on a middle page -> not trusted; one marked as an
+//      acknowledgment (left for a person by design) alone does not block;
+//   5. an equipment write that reached another control -> not trusted;
+//   6. a page the exit reading could not read, or a learn that reports no reading -> not trusted
+//      (an unknown is never a clean page);
+//   7. a clean learn IS still trusted (the over-correction guard), and its words never pair
+//      "trusted" with "not re-read" — they say how many pages were read, of how many;
+//   8. pageExitTrustSignals / evaluateTrustGate, directly.
 //
-// KILL TESTS (each disables its fix and turns this file red — recorded in the commit):
-//   K1 autoLearn.evaluateTrustGate: drop the computePendingAtExit blocker      -> (1), (5) fail.
-//   K2 autoLearn.evaluateTrustGate: drop the exitValidationErrors blocker      -> (2), (5) fail.
-//   K3 autoLearn: feed requiredMisses unfiltered to learnNoteTopicsFromMisses  -> (3) fails.
-//   K4 autoLearn.trustedLearnWording: restore "the earlier pages were not re-read" -> (4) fails.
+// KILL TESTS (each disables its fix and turns this file red):
+//   K1 evaluateTrustGate: drop the exitValidationErrors blocker   -> (1), (8) fail.
+//   K2 evaluateTrustGate: drop the exitComputePending blocker     -> (2), (8) fail.
+//   K3 autoLearn: feed requiredMisses unfiltered to learnNoteTopicsFromMisses -> (3) fails.
+//   K4 pageExitTrustSignals: drop the acknowledgment filter         -> (7), (8) fail.
+//   K5 evaluateTrustGate: drop the exitPagesRead blockers          -> (6), (8) fail.
+//   K6 trustedLearnWording: restore "the earlier pages were not re-read" -> (7) fails.
+//   On origin/main (no pageExitTrustSignals, the gate blind to trustEvidence) (1), (2), (4), (5),
+//   (6) and (8) fail.
 //
 // Run: npx tsx backend/test/learnTrustBlanks.test.ts
 import "./_isolate"; // FIRST — generated files land in a temp cwd, never the repo's backend/data
@@ -55,8 +66,14 @@ const fakeLlm = Object.assign(Object.create(base), {
 });
 autoLearn.setAutoLearnSeamsForTests({ llm: () => fakeLlm });
 
+type Evidence = { page: number; where: string; validationErrors: string[]; requiredUnchecked: Array<{ label: string; acknowledgment: boolean }>; strayWrites: string[]; computePending: string };
 const portalUrl = "https://devhub.portlandoregon.gov/apply";
-/** A four-page walk that reached review with six bound fills — enough to clear every other bar. */
+/** One page's evidence, the adapter's shape. */
+const evidence = (page: number, e: Partial<Evidence>): Evidence => ({
+  page, where: "devhub.portlandoregon.gov/apply", validationErrors: [], requiredUnchecked: [], strayWrites: [], computePending: "", ...e,
+});
+/** A four-page walk that reached review with six bound fills, every form page (2-4) read — enough
+ *  to clear every other bar. Page 2 is the MIDDLE page. */
 function walkedLearn(projectId: string, extra: Record<string, unknown>): Record<string, unknown> {
   const project = repo.getProjectDetail(db, projectId).project;
   const replay = recipes.resolveRecipeFieldValues(db, project, "AHJ", "building");
@@ -74,7 +91,8 @@ function walkedLearn(projectId: string, extra: Record<string, unknown>): Record<
     reviewScreen: { fields: [{ label: "Owner", value: "x" }], bodyTextSnippet: "Review your application before submitting." },
     reviewScreenshotBase64: "iVBORw0KGgo=",
     requiredFieldMisses: [], missingRequiredDocs: [], validationBlocks: [],
-    equipmentNotHeld: [], computePendingAtExit: [], exitValidationErrors: [],
+    equipmentNotHeld: [],
+    pageExitReads: { read: [2, 3, 4], unread: [] },
     ...extra,
   };
 }
@@ -92,21 +110,20 @@ const notTrusted = (r: Awaited<ReturnType<typeof learnWith>>, why: string): void
 
 // The PROBLEM cases run first: a trusted recipe on this portal would turn every later run into
 // the protect-complete path, which proves nothing about the gate.
-const STALE = 'page 2: "Needs to be recalculated"';
-const INVALID = "page 2: Inverter Clone System Model: This field is required.";
+const BLANK_SELECT = "Inverter Clone System Model: This field is required.";
+const STALE = '"Needs to be recalculated"';
 const UNHELD = "Inverter Clone System Model";
 
-await check("(1) a learn whose MIDDLE page was left with a total to recalculate is NOT trusted", async () => {
-  const r = await learnWith({ computePendingAtExit: [STALE] });
-  notTrusted(r, "a page left stale");
-  assert.match(r.issues, /recalculate/i, `the issues do not say what stopped it: ${r.issues.slice(0, 300)}`);
-  assert.match(r.issues, /page 2/, "the issues do not name the page");
+await check("(1) a required select left blank on the MIDDLE page is NOT trusted", async () => {
+  const r = await learnWith({ trustEvidence: [evidence(2, { validationErrors: [BLANK_SELECT] })] });
+  notTrusted(r, "a middle page left with a required select blank");
+  assert.match(r.issues, /validation error.*page 2: Inverter Clone System Model: This field is required/i, `the issues do not say what stopped it: ${r.issues.slice(0, 300)}`);
 });
 
-await check("(2) a learn whose MIDDLE page was left showing a validation error is NOT trusted", async () => {
-  const r = await learnWith({ exitValidationErrors: [INVALID] });
-  notTrusted(r, "a page left invalid");
-  assert.match(r.issues, /validation error.*This field is required/i, `the issues do not say what stopped it: ${r.issues.slice(0, 300)}`);
+await check("(2) a MIDDLE page left with a total to recalculate is NOT trusted", async () => {
+  const r = await learnWith({ trustEvidence: [evidence(2, { computePending: STALE })] });
+  notTrusted(r, "a page left stale");
+  assert.match(r.issues, /recalculate.*page 2: "Needs to be recalculated"/i, `the issues do not say what stopped it: ${r.issues.slice(0, 300)}`);
 });
 
 await check("(3) an equipment value the portal did not keep blocks trust, and never becomes a digest topic", async () => {
@@ -120,14 +137,39 @@ await check("(3) an equipment value the portal did not keep blocks trust, and ne
   assert.ok(terms.includes("owned"), `a real unanswered question must still teach its words: ${terms.join(",")}`);
 });
 
-await check("(4) a CLEAN learn is still trusted, and its words never pair 'trusted' with 'not re-read'", async () => {
-  const r = await learnWith({});
+await check("(4) a REQUIRED checkbox left unchecked on a middle page is NOT trusted", async () => {
+  const BOX = "The battery system will not backfeed into the grid.";
+  const r = await learnWith({ trustEvidence: [evidence(2, { requiredUnchecked: [{ label: BOX, acknowledgment: false }] })] });
+  notTrusted(r, "a required box left unchecked");
+  assert.match(r.issues, /checkbox.*page 2: The battery system will not backfeed/i, `the issues do not name the box: ${r.issues.slice(0, 300)}`);
+  // Unmarked counts as required (fail closed): a box with no acknowledgment flag at all blocks too.
+  const unmarked = await learnWith({ trustEvidence: [evidence(3, { requiredUnchecked: [{ label: BOX } as never] })] });
+  notTrusted(unmarked, "a required box with no acknowledgment flag");
+});
+
+await check("(5) an equipment write that reached another control is NOT trusted", async () => {
+  const r = await learnWith({ trustEvidence: [evidence(2, { strayWrites: ['Battery Inverter Model: its selector now reaches "Total System Export (kW)" — not filled'] })] });
+  notTrusted(r, "a stray equipment write");
+  assert.match(r.issues, /another control.*page 2: Battery Inverter Model/i, `the issues do not name the write: ${r.issues.slice(0, 300)}`);
+});
+
+await check("(6) a page the exit reading could not read, or a learn with no reading, is NOT trusted", async () => {
+  const unread = await learnWith({ pageExitReads: { read: [3, 4], unread: [2] } });
+  notTrusted(unread, "a page left unread");
+  assert.match(unread.issues, /Page\(s\) 2 could not be read/i, `the issues do not name the unread page: ${unread.issues.slice(0, 300)}`);
+  const none = await learnWith({ pageExitReads: undefined });
+  notTrusted(none, "a learn that reports no page-exit reading");
+  assert.match(none.issues, /did not report reading its pages/i, none.issues.slice(0, 300));
+});
+
+await check("(7) a CLEAN learn is still trusted, with an acknowledgment left for a person; its words never pair 'trusted' with 'not re-read'", async () => {
+  const r = await learnWith({ trustEvidence: [evidence(4, { requiredUnchecked: [{ label: "I understand my form will not be submitted until I click Submit", acknowledgment: true }] })] });
   assert.equal(r.result.status, "trusted", `the gate must still pass a clean run: ${String(r.result.message).slice(0, 300)} | ${r.issues.slice(0, 300)}`);
   const message = String(r.result.message);
   const note = String(r.recipe?.notes ?? "");
   for (const [what, text] of [["message", message], ["note", note]] as const) {
     assert.doesNotMatch(text, /not re-?read/i, `the ${what} says trusted AND that pages were not re-read: ${text}`);
-    assert.match(text, /each form page was checked as the walk left it/i, `the ${what} does not say what every page was checked for: ${text}`);
+    assert.match(text, /read 3 of the 4 page\(s\) as it left them/i, `the ${what} does not say how many pages were read, of how many: ${text}`);
     // The denominator dryrunPortalClose (B10) pins is still there.
     assert.match(text, /3 field\(s\) checked on the final page \(3 matched\) of 6 recorded fill\(s\) across 4 page\(s\)/, `the ${what} lost its denominator: ${text}`);
   }
@@ -135,20 +177,32 @@ await check("(4) a CLEAN learn is still trusted, and its words never pair 'trust
   assert.match(note, /^Auto-learned and verified \(high confidence\) on 4 page\(s\)\./, "the matching-key prefix changed");
 });
 
-await check("(5) evaluateTrustGate blocks on each new signal, and passes without them", () => {
+await check("(8) pageExitTrustSignals + evaluateTrustGate: every kind blocks, the acknowledgment does not, an unknown is not clean", () => {
   const clean = {
     reachedReview: true, filledSomething: true, reviewReadable: true, verificationAccurate: true, textContradicts: false,
     requiredFieldMisses: [] as string[], missingRequiredDocs: [] as string[], validationBlocks: [] as string[],
-    computePendingAtExit: [] as string[], exitValidationErrors: [] as string[],
     ambiguousLiteralCount: 0, deadBindings: [] as string[], pageCount: 10, substantiveFills: 92, formPurposeMismatch: false,
   };
-  assert.deepEqual(autoLearn.evaluateTrustGate(clean), { trusted: true, blockers: [] });
-  const stale = autoLearn.evaluateTrustGate({ ...clean, computePendingAtExit: [STALE] });
-  assert.equal(stale.trusted, false);
-  assert.match(stale.blockers.join(" | "), /recalculated.*page 2/i);
-  const invalid = autoLearn.evaluateTrustGate({ ...clean, exitValidationErrors: [INVALID] });
-  assert.equal(invalid.trusted, false);
-  assert.match(invalid.blockers.join(" | "), /validation error.*Model/i);
+  type Learn = { trustEvidence?: Evidence[]; pageExitReads?: { read: number[]; unread: number[] } };
+  const gate = (learn: Learn) => autoLearn.evaluateTrustGate({ ...clean, ...autoLearn.pageExitTrustSignals(learn) });
+  const reads = { read: [3, 4, 5, 6, 7, 8, 9, 10], unread: [] as number[] };
+  assert.deepEqual(gate({ pageExitReads: reads }), { trusted: true, blockers: [] });
+  assert.deepEqual(gate({ pageExitReads: reads, trustEvidence: [evidence(10, { requiredUnchecked: [{ label: "I certify I am the property owner", acknowledgment: true }] })] }), { trusted: true, blockers: [] },
+    "an acknowledgment left for a person by design must not block");
+  const cases: Array<[string, Learn, RegExp]> = [
+    ["blank select on page 9", { pageExitReads: reads, trustEvidence: [evidence(9, { validationErrors: [BLANK_SELECT] })] }, /validation error: page 9: Inverter Clone System Model/],
+    ["stale total on page 9", { pageExitReads: reads, trustEvidence: [evidence(9, { computePending: STALE })] }, /recalculated: page 9: "Needs to be recalculated"/],
+    ["required box on page 9", { pageExitReads: reads, trustEvidence: [evidence(9, { requiredUnchecked: [{ label: "The battery system will not backfeed into the grid.", acknowledgment: false }] })] }, /left unchecked: page 9: The battery system/],
+    ["stray write on page 9", { pageExitReads: reads, trustEvidence: [evidence(9, { strayWrites: ["Battery Inverter Model: not filled"] })] }, /another control: page 9: Battery Inverter Model/],
+    ["page 9 unread", { pageExitReads: { read: [3, 4, 5, 6, 7, 8, 10], unread: [9] } }, /could not be read as the walk left them: 9/],
+    ["no reading reported", {}, /did not report reading its pages/],
+    ["no page read", { pageExitReads: { read: [], unread: [] } }, /no page was read/],
+  ];
+  for (const [label, learn, why] of cases) {
+    const v = gate(learn);
+    assert.equal(v.trusted, false, `${label} must block`);
+    assert.match(v.blockers.join(" | "), why, `${label}: ${v.blockers.join(" | ")}`);
+  }
 });
 
 finish("learn-trust-blanks");
