@@ -62,6 +62,16 @@ export function createUser(
   return getUser(db, id)!;
 }
 
+/**
+ * An org admin cannot reset or switch off a superadmin's login (the owner's own). The one answer
+ * for both doors that do that: staffLogins (reset, deactivate) and updateUser's `active` (#474).
+ */
+export function assertMayManageLogin(actor: { role: string }, target: { role: string }): void {
+  if (target.role === ROLE_SUPERADMIN && actor.role !== ROLE_SUPERADMIN) {
+    throw new HttpError(403, "Only a superadmin can manage a superadmin's login.");
+  }
+}
+
 export function updateUser(
   db: AppDb,
   userId: string,
@@ -92,7 +102,21 @@ export function updateUser(
     role = input.role;
   }
 
-  const active = input.active !== undefined ? Boolean(input.active) : user.active;
+  // WHO MAY SWITCH A LOGIN OFF (#474). This door used to take `active` from anyone signed in,
+  // so an operator could lock an admin out (and, after #432, end their sessions) with one PUT.
+  // The same rules as the dashboard's own door (staffLogins.setStaffLoginActive): an admin only,
+  // never your own login, and a superadmin's only by a superadmin. Checked BEFORE the UPDATE, so
+  // a refused request changes nothing else it carried either. No actor (sign-in off, a script)
+  // is refused like an operator: nobody here can be shown to be an admin.
+  let active = user.active;
+  if (input.active !== undefined && Boolean(input.active) !== user.active) {
+    if (!actor || !ADMIN_ROLES.has(actor.role)) {
+      throw new HttpError(403, "Only an admin can switch a teammate's login on or off.");
+    }
+    if (actor.id === userId) throw new HttpError(403, "You can't switch off your own login.");
+    assertMayManageLogin(actor, user);
+    active = Boolean(input.active);
+  }
   db.run(
     "UPDATE users SET name = ?, email = ?, role = ?, color = ?, active = ? WHERE id = ?",
     [
