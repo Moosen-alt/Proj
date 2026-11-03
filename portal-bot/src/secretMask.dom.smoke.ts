@@ -96,6 +96,34 @@
 //   the whole round-2 secretMask.ts (633cfbc3) → 29: the 14 of section 7 and all 15 of section 8 kept
 //     with the account in clear (the check's five at 1210 / 722 / 378 / 1210 / 650 px).
 //
+// #436 ROUND 4 — A SUPERSET BY CONSTRUCTION (the round-3 check's regression: text straight in an
+// <optgroup>, or a number split across options, of a listbox/multiple select — main tagged the
+// OPTGROUP, the rewritten tagger nothing). The learner and the staged picture now tag through
+// tagSecretsForMask: origin/main's tagger body verbatim FIRST, then the shared tagger, which tags a
+// <select> WHOLE by its full text. secretMaskMainTagger.test.ts pins the body by hash.
+//   FACE 1 (section 9, scripts on, the checker's r4 corpus: the three select carriers under all ten
+//              wrappers, strayChild2's five bare and in a shadow root, three plain selects bare and in
+//              a shadow root — 46 pages): the SHIPPED union first, on a page with no shim, then main's
+//              tagger: STRICT tags(learner) ⊇ tags(main) by element, and the learner's mask leaves 0
+//              green. Section 7 now asks the strict superset of the union too.
+//   FACE 2 (section 10, scriptless): refused with no file or kept with 0 green — and, stricter, KEPT
+//              with 0 green (a refusal there would be the coverage backstop hiding a tagger miss).
+//
+// Kill, round 4 (each run by hand against secretMask.ts, then restored; of 379):
+//   K1 tagSecretsForMask without main's pass → 36 fail: the strict ⊇ check on all 35 non-shadow r4
+//     pages (main tags the OPTGROUP / OPTION, the learner only the SELECT) and section 7's
+//     selectChosen; secretMaskMainTagger.test.ts fails its order check;
+//   K2 the tagger's select pass option by option again (no textContent, tree-order or run-together
+//     reading) → 17 fail: face 1's 0-green check on the eight shadow pages (main does not reach a
+//     shadow root; 621-4987 px left) and on ogTextCollapsed (main's OPTGROUP tag masks nothing of a
+//     collapsed select: 113 px), and face 2's "kept" on the eight shadow pages (refused by the
+//     coverage check: "<select> shows a known secret and is not tagged for the mask");
+//   K2 + K3 (the coverage check's select reading off too: the control check option by option, the
+//     leftover walk dropping a select's text) → 25 fail: the 17, and the eight shadow pages KEPT with
+//     the account in clear (2448 px on selOptgroupText) — the backstop is what refused them under K2;
+//   K3 alone → 0 fail (with the select tagged whole, the backstop is not reached on these pages);
+//   K4 one byte of main's body (`let n = 0 ;`) → secretMaskMainTagger.test.ts fails its hash check.
+//
 //   npx tsx portal-bot/src/secretMask.dom.smoke.ts
 import "./smokeArtifactDirs";
 import fs from "node:fs";
