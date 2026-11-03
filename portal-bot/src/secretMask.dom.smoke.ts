@@ -1,4 +1,4 @@
-// #436 FIX ROUND 1 — THE STAGED PICTURE'S MASK IS VERIFIED, IN A REAL BROWSER (secretMask.ts).
+// #436 FIX ROUNDS 1-2 — THE STAGED PICTURE'S MASK IS VERIFIED, IN A REAL BROWSER (secretMask.ts).
 //
 // The adversarial check's probe, re-run: a scriptless page (Emulation.setScriptExecutionDisabled, as
 // the staged walk's page is) on 127.0.0.1, 800x600, synthetic ACCOUNT=8814402937 at fixed spots. Each
@@ -25,6 +25,42 @@
 // maskedFullPageScreenshot screenshotting with no mask → "probe: ok:true" fails (the pixel check
 // refuses); no closedShadowRootCount refusal → "closed" ok:true and a file on disk; no residual-text
 // check → "bodyText" and "twice" ok:true and a file on disk.
+//
+// #436 FIX ROUND 2 — WHAT IS PAINTED DECIDES, AND THE PICTURE IS OF THE PAGE THAT WAS CHECKED.
+//   MUST-PASS  painted (no extra CSS but the overflow spots): a <noscript>'s own text (top 100) and one
+//              split across a <b> (top 200) — the walk's scriptless page paints both —, an input's
+//              placeholder (top 300), a <noscript> whose text overflows its zero-width box (top 400),
+//              two overflowing spans in one wrapper (top 500) → ok:true, every spot >= 90% mask colour.
+//   MUST-PASS  harmless: a broken image whose alt carries nothing, ::after content that carries
+//              nothing, a list item, beside a plain masked account → ok:true.
+//   MUST-EXCL  imgAlt (a broken <img alt=ACCOUNT>), inputImage (<input type=image alt=ACCOUNT>), after
+//              (::after{content:attr(data-acct)}), quotes (an open-quote drawing it), marker (a string
+//              list-style-type) → ok:false, named, no file.
+//   MUST-EXCL  THE PAGE MOVES (opts.beforeShot, between the check and the shot): reload (the same URL
+//              loads again — the checker's meta-refresh race, made deterministic), reloadInto (the
+//              first load shows nothing, the reload shows the account: nothing was marked, so the
+//              count alone reads 0 = 0), frameReload (a shown iframe reloads), tagsGone (the same
+//              document, the marked box's tags gone) → ok:false, named, no file. still: the seam
+//              doing nothing → ok:true.
+//
+// Kill, round 2 (each run by hand against this file, then restored; the failing checks as seen):
+//   the read-back's document-mark test dropped (`!st || !st.same` → `!st`) → "reloadInto" ok:true and
+//     a file on disk ("reload" and "frameReload" still refused, by the count, not by name);
+//   the count test dropped (`if (false)`) → "tagsGone" ok:true and a file on disk;
+//   both dropped (round 1's read-back) → "reload", "reloadInto", "frameReload", "tagsGone" all ok:true
+//     with a file on disk;
+//   the tagger skipping NOSCRIPT again → "painted: ok:true" fails (the coverage check refuses the
+//     untagged painted text); with the leftover walk skipping noscript by name too → the three
+//     noscript spots read mask share 0.000;
+//   textRects skipping SCRIPT|STYLE|NOSCRIPT|TEMPLATE|TITLE by name → the overflowing <noscript> spot
+//     reads 0.000 (not measured, so the mask stayed on its zero-width box);
+//   `painted` counting every climb, not distinct boxes → "painted: ok:true" fails ("5 of the 6
+//     masked box(es) ... found again");
+//   the tagger without the placeholder → "painted: ok:true" fails (untagged <input#ph>); with the
+//     control check's placeholder off too → the placeholder spot reads 0.000;
+//   no alt check → "imgAlt" and "inputImage" ok:true with a file; no generated-content check →
+//     "after", "quotes", "marker" ok:true with a file; no quotes term → "quotes"; no list-style-type
+//     term → "marker".
 //
 //   npx tsx portal-bot/src/secretMask.dom.smoke.ts
 import "./smokeArtifactDirs";
@@ -71,6 +107,11 @@ const PAGES: Record<string, string> = {
     `<div id="ns1" style="${abs(100, "font-size:20px")}"><noscript>Account ${ACCOUNT}</noscript></div>`,
     `<div id="ns2" style="${abs(200, "font-size:20px")}"><noscript>Account 8814<b>402937</b></noscript></div>`,
     `<input id="ph" placeholder="${ACCOUNT}" style="${abs(300, "width:300px;height:40px;font-size:18px")}">`,
+    // A <noscript> whose own text overflows its zero-width box: it must be MEASURED (its text rects),
+    // so the mask climbs to the wrapper that holds it.
+    `<div id="ns3" style="${abs(400, "width:400px;height:40px")}"><noscript style="display:inline-block;width:0;height:24px;white-space:nowrap;font-size:20px">Acct ${ACCOUNT}</noscript></div>`,
+    // Two tagged spans whose text overflows climb to ONE wrapper: one box to paint, not two.
+    `<div id="dup" style="${abs(500, "width:400px;height:60px")}"><span style="display:inline-block;width:0;height:24px;white-space:nowrap;font-size:20px">One ${ACCOUNT}</span><br><span style="display:inline-block;width:0;height:24px;white-space:nowrap;font-size:20px">Two ${ACCOUNT}</span></div>`,
   ].join(""), false),
   imgAlt: doc(`<img alt="${ACCOUNT}" src="/missing.png" style="${abs(100, "font-size:20px")}">`, false),
   inputImage: doc(`<input type="image" alt="${ACCOUNT}" src="/missing.png" style="${abs(100, "width:300px;height:40px;font-size:18px")}">`, false),
@@ -211,6 +252,8 @@ try {
         ["a <noscript>'s own text (the walk's scriptless page paints it)", { x: 14, y: 104, w: 120, h: 14 }],
         ["a <noscript> whose account is split across a <b>", { x: 14, y: 204, w: 120, h: 14 }],
         ["an input's placeholder", { x: 14, y: 304, w: 290, h: 32 }],
+        ["a <noscript>'s text overflowing its zero-width box", { x: 14, y: 402, w: 140, h: 18 }],
+        ["two overflowing spans in one wrapper", { x: 14, y: 502, w: 140, h: 44 }],
       ];
       for (const [label, box] of spots) {
         const share = await maskShare(file, box);

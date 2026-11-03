@@ -13,7 +13,10 @@
 // THE STAGED REVIEW'S PICTURE IS VERIFIED, NOT TRUSTED (maskedFullPageScreenshot, #436 fix round 1):
 // a page with a closed shadow root, a secret no element can be tagged for, or a tagged secret painted
 // outside every box the mask can draw is refused; and after the shot, every masked box must read as
-// the mask colour in the PNG itself, or the file is deleted and the picture is refused.
+// the mask colour in the PNG itself, or the file is deleted and the picture is refused. #436 fix round
+// 2: what is PAINTED decides, never a tag name (a scriptless page paints <noscript>; placeholder, alt
+// and generated content are painted too), and the picture must be of the document that was checked
+// (each frame marked before tagging, read back after the shot, every marked box found again).
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import type { CDPSession, ElementHandle, Frame, Locator, Page } from "playwright";
@@ -45,8 +48,11 @@ export function secretMaskPatterns(secrets: readonly string[]): SecretMaskPatter
  *  locator pierces open roots, so the mask covers what is tagged there). A <select> is tagged when
  *  any of its options (text or label) or option groups carries one: a collapsed select paints its
  *  chosen option, and an <option> has no box of its own (#436 fix round 1 — the tagger tagged the
- *  0x0 option, so the mask drew nothing over the select). Returns how many were tagged. Throws when
- *  the page cannot be evaluated (the caller decides whether that fails closed). */
+ *  0x0 option, so the mask drew nothing over the select). #436 fix round 2: an input or text area is
+ *  tagged by its placeholder too, an image (or image button) by its alt, and a <noscript> is content.
+ *  Every change here tags MORE, never less: the learner's withSecretMask shares this tagger. Returns
+ *  how many were tagged. Throws when the page cannot be evaluated (the caller decides whether that
+ *  fails closed). */
 export async function tagSecretsInPage(page: Pick<Page, "evaluate">, pats: SecretMaskPattern[]): Promise<number> {
   // Plain loops only: a function DECLARED inside an evaluated body needs the __name shim.
   return Number(await page.evaluate((ps: Array<{ digits: string; literal: string }>) => {
