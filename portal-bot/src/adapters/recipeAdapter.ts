@@ -823,6 +823,25 @@ export function draftPickStopTell(stampLabel: string, picks: string[]): string {
   return `${head}${brief}${tail}`;
 }
 
+/** A click that leaves the page: the recorder's "advance:" wording, or a Continue/Next control (a
+ *  hand-patched "human-patch: Next" carries no "advance:" note). THE one answer: the fee-tier stop's
+ *  next advancing click and the staged review's page count (#436) both read it. */
+export function isAdvancingClickStep(step: RecipeStep): boolean {
+  const note = String(step.note ?? "");
+  if (/^advance\b/i.test(note)) return true;
+  const name = `${step.selector?.name ?? ""} ${step.selector?.text ?? ""} ${note}`;
+  return /\bcontinue\b|\bnext\b|save (and|&) continue/i.test(name) && !/add new|add contact|search|lookup|calculate/i.test(name);
+}
+
+/** #436 PR1 — HOW MANY PAGES THE RECIPE WALKS: 1 + every advancing click that is not the final
+ *  submit. A recipe of more than one page whose review page offers no step link cannot be compared
+ *  beyond the review page, and the staged review says so (walkStagedDraft's expectedPages). An
+ *  over-count only ever withholds "approvable"; an under-count would let a review-only reading of a
+ *  multi-page draft pass, so this reads the broad predicate, not only the "advance:" note. */
+export function stagedReviewExpectedPages(steps: readonly RecipeStep[]): number {
+  return steps.filter((s) => s.action === "click" && !isFinalSubmitStep(s) && isAdvancingClickStep(s)).length + 1;
+}
+
 export class RecipeAdapter extends BasePortalAdapter {
   portalName: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -3899,7 +3918,7 @@ export class RecipeAdapter extends BasePortalAdapter {
       .map((s) => String(s ?? "").trim()).filter((s) => s.length >= 4)));
     const terminal = (this.recipe.steps ?? []).filter((s) => isFinalSubmitStep(s));
     // How many pages the recipe walks: a recipe of more than one page must offer step links to compare them.
-    const expectedPages = (this.recipe.steps ?? []).filter((s) => s.action === "click" && /^advance\b/i.test(String(s.note ?? ""))).length + 1;
+    const expectedPages = stagedReviewExpectedPages(this.recipe.steps ?? []);
     const runKey = String(this.options.runId || `run-${Date.now()}`).replace(/[^A-Za-z0-9-]/g, "").slice(0, 64) || `run-${Date.now()}`;
     const shotPath = path.join(stagedReviewShotsDir(), `staged-review-${runKey}.png`);
     let shot = "";
@@ -8828,12 +8847,9 @@ export class RecipeAdapter extends BasePortalAdapter {
     return !!read;
   }
 
-  /** A click that leaves the page: the recorder's "advance:" wording, or a Continue/Next control. */
+  /** A click that leaves the page (isAdvancingClickStep, the one answer). */
   private isAdvancingClick(step: RecipeStep): boolean {
-    const note = String(step.note ?? "");
-    if (/^advance\b/i.test(note)) return true;
-    const name = `${step.selector?.name ?? ""} ${step.selector?.text ?? ""} ${note}`;
-    return /\bcontinue\b|\bnext\b|save (and|&) continue/i.test(name) && !/add new|add contact|search|lookup|calculate/i.test(name);
+    return isAdvancingClickStep(step);
   }
 
   /** Every visible text box on the page whose own label carries a kVA bound, by control id. The

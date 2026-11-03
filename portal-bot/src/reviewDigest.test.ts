@@ -19,6 +19,9 @@
 //   (i) the key: same key + nonce → the same digest; another key → another keyId and digest; another
 //       nonce (another row) → no mac in common (the same number on two projects never links).
 //   (j) the label output: labels are redacted (secrets to a last 4) and capped at 80.
+//   (k) the recipe's page count (recipeAdapter.stagedReviewExpectedPages) reads the engine's one
+//       advancing-click predicate: a hand-patched "Next" with no "advance:" note is a page, so a
+//       review page with no step links is refused for it; the final submit and "Add New" are not pages.
 //
 // KILL TESTS (run by hand, each turns this file red):
 //   K1 normalizedValue: return the raw value (no ruling-7 drop) → (g) fails.
@@ -27,6 +30,7 @@
 //   K4 finishDigestReading: drop the row cap → (f) "over 400 rows" fails.
 //   K5 walkStagedDraft: push a non-navigable link as read → (f) "opens by a script" fails.
 //   K6 buildStagedReviewCapture: approvable ignores `why` → every (f) case fails.
+//   K9 stagedReviewExpectedPages: count only /^advance\b/ notes (the pre-fix heuristic) → (k) fails.
 //
 //   npx tsx portal-bot/src/reviewDigest.test.ts
 import assert from "node:assert/strict";
@@ -288,6 +292,31 @@ await check("(j) the label output: redacted (a secret to its last 4) and at most
   assert.ok(c.sections[0].items.every((i) => i.label.length <= 80));
   const row = c.fieldReport.find((r) => /^Account/.test(r.label));
   assert.ok(row && /\*+9274/.test(row.display), `the field report did not mask the account: ${JSON.stringify(row)}`);
+});
+
+await check("(k) the recipe's page count reads every advancing click: a hand-patched 'Next' is a page, the final submit is not", async () => {
+  const { stagedReviewExpectedPages } = await import("./adapters/recipeAdapter");
+  const fill = { action: "fill", selector: { label: "Customer Name" }, field: "customerName" } as const;
+  const steps = [
+    { action: "goto", value: REVIEW_URL } as const,
+    fill,
+    { action: "click", selector: { role: "button", name: "Next" }, note: "human-patch: Next" } as const,
+    fill,
+    { action: "click", selector: { role: "button", name: "Save and Continue" }, note: "advance: Save and Continue" } as const,
+    { action: "stopForReview" } as const,
+    { action: "click", selector: { role: "button", name: "Submit and Continue" }, note: "final submit: Submit and Continue", isFinalSubmit: true } as const,
+  ];
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  assert.equal(stagedReviewExpectedPages(steps as any), 3, "the hand-patched Next (no 'advance:' note) was not counted, or the final submit was");
+  // ...so a review page that offers no step link is refused for the two pages it cannot open.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const walk = await walkStagedDraft(stubNav(pagesOf(), []), { reviewUrl: REVIEW_URL, gapMs: 0, expectedPages: stagedReviewExpectedPages(steps as any) });
+  const c = buildStagedReviewCapture({ walk, secrets: [], key: KEY, nonce: NONCE });
+  assert.equal(c.approvable, false);
+  assert.ok(c.why.some((w) => /other 2 step page\(s\) cannot be opened by navigation alone/.test(w)), c.why.join(" | "));
+  // MUST PASS: an in-page "Add New" or "Search" click is not a page.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  assert.equal(stagedReviewExpectedPages([fill, { action: "click", selector: { role: "button", name: "Add New Contact" }, note: "human-patch: Add New Contact" }, { action: "stopForReview" }] as any), 1);
 });
 
 console.log(failures === 0 ? `\nAll ${total}/${total} reviewDigest checks passed.` : `\n${failures}/${total} reviewDigest check(s) FAILED.`);
