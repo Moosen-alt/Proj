@@ -271,8 +271,10 @@ check("with the data held still, the refusal is byte-identical across two differ
     const tracksSrc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "submittalTracks.ts"), "utf8");
     const fs0 = tracksSrc.indexOf("export function trackFilingOnRecord(");
     assert.ok(fs0 > 0, "trackFilingOnRecord must be findable");
-    assert.ok(tracksSrc.slice(fs0, tracksSrc.indexOf("\n}\n", fs0)).includes("status IN ('submitted', 'submitted_unconfirmed')"),
-      "the filed-track reading must still read submitted AND submitted_unconfirmed");
+    // The SUBMISSIONS read itself (the portal_runs read below it carries the same words, so a bare
+    // substring would pass with the submissions read narrowed).
+    assert.match(tracksSrc.slice(fs0, tracksSrc.indexOf("\n}\n", fs0)), /FROM submissions\s+WHERE [^`]*status IN \('submitted', 'submitted_unconfirmed'\)/,
+      "the filed-track reading must still read submitted AND submitted_unconfirmed submissions");
     const ps0 = tracksSrc.indexOf("export function trackSubmittedAndTracked(");
     assert.ok(ps0 > 0 && tracksSrc.slice(ps0, tracksSrc.indexOf("\n}\n", ps0)).includes("trackFilingOnRecord(db, projectId, track)"),
       "trackSubmittedAndTracked must still ask trackFilingOnRecord first");
