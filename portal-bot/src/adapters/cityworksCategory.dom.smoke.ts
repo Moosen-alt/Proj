@@ -38,8 +38,13 @@
 //                  the force-click "succeeds" on the disabled button, the page does not move, Begin is
 //                  banned as dead under a page key the case type does not change, and once enabled it
 //                  is skipped: the walk ended on the repeat-page stop.)
-//   gone   — the chosen category disappears between the plan and the click (an SPA re-render).
-//            MUST: a named failure ("not on the page") in seconds, never minutes of retries.
+//   gone   — the chosen category disappears between the plan and the click (an SPA re-render) and
+//            never comes back. MUST: named (navigate_control_absent) in seconds, never minutes of
+//            retries; the click that never happened is not a step; the planner is told and the page
+//            is planned again (the advance door's rule), and the walk ends on its own.
+//   back   — the chosen category disappears between the plan and the click, and is back a moment
+//            later (the SPA re-rendered it). MUST: the re-plan clicks it and the walk reaches the
+//            form, with one recorded category click (a hard stop here was a false stop).
 //   wedge  — the category's click handler never returns (the page's script is stuck). MUST: the
 //            navigate click's budget ends the walk, named (AUTOLEARN_CLICK_BUDGET_MS=20000 here).
 //   freeze — the category click returns, its case types render, and then the page's main thread
@@ -104,12 +109,12 @@ const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
 
 const norm = (s: unknown): string => String(s ?? "").replace(/\s+/g, " ").trim();
 
-type Mode = "live" | "eager" | "advance" | "eagerAdvance" | "gone" | "wedge" | "freeze" | "stall";
-const MODES: Mode[] = ["live", "eager", "advance", "eagerAdvance", "gone", "wedge", "freeze", "stall"];
+type Mode = "live" | "eager" | "advance" | "eagerAdvance" | "gone" | "back" | "wedge" | "freeze" | "stall";
+const MODES: Mode[] = ["live", "eager", "advance", "eagerAdvance", "gone", "back", "wedge", "freeze", "stall"];
 /** Each mode's wall-clock bound in this smoke: well above its healthy time, far below the hang. */
-const DEADLINE_S: Record<Mode, number> = { live: 240, eager: 240, advance: 240, eagerAdvance: 240, gone: 150, wedge: 150, freeze: 180, stall: 180 };
+const DEADLINE_S: Record<Mode, number> = { live: 240, eager: 240, advance: 240, eagerAdvance: 240, gone: 150, back: 240, wedge: 150, freeze: 180, stall: 180 };
 /** The modes whose planner walks to the form, and the door it names "Begin Application" through. */
-const WALKS: Partial<Record<Mode, "navigate" | "advance">> = { live: "navigate", eager: "navigate", advance: "advance", eagerAdvance: "advance" };
+const WALKS: Partial<Record<Mode, "navigate" | "advance">> = { live: "navigate", eager: "navigate", advance: "advance", eagerAdvance: "advance", back: "navigate" };
 /** The step note a click through each door records. */
 const STEP_NOTE = /^(?:navigate to application|advance): /;
 /** The watchdog's budgets in the freeze and stall modes (the walk's own, and a planner call's). */
@@ -222,22 +227,44 @@ async function walk(mode: Mode): Promise<void> {
     ...(mode === "stall" ? { stallWatchdogMs: WALK_STALL_MS, plannerStallWatchdogMs: PLANNER_STALL_MS } : {}),
   });
   (adapter as unknown as { page: unknown }).page = page;
-  // gone: the chosen category leaves the page between the plan and the click (an SPA re-render),
-  // timed off the learner's own navigate_chosen event so it lands before the click, every time.
+  // gone / back: the chosen category leaves the page between the plan and the click (an SPA
+  // re-render), timed off the learner's own navigate_chosen event so it lands before the click,
+  // every time. gone: it never comes back (any re-render drops it again). back: it is put back
+  // the moment the learner names it absent.
   let chosenAt = 0;
   if (adapter.debug) {
     const listener = adapter.debug.onEvent;
+    let removed = false;
     adapter.debug.onEvent = (evt) => {
       listener?.(evt);
       if (evt.type === "navigate_chosen" && /Building Permits/.test(String(evt.label ?? ""))) {
-        chosenAt = Date.now();
+        if (!chosenAt) chosenAt = Date.now();
         if (mode === "gone") {
           void page.evaluate(() => {
+            const drop = (): void => {
+              for (const b of Array.from(document.querySelectorAll(".category-subcategories button"))) {
+                if ((b.textContent || "").includes("Building Permits")) b.remove();
+              }
+            };
+            drop();
+            new MutationObserver(drop).observe(document.body, { childList: true, subtree: true });
+          }).catch(() => null);
+        }
+        if (mode === "back" && !removed) {
+          removed = true;
+          void page.evaluate(() => {
             for (const b of Array.from(document.querySelectorAll(".category-subcategories button"))) {
-              if ((b.textContent || "").includes("Building Permits")) b.remove();
+              if ((b.textContent || "").includes("Building Permits")) { (window as unknown as { cwRemoved?: Element }).cwRemoved = b; b.remove(); }
             }
           }).catch(() => null);
         }
+      }
+      if (evt.type === "navigate_control_absent" && mode === "back") {
+        void page.evaluate(() => {
+          const b = (window as unknown as { cwRemoved?: Element }).cwRemoved;
+          const host = document.querySelector(".category-subcategories");
+          if (b && host) host.appendChild(b);
+        }).catch(() => null);
       }
     };
   }
@@ -315,11 +342,22 @@ async function walk(mode: Mode): Promise<void> {
     check(`${mode}: after the enabling choice the planner is not told it is STUCK`,
       !evTypes.includes("recovery_attempt") && !calls.some((c) => /You are STUCK/.test(c.hint)), `events=${JSON.stringify(evTypes)} | ${trace}`);
   }
+  if (mode === "gone" || mode === "back") {
+    const absentAt = events.findIndex((e) => e.type === "navigate_control_absent" && /Building Permits/.test(String(e.label ?? "")));
+    const absentMs = absentAt >= 0 ? Number(events[absentAt].tookMs ?? -1) : -1;
+    check(`${mode}: a chosen control that left the page is named absent (navigate_control_absent) in seconds, not minutes (${Math.round(absentMs / 1000)} s from the click; bound 40 s)`,
+      absentMs >= 0 && absentMs <= 40_000 && !evTypes.includes("navigate_timed_out"), `events=${JSON.stringify(evTypes)} | ${trace}`);
+    check(`${mode}: ...the page is planned again, and the planner is told the control was not on the page`,
+      calls.some((c) => /folder Building Permits" was not on the page/.test(c.hint)), trace);
+    // The click that never happened leaves nothing behind: no step for it (back: the one later,
+    // real click is the only category step), so a replay never walks a click on a missing control.
+    check(`${mode}: the click that never happened is not a recorded step`,
+      steps.filter((s) => /folder Building Permits/.test(norm(s.note))).length === (mode === "back" ? 1 : 0), trace);
+  }
   if (mode === "gone") {
     const secs = chosenAt && endedAt ? Math.round((endedAt - chosenAt) / 1000) : -1;
-    check("gone: a chosen control that left the page fails the walk NAMED ('not on the page') — no retries, no timeout",
-      !!res && res.ok === false && /not on the page/i.test(String(res.message)) && !/timeout|did not finish/i.test(String(res.message)), trace);
-    check(`gone: ...in seconds, not minutes (${secs} s from the choice to the end; bound 60 s)`, secs >= 0 && secs <= 60, trace);
+    check(`gone: ...and the walk ends on its own, not ok, never as a timeout (${secs} s from the choice to the end; bound 120 s)`,
+      !!res && res.ok === false && !/timeout|did not finish/i.test(String(res.message)) && secs >= 0 && secs <= 120, trace);
   }
   if (mode === "wedge") {
     const secs = chosenAt && endedAt ? Math.round((endedAt - chosenAt) / 1000) : -1;

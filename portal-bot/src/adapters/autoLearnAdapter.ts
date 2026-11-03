@@ -7783,13 +7783,15 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           navCount++;
           if (navLoopKey) this.navClicksByPath.add(navLoopKey);
           // A contact section's opener tells the dialog guard whose dialog opens next.
+          const contactRoleBefore = this.openContactRole;
           this.noteContactClick(navField, url);
-          steps.push({
+          const navStep: RecipeStep = {
             action: "click",
             phase: "open",
             selector: navField.selector,
             note: `navigate to application: ${navField.label || "link"}`,
-          });
+          };
+          steps.push(navStep);
           // Extra settle before the first navigation click. Accela/ExtJS dashboards render
           // their permit-type links via AJAX after the page shell loads; the links are in the
           // DOM a few ms after extraction but may still have an ExtJS loading mask above them.
@@ -7839,6 +7841,25 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           if (res.timedOut) {
             this.debug?.event({ type: "navigate_timed_out", page: pageCount, label: (navField.label || "").slice(0, 60), tookMs: Date.now() - navStarted });
             return fail(steps, this.portalName, `Failed to click navigation link "${navField.label}" on page ${pageCount}: the click did not finish within ${Math.round(clickStepBudgetMs() / 1000)} s (the control never responded); the walk stopped rather than keep retrying it.`, null, pageCount, portalNotices);
+          }
+          if (!res.ok && res.absent) {
+            // A NAVIGATE WHOSE CONTROL IS NOT ON THE PAGE IS RE-PLANNED, NOT THE END OF THE RUN — the
+            // advance door's rule (#556). clickResilient names an absent control after its two looks
+            // (12 s, 6 s); on main the retries kept looking for minutes and clicked it if it came back.
+            // An SPA that re-rendered the control away, or put it back a moment later, deserves the
+            // fresh look a re-plan gives, never a hard stop. Nothing was clicked, so nothing of the
+            // click is kept: its step (by identity), the navigation count, the loop guard's key (a
+            // control that comes back must not be refused as a re-click) and the contact-dialog
+            // expectation all come back out — the consent-wall path's bookkeeping. Bounded like every
+            // re-plan: the stuck guard, the repeat-page stop, the page budget.
+            const lbl = (navField.label || "").replace(/\s+/g, " ").trim().slice(0, 60);
+            this.debug?.event({ type: "navigate_control_absent", page: pageCount, label: lbl, tookMs: Date.now() - navStarted });
+            if (steps.length && steps[steps.length - 1] === navStep) steps.pop();
+            navCount = Math.max(0, navCount - 1);
+            if (navLoopKey) this.navClicksByPath.delete(navLoopKey);
+            this.openContactRole = contactRoleBefore;
+            pendingHint = `"${lbl}" was not on the page when it was clicked: the page changed after it was read. Choose from what the page shows now.`;
+            continue;
           }
           if (!res.ok) {
             return fail(steps, this.portalName, `Failed to click navigation link "${navField.label}" on page ${pageCount}: ${res.message ?? "unknown"}`, null, pageCount, portalNotices);
@@ -8940,7 +8961,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             type: "advance_control_absent",
             page: pageCount,
             label: String(advanceField.label ?? "").slice(0, 60),
-            ms: Date.now() - advStarted,
+            tookMs: Date.now() - advStarted, // not `ms`: that is the bundle's own timestamp
           });
         }
         // #344 §4 — AFTER A VERIFIED INFORMATION PAGE'S CLICK the page it led to must read as an
@@ -11904,8 +11925,9 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // (12 s) and the second (6 s) is absent: say so, in words that are not a timeout, so the
       // caller gets a named failure instead of a retry. (A click that navigated away has
       // already returned through the URL / tab check below.) Each door decides what absent
-      // means (boundedClick carries the marker): the navigate door stops, named; the ADVANCE
-      // door treats it as an advance that did nothing and recovers, as it did on a timeout.
+      // means (boundedClick carries the marker): the navigate door re-plans the page, named
+      // (navigate_control_absent); the ADVANCE door treats it as an advance that did nothing and
+      // recovers, as it did on a timeout.
       const present = typeof loc.count === "function" ? await loc.count().catch(() => -1) : -1;
       if (present === 0) {
         const nowUrl = (this.page && typeof this.page.url === "function") ? String(this.page.url() ?? "") : "";
