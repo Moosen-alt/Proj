@@ -3009,6 +3009,38 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       addColumnIfMissing(db, "clients", "intake_senders", "TEXT NOT NULL DEFAULT ''");
     },
   },
+  {
+    version: 60,
+    name: "email_poll_cursors",
+    up: (db) => {
+      // READ EVERY MESSAGE IN A BURST (#539). The inbox poll used to re-read only the newest
+      // EMAIL_IMAP_MAX_MESSAGES (100) of the whole mailbox each tick, and Gmail one capped page,
+      // so a burst of more than that between two ticks was never read at all.
+      //   email_poll_cursors: one row per polled inbox. IMAP: the UIDVALIDITY it was read under and
+      //     the highest UID handed on (to the tracker, or to an email_intake job). Gmail:
+      //     last_uid is the epoch-ms time of the last tick that caught up, the anchor of the next
+      //     tick's query window. source_key is `imap:<source row id>`, `imap-env:<hash>` for the
+      //     central env inbox, `gmail:env`. A source's org is read from its source row, never here.
+      //   email_poll_seen: Gmail has no UID, so the ids already handed on are recorded, and a
+      //     message past the per-tick bound stays unseen (and in the window) until a later tick.
+      // Created here, never lazily: reads write nothing.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS email_poll_cursors (
+          source_key TEXT PRIMARY KEY,
+          uid_validity TEXT NOT NULL DEFAULT '',
+          last_uid INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS email_poll_seen (
+          source_key TEXT NOT NULL,
+          message_ref TEXT NOT NULL,
+          seen_at TEXT NOT NULL,
+          PRIMARY KEY (source_key, message_ref)
+        );
+        CREATE INDEX IF NOT EXISTS idx_email_poll_seen_at ON email_poll_seen(source_key, seen_at);
+      `);
+    },
+  },
 ];
 
 /** v47 was edited in place while #218 was open (Helm's review at 0116f98a): a DB that ran an earlier
