@@ -39,6 +39,10 @@
 //              iframe and inside a declarative open shadow root is masked (the picture's pixels there are
 //              the mask colour); a review value only a script fills is named (the scriptless reading
 //              misses it), and the row is unapprovable.
+//   FIX ROUND 1 — THE PICTURE IS NEVER TAKEN WHERE THE MASK CANNOT BE TRUSTED (stage path): the review
+//              page holds a CLOSED declarative shadow root showing the account → no picture (none named,
+//              none on disk), unapprovable, named; a collapsed <select> whose chosen option is the account
+//              → the picture's pixels over the select are the mask colour.
 //
 // Kill (each turns this red, by hand): openPlaywrightDigestNavigator without
 // Emulation.setScriptExecutionDisabled and its scriptsOffInPage checks → "scripted" sees the beacon /
@@ -46,12 +50,16 @@
 // Network.setBypassServiceWorker → "scripted" sees the service worker's POST. The Fetch handler
 // continuing every request → "redirectSubmit" and "metaSubmit" GET /MvcProjects/SubmitProject.
 // maskedFullPageScreenshot tagging the main frame only → "maskFrame" has no mask pixels in the frame.
-// The adapter without shownOnlyWithScripts → "scriptValue" reads approvable.
+// The adapter without shownOnlyWithScripts → "scriptValue" reads approvable. walkStagedDraft calling
+// atReview on an unreadable review reading AND maskedFullPageScreenshot without its closed-root
+// refusal → "maskClosed" writes a picture. The tagger tagging the <option> → "maskSelect" has no mask
+// pixels over the select (and the coverage check refuses the picture).
 //
 //   npx tsx portal-bot/src/adapters/stagedReviewWalk.dom.smoke.ts
 import "../smokeArtifactDirs";
 import fs from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import { chromium, type Page } from "playwright";
 import type { PortalRecipe, ProjectRecord, RecipeStep, StagedReviewCapture } from "../../../shared/src/types";
 import { stageWithRecipe } from "../index";
@@ -105,6 +113,7 @@ const page = (title: string, pid: number, mode: string, body: string, head = "")
 const MODES: Record<number, string> = {
   4417: "clean", 4418: "scriptTab", 4419: "crossFrame", 4420: "dialog", 4421: "serverChanging", 4423: "nativeDialog", 4424: "actionTabs",
   4425: "scripted", 4426: "submitTab", 4427: "redirectSubmit", 4428: "metaSubmit", 4431: "maskFrame", 4432: "scriptValue",
+  4433: "maskClosed", 4434: "maskSelect",
 };
 
 /** Every way a page writes by itself (skeptic round 3) — on a STEP page only (the run's own window never opens one). */
@@ -144,6 +153,8 @@ const reviewBody = (pid: number, mode: string): string => {
   return `<p>Please review your application before submitting.</p>
     <dl><dt>Customer</dt><dd>Avery Fenwick</dd>${mode === "maskFrame" ? "" : account}<dt>System Size (kW DC)</dt><dd id="size">${mode === "scriptValue" ? "" : "8.6"}</dd></dl>
     ${mode === "maskFrame" ? account : ""}
+    ${mode === "maskClosed" ? `<div id="closedhost"><template shadowrootmode="closed"><p>Closed account ${ACCOUNT}</p></template></div>` : ""}
+    ${mode === "maskSelect" ? `<label for="acctSel">Account on the bill</label><select id="acctSel" style="position:absolute;left:10px;top:600px;width:300px;height:40px;font-size:18px"><option>Choose one</option><option selected>${ACCOUNT}</option></select>` : ""}
     ${mode === "scriptValue" ? `<script>document.getElementById("size").textContent = "8.6";</script>` : ""}
     <p>Last saved ${saved}</p>
     ${mode === "dialog" ? `<div role="dialog" style="border:1px solid #000;padding:8px">Your session will expire soon.</div>` : ""}
@@ -275,6 +286,29 @@ try {
     const sv = await stage(4432);
     check("scriptValue: a review value only a script fills is named, and the row is unapprovable",
       sv.c?.approvable === false && !!sv.c?.why.some((w) => /the review page shows 1 value\(s\) only while the portal's scripts run \(System Size \(kW DC\)\)/.test(w)), JSON.stringify(sv.c?.why));
+  }
+
+  // ── 1c. fix round 1: no picture where the mask cannot be trusted; a select is masked ──────────
+  console.log("\n1c. FIX ROUND 1: a closed shadow root gives no picture; a collapsed select's account is masked");
+  {
+    const closedFile = path.join(stagedReviewShotsDir(), "staged-review-smoke-staged-walk-4433.png");
+    fs.rmSync(closedFile, { force: true });
+    const { c } = await stage(4433);
+    check("maskClosed: unapprovable, and the review page's refusal is named (no checks, no picture)",
+      c?.approvable === false && !!c?.why.some((w) => /^the review page could not be read \(the page holds 1 closed shadow root\(s\).*no picture of it was taken$/.test(w)), JSON.stringify(c?.why));
+    check("maskClosed: the reading names no picture", String(c?.screenshotPath ?? "") === "", String(c?.screenshotPath));
+    check("maskClosed: no picture of the page is on disk", !fs.existsSync(closedFile), closedFile);
+    const sel = await stage(4434);
+    const shot = String(sel.c?.screenshotPath ?? "");
+    check("maskSelect: the picture was written", !!shot && fs.existsSync(shot), `${shot} ${JSON.stringify(sel.c?.why)}`);
+    const b = await chromium.launch({ headless: true });
+    try {
+      const pg = await b.newPage();
+      // The select is 300x40 at (10, 600); a little in from its edges, all of it the mask colour.
+      const inSelect = shot && fs.existsSync(shot) ? await maskPixels(pg, shot, { x: 14, y: 604, w: 290, h: 32 }) : -1;
+      check("maskSelect: the collapsed select showing the account is masked (mask-colour pixels over it)", inSelect >= Math.floor(0.9 * 290 * 32), `mask pixels=${inSelect} of ${290 * 32} shot=${shot}`);
+    } finally { await b.close().catch(() => null); }
+    check("maskSelect: the synthetic account number is nowhere in the reading", !leaks(sel.c), "");
   }
 
   // ── 2. stable across two walks; 3. a real change is seen ───────────────────────────────────

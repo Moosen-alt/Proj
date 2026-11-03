@@ -33,6 +33,8 @@
 //       landing on one page (m1), a tab landing on another draft or a login page (m2), another draft's
 //       link and the draft's own non-step tabs at another address (m3) never make up the count.
 //   (n) the scriptless reading against the person's window: a value only scripts show is named.
+//   (f8) #436 fix round 1: a review page whose reading is unreadable or refused (a closed shadow root,
+//       a dialog, a failed second read) gets no checks and NO PICTURE: atReview is never called.
 //
 // KILL TESTS (run by hand, each turns this file red):
 //   K1 normalizedValue: return the raw value (no ruling-7 drop) → (g) fails.
@@ -49,6 +51,9 @@
 //   K14 walkStagedDraft: count every opened link (no distinct / same-form check) → (m1), (m3) fail.
 //   K15 walkStagedDraft: skip the landed-on-this-draft check → (m2) fails.
 //   K16 walkStagedDraft: ignore the review link's filing shape → (l) fails (visited is not empty).
+//   K17 walkStagedDraft: call atReview on an unreadable review reading → (f8) fails (the picture is taken).
+//   K18 captureStagedReview: back to `t.reviewPage === false` (an unknown passes as review), or no early
+//       return on an unreadable scriptless reading → (o) fails.
 //
 //   npx tsx portal-bot/src/reviewDigest.test.ts
 import assert from "node:assert/strict";
@@ -513,6 +518,27 @@ await check("(k) the recipe's page count reads every advancing click: a hand-pat
   assert.equal(stagedReviewExpectedPages([fill, { action: "click", selector: { role: "button", name: "Add New Contact" }, note: "human-patch: Add New Contact" }, { action: "stopForReview" }] as any), 1);
 });
 
+await check("(f8) #436 fix round 1: a review page whose reading is unreadable or refused gets NO checks and NO picture (atReview is never called)", async () => {
+  const shapes: Array<[string, RawDigestReading | RawDigestReading[]]> = [
+    ["a closed shadow root", { ...reading([]), unreadable: "the page holds 1 closed shadow root(s), whose controls a page script cannot read" }],
+    ["a dialog", { ...reading([]), unreadable: "a dialog is open on the page" }],
+    ["a second read that fails", [reading(BASE), { ...reading([]), unreadable: "the page reads nothing" }]],
+  ];
+  for (const [label, page] of shapes) {
+    let calls = 0;
+    const walk = await walkStagedDraft(stubNav({ ...pagesOf(), [REVIEW_URL]: page }, [link("Customer", S1)]), {
+      reviewUrl: REVIEW_URL, gapMs: 0, atReview: async () => { calls++; return []; },
+    });
+    assert.equal(calls, 0, `${label}: atReview (the checks and the masked picture) ran on an unreadable review page`);
+    assert.ok(walk.reasons.some((w) => /^the review page could not be read \(.+\), so its checks were not run and no picture of it was taken$/.test(w)), `${label}: ${walk.reasons.join(" | ")}`);
+    assert.equal(buildStagedReviewCapture({ walk, secrets: [], key: KEY, nonce: NONCE }).approvable, false, `${label}: approvable`);
+  }
+  // MUST PASS: a readable review page still gets its checks (and its picture).
+  let calls = 0;
+  await walkStagedDraft(stubNav(pagesOf(), [link("Customer", S1)]), { reviewUrl: REVIEW_URL, gapMs: 0, atReview: async () => { calls++; return []; } });
+  assert.equal(calls, 1, "a readable review page's checks did not run");
+});
+
 // ── skeptic round 3, blocker 1: the walk runs UNDER the review lock ─────────────────────────────────
 await check("(o) the adapter locks the review page BEFORE the walk (source scan), and refuses the walk with no backstop", async () => {
   const fs = await import("node:fs");
@@ -528,6 +554,11 @@ await check("(o) the adapter locks the review page BEFORE the walk (source scan)
   assert.match(capture, /if \(!this\.backstop\) return unapprovableStagedReview\("the run has no network backstop/, "captureStagedReview walks with no backstop");
   const opens = capture.indexOf("openPlaywrightDigestNavigator(");
   assert.ok(opens > 0 && capture.indexOf("if (!this.backstop)") < opens, "the backstop check comes after the walk page is opened");
+  // #436 fix round 1: an unknown never reads as review (the shared reading not answering is a refusal),
+  // and the picture is never taken of a page whose scriptless reading is unreadable.
+  assert.match(capture, /if \(t\.reviewPage !== true\) \{/, "the review-page check passes a page the shared reading could not answer for");
+  const early = capture.indexOf("if (scriptless.unreadable) return [");
+  assert.ok(early > 0 && early < capture.indexOf("maskedFullPageScreenshot("), "atReview takes the picture of an unreadable review page");
 });
 
 console.log(failures === 0 ? `\nAll ${total}/${total} reviewDigest checks passed.` : `\n${failures}/${total} reviewDigest check(s) FAILED.`);

@@ -93,7 +93,8 @@ export interface RecordStagedReviewInput {
 /**
  * THE ONE WRITER of portal_staged_reviews. From the in-memory capture only. Supersedes every earlier
  * row of the track, re-checks rule 2 (hashes are hashes; text is scrubbed), and keeps the picture only
- * when it sits in the staged-review folder. Returns the row it wrote.
+ * when it sits in the staged-review folder AND the review page beside it was read. Returns the row it
+ * wrote.
  */
 export function recordStagedReview(db: AppDb, input: RecordStagedReviewInput): { id: string; approvable: boolean; why: string } {
   const c = input.capture;
@@ -123,7 +124,16 @@ export function recordStagedReview(db: AppDb, input: RecordStagedReviewInput): {
   const attachments: StagedReviewAttachment[] = (Array.isArray(c?.attachments) ? c.attachments : []).slice(0, 40).map((a) => ({
     name: scrub(a?.name, 120), docType: scrub(a?.docType, 60), sha256: HEX64.test(s(a?.sha256)) ? s(a?.sha256) : "", listed: a?.listed === true,
   }));
-  const shot = servableShot(c?.screenshotPath);
+  // THE PICTURE IS KEPT ONLY WITH A READ REVIEW PAGE (#436 fix round 1): the reading came back hashed
+  // and its first section is the review page, read. A picture beside a review page the reader could
+  // not read or refused (a closed shadow root, a dialog) is one the mask cannot be trusted on: the row
+  // never names it, and this run's own file (the adapter's staged-review-<run>.png) is deleted.
+  const reviewRead = hashed && sectionsIn.length > 0 && s(sectionsIn[0]?.step) === "review" && !s(sectionsIn[0]?.unreadable).trim();
+  const offered = servableShot(c?.screenshotPath);
+  const shot = reviewRead ? offered : "";
+  if (offered && !shot && path.basename(offered) === `staged-review-${s(input.runId).replace(/[^A-Za-z0-9-]/g, "").slice(0, 64)}.png`) {
+    try { fs.unlinkSync(offered); } catch { /* not served either way: no row names it */ }
+  }
   const digest = hashed ? s(c?.digest) : "";
   // THE DRAFT ID AND LINK ARE KEPT EXACTLY OR NOT AT ALL (stagedDraftReference, the reader's own
   // predicate, again with the project's secrets): never through scrub(), whose display redaction masks

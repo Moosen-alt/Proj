@@ -22,6 +22,8 @@
 //   (h) THE DRAFT ID AND LINK ARE KEPT EXACTLY: ProjectId 204411 / 42199 / AB12345CDE and an Accela
 //       capID row hold the portal's own id and link, approvable; an id the link does not carry, or a
 //       link with session material, is refused (both ""), never masked.
+//   (i) a picture beside a review page the reader could not read, or a reading not hashed, is never
+//       kept (the row and the card name none; this run's own file is deleted).
 //
 // KILL TESTS (run by hand on this tree):
 //   K1 repository: record from JSON.parse(result_json).stagedReview instead of the taken capture → (d) fails.
@@ -30,6 +32,7 @@
 //   K4 repository: drop the supersede at run start and in the writer → (e) fails.
 //   K5 recordStagedReview: store scrub(draftId) / scrub(reviewLink) again (the pre-fix display
 //      redaction) → (h) fails: "**4411", "*****", "AB*****CDE".
+//   K6 recordStagedReview: keep servableShot(c.screenshotPath) whatever the review section reads → (i) fails.
 //
 // Run: npx tsx backend/test/stagedReviewRow.test.ts
 import "./_isolate"; // FIRST
@@ -232,6 +235,44 @@ await check("(h) the draft id and review link are kept EXACTLY (5- and 6-digit i
   assert.equal(Number(row2.approvable), 0, "a link carrying a session token was kept approvable");
   assert.equal(row2.review_link, "");
   assert.match(String(row2.unapprovable_reason), /not in its kept form/);
+});
+
+await check("(i) #436 fix round 1: a picture beside a review page the reader could not read (or a reading not hashed) is never kept", async () => {
+  const unreadableCapture = (tag: string) => {
+    const bad = { title: "Review and Submit", url: REVIEW_URL, items: [], unreadable: "the page holds 1 closed shadow root(s), whose controls a page script cannot read" };
+    return digest.buildStagedReviewCapture({
+      walk: { sections: [{ step: "review", where: "https://pgenm.powerclerk.example/MvcProjects/EditForm", first: bad, second: null, unreadable: bad.unreadable }], reasons: [], stepsFound: 0, stepsRead: 0, writesBlocked: 0, reviewUrl: REVIEW_URL },
+      secrets: [], screenshotPath: shotFor(tag),
+    });
+  };
+  // Through the real Stage: the row and the card name no picture.
+  const pid = fx.newProject();
+  const cap = unreadableCapture("i1");
+  assert.ok(cap.screenshotPath, "fixture: the capture offers no picture");
+  nextResult = () => staged({ stagedReview: cap });
+  await repo.prepareSubmission(db, pid, "nem");
+  const row = rowsFor(pid)[0];
+  assert.ok(row, "no row");
+  assert.equal(String(row.screenshot_path), "", `a picture beside an unreadable review page was kept: ${String(row.screenshot_path)}`);
+  assert.equal(Number(row.approvable), 0);
+  assert.equal(nemCard(pid).stagedReview?.screenshotUrl, "", "the card offers a picture of an unreadable review page");
+  // The writer itself: this run's own file is deleted; a reading that is not hashed keeps no picture either.
+  const { recordStagedReview } = await import("../src/stagedReviews");
+  const own = path.join(stagedReviewShotsDir(), "staged-review-run-i2.png");
+  fs.writeFileSync(own, Buffer.from("\x89PNG fixture i2", "latin1"));
+  const pid2 = fx.newProject();
+  recordStagedReview(db, { runId: "run-i2", projectId: pid2, track: "nem", recipeId: "", stepsSignature: "", capture: { ...unreadableCapture("i2-other"), screenshotPath: own }, secrets: [] });
+  assert.equal(String(rowsFor(pid2)[0].screenshot_path), "");
+  assert.ok(!fs.existsSync(own), "this run's own picture of an unreadable review page was left on disk");
+  const pid3 = fx.newProject();
+  const good = captureOf("i3");
+  const forged = { ...good, sections: good.sections.map((sec) => ({ ...sec, items: sec.items.map((it) => ({ ...it, mac: "7.2" })) })) };
+  recordStagedReview(db, { runId: "run-i3", projectId: pid3, track: "nem", recipeId: "", stepsSignature: "", capture: forged, secrets: [] });
+  assert.equal(String(rowsFor(pid3)[0].screenshot_path), "", "a reading that did not come back hashed kept its picture");
+  // MUST PASS: a read review page keeps its picture ((b) above, again here by the writer itself).
+  const pid4 = fx.newProject();
+  recordStagedReview(db, { runId: "run-i4", projectId: pid4, track: "nem", recipeId: "", stepsSignature: "", capture: captureOf("i4"), secrets: [] });
+  assert.ok(String(rowsFor(pid4)[0].screenshot_path).endsWith("staged-review-i4.png"), String(rowsFor(pid4)[0].screenshot_path));
 });
 
 // ── the route, on a real server ─────────────────────────────────────────────────────────────

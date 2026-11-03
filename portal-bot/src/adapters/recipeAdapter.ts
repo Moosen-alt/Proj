@@ -3940,6 +3940,9 @@ export class RecipeAdapter extends BasePortalAdapter {
       atReview: async (scriptless) => {
         const reasons: string[] = [];
         const wp = nav.page;
+        // Never a picture of a page whose reading is unreadable or refused (walkStagedDraft does not
+        // call this then; asked again here, where the picture is taken).
+        if (scriptless.unreadable) return [`the review page could not be read (${scriptless.unreadable.slice(0, 120)}), so no picture of it was taken`];
         // THE WALK RUNS NO SCRIPT, SO A VALUE ONLY A SCRIPT FILLS READS EMPTY THERE (on both loads, and
         // an edit to it would never be seen): the review page in this run's own window — scripts on,
         // only read — must show no control, pair or row the scriptless reading lacks. A window that
@@ -3956,7 +3959,13 @@ export class RecipeAdapter extends BasePortalAdapter {
           const ps = (globalThis as any)[g];
           return ps && typeof ps.terminalPageInPage === "function" ? { reviewPage: ps.terminalPageInPage().reviewPage } : {};
         }, PORTAL_SAFETY_GLOBAL).catch(() => ({})) as { reviewPage?: boolean };
-        if (t.reviewPage === false) reasons.push("the page the Stage stopped on does not read as the portal's review step");
+        // Only a page that READS as review passes: one the shared reading could not answer for (the
+        // global missing, the evaluate thrown) is a refusal too — an unknown never reads as review.
+        if (t.reviewPage !== true) {
+          reasons.push(t.reviewPage === false
+            ? "the page the Stage stopped on does not read as the portal's review step"
+            : "the page the Stage stopped on could not be checked as the portal's review step");
+        }
         if (terminal.length !== 1) reasons.push(terminal.length ? `the recipe has ${terminal.length} recorded final submits` : "the recipe has no recorded final submit");
         else if ((terminal[0].selector as RecipeSelector | undefined)?.frame) reasons.push("the recorded final submit sits inside a frame");
         else {

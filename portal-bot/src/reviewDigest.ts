@@ -68,6 +68,7 @@ import { draftReferenceFromUrl } from "./adapters/submissionLedger";
 import { stagedDraftReference } from "./stagedDraftReference";
 import { dialogsLeftToPerson } from "./personDialogs";
 import { recordNumberCandidates } from "./recordNumber";
+import { closedShadowRootCount } from "./secretMask";
 
 export const REVIEW_DIGEST_VERSION = 1;
 /** More rows than this on one page and the page is refused ("over the cap"), never hashed. */
@@ -428,33 +429,9 @@ const SHIM = "globalThis.__name = globalThis.__name || function (fn) { return fn
 const originOf = (u: string): string => { try { return new URL(u).origin; } catch { return ""; } };
 const whereOf = (u: string): string => { try { const x = new URL(u); return `${x.origin}${x.pathname}`; } catch { return ""; } };
 
-interface CdpDomNode { shadowRootType?: string; children?: CdpDomNode[]; shadowRoots?: CdpDomNode[]; contentDocument?: CdpDomNode }
-
-/** How many CLOSED shadow roots the page holds (its same-process frames included), through a
- *  short-lived DevTools session: a page script cannot see into one, so neither can the reader. A
- *  browser's own (user-agent) roots — a date input's, a video's — are not counted. null = could not
- *  be checked. Read-only: DOM.getDocument inspects; it dispatches nothing to the page. */
-export async function closedShadowRootCount(page: Page): Promise<number | null> {
-  let session: CDPSession | null = null;
-  try {
-    session = await page.context().newCDPSession(page);
-    const doc = await session.send("DOM.getDocument", { depth: -1, pierce: true }) as unknown as { root: CdpDomNode };
-    let n = 0;
-    const stack: CdpDomNode[] = [doc.root];
-    while (stack.length) {
-      const x = stack.pop()!;
-      if (x.shadowRootType === "closed") n++;
-      for (const c of x.children ?? []) stack.push(c);
-      for (const r of x.shadowRoots ?? []) stack.push(r);
-      if (x.contentDocument) stack.push(x.contentDocument);
-    }
-    return n;
-  } catch {
-    return null;
-  } finally {
-    await session?.detach().catch(() => null);
-  }
-}
+// How many CLOSED shadow roots the page holds: the ONE count the reader and the staged picture's mask
+// (secretMask.ts, where it lives) both refuse on.
+export { closedShadowRootCount };
 
 /** Read one page for the digest (its main frame and every visible same-origin frame). Never throws:
  *  a failure is an unreadable reading, by name. `dialogSeen` reports a native dialog the walk page
@@ -669,7 +646,12 @@ export async function walkStagedDraft(nav: DigestNavigator, opts: {
       } else {
         sections.push(review.section);
         if (!review.section.unreadable) read.push({ at: review.at, sig: sigOf(review.section.first) });
-        if (opts.atReview) {
+        // A REVIEW PAGE WHOSE READING IS UNREADABLE OR REFUSED GETS NO CHECKS AND NO PICTURE (#436 fix
+        // round 1): atReview takes the masked picture, and a page the reader refused (a closed shadow
+        // root, a dialog, a frame it cannot read) is exactly one the mask cannot be trusted on.
+        if (opts.atReview && review.section.unreadable) {
+          reasons.push(`the review page could not be read (${review.section.unreadable.slice(0, 120)}), so its checks were not run and no picture of it was taken`);
+        } else if (opts.atReview) {
           try { reasons.push(...await opts.atReview(review.section.first)); } catch (e) { reasons.push(`the review page's checks could not run (${String((e as { message?: string })?.message ?? e).slice(0, 60)})`); }
         }
         const links = draftStepLinks(await nav.stepLinks().catch(() => [] as DigestStepLink[]), opts.reviewUrl);

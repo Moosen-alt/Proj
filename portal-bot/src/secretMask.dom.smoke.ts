@@ -1,0 +1,181 @@
+// #436 FIX ROUND 1 — THE STAGED PICTURE'S MASK IS VERIFIED, IN A REAL BROWSER (secretMask.ts).
+//
+// The adversarial check's probe, re-run: a scriptless page (Emulation.setScriptExecutionDisabled, as
+// the staged walk's page is) on 127.0.0.1, 800x600, synthetic ACCOUNT=8814402937 at fixed spots. Each
+// picture is decoded and the mask colour (#FF00FF) is counted in each spot's box.
+//   MUST-PASS  probe: a collapsed <select> whose chosen option shows the account (top 100), a DISABLED
+//              input holding it (top 200), an OPEN declarative shadow root (top 300), a plain div
+//              (top 400), a zero-width span whose text overflows its box (top 700), a listbox select
+//              (top 800) and a div far below the fold (top 2500) → ok:true, and EVERY one of those
+//              boxes is painted over (>= 90% mask colour where its text stands).
+//   MUST-EXCL  closed: the checker's exact page (its third spot a CLOSED declarative shadow root) →
+//              ok:false, named, and NO file on disk.
+//   MUST-EXCL  bodyText: the account as text straight in <body> (no element to tag) → ok:false, no file.
+//   MUST-EXCL  twice: a second copy beside a tagged one in the same element → ok:false, no file.
+//   MUST-PASS  hidden: the account only in a hidden input and a display:none div → ok:true (nothing of
+//              it is painted, so nothing needs a box).
+//   THE PIXEL CHECK ITSELF: unpaintedMaskBoxes on an UNMASKED shot of the probe page reports the boxes
+//              short; on the masked shot, none.
+//   THE LEARNER'S TAGGER (shared): the <select> is tagged, never its <option>; clearSecretTags removes
+//              every tag.
+//
+// Kill (each turns this red, by hand): the tagger without its <select> loop → probe "select" pixels
+// (and the coverage check's untagged-select refusal) fail; maskedFullPageScreenshot screenshotting
+// with no mask → probe ok:false (the pixel check refuses); no closedShadowRootCount refusal →
+// "closed" ok:true; no residual-text check → "bodyText" and "twice" ok:true.
+//
+//   npx tsx portal-bot/src/secretMask.dom.smoke.ts
+import "./smokeArtifactDirs";
+import fs from "node:fs";
+import http from "node:http";
+import os from "node:os";
+import path from "node:path";
+import { chromium, type Page } from "playwright";
+import { clearSecretTags, maskedFullPageScreenshot, secretMaskPatterns, tagSecretsInPage, unpaintedMaskBoxes } from "./secretMask";
+
+let failures = 0;
+let total = 0;
+const check = (label: string, ok: boolean, detail = ""): void => {
+  total++;
+  if (ok) console.log(`  ok   - ${label}`);
+  else { failures++; console.error(`  FAIL - ${label}\n         ${detail}`); }
+};
+
+// Synthetic only.
+const ACCOUNT = "8814402937";
+const abs = (top: number, extra = ""): string => `position:absolute;left:10px;top:${top}px;${extra}`;
+const SPOTS = {
+  select: `<select id="sel" style="${abs(100, "width:300px;height:40px;font-size:18px")}"><option>Choose one</option><option selected>${ACCOUNT}</option></select>`,
+  disabled: `<input id="dis" disabled value="${ACCOUNT}" style="${abs(200, "width:300px;height:40px;font-size:18px")}">`,
+  open: `<div id="openhost" style="${abs(300, "width:400px;height:40px")}"><template shadowrootmode="open"><p style="margin:0;font-size:20px">Open ${ACCOUNT}</p></template></div>`,
+  closed: `<div id="closedhost" style="${abs(300, "width:400px;height:40px")}"><template shadowrootmode="closed"><p style="margin:0;font-size:20px">Closed ${ACCOUNT}</p></template></div>`,
+  plain: `<div id="plain" style="${abs(400, "width:400px;height:40px;font-size:20px")}">Account ${ACCOUNT}</div>`,
+  overflow: `<div id="ovf" style="${abs(700, "width:400px;height:40px")}"><span id="ovfspan" style="display:inline-block;width:0;height:24px;white-space:nowrap;font-size:20px">Acct ${ACCOUNT}</span></div>`,
+  listbox: `<select id="lb" size="3" style="${abs(800, "width:300px;height:80px;font-size:16px")}"><option>One</option><option>${ACCOUNT}</option><option>Three</option></select>`,
+  below: `<div id="below" style="${abs(2500, "width:400px;height:40px;font-size:20px")}">Far below ${ACCOUNT}</div>`,
+};
+const doc = (body: string, tall = true): string =>
+  `<!doctype html><html><head><meta charset="utf-8"><title>Review</title></head><body style="margin:0;${tall ? "height:2700px;" : ""}position:relative"><h1 style="margin:0;font-size:20px">Review and Submit</h1>${body}</body></html>`;
+const PAGES: Record<string, string> = {
+  probe: doc([SPOTS.select, SPOTS.disabled, SPOTS.open, SPOTS.plain, SPOTS.overflow, SPOTS.listbox, SPOTS.below].join("")),
+  // The checker's exact shape: select, disabled input, CLOSED shadow root, plain div.
+  closed: doc([SPOTS.select, SPOTS.disabled, SPOTS.closed, SPOTS.plain].join(""), false),
+  bodyText: `<!doctype html><html><head><title>Review</title></head><body>Account ${ACCOUNT}</body></html>`,
+  twice: doc(`<div id="t" style="${abs(100, "font-size:20px")}">${ACCOUNT} <b>${ACCOUNT}</b></div>`, false),
+  hidden: doc(`<input type="hidden" name="acct" value="${ACCOUNT}"><div style="display:none">Account ${ACCOUNT}</div><p style="${abs(100)}">Nothing of it shows.</p>`, false),
+};
+
+const server = http.createServer((req, res) => {
+  const name = String(req.url || "/").replace(/^\/+/, "").split("?")[0];
+  const html = PAGES[name];
+  res.writeHead(html ? 200 : 404, { "content-type": "text/html; charset=utf-8" });
+  res.end(html ?? "<h1>Not found</h1>");
+});
+await new Promise<void>((r) => server.listen(0, "127.0.0.1", () => r()));
+const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+const dir = fs.mkdtempSync(path.join(os.tmpdir(), "autopilot-test-secretmask-"));
+
+const browser = await chromium.launch({ headless: true });
+/** A page as the staged walk opens one: no page script ever runs on it. */
+const scriptless = async (name: string): Promise<Page> => {
+  const ctx = await browser.newContext({ viewport: { width: 800, height: 600 } });
+  const pg = await ctx.newPage();
+  const cdp = await ctx.newCDPSession(pg);
+  await cdp.send("Emulation.setScriptExecutionDisabled", { value: true });
+  await pg.goto(`${base}/${name}`);
+  return pg;
+};
+/** The share of mask-colour pixels in a box of the picture (CSS pixels; the shot is scale "css"). */
+const maskShare = async (file: string, b: { x: number; y: number; w: number; h: number }): Promise<number> => {
+  const { createCanvas, loadImage } = await import("@napi-rs/canvas");
+  const img = await loadImage(fs.readFileSync(file));
+  const cv = createCanvas(img.width, img.height);
+  const g = cv.getContext("2d");
+  g.drawImage(img, 0, 0);
+  const d = g.getImageData(Math.round(b.x), Math.round(b.y), Math.round(b.w), Math.round(b.h)).data;
+  let n = 0;
+  for (let i = 0; i < d.length; i += 4) if (d[i] >= 240 && d[i + 1] <= 20 && d[i + 2] >= 240) n++;
+  return n / (d.length / 4);
+};
+
+try {
+  console.log("\n1. MUST-PASS: the probe page — every spot that shows the account is painted over");
+  {
+    const pg = await scriptless("probe");
+    const file = path.join(dir, "probe.png");
+    const m = await maskedFullPageScreenshot(pg, [ACCOUNT], file);
+    check("probe: ok:true and the picture is on disk", m.ok && fs.existsSync(file), JSON.stringify(m));
+    if (m.ok && fs.existsSync(file)) {
+      // Inside each spot, a little in from its edges (where its text stands).
+      const spots: Array<[string, { x: number; y: number; w: number; h: number }]> = [
+        ["the collapsed <select> showing the chosen account", { x: 14, y: 104, w: 290, h: 32 }],
+        ["the DISABLED input holding it", { x: 14, y: 204, w: 290, h: 32 }],
+        ["the OPEN shadow root's text", { x: 14, y: 302, w: 120, h: 18 }],
+        ["the plain div", { x: 14, y: 404, w: 200, h: 18 }],
+        ["the zero-width span's overflowing text", { x: 14, y: 702, w: 140, h: 18 }],
+        ["the listbox select", { x: 14, y: 804, w: 290, h: 72 }],
+        ["the div far below the fold (y 2500)", { x: 14, y: 2504, w: 200, h: 18 }],
+      ];
+      for (const [label, box] of spots) {
+        const share = await maskShare(file, box);
+        check(`probe: ${label} is masked`, share >= 0.9, `mask share=${share.toFixed(3)} box=${JSON.stringify(box)}`);
+      }
+      // The heading (no secret) is not masked.
+      const heading = await maskShare(file, { x: 2, y: 2, w: 150, h: 16 });
+      check("probe: the heading (no secret) is not masked", heading < 0.05, `mask share=${heading.toFixed(3)}`);
+    }
+    const left = await pg.evaluate(() => document.querySelectorAll("[data-al-secret], [data-al-secret-check]").length);
+    check("probe: every tag is cleared afterwards", left === 0, `left=${left}`);
+    // THE PIXEL CHECK ITSELF: an UNMASKED picture of the same page reads as short.
+    const plainFile = path.join(dir, "probe-unmasked.png");
+    await pg.screenshot({ path: plainFile, fullPage: true, scale: "css" });
+    const short = await unpaintedMaskBoxes(plainFile, [{ x: 10, y: 400, width: 400, height: 40 }, { x: 10, y: 2500, width: 400, height: 40 }]);
+    check("pixel check: an unmasked picture's boxes read as NOT painted over (2 of 2)", short === 2, `short=${short}`);
+    if (m.ok && fs.existsSync(file)) {
+      const none = await unpaintedMaskBoxes(file, [{ x: 10, y: 400, width: 400, height: 40 }, { x: 10, y: 2500, width: 400, height: 40 }]);
+      check("pixel check: the masked picture's boxes read as painted over (0 short)", none === 0, `short=${none}`);
+    }
+    // THE LEARNER'S TAGGER (shared): the select, never its option.
+    const n = await tagSecretsInPage(pg, secretMaskPatterns([ACCOUNT]));
+    const t = await pg.evaluate(() => ({
+      sel: document.getElementById("sel")!.hasAttribute("data-al-secret"),
+      lb: document.getElementById("lb")!.hasAttribute("data-al-secret"),
+      options: document.querySelectorAll("option[data-al-secret]").length,
+    }));
+    check("tagger: the <select>s are tagged, no <option> is", n > 0 && t.sel && t.lb && t.options === 0, JSON.stringify({ n, ...t }));
+    await clearSecretTags(pg);
+    check("tagger: clearSecretTags removes every tag", await pg.evaluate(() => document.querySelectorAll("[data-al-secret]").length) === 0);
+    await pg.context().close();
+  }
+
+  console.log("\n2. MUST-EXCLUDE: a page the mask cannot cover gives no picture at all");
+  const refused = async (name: string, want: RegExp): Promise<void> => {
+    const pg = await scriptless(name);
+    const file = path.join(dir, `${name}.png`);
+    const m = await maskedFullPageScreenshot(pg, [ACCOUNT], file);
+    check(`${name}: ok:false, named`, !m.ok && want.test(m.why), JSON.stringify(m));
+    check(`${name}: no picture on disk`, !fs.existsSync(file), file);
+    await pg.context().close();
+  };
+  await refused("closed", /closed shadow root/);
+  await refused("bodyText", /no element could be tagged/);
+  await refused("twice", /no element could be tagged/);
+
+  console.log("\n3. MUST-PASS: a secret that paints nothing needs no box");
+  {
+    const pg = await scriptless("hidden");
+    const file = path.join(dir, "hidden.png");
+    const m = await maskedFullPageScreenshot(pg, [ACCOUNT], file);
+    check("hidden: ok:true (a hidden input and a display:none div paint nothing)", m.ok && fs.existsSync(file), JSON.stringify(m));
+    const none = await maskedFullPageScreenshot(pg, [], path.join(dir, "nosecret.png"));
+    check("no secret known: a plain picture, ok:true", none.ok && fs.existsSync(path.join(dir, "nosecret.png")), JSON.stringify(none));
+    await pg.context().close();
+  }
+} finally {
+  await browser.close().catch(() => null);
+  server.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
+console.log(failures === 0 ? `\nAll ${total}/${total} secretMask checks passed.` : `\n${failures}/${total} secretMask check(s) FAILED.`);
+process.exit(failures === 0 ? 0 : 1);
