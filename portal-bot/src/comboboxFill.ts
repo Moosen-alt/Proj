@@ -102,7 +102,8 @@ const POPUP_SELECTOR_LIST = [
 ];
 const POPUP_SELECTORS = POPUP_SELECTOR_LIST.join(", ");
 // The same list, restricted to popups that were NOT on screen before we opened this widget.
-const FRESH_POPUP_SELECTORS = POPUP_SELECTOR_LIST.map((sel) => `${sel}:not([data-al-prepopup])`).join(", ");
+// Exported for the typeahead filler (#575), which finds a suggestion list the same way.
+export const FRESH_POPUP_SELECTORS =POPUP_SELECTOR_LIST.map((sel) => `${sel}:not([data-al-prepopup])`).join(", ");
 
 // A POPUP THAT WAS ALREADY ON SCREEN IS NOT THE ONE WE JUST OPENED.
 //

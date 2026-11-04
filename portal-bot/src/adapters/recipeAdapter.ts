@@ -95,6 +95,8 @@ import { reviewComparison, scrapeReviewScreen as scrapeReviewScreenShared, utili
 import { controlReadsUnanswered, pinEmptyRequiredControl, PINNED_CONTROL_ATTR, SWEPT_BLANK_ATTR, sweepEmptyRequiredControls, type EmptyRequired } from "../requiredControlSweep";
 import { openPortal } from "../browser";
 import { selectWithFallback, comboboxFaceInPage, type ComboboxPick } from "../comboboxFill";
+import { fillTypeahead, typeaheadFailureLine, TypeaheadStop } from "../typeaheadFill";
+import { typeaheadMatchMode, type TypeaheadSite } from "../typeaheadMatch";
 import { assertFilerIdentityHeld, FilerIdentityStop, filerIdentityFieldForSelect, filerIdentityStopMessage, isFilerIdentityField, isUnansweredOption, readNativeSelect, selectFilerIdentity } from "../filerIdentitySelect";
 import {
   classifySubmissionText, finalSubmitEnvAllows, finalSubmitRefusals, isFinalSubmitControl, isPayFee, isPayNowDialogText, mayClickFinalSubmit,
@@ -1452,11 +1454,13 @@ export class RecipeAdapter extends BasePortalAdapter {
       // A FilerIdentityStop that escaped the step loop (a click between steps) is the run's answer too.
       const ranRaw = await this.runAll(project).catch((err: unknown) => {
         if (err instanceof FilerIdentityStop) return fail(err.message, { driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals });
+        if (err instanceof TypeaheadStop) return fail(err.message, { driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified });
         throw err;
       });
       // ...and a stop recorded on a path that swallowed it never ends as "reached review".
-      const ran = this.filerIdentityStop && ranRaw.ok
-        ? fail(this.filerIdentityStop, { ...(ranRaw.data ?? {}), driftWarnings: this.driftWarnings, guardRefusals: this.guardRefusals })
+      const stopped = this.filerIdentityStop || this.typeaheadStop;
+      const ran = stopped && ranRaw.ok
+        ? fail(stopped, { ...(ranRaw.data ?? {}), driftWarnings: this.driftWarnings, guardRefusals: this.guardRefusals })
         : ranRaw;
       // A dismissed dialog cancelled the approved click: the result says so in data too.
       const r = this.finalSubmitNothingSent ? { ...ran, data: { ...(ran.data ?? {}), finalSubmitClicked: false, finalSubmitRequestSent: false } } : ran;
@@ -1555,6 +1559,11 @@ export class RecipeAdapter extends BasePortalAdapter {
    *  refuses, so a caller that swallows the stop (a gap-fill write, an array re-run) cannot carry the
    *  run on to Next under the portal's default company. */
   private filerIdentityStop = "";
+  /** #575 — a search-as-you-type box whose suggestions need a person (a near-miss address, several
+   *  equal suggestions): nothing was picked. Sticky for the run like filerIdentityStop — every later
+   *  step, click and key press refuses — so a caller that swallows the stop (the re-assert pass)
+   *  cannot carry the run on to Next without the address. */
+  private typeaheadStop = "";
   /** #333: after the hand-over, a person's own main-frame form request went (their submit, or a
    *  postback they made) — the run's end page is theirs now, not where the run "stopped". */
   private personMovedOn = false;
@@ -2795,8 +2804,8 @@ export class RecipeAdapter extends BasePortalAdapter {
       }
       // WHO IS FILING STOPPED THE RUN (#524) on a path that swallowed the throw (a gap-fill write, an
       // array re-run): stop here, named, before the next step.
-      if (this.filerIdentityStop) {
-        return fail(this.filerIdentityStop, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: Math.max(0, stepIdx - 1), trace, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified });
+      if (this.filerIdentityStop || this.typeaheadStop) {
+        return fail(this.filerIdentityStop || this.typeaheadStop, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: Math.max(0, stepIdx - 1), trace, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified });
       }
       // THE PORTAL SAYS THIS ADDRESS IS NOT SERVED HERE (portal-truth D5): after every step that
       // moved the page (a click, a goto), ask the one predicate of the page's visible text. A replay
@@ -3271,7 +3280,8 @@ export class RecipeAdapter extends BasePortalAdapter {
           // WHO IS FILING (#524): never retried, healed or skipped as optional — a retry or a heal
           // re-asks the same list the same question, and an optional skip leaves the portal's default
           // company standing.
-          if (err instanceof FilerIdentityStop) {
+          // A TYPEAHEAD QUESTION (#575) likewise: the same list would give the same near miss.
+          if (err instanceof FilerIdentityStop || err instanceof TypeaheadStop) {
             closePrevStepTiming();
             trace.push({ i: stepIdx, action: step.action, note: String(step.note ?? "").slice(0, 52), outcome: "FAILED", page: await currentPageLabel() });
             return fail(err.message, { executed, skipped, healedSteps: this.healedSteps, driftWarnings: this.driftWarnings, agingNotes: this.agingNotes, guardRefusals: this.guardRefusals, failedStepIndex: stepIdx, trace, slowSteps, fieldsVerified: this.fieldsVerified, fieldsUnverified: this.fieldsUnverified, pageShotDir: this.pageShotDir, outcomeShotPath: this.outcomeShotPath });
@@ -4727,6 +4737,45 @@ export class RecipeAdapter extends BasePortalAdapter {
     return String(this.fieldValues.installerCompanyName ?? "").replace(/\s+/g, " ").trim();
   }
 
+  /** #575 — A RECORDED TYPEAHEAD STEP: type THIS job's value, wait for the box's suggestions, pick the
+   *  one typeaheadMatch says is this job's (an address by house number, street, directional, unit and
+   *  city/ZIP from this run's own field values), then read the box back after the autosave. A near
+   *  miss or several equal suggestions stop the run for a person (sticky, named); no suggestions or
+   *  none matching is a FAILED step, named, with the box left empty. */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  private async fillTypeaheadStep(step: RecipeStep, scoped: any, v: string): Promise<boolean> {
+    const label = String(this.stepLabel(step) || step.note || "search box").slice(0, 60);
+    const fieldName = String(step.note ?? step.field ?? step.action).slice(0, 60);
+    const projectStreet = String(this.fieldValues.street || this.fieldValues.projectAddress || "");
+    const mode = typeaheadMatchMode({ field: step.field, label, value: v, projectStreet });
+    const site: TypeaheadSite = mode === "site"
+      ? { street: projectStreet || v, city: String(this.fieldValues.city ?? "").trim() || undefined, zip: String(this.fieldValues.zip ?? "").trim() || undefined }
+      : { street: v };
+    const out = await fillTypeahead(this.page, scoped, { value: v, mode, site });
+    if (out.outcome === "picked") {
+      await this.waitForAutosaveCommitted();
+      const shown = String((await scoped.inputValue?.({ timeout: 2000 }).catch(() => "")) ?? "").trim();
+      if (!shown) {
+        this.driftWarnings.push(`FAILED "${label}": picked "${out.picked}" and the box was empty once the page saved — the portal did not keep the pick`);
+        if (!this.fieldsUnverified.includes(fieldName)) this.fieldsUnverified.push(fieldName);
+        return false;
+      }
+      if (!this.fieldsVerified.includes(fieldName)) this.fieldsVerified.push(fieldName);
+      this.writtenTarget = scoped;
+      return true;
+    }
+    const line = typeaheadFailureLine(label, out);
+    if (!this.fieldsUnverified.includes(fieldName)) this.fieldsUnverified.push(fieldName);
+    if (out.outcome === "ask") {
+      const msg = `Stopped for a person: ${line} Answer it (or correct the project's address) and run again.`;
+      this.typeaheadStop = msg;
+      if (!this.driftWarnings.includes(`STOPPED: ${line}`)) this.driftWarnings.push(`STOPPED: ${line}`);
+      throw new TypeaheadStop(msg);
+    }
+    this.driftWarnings.push(`FAILED ${line}`);
+    return false;
+  }
+
   /** #524 — record WHO IS FILING's stop (sticky for the run) and throw it. */
   private stopOnFilerIdentity(step: RecipeStep, why: string, err?: unknown): never {
     const field = String(step.field ?? "");
@@ -5672,6 +5721,7 @@ export class RecipeAdapter extends BasePortalAdapter {
   private async executeStep(step: RecipeStep, pastReview: boolean): Promise<boolean> {
     if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (step ${String(step.note || step.action)})`);
     if (this.filerIdentityStop) throw new FilerIdentityStop(this.filerIdentityStop, String(step.field ?? ""));
+    if (this.typeaheadStop) throw new TypeaheadStop(this.typeaheadStop);
     // Which view each recorded write ran in (#362: a re-assert from another page is a pick).
     if (RecipeAdapter.WRITE_ACTIONS.has(step.action) && !this.inPolicyRetry) {
       const idx = this.recipe.steps.indexOf(step);
@@ -5988,6 +6038,10 @@ export class RecipeAdapter extends BasePortalAdapter {
         }
         if (!v) { this.noteUnresolved(step); return false; }
         await waitForElement(scoped);
+        // A SEARCH-AS-YOU-TYPE BOX (#575): typed and picked by the learner's own rule, read back
+        // by its own rule — the box holds the SUGGESTION, so fillHeld's "shows what we typed"
+        // would call a good pick a miss, and a plain fill() leaves a value nobody picked.
+        if (step.fillStrategy === "typeahead") return this.fillTypeaheadStep(step, scoped, v);
         // MASKED CONTROLS (Accela phone / zip): they keep their validation state from KEY
         // events, so .fill() - which assigns .value and fires input+change - leaves the box
         // showing the right text while the portal still reports "Required Invalid". The
@@ -7209,6 +7263,7 @@ export class RecipeAdapter extends BasePortalAdapter {
   private async guardedClick(target: unknown, why: string, opts?: { timeout?: number; force?: boolean }, flags: { passThrough?: boolean; finalSubmitApproved?: boolean; draftCreatingApproved?: boolean } = {}): Promise<void> {
     if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (${why})`);
     if (this.filerIdentityStop) throw new FilerIdentityStop(this.filerIdentityStop, "");
+    if (this.typeaheadStop) throw new TypeaheadStop(this.typeaheadStop);
     const reason = await this.guardAction({ kind: "click", target, why, ...flags });
     if (reason) throw new ReplayGuardRefusal(reason);
     // THE APPROVED FINAL SUBMIT (and its confirm dialog) is the one click whose FILING request
@@ -7236,6 +7291,7 @@ export class RecipeAdapter extends BasePortalAdapter {
   private async guardedPress(target: unknown, key: string, why: string): Promise<void> {
     if (this.inputsClosed) throw new ReplayGuardRefusal(`${INPUT_CLOSED} (${why})`);
     if (this.filerIdentityStop) throw new FilerIdentityStop(this.filerIdentityStop, "");
+    if (this.typeaheadStop) throw new TypeaheadStop(this.typeaheadStop);
     const focused = /^(enter|numpadenter|space| )$/i.test(key) && this.page && typeof this.page.locator === "function"
       ? (target && typeof (target as { evaluate?: unknown }).evaluate === "function" ? target : this.page.locator(":focus"))
       : target;

@@ -174,8 +174,9 @@ export type SiteDraftFind =
   | { found: true; entry: LedgerEntry; why: string }
   | { found: false; ambiguous: boolean; why: string };
 
-const DIRECTIONAL = /^(?:n|s|e|w|ne|nw|se|sw|north|south|east|west|northeast|northwest|southeast|southwest)$/;
-const SUFFIXES: Record<string, string> = {
+// Exported (#575) so the typeahead matcher reads a street with the same vocabulary.
+export const DIRECTIONAL = /^(?:n|s|e|w|ne|nw|se|sw|north|south|east|west|northeast|northwest|southeast|southwest)$/;
+export const SUFFIXES: Readonly<Record<string, string>> = {
   st: "st", street: "st", ave: "ave", av: "ave", avenue: "ave", rd: "rd", road: "rd", dr: "dr", drive: "dr", ln: "ln", lane: "ln",
   ct: "ct", court: "ct", cir: "cir", circle: "cir", blvd: "blvd", boulevard: "blvd", way: "way", pl: "pl", place: "pl", ter: "ter",
   terrace: "ter", trl: "trl", trail: "trl", pkwy: "pkwy", parkway: "pkwy", hwy: "hwy", highway: "hwy", loop: "loop", sq: "sq",
@@ -196,7 +197,16 @@ const zip5 = (s: string): string => { const m = String(s || "").match(/\b(\d{5})
  *  a single letter right after the suffix ("1234 Main St B") counts only on the project's own
  *  address (`strict` off): on a list row a bare letter or number after the street is an initial,
  *  a date, a size or a fee column, not a unit. `after` is what the row says past the street line. */
-export interface SiteKey { house: string; words: string[]; suffix: string; unit: string; city: string; zip: string; after: string[] }
+export interface SiteKey {
+  house: string; words: string[]; suffix: string; unit: string; city: string; zip: string; after: string[];
+  /** #575 — the street's directionals, canonical ("n", "sw"), in the order written: those inside the
+   *  street line, and one right after its suffix ("Main St NW"), read without being consumed (`after`
+   *  and the unit stay what they were). rowFit never reads it — a draft row may abbreviate them — but
+   *  a typeahead's address suggestion (typeaheadMatch) is never picked when its directional is not
+   *  the project's ("123 S Example Dr" for "123 W Example Dr"). */
+  dirs: string[];
+}
+const DIRECTION_CANON: Record<string, string> = { north: "n", south: "s", east: "e", west: "w", northeast: "ne", northwest: "nw", southeast: "se", southwest: "sw" };
 export function siteKey(site: { street?: string; city?: string; zip?: string }, strict = false): SiteKey | null {
   const raw = String(site.street ?? "");
   const city = formKey(String(site.city ?? "")).split(" ")[0] || "";
@@ -205,6 +215,7 @@ export function siteKey(site: { street?: string; city?: string; zip?: string }, 
   const houseAt = toks.findIndex((w) => /^\d+[a-z]?$/.test(w));
   if (houseAt < 0) return null;
   const words: string[] = []; let suffix = ""; let unit = ""; let i = houseAt + 1;
+  const dirs: string[] = [];
   for (; i < toks.length; i++) {
     const w = toks[i];
     if (UNIT_WORD.test(w)) { unit = toks[i + 1] ?? ""; i += 2; break; }
@@ -214,9 +225,10 @@ export function siteKey(site: { street?: string; city?: string; zip?: string }, 
       const n = toks[i] ?? "";
       if (UNIT_WORD.test(n)) { unit = toks[i + 1] ?? ""; i += 2; }
       else if (!strict && /^[a-z]$/.test(n) && !DIRECTIONAL.test(n)) { unit = n; i += 1; }
+      else if (DIRECTIONAL.test(n)) dirs.push(DIRECTION_CANON[n] ?? n);
       break;
     }
-    if (DIRECTIONAL.test(w)) continue;
+    if (DIRECTIONAL.test(w)) { dirs.push(DIRECTION_CANON[w] ?? w); continue; }
     words.push(w);
   }
   const after = toks.slice(i).concat(formKey(raw.slice(line.length)).split(" ").filter(Boolean));
@@ -224,7 +236,7 @@ export function siteKey(site: { street?: string; city?: string; zip?: string }, 
   if (!unit) { const k = after.findIndex((w) => UNIT_WORD.test(w)); if (k >= 0) unit = after[k + 1] ?? ""; }
   const zip = zip5(String(site.zip ?? "")) || zip5(after.join(" ")) || "";
   const cityOut = city || (after.find((w) => /^[a-z]{3,}$/.test(w) && !STATE.test(w)) ?? "");
-  return words.length ? { house: toks[houseAt], words, suffix, unit, city: cityOut, zip, after } : null;
+  return words.length ? { house: toks[houseAt], words, suffix, unit, city: cityOut, zip, after, dirs } : null;
 }
 
 /** Words a list row carries after an address that are never a city: statuses, actions, programs. */
