@@ -196,14 +196,33 @@ export async function resendCommunication(
 }
 
 /**
+ * THE CLIENT-EMAIL SWITCH, ONE ANSWER for every client email: status and filing updates, the
+ * installer handoff, intake and login request links and their reminders, and the email-intake
+ * reply. Four copies of this regex used to answer it separately.
+ *
+ * CLIENT_NOTIFICATIONS=off (or 0/false) silences them all. "off" too: every other kill switch in
+ * this codebase accepts it, and the demo kit's .env said CLIENT_NOTIFICATIONS=off for weeks while
+ * the old line quietly ignored it. CLIENT_NOTIFICATIONS_ALLOW_CLIENTS names the clients (ids,
+ * separated by commas or spaces) that are still mailed while it is off: a test client, so email
+ * can be exercised end to end while every real client stays silent (owner, 2026-11-03: never
+ * email the real client while email is being worked on). A caller that cannot name the client
+ * gets "off": the exception never widens to an unknown recipient.
+ */
+export function clientEmailsOffFor(clientId: string | null | undefined): boolean {
+  if (!/^(0|false|off)$/i.test(String(process.env.CLIENT_NOTIFICATIONS ?? "").trim())) return false;
+  const id = String(clientId ?? "").trim();
+  if (!id) return true;
+  const allowed = String(process.env.CLIENT_NOTIFICATIONS_ALLOW_CLIENTS ?? "").split(/[\s,;]+/).map((s) => s.trim()).filter(Boolean);
+  return !allowed.includes(id);
+}
+
+/**
  * Whether this project may talk to its client at all — the ONE answer for every client update
  * (status changes and filings alike). Synchronous, so the filing door can ask it before it
  * claims its once-per-track marker.
  */
 export function clientUpdatesSilenced(db: AppDb, project: Pick<ProjectRecord, "id" | "clientId">): boolean {
-  // "off" too: every other kill switch in this codebase accepts it, and the demo kit's .env said
-  // CLIENT_NOTIFICATIONS=off for weeks while this line quietly ignored it.
-  if (/^(0|false|off)$/i.test(String(process.env.CLIENT_NOTIFICATIONS ?? "").trim())) return true;
+  if (clientEmailsOffFor(project.clientId)) return true;
   if (!project.clientId) return true;
 
   // AN ARCHIVED PROJECT DOES NOT TALK. Hiding the card was only half the feature: the monitor

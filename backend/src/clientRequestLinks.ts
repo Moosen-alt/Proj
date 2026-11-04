@@ -54,7 +54,7 @@ import type { ProjectRecord } from "../../shared/src/types";
 import { redactSecretValues } from "../../shared/src/portalSafety";
 import { addAuditLog } from "./audit";
 import { BRAND } from "./clientUpdates";
-import { formatProjectAddress, sendEmail, smtpConfigured } from "./clientNotifier";
+import { clientEmailsOffFor, formatProjectAddress, sendEmail, smtpConfigured } from "./clientNotifier";
 import { addCommunication } from "./crm";
 import { createCredentialRequest } from "./credentialRequests";
 import { createIntakeRequest, missingIntakeFields, unansweredPortalQuestions, type IntakeField } from "./intakeRequests";
@@ -87,8 +87,15 @@ export interface ClientRequestOptions {
   nemPortalUrl?: (db: AppDb, project: ProjectRecord) => string;
 }
 
-export function clientRequestAutoSendEnabled(): boolean {
-  if (/^(0|false|off)$/i.test(String(process.env.CLIENT_NOTIFICATIONS ?? "").trim())) return false;
+/** Whether request links may be emailed to this client: the one client-email switch
+ *  (clientEmailsOffFor, with its test-client exception) and CLIENT_REQUEST_AUTO_SEND. With no client
+ *  named, the switch answers "off" whenever it is off. */
+export function clientRequestAutoSendEnabled(clientId?: string | null): boolean {
+  if (clientEmailsOffFor(clientId)) return false;
+  return requestAutoSendFlagOn();
+}
+
+function requestAutoSendFlagOn(): boolean {
   return !/^(0|false|off)$/i.test(String(process.env.CLIENT_REQUEST_AUTO_SEND ?? "").trim());
 }
 
@@ -425,13 +432,14 @@ export interface AutoSendOutcome {
 export async function autoSendClientRequests(db: AppDb, projectId: string, opts: ClientRequestOptions = {}): Promise<AutoSendOutcome> {
   const out: AutoSendOutcome = { sent: [], closed: 0 };
   try {
-    if (!clientRequestAutoSendEnabled()) return { ...out, skipped: "auto-send is off" };
+    if (!requestAutoSendFlagOn()) return { ...out, skipped: "auto-send is off" };
     const now = opts.now ?? new Date();
     const row = db.get<{ status?: string; archived_at?: string; client_id?: string; org_id?: string }>(
       "SELECT status, archived_at, client_id, org_id FROM projects WHERE id = ?", [projectId],
     );
     if (!row) return { ...out, skipped: "no such project" };
     const clientId = String(row.client_id ?? "");
+    if (!clientRequestAutoSendEnabled(clientId)) return { ...out, skipped: "auto-send is off" };
     const project = getProjectDetail(db, projectId).project;
     const live = !String(row.archived_at ?? "").trim() && HELD_STATUSES.has(String(row.status ?? ""));
 
@@ -515,13 +523,16 @@ function closeSpentCredentialAsks(db: AppDb, clientId: string, now: Date): numbe
 export async function remindClientRequests(db: AppDb, opts: ClientRequestOptions = {}): Promise<{ reminded: number; closed: number }> {
   const result = { reminded: 0, closed: 0 };
   try {
-    if (!clientRequestAutoSendEnabled()) return result;
+    if (!requestAutoSendFlagOn()) return result;
     const days = clientRequestReminderDays();
     if (days <= 0) return result;
     const now = opts.now ?? new Date();
     const cutoff = new Date(now.getTime() - days * 86_400_000).toISOString();
     const due = openAsks(db, "reminder_at = '' AND delivery_status = 'sent' AND sent_at <= ?", [cutoff]);
     for (const ask of due) {
+      // The switch per client, before anything else: an ask for a client the switch silences is
+      // left exactly as it was (not reminded, not closed), as when the whole tick returned early.
+      if (!clientRequestAutoSendEnabled(ask.client_id)) continue;
       try {
         const row = db.get<{ status?: string; archived_at?: string; org_id?: string }>(
           "SELECT status, archived_at, org_id FROM projects WHERE id = ?", [ask.project_id],
