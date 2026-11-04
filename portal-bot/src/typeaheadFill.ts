@@ -106,13 +106,47 @@ export function readSuggestionsInPage(args: { controlsId: string; fresh: string 
   return out;
 }
 
+/**
+ * Runs IN THE PAGE. Whether the box's suggestion panel shows that it is still loading: a visible
+ * progress bar, spinner or aria-busy in the list the box names (and up to three of its ancestors,
+ * the overlay pane it sits in) or around the box itself. A list that is still loading is not an
+ * empty one — a city's GIS search showed its progress bar for longer than the per-query wait, and
+ * the fill gave up on a list that was about to answer (#575, live). No nested functions.
+ */
+export function suggestionsLoadingInPage(args: { controlsId: string }): boolean {
+  const roots: Element[] = [];
+  if (args.controlsId) {
+    for (const id of args.controlsId.split(/\s+/)) {
+      let el: Element | null = id ? document.getElementById(id) : null;
+      for (let i = 0; i < 4 && el; i++) { roots.push(el); el = el.parentElement; }
+    }
+  }
+  let box: Element | null = document.activeElement;
+  for (let i = 0; i < 4 && box && box !== document.body; i++) { roots.push(box); box = box.parentElement; }
+  const SEL = '[role="progressbar"], mat-progress-bar, mat-spinner, mat-progress-spinner, [aria-busy="true"], [class*="progress"], [class*="spinner"], [class*="loading"]';
+  for (const root of roots) {
+    if (root.getAttribute("aria-busy") === "true") return true;
+    const found = root.querySelectorAll(SEL);
+    for (let i = 0; i < found.length; i++) {
+      const el = found[i] as HTMLElement;
+      const r = el.getBoundingClientRect();
+      const s = getComputedStyle(el);
+      if (r.width > 0 && r.height > 0 && s.visibility !== "hidden" && s.display !== "none" && s.opacity !== "0") return true;
+    }
+  }
+  return false;
+}
+
 /** Poll until the suggestions hold still (two equal reads in a row) or the wait ends. Returns the
- *  last read, raw (indexes line up with the data-al-sugg marks); [] when nothing real was offered. */
+ *  last read, raw (indexes line up with the data-al-sugg marks); [] when nothing real was offered.
+ *  While the panel shows it is still loading (suggestionsLoadingInPage) the wait carries on past
+ *  its own length, never past the fill's deadline. */
 async function settledSuggestions(page: any, controlsId: string, waitMs: number, deadline: number): Promise<string[]> {
   const until = Math.min(Date.now() + waitMs, deadline);
   let prev = "";
   let last: string[] = [];
-  while (Date.now() < until) {
+  let loading = false;
+  while (Date.now() < until || (loading && Date.now() < deadline)) {
     await page.waitForTimeout?.(250).catch(() => null);
     const read = await page.evaluate(readSuggestionsInPage, { controlsId, fresh: FRESH_POPUP_SELECTORS }).catch(() => [] as string[]);
     const rows = Array.isArray(read) ? read.map((t) => String(t ?? "")) : [];
@@ -120,6 +154,9 @@ async function settledSuggestions(page: any, controlsId: string, waitMs: number,
     if (rows.some((t) => suggestionText(t)) && sig === prev) return rows;
     prev = sig;
     last = rows;
+    loading = rows.some((t) => suggestionText(t))
+      ? false
+      : Boolean(await page.evaluate(suggestionsLoadingInPage, { controlsId }).catch(() => false));
   }
   return last.some((t) => suggestionText(t)) ? last : [];
 }

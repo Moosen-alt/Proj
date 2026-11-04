@@ -91,7 +91,7 @@ const formPage = (mode: string): string => `<!doctype html><html><head><title>Pu
 <button type="button" id="next">Next</button>
 <div class="cdk-overlay-container"></div>
 <script>
-  var BOOK = ${JSON.stringify(BOOKS[mode] ?? [])};
+  var BOOK = ${JSON.stringify(BOOKS[mode] ?? (mode === "slow" ? BOOKS.exact : []))};
   var MODE = ${JSON.stringify(mode)};
   var box = document.getElementById("cw-ui-input-2000000000000002");
   var overlay = document.querySelector(".cdk-overlay-container");
@@ -132,6 +132,19 @@ const formPage = (mode: string): string => `<!doctype html><html><head><title>Pu
     clearTimeout(timer);
     var q = box.value.trim();
     if (q.length < 3) { close(); return; }
+    if (MODE === "slow") {
+      // A slow GIS search (the live city's): the panel opens at once with only a progress bar,
+      // and the suggestions arrive 9 s later, longer than one query's own wait.
+      close();
+      var loadingPanel = document.createElement("div");
+      loadingPanel.className = "cw-ui-autocomplete-panel"; loadingPanel.setAttribute("role", "listbox");
+      loadingPanel.id = "list-cw-ui-input-2000000000000002";
+      var bar = document.createElement("div"); bar.className = "cw-progress-bar"; bar.setAttribute("role", "progressbar");
+      bar.style.cssText = "height:4px;background:#1976d2";
+      loadingPanel.appendChild(bar); overlay.appendChild(loadingPanel); box.setAttribute("aria-expanded", "true");
+      timer = setTimeout(function () { render(q); }, 9000);
+      return;
+    }
     // The GIS search answers after a debounce and a round trip.
     timer = setTimeout(function () { render(q); }, 350);
   });
@@ -304,6 +317,24 @@ if (recorded) {
   check("...nothing picked, the box empty",
     r.after.picked === "" && r.after.value === "", `picked=${JSON.stringify(r.after.picked)} value=${JSON.stringify(r.after.value)}`);
   await r.page.close();
+}
+
+// ---- E2) A SLOW LIST: a panel that shows a progress bar is still loading, not empty ---------------
+{
+  const page = await ctx.newPage();
+  await page.goto(`${base}/?mode=slow`);
+  const t0 = Date.now();
+  const out = await fillTypeahead(page, page.locator("#cw-ui-input-2000000000000002"), {
+    value: JOB.street, mode: "site", site: { street: JOB.street, city: JOB.city, zip: JOB.zip },
+  });
+  const ms = Date.now() - t0;
+  const after = await read(page);
+  console.log(`   slow list: ${ms} ms outcome=${out.outcome} after=${JSON.stringify(after)}`);
+  check("slow list (9 s behind a progress bar): the fill waits while it loads and picks the job's address",
+    out.outcome === "picked" && after.value === "4821 W QUILLFEATHER DR, MARROWVALE, UT 84999" && /^PICKED 4821 W QUILLFEATHER DR/.test(after.picked),
+    JSON.stringify({ outcome: out.outcome, after }));
+  check("...within the fill's 30 s budget", ms < 30_000, `${ms} ms`);
+  await page.close();
 }
 
 // ---- F) NO SUGGESTIONS: a named failure, within the fill's budget ---------------------------------
