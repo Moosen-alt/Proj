@@ -4335,6 +4335,13 @@ export interface RecipeStep {
    *  signing statement): the step types that part of the client's authorized signer
    *  (splitSignerName), never the whole name, never a contact's. Only on signature steps. */
   signerNamePart?: "first" | "last";
+  /** HOW a fill step writes its value (#575), kept apart from the label, which stays the matching key.
+   *  "typeahead": an editable search-as-you-type box (role=combobox + aria-autocomplete list|both — a
+   *  city's GIS address search, a contractor lookup): type the value, wait for the box's own
+   *  suggestions, click the ONE that matches (an address by house number, street words, directional,
+   *  unit and city/ZIP — portal-bot typeaheadMatch), read it back. A near miss or several equal
+   *  suggestions pick nothing and stop for a person. Absent = an ordinary fill. */
+  fillStrategy?: "typeahead";
   /** Set when this step's recorded answer was withheld from the shared recipe and the step replays
    *  BLANK for a person to answer — why, in words (e.g. a company-identity literal the save guard
    *  refused to persist). Metadata only: never part of the step's label or matching. */

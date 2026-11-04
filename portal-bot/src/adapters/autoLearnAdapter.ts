@@ -7,6 +7,8 @@ import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep, StepFinge
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, type PortalContext, type PortalStepResult } from "../adapter";
 import { openPortal } from "../browser";
 import { selectWithFallback, readClosedComboboxOptions } from "../comboboxFill";
+import { fillTypeahead, typeaheadFailureLine } from "../typeaheadFill";
+import { typeaheadMatchMode, type TypeaheadSite } from "../typeaheadMatch";
 import { assertFilerIdentityHeld, FilerIdentityStop, filerIdentityFieldForSelect, filerIdentityStopMessage, selectFilerIdentity } from "../filerIdentitySelect";
 import { detectChallengeFrame, frameSelectorFor, maskId, readbackMatches, redactCaptureText, redactStatusText, safeAction, sleep, smartWait, waitForElement, waitForInteractiveControls } from "../safeAction";
 import { applyFormatHint } from "../formatHint";
@@ -168,6 +170,11 @@ export interface ExtractedField {
    *  Carried so the planner's navigate and advance doors can refuse it: a tile is entered by
    *  the chooser (by vocabulary) or by the single-tile door, never by the planner. */
   tile?: boolean;
+  /** HOW the control takes a value, apart from its label (#575): "typeahead" — a search-as-you-type
+   *  box (editable role=combobox, aria-autocomplete list|both). applyFill types the value, waits for
+   *  the box's suggestions and picks the one typeaheadMatch says is this job's; the recorded step
+   *  carries the same strategy (RecipeStep.fillStrategy) so the replay does the same. */
+  fillStrategy?: "typeahead";
 }
 
 export interface LearnPlanRequest {
@@ -308,6 +315,11 @@ export interface LearnResult {
    *  select with no option that is exactly this client's (or two). Nothing was selected there, and
    *  no step was recorded for it. Undefined when none. */
   filerIdentityRefused?: string[];
+  /** #575 — SEARCH-AS-YOU-TYPE BOXES THAT PICKED NOTHING, one operator-readable line each: a
+   *  question for a person (a near-miss address, several equal suggestions — the walk stopped on it,
+   *  stopReason "typeahead_question") or a named failure (no suggestions, none matching, a pick the
+   *  box did not keep). Nothing was picked there and the box was left empty. Undefined when none. */
+  typeaheadMisses?: string[];
   /** The FULL url (query string included) of the application this run worked on, captured
    *  where it stopped. Without it there is no way to audit the right application afterwards:
    *  a portal list can hold several drafts for the same customer, and auditing "the first" or
@@ -1515,6 +1527,9 @@ export interface RawField {
   /** A choice tile (markChoiceTilesInPage): a card clicked as a whole, labelled by its title.
    *  Its selector is the title TEXT — getByRole finds nothing on a plain container. */
   tile?: boolean;
+  /** A search-as-you-type box (#575): an editable <input role=combobox aria-autocomplete=list|both>.
+   *  Its fieldType stays "text"; see ExtractedField.fillStrategy. */
+  typeahead?: boolean;
 }
 
 // Serializable extractor — derives a label and selector hints for each interactive
@@ -1873,12 +1888,28 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
     // custom-dropdown block below still handles it — that block ALSO captures the
     // aria-controls listbox's rendered options into RawField.options, which gap-fill
     // uses to validate planner-proposed values. Upgrading divs here would skip it.
+    //
+    // ...EXCEPT A SEARCH-AS-YOU-TYPE BOX, WHICH IS TYPED INTO (#575). Cityworks' GIS "Location" is
+    // <input role="combobox" aria-autocomplete="list" aria-controls="list-…"> — EDITABLE, and its
+    // list exists only after typing. As a "select" it was opened (an empty list), nothing was
+    // picked, and the value dropped in silence; Next then did nothing, page after page. The gate is
+    // the box SAYING it completes from a list as you type (aria-autocomplete list|both) and being
+    // editable: PowerClerk's filtered-select carries no aria-autocomplete (and is readonly live),
+    // and plain editable combobox inputs that open their list on click stay selects. It stays a
+    // TEXT field (the planner binds it like any address box) and carries its strategy apart from
+    // its label, which remains the matching key; applyFill and the replay type, wait and pick.
+    let typeahead = false;
     {
       const comboRole = (el.getAttribute("role") || "").toLowerCase();
       const comboPopup = (el.getAttribute("aria-haspopup") || "").toLowerCase();
       if ((comboRole === "combobox" || comboRole === "listbox" || comboPopup === "listbox") &&
           tag === "input" && fieldType === "text") {
-        fieldType = "select";
+        const completes = (el.getAttribute("aria-autocomplete") || "").toLowerCase();
+        const box = el as HTMLInputElement;
+        const editable = !box.readOnly && !box.disabled && el.getAttribute("aria-readonly") !== "true"
+          && el.getAttribute("aria-disabled") !== "true";
+        if (comboRole === "combobox" && (completes === "list" || completes === "both") && editable) typeahead = true;
+        else fieldType = "select";
       }
     }
 
@@ -2096,6 +2127,7 @@ export function extractFieldsInPage(els: Element[]): RawField[] {
     out.push({
       label, fieldType, options, role, name, placeholder, id, text, href,
       tile: tileLabel ? true : undefined,
+      typeahead: typeahead && fieldType === "text" ? true : undefined,
       required: required || undefined,
       section: sectionFor(el) || undefined,
       testCss,
@@ -2213,6 +2245,7 @@ export function toExtractedField(raw: RawField): ExtractedField {
   // `disabled` that stops at the RawField boundary would make every gated Next invisible to it.
   if (raw.disabled) field.disabled = true;
   if (raw.tile) field.tile = true;
+  if (raw.typeahead && raw.fieldType === "text") field.fillStrategy = "typeahead";
   // Fingerprint: raw element attributes for replay-heal tie-breaking. Attribute
   // NAMES/labels only — never values, so nothing sensitive can land in a recipe.
   if (raw.id || raw.name || raw.placeholder || raw.ariaLabel || raw.section) {
@@ -2241,6 +2274,8 @@ interface AppliedFill {
   selector: RecipeSelector;
   label: string;
   fieldType: ExtractedField["fieldType"];
+  /** #575 — a search-as-you-type box: re-applied by typing and picking (applyFill), never fill(). */
+  fillStrategy?: ExtractedField["fillStrategy"];
   /** Value typed (empty for sensitive fields, which are only checked for non-emptiness). */
   expected: string;
   sensitive: boolean;
@@ -2577,6 +2612,16 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   private readonly secretsLeftBlank: Array<{ label: string; bound: boolean }> = [];
   /** #524 — company / contact-code selects refused (see LearnResult.filerIdentityRefused). */
   private readonly filerIdentityRefused: string[] = [];
+  /** #575 — typeahead boxes that picked nothing (see LearnResult.typeaheadMisses). */
+  private readonly typeaheadMisses: string[] = [];
+  /** #575 — a typeahead whose suggestions need a person (a near miss, several equal), set by
+   *  applyFill and read once the page's fills are applied: the walk stops there with it. */
+  private typeaheadQuestion: string | null = null;
+  /** #575 — label + value → the outcome already met, so a re-plan of the same blank (#410) does not
+   *  retype the same address into the same box and wait out the same empty list again. */
+  private readonly typeaheadTried = new Map<string, string>();
+  /** #575 — the job's site address, which an address suggestion is judged against (set by learn()). */
+  private typeaheadSite: TypeaheadSite = { street: "" };
   /** True once the delegated final submit actually went through. Read by the caller. */
   finalSubmitClicked = false;
   /** The completion/receipt page as text + URL, captured while standing on it. */
@@ -4606,6 +4651,12 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       // What discipline this run is filing. Held on the instance so the fill guard can refuse
       // a record type that contradicts it — the planner sees one page at a time and does not.
       this.permitDiscipline = String(project.permitType ?? "");
+      // #575: the job's own address, which a typeahead's address suggestion must be unmistakably.
+      this.typeaheadSite = {
+        street: String(project.projectAddress ?? "").split(",")[0].trim(),
+        city: String(project.city ?? this.siteIdentity?.city ?? "").trim() || undefined,
+        zip: String(project.zip ?? this.siteIdentity?.zip ?? "").trim() || undefined,
+      };
       // The secrets a recorded step binds by name, read from the SAME project fields the replay's
       // value map uses (portalRecipes.resolveRecipeFieldValues: accountNumber / meterNumber).
       this.secretSource = {
@@ -4640,6 +4691,17 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       result = { ...result, pageExitReads: { read: [...this.pageExitReads.read], unread: [...this.pageExitReads.unread] } };
       if (this.equipmentStrays.length) {
         result = { ...result, message: `${result.message} EQUIPMENT FILL REACHED ANOTHER CONTROL — check before submitting: ${this.equipmentStrays.slice(0, 6).map((l) => this.scrubSecrets(l)).join("; ")}.` };
+      }
+      // #575: a search box that picked nothing is said, whichever way the walk ended (a stop on its
+      // question already leads with it).
+      if (this.typeaheadMisses.length) {
+        const lines = this.typeaheadMisses.map((l) => this.scrubSecrets(l));
+        const unsaid = lines.filter((l) => !String(result!.message ?? "").includes(l));
+        result = {
+          ...result,
+          typeaheadMisses: lines,
+          ...(unsaid.length ? { message: `${result.message} 📍 Not picked — ${unsaid.slice(0, 4).join(" | ")}` } : {}),
+        };
       }
       if (this.infoPageCandidate) result = { ...result, infoPageCandidate: this.infoPageCandidate };
       if (this.infoPagePassed.length) result = { ...result, infoPagePassed: [...this.infoPagePassed] };
@@ -8246,6 +8308,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             selector: field.selector,
             label: field.label || "",
             fieldType: field.fieldType,
+            fillStrategy: field.fillStrategy,
             expected: sensitive ? "" : (fillReq.value ?? ""),
             sensitive,
             required: !!field.required,
@@ -8253,6 +8316,22 @@ export class AutoLearnAdapter extends BasePortalAdapter {
             secretBinding: this.typedSecretBinding(step),
           });
         }
+      }
+
+      // d1') A SEARCH BOX WHOSE SUGGESTIONS NEED A PERSON STOPS THE WALK HERE (#575). The city's map
+      //      lists the house under another street direction (or another unit, or twice): picking any
+      //      of them could file the permit against the wrong property, and without a pick the page
+      //      cannot advance — re-planning it only re-asks the same list. Nothing was picked, the box
+      //      was left empty, and the question is the run's answer. No pauseReason: nothing here is a
+      //      challenge or a park, and the browser is not held for anyone.
+      if (this.typeaheadQuestion) {
+        const question = this.typeaheadQuestion;
+        this.debug?.event({ type: "typeahead_question_stop", page: pageCount });
+        return {
+          ...fail(steps, this.portalName, `Stopped for a person on page ${pageCount}: ${question} Answer it (or correct the project's address) and run again; the steps before this page were recorded.`, null, pageCount, portalNotices),
+          stopReason: "typeahead_question",
+          typeaheadMisses: [...this.typeaheadMisses],
+        };
       }
 
       // d2) SENSITIVE-FIELD DETERMINISTIC PASS — any sensitive text field (account/meter number)
@@ -8449,6 +8528,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
                   selector: field.selector,
                   label: field.label || "",
                   fieldType: field.fieldType,
+                  fillStrategy: field.fillStrategy,
                   expected: fillReq.value ?? "",
                   sensitive: false,
                   required: !!field.required,
@@ -10559,6 +10639,71 @@ export class AutoLearnAdapter extends BasePortalAdapter {
     };
   }
 
+  /** #575 — fill a search-as-you-type box: type, wait for its suggestions, pick the ONE typeaheadMatch
+   *  says is this job's (typeaheadFill), and record a fill step carrying the same strategy. Anything
+   *  else picks nothing and is said (typeaheadMisses); a near miss or several equal suggestions also
+   *  set the question the walk stops on. Never a secret: a box whose suggestions are read never gets
+   *  one typed into it. */
+  private async applyTypeaheadFill(
+    field: ExtractedField,
+    fillReq: { value: string; field?: string },
+    value: string,
+    sensitive: boolean,
+  ): Promise<RecipeStep | null> {
+    const label = String(field.label ?? "").replace(/\s+/g, " ").trim().slice(0, 80);
+    const miss = (line: string): null => {
+      if (line && !this.typeaheadMisses.includes(line)) this.typeaheadMisses.push(line);
+      return null;
+    };
+    if (sensitive) return miss(`"${label}": a sensitive value is never typed into a search box whose suggestions are read — left for a person.`);
+    const v = String(value ?? "").replace(/\s+/g, " ").trim();
+    if (!v) return null;
+    // A re-plan of the same blank asks for the same value again: the answer has not changed. Keyed
+    // by the control too, so another box with the same label and value (a mailing address on a
+    // later page) is still tried, and said, rather than skipped.
+    const memo = `${JSON.stringify(field.selector ?? {})}\u0000${label}\u0000${v}`;
+    const prior = this.typeaheadTried.get(memo);
+    if (prior) {
+      this.debug?.event({ type: "typeahead_not_retried", label: label.slice(0, 60), outcome: prior });
+      return null;
+    }
+    const mode = typeaheadMatchMode({ field: fillReq.field, label, value: v, projectStreet: this.typeaheadSite.street });
+    const site: TypeaheadSite = mode === "site"
+      ? { street: this.typeaheadSite.street || v, city: this.typeaheadSite.city, zip: this.typeaheadSite.zip }
+      : { street: v };
+    const loc = await this.locator(field.selector).catch(() => null);
+    const out = loc
+      ? await fillTypeahead(this.page, loc, { value: v, mode, site })
+      : { outcome: "unusable" as const, why: "the box could not be located" };
+    // Outcome and counts only — never the address or the suggestions themselves.
+    this.debug?.event({ type: "typeahead_fill", label: label.slice(0, 60), mode, outcome: out.outcome, ...("offered" in out ? { offered: out.offered.length } : {}) });
+    if (out.outcome !== "picked") {
+      this.typeaheadTried.set(memo, out.outcome);
+      const line = typeaheadFailureLine(label, out);
+      if (out.outcome === "ask" && !this.typeaheadQuestion) this.typeaheadQuestion = line;
+      return miss(line);
+    }
+    const step: RecipeStep = {
+      action: "fill",
+      phase: "fill",
+      selector: field.selector,
+      note: field.label || undefined,
+      fillStrategy: "typeahead",
+      ...(field.fingerprint ? { fingerprint: field.fingerprint } : {}),
+    };
+    // BOUND, NEVER THE SUGGESTION'S TEXT: a recipe is shared, and each replay types ITS job's value
+    // and picks ITS job's suggestion by the same rule. The job's own address typed unbound is
+    // rebound to `street` (correctTruncatedAddressFill's reason: never this project's literal).
+    const bindable = (k: string): boolean => !this.bindableFields.size || this.bindableFields.has(k);
+    if (fillReq.field && bindable(fillReq.field)) step.field = fillReq.field;
+    else if (mode === "site" && bindable("street")) step.field = "street";
+    else {
+      if (fillReq.field) this.debug?.event({ type: "unbindable_field_refused", field: String(fillReq.field), label: label.slice(0, 60) });
+      step.value = v;
+    }
+    return step;
+  }
+
   private async applyFillInner(
     field: ExtractedField,
     fillReq: { value: string; field?: string },
@@ -10757,6 +10902,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const filer = this.filerIdentityFieldFor(field, fillReq.field);
       if (filer) return this.applyFilerIdentitySelect(field, filer, fillReq);
     }
+
+    // A SEARCH-AS-YOU-TYPE BOX IS TYPED INTO AND PICKED FROM (#575): fill() would leave the value
+    // un-picked in the box (which then reads as "held"), and the select path opens an empty list.
+    if (action === "fill" && field.fillStrategy === "typeahead") return this.applyTypeaheadFill(field, fillReq, value, sensitive);
 
     const res = await safeAction(
       // The label is non-PII enough for a log line, but keep it short.
@@ -11066,6 +11215,7 @@ export class AutoLearnAdapter extends BasePortalAdapter {
         selector: field.selector,
         label: field.label || "",
         fieldType: field.fieldType,
+        fillStrategy: field.fillStrategy,
         expected: fillReq.value ?? "",
         sensitive: false,
         required: !!field.required,
@@ -11388,6 +11538,17 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           }
         } else if (a.sensitive || !a.expected) {
           // nothing to retype — fall through to the re-check
+        } else if (a.fillStrategy === "typeahead") {
+          // #575: by typing and picking again, never fill() — a typed value nobody picked would read
+          // as held here and be dropped by the portal later. A miss is said (typeaheadMisses).
+          const mode = typeaheadMatchMode({ label: a.label, value: a.expected, projectStreet: this.typeaheadSite.street });
+          const site: TypeaheadSite = mode === "site" ? { ...this.typeaheadSite, street: this.typeaheadSite.street || a.expected } : { street: a.expected };
+          const again = await fillTypeahead(this.page, loc, { value: a.expected, mode, site });
+          if (again.outcome !== "picked") {
+            const line = typeaheadFailureLine(a.label, again);
+            if (line && !this.typeaheadMisses.includes(line)) this.typeaheadMisses.push(line);
+            if (again.outcome === "ask" && !this.typeaheadQuestion) this.typeaheadQuestion = line;
+          }
         } else if (a.fieldType === "select") {
           if (!(await selectWithFallback(this.page!, loc, a.expected))) await this.noteSelectNotOffered(loc, a.label, a.expected, a.sensitive);
         } else if (a.fieldType === "checkbox" || a.fieldType === "radio") {
