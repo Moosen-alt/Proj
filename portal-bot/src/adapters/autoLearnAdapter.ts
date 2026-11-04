@@ -320,6 +320,10 @@ export interface LearnResult {
    *  stopReason "typeahead_question") or a named failure (no suggestions, none matching, a pick the
    *  box did not keep). Nothing was picked there and the box was left empty. Undefined when none. */
   typeaheadMisses?: string[];
+  /** #575 — search boxes where the portal's own spelling of the job's address was picked: only the
+   *  street direction differed and it was the only such address (typeaheadMatch's one exception).
+   *  A person checks the project's address. Undefined when none. */
+  typeaheadAdjusted?: string[];
   /** The FULL url (query string included) of the application this run worked on, captured
    *  where it stopped. Without it there is no way to audit the right application afterwards:
    *  a portal list can hold several drafts for the same customer, and auditing "the first" or
@@ -2614,6 +2618,8 @@ export class AutoLearnAdapter extends BasePortalAdapter {
   private readonly filerIdentityRefused: string[] = [];
   /** #575 — typeahead boxes that picked nothing (see LearnResult.typeaheadMisses). */
   private readonly typeaheadMisses: string[] = [];
+  /** #575 — typeahead picks in the portal's spelling (see LearnResult.typeaheadAdjusted). */
+  private readonly typeaheadAdjusted: string[] = [];
   /** #575 — a typeahead whose suggestions need a person (a near miss, several equal), set by
    *  applyFill and read once the page's fills are applied: the walk stops there with it. */
   private typeaheadQuestion: string | null = null;
@@ -4702,6 +4708,10 @@ export class AutoLearnAdapter extends BasePortalAdapter {
           typeaheadMisses: lines,
           ...(unsaid.length ? { message: `${result.message} 📍 Not picked — ${unsaid.slice(0, 4).join(" | ")}` } : {}),
         };
+      }
+      if (this.typeaheadAdjusted.length) {
+        const lines = this.typeaheadAdjusted.map((l) => this.scrubSecrets(l));
+        result = { ...result, typeaheadAdjusted: lines, message: `${result.message} 📍 Portal's spelling used — ${lines.slice(0, 4).join(" | ")}` };
       }
       if (this.infoPageCandidate) result = { ...result, infoPageCandidate: this.infoPageCandidate };
       if (this.infoPagePassed.length) result = { ...result, infoPagePassed: [...this.infoPagePassed] };
@@ -10682,6 +10692,11 @@ export class AutoLearnAdapter extends BasePortalAdapter {
       const line = typeaheadFailureLine(label, out);
       if (out.outcome === "ask" && !this.typeaheadQuestion) this.typeaheadQuestion = line;
       return miss(line);
+    }
+    if (out.adjusted) {
+      const note = `"${label}": ${out.adjusted}`;
+      if (!this.typeaheadAdjusted.includes(note)) this.typeaheadAdjusted.push(note);
+      this.debug?.event({ type: "typeahead_adjusted", label: label.slice(0, 60) });
     }
     const step: RecipeStep = {
       action: "fill",

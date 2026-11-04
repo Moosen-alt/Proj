@@ -14,9 +14,14 @@
 //     and street suffixes (Dr / Drive) are normalized by the shared site key (draftCreated
 //     siteKey — the draft finder's own address tokenizer, so the two never disagree on what a
 //     suffix, a unit or a ZIP is) and its row verdict (rowFit) decides unit / ZIP / city;
-//   - a near miss (a directional, a unit, a city the suggestion names that is not the job's) or
-//     several equally good suggestions pick NOTHING: the run stops with a plain question for a
-//     person ("The portal's address list shows … ; the project says … . Use the portal's?");
+//   - ONE exception (owner, 2026-11-04): when the only near miss on the list differs ONLY in its
+//     street direction (same number, street words, suffix, unit and city/ZIP; the same line
+//     listed twice counts once), it is the city's spelling of this house and is picked, said in
+//     `adjusted` (the learner's message, the replay's drift notes) so a person checks the
+//     project's address. A second direction on the list (S and N) still asks;
+//   - any other near miss (a unit, a city the suggestion names that is not the job's) or several
+//     equally good suggestions pick NOTHING: the run stops with a plain question for a person
+//     ("The portal's address list shows … ; the project says … . Use the portal's?");
 //   - any other lookup (a contractor, a parcel) is picked only on an exact match of the bound
 //     value (case, spacing and punctuation ignored), exactly one.
 //
@@ -28,8 +33,9 @@ import { DIRECTIONAL, SUFFIXES, rowFit, siteKey, type SiteKey } from "./draftCre
 
 /** What to do with a list of suggestions. */
 export type TypeaheadChoice =
-  /** Exactly one suggestion is the job's: click it. */
-  | { kind: "pick"; index: number; text: string; why: string }
+  /** Exactly one suggestion is the job's: click it. `adjusted` says the portal's spelling differs
+   *  from the project's (only the street direction) and must be shown to a person. */
+  | { kind: "pick"; index: number; text: string; why: string; adjusted?: string }
   /** A near miss or several equal candidates: pick nothing; ask a person `question`. */
   | { kind: "ask"; question: string; candidates: string[]; why: string }
   /** Nothing offered is the job's (or nothing was offered). */
@@ -89,7 +95,7 @@ function suffixAfterWords(text: string, key: SiteKey): string {
   return SUFFIXES[t] ?? (t === "ct" ? "ct" : "");
 }
 
-type Verdict = { kind: "exact" } | { kind: "near"; why: string } | { kind: "other" };
+type Verdict = { kind: "exact" } | { kind: "near"; why: string; dirOnly: boolean } | { kind: "other" };
 
 /** How one suggestion fits the job's site key. */
 function fitSuggestion(text: string, key: SiteKey, city: string, projectStreet: string): Verdict {
@@ -113,10 +119,11 @@ function fitSuggestion(text: string, key: SiteKey, city: string, projectStreet: 
   } else if (fit.fit === "ambiguous") {
     reasons.push(fit.why.replace(/\bthe row\b/g, "the suggestion"));
   }
+  const others = reasons.length;
   if (rk.dirs.join(" ") !== key.dirs.join(" ")) {
     reasons.push(`the street direction differs: ${dirsWord(rk.dirs)} on the portal, ${dirsWord(key.dirs)} on the project`);
   }
-  return reasons.length ? { kind: "near", why: reasons.join("; ") } : { kind: "exact" };
+  return reasons.length ? { kind: "near", why: reasons.join("; "), dirOnly: others === 0 } : { kind: "exact" };
 }
 
 /**
@@ -132,17 +139,38 @@ export function chooseAddressSuggestion(suggestions: unknown[], site: TypeaheadS
   const city = String(site.city ?? "");
   const texts = (Array.isArray(suggestions) ? suggestions : []).map(suggestionText);
   const exact: Array<{ index: number; text: string }> = [];
-  const near: Array<{ index: number; text: string; why: string }> = [];
+  const near: Array<{ index: number; text: string; why: string; dirOnly: boolean }> = [];
+  // THE SAME LINE TWICE IS ONE ADDRESS. A city's GIS can list one house twice, word for word (an
+  // address point and its parcel; live: two identical rows). Rows written differently ("DR" and
+  // "Drive") still count as two candidates and are asked about.
+  const seen = new Set<string>();
   for (let index = 0; index < texts.length; index++) {
     const text = texts[index];
     if (!text) continue;
+    const same = text.toLowerCase().replace(/\s+/g, " ").trim();
+    if (seen.has(same)) continue;
+    seen.add(same);
     const v = fitSuggestion(text, key, city, String(site.street ?? ""));
     if (v.kind === "exact") exact.push({ index, text });
-    else if (v.kind === "near") near.push({ index, text, why: v.why });
+    else if (v.kind === "near") near.push({ index, text, why: v.why, dirOnly: v.dirOnly });
   }
   const offered = texts.filter(Boolean);
   if (exact.length === 1) {
     return { kind: "pick", index: exact[0].index, text: exact[0].text, why: `"${exact[0].text}" is the project's address (house number, street, direction${key.unit ? ", unit" : ""}${key.city || key.zip ? " and city/ZIP where shown" : ""})` };
+  }
+  // ONLY THE STREET DIRECTION DIFFERS, AND IT IS THE ONLY SUCH ADDRESS (owner, 2026-11-04: "can we
+  // have it pick automatically if something like this happens"). The same house number, street
+  // words, suffix, unit and city/ZIP, and the city's list offers no other direction of it: the
+  // city's own record of this house, spelled its way. In a grid city "4024 W" and "4024 S" can be
+  // two real streets, so this holds only while it is the ONE candidate: a second direction on the
+  // list (S and N), or any other difference, still asks. The pick is never silent (`adjusted`).
+  if (!exact.length && near.length === 1 && near[0].dirOnly) {
+    const n = near[0];
+    return {
+      kind: "pick", index: n.index, text: n.text,
+      why: `"${n.text}" is the project's address in the portal's spelling (${n.why}; the only such address on the list)`,
+      adjusted: `picked the portal's "${n.text}" for the project's "${street}": ${n.why}, and it was the only such address on the list. Check the project's address.`,
+    };
   }
   if (exact.length > 1) {
     const list = exact.slice(0, 5).map((e) => `"${e.text}"`).join(" | ");

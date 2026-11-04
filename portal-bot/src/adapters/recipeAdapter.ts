@@ -4761,6 +4761,9 @@ export class RecipeAdapter extends BasePortalAdapter {
         return false;
       }
       if (!this.fieldsVerified.includes(fieldName)) this.fieldsVerified.push(fieldName);
+      // The portal's own spelling of this job's address was picked (only the street direction
+      // differed, the only such address): never silent, a person checks the project's address.
+      if (out.adjusted) this.driftWarnings.push(`NOTE "${label}": ${out.adjusted}`);
       this.writtenTarget = scoped;
       return true;
     }

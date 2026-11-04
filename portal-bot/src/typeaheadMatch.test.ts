@@ -4,9 +4,12 @@
 // replay alike):
 //   MUST PICK    — the job's address as the portal words it (upper case, suffix spelled out, the
 //                  city and ZIP after it, a parcel id in front of it); an exact non-address value.
-//   MUST ASK     — a directional that is not the job's (S vs W, or a directional the project does
-//                  not have); a unit the project does not name; the same address listed twice; a
-//                  city the suggestion names that is not the job's.
+//   PICK, SAID   — the only address on the list that differs from the job's ONLY in its street
+//                  direction (S vs W, or a directional the project does not have): the portal's
+//                  spelling, with a note (adjusted). The same line listed twice counts once.
+//   MUST ASK     — two directions of the same house on the list (S and N); a direction plus any
+//                  other difference; a unit the project does not name; the same address listed
+//                  twice in two spellings; a city the suggestion names that is not the job's.
 //   MUST REFUSE  — another house number, another street (Example vs Example Ridge), another suffix
 //                  (Ct vs Dr), another ZIP; a containment match on a non-address value; the
 //                  widget's own "No results" row.
@@ -64,19 +67,46 @@ check("an exact match beside a near miss is picked (the near miss is another doo
   if (c.kind === "pick") assert.equal(c.index, 1);
 });
 
+// ---- ONLY THE DIRECTION DIFFERS, THE ONLY SUCH ADDRESS: the portal's spelling, said ------------
+check("a DIRECTION-only difference, the only such address on the list: picked in the portal's spelling, with a note", () => {
+  const c = chooseAddressSuggestion(["4812 S QUILLFEATHER DR, MARROWVALE, UT 84999", "4821 S QUILLFEATHER DR, MARROWVALE, UT 84999"], SITE);
+  assert.equal(c.kind, "pick", JSON.stringify(c));
+  if (c.kind === "pick") {
+    assert.equal(c.index, 1);
+    assert.ok(c.adjusted, "the pick carries its note");
+    assert.match(String(c.adjusted), /4821 S QUILLFEATHER DR/);
+    assert.match(String(c.adjusted), /4821 W Quillfeather Dr/);
+    assert.match(String(c.adjusted), /direction/);
+  }
+});
+check("...the same line listed twice still counts as one (the live city's two identical rows)", () => {
+  const c = chooseAddressSuggestion(["4821 S QUILLFEATHER DR", "4821 S QUILLFEATHER DR"], SITE);
+  assert.equal(c.kind, "pick", JSON.stringify(c));
+  if (c.kind === "pick") { assert.equal(c.index, 0); assert.ok(c.adjusted); }
+});
+check("...and a directional the project does not have is the same rule (the only such address: picked, said)", () => {
+  const c = chooseAddressSuggestion(["77 N Brindlecove Ln"], { street: "77 Brindlecove Ln", city: "Marrowvale" });
+  assert.equal(c.kind, "pick", JSON.stringify(c));
+  if (c.kind === "pick") assert.ok(c.adjusted);
+});
+check("an exact match is never marked adjusted", () => {
+  const c = chooseAddressSuggestion(["4821 W QUILLFEATHER DR"], SITE);
+  assert.equal(c.kind, "pick", JSON.stringify(c));
+  if (c.kind === "pick") assert.equal(c.adjusted, undefined);
+});
+
 // ---- MUST ASK -------------------------------------------------------------------------------
-check("a DIRECTIONAL difference picks nothing and asks, naming both", () => {
-  const c = chooseAddressSuggestion(["4821 S QUILLFEATHER DR, MARROWVALE, UT 84999"], SITE);
+check("TWO directions of the same house number on the list (S and N, a grid city's two streets): ask, naming both", () => {
+  const c = chooseAddressSuggestion(["4821 S QUILLFEATHER DR, MARROWVALE, UT 84999", "4821 N QUILLFEATHER DR, MARROWVALE, UT 84999"], SITE);
   assert.equal(c.kind, "ask", JSON.stringify(c));
   if (c.kind === "ask") {
     assert.match(c.question, /4821 S QUILLFEATHER DR/);
+    assert.match(c.question, /4821 N QUILLFEATHER DR/);
     assert.match(c.question, /4821 W Quillfeather Dr/);
-    assert.match(c.question, /direction/);
-    assert.match(c.question, /Use the portal's\?$/);
   }
 });
-check("a directional the project does not have is a near miss, not a match", () => {
-  const c = chooseAddressSuggestion(["77 N Brindlecove Ln"], { street: "77 Brindlecove Ln", city: "Marrowvale" });
+check("a direction AND a unit that differ is not direction-only: ask", () => {
+  const c = chooseAddressSuggestion(["4821 S QUILLFEATHER DR APT 3"], SITE);
   assert.equal(c.kind, "ask", JSON.stringify(c));
 });
 check("a unit the project does not name asks", () => {
@@ -118,8 +148,14 @@ check("...and so is the reverse, a Court project against a Drive suggestion", ()
 });
 check("a leading NE is a directional, not Nebraska (the address still keys)", () => {
   const ne = { street: "3307 NE Saltmarsh St", city: "Marrowvale" };
-  assert.equal(chooseAddressSuggestion(["3307 NE SALTMARSH ST"], ne).kind, "pick");
-  assert.equal(chooseAddressSuggestion(["3307 NW SALTMARSH ST"], ne).kind, "ask");
+  const exact = chooseAddressSuggestion(["3307 NE SALTMARSH ST"], ne);
+  assert.equal(exact.kind, "pick");
+  assert.equal(exact.kind === "pick" ? exact.adjusted : "x", undefined, "NE for NE is exact, no note");
+  // NW alone is the direction-only exception (picked, said); NW beside NE is two streets (ask).
+  const nwOnly = chooseAddressSuggestion(["3307 NW SALTMARSH ST"], ne);
+  assert.equal(nwOnly.kind, "pick");
+  assert.ok(nwOnly.kind === "pick" && nwOnly.adjusted);
+  assert.equal(chooseAddressSuggestion(["3307 NW SALTMARSH ST", "3307 SW SALTMARSH ST"], ne).kind, "ask");
 });
 check("a leading Mt is Mount, not Montana", () => {
   const mt = { street: "58 Mt Corrowind Rd", city: "Marrowvale" };

@@ -13,10 +13,13 @@
 // SYNTHETIC addresses only — invented streets, numbers and cities. Modes (?mode=):
 //   exact      the job's address is listed among neighbours → picked, read back, and the REPLAY
 //              re-finds it (and types THAT job's address for another job);
-//   direction  the city lists the house under another street direction → nothing picked, the walk
-//              stops with the question, the box is left empty; the replay stops the same way;
+//   direction  the city lists the house under another street direction, the only such address →
+//              the portal's spelling is picked and SAID (📍 Portal's spelling used / a NOTE drift
+//              warning), in the learner and the replay (owner, 2026-11-04);
+//   twoDirs    the city lists the house number under TWO other directions (S and N) → nothing
+//              picked, the walk stops with the question; the replay stops the same way;
 //   none       the box offers nothing → a NAMED failure within the fill's budget, box empty;
-//   dupes      the same address listed twice → nothing picked, the question.
+//   dupes      the same line listed twice (the live city's two identical rows) → one address, picked.
 // MUST EXCLUDE: PowerClerk's readonly filtered-select and an editable combobox with no
 // aria-autocomplete are still selects.
 //
@@ -50,6 +53,10 @@ const BOOKS: Record<string, string[]> = {
   direction: [
     "4812 S QUILLFEATHER DR, MARROWVALE, UT 84999",
     "4821 S QUILLFEATHER DR, MARROWVALE, UT 84999",
+  ],
+  twoDirs: [
+    "4821 S QUILLFEATHER DR, MARROWVALE, UT 84999",
+    "4821 N QUILLFEATHER DR, MARROWVALE, UT 84999",
   ],
   none: [],
   dupes: [
@@ -291,15 +298,34 @@ if (recorded) {
   check("replay: a recorded typeahead step to replay", false, "the learn recorded no Location step");
 }
 
-// ---- D) LEARN, DIRECTION MISMATCH: nothing picked, the question, the box empty --------------------
+// ---- D) LEARN, DIRECTION-ONLY, THE ONLY SUCH ADDRESS: the portal's spelling picked, said ------------
 {
   const { result, page, ms, before } = await learn("direction");
-  console.log(`   learn direction: ${ms} ms stop=${result.stopReason} box=${JSON.stringify(before.value)} picked=${JSON.stringify(before.picked)}`);
+  console.log(`   learn direction: ${ms} ms stop=${result.stopReason} picked=${JSON.stringify(before.picked)}`);
+  // The pick held, so Next advanced the walk to the review page (the replica's Next refuses an
+  // unpicked box); which address was picked is pinned by the message below and the replay (E).
+  check("learn: the only direction-only near miss is picked and the application advances",
+    before.picked === "(advanced)" && result.stopReason !== "typeahead_question",
+    `stop=${result.stopReason} before=${JSON.stringify(before)}`);
+  check("...and SAID: Portal's spelling used, naming both addresses",
+    result.message.includes("Portal's spelling used") && result.message.includes("4821 S QUILLFEATHER DR") && result.message.includes("4821 W Quillfeather Dr")
+      && (result.typeaheadAdjusted ?? []).length === 1,
+    result.message.slice(0, 400));
+  check("...and the Location step is recorded, bound to the street (never the portal's text)",
+    result.steps.some((s) => s.note === "Location" && s.fillStrategy === "typeahead" && s.field === "street"),
+    JSON.stringify(result.steps.map((s) => [s.note, s.field, s.fillStrategy])));
+  await page.close();
+}
+
+// ---- D2) LEARN, TWO DIRECTIONS ON THE LIST: nothing picked, the question, the box empty ------------
+{
+  const { result, page, ms, before } = await learn("twoDirs");
+  console.log(`   learn twoDirs: ${ms} ms stop=${result.stopReason} box=${JSON.stringify(before.value)} picked=${JSON.stringify(before.picked)}`);
   console.log(`   message: ${result.message.slice(0, 400)}`);
-  check("learn: a direction mismatch stops the walk with the question",
+  check("learn: two directions of the house on the list stop the walk with the question",
     result.stopReason === "typeahead_question", `stopReason=${result.stopReason}; message=${result.message.slice(0, 300)}`);
   check("...naming the portal's address and the project's",
-    /4821 S QUILLFEATHER DR/.test(result.message) && /4821 W Quillfeather Dr/.test(result.message) && /Use the portal's\?/.test(result.message),
+    /4821 S QUILLFEATHER DR/.test(result.message) && /4821 N QUILLFEATHER DR/.test(result.message) && /4821 W Quillfeather Dr/.test(result.message) && /Which one, if any/.test(result.message),
     result.message.slice(0, 400));
   check("...with NOTHING picked and the box left empty",
     before.picked === "" && before.value === "", `picked=${JSON.stringify(before.picked)} value=${JSON.stringify(before.value)}`);
@@ -308,12 +334,24 @@ if (recorded) {
   await page.close();
 }
 
-// ---- E) REPLAY, DIRECTION MISMATCH: stops the same way ---------------------------------------------
+// ---- E) REPLAY, DIRECTION-ONLY: picked in the portal's spelling, with a NOTE ----------------------
 if (recorded) {
   const r = await replay("direction", recorded, JOB);
-  console.log(`   replay direction: ok=${r.ok} value=${JSON.stringify(r.after.value)} message=${r.message.slice(0, 200)}`);
-  check("replay: a direction mismatch stops the run for a person, named",
-    !r.ok && /Stopped for a person/.test(r.message) && /4821 S QUILLFEATHER DR/.test(r.message), r.message.slice(0, 300));
+  const warnings = (r.data.driftWarnings as string[] | undefined) ?? [];
+  console.log(`   replay direction: ok=${r.ok} picked=${JSON.stringify(r.after.picked)} notes=${JSON.stringify(warnings.filter((w) => w.startsWith("NOTE")))}`);
+  check("replay: the only direction-only near miss is picked in the portal's spelling, with a NOTE",
+    r.after.picked === "PICKED 4821 S QUILLFEATHER DR, MARROWVALE, UT 84999"
+      && warnings.some((w) => w.startsWith('NOTE "Location": picked the portal\'s "4821 S QUILLFEATHER DR')),
+    JSON.stringify({ picked: r.after.picked, warnings }));
+  await r.page.close();
+}
+
+// ---- E1) REPLAY, TWO DIRECTIONS: stops for a person -------------------------------------------------
+if (recorded) {
+  const r = await replay("twoDirs", recorded, JOB);
+  console.log(`   replay twoDirs: ok=${r.ok} value=${JSON.stringify(r.after.value)} message=${r.message.slice(0, 200)}`);
+  check("replay: two directions on the list stop the run for a person, named",
+    !r.ok && r.message.includes("Stopped for a person") && r.message.includes("4821 S QUILLFEATHER DR") && r.message.includes("4821 N QUILLFEATHER DR"), r.message.slice(0, 300));
   check("...nothing picked, the box empty",
     r.after.picked === "" && r.after.value === "", `picked=${JSON.stringify(r.after.picked)} value=${JSON.stringify(r.after.value)}`);
   await r.page.close();
@@ -383,8 +421,8 @@ if (recorded) {
 {
   const { result, page, before } = await learn("dupes");
   console.log(`   learn dupes: stop=${result.stopReason} box=${JSON.stringify(before.value)}`);
-  check("learn: the same address listed twice picks nothing and asks which",
-    result.stopReason === "typeahead_question" && /2 entries/.test(result.message) && before.value === "" && before.picked === "",
+  check("learn: the same line listed twice is one address: picked, no question",
+    result.stopReason !== "typeahead_question" && before.picked === "(advanced)" && !(result.typeaheadAdjusted ?? []).length,
     `stop=${result.stopReason} box=${JSON.stringify(before)} message=${result.message.slice(0, 300)}`);
   await page.close();
 }

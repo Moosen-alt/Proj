@@ -31,7 +31,7 @@ import { addressQueries, chooseAddressSuggestion, chooseExactSuggestion, suggest
 
 /** What a typeahead fill did. Only "picked" wrote a value the box kept. */
 export type TypeaheadOutcome =
-  | { outcome: "picked"; picked: string; held: string; typed: string; why: string }
+  | { outcome: "picked"; picked: string; held: string; typed: string; why: string; adjusted?: string }
   /** A near miss or several equal candidates: nothing picked, the box cleared; ask `question`. */
   | { outcome: "ask"; question: string; offered: string[]; typed: string; why: string }
   | { outcome: "no_suggestions"; why: string; typed: string[] }
@@ -277,7 +277,7 @@ export async function fillTypeahead(page: any, loc: any, req: TypeaheadRequest):
     }
     // Commit the way every fill commits (a per-field save on blur).
     if (typeof loc.blur === "function") await loc.blur().catch(() => null);
-    return { outcome: "picked", picked: choice.text, held, typed: usedQuery, why: choice.why };
+    return { outcome: "picked", picked: choice.text, held, typed: usedQuery, why: choice.why, ...(choice.kind === "pick" && choice.adjusted ? { adjusted: choice.adjusted } : {}) };
   } finally {
     await clearPopupMarks(doc);
     await doc.evaluate(() => { document.querySelectorAll("[data-al-sugg]").forEach((n) => n.removeAttribute("data-al-sugg")); }).catch(() => null);
