@@ -67,7 +67,7 @@ import { addAuditLog } from "./audit";
 import { enqueueStageSteps } from "./autoStageSteps";
 import { classifyDoc, extractPdfText } from "./batchImport";
 import { BRAND } from "./clientUpdates";
-import { ensureStatusShareToken, formatProjectAddress, sendEmail, smtpConfigured, statusShareUrl } from "./clientNotifier";
+import { clientEmailsOffFor, ensureStatusShareToken, formatProjectAddress, sendEmail, smtpConfigured, statusShareUrl } from "./clientNotifier";
 import { addCommunication } from "./crm";
 import { describeKind, isImageKind, looksLikeCad, sniffFileKind } from "./fileTypes";
 import { HttpError } from "./httpError";
@@ -430,7 +430,23 @@ const FIELD_LABELS: Record<string, string> = {
   owner: "Homeowner name", street: "Project address", city: "City", state: "State", zip: "ZIP", ahj: "Permitting jurisdiction (AHJ)",
   utility: "Utility", account: "Utility account number", meter: "Meter number", dcKw: "System size (DC kW)", acKw: "System size (AC kW)",
   moduleMake: "Module make", moduleModel: "Module model", moduleQty: "Module count", invMake: "Inverter make", invModel: "Inverter model",
+  moduleWattage: "Module wattage", invQty: "Inverter count", invOutputW: "Inverter output (W)",
+  batteryMake: "Battery make", batteryModel: "Battery model", batteryQty: "Battery count",
+  pvMicroMake: "Microinverter make", pvMicroModel: "Microinverter model", pvMicroQty: "Microinverter count",
+  roofMaterial: "Roof material", roofMaterialSubtype: "Roof material type", mounting: "Mounting type", rackingSystem: "Racking system",
+  roofRafterSpan: "Rafter span", roofRafterSpacing: "Rafter spacing", roofLayers: "Roof layers", framingType: "Roof framing type",
+  interco: "Interconnection method", busRating: "Main panel bus rating (A)", mainBreaker: "Main breaker (A)", pvBreaker: "PV breaker (A)",
+  snow: "Snow load", wind: "Wind speed", windSpeed: "Wind speed", existingSystem: "Existing solar system",
 };
+
+/** A field's name in words for a client email. Every key has one: the table above, else the key
+ *  itself split at its capitals ("acRunLengthFt" -> "Ac run length ft"), never the raw camelCase
+ *  name (an intake reply once asked a client to double-check "roofMaterial"). */
+export function intakeFieldLabel(key: string): string {
+  if (FIELD_LABELS[key]) return FIELD_LABELS[key];
+  const words = String(key).replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ").trim().toLowerCase();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : String(key);
+}
 
 export function intakeReplyEmail(input: {
   project: ProjectRecord; attached: boolean; link: string; missing: string[]; unsure: string[]; refused: EmailIntakeFile[];
@@ -458,15 +474,15 @@ export function intakeReplyEmail(input: {
   };
 }
 
-function autoReplyOff(): string {
+function autoReplyOff(clientId: string | null | undefined): string {
   if (/^(0|false|off)$/i.test(String(process.env.EMAIL_INTAKE_AUTO_REPLY ?? "").trim())) return "EMAIL_INTAKE_AUTO_REPLY is off, so no send was attempted.";
-  if (/^(0|false|off)$/i.test(String(process.env.CLIENT_NOTIFICATIONS ?? "").trim())) return "CLIENT_NOTIFICATIONS is off, so no send was attempted.";
+  if (clientEmailsOffFor(clientId)) return "CLIENT_NOTIFICATIONS is off, so no send was attempted.";
   return "";
 }
 
 async function reply(db: AppDb, input: { project: ProjectRecord; orgId: string; to: string; subject: string; body: string }, opts: IntakeOptions): Promise<string> {
   let status: "sent" | "draft" | "failed" = "draft";
-  let detail = autoReplyOff();
+  let detail = autoReplyOff(input.project.clientId);
   if (detail) { /* stays a draft */ }
   else if (!String(process.env.PUBLIC_BASE_URL ?? "").trim()) detail = "PUBLIC_BASE_URL is not set, so the status link would point at this machine; nothing was sent.";
   else if (!opts.send && !smtpConfigured()) detail = "SMTP is not configured (SMTP_HOST / SMTP_FROM are unset), so no send was attempted.";
@@ -608,7 +624,7 @@ async function processOne(db: AppDb, raw: Buffer, opts: IntakeOptions, result: E
       .map(([, f]) => String(f.value));
     const email = intakeReplyEmail({
       project, attached: Boolean(existingId), link: statusShareUrl(ensureStatusShareToken(db, projectId)),
-      missing, unsure: unsure.map((k) => FIELD_LABELS[k] ?? k), refused, secrets: [...projectSecrets, ...readSecrets],
+      missing, unsure: unsure.map((k) => intakeFieldLabel(k)), refused, secrets: [...projectSecrets, ...readSecrets],
     });
     replyStatus = await reply(db, { project, orgId, to: sender, ...email }, opts);
   }

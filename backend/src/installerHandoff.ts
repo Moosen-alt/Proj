@@ -38,7 +38,7 @@ import type { ProjectRecord } from "../../shared/src/types";
 import { addAuditLog } from "./audit";
 import { addCommunication, undeliveredCommunications } from "./crm";
 import {
-  clientUpdatesSilenced, ensureStatusShareToken, formatProjectAddress, sendEmail, smtpConfigured, statusShareUrl,
+  clientEmailsOffFor, clientUpdatesSilenced, ensureStatusShareToken, formatProjectAddress, sendEmail, smtpConfigured, statusShareUrl,
 } from "./clientNotifier";
 import { BRAND, clientFacingPermitType, clientPermitStructure, recordClientUpdateNote, type ClientUpdate } from "./clientUpdates";
 import { INSTALLER_HANDOFF_SENDER, installerHandoffAttachments } from "./handoffDocuments";
@@ -205,7 +205,7 @@ export async function sendInstallerHandoff(
     // THE ONE "may this project talk to its client" answer every client update asks (#490):
     // CLIENT_NOTIFICATIONS=off, no submitting client, or an archived project.
     if (clientUpdatesSilenced(db, { id: project.id, clientId: clientId || null })) {
-      return skip(/^(0|false|off)$/i.test(String(process.env.CLIENT_NOTIFICATIONS ?? "").trim())
+      return skip(clientEmailsOffFor(clientId || null)
         ? "Client emails are switched off on this server (CLIENT_NOTIFICATIONS=off)."
         : !clientId ? "This project has no submitting client to send the packet to." : "This project is archived.");
     }
