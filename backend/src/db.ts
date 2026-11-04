@@ -3046,6 +3046,53 @@ const VERSIONED_MIGRATIONS: VersionedMigration[] = [
       `);
     },
   },
+  {
+    version: 61,
+    name: "portal_staged_reviews",
+    up: (db) => {
+      // THE STAGED DRAFT'S REVIEW DIGEST (#436 PR1). A plain NEM Stage that stops at review reads every
+      // step page of the draft read-only (portal-bot reviewDigest.ts) and the run's in-memory result
+      // carries the reading; stagedReviews.recordStagedReview is the ONE writer (never from
+      // result_json, which has a second writer). One row per Stage run.
+      //   digest / sections_json: HMAC-SHA256 under a subkey of SESSION_ENCRYPTION_KEY (key_id) with
+      //     this row's nonce — never a value in clear (rule 2). sections_json holds each step's items
+      //     as { kind, label (redacted), ordinal, mac }.
+      //   field_report_json: per value the pages show, its label and the value MASKED (secrets to a
+      //     last 4, redactCaptureText), and the project field it came from ('' = none).
+      //   attachments_json: each file the Stage uploaded, its project file's sha256, listed or absent.
+      //   screenshot_path: the MASKED picture of the review page (statePaths.stagedReviewShotsDir) —
+      //     the only file /api/projects/:id/staged-reviews/:runId/screenshot serves.
+      //   approvable / unapprovable_reason: PR1 shows them; Approve on a staged draft stays held.
+      //   superseded_at / superseded_by: a later Stage of the same track supersedes the row at its start.
+      // Created here, never lazily: the track card reads it, and reads write nothing.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS portal_staged_reviews (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL UNIQUE,
+          project_id TEXT NOT NULL,
+          track TEXT NOT NULL,
+          recipe_id TEXT NOT NULL DEFAULT '',
+          steps_signature TEXT NOT NULL DEFAULT '',
+          digest_version INTEGER NOT NULL,
+          key_id TEXT NOT NULL DEFAULT '',
+          nonce TEXT NOT NULL DEFAULT '',
+          digest TEXT NOT NULL DEFAULT '',
+          sections_json TEXT NOT NULL DEFAULT '[]',
+          draft_id TEXT NOT NULL DEFAULT '',
+          review_link TEXT NOT NULL DEFAULT '',
+          field_report_json TEXT NOT NULL DEFAULT '[]',
+          attachments_json TEXT NOT NULL DEFAULT '[]',
+          screenshot_path TEXT NOT NULL DEFAULT '',
+          approvable INTEGER NOT NULL DEFAULT 0,
+          unapprovable_reason TEXT NOT NULL DEFAULT '',
+          created_at TEXT NOT NULL,
+          superseded_at TEXT NOT NULL DEFAULT '',
+          superseded_by TEXT NOT NULL DEFAULT ''
+        );
+        CREATE INDEX IF NOT EXISTS idx_portal_staged_reviews_track ON portal_staged_reviews(project_id, track, created_at);
+      `);
+    },
+  },
 ];
 
 /** v47 was edited in place while #218 was open (Helm's review at 0116f98a): a DB that ran an earlier

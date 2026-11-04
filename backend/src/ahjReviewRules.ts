@@ -42,7 +42,9 @@ import type {
 import type { EffectiveCodeContext } from "./codeProfiles";
 import { checkFieldLabel, compareCheckWithPlan, describeCheckRequirement, parseAmendmentCheck } from "./amendmentChecks";
 import type { DesignTextSource } from "./designCriteria";
-import { redactSecretValues } from "../../shared/src/portalSafety";
+import { redactSecretValues, SECRET_SEPARATOR_CLASS } from "../../shared/src/portalSafety";
+/** 5+ digits with any of redactSecretValues' separators between them but "/" (wordingNamesProject). */
+const LONG_DIGIT_RUN = new RegExp(String.raw`\d(?:${SECRET_SEPARATOR_CLASS.replace("/", "")}*\d){4,}`);
 
 export const PRIOR_CORRECTION_ID = "city.ahj.prior-correction";
 export const PRIOR_CORRECTION_UNCONFIRMED_ID = "city.ahj.prior-correction-unconfirmed";
@@ -181,9 +183,9 @@ export function wordingNamesProject(
   secrets: Iterable<string> = [],
 ): boolean {
   const raw = String(phrase || "");
-  // Separators as redactSecretValues reads them (whitespace, any dash: ASCII, U+2010-2015, the
-  // U+2212 minus; ".", "#"), except "/": "120/240 V" is a service voltage.
-  if (/@/.test(raw) || /\d(?:[\s\-\u2010-\u2015\u2212.#]*\d){4,}/.test(raw)) return true;
+  // Separators as redactSecretValues reads them (SECRET_SEPARATOR_CLASS, the one class), except "/":
+  // "120/240 V" is a service voltage.
+  if (/@/.test(raw) || LONG_DIGIT_RUN.test(raw)) return true;
   if (redactSecretValues(raw, secrets) !== raw) return true;
   const p = ` ${raw.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()} `;
   if (nameWords(project.homeownerName).some((w) => p.includes(` ${w} `))) return true;

@@ -4752,3 +4752,96 @@ export interface WebLookupResult {
   /** The call hit its own time budget; text/URLs are what the search had gathered by then. */
   timedOut?: boolean;
 }
+
+// ---------------------------------------------------------------------------------------------
+// #436 — THE STAGED DRAFT'S REVIEW DIGEST (PR1: recorded and shown; nothing clicks on it yet).
+//
+// A NEM Stage that stops at review reads every step page of the draft READ-ONLY (portal-bot
+// reviewDigest.ts, the ONE reader) and hands this back IN MEMORY; the backend's one writer
+// (stagedReviews.recordStagedReview) keeps it in portal_staged_reviews. Rule 2: no value is ever
+// kept in clear. `mac` is HMAC-SHA256 under a subkey of SESSION_ENCRYPTION_KEY with the row's own
+// nonce; every label and display value passed redactSecretValues, then redactCaptureText.
+// ---------------------------------------------------------------------------------------------
+
+/** What one digest item is: a form control (checkbox / radio group / anything else), a <dl> pair, a
+ *  table row of any width, a visible text line, the URL's draft id, or the application number shown. */
+export type StagedReviewItemKind = "field" | "check" | "radio" | "pair" | "row" | "line" | "draft" | "appno";
+
+export interface StagedReviewItem {
+  kind: StagedReviewItemKind;
+  /** The item's label, redacted (a line's is a short redacted prefix). At most 80 characters. */
+  label: string;
+  /** 1 for the first item with this kind and label on the section, 2 for the next... (counted duplicates). */
+  ordinal: number;
+  /** HMAC-SHA256 hex of the RAW label and value under the row's nonce. Never the value. */
+  mac: string;
+}
+
+export interface StagedReviewSection {
+  /** The step's own name (its tab label, else the page title), redacted. "review" is the page the Stage stopped on. */
+  step: string;
+  /** origin + path the section was read at (no query: a query can carry session material). */
+  where: string;
+  /** HMAC over the section's items in order ("" when the section was unreadable: never hashed). */
+  digest: string;
+  items: StagedReviewItem[];
+  /** "" when read; otherwise why the page could not be read, by name. */
+  unreadable: string;
+}
+
+/** One value the draft's pages show, for the person approving: label, the value masked, and which
+ *  project field it came from ("" = not from a project field). */
+export interface StagedReviewFieldReportRow {
+  label: string;
+  display: string;
+  source: string;
+  /** The step it was read on (redacted). */
+  step: string;
+}
+
+/** A file the Stage uploaded, and whether the draft's pages still list it. */
+export interface StagedReviewAttachment {
+  name: string;
+  docType: string;
+  /** sha256 of the project file the Stage uploaded ("" when it could not be read). */
+  sha256: string;
+  listed: boolean;
+}
+
+/** What the adapter hands the backend at its review stop (in memory only — never via result_json). */
+export interface StagedReviewCapture {
+  version: number;
+  /** Which subkey hashed it (a key change reads as "key changed", never as "the page differs"). "" = no key. */
+  keyId: string;
+  /** The row's nonce (hex): the same number on two projects never yields the same mac. */
+  nonce: string;
+  /** HMAC over every section digest and the draft id; "" when the row is not approvable. */
+  digest: string;
+  sections: StagedReviewSection[];
+  /** The draft's own key off the review page's link (PowerClerk's ProjectId); "" when it carries none. */
+  draftId: string;
+  /** The review page's link through cleanRecordLink (identifiers only, never session material). */
+  reviewLink: string;
+  fieldReport: StagedReviewFieldReportRow[];
+  attachments: StagedReviewAttachment[];
+  /** The MASKED picture of the review page (every known secret blanked), or "" when none was taken. */
+  screenshotPath: string;
+  approvable: boolean;
+  /** Why not approvable, each by name. Empty when approvable. */
+  why: string[];
+  walk: { stepsFound: number; stepsRead: number; writesBlocked: number };
+}
+
+/** The track card's view of the newest staged review (the server's own row). */
+export interface StagedReviewView {
+  runId: string;
+  approvable: boolean;
+  /** Why it is not approvable ("" when it is). */
+  why: string;
+  createdAt: string;
+  /** The masked picture's URL, or "" when none was kept. */
+  screenshotUrl: string;
+  fieldReport: StagedReviewFieldReportRow[];
+  attachments: Array<{ name: string; docType: string; listed: boolean }>;
+  sections: Array<{ step: string; items: number; unreadable: string }>;
+}

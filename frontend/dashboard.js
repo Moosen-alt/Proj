@@ -5394,6 +5394,25 @@ function trackCardHtml(t) {
   const approveHeld = t.type === "nem" && t.status === "staged"
     ? "This filing has a staged draft; finish it from the review window or by staging again, then a person submits."
     : "";
+  // #436 RULING 5 (owner 2026-11-03): A FILING ALREADY SUBMITTED AND TRACKED IS NEVER STAGED AGAIN. The
+  // server's own reason (stageBlocked: a filing on record; a number on the tracking card alone never is); the
+  // route refuses the same request with a 409, so a stale card's click files nothing either.
+  const stageBlocked = t.stageBlocked ? String(t.stageBlocked) : "";
+  // #436 PR1 — WHAT THE STAGED DRAFT SHOWS, beside the held Approve: the masked picture of its review
+  // page and each value its pages show (label, masked value, the project field it came from), plus
+  // each uploaded file as listed or absent. The server's own row; Approve stays held as above.
+  const sr = t.stagedReview && typeof t.stagedReview === "object" ? t.stagedReview : null;
+  const srRows = sr && Array.isArray(sr.fieldReport) ? sr.fieldReport : [];
+  const srFiles = sr && Array.isArray(sr.attachments) ? sr.attachments : [];
+  const stagedReviewBlock = sr
+    ? `<details class="track-staged-review" data-track-staged-review="${esc(t.type)}" style="margin:6px 0">
+        <summary style="font-size:12px">What the staged draft shows (${srRows.length} value${srRows.length === 1 ? "" : "s"}, read ${esc(fmtDate(sr.createdAt))}) — ${sr.approvable ? "read cleanly" : `not approvable: ${esc(sr.why || "see below")}`}</summary>
+        ${sr.screenshotUrl ? `<a href="${esc(sr.screenshotUrl)}" target="_blank" rel="noopener" title="Open the full-size masked picture"><img src="${esc(sr.screenshotUrl)}" alt="The staged draft's review page, account and meter numbers masked" style="max-width:100%;border:1px solid var(--border);border-radius:var(--radius-sm);margin:4px 0" /></a>` : `<p class="muted" style="font-size:11px;margin:4px 0">No masked picture of the review page was kept.</p>`}
+        ${srRows.length ? `<table style="width:100%;border-collapse:collapse;font-size:12px" data-staged-field-report><thead><tr><th style="text-align:left" class="muted">Field</th><th style="text-align:left" class="muted">On the draft (masked)</th><th style="text-align:left" class="muted">Source</th></tr></thead><tbody>${srRows.map((r) => `<tr><th scope="row" style="text-align:left;padding:2px 8px 2px 0;font-weight:normal">${esc(r.label || "(no label)")}</th><td style="padding:2px 8px 2px 0">${esc(r.display)}</td><td class="muted" style="padding:2px 0">${r.source ? `from ${esc(r.source)}` : "not from a project field"}</td></tr>`).join("")}</tbody></table>` : `<p class="muted" style="font-size:11px;margin:4px 0">The draft's pages showed no labelled values.</p>`}
+        ${srFiles.length ? `<ul style="margin:4px 0 0 18px;padding:0;font-size:12px" data-staged-attachments>${srFiles.map((a) => `<li>attachment: ${esc(a.name)} — ${a.listed ? "listed on the draft" : "<strong>absent</strong> from the draft's pages"}</li>`).join("")}</ul>` : ""}
+        <p class="muted" style="font-size:11px;margin:4px 0 0">Read-only reading of every step page the draft offers. Approve stays with a person in the portal for now.</p>
+      </details>`
+    : "";
 
   return `
   <article class="item ${cls} track-card">
@@ -5413,7 +5432,10 @@ function trackCardHtml(t) {
       && !screenshotMisses.has(screenshotKey(state.selectedProjectId, t.recipeId, t.recipeStatus))
       ? `<div style="margin:6px 0 4px" data-shot-wrap><a href="/api/projects/${esc(state.selectedProjectId)}/portal-runs/${esc(t.recipeId)}/review-screenshot" target="_blank" rel="noopener" title="Open the full-size capture"><img src="/api/projects/${esc(state.selectedProjectId)}/portal-runs/${esc(t.recipeId)}/review-screenshot" alt="Auto-captured portal page" class="review-shot" style="max-width:100%;border:1px solid var(--border);border-radius:var(--radius-sm)" data-shot-key="${esc(screenshotKey(state.selectedProjectId, t.recipeId, t.recipeStatus))}" onerror="window.__noteMissingReviewShot(this)" /></a><p class="muted" style="font-size:11px;margin:2px 0 0">${t.recipeStatus === "complete" ? "Portal review screen (auto-captured) — click for full size" : "Last captured page — recording not complete. If this is a login page, add this portal's login under “Manage logins” and re-stage."}</p></div>` : ""}
     <div class="track-actions">
-      <button type="button" class="secondary" data-track-stage="${esc(t.type)}" title="Auto-fill this filing's portal up to the final review screen — you submit manually"><i data-lucide="bot"></i><span>Stage in portal</span></button>
+      ${stageBlocked
+        ? `<button type="button" class="secondary" data-track-stage="${esc(t.type)}" disabled aria-disabled="true" title="${esc(stageBlocked)}"><i data-lucide="bot"></i><span>Stage in portal</span></button>
+      <span class="muted" style="font-size:11px" data-track-stage-blocked>${esc(stageBlocked)}</span>`
+        : `<button type="button" class="secondary" data-track-stage="${esc(t.type)}" title="Auto-fill this filing's portal up to the final review screen — you submit manually"><i data-lucide="bot"></i><span>Stage in portal</span></button>`}
       ${approveHeld
         ? `<button type="button" class="secondary" data-track-approve="${esc(t.type)}" disabled aria-disabled="true" title="${esc(approveHeld)}"><i data-lucide="check-check"></i><span>Approve &amp; auto-submit</span></button>
       <span class="muted" style="font-size:11px" data-track-approve-held>${esc(approveHeld)}</span>`
@@ -5428,6 +5450,7 @@ function trackCardHtml(t) {
         ? `<button type="button" class="secondary" data-track-check-signature="${esc(t.type)}" title="The bot reopens the draft on the utility portal and reads the homeowner's signature status. Signed: it stages step 5 up to its Submit and stops there for you. Not signed, or unreadable: it stops on the record page and says why. It never re-sends the request and never submits."><i data-lucide="refresh-cw"></i><span>Check signature now</span></button>`
         : ""}
     </div>
+    ${stagedReviewBlock}
     ${t.signatureRequest && t.signatureRequest.state ? `<p class="muted" style="font-size:12px;margin:4px 0" data-track-signature-state="${esc(t.signatureRequest.state)}">Signature step: ${esc(signatureStateText(t.signatureRequest))}</p>` : ""}
     ${recipeBlock}
     ${trackIssuerEditHtml(t)}

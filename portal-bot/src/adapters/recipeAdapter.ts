@@ -1,6 +1,9 @@
 import fs from "fs";
 import path from "path";
-import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep } from "../../../shared/src/types";
+import type { PortalRecipe, ProjectRecord, RecipeSelector, RecipeStep, StagedReviewCapture } from "../../../shared/src/types";
+import { buildStagedReviewCapture, countRecordedControl, openPlaywrightDigestNavigator, readDigestPage, shownOnlyWithScripts, unapprovableStagedReview, walkStagedDraft } from "../reviewDigest";
+import { maskedFullPageScreenshot } from "../secretMask";
+import { stagedReviewShotsDir } from "../../../backend/src/statePaths";
 import { BasePortalAdapter, HUMAN_REVIEW_MESSAGE, ok, fail, type PortalContext, type PortalStepResult } from "../adapter";
 import { applyFormatHint } from "../formatHint";
 import { extractRecordNumber, pageConfirmsSubmission, recordNumberCandidates, RECORD_NUMBER_TIERS } from "../recordNumber";
@@ -820,6 +823,25 @@ export function draftPickStopTell(stampLabel: string, picks: string[]): string {
   return `${head}${brief}${tail}`;
 }
 
+/** A click that leaves the page: the recorder's "advance:" wording, or a Continue/Next control (a
+ *  hand-patched "human-patch: Next" carries no "advance:" note). THE one answer: the fee-tier stop's
+ *  next advancing click and the staged review's page count (#436) both read it. */
+export function isAdvancingClickStep(step: RecipeStep): boolean {
+  const note = String(step.note ?? "");
+  if (/^advance\b/i.test(note)) return true;
+  const name = `${step.selector?.name ?? ""} ${step.selector?.text ?? ""} ${note}`;
+  return /\bcontinue\b|\bnext\b|save (and|&) continue/i.test(name) && !/add new|add contact|search|lookup|calculate/i.test(name);
+}
+
+/** #436 PR1 — HOW MANY PAGES THE RECIPE WALKS: 1 + every advancing click that is not the final
+ *  submit. A recipe of more than one page whose review page offers no step link cannot be compared
+ *  beyond the review page, and the staged review says so (walkStagedDraft's expectedPages). An
+ *  over-count only ever withholds "approvable"; an under-count would let a review-only reading of a
+ *  multi-page draft pass, so this reads the broad predicate, not only the "advance:" note. */
+export function stagedReviewExpectedPages(steps: readonly RecipeStep[]): number {
+  return steps.filter((s) => s.action === "click" && !isFinalSubmitStep(s) && isAdvancingClickStep(s)).length + 1;
+}
+
 export class RecipeAdapter extends BasePortalAdapter {
   portalName: string;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -1234,6 +1256,10 @@ export class RecipeAdapter extends BasePortalAdapter {
   private ledgerBefore: LedgerEntry[] | null = null;
   /** The recipe step index the loop is on — the final-submit gate's "is this the terminal step". */
   private currentStepIdx = -1;
+  /** #436 PR1 — the staged draft's review digest, read at the review stop (options.stagedReview).
+   *  IN MEMORY ONLY: runAdapter hands it to the backend's one writer; it is never part of a step's
+   *  data (result_json is not where it lives). null = not asked for, or the run did not stop at review. */
+  stagedReviewCapture: StagedReviewCapture | null = null;
   /** The step whose selector resolveLocator is resolving right now (for disambiguation). */
   private resolvingStep: RecipeStep | null = null;
   /** Every click/press/goto the chokepoint refused this run, in order. */
@@ -1277,6 +1303,13 @@ export class RecipeAdapter extends BasePortalAdapter {
        *  function; the learn self-test, the cross-project replay, the benchmark and the correction /
        *  status constructions never hand over, so a click in their tail is held as on main. */
       handOverReview?: boolean;
+      /** #436 PR1 — READ THE STAGED DRAFT FOR ITS REVIEW DIGEST at the review stop (reviewDigest.ts):
+       *  every step page, read-only, in a separate page of this context, before the page is handed
+       *  to anyone. The backend passes it only on a plain NEM recipe stage (never an approved run).
+       *  `secrets`: the project's account / meter numbers (and parser aliases) the masked picture and
+       *  every label blank. Nothing is clicked on it; any failure is an unapprovable capture, never a
+       *  failed Stage. */
+      stagedReview?: { secrets: string[]; gapMs?: number } | null;
     } = {},
   ) {
     super();
@@ -3699,6 +3732,25 @@ export class RecipeAdapter extends BasePortalAdapter {
     this.dischargeCoveredWarning();
     // D4: every owed document has an outcome — an owed one no attachment row carried is named.
     this.settleOwedLedger();
+    // #436 PR1 — THE STAGED DRAFT'S REVIEW DIGEST, read BEFORE the page is handed to anyone: a plain
+    // NEM stage (the backend asks), that stopped at review (not at payment, nothing clicked). The
+    // run's own last answers drain first, so the walk's GETs read what the portal saved. The walk is
+    // a separate page of this context (reviewDigest.ts): this window — the one a person submits in —
+    // is never navigated, and nothing here writes. Any failure is an unapprovable capture, never a
+    // failed or paused Stage.
+    // UNDER THE READ-ONLY LOCK (skeptic round 3): the run locks the review page HERE, before the walk,
+    // not after it — the backstop's sticky review lockdown aborts every state-changing request from
+    // every page of the context (the walk page's among them) for the whole walk. It is the lock
+    // lockReview below sets anyway (sticky: the later call keeps this reason); nothing the run writes
+    // comes after this point; and a person's own input after the hand-over still lifts it exactly as
+    // before (#333).
+    if (this.options.stagedReview && !this.options.autoSubmit && !pastReview && !this.finalSubmitClicked && !this.stoppedAtPayment) {
+      await this.drainBeforeReviewLock();
+      this.backstop?.lockReview(`replay stopped at review, reading the staged draft (${this.recipe.id})`);
+      const cfg = this.options.stagedReview;
+      this.stagedReviewCapture = await this.captureStagedReview(cfg).catch((e) =>
+        unapprovableStagedReview(`the staged review could not be read (${String((e as { message?: string })?.message ?? e).replace(/\s+/g, " ").slice(0, 80)})`, this.pageUrlNoHash()));
+    }
     // THE REVIEW-PAGE LOCKDOWN (filingBackstop.ts): the run's last write to the page (the final
     // re-assert and gap-fill above, which a portal autosaves on blur) is done. From here until
     // fillApplication hands the page to a person (dispose), every state-changing request is
@@ -3859,6 +3911,81 @@ export class RecipeAdapter extends BasePortalAdapter {
       + (personRequestWent
         ? ` A request from the page went through after you touched it while the stage was finishing (it may also have been the portal saving the stage's answers) — check the portal before anything else.`
         : ` Next: in the portal, finish that page (check every attachment is listed and nothing is flagged required), continue to the review page, verify every field there, then submit. Nothing was filed.`);
+  }
+
+  /** #436 PR1 — READ THE STAGED DRAFT FOR ITS REVIEW DIGEST (reviewDigest.ts is the one reader). A walk
+   *  page of this context — scriptless, its every request judged — loads the review page by its link
+   *  (a GET) twice and reads each load, checks it reads as review with exactly one recorded final
+   *  submit (not inside a frame) and that the run's own window (scripts on) shows nothing the
+   *  scriptless reading lacks, takes the MASKED picture of it, then loads every step tab of this draft
+   *  by its link twice and reads each. `this.page` is never navigated, clicked or written: it is only
+   *  read. Runs only under the run's review lock (the caller sets it). */
+  private async captureStagedReview(cfg: { secrets: string[]; gapMs?: number }): Promise<StagedReviewCapture> {
+    const page = this.page;
+    if (!page || typeof page.context !== "function" || typeof page.url !== "function") return unapprovableStagedReview("no browser page to read the staged draft from");
+    const reviewUrl = String(page.url() ?? "");
+    if (!this.backstop) return unapprovableStagedReview("the run has no network backstop, so the staged draft's pages were not read (the walk runs only under the review lock)", reviewUrl);
+    const secrets = Array.from(new Set([...(cfg.secrets ?? []), String(this.fieldValues.accountNumber ?? ""), String(this.fieldValues.meterNumber ?? "")]
+      .map((s) => String(s ?? "").trim()).filter((s) => s.length >= 4)));
+    const terminal = (this.recipe.steps ?? []).filter((s) => isFinalSubmitStep(s));
+    // How many pages the recipe walks: a recipe of more than one page must offer step links to compare them.
+    const expectedPages = stagedReviewExpectedPages(this.recipe.steps ?? []);
+    const runKey = String(this.options.runId || `run-${Date.now()}`).replace(/[^A-Za-z0-9-]/g, "").slice(0, 64) || `run-${Date.now()}`;
+    const shotPath = path.join(stagedReviewShotsDir(), `staged-review-${runKey}.png`);
+    let shot = "";
+    this.progress("wait", "Reading the staged draft's pages for the review digest (read-only)", 0);
+    const nav = await openPlaywrightDigestNavigator(page, reviewUrl);
+    const walk = await walkStagedDraft(nav, {
+      reviewUrl, gapMs: cfg.gapMs, expectedPages,
+      atReview: async (scriptless) => {
+        const reasons: string[] = [];
+        const wp = nav.page;
+        // Never a picture of a page whose reading is unreadable or refused (walkStagedDraft does not
+        // call this then; asked again here, where the picture is taken).
+        if (scriptless.unreadable) return [`the review page could not be read (${scriptless.unreadable.slice(0, 120)}), so no picture of it was taken`];
+        // THE WALK RUNS NO SCRIPT, SO A VALUE ONLY A SCRIPT FILLS READS EMPTY THERE (on both loads, and
+        // an edit to it would never be seen): the review page in this run's own window — scripts on,
+        // only read — must show no control, pair or row the scriptless reading lacks. A window that
+        // cannot be read is a refusal too: the check could not be made.
+        const withScripts = await readDigestPage(page);
+        if (withScripts.unreadable) reasons.push(`the review page in the run's window could not be read to check the walk's scriptless reading (${withScripts.unreadable})`);
+        else {
+          const only = shownOnlyWithScripts(withScripts, scriptless);
+          if (only.length) reasons.push(`the review page shows ${only.length} value(s) only while the portal's scripts run (${only.slice(0, 3).join(", ")}${only.length > 3 ? ", ..." : ""}), so the draft's pages cannot be read with its scripts off`);
+        }
+        await wp.evaluate(PORTAL_SAFETY_IN_PAGE_SOURCE).catch(() => null);
+        const t = await wp.evaluate((g: string) => {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const ps = (globalThis as any)[g];
+          return ps && typeof ps.terminalPageInPage === "function" ? { reviewPage: ps.terminalPageInPage().reviewPage } : {};
+        }, PORTAL_SAFETY_GLOBAL).catch(() => ({})) as { reviewPage?: boolean };
+        // Only a page that READS as review passes: one the shared reading could not answer for (the
+        // global missing, the evaluate thrown) is a refusal too — an unknown never reads as review.
+        if (t.reviewPage !== true) {
+          reasons.push(t.reviewPage === false
+            ? "the page the Stage stopped on does not read as the portal's review step"
+            : "the page the Stage stopped on could not be checked as the portal's review step");
+        }
+        if (terminal.length !== 1) reasons.push(terminal.length ? `the recipe has ${terminal.length} recorded final submits` : "the recipe has no recorded final submit");
+        else if ((terminal[0].selector as RecipeSelector | undefined)?.frame) reasons.push("the recorded final submit sits inside a frame");
+        else {
+          const n = await countRecordedControl(wp, terminal[0].selector as RecipeSelector);
+          if (n !== 1) reasons.push(`the recorded final submit matches ${n} controls on the review page, not exactly one`);
+        }
+        await fs.promises.mkdir(path.dirname(shotPath), { recursive: true }).catch(() => null);
+        const m = await maskedFullPageScreenshot(wp, secrets, shotPath);
+        if (m.ok) shot = shotPath;
+        else reasons.push(m.why);
+        return reasons;
+      },
+    });
+    const boundValues = Array.from(new Map((this.recipe.steps ?? [])
+      .filter((s) => typeof s.field === "string" && s.field)
+      .map((s) => [String(s.field), { key: String(s.field), value: String(this.fieldValues[String(s.field)] ?? "") }] as const)).values());
+    const uploads = this.uploadsPerformed.map((u) => ({
+      fileName: u.fileName, docType: u.docType, filePath: u.docType ? this.docsByType[u.docType] : undefined,
+    }));
+    return buildStagedReviewCapture({ walk, secrets, boundValues, uploads, screenshotPath: shot });
   }
 
   /** Binding keys the planner invented that the dictionary does not define — reported once
@@ -8750,12 +8877,9 @@ export class RecipeAdapter extends BasePortalAdapter {
     return !!read;
   }
 
-  /** A click that leaves the page: the recorder's "advance:" wording, or a Continue/Next control. */
+  /** A click that leaves the page (isAdvancingClickStep, the one answer). */
   private isAdvancingClick(step: RecipeStep): boolean {
-    const note = String(step.note ?? "");
-    if (/^advance\b/i.test(note)) return true;
-    const name = `${step.selector?.name ?? ""} ${step.selector?.text ?? ""} ${note}`;
-    return /\bcontinue\b|\bnext\b|save (and|&) continue/i.test(name) && !/add new|add contact|search|lookup|calculate/i.test(name);
+    return isAdvancingClickStep(step);
   }
 
   /** Every visible text box on the page whose own label carries a kVA bound, by control id. The

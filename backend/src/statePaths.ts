@@ -95,6 +95,12 @@ export function replayRunsDir(o?: StatePathOptions): string {
   return pick(o, "REPLAY_RUN_DIR", path.join(runDataDir(o), "replay-runs"));
 }
 
+/** #436 — the staged reviews' MASKED review-page pictures (one per Stage run). The route
+ *  /api/projects/:id/staged-reviews/:runId/screenshot serves only a file inside this folder. */
+export function stagedReviewShotsDir(o?: StatePathOptions): string {
+  return path.join(replayRunsDir(o), "staged-reviews");
+}
+
 export function screenshotsDir(o?: StatePathOptions): string {
   return pick(o, "PORTAL_SCREENSHOT_DIR", path.join(runDataDir(o), "screenshots"));
 }
